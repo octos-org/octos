@@ -3982,6 +3982,166 @@ impl InProcessAgentOrchestrator {
             .map_err(|e| format!("failed to resolve peer escalation: {e}"))
     }
 
+    /// #1967 — the READ surface for peer escalations: list this goal's OPEN
+    /// escalation rows for `goal_get`. The write half
+    /// ([`Self::model_goal_record_peer_escalation`]) has run since #1961 but
+    /// no production SELECT existed — an open escalation was invisible to the
+    /// master model unless it happened to catch the park-time wake. Mirrors
+    /// [`Self::model_goal_ledger_findings`]: no binding check here because
+    /// `goal_get` already authorized the goal_id it passes, and a missing /
+    /// unopenable ledger is an empty list, never an error. Question text is
+    /// re-capped at ≤300 chars INCLUDING the truncation ellipsis (the
+    /// producer caps at 500) to keep the goal_get snapshot compact.
+    pub(crate) fn model_goal_ledger_open_escalations(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+    ) -> Vec<Value> {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        if !ledger_path.is_file() {
+            return Vec::new();
+        }
+        let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) else {
+            return Vec::new();
+        };
+        let now_ms = now_ms_u64();
+        ledger
+            .list_open_escalations(goal_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| {
+                // #1967 codex round — the cap INCLUDES the ellipsis: a
+                // >300-char question renders as 299 chars + '…' (exactly
+                // 300), never 301, so the surface's ≤300 contract holds for
+                // the whole rendered string. An exactly-300-char question
+                // passes through untouched (`nth(300)` = a 301st char
+                // exists). The producer caps at 500, so this re-cap only
+                // bites on long questions.
+                let question = if e.question.chars().nth(300).is_some() {
+                    let capped: String = e.question.chars().take(299).collect();
+                    format!("{capped}…")
+                } else {
+                    e.question
+                };
+                json!({
+                    "escalation_id": e.escalation_id,
+                    "peer_id": e.peer_id,
+                    "task_id": e.task_id,
+                    "question": question,
+                    "created_at_ms": e.created_at_ms,
+                    "age_seconds": now_ms.saturating_sub(e.created_at_ms) / 1000,
+                    "default_action": e.default_action,
+                    "default_after_secs": e.default_after_secs,
+                })
+            })
+            .collect()
+    }
+
+    /// #1967 — resolve every OPEN escalation whose producer-declared default
+    /// timer has elapsed (`created_at_ms + default_after_secs*1000 < now`),
+    /// across ALL of this profile's goal ledgers. Returns the number of rows
+    /// resolved. Wired into the global master-continuation drain
+    /// (`spawn_global_master_continuation_drain`), throttled THERE to once
+    /// per minute. DORMANT until a producer sets defaults: the only writer
+    /// ([`Self::model_goal_record_peer_escalation`]) records
+    /// `default_action`/`default_after_secs` as `None` today, so no row
+    /// qualifies until escalations start declaring them.
+    ///
+    /// IMPORTANT LIMIT (v1): resolving the ledger row does NOT un-park a live
+    /// peer. The parked approval/question oneshot lives in the process-global
+    /// pending stores keyed by the peer's wire session, and honouring
+    /// `default_action` there would need the full `peer_respond` delivery
+    /// path (approve/deny/answer routing + decided events) — a hard cancel
+    /// would DENY an escalation whose default says "proceed". v1 timeout is
+    /// ledger-truth + master-visibility only: `goal_get` stops surfacing the
+    /// row; the peer stays parked until answered (`peer_respond`), closed
+    /// (`peer_close`), or its pending entry is cancelled.
+    ///
+    /// ORDERING HAZARD (#1967 codex round, dormant today): `peer_respond`
+    /// DELIVERS the answer to the parked peer BEFORE it resolves the ledger
+    /// row. A sweep firing inside that gap flips the row to `[timeout] …`
+    /// first; the answer's bulk resolve then matches no `open` row (benign
+    /// `Ok(0)`) and records nothing — the ledger attributes a timeout to an
+    /// escalation that was actually ANSWERED. The answer itself is never
+    /// lost (delivery already happened); only the ledger's resolution text
+    /// is wrong. Unreachable while every producer writes
+    /// `default_after_secs = None`; if defaults ever ship, revisit with an
+    /// answered-wins amend step — deliberately NOT an amend API today.
+    ///
+    /// NOTE: `serve --stdio` returns before the global drain is spawned
+    /// (serve.rs spawns it only on the ws/http path), so this sweep never
+    /// runs under `--stdio` — a pre-existing drain gap tracked separately;
+    /// the drain spawn is deliberately not moved in this change.
+    pub(crate) fn sweep_escalation_timeouts(&self, profile_data_dir: &std::path::Path) -> usize {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        let Ok(entries) = std::fs::read_dir(&ledger_dir) else {
+            // No goal-ledgers dir — this profile never recorded an escalation.
+            return 0;
+        };
+        let now_ms = now_ms();
+        let mut resolved = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Real ledger files only — skips the WAL/SHM sidecars (`.db-wal`,
+            // `.db-shm`) SQLite keeps beside each ledger.
+            if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                continue;
+            }
+            // #1967 codex round — `GoalLedger::open` MUTATES its target (WAL
+            // pragma switch + DDL), so never follow a symlinked entry out of
+            // `goal-ledgers/`: a planted link would let this scan
+            // initialize/flip tables in an arbitrary sqlite file. Fail closed
+            // on an unstat-able entry too (same posture as `staged_peer_dir`).
+            let is_symlink = std::fs::symlink_metadata(&path)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(true);
+            if is_symlink {
+                tracing::warn!(
+                    path = %path.display(),
+                    "escalation sweep skipping symlinked/unstatable goal-ledger entry"
+                );
+                continue;
+            }
+            let Ok(ledger) = octos_fleet::GoalLedger::open(&path) else {
+                continue;
+            };
+            let Ok(candidates) = ledger.list_expired_open_escalations(now_ms) else {
+                continue;
+            };
+            for esc in candidates {
+                let resolution = escalation_timeout_resolution(esc.default_action.as_deref());
+                match ledger.resolve_escalation_by_id(
+                    &esc.escalation_id,
+                    &resolution,
+                    "system:escalation-timeout",
+                ) {
+                    Ok(true) => {
+                        resolved += 1;
+                        tracing::info!(
+                            escalation_id = %esc.escalation_id,
+                            goal_id = %esc.goal_id,
+                            peer_id = %esc.peer_id,
+                            resolution = %resolution,
+                            "escalation timeout sweep resolved an expired escalation"
+                        );
+                    }
+                    // Raced a concurrent answer/close between SELECT and
+                    // UPDATE — the real resolution wins, nothing to count.
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            escalation_id = %esc.escalation_id,
+                            error = %err,
+                            "escalation timeout sweep failed to resolve a row"
+                        );
+                    }
+                }
+            }
+        }
+        resolved
+    }
+
     /// Directory holding this profile's per-goal ledgers. Resolved under the
     /// profile's persistent `data_dir` so ledgers (a) survive restarts and
     /// `/tmp` cleanup, (b) are profile-isolated (a peer on profile A cannot
@@ -6814,6 +6974,15 @@ fn sanitize_filename_for_ledger(goal_id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// #1967 — the resolution text a timed-out escalation records: `[timeout]
+/// <default_action>` when the producer declared what the peer would do,
+/// `[timeout] expired` otherwise — so an audit can tell an answered row
+/// (`[answer]`/`[approval]`), an abandoned one (`[closed]`) and an expired
+/// one apart at a glance.
+fn escalation_timeout_resolution(default_action: Option<&str>) -> String {
+    format!("[timeout] {}", default_action.unwrap_or("expired"))
 }
 
 /// Symlink-safe `staged_peer_dir` for the ledger aggregation path: a peer
@@ -14415,6 +14584,293 @@ mod tests {
             "the durable ledger must reflect the final `complete` status"
         );
         assert_eq!(row.objective, "prove the ledger reflects completion");
+    }
+
+    /// #1967 test helper — seed a goal ledger at
+    /// `<data_dir>/goal-ledgers/<goal_id>.db` with its goals row, returning
+    /// the opened ledger for direct escalation writes.
+    fn seed_goal_ledger(data_dir: &std::path::Path, goal_id: &str) -> octos_fleet::GoalLedger {
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(data_dir);
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger = octos_fleet::GoalLedger::open(
+            ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id))),
+        )
+        .expect("open ledger");
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.to_owned(),
+                objective: "escalation lifecycle".to_owned(),
+                status: "active".to_owned(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .expect("goals row");
+        ledger
+    }
+
+    /// #1967 test helper — an OPEN escalation row for the sweeps/surfaces.
+    fn open_escalation_row(
+        escalation_id: &str,
+        goal_id: &str,
+        peer_id: &str,
+        question: &str,
+        created_at_ms: u64,
+        default_action: Option<&str>,
+        default_after_secs: Option<i64>,
+    ) -> octos_fleet::Escalation {
+        octos_fleet::Escalation {
+            escalation_id: escalation_id.to_owned(),
+            goal_id: goal_id.to_owned(),
+            task_id: None,
+            peer_id: peer_id.to_owned(),
+            question: question.to_owned(),
+            context: None,
+            status: "open".to_owned(),
+            default_action: default_action.map(str::to_owned),
+            default_after_secs,
+            created_at_ms,
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        }
+    }
+
+    /// #1967 — `goal_get`'s escalation surface: open rows come back in the
+    /// compact shape the tool folds in (escalation_id, peer_id, task_id,
+    /// question capped at 300 chars, created_at_ms, age_seconds,
+    /// default_action, default_after_secs), oldest first; resolved rows and
+    /// a missing ledger yield nothing.
+    #[test]
+    fn model_goal_ledger_open_escalations_shape_and_truncation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        // No ledger file yet → empty, not an error.
+        assert!(
+            orchestrator
+                .model_goal_ledger_open_escalations(data_dir.path(), "g-esc")
+                .is_empty()
+        );
+        let ledger = seed_goal_ledger(data_dir.path(), "g-esc");
+        let now_ms = now_ms_u64();
+        ledger
+            .append_escalation(&open_escalation_row(
+                "esc-newer",
+                "g-esc",
+                "peer-b",
+                &"q".repeat(400),
+                now_ms.saturating_sub(5_000),
+                Some("proceed"),
+                Some(300),
+            ))
+            .unwrap();
+        ledger
+            .append_escalation(&open_escalation_row(
+                "esc-older",
+                "g-esc",
+                "peer-a",
+                "[question] which port?",
+                now_ms.saturating_sub(60_000),
+                None,
+                None,
+            ))
+            .unwrap();
+        // A resolved row must never surface.
+        ledger
+            .append_escalation(&open_escalation_row(
+                "esc-done", "g-esc", "peer-c", "answered", 1_000, None, None,
+            ))
+            .unwrap();
+        ledger
+            .resolve_escalation("peer-c", "[answer] yes", "master", 2_000)
+            .unwrap();
+
+        let rows = orchestrator.model_goal_ledger_open_escalations(data_dir.path(), "g-esc");
+        assert_eq!(rows.len(), 2, "open rows only");
+        assert_eq!(rows[0]["escalation_id"], json!("esc-older"), "oldest first");
+        assert_eq!(rows[0]["peer_id"], json!("peer-a"));
+        assert_eq!(rows[0]["question"], json!("[question] which port?"));
+        assert_eq!(rows[0]["task_id"], Value::Null);
+        assert_eq!(rows[0]["default_action"], Value::Null);
+        assert_eq!(rows[0]["default_after_secs"], Value::Null);
+        let age = rows[0]["age_seconds"].as_u64().expect("age_seconds");
+        assert!((30..=600).contains(&age), "age ≈ 60s, got {age}");
+        // #1967 codex round — the 400-char question is capped at 300 chars
+        // INCLUDING the ellipsis (299 + '…'), never 301: the surface's ≤300
+        // contract holds for the whole rendered string.
+        let question = rows[1]["question"].as_str().expect("question");
+        assert_eq!(
+            question.chars().count(),
+            300,
+            "cap is ≤300 INCLUDING the ellipsis"
+        );
+        assert_eq!(question, format!("{}…", "q".repeat(299)));
+        assert_eq!(rows[1]["default_action"], json!("proceed"));
+        assert_eq!(rows[1]["default_after_secs"], json!(300));
+        assert_eq!(
+            rows[1]["created_at_ms"],
+            json!(now_ms.saturating_sub(5_000))
+        );
+        // Boundary: an EXACTLY-300-char question passes through untruncated —
+        // no ellipsis burned on a question already within the cap.
+        ledger
+            .append_escalation(&open_escalation_row(
+                "esc-exact",
+                "g-esc",
+                "peer-d",
+                &"e".repeat(300),
+                now_ms,
+                None,
+                None,
+            ))
+            .unwrap();
+        let rows = orchestrator.model_goal_ledger_open_escalations(data_dir.path(), "g-esc");
+        let exact = rows
+            .iter()
+            .find(|r| r["escalation_id"] == json!("esc-exact"))
+            .expect("esc-exact listed");
+        assert_eq!(exact["question"], json!("e".repeat(300)));
+    }
+
+    /// #1967 — the timeout resolution string carries the producer's declared
+    /// default (or the "expired" placeholder) so the master can tell WHAT the
+    /// timeout committed the peer to.
+    #[test]
+    fn escalation_timeout_resolution_names_default_or_expired() {
+        assert_eq!(
+            escalation_timeout_resolution(Some("proceed with plan A")),
+            "[timeout] proceed with plan A"
+        );
+        assert_eq!(escalation_timeout_resolution(None), "[timeout] expired");
+    }
+
+    /// #1967 — `sweep_escalation_timeouts` resolves ONLY open escalations
+    /// whose `default_after_secs` has elapsed; unexpired and no-default rows
+    /// stay open, and a second pass is a no-op (idempotent).
+    #[test]
+    fn sweep_escalation_timeouts_resolves_only_elapsed_defaults() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        // No goal-ledgers dir at all → nothing to sweep.
+        assert_eq!(orchestrator.sweep_escalation_timeouts(data_dir.path()), 0);
+        let ledger = seed_goal_ledger(data_dir.path(), "g-sweep");
+        let now_ms = now_ms_u64();
+        // Expired: created 10s ago with a 1s default.
+        ledger
+            .append_escalation(&open_escalation_row(
+                "esc-expired",
+                "g-sweep",
+                "p1",
+                "waited too long",
+                now_ms.saturating_sub(10_000),
+                Some("proceed"),
+                Some(1),
+            ))
+            .unwrap();
+        // Unexpired: created now with a 1h default.
+        ledger
+            .append_escalation(&open_escalation_row(
+                "esc-later",
+                "g-sweep",
+                "p2",
+                "still fresh",
+                now_ms,
+                None,
+                Some(3_600),
+            ))
+            .unwrap();
+        // No default → the sweep must never touch it.
+        ledger
+            .append_escalation(&open_escalation_row(
+                "esc-forever",
+                "g-sweep",
+                "p3",
+                "needs a human",
+                now_ms.saturating_sub(10_000),
+                None,
+                None,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            orchestrator.sweep_escalation_timeouts(data_dir.path()),
+            1,
+            "exactly the elapsed default resolves"
+        );
+        let still_open = ledger.list_open_escalations("g-sweep").unwrap();
+        assert_eq!(
+            still_open
+                .iter()
+                .map(|e| e.escalation_id.as_str())
+                .collect::<Vec<_>>(),
+            // Oldest first: esc-forever (now-10s) precedes esc-later (now).
+            vec!["esc-forever", "esc-later"],
+            "unexpired + no-default rows stay open"
+        );
+        assert_eq!(
+            orchestrator.sweep_escalation_timeouts(data_dir.path()),
+            0,
+            "second pass is a no-op"
+        );
+    }
+
+    /// #1967 codex round — `GoalLedger::open` MUTATES its target (WAL pragma
+    /// switch + DDL), so the sweep must never follow a symlinked entry out of
+    /// `goal-ledgers/`: a planted link would let the scan initialize/flip
+    /// tables in an arbitrary sqlite file. Same fail-closed posture as
+    /// `staged_peer_dir`.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_escalation_timeouts_skips_symlinked_ledgers() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        // A REAL ledger with an expired-default row lives OUTSIDE the
+        // goal-ledgers dir; only a symlink points at it from inside.
+        let outside = data_dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target_db = outside.join("foreign.db");
+        let foreign = octos_fleet::GoalLedger::open(&target_db).expect("open foreign ledger");
+        foreign
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: "g-foreign".to_owned(),
+                objective: "not ours".to_owned(),
+                status: "active".to_owned(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        foreign
+            .append_escalation(&open_escalation_row(
+                "esc-foreign",
+                "g-foreign",
+                "p1",
+                "expired elsewhere",
+                now_ms_u64().saturating_sub(10_000),
+                Some("proceed"),
+                Some(1),
+            ))
+            .unwrap();
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path());
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        std::os::unix::fs::symlink(&target_db, ledger_dir.join("linked.db")).unwrap();
+
+        assert_eq!(
+            orchestrator.sweep_escalation_timeouts(data_dir.path()),
+            0,
+            "a symlinked ledger entry must be skipped, not opened"
+        );
+        assert_eq!(
+            foreign.list_open_escalations("g-foreign").unwrap().len(),
+            1,
+            "the link target's row must remain untouched"
+        );
     }
 
     /// #1696 — `goal_get` snapshot: stable shape with remaining budget;

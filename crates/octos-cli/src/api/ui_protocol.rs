@@ -14344,12 +14344,39 @@ fn enqueue_peer_awaiting_input_wake(
     }
 }
 
-/// Resolve the peer's `peers_root` from `state.profiles` and enqueue the
-/// awaiting-input wake on its originator. The thin `AppState` seam over
-/// [`enqueue_peer_awaiting_input_wake`] that the park-point requesters call.
-/// No-op for a non-peer session or an unregistered profile.
+/// Resolve the peer's profile `data_dir` from `state.profiles` and delegate.
+/// The thin `AppState` seam over [`wake_master_and_record_park_escalation`]
+/// that the park-point requesters call. No-op for a non-peer session or an
+/// unregistered profile.
 fn wake_master_on_peer_awaiting_input(
     state: &AppState,
+    peer_session: &SessionKey,
+    pending_id: &str,
+    park_kind: PeerPendingKind,
+    prompt: &str,
+) {
+    let Some((profile_id, _slug)) = peer_slug_and_profile(peer_session) else {
+        return;
+    };
+    let Some(runtime) = state.profiles.get(profile_id) else {
+        return;
+    };
+    wake_master_and_record_park_escalation(
+        &runtime.data_dir,
+        peer_session,
+        pending_id,
+        park_kind,
+        prompt,
+    );
+}
+
+/// The `AppState`-free body of [`wake_master_on_peer_awaiting_input`] (split
+/// out in the #1967 codex round so the park-time effects are unit-testable
+/// with a tempdir `data_dir`): enqueue the awaiting-input wake on the peer's
+/// originator, then persist the park as a durable `Escalation` row when the
+/// peer carries a goal context.
+fn wake_master_and_record_park_escalation(
+    data_dir: &Path,
     peer_session: &SessionKey,
     pending_id: &str,
     park_kind: PeerPendingKind,
@@ -14358,10 +14385,24 @@ fn wake_master_on_peer_awaiting_input(
     let Some((profile_id, slug)) = peer_slug_and_profile(peer_session) else {
         return;
     };
-    let Some(runtime) = state.profiles.get(profile_id) else {
+    let peers_root = data_dir.join("peers");
+    // #1967 codex round — a park can land in the documented close race (the
+    // #P1-2 residual: between peer_close's pending-cancel sweep and its wire
+    // eviction). By then the `closed` marker is durable, `peer_respond`
+    // refuses the peer, and peer_close's ledger resolve has ALREADY run — so
+    // a wake would point the master at an unanswerable peer, and a fresh
+    // escalation row would sit orphaned `open` forever. A closed peer's park
+    // must produce NEITHER. The requester's live oneshot itself remains
+    // #1842 (close-while-parked) — out of scope here.
+    if peer_is_closed(&peers_root, slug) {
+        tracing::debug!(
+            slug,
+            profile = profile_id,
+            kind = park_kind.as_str(),
+            "peer parked after close — suppressing master wake and escalation row"
+        );
         return;
-    };
-    let peers_root = runtime.data_dir.join("peers");
+    }
     let _ =
         enqueue_peer_awaiting_input_wake(&peers_root, peer_session, pending_id, park_kind, prompt);
 
@@ -14402,7 +14443,7 @@ fn wake_master_on_peer_awaiting_input(
         PeerPendingKind::Question => "question",
     };
     if let Err(err) = default_agent_orchestrator().model_goal_record_peer_escalation(
-        &runtime.data_dir,
+        data_dir,
         goal_id,
         profile_id,
         &originator,
@@ -14448,6 +14489,104 @@ mod peer_awaiting_wake_tests {
 
     fn peer_session(profile: &str, chat: &str, slug: &str) -> SessionKey {
         SessionKey::with_profile_topic(profile, "api", chat, &format!("peer-{slug}"))
+    }
+
+    /// #1967 codex round — a peer that parks AFTER `peer_close` (the
+    /// documented #P1-2 close-race residual: a park landing between the
+    /// pending-cancel sweep and the wire eviction) must produce NEITHER a
+    /// master wake NOR a fresh escalation row. The close already cancelled
+    /// its pendings and resolved its ledger rows; `peer_respond` refuses a
+    /// closed peer, so a row written now would be orphaned `open` forever.
+    /// An identically-staged OPEN peer is the positive control: same goal,
+    /// same originator — wake + row both land.
+    #[test]
+    fn closed_peer_park_produces_neither_wake_nor_escalation_row() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let peers_root = data_dir.join("peers");
+        let profile = "tenant-wake-closed-esc";
+        let master = "tenant-wake-closed-esc:api:master";
+        // A goal OWNED by the originator, so the escalation write would
+        // succeed if (wrongly) attempted for the closed peer — the test must
+        // prove the GUARD suppresses it, not a binding failure.
+        let orchestrator = default_agent_orchestrator();
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: SessionKey(master.to_owned()),
+                profile_id: profile.to_owned(),
+                objective: "close-race escalation guard".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&SessionKey(master.to_owned()))
+            .expect("goal id");
+        let ledger_path = data_dir.join("goal-ledgers").join(format!("{goal_id}.db"));
+        // `set_goal` enqueues the initial GoalContinue on the master, so the
+        // wake assertions below are DELTAS against this baseline.
+        let baseline = orchestrator.pending_continuation_count_for_session_for_test(
+            &SessionKey(master.to_owned()),
+            profile,
+        );
+
+        // The CLOSED peer: staged + goal-bound, with the durable marker.
+        stage_peer_with_originator(&peers_root, "retired", Some(master));
+        std::fs::write(
+            peers_root.join("retired").join("goal"),
+            format!("{goal_id}\n"),
+        )
+        .unwrap();
+        std::fs::write(peers_root.join("retired").join("closed"), "closer\n1\n").unwrap();
+        wake_master_and_record_park_escalation(
+            data_dir,
+            &peer_session(profile, "retired-wire", "retired"),
+            "approval-closed-1",
+            PeerPendingKind::Approval,
+            "run the migration?",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(master.to_owned()),
+                profile,
+            ),
+            baseline,
+            "a closed peer's park must not wake the master"
+        );
+        assert!(
+            !ledger_path.exists(),
+            "a closed peer's park must not write an escalation row (ledger created at {})",
+            ledger_path.display()
+        );
+
+        // Positive control: the SAME staging without the marker → both land.
+        stage_peer_with_originator(&peers_root, "active", Some(master));
+        std::fs::write(
+            peers_root.join("active").join("goal"),
+            format!("{goal_id}\n"),
+        )
+        .unwrap();
+        wake_master_and_record_park_escalation(
+            data_dir,
+            &peer_session(profile, "active-wire", "active"),
+            "approval-open-1",
+            PeerPendingKind::Approval,
+            "run the migration?",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(
+                &SessionKey(master.to_owned()),
+                profile,
+            ),
+            baseline + 1,
+            "an open peer's park wakes the master"
+        );
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("ledger exists");
+        let open = ledger.list_open_escalations(&goal_id).unwrap();
+        assert_eq!(open.len(), 1, "exactly the open peer's row was written");
+        assert_eq!(open[0].peer_id, "active");
     }
 
     /// A peer parking on an APPROVAL wakes its originator (master) with a
@@ -14964,6 +15103,14 @@ fn peer_respond_resolve(
     // stops showing it as open. Best-effort: a goal-less peer, a missing
     // ledger, or no open escalation is a benign no-op, and a ledger write
     // failure must NOT fail the resume the caller already committed to.
+    //
+    // #1967 codex round — ordering: because delivery happens BEFORE this
+    // resolve, a timeout sweep (`sweep_escalation_timeouts`) firing in the
+    // gap can flip the row to `[timeout] …` first, making this bulk resolve
+    // a no-op — the ledger then shows a timeout for an escalation that was
+    // actually answered (the delivered answer itself is unaffected). Dormant
+    // while producers write `default_after_secs = None`; the hazard and the
+    // deliberate no-amend-API decision are documented on the sweep.
     if let Some(peer_dir) = staged_peer_dir(peers_root, &slug) {
         let goal_id = peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
             .and_then(|body| body.lines().next().map(|l| l.trim().to_owned()))
@@ -16165,6 +16312,35 @@ fn build_peer_close_callback(
         cancel_peer_pending_on_close(&contracts, &profile_id, &slug, &|event| {
             emit_cancelled(event)
         });
+        // #1967 — the cancel above released the live oneshot, but the
+        // escalation row written at park time
+        // (`model_goal_record_peer_escalation`) is DURABLE: with the peer now
+        // closed, `peer_respond` refuses it, so nothing would ever flip the
+        // row off `open` — a permanent phantom on the master's goal_get
+        // escalation surface. Resolve it bulk-by-peer (the depth-1 peer has
+        // at most one open escalation, and every open row of a closed peer is
+        // by definition abandoned). Best-effort: a goal-less peer / missing
+        // ledger is a benign Ok(0), and a ledger failure must never fail the
+        // close (the marker is already durable).
+        let goal_id = peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
+            .and_then(|body| body.lines().next().map(|l| l.trim().to_owned()))
+            .filter(|s| !s.is_empty());
+        if let (Some(goal_id), Some(data_dir)) = (goal_id, peers_root.parent()) {
+            if let Err(err) = default_agent_orchestrator().model_goal_resolve_peer_escalation(
+                data_dir,
+                &goal_id,
+                &slug,
+                "[closed] peer closed before answering",
+                &origin_session,
+            ) {
+                tracing::warn!(
+                    slug = %slug,
+                    goal_id = %goal_id,
+                    error = %err,
+                    "peer-goal: failed to resolve open escalation on peer close (close proceeds)"
+                );
+            }
+        }
         // Peer-fleet auto-synthesis RESET — the close marker now excludes this
         // peer from the master's owned fleet. If it was the LAST owned peer, the
         // fleet is fully retired: drop the `.synthesized` marker so a genuinely
@@ -21498,8 +21674,52 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             interval_secs = GLOBAL_MASTER_CONTINUATION_DRAIN_INTERVAL_SECS,
             "global master-continuation drain loop started (connection-independent)"
         );
+        // #1967 — escalation timeout sweep cadence: this loop ticks every 5s,
+        // but the sweep opens every goal-ledger db under every profile, so it
+        // runs at most once per minute. Loop-local throttle state on purpose
+        // (NOT in the orchestrator): the cadence belongs to this driver, and
+        // tests driving `sweep_escalation_timeouts` directly must never be
+        // throttled. `None` start = first in-loop tick sweeps immediately, so
+        // rows that expired while the serve was down resolve promptly.
+        const ESCALATION_SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(60);
+        let mut last_escalation_sweep: Option<std::time::Instant> = None;
         loop {
             tick.tick().await;
+
+            // #1967 — resolve expired open escalations across every profile's
+            // goal ledgers. Ledger-truth + master-visibility only: a live
+            // parked peer is NOT un-parked (see `sweep_escalation_timeouts`
+            // for why a hard cancel would be wrong). Dormant until producers
+            // set `default_after_secs`.
+            if last_escalation_sweep.is_none_or(|at| at.elapsed() >= ESCALATION_SWEEP_MIN_INTERVAL)
+            {
+                last_escalation_sweep = Some(std::time::Instant::now());
+                // #1967 codex round — the sweep is synchronous rusqlite I/O
+                // (opens every goal-ledger db), so run it on the blocking
+                // pool: it must never stall this drain tick. Detached on
+                // purpose (handle dropped): the 60s throttle above bounds
+                // re-entry, and a pathological >60s sweep overlapping the
+                // next is harmless — `resolve_escalation_by_id` only ever
+                // flips rows still `open`.
+                let profile_dirs: Vec<(String, PathBuf)> = state
+                    .profiles
+                    .iter()
+                    .map(|(id, runtime)| (id.clone(), runtime.data_dir.clone()))
+                    .collect();
+                tokio::task::spawn_blocking(move || {
+                    for (profile_id, data_dir) in profile_dirs {
+                        let swept =
+                            default_agent_orchestrator().sweep_escalation_timeouts(&data_dir);
+                        if swept > 0 {
+                            info!(
+                                profile = %profile_id,
+                                swept,
+                                "escalation timeout sweep resolved expired escalations"
+                            );
+                        }
+                    }
+                });
+            }
 
             // codex P2 (reap): this loop never closes, so the per-connection
             // cleanup path (`abort_connection_turns` on socket close) never runs

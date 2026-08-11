@@ -88,6 +88,12 @@ pub struct Escalation {
     pub resolution: Option<String>,
 }
 
+/// #1967 — the one column list every escalation SELECT shares; order is the
+/// contract [`GoalLedger::escalation_from_row`] maps by index.
+const ESCALATION_SELECT_COLUMNS: &str = "escalation_id, goal_id, task_id, peer_id, question, \
+     context, status, default_action, default_after_secs, created_at_ms, resolved_at_ms, \
+     resolved_by, resolution";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     pub decision_id: String,
@@ -552,6 +558,11 @@ impl GoalLedger {
     /// `open` status resolves exactly the escalation just answered. Returns the
     /// number of rows updated (0 when there was no open escalation — e.g. an
     /// approval on a goal-less peer, or a double-resolve).
+    ///
+    /// #1967 — this bulk-by-peer form stays the right call for the ANSWER and
+    /// CLOSE paths ("everything open for this peer" IS the one escalation the
+    /// depth-1 peer parked on / abandoned). The timeout sweep instead addresses
+    /// individual rows via [`Self::resolve_escalation_by_id`].
     pub fn resolve_escalation(
         &self,
         peer_id: &str,
@@ -567,6 +578,93 @@ impl GoalLedger {
             params![resolution, resolved_by, resolved_at_ms, peer_id],
         )?;
         Ok(updated)
+    }
+
+    /// #1967 — shared row → [`Escalation`] mapper for the SELECT paths below.
+    /// Column order must match [`ESCALATION_SELECT_COLUMNS`].
+    fn escalation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Escalation> {
+        Ok(Escalation {
+            escalation_id: row.get(0)?,
+            goal_id: row.get(1)?,
+            task_id: row.get(2)?,
+            peer_id: row.get(3)?,
+            question: row.get(4)?,
+            context: row.get(5)?,
+            status: row.get(6)?,
+            default_action: row.get(7)?,
+            default_after_secs: row.get(8)?,
+            created_at_ms: row.get(9)?,
+            resolved_at_ms: row.get(10)?,
+            resolved_by: row.get(11)?,
+            resolution: row.get(12)?,
+        })
+    }
+
+    /// #1967 — the READ half of the escalation lifecycle. Producers wrote rows
+    /// (`append_escalation`) and the answer path flipped them
+    /// (`resolve_escalation`), but no production SELECT existed — an open
+    /// escalation was invisible to the master model. `goal_get` folds these in
+    /// via `model_goal_ledger_open_escalations`; oldest first so the master
+    /// answers in park order.
+    pub fn list_open_escalations(&self, goal_id: &str) -> Result<Vec<Escalation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ESCALATION_SELECT_COLUMNS} FROM escalations
+             WHERE goal_id = ?1 AND status = 'open'
+             ORDER BY created_at_ms ASC"
+        ))?;
+        let rows = stmt
+            .query_map(params![goal_id], Self::escalation_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// #1967 — TARGETED resolve: flip ONE escalation by primary key, provided
+    /// it is still `open`. Returns whether a row flipped (`false` = unknown id
+    /// or already resolved — a recorded resolution is never clobbered). Used
+    /// by the timeout sweep, which addresses each expired row individually;
+    /// the answer/close paths use the peer_id-bulk
+    /// [`Self::resolve_escalation`] instead (see its doc).
+    pub fn resolve_escalation_by_id(
+        &self,
+        escalation_id: &str,
+        resolution: &str,
+        resolved_by: &str,
+    ) -> Result<bool> {
+        let resolved_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE escalations
+             SET status = 'resolved', resolution = ?1, resolved_by = ?2, resolved_at_ms = ?3
+             WHERE escalation_id = ?4 AND status = 'open'",
+            params![resolution, resolved_by, resolved_at_ms, escalation_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// #1967 — timeout candidates for the escalation sweep: OPEN rows whose
+    /// `default_after_secs` timer has ELAPSED (`created_at_ms +
+    /// default_after_secs*1000 < now_ms`, strict). Deliberately NO goal
+    /// filter: the sweep addresses one per-goal ledger FILE, and the filename
+    /// is a lossy `sanitize_filename_for_ledger` mapping so the goal_id cannot
+    /// be recovered from the path — the rows carry it. Rows without a default
+    /// never qualify (the master must answer them via peer_respond, or
+    /// peer_close resolves them).
+    pub fn list_expired_open_escalations(&self, now_ms: i64) -> Result<Vec<Escalation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ESCALATION_SELECT_COLUMNS} FROM escalations
+             WHERE status = 'open' AND default_after_secs IS NOT NULL
+               AND created_at_ms + default_after_secs * 1000 < ?1
+             ORDER BY created_at_ms ASC"
+        ))?;
+        let rows = stmt
+            .query_map(params![now_ms], Self::escalation_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Append a decision to the ledger.
@@ -1732,6 +1830,220 @@ mod digest_integration_tests {
             ledger.get_goal("g2").unwrap().unwrap().status,
             "active",
             "a newer resume of a `blocked` goal must be allowed"
+        );
+    }
+
+    /// #1967 test helper — a minimal OPEN escalation row. The lifecycle tests
+    /// below vary only id/peer/timing/defaults, so keep the noise here.
+    fn open_escalation(
+        escalation_id: &str,
+        goal_id: &str,
+        peer_id: &str,
+        created_at_ms: u64,
+        default_action: Option<&str>,
+        default_after_secs: Option<i64>,
+    ) -> Escalation {
+        Escalation {
+            escalation_id: escalation_id.to_string(),
+            goal_id: goal_id.to_string(),
+            task_id: None,
+            peer_id: peer_id.to_string(),
+            question: format!("question from {peer_id}"),
+            context: None,
+            status: "open".to_string(),
+            default_action: default_action.map(str::to_string),
+            default_after_secs,
+            created_at_ms,
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        }
+    }
+
+    fn goal_row(goal_id: &str) -> Goal {
+        Goal {
+            goal_id: goal_id.to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        }
+    }
+
+    /// #1967 — the READ half of the escalation lifecycle. `append_escalation`
+    /// wrote rows and the resolve paths flipped them, but no production SELECT
+    /// existed: an open escalation was invisible. `list_open_escalations`
+    /// returns only this goal's OPEN rows, oldest first.
+    #[test]
+    fn list_open_escalations_returns_open_rows_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger.create_goal(&goal_row("g1")).unwrap();
+        ledger.create_goal(&goal_row("g2")).unwrap();
+        // Insert out of created order to prove the ORDER BY.
+        ledger
+            .append_escalation(&open_escalation("esc-b", "g1", "peer-b", 3000, None, None))
+            .unwrap();
+        ledger
+            .append_escalation(&open_escalation("esc-a", "g1", "peer-a", 1000, None, None))
+            .unwrap();
+        ledger
+            .append_escalation(&open_escalation("esc-c", "g1", "peer-c", 2000, None, None))
+            .unwrap();
+        // A different goal's row must not leak into g1's listing.
+        ledger
+            .append_escalation(&open_escalation("esc-x", "g2", "peer-x", 500, None, None))
+            .unwrap();
+        // A resolved row must not be listed as open.
+        ledger
+            .resolve_escalation("peer-c", "[answer] done", "master", 4000)
+            .unwrap();
+
+        let open = ledger.list_open_escalations("g1").unwrap();
+        assert_eq!(
+            open.iter()
+                .map(|e| e.escalation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["esc-a", "esc-b"],
+            "open-only, this goal only, oldest first"
+        );
+        assert_eq!(open[0].peer_id, "peer-a");
+        assert_eq!(open[0].question, "question from peer-a");
+    }
+
+    /// #1967 — `resolve_escalation_by_id` flips exactly the addressed row
+    /// (the peer_id-bulk `resolve_escalation` cannot target one of several
+    /// rows) and refuses an already-resolved or unknown id with `Ok(false)`.
+    #[test]
+    fn resolve_escalation_by_id_targets_one_row_and_refuses_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger.create_goal(&goal_row("g1")).unwrap();
+        // TWO open rows for the SAME peer — bulk resolve would flip both.
+        ledger
+            .append_escalation(&open_escalation("esc-1", "g1", "picker", 1000, None, None))
+            .unwrap();
+        ledger
+            .append_escalation(&open_escalation("esc-2", "g1", "picker", 2000, None, None))
+            .unwrap();
+
+        let flipped = ledger
+            .resolve_escalation_by_id("esc-1", "[timeout] expired", "system:escalation-timeout")
+            .unwrap();
+        assert!(flipped, "an open row must resolve");
+        let open = ledger.list_open_escalations("g1").unwrap();
+        assert_eq!(open.len(), 1, "only the addressed row was flipped");
+        assert_eq!(open[0].escalation_id, "esc-2");
+
+        // Already resolved → refused (no clobber of the recorded resolution).
+        let again = ledger
+            .resolve_escalation_by_id("esc-1", "[answer] late", "master")
+            .unwrap();
+        assert!(!again, "a resolved row must not re-resolve");
+        // Unknown id → refused, not an error.
+        assert!(
+            !ledger
+                .resolve_escalation_by_id("esc-nope", "[timeout] expired", "system")
+                .unwrap()
+        );
+
+        // The FIRST resolve's text landed verbatim and survived the refused
+        // re-resolve (same raw-row check idiom as the #1961 test above).
+        let conn = ledger.conn.lock().unwrap();
+        let (status, resolution, resolved_by): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolution, resolved_by FROM escalations WHERE escalation_id = 'esc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "resolved");
+        assert_eq!(resolution.as_deref(), Some("[timeout] expired"));
+        assert_eq!(resolved_by.as_deref(), Some("system:escalation-timeout"));
+    }
+
+    /// #1967 — timeout candidates: only OPEN rows whose `default_after_secs`
+    /// has ELAPSED (`created_at_ms + s*1000 < now_ms`) qualify. Unexpired,
+    /// no-default, and already-resolved rows never surface.
+    #[test]
+    fn list_expired_open_escalations_filters_elapsed_defaults_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger.create_goal(&goal_row("g1")).unwrap();
+        // created 1000 + 10s → expires at 11_000: EXPIRED at now=60_000.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-expired",
+                "g1",
+                "p1",
+                1000,
+                Some("proceed"),
+                Some(10),
+            ))
+            .unwrap();
+        // created 1000 + 100s → expires at 101_000: NOT expired at now=60_000.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-later",
+                "g1",
+                "p2",
+                1000,
+                None,
+                Some(100),
+            ))
+            .unwrap();
+        // No default timer → never a candidate.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-forever",
+                "g1",
+                "p3",
+                1000,
+                None,
+                None,
+            ))
+            .unwrap();
+        // Expired timer but already resolved → never a candidate.
+        ledger
+            .append_escalation(&open_escalation(
+                "esc-done",
+                "g1",
+                "p4",
+                1000,
+                None,
+                Some(1),
+            ))
+            .unwrap();
+        ledger
+            .resolve_escalation("p4", "[answer] handled", "master", 5000)
+            .unwrap();
+
+        let candidates = ledger.list_expired_open_escalations(60_000).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|e| e.escalation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["esc-expired"],
+            "only the elapsed open default is a timeout candidate"
+        );
+        assert_eq!(candidates[0].default_action.as_deref(), Some("proceed"));
+        // At the exact boundary (created + s*1000 == now) the row is NOT yet
+        // expired — strict `<` matches the sweep's contract.
+        assert!(
+            ledger
+                .list_expired_open_escalations(11_000)
+                .unwrap()
+                .is_empty(),
+            "boundary instant is not yet expired"
+        );
+        assert_eq!(
+            ledger.list_expired_open_escalations(11_001).unwrap().len(),
+            1
         );
     }
 }
