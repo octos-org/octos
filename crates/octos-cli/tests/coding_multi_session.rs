@@ -198,6 +198,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         config: octos_cli::config::Config::default(),
         snapshots: None,
         llm: Arc::new(ReadFileStubLlm),
+        goal_verifier_llm: None,
         adaptive_router: None,
         runtime_qos_catalog: None,
         primary_model_id: "m11g-readfile-stub".to_string(),

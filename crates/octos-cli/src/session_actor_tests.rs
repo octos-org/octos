@@ -2137,6 +2137,7 @@ async fn setup_actor_with_mode(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -2214,6 +2215,7 @@ async fn build_unspawned_actor(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     }
 }
 
@@ -2421,6 +2423,7 @@ async fn setup_actor_with_timeout(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -2798,6 +2801,7 @@ async fn test_session_actor_emits_resume_and_turn_end_hooks() {
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -2933,6 +2937,7 @@ async fn test_forced_background_turn_emits_turn_end_hook() {
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -3062,6 +3067,7 @@ async fn setup_actor_for_cron_regression(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -3166,6 +3172,7 @@ async fn setup_speculative_actor(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -3267,6 +3274,7 @@ async fn setup_speculative_actor_with_indicator(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
     };
 
     let handle = tokio::spawn(actor.run());
@@ -5739,6 +5747,7 @@ async fn setup_dispatch_registry(
         llm: provider.clone(),
         llm_for_compaction: provider.clone(),
         llm_strong: provider.clone(),
+        goal_verifier_llm: None,
         memory,
         memory_inject_tokens: 2500,
         memory_refresh_enabled: true,
@@ -8783,6 +8792,7 @@ async fn setup_actor_with_approval_provider(
         consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
         current_command_cmid: None,
         last_turn_total_tokens: 0,
+        goal_verifier_llm: None,
         usage_ledger: None,
         session_usage: Default::default(),
         usage_profile_id: "test-profile".to_string(),

@@ -123,6 +123,77 @@ fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderR
     if registered > 0 { Some(router) } else { None }
 }
 
+/// #1935 — the reserved `sub_providers` lane key that selects the
+/// INDEPENDENT goal-completion verifier model.
+pub const GOAL_VERIFIER_LANE_KEY: &str = "goal_verifier";
+
+/// #1935 — build the INDEPENDENT goal-completion verifier provider from the
+/// profile's `sub_providers` (lane key [`GOAL_VERIFIER_LANE_KEY`]).
+///
+/// The verifier used to run on the SAME provider/lane as the agent being
+/// graded, which weakens the "don't grade your own homework" property.
+/// Configuring a `sub_providers` entry keyed `goal_verifier` routes every
+/// goal-completion verification (the `goal_update` tool, the gateway and
+/// serve autonomous sentinel accountants, and the serve interactive sentinel)
+/// through a separately-routed model instead.
+///
+/// Follows the established lane idioms:
+/// - Lane selection is LAST-wins on duplicate keys, mirroring
+///   `ProviderRouter::register_with_full_meta` and the peer model lane.
+/// - The lane's `api_key_env` is applied UNCONDITIONALLY (even when `None`):
+///   a lane that omits its own key must CLEAR the primary's `api_key_env`
+///   and fall back to its OWN provider's default env var, never borrow the
+///   primary provider's credential (#peer-model semantics).
+/// - The built provider is wrapped in `RetryProvider`, like every other lane.
+///
+/// CREDENTIAL ISOLATION (#1935 codex blocker): the key resolver's normal
+/// chain consults the GLOBAL provider auth store BEFORE the configured env
+/// var (`Config::resolve_api_key`), so a same-provider lane whose
+/// `api_key_env` is missing or typo'd would silently grade with the
+/// PRIMARY's login credential — defeating the verifier's independence with
+/// no signal. The lane build therefore sets `bypass_auth_store` (the same
+/// explicit-key-must-win escape hatch octos-ffi uses): the lane's key
+/// resolves ONLY from its declared `api_key_env` (profile `env_vars` /
+/// keychain, then process env — never the auth store). An unset/empty var
+/// fails the build → the warn below + `None` → visible fail-open to the
+/// session's own provider.
+///
+/// Returns `None` — and the call sites then fall back to the grading
+/// session's own provider, which is the pre-#1935 behavior unchanged (the
+/// back-compat default) — when no `goal_verifier` lane is configured or the
+/// configured lane fails to build.
+pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvider>> {
+    let sp = config
+        .sub_providers
+        .iter()
+        .rev()
+        .find(|sp| sp.key == GOAL_VERIFIER_LANE_KEY)?;
+    let mut sp_config = config.clone();
+    sp_config.api_key_env = sp.api_key_env.clone();
+    // #1935 codex blocker — never let the global auth store satisfy the
+    // verifier lane's credential (see the doc comment above).
+    sp_config.bypass_auth_store = true;
+    match chat::create_provider_with_api_type(
+        &sp.provider,
+        &sp_config,
+        sp.model.clone(),
+        sp.base_url.clone(),
+        sp.api_type.as_deref(),
+    ) {
+        Ok(provider) => Some(Arc::new(octos_llm::RetryProvider::new(provider))),
+        Err(error) => {
+            warn!(
+                lane = GOAL_VERIFIER_LANE_KEY,
+                provider = %sp.provider,
+                error = %error,
+                "failed to build the goal_verifier lane provider — goal completion \
+                 verification falls back to the session's own provider"
+            );
+            None
+        }
+    }
+}
+
 /// All long-lived state that belongs to a single profile within the
 /// current host process.
 ///
@@ -219,6 +290,14 @@ pub struct ProfileRuntime {
     /// is `Some`) adaptive routing. Every session for this profile
     /// uses this same provider.
     pub llm: Arc<dyn LlmProvider>,
+
+    /// #1935 — the INDEPENDENT goal-completion verifier lane, resolved at
+    /// profile build from the `sub_providers` entry keyed
+    /// [`GOAL_VERIFIER_LANE_KEY`] (see [`build_goal_verifier_provider`]).
+    /// `None` when the lane is unconfigured (or failed to build): the
+    /// verifier call sites then fall back to the grading session's own
+    /// provider — the pre-#1935 behavior, kept as the back-compat default.
+    pub goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
 
     /// Typed handle to the adaptive router if QoS-aware adaptive
     /// routing was wired in. `None` when only a single provider was
@@ -645,6 +724,7 @@ impl ProfileRuntime {
             data_dir: self.data_dir.clone(),
             config: self.config.clone(),
             llm: self.llm.clone(),
+            goal_verifier_llm: self.goal_verifier_llm.clone(),
             adaptive_router: self.adaptive_router.clone(),
             runtime_qos_catalog: self.runtime_qos_catalog.clone(),
             primary_model_id: self.primary_model_id.clone(),
@@ -1179,6 +1259,15 @@ impl ProfileRuntime {
         let runtime_lifecycle = Some(Arc::new(ProfileRuntimeLifecycle {
             cron_service: Some(cron_service.clone()),
         }));
+        // #1935 — resolve the INDEPENDENT goal-completion verifier lane
+        // (`sub_providers` key `goal_verifier`) once at profile build. It is
+        // threaded into the `goal_update` tool below and stored on the
+        // runtime so the serve turn accountants (autonomous + interactive
+        // sentinel) verify on it too. `None` ⇒ every verifier call site
+        // falls back to the grading session's own provider (pre-#1935
+        // behavior, the back-compat default).
+        let goal_verifier_llm = build_goal_verifier_provider(&config);
+
         // #1696 — structured goal tools: goal_get (objective + remaining
         // budget) and goal_update (model-owned complete|blocked ONLY,
         // executor-enforced). Session resolved per-call from
@@ -1196,10 +1285,16 @@ impl ProfileRuntime {
                     .with_data_dir(data_dir.to_path_buf()),
             );
             tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
-            tools.register(
-                crate::goal_tool::GoalUpdateTool::new(profile.id.clone())
-                    .with_data_dir(data_dir.to_path_buf()),
-            );
+            {
+                // #1935 — completion claims are graded on the independent
+                // verifier lane when one is configured.
+                let mut goal_update = crate::goal_tool::GoalUpdateTool::new(profile.id.clone())
+                    .with_data_dir(data_dir.to_path_buf());
+                if let Some(ref verifier) = goal_verifier_llm {
+                    goal_update = goal_update.with_verifier_provider(verifier.clone());
+                }
+                tools.register(goal_update);
+            }
             // #1857 PR 5a — the goal keeper's fleet controls: decompose the
             // objective onto a durable fleet (`goal_plan`) and launch its ready
             // tasks onto the live worker pool (`goal_dispatch`). `goal_get`
@@ -1359,6 +1454,7 @@ impl ProfileRuntime {
             // fields below carry the pre-extracted hot-path state.
             config: config.clone(),
             llm,
+            goal_verifier_llm,
             adaptive_router,
             runtime_qos_catalog,
             primary_model_id,
@@ -2464,6 +2560,155 @@ mod tests {
         assert!(
             child_registry.get("run_pipeline").is_some(),
             "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",
+        );
+    }
+
+    /// #1935 — a `sub_providers` entry keyed [`GOAL_VERIFIER_LANE_KEY`]
+    /// builds the INDEPENDENT goal-completion verifier lane at profile
+    /// build. `ollama` requires no API key / base_url / model, so the
+    /// construction succeeds offline (no network call is made at build).
+    #[test]
+    fn should_build_goal_verifier_lane_when_sub_provider_configured() {
+        let config = Config {
+            sub_providers: vec![crate::config::SubProviderConfig {
+                key: GOAL_VERIFIER_LANE_KEY.to_string(),
+                provider: "ollama".to_string(),
+                model: Some("qwen3:4b".to_string()),
+                api_key_env: None,
+                base_url: None,
+                description: None,
+                default_context_window: None,
+                max_output_tokens: None,
+                api_type: None,
+            }],
+            ..Default::default()
+        };
+        let lane = build_goal_verifier_provider(&config)
+            .expect("configured goal_verifier lane must build");
+        assert_eq!(
+            lane.model_id(),
+            "qwen3:4b",
+            "verifier lane must run the lane's own model, not the primary",
+        );
+    }
+
+    /// #1935 back-compat default — no `goal_verifier` sub-provider means no
+    /// dedicated lane: the call sites then fall back to the session's own
+    /// provider, which is the pre-#1935 verifier behavior unchanged. A
+    /// sub-provider under a DIFFERENT key must not be picked up either.
+    #[test]
+    fn should_skip_goal_verifier_lane_when_unconfigured() {
+        assert!(
+            build_goal_verifier_provider(&Config::default()).is_none(),
+            "no sub_providers ⇒ no verifier lane (fallback to session provider)",
+        );
+
+        let config = Config {
+            sub_providers: vec![crate::config::SubProviderConfig {
+                key: "cheap".to_string(),
+                provider: "ollama".to_string(),
+                model: Some("qwen3:4b".to_string()),
+                api_key_env: None,
+                base_url: None,
+                description: None,
+                default_context_window: None,
+                max_output_tokens: None,
+                api_type: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            build_goal_verifier_provider(&config).is_none(),
+            "a differently-keyed lane must not become the goal verifier",
+        );
+    }
+
+    /// #1935 — duplicate `goal_verifier` lane keys resolve LAST-wins,
+    /// mirroring `ProviderRouter::register_with_full_meta` (and the peer
+    /// model lane's `select_peer_lane`), so the verifier runs on the same
+    /// model a pipeline sub-provider lane with that key would resolve to.
+    #[test]
+    fn should_pick_last_goal_verifier_lane_when_key_duplicated() {
+        let lane = |model: &str| crate::config::SubProviderConfig {
+            key: GOAL_VERIFIER_LANE_KEY.to_string(),
+            provider: "ollama".to_string(),
+            model: Some(model.to_string()),
+            api_key_env: None,
+            base_url: None,
+            description: None,
+            default_context_window: None,
+            max_output_tokens: None,
+            api_type: None,
+        };
+        let config = Config {
+            sub_providers: vec![lane("first-model"), lane("second-model")],
+            ..Default::default()
+        };
+        let provider = build_goal_verifier_provider(&config)
+            .expect("duplicated goal_verifier lane still builds");
+        assert_eq!(provider.model_id(), "second-model", "last lane wins");
+    }
+
+    /// Helper: a key-REQUIRING (`openai`) goal_verifier lane whose credential
+    /// must come from `api_key_env`. The key value is supplied through the
+    /// profile `env_vars` map (the keychain-backed store `resolve_api_key`
+    /// consults after the auth store), so the test never mutates process env.
+    fn openai_goal_verifier_config(api_key_env: &str, env_vars: HashMap<String, String>) -> Config {
+        Config {
+            sub_providers: vec![crate::config::SubProviderConfig {
+                key: GOAL_VERIFIER_LANE_KEY.to_string(),
+                provider: "openai".to_string(),
+                model: Some("gpt-4o-mini".to_string()),
+                api_key_env: Some(api_key_env.to_string()),
+                base_url: None,
+                description: None,
+                default_context_window: None,
+                max_output_tokens: None,
+                api_type: None,
+            }],
+            env_vars,
+            ..Default::default()
+        }
+    }
+
+    /// #1935 codex blocker (credential isolation) — a lane with `api_key_env`
+    /// SET resolves its credential from that var (here via the profile
+    /// `env_vars` map) and builds.
+    #[test]
+    fn should_resolve_goal_verifier_lane_key_from_its_api_key_env() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "OCTOS_TEST_1935_LANE_KEY".to_string(),
+            "lane-secret".to_string(),
+        );
+        let config = openai_goal_verifier_config("OCTOS_TEST_1935_LANE_KEY", env_vars);
+        let lane = build_goal_verifier_provider(&config)
+            .expect("lane with a resolvable api_key_env must build");
+        assert_eq!(lane.model_id(), "gpt-4o-mini");
+    }
+
+    /// #1935 codex blocker (credential isolation) — a lane whose
+    /// `api_key_env` names an UNSET var must yield `None` (warn + fail-open
+    /// to the session provider), NEVER silently borrow a same-provider
+    /// credential from the global auth store.
+    ///
+    /// STRUCTURAL pin, stated plainly: this test seeds NO auth store — tests
+    /// must not write the user's global `auth.json`, so the auth-store-wins
+    /// failure mode is not literally reproduced here. What the test pins is
+    /// the mechanism that makes that failure impossible:
+    /// `build_goal_verifier_provider` sets `bypass_auth_store`, which removes
+    /// the auth-store arm from `resolve_api_key` entirely, so this assertion
+    /// is deterministic on ANY host — including one where `octos auth login
+    /// -p openai` has stored a credential that the non-bypassed chain would
+    /// have returned before ever consulting the lane's env var.
+    #[test]
+    fn should_refuse_goal_verifier_lane_when_api_key_env_unset_even_with_auth_store() {
+        let config =
+            openai_goal_verifier_config("OCTOS_TEST_1935_DEFINITELY_UNSET_KEY", HashMap::new());
+        assert!(
+            build_goal_verifier_provider(&config).is_none(),
+            "unset lane api_key_env must fail the lane build (fail-open to the \
+             session provider), not fall back to the auth store's credential",
         );
     }
 }

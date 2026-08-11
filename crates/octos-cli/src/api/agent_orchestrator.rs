@@ -648,6 +648,26 @@ pub(crate) fn wire_key_from_goal_key(key: &SessionKey) -> SessionKey {
     }
 }
 
+/// #1935 codex round 3 (TOCTOU) — the goal identity + the exact objective a
+/// completion verifier judged, captured under ONE state-lock acquisition by
+/// [`InProcessAgentOrchestrator::goal_verification_snapshot`]. The pair is
+/// mutually consistent by construction; `maybe_complete_goal_from_model`
+/// re-checks BOTH fields against the live record after the verifier await,
+/// so neither a clear/recreate (new id — even with the same objective text)
+/// nor a same-id objective edit can complete on a stale Done verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GoalVerificationSnapshot {
+    pub(crate) goal_id: String,
+    pub(crate) objective: String,
+    /// #1935 codex round 4 (ABA) — the record's user-intent mutation counter
+    /// at snapshot time. `set_goal`'s user-path replace preserves `goal_id`,
+    /// and the user can restore the identical objective text, so (id,
+    /// objective, status) can ALL match again at verdict time; the revision
+    /// is the incarnation that still differs. Checked by
+    /// `maybe_complete_goal_from_model` / `model_transition_goal_guarded`.
+    pub(crate) revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AgentArtifactRecord {
     pub(crate) id: String,
@@ -921,24 +941,59 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
 type LoopRunnableFilter<'a> = dyn Fn(&SessionKey, &str) -> bool + 'a;
 
 impl InProcessAgentOrchestrator {
-    /// Get the goal objective for a session (used by goal completion verifier).
+    /// Get the goal ID for a session. #1935 round 4: production verifier
+    /// paths all migrated to the one-lock [`Self::goal_verification_snapshot`]
+    /// (split reads were the TOCTOU); this narrower accessor remains for
+    /// tests only. Resolves the #1666 cwd-scoped store key like the snapshot.
+    #[cfg(test)]
+    pub(crate) fn goal_id_for_session(&self, session_id: &SessionKey) -> Option<String> {
+        let key = self.scoped_goal_key(session_id);
+        self.state().goals.get(&key).map(|g| g.goal_id.clone())
+    }
+
+    /// Goal objective accessor — tests only, same #1935 round-4 note as
+    /// [`Self::goal_id_for_session`] (production reads go through the
+    /// one-lock snapshot). #1980's restart-durability tests assert restored
+    /// objectives through it.
+    #[cfg(test)]
     pub(crate) fn goal_objective_for_test(&self, session_id: &SessionKey) -> Option<String> {
-        // #1666 scoping (soak bug: goals stored under the cwd-scoped store
-        // identity via `model_create_goal`, but this looked up the RAW wire
-        // session id → miss → the completion verifier got "no goal objective
-        // found for verification" and goals stuck at `blocked`). Resolve the
-        // same scoped key `model_create_goal`/`model_goal_snapshot` use.
         let key = self.scoped_goal_key(session_id);
         self.state().goals.get(&key).map(|g| g.objective.clone())
     }
 
-    /// Get the goal ID for a session (used by goal completion verifier to prevent stale verdicts).
-    pub(crate) fn goal_id_for_session(&self, session_id: &SessionKey) -> Option<String> {
-        // Same #1666 scoping as `goal_objective_for_test` — resolve the scoped
-        // store key, not the raw wire session id.
+    /// #1935 codex round 3 (TOCTOU) — capture the goal identity AND the
+    /// objective the completion verifier will judge in ONE state-lock
+    /// acquisition. Reading them through two separate calls
+    /// (`goal_id_for_session` + `goal_objective_for_test`) left a window
+    /// where a clear/recreate between the reads paired the OLD objective
+    /// with the NEW goal_id (or a same-objective recreate slipped both
+    /// optional checks) — a mixed snapshot that
+    /// [`Self::maybe_complete_goal_from_model`]'s per-field rechecks could
+    /// not catch. Every verifier call site takes this snapshot, grades
+    /// `snapshot.objective`, and passes the whole snapshot to the completion
+    /// gate, which re-checks BOTH fields against the live record.
+    ///
+    /// Returns `None` when the session has no goal under its scoped key or
+    /// the goal belongs to a different profile — there is nothing safe to
+    /// verify, so callers skip the verifier spend entirely.
+    pub(crate) fn goal_verification_snapshot(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> Option<GoalVerificationSnapshot> {
         let key = self.scoped_goal_key(session_id);
-        self.state().goals.get(&key).map(|g| g.goal_id.clone())
+        let state = self.state();
+        let goal = state.goals.get(&key)?;
+        if goal.profile_id != profile_id {
+            return None;
+        }
+        Some(GoalVerificationSnapshot {
+            goal_id: goal.goal_id.clone(),
+            objective: goal.objective.clone(),
+            revision: goal.revision,
+        })
     }
+
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
         self.shared
             .state
@@ -2770,7 +2825,6 @@ impl InProcessAgentOrchestrator {
         if goal.profile_id != profile_id {
             return;
         }
-        let goal_id = goal.goal_id.clone();
         let wrap_up = record_goal_turn_internal(goal, tokens_consumed, elapsed_seconds, now);
         let goal_snapshot = goal.clone();
         persist_goal_state(&state, session_id, &goal_snapshot, false);
@@ -2782,15 +2836,7 @@ impl InProcessAgentOrchestrator {
             // `enqueue_goal_wrap_up` applies the explicit dedupe key so
             // the wrap-up cannot collide with the normal-continuation
             // key shape.
-            enqueue_goal_wrap_up(
-                &mut state,
-                session_id,
-                profile_id,
-                &goal_id,
-                &goal_snapshot.objective,
-                prompt,
-                now_system,
-            );
+            enqueue_goal_wrap_up(&mut state, session_id, &goal_snapshot, prompt, now_system);
         }
     }
 
@@ -2861,6 +2907,41 @@ impl InProcessAgentOrchestrator {
         tokens_consumed: u64,
         elapsed_seconds: u64,
     ) -> Option<Value> {
+        // Turn charges keep the strict active-only gate — `false` here means
+        // every pre-existing caller is byte-identical in behavior.
+        self.charge_goal_tokens_gated(
+            session_id,
+            profile_id,
+            expected_goal_id,
+            tokens_consumed,
+            elapsed_seconds,
+            false,
+        )
+    }
+
+    /// Shared charge body for [`Self::charge_active_goal_tokens`] (turn
+    /// charges, `allow_budget_limited = false`) and
+    /// [`Self::charge_goal_verifier_usage`] (`true`).
+    ///
+    /// #1935 codex blocker — `allow_budget_limited`: each sentinel path
+    /// charges the TURN's spend first; when that flip crosses the budget the
+    /// goal is `budget_limited` by the time the verifier's own usage lands,
+    /// and the strict active-only gate would silently drop the verifier
+    /// charge exactly when the budget matters most. `budget_limited` is an
+    /// accounting freeze for SCHEDULING (no further autonomous fires), not a
+    /// ledger freeze — the verifier ran as part of concluding an active
+    /// goal's turn, so its spend must still count. `complete` / `blocked` /
+    /// `paused` goals never accrue on either path.
+    #[allow(clippy::too_many_arguments)]
+    fn charge_goal_tokens_gated(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        expected_goal_id: &str,
+        tokens_consumed: u64,
+        elapsed_seconds: u64,
+        allow_budget_limited: bool,
+    ) -> Option<Value> {
         if tokens_consumed == 0 && elapsed_seconds == 0 {
             return None;
         }
@@ -2893,10 +2974,14 @@ impl InProcessAgentOrchestrator {
         if goal.goal_id != expected_goal_id {
             return None;
         }
-        // Only an actively-accruing goal advances. A paused /
-        // budget_limited / complete goal must not creep forward on a
-        // stray interactive turn.
-        if goal.status != "active" {
+        // Only an actively-accruing goal advances on a TURN charge. A paused /
+        // budget_limited / complete goal must not creep forward on a stray
+        // interactive turn. The verifier charge (`allow_budget_limited`)
+        // additionally admits `budget_limited` — see the doc comment above —
+        // but never complete/blocked/paused.
+        let status_ok =
+            goal.status == "active" || (allow_budget_limited && goal.status == "budget_limited");
+        if !status_ok {
             return None;
         }
         goal.updated_at_ms = now;
@@ -2910,7 +2995,6 @@ impl InProcessAgentOrchestrator {
         // schedulability gates on `status == "active"`, not on the live
         // token count).
         let goal_id = goal.goal_id.clone();
-        let objective = goal.objective.clone();
         let wrap_up_prompt = {
             let exhausted = goal.token_budget > 0
                 && goal.tokens_used >= goal.token_budget
@@ -2934,15 +3018,7 @@ impl InProcessAgentOrchestrator {
         // the map holds, or restart/drain would resolve a different goal.
         persist_goal_state(&state, &key, &snapshot, false);
         if let Some(prompt) = wrap_up_prompt {
-            enqueue_goal_wrap_up(
-                &mut state,
-                &key,
-                &profile_for_event,
-                &goal_id,
-                &objective,
-                prompt,
-                now_system,
-            );
+            enqueue_goal_wrap_up(&mut state, &key, &snapshot, prompt, now_system);
         }
         // #1959 (codex #1) — stamp the generation like every other goal-event
         // producer so the send guard can order this token-charge update.
@@ -2956,6 +3032,44 @@ impl InProcessAgentOrchestrator {
             "generation": generation,
             "transition_actor": "backend",
         }))
+    }
+
+    /// #1958 / #1935 — fold a goal-completion VERIFIER call's token usage
+    /// into the goal's `tokens_used`. The verifier makes a real LLM call at
+    /// every verifier site — the three sentinel accountants (SessionActor
+    /// gateway, AppUI autonomous, AppUI interactive) AND the `goal_update`
+    /// tool, which since codex round 5 charges DIRECTLY through this method
+    /// too (its former `ToolResult.tokens_used` stamp rode turn totals into
+    /// the active-only post-turn charge and was rejected exactly when the
+    /// tool had just completed the goal). This is the single goal-side
+    /// charge route for verifier spend.
+    ///
+    /// Interactive-shaped charge (delegates to the shared
+    /// [`Self::charge_goal_tokens_gated`] body): input+output tokens only, no
+    /// elapsed seconds, no continuation / rate-window side effects. Callers
+    /// must charge BEFORE [`Self::maybe_complete_goal_from_model`] — a goal
+    /// that has flipped to `complete` can no longer be charged. No-op when
+    /// the caller holds no goal binding (`expected_goal_id` is `None` — the
+    /// binding is what rejects a mid-verify goal replacement) or the verifier
+    /// reported zero usage (the provider-error fail-safe path).
+    ///
+    /// #1935 codex blocker — charges with `allow_budget_limited = true`: the
+    /// sentinel paths charge the TURN first, and when that flips the goal to
+    /// `budget_limited` the verifier's own spend must still land (the strict
+    /// active-only gate would drop it exactly at the budget boundary).
+    pub(crate) fn charge_goal_verifier_usage(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        expected_goal_id: Option<&str>,
+        usage: &octos_llm::TokenUsage,
+    ) -> Option<Value> {
+        let expected_goal_id = expected_goal_id?;
+        let tokens = u64::from(usage.input_tokens).saturating_add(u64::from(usage.output_tokens));
+        if tokens == 0 {
+            return None;
+        }
+        self.charge_goal_tokens_gated(session_id, profile_id, expected_goal_id, tokens, 0, true)
     }
 
     /// #979 / M15-C2 — after a goal-driven turn finishes, re-queue
@@ -3479,7 +3593,15 @@ impl InProcessAgentOrchestrator {
         profile_id: &str,
         assistant_content: &str,
         verdict: &GoalCompletionVerdict,
-        expected_goal_id: Option<&str>,
+        // #1935 codex round 3 (stale-verdict TOCTOU) — the goal_id + the
+        // exact objective the verifier judged, captured under ONE lock via
+        // [`Self::goal_verification_snapshot`] BEFORE the verifier await.
+        // Both fields are re-checked against the live record below: a
+        // clear/recreate (new id, even with identical objective text) fails
+        // the id check; a same-id objective edit fails the objective check.
+        // Required — a caller without a snapshot has nothing safe to
+        // complete and must not call at all.
+        snapshot: &GoalVerificationSnapshot,
         // #1957 (codex #1) — profile data dir. The sentinel-driven completion
         // path used to flip `status = "complete"` in memory only, leaving the
         // durable ledger showing the goal still `active`. When `Some`, sync the
@@ -3508,24 +3630,66 @@ impl InProcessAgentOrchestrator {
             return false;
         }
         if goal.status == "complete" {
+            // Idempotent re-claim of an already-complete goal — silent.
+            return false;
+        }
+        // #1935 codex (stale-verdict TOCTOU) — a sentinel completion may only
+        // conclude a goal that is still concluding: `active`, or
+        // `budget_limited` (the turn/verifier charge crossed the budget while
+        // the reply was in flight). A goal the user PAUSED — or the breaker
+        // BLOCKED — mid-verify keeps its `goal_id`, so the id recheck below
+        // would admit the flip; refuse on status instead.
+        if !matches!(goal.status.as_str(), "active" | "budget_limited") {
+            tracing::warn!(
+                session_id = %session_id,
+                goal_id = %goal.goal_id,
+                status = %goal.status,
+                "stale verifier verdict: goal left the completable states \
+                 (active|budget_limited) during verification"
+            );
             return false;
         }
         // CRITICAL: Revalidate goal identity to prevent stale verifier verdicts.
-        // If the goal changed between fetching the objective (for the verifier)
+        // If the goal changed between the snapshot (taken for the verifier)
         // and completing it here, the Done verdict may be for the WRONG goal.
-        // The caller passes the goal_id that was snapshotted when the verifier
-        // was invoked; if it doesn't match the current goal, we must not complete.
-        if let Some(expected_id) = expected_goal_id {
-            if goal.goal_id != expected_id {
-                tracing::warn!(
-                    session_id = %session_id,
-                    expected_goal_id = %expected_id,
-                    actual_goal_id = %goal.goal_id,
-                    "stale verifier verdict: goal changed between verifier call and completion"
-                );
-                return false;
-            }
+        if goal.goal_id != snapshot.goal_id {
+            tracing::warn!(
+                session_id = %session_id,
+                expected_goal_id = %snapshot.goal_id,
+                actual_goal_id = %goal.goal_id,
+                "stale verifier verdict: goal changed between verifier call and completion"
+            );
+            return false;
         }
+        // #1935 codex (stale-verdict TOCTOU) — same-id objective edit: the
+        // verdict certifies the objective the VERIFIER saw, not whatever the
+        // record says now.
+        if goal.objective != snapshot.objective {
+            tracing::warn!(
+                session_id = %session_id,
+                goal_id = %goal.goal_id,
+                "stale verifier verdict: objective was edited between \
+                 verifier call and completion"
+            );
+            return false;
+        }
+        // #1935 codex round 4 (ABA) — same-id, same-objective-text replace
+        // (edit away and back, or an identical-text user re-set) still bumps
+        // the revision, so a verdict rendered against the PREVIOUS incarnation
+        // refuses here even though every other field matches.
+        if goal.revision != snapshot.revision {
+            tracing::warn!(
+                session_id = %session_id,
+                goal_id = %goal.goal_id,
+                snapshot_revision = snapshot.revision,
+                current_revision = goal.revision,
+                "stale verifier verdict: goal was mutated between verifier \
+                 call and completion (ABA)"
+            );
+            return false;
+        }
+        // The verified flip is itself an intent write.
+        goal.revision = goal.revision.wrapping_add(1);
         goal.status = "complete".to_owned();
         goal.updated_at_ms = now_ms();
         let snapshot = goal.clone();
@@ -3893,6 +4057,7 @@ impl InProcessAgentOrchestrator {
     /// the tool executor): the model may set ONLY `complete` or `blocked`.
     /// Structured successor to the `<goal:complete>` text sentinel
     /// ([`Self::maybe_complete_goal_from_model`], kept for back-compat).
+    #[cfg(test)]
     pub(crate) async fn model_transition_goal(
         &self,
         session_id: &SessionKey,
@@ -3906,12 +4071,60 @@ impl InProcessAgentOrchestrator {
         // that have no data dir (tests); those just skip the sync.
         ledger_data_dir: Option<&std::path::Path>,
     ) -> Result<Value, String> {
-        // #1666 residue — the `goal_update` tool addresses THIS folder's goal.
-        // `expected_fleet_id: None` — a model-claimed transition carries no
-        // fleet expectation (review FIX 2 guards only the fleet-driven paths).
+        // #1666 residue — addresses THIS folder's goal. Unguarded wrapper:
+        // no fleet expectation and no verifier snapshot. As of the #1979/#1980
+        // train every PRODUCTION transition goes through either
+        // [`Self::model_transition_goal_guarded`] (verifier-gated goal_update)
+        // or [`Self::model_transition_goal_at_key`] with a fleet id (fleet
+        // terminals, escalation denials), so this wrapper remains for the
+        // ownership-matrix tests only.
         let key = self.scoped_goal_key(session_id);
-        self.model_transition_goal_at_key(&key, profile_id, status, reason, ledger_data_dir, None)
-            .await
+        self.model_transition_goal_at_key(
+            &key,
+            profile_id,
+            status,
+            reason,
+            ledger_data_dir,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// #1935 codex round 4 (A1) — like [`Self::model_transition_goal`], but
+    /// when `expected_snapshot` is `Some`, the transition re-checks the goal's
+    /// (id, objective, revision) against the caller's one-lock
+    /// [`GoalVerificationSnapshot`] INSIDE the same lock that performs the
+    /// mutation. The `goal_update` tool previously read the objective and the
+    /// goal id in separate lock acquisitions, re-read the id after the
+    /// verifier await, and then transitioned UNCONDITIONALLY in yet another
+    /// acquisition — a goal swapped between its re-read and the transition
+    /// still completed on a stale verdict. Passing the snapshot into the
+    /// transition closes that window the same way
+    /// [`Self::maybe_complete_goal_from_model`] does for the sentinel paths.
+    /// Resolves the scoped key, then delegates to the shared
+    /// [`Self::model_transition_goal_at_key`] core (no fleet expectation —
+    /// the snapshot is the verifier paths' guard).
+    pub(crate) async fn model_transition_goal_guarded(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        status: &str,
+        reason: &str,
+        expected_snapshot: Option<&GoalVerificationSnapshot>,
+        ledger_data_dir: Option<&std::path::Path>,
+    ) -> Result<Value, String> {
+        let key = self.scoped_goal_key(session_id);
+        self.model_transition_goal_at_key(
+            &key,
+            profile_id,
+            status,
+            reason,
+            ledger_data_dir,
+            None,
+            expected_snapshot,
+        )
+        .await
     }
 
     /// #1865 — the storage-key core of [`Self::model_transition_goal`]: takes
@@ -3930,6 +4143,13 @@ impl InProcessAgentOrchestrator {
     /// await window would otherwise let a STALE fleet's evidence terminalize
     /// the REPLACEMENT goal. Fleet-driven callers pass their in-hand fleet id;
     /// the `goal_update` wrapper passes `None` (no fleet expectation).
+    ///
+    /// #1935 codex round 4/train-merge — `expected_snapshot` is the verifier
+    /// paths' twin guard (id, objective, revision under this same lock);
+    /// fleet callers pass `None`. The shared mutation body enforces BOTH
+    /// re-checks and bumps the revision exactly once per committed
+    /// transition.
+    #[allow(clippy::too_many_arguments)]
     async fn model_transition_goal_at_key(
         &self,
         key: &SessionKey,
@@ -3938,6 +4158,7 @@ impl InProcessAgentOrchestrator {
         reason: &str,
         ledger_data_dir: Option<&std::path::Path>,
         expected_fleet_id: Option<&str>,
+        expected_snapshot: Option<&GoalVerificationSnapshot>,
     ) -> Result<Value, String> {
         if !matches!(status, "complete" | "blocked") {
             return Err(format!(
@@ -3975,7 +4196,40 @@ impl InProcessAgentOrchestrator {
             if goal.status == "complete" {
                 return Err("goal is already complete".to_owned());
             }
+            // #1935 codex round 4 (A1) — verifier-gated transitions re-check
+            // the one-lock snapshot here, under the SAME lock that mutates:
+            // id (clear+recreate), objective (same-id edit), and revision
+            // (same-id same-text ABA replace) all refuse.
+            if let Some(expected) = expected_snapshot {
+                // #1935 codex round 5 — status-gate parity with the sentinel
+                // path (`maybe_complete_goal_from_model`): a verifier-gated
+                // completion may only conclude a goal that is still concluding
+                // (`active` | `budget_limited`). A breaker-blocked or paused
+                // goal must not be completed by a stale Done verdict.
+                // Unguarded callers (fleet terminal transitions, escalation
+                // denials, `blocked` declarations) pass no snapshot and keep
+                // their pre-existing semantics.
+                if !matches!(goal.status.as_str(), "active" | "budget_limited") {
+                    return Err(format!(
+                        "goal left the completable states (active|budget_limited) \
+                         during verification (now `{}`) — stale verdict rejected",
+                        goal.status
+                    ));
+                }
+                if goal.goal_id != expected.goal_id
+                    || goal.objective != expected.objective
+                    || goal.revision != expected.revision
+                {
+                    return Err(format!(
+                        "goal changed during verification (verified {} rev {}, \
+                         found {} rev {}) — stale verdict rejected",
+                        expected.goal_id, expected.revision, goal.goal_id, goal.revision
+                    ));
+                }
+            }
             let status_changed = goal.status != status;
+            // A model-owned transition is an intent write (#1935 round 4).
+            goal.revision = goal.revision.wrapping_add(1);
             goal.status = status.to_owned();
             goal.updated_at_ms = now_ms();
             let snapshot = goal.clone();
@@ -4452,15 +4706,7 @@ impl InProcessAgentOrchestrator {
             charged.map(|(owning_key, snapshot, wrap_up_prompt)| {
                 persist_goal_state(&state, &owning_key, &snapshot, false);
                 if let Some(prompt) = wrap_up_prompt {
-                    enqueue_goal_wrap_up(
-                        &mut state,
-                        &owning_key,
-                        &snapshot.profile_id,
-                        &snapshot.goal_id,
-                        &snapshot.objective,
-                        prompt,
-                        now_system,
-                    );
+                    enqueue_goal_wrap_up(&mut state, &owning_key, &snapshot, prompt, now_system);
                 }
                 // The FRESH snapshot (post-charge, post-flip) feeds the ledger
                 // upsert below, so the goals row finally carries real numbers.
@@ -4998,6 +5244,77 @@ impl InProcessAgentOrchestrator {
             .and_then(|goal| goal.fleet_id.clone())
     }
 
+    /// #1935 codex round 5 — bind a just-created fleet to the goal that was
+    /// snapshotted BEFORE the async fleet creation. `model_create_fleet_plan`
+    /// awaits `Fleet::create` between its goal snapshot and this bind; a goal
+    /// cleared+recreated (or otherwise user-mutated — the revision catches a
+    /// same-id edit) in that window must NOT receive the fleet. Pre-fix the
+    /// bind blindly attached the fleet to whichever goal occupied the key,
+    /// handing the replacement a plan decomposed from a DIFFERENT objective.
+    ///
+    /// On refusal the just-created fleet stays UNBOUND and is inert:
+    /// `goal_dispatch` resolves the fleet exclusively through `goal.fleet_id`
+    /// (see [`Self::resolve_owned_fleet`]), so an unbound fleet can never
+    /// dispatch tasks or wake a keeper — the same benign-orphan class as the
+    /// H3 uuid-collision note in `model_create_fleet_plan`. Cancelling the
+    /// orphan is another lane's API and is deliberately NOT attempted here;
+    /// the keeper simply re-runs `goal_plan` against the current goal.
+    ///
+    /// #1935 codex round 6 — `expected_fleet_id` is a CAS on the binding
+    /// itself: the goal's CURRENT `fleet_id` must equal the pre-await
+    /// snapshot's value (normally `None`; a legitimate re-bind passes the
+    /// existing id). Two `goal_plan` calls racing in one parallel batch both
+    /// snapshot `fleet_id = None` at the same revision and both create
+    /// distinct UUID fleets; the first bind neither bumps the revision nor
+    /// was occupancy checked, so the second silently OVERWROTE the first
+    /// binding (orphaning a "successfully planned" fleet and violating the
+    /// tool's documented idempotency). With the CAS the second caller loses
+    /// cleanly with the same re-run error.
+    fn bind_fleet_to_goal(
+        &self,
+        key: &SessionKey,
+        expected_goal_id: &str,
+        expected_revision: u64,
+        expected_fleet_id: Option<&str>,
+        fleet_id: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let mut state = self.state();
+        let refusal = match state.goals.get_mut(key) {
+            None => Some(("cleared", String::new(), 0_u64)),
+            Some(goal)
+                if goal.goal_id != expected_goal_id || goal.revision != expected_revision =>
+            {
+                Some(("replaced or mutated", goal.goal_id.clone(), goal.revision))
+            }
+            Some(goal) if goal.fleet_id.as_deref() != expected_fleet_id => Some((
+                "bound to another fleet (concurrent goal_plan)",
+                goal.goal_id.clone(),
+                goal.revision,
+            )),
+            Some(goal) => {
+                goal.fleet_id = Some(fleet_id.to_owned());
+                goal.updated_at_ms = now_ms as i64;
+                let snapshot = goal.clone();
+                persist_goal_state(&state, key, &snapshot, false);
+                None
+            }
+        };
+        if let Some((how, current_goal_id, current_revision)) = refusal {
+            tracing::warn!(
+                fleet_id = %fleet_id,
+                expected_goal_id = %expected_goal_id,
+                expected_revision,
+                current_goal_id = %current_goal_id,
+                current_revision,
+                "goal_plan bind refused: goal was {how} during planning — the \
+                 unbound fleet is inert (goal_dispatch resolves via goal.fleet_id)"
+            );
+            return Err("goal changed during planning — re-run goal_plan".to_owned());
+        }
+        Ok(())
+    }
+
     /// #1857 PR 5a — `goal_plan` tool: lazily create the durable fleet this goal
     /// drives and decompose the objective onto `tasks`. Idempotent — a goal that
     /// already has a `fleet_id` returns "already planned" rather than recreating
@@ -5025,7 +5342,15 @@ impl InProcessAgentOrchestrator {
         // Captured before the state lock (`fleet_pool` takes its own lock); also
         // carries the per-task token projection for the MEDIUM warning below.
         let pool = self.fleet_pool();
-        let (existing_fleet, root, workspace_has_runtime_hint, objective, token_budget, goal_id) = {
+        let (
+            existing_fleet,
+            root,
+            workspace_has_runtime_hint,
+            objective,
+            token_budget,
+            goal_id,
+            goal_revision,
+        ) = {
             let state = self.state();
             let Some(goal) = state.goals.get(&key) else {
                 return Err("no goal is set for this session".to_owned());
@@ -5050,9 +5375,13 @@ impl InProcessAgentOrchestrator {
                 goal.objective.clone(),
                 goal.token_budget,
                 goal.goal_id.clone(),
+                // #1935 codex round 5 — snapshot the revision alongside the id
+                // so the post-await bind can refuse a goal replaced (or user-
+                // mutated) during fleet creation.
+                goal.revision,
             )
         };
-        if let Some(fleet_id) = existing_fleet {
+        if let Some(fleet_id) = existing_fleet.as_deref() {
             // #1857 PR 5a fix (H3, codex round 3) — validate the existing binding
             // belongs to this goal before returning it: never surface a foreign
             // fleet id from a stale/corrupt `goal.fleet_id`.
@@ -5061,7 +5390,7 @@ impl InProcessAgentOrchestrator {
                     "fleet kernel store is not available (serve boot did not open it)".to_owned(),
                 );
             };
-            Self::resolve_owned_fleet(Arc::new(store), &fleet_id, &key, profile_id).await?;
+            Self::resolve_owned_fleet(Arc::new(store), fleet_id, &key, profile_id).await?;
             return Ok(json!({
                 "status": "already_planned",
                 "fleet_id": fleet_id,
@@ -5143,15 +5472,19 @@ impl InProcessAgentOrchestrator {
             Err(e) => return Err(format!("failed to create fleet plan: {e}")),
         };
         // Stash the binding on the goal record (single-lock RMW; persist).
-        {
-            let mut state = self.state();
-            if let Some(goal) = state.goals.get_mut(&key) {
-                goal.fleet_id = Some(fleet_id.clone());
-                goal.updated_at_ms = now_ms as i64;
-                let snapshot = goal.clone();
-                persist_goal_state(&state, &key, &snapshot, false);
-            }
-        }
+        // #1935 codex round 5/6 — guarded: the goal snapshotted BEFORE the
+        // `Fleet::create` await must still occupy the key AND still carry the
+        // snapshot's fleet binding (None here — the already-planned early
+        // return above fired otherwise), or the bind is refused and the tool
+        // errors (see `bind_fleet_to_goal`).
+        self.bind_fleet_to_goal(
+            &key,
+            &goal_id,
+            goal_revision,
+            existing_fleet.as_deref(),
+            &fleet_id,
+            now_ms,
+        )?;
         tracing::info!(
             session = %session_id,
             fleet_id = %fleet_id,
@@ -5509,6 +5842,8 @@ impl InProcessAgentOrchestrator {
                             ),
                             ledger_data_dir,
                             Some(&fleet_id),
+                            // Fleet-driven transition: no verifier snapshot.
+                            None,
                         )
                         .await;
                 }
@@ -5598,6 +5933,8 @@ impl InProcessAgentOrchestrator {
                     "all fleet tasks accepted",
                     ledger_data_dir,
                     expected_fleet_id,
+                    // Fleet-driven transition: no verifier snapshot.
+                    None,
                 )
                 .await;
         } else if un_completable {
@@ -5613,6 +5950,8 @@ impl InProcessAgentOrchestrator {
                     ),
                     ledger_data_dir,
                     expected_fleet_id,
+                    // Fleet-driven transition: no verifier snapshot.
+                    None,
                 )
                 .await;
         }
@@ -6051,6 +6390,8 @@ impl InProcessAgentOrchestrator {
                 fleet_id: Some(fleet_id.to_owned()),
                 controller_workspace_root: None,
                 controller_workspace_has_runtime_hint: None,
+                revision: 0,
+                wrap_up_generation: 0,
             },
         );
     }
@@ -6860,6 +7201,29 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     true,
                 ));
             }
+            // #1935 codex round 7 — ATOMIC model-create admission.
+            // `model_create_goal` checks "no unfinished goal exists" (and
+            // drops a completed record) under ONE lock, but delegates the
+            // create to this method, which RE-locks: two parallel model
+            // creates could both pass that pre-check, and the loser landed
+            // HERE — the update branch — silently overwriting the winner's
+            // freshly-created objective. `transition_actor == "model"` is
+            // produced only by the model-create path (or a wire caller
+            // explicitly claiming model intent), so enforce the same
+            // precondition under the admission lock itself: a model create
+            // must never mutate an unfinished goal. User/backend replace
+            // semantics are unchanged.
+            if transition_actor == "model" && goal.status != "complete" {
+                return Err(autonomy_error(
+                    kinds::GOAL_INVALID_STATE,
+                    "cannot create a new goal because this session has an unfinished goal; \
+                     complete or clear the existing goal first",
+                    Some(&request.session_id),
+                    Some(&request.profile_id),
+                    None,
+                    true,
+                ));
+            }
             let prior_status = goal.status.clone();
             // Over-budget re-activation guard (mini5 durable-ledger seq-454):
             // a goal that has already spent its entire token budget must NOT
@@ -6885,6 +7249,14 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     true,
                 ));
             }
+            // #1935 codex round 4 (ABA) — every user-path mutation of an
+            // existing goal bumps the revision, even when the submitted
+            // objective/status text equals the current values: an
+            // edit-away-and-back (X→Y→X) between a verifier snapshot and its
+            // verdict must leave evidence, or the stale Done verdict would
+            // complete the replacement (issue #1975's user-path ABA). Pure
+            // accounting never bumps — see the field doc.
+            goal.revision = goal.revision.wrapping_add(1);
             goal.objective = objective.to_owned();
             if let Some(status) = requested_status {
                 goal.status = status.to_owned();
@@ -6899,6 +7271,14 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             // active window silently never emits its summary turn.
             if goal.status == "active" && prior_status != "active" {
                 goal.wrap_up_emitted = false;
+                // #1935 codex round 4 — new wrap-up GENERATION: the previous
+                // generation's wrap-up may have been durably tombstoned
+                // (refused at drain while paused/blocked). The next remint
+                // must carry a fresh dedupe key
+                // (`…/wrap_up/<profile>/<goal_id>/<gen>`), or the tombstone
+                // outranks the remint's Queued event on supervisor replay and
+                // the re-budgeted goal can never wrap up again.
+                goal.wrap_up_generation = goal.wrap_up_generation.wrapping_add(1);
                 // Re-activation forgives the failure streak (#1693) —
                 // the user explicitly asked for another attempt.
                 goal.consecutive_failed_turns = 0;
@@ -6958,6 +7338,10 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 fleet_id: None,
                 controller_workspace_root: None,
                 controller_workspace_has_runtime_hint: None,
+                // #1935 round 4 — fresh records start at revision 0 / wrap-up
+                // generation 0; every user-path mutation bumps `revision`.
+                revision: 0,
+                wrap_up_generation: 0,
             };
             state.goals.insert(key.clone(), goal.clone());
             goal
@@ -6970,15 +7354,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // goal is `budget_limited` here, so the active-continuation branch
         // above did NOT fire — the only queued turn is this summarize-and-stop.
         if let Some(prompt) = pending_wrap_up {
-            enqueue_goal_wrap_up(
-                &mut state,
-                &key,
-                &request.profile_id,
-                &goal.goal_id,
-                &goal.objective,
-                prompt,
-                SystemTime::now(),
-            );
+            enqueue_goal_wrap_up(&mut state, &key, &goal, prompt, SystemTime::now());
         }
         persist_goal_state(&state, &key, &goal, false);
         // #1959 (codex #1) — stamp the generation so a user-set goal update
@@ -7517,6 +7893,28 @@ struct AutonomyGoalRecord {
     /// explicit cwd, `Some(false)` for a derived Tier-3 root, `None` for legacy
     /// records whose provenance is unknown (and therefore unsafe as a hint).
     controller_workspace_has_runtime_hint: Option<bool>,
+    /// #1935 codex round 4 (ABA) — monotonic counter of USER/MODEL-INTENT
+    /// mutations. BUMP SET (documented contract): `set_goal` on an existing
+    /// record (create starts at 0; replace / objective edit / pause /
+    /// reactivate / budget change — bumped even when the submitted values
+    /// equal the current ones, so an edit-away-and-back X→Y→X leaves
+    /// evidence), `model_transition_goal*` (complete/blocked), and the
+    /// verified sentinel completion flip. Pure ACCOUNTING deliberately does
+    /// NOT bump: token/time charges, continuation counters, rate window,
+    /// `wrap_up_emitted` bookkeeping, and the AUTOMATIC `budget_limited`
+    /// exhaustion flip — an in-flight verified completion must survive its
+    /// own turn/verifier charge crossing the budget. Restored snapshots
+    /// without the field default to 0 (metadata `unwrap_or(0)`, the
+    /// supervisor-bag equivalent of `#[serde(default)]`).
+    revision: u64,
+    /// #1935 codex round 4 — wrap-up generation, bumped whenever
+    /// `wrap_up_emitted` is CLEARED (user reactivation). Rides the wrap-up
+    /// continuation dedupe key (`…/wrap_up/<profile>/<goal_id>/<gen>`) so a
+    /// durably tombstoned gen-N wrap-up (refused while paused — see
+    /// `stale_drop_should_tombstone`) can never mask the gen-N+1 remint on
+    /// supervisor replay (`Completed` outranks `Queued` per key). Restored
+    /// snapshots without the field default to 0.
+    wrap_up_generation: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -8157,17 +8555,23 @@ fn pending_continuation_is_schedulable(
             // strand legacy persisted wrap-ups indefinitely.
             // Detect the legacy shape and let it through — the goal
             // record's id already matched above.
+            //
+            // #1935 codex blocker — the legacy exemption gets the same
+            // status narrowing as the `GoalWrapUp` arm below: a wrap-up
+            // is only schedulable while the goal is still concluding
+            // (`active` | `budget_limited`), never after it went
+            // `complete` / `blocked` / `paused`.
             if item.metadata.contains_key("wrap_up_prompt") || item.metadata.contains_key("wrap_up")
             {
-                return true;
+                return matches!(goal.status.as_str(), "active" | "budget_limited");
             }
             matches!(goal.status.as_str(), "active")
         }
         MasterContinuationReason::GoalWrapUp => {
             // Wrap-up is the explicit terminal goal turn — must drain
-            // even when the goal is `budget_limited`. Skip only if
-            // the goal has since been cleared (operator nuked it
-            // mid-wrap-up) OR was replaced by a different goal.
+            // even when the goal is `budget_limited`. Skip if the goal
+            // has since been cleared (operator nuked it mid-wrap-up) OR
+            // was replaced by a different goal.
             let session_key = SessionKey(item.session_id.as_str().to_owned());
             let Some(goal) = state.goals.get(&session_key) else {
                 return false;
@@ -8177,7 +8581,18 @@ fn pending_continuation_is_schedulable(
                     return false;
                 }
             }
-            true
+            // #1935 codex blocker — status gate (narrows a PRE-EXISTING
+            // hole): the unconditional `true` here admitted a wrap-up
+            // for a goal that had since gone `complete`, firing a
+            // post-completion autonomous turn (observed on the live
+            // soak: a verifier charge crosses the budget → wrap-up
+            // enqueued → the Done flip completes the goal → the queued
+            // wrap-up still drained). A wrap-up is schedulable ONLY
+            // while its goal is still concluding: `active` (budget
+            // raised mid-flight) or `budget_limited` (the normal
+            // wrap-up state). `complete` / `blocked` / `paused` refuse;
+            // the drain's stale-drop path handles the queue entry.
+            matches!(goal.status.as_str(), "active" | "budget_limited")
         }
         // ChildCompleted, ScatterJoinComplete, External — no owning
         // goal/loop record to inspect, pass through.
@@ -8203,6 +8618,21 @@ fn pending_continuation_is_schedulable(
 /// the same stable dedupe_key, and any Completed tombstone written
 /// during the pause would prevent the new Queued event from sticking
 /// in the ledger.
+///
+/// #1935 codex round 3 — EXCEPTION: goal WRAP-UPs (the dedicated
+/// `GoalWrapUp` reason and the legacy `GoalContinue` + `wrap_up_prompt`
+/// metadata shape) DO tombstone when refused for status
+/// (paused/complete/blocked). Restart restores every non-completed
+/// record, and a later user REACTIVATION (`set_goal` → `active`, which
+/// also clears `wrap_up_emitted`) would make the resurrected STALE
+/// wrap-up schedulable again and fire it. The stale record is never
+/// needed: reactivation resets `wrap_up_emitted`, so if the budget
+/// still binds, normal accounting mints a FRESH wrap-up on the next
+/// charge. (That fresh wrap-up shares the stable dedupe_key, so its
+/// durable upsert is masked by the tombstone — it still fires from the
+/// in-memory queue, and after another restart the same
+/// `wrap_up_emitted` reset re-mints it; only cross-restart durability
+/// of the replacement is traded away, never the fire itself.)
 fn stale_drop_should_tombstone(
     state: &AutonomyRuntimeState,
     item: &QueuedMasterContinuation,
@@ -8242,9 +8672,22 @@ fn stale_drop_should_tombstone(
                     return true;
                 }
             }
+            // #1935 codex round 3 — a WRAP-UP refused at drain time was
+            // refused for STATUS (its admission gate accepts
+            // active|budget_limited, and status cannot change between the
+            // gate and this decision — both run under the same state lock).
+            // Tombstone it durably so a restart-restore + user reactivation
+            // cannot resurrect and fire the stale wrap-up; see the fn doc
+            // for why the replacement wrap-up is never lost.
+            let is_wrap_up = matches!(item.reason, MasterContinuationReason::GoalWrapUp)
+                || item.metadata.contains_key("wrap_up_prompt")
+                || item.metadata.contains_key("wrap_up");
+            if is_wrap_up {
+                return !matches!(goal.status.as_str(), "active" | "budget_limited");
+            }
             // Same goal_id is still present (e.g. paused,
             // budget_limited). Resuming it can re-queue the same
-            // dedupe_key; don't tombstone.
+            // dedupe_key; don't tombstone a plain GoalContinue.
             false
         }
         // ChildCompleted, ScatterJoinComplete, External — no entity
@@ -8477,6 +8920,13 @@ fn record_goal_turn_internal(
         if goal.consecutive_failed_turns >= GOAL_MAX_CONSECUTIVE_FAILED_TURNS
             && goal.status == "active"
         {
+            // #1935 codex round 5 — the breaker's active→blocked flip is a
+            // STATUS change and must invalidate in-flight verifier verdicts
+            // (that is the point of blocking). The no-bump exclusions remain
+            // pure accounting + the automatic `budget_limited` exhaustion
+            // flip below, whose in-flight-completion-survives-its-own-charge
+            // property is unchanged.
+            goal.revision = goal.revision.wrapping_add(1);
             goal.status = "blocked".to_owned();
             return None;
         }
@@ -8522,27 +8972,29 @@ fn record_goal_turn_internal(
 fn enqueue_goal_wrap_up(
     state: &mut AutonomyRuntimeState,
     session_id: &SessionKey,
-    profile_id: &str,
-    goal_id: &str,
-    objective: &str,
+    // The just-flipped goal snapshot: supplies the profile, id, objective,
+    // and — #1935 codex round 4 — the wrap-up GENERATION that rides the
+    // dedupe key, so a durably tombstoned earlier generation (refused while
+    // paused) never masks this remint's Queued event on supervisor replay.
+    goal: &AutonomyGoalRecord,
     wrap_up_prompt: String,
     now_system: SystemTime,
 ) {
     let wrap_up_request = MasterContinuationRequest::new(
         "coding-autonomy-goal",
         session_id.to_string(),
-        profile_id.to_owned(),
+        goal.profile_id.clone(),
         MasterContinuationReason::GoalWrapUp,
         now_system,
     )
-    .with_goal_id(goal_id.to_owned())
-    .with_metadata("objective", objective.to_owned())
+    .with_goal_id(goal.goal_id.clone())
+    .with_metadata("objective", goal.objective.clone())
     .with_metadata("status", "budget_limited".to_owned())
     .with_metadata("wrap_up", "true".to_owned())
     .with_metadata("wrap_up_prompt", wrap_up_prompt)
     .with_dedupe_key(format!(
-        "coding-autonomy-goal/wrap_up/{}/{}",
-        profile_id, goal_id
+        "coding-autonomy-goal/wrap_up/{}/{}/{}",
+        goal.profile_id, goal.goal_id, goal.wrap_up_generation
     ));
     enqueue_and_persist_continuation(state, wrap_up_request);
 }
@@ -8585,20 +9037,20 @@ fn detect_goal_complete_sentinel(content: &str) -> bool {
 ///
 /// Mirrors the AgentVerifierConfig pattern: fresh judge prompt, no agent
 /// scratchpad, separate model lane.
-pub(crate) async fn run_goal_completion_verifier(
-    provider: Arc<dyn LlmProvider>,
-    objective: &str,
-    evidence: &str,
-) -> GoalCompletionVerdict {
-    run_goal_completion_verifier_with_usage(provider, objective, evidence)
-        .await
-        .0
-}
-
-/// Like [`run_goal_completion_verifier`], but also returns the verifier LLM
-/// call's [`TokenUsage`] so the caller can fold it into turn / goal-budget
-/// accounting (#1958). The verifier now makes a real provider call, so its
-/// tokens must not be silently dropped. On a provider error the usage is zero.
+///
+/// #1935 — `provider` is resolved BY THE CALL SITES: the profile's dedicated
+/// `goal_verifier` sub-provider lane when configured
+/// (`crate::runtime::profile::build_goal_verifier_provider`), else the
+/// grading session's own provider (the pre-#1935 back-compat default).
+///
+/// Also returns the verifier LLM call's [`octos_llm::TokenUsage`] so the
+/// caller can fold it into goal-budget accounting (#1958) — the verifier
+/// makes a real provider call, so its tokens must not be silently dropped.
+/// ALL four verifier sites (the three sentinel accountants and the
+/// `goal_update` tool) charge it directly via
+/// `charge_goal_verifier_usage`; since codex round 5 nothing rides
+/// `ToolResult.tokens_used` for this call. On a provider error the usage
+/// is zero.
 pub(crate) async fn run_goal_completion_verifier_with_usage(
     provider: Arc<dyn LlmProvider>,
     objective: &str,
@@ -9227,6 +9679,13 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
             &group.metadata,
             "controller_workspace_has_runtime_hint",
         ),
+        // #1935 round 4 — `unwrap_or(0)` is the supervisor-bag equivalent of
+        // `#[serde(default)]`: pre-round-4 snapshots restore at revision 0 /
+        // generation 0 and stay internally consistent from there.
+        revision: supervisor_metadata_u64(&group.metadata, "revision").unwrap_or(0),
+        wrap_up_generation: supervisor_metadata_u64(&group.metadata, "wrap_up_generation")
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
     };
     state.next_goal_seq = state.next_goal_seq.max(sequence_suffix(&goal.goal_id));
     state.goals.insert(session_id, goal);
@@ -9473,6 +9932,8 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         fleet_id: None,
         controller_workspace_root: None,
         controller_workspace_has_runtime_hint: None,
+        revision: 0,
+        wrap_up_generation: 0,
     };
     persist_goal_state(state, session_id, &goal, true);
 }
@@ -9550,6 +10011,14 @@ fn persist_goal_state_with_store(
     group.metadata.insert(
         "consecutive_failed_turns".into(),
         json!(goal.consecutive_failed_turns),
+    );
+    // #1935 round 4 — ABA revision + wrap-up generation ride the open bag.
+    group
+        .metadata
+        .insert("revision".into(), json!(goal.revision));
+    group.metadata.insert(
+        "wrap_up_generation".into(),
+        json!(goal.wrap_up_generation as u64),
     );
     // PR 5a — ride the fleet binding + controller root through the open
     // metadata bag (no schema bump). Both `None` for a pre-fleet or cleared
@@ -12439,6 +12908,7 @@ mod tests {
                 "all fleet tasks accepted",
                 None,
                 Some("fleet-superseded"),
+                None,
             )
             .await
             .expect_err("a moved binding must refuse the transition");
@@ -12460,6 +12930,7 @@ mod tests {
                 "all fleet tasks accepted",
                 None,
                 Some("fleet-current"),
+                None,
             )
             .await
             .expect("matching binding transitions");
@@ -15814,6 +16285,73 @@ mod tests {
     /// #1696 — the model-owned transition matrix: complete|blocked only,
     /// profile-scoped, refuses double-complete; the post-turn budget flip
     /// must not overwrite a mid-turn model transition.
+    #[test]
+    fn model_create_goal_refuses_interleaved_double_create() {
+        // #1935 codex round 7 — `model_create_goal` checks "no unfinished
+        // goal" under one lock but delegates the create to `set_goal`, which
+        // RE-locks: two parallel creates both passed the pre-check (both saw
+        // the key empty after their remove), and the loser landed in
+        // `set_goal`'s UPDATE branch, silently overwriting the winner's
+        // objective. The admission is now enforced atomically inside
+        // `set_goal` for model intent; this test drives the loser's exact
+        // interleaved second half at the orchestrator seam.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-create-race");
+        orchestrator
+            .model_create_goal(
+                &session_id,
+                "tenant-a",
+                "objective A (winner)",
+                Some(10_000),
+            )
+            .expect("first create succeeds");
+
+        // The interleaved loser already passed the pre-check while the
+        // winner's goal did not exist yet; its delegated `set_goal` (model
+        // intent) now runs against the winner's ACTIVE goal and must refuse
+        // under the admission lock itself.
+        let err = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "objective B (loser)".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: Some("model".into()),
+            })
+            .expect_err("interleaved model create must refuse, not overwrite");
+        assert!(
+            err.message.contains("unfinished goal"),
+            "loser gets the unfinished-goal refusal: {}",
+            err.message,
+        );
+
+        // A sequential second create still refuses at the pre-check.
+        let err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "objective C", None)
+            .expect_err("sequential second create refuses");
+        assert!(err.contains("unfinished goal"), "pre-check refusal: {err}");
+
+        // The winner's objective stands untouched.
+        let snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("winner's goal exists");
+        assert_eq!(snapshot.objective, "objective A (winner)");
+
+        // User-path replace semantics are UNCHANGED: a user edit of the
+        // unfinished goal still lands.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "objective A (user-edited)".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("user replace still works");
+    }
+
     #[tokio::test]
     async fn model_create_goal_gates_on_unfinished_goal() {
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -17153,6 +17691,809 @@ mod tests {
         );
     }
 
+    /// #1958 / #1935 — the goal-completion verifier makes a REAL LLM call,
+    /// so every sentinel call site (SessionActor + the AppUI autonomous and
+    /// interactive accountants) must fold its `TokenUsage` into the goal's
+    /// `tokens_used` via `charge_goal_verifier_usage`. The charge is
+    /// interactive-shaped: tokens only (input+output), no elapsed seconds,
+    /// no continuation/rate-window side effects, and it must land BEFORE the
+    /// completion flip (a `complete` goal can no longer be charged).
+    #[test]
+    fn charge_goal_verifier_usage_lands_in_goal_tokens_used() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-verifier-usage");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "charge the verifier spend".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator.goal_id_for_session(&session_id);
+
+        let usage = octos_llm::TokenUsage {
+            input_tokens: 120,
+            output_tokens: 30,
+            ..Default::default()
+        };
+        let event = orchestrator.charge_goal_verifier_usage(
+            &session_id,
+            "tenant-a",
+            goal_id.as_deref(),
+            &usage,
+        );
+        assert!(
+            event.is_some(),
+            "verifier usage on an active goal charges and returns an update event",
+        );
+        let (tokens_used, continuations_used, rate_window_count) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 150,
+            "verifier input+output tokens land in tokens_used"
+        );
+        assert_eq!(
+            continuations_used, 0,
+            "verifier charge is not a continuation"
+        );
+        assert_eq!(
+            rate_window_count, 0,
+            "verifier charge must not touch the autonomous rate window"
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "charging alone must not transition the goal",
+        );
+
+        // Without a bound goal id there is nothing safe to charge (the
+        // binding is what rejects a mid-verify goal replacement) — no-op.
+        assert!(
+            orchestrator
+                .charge_goal_verifier_usage(&session_id, "tenant-a", None, &usage)
+                .is_none(),
+            "no goal binding ⇒ no charge",
+        );
+        // Zero usage (provider error path) is a no-op too.
+        assert!(
+            orchestrator
+                .charge_goal_verifier_usage(
+                    &session_id,
+                    "tenant-a",
+                    goal_id.as_deref(),
+                    &octos_llm::TokenUsage::default(),
+                )
+                .is_none(),
+            "zero verifier usage ⇒ no charge",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 150, "no-op paths must not move the counter");
+    }
+
+    /// #1935 codex blocker — the sentinel paths charge the TURN first; when
+    /// that flips the goal to `budget_limited`, the verifier's own spend must
+    /// STILL land (the strict active-only gate would silently drop it exactly
+    /// at the budget boundary). The plain turn charge stays refused on the
+    /// now-frozen goal, and no duplicate wrap-up is enqueued.
+    #[test]
+    fn charge_goal_verifier_usage_lands_after_budget_limited_flip() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-verifier-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "cross the budget then verify".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // The TURN charge crosses the budget → budget_limited + wrap-up.
+        let turn_event =
+            orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 1_200, 5);
+        assert!(turn_event.is_some(), "turn charge lands and flips");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "budget crossing enqueued exactly one wrap-up",
+        );
+
+        // The VERIFIER charge must still land on the budget_limited goal…
+        let usage = octos_llm::TokenUsage {
+            input_tokens: 40,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let verifier_event = orchestrator.charge_goal_verifier_usage(
+            &session_id,
+            "tenant-a",
+            Some(&goal_id),
+            &usage,
+        );
+        assert!(
+            verifier_event.is_some(),
+            "verifier spend must be counted after the budget_limited flip",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 1_250, "1200 turn + 50 verifier tokens");
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "the verifier charge must not enqueue a second wrap-up",
+        );
+
+        // …while a plain TURN charge on the frozen goal stays refused.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 100, 1)
+                .is_none(),
+            "turn charges keep the strict active-only gate",
+        );
+    }
+
+    /// #1935 codex blocker (narrows a PRE-EXISTING hole) — a queued
+    /// `GoalWrapUp` must refuse to drain once its goal has gone `complete`:
+    /// the old unconditional exemption admitted it and fired a
+    /// post-completion autonomous turn (verifier charge crosses the budget →
+    /// wrap-up enqueued → Done flip completes the goal → queued wrap-up still
+    /// drained). A `budget_limited` goal's wrap-up still drains (control).
+    #[test]
+    fn goal_wrap_up_refuses_drain_after_completion() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+
+        // Control: budget_limited goal → its wrap-up drains.
+        let limited = SessionKey::with_profile("tenant-a", "api", "wrapup-limited");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: limited.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "wrap up normally".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &limited,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        orchestrator.force_goal_tokens_used_for_test(&limited, 900);
+        orchestrator.record_goal_turn(&limited, "tenant-a", 200, 5);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &limited,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "budget_limited wrap-up still drains");
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
+
+        // The hole: same setup, but the goal COMPLETES after the wrap-up was
+        // enqueued (the FIX-3 race). Drain must refuse it.
+        let completed = SessionKey::with_profile("tenant-a", "api", "wrapup-completed");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: completed.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "complete before the wrap-up drains".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &completed,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        orchestrator.force_goal_tokens_used_for_test(&completed, 900);
+        orchestrator.record_goal_turn(&completed, "tenant-a", 200, 5);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&completed).as_deref(),
+            Some("budget_limited"),
+        );
+        // The Done flip lands while the wrap-up is still queued.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&completed) {
+            goal.status = "complete".to_owned();
+        }
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &completed,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "a complete goal's queued wrap-up must not fire a post-completion turn",
+        );
+    }
+
+    /// #1935 codex (stale-verdict TOCTOU) — `set_goal` can EDIT the objective
+    /// while keeping the same `goal_id`, so the id recheck alone would admit
+    /// a Done verdict rendered against an objective that no longer exists.
+    /// The verifier's `goal_verification_snapshot` is re-checked field-by-
+    /// field; an objective mismatch refuses the completion.
+    #[test]
+    fn maybe_complete_goal_from_model_rejects_edited_objective() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-objective-edit");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "objective v1".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Snapshot BEFORE the edit — what the verifier judged.
+        let stale_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+        assert_eq!(stale_snapshot.objective, "objective v1");
+        // Same-id objective edit (what `set_goal` does on an existing goal).
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.objective = "objective v2".to_owned();
+        }
+
+        // Done verdict judged against the OLD objective → refused.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            &stale_snapshot,
+            None,
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "edited objective must reject the stale verdict",
+        );
+
+        // A FRESH snapshot (current objective) completes.
+        let fresh_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("goal still snapshots");
+        assert_eq!(fresh_snapshot.objective, "objective v2");
+        assert_eq!(
+            fresh_snapshot.goal_id, stale_snapshot.goal_id,
+            "the edit kept the goal_id — only the snapshot objective differs",
+        );
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            &fresh_snapshot,
+            None,
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+        );
+    }
+
+    /// #1935 codex round 4 (ABA) — `set_goal`'s user-path replace PRESERVES
+    /// the goal_id, and the user can restore the identical objective text, so
+    /// after an edit-away-and-back (X→Y→X) the goal's (id, objective, status)
+    /// ALL match a pre-edit snapshot again. Only the `revision` — bumped on
+    /// every user-path `set_goal` mutation — still differs, and the stale
+    /// verdict must refuse on it. Driven entirely through the PRODUCTION
+    /// `set_goal` path (no raw map edits — codex round-3 flag). Independent
+    /// of #1975's model-create fresh-id fix, which does not cover this
+    /// user path.
+    #[test]
+    fn goal_verification_snapshot_rejects_same_id_user_replace_aba() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-snapshot-aba");
+        let set = |objective: &str| GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: "tenant-a".into(),
+            objective: objective.into(),
+            status: Some("active".into()),
+            token_budget: None,
+            transition_actor: None,
+        };
+        orchestrator
+            .set_goal(set("objective X"))
+            .expect("set active goal");
+        // Wrong profile ⇒ no snapshot ⇒ callers skip the verifier entirely.
+        assert!(
+            orchestrator
+                .goal_verification_snapshot(&session_id, "tenant-b")
+                .is_none(),
+            "profile mismatch must yield no verification snapshot",
+        );
+        let stale_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
+        // User-path replace: edit AWAY (X→Y) and BACK (Y→X) through the
+        // production `set_goal` — the same goal record is mutated in place,
+        // so the id is preserved and after the round-trip the objective and
+        // status byte-match the pre-edit snapshot again.
+        orchestrator
+            .set_goal(set("objective Y"))
+            .expect("edit away");
+        orchestrator
+            .set_goal(set("objective X"))
+            .expect("edit back");
+        let fresh_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("goal still snapshots");
+        assert_eq!(
+            fresh_snapshot.goal_id, stale_snapshot.goal_id,
+            "the user-path replace preserves the goal_id (the ABA setup)",
+        );
+        assert_eq!(
+            fresh_snapshot.objective, stale_snapshot.objective,
+            "objective text is restored byte-identical (the ABA setup)",
+        );
+        assert_ne!(
+            fresh_snapshot.revision, stale_snapshot.revision,
+            "only the revision still tells the incarnations apart",
+        );
+
+        // The STALE snapshot must refuse against the replaced goal…
+        assert!(
+            !orchestrator.maybe_complete_goal_from_model(
+                &session_id,
+                "tenant-a",
+                "Done. <goal:complete>",
+                &GoalCompletionVerdict::Done,
+                &stale_snapshot,
+                None,
+            ),
+            "a pre-replace verdict must not complete the replacement (ABA)",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+        );
+        // …while the fresh snapshot completes it.
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            &fresh_snapshot,
+            None,
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+        );
+    }
+
+    /// #1935 codex round 4 (A1) — the `goal_update` tool's transition is the
+    /// fourth verifier path; `model_transition_goal_guarded` must re-check
+    /// the one-lock snapshot (id, objective, revision) INSIDE the mutation
+    /// lock and refuse the same user-path ABA `set_goal` replace.
+    #[tokio::test]
+    async fn model_transition_goal_guarded_rejects_stale_snapshot() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-guarded-aba");
+        let set = |objective: &str| GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: "tenant-a".into(),
+            objective: objective.into(),
+            status: Some("active".into()),
+            token_budget: None,
+            transition_actor: None,
+        };
+        orchestrator
+            .set_goal(set("objective X"))
+            .expect("set active goal");
+        let stale_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+        orchestrator
+            .set_goal(set("objective Y"))
+            .expect("edit away");
+        orchestrator
+            .set_goal(set("objective X"))
+            .expect("edit back");
+
+        let err = orchestrator
+            .model_transition_goal_guarded(
+                &session_id,
+                "tenant-a",
+                "complete",
+                "claims done against the old incarnation",
+                Some(&stale_snapshot),
+                None,
+            )
+            .await
+            .expect_err("stale snapshot must refuse the guarded transition");
+        assert!(
+            err.contains("stale verdict rejected"),
+            "refusal names the stale verdict: {err}",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+        );
+
+        // A fresh snapshot transitions normally.
+        let fresh_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("goal still snapshots");
+        orchestrator
+            .model_transition_goal_guarded(
+                &session_id,
+                "tenant-a",
+                "complete",
+                "verified against the live incarnation",
+                Some(&fresh_snapshot),
+                None,
+            )
+            .await
+            .expect("fresh snapshot transitions");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+        );
+    }
+
+    /// #1935 codex round 5 (FIX 1) — the circuit breaker's active→blocked
+    /// flip is a status change that must invalidate in-flight verifier
+    /// verdicts: it bumps the revision, and BOTH verifier-gated completion
+    /// paths (the sentinel `maybe_complete_goal_from_model` and the tool's
+    /// `model_transition_goal_guarded`, whose status gate now matches the
+    /// sentinel's active|budget_limited rule) refuse a Done verdict
+    /// snapshotted before the breaker tripped.
+    #[tokio::test]
+    async fn breaker_blocked_goal_refuses_stale_verdict_on_both_paths() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-breaker-verify");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "trip the breaker mid-verify".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let stale_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
+        // Trip the #1693 breaker through the production accountant: three
+        // consecutive zero-token turns flip active → blocked.
+        for _ in 0..GOAL_MAX_CONSECUTIVE_FAILED_TURNS {
+            orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        }
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("blocked"),
+            "the breaker tripped",
+        );
+        let blocked_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("blocked goal still snapshots");
+        assert_ne!(
+            blocked_snapshot.revision, stale_snapshot.revision,
+            "the breaker flip bumps the revision (invalidates in-flight verdicts)",
+        );
+
+        // Sentinel path refuses the stale Done verdict…
+        assert!(
+            !orchestrator.maybe_complete_goal_from_model(
+                &session_id,
+                "tenant-a",
+                "Done. <goal:complete>",
+                &GoalCompletionVerdict::Done,
+                &stale_snapshot,
+                None,
+            ),
+            "sentinel path must refuse a verdict for a breaker-blocked goal",
+        );
+        // …and so does the guarded transition (status gate BEFORE the
+        // field checks — proven by passing the goal's own CURRENT snapshot,
+        // which matches every field yet must still refuse on status).
+        let err = orchestrator
+            .model_transition_goal_guarded(
+                &session_id,
+                "tenant-a",
+                "complete",
+                "stale claim",
+                Some(&blocked_snapshot),
+                None,
+            )
+            .await
+            .expect_err("guarded transition must refuse a blocked goal");
+        assert!(
+            err.contains("stale verdict rejected"),
+            "refusal names the stale verdict: {err}",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("blocked"),
+            "the goal stays blocked for the user to resume",
+        );
+    }
+
+    /// #1935 codex round 5 (FIX 2) — `model_create_fleet_plan` snapshots the
+    /// goal, AWAITS fleet creation, then binds. A goal cleared+recreated in
+    /// that window must not receive the fleet: `bind_fleet_to_goal` re-checks
+    /// (goal_id, revision) under the state lock at bind time, refuses with
+    /// the re-run error, and leaves the replacement goal's `fleet_id` empty
+    /// (the unbound fleet is inert — `goal_dispatch` resolves only through
+    /// `goal.fleet_id`).
+    #[test]
+    fn goal_plan_bind_refuses_replaced_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-bind-race");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "plan me".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // The pre-await snapshot goal_plan would capture.
+        let planned = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
+        // Mid-await: the user clears and recreates through PRODUCTION paths.
+        orchestrator
+            .clear_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("clear goal");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "a different objective entirely".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("recreate goal");
+
+        // The post-await bind must refuse and leave the replacement unbound.
+        let err = orchestrator
+            .bind_fleet_to_goal(
+                &session_id,
+                &planned.goal_id,
+                planned.revision,
+                None,
+                "fleet-x",
+                1_000,
+            )
+            .expect_err("bind must refuse the replaced goal");
+        assert!(
+            err.contains("re-run goal_plan"),
+            "refusal instructs a re-plan: {err}",
+        );
+        assert!(
+            orchestrator
+                .state()
+                .goals
+                .get(&session_id)
+                .expect("replacement goal exists")
+                .fleet_id
+                .is_none(),
+            "the replacement goal must NOT inherit the stale plan's fleet",
+        );
+
+        // Positive control: a matching (id, revision) binds and persists.
+        let current = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("replacement snapshots");
+        orchestrator
+            .bind_fleet_to_goal(
+                &session_id,
+                &current.goal_id,
+                current.revision,
+                None,
+                "fleet-y",
+                2_000,
+            )
+            .expect("matching snapshot binds");
+        assert_eq!(
+            orchestrator
+                .state()
+                .goals
+                .get(&session_id)
+                .expect("goal exists")
+                .fleet_id
+                .as_deref(),
+            Some("fleet-y"),
+        );
+    }
+
+    /// #1935 codex round 6 — two `goal_plan` calls racing in one parallel
+    /// batch both snapshot `fleet_id = None` at the same revision and both
+    /// create distinct UUID fleets. The first bind neither bumps the revision
+    /// nor was occupancy checked, so the second silently OVERWROTE the first
+    /// binding. The bind now CASes on the snapshot's `fleet_id`: the loser
+    /// refuses cleanly with the re-run error and the winner's binding stands;
+    /// a legitimate re-bind passing the now-current fleet id still succeeds.
+    #[test]
+    fn goal_plan_bind_refuses_concurrent_overwrite() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-bind-concurrent");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "plan me twice".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Both concurrent callers share the same pre-await view: same goal,
+        // same revision, fleet_id = None.
+        let shared = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
+        // Caller #1 wins the bind…
+        orchestrator
+            .bind_fleet_to_goal(
+                &session_id,
+                &shared.goal_id,
+                shared.revision,
+                None,
+                "fleet-1",
+                1_000,
+            )
+            .expect("first bind wins");
+        // …and caller #2 — same expected None — must lose CLEANLY instead of
+        // overwriting (the pre-fix behavior orphaned fleet-1 silently).
+        let err = orchestrator
+            .bind_fleet_to_goal(
+                &session_id,
+                &shared.goal_id,
+                shared.revision,
+                None,
+                "fleet-2",
+                1_001,
+            )
+            .expect_err("second concurrent bind must refuse");
+        assert!(
+            err.contains("re-run goal_plan"),
+            "loser gets the re-run error: {err}",
+        );
+        assert_eq!(
+            orchestrator
+                .state()
+                .goals
+                .get(&session_id)
+                .expect("goal exists")
+                .fleet_id
+                .as_deref(),
+            Some("fleet-1"),
+            "the winner's binding stands",
+        );
+
+        // A legitimate re-bind (re-plan) passing the CURRENT fleet id succeeds.
+        let current = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("goal still snapshots");
+        orchestrator
+            .bind_fleet_to_goal(
+                &session_id,
+                &current.goal_id,
+                current.revision,
+                Some("fleet-1"),
+                "fleet-2",
+                2_000,
+            )
+            .expect("re-plan bind with the current fleet id succeeds");
+        assert_eq!(
+            orchestrator
+                .state()
+                .goals
+                .get(&session_id)
+                .expect("goal exists")
+                .fleet_id
+                .as_deref(),
+            Some("fleet-2"),
+        );
+    }
+
+    /// #1935 codex (stale-verdict TOCTOU) — a goal PAUSED (or blocked) during
+    /// verification keeps its `goal_id`, so the id recheck alone would admit
+    /// the flip; the status gate must refuse anything outside
+    /// active|budget_limited. `budget_limited` itself still completes (the
+    /// FIX-2/FIX-3 conclusion path depends on it).
+    #[test]
+    fn maybe_complete_goal_from_model_rejects_paused_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-paused-verify");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "pause mid-verify".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
+        for frozen in ["paused", "blocked"] {
+            if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+                goal.status = frozen.to_owned();
+            }
+            assert!(
+                !orchestrator.maybe_complete_goal_from_model(
+                    &session_id,
+                    "tenant-a",
+                    "Done. <goal:complete>",
+                    &GoalCompletionVerdict::Done,
+                    &snapshot,
+                    None,
+                ),
+                "a {frozen} goal must refuse a sentinel completion",
+            );
+            assert_eq!(
+                orchestrator.goal_status_for_test(&session_id).as_deref(),
+                Some(frozen),
+                "status untouched by the refused claim",
+            );
+        }
+
+        // budget_limited is still a completable conclusion state.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.status = "budget_limited".to_owned();
+        }
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "Done. <goal:complete>",
+            &GoalCompletionVerdict::Done,
+            &snapshot,
+            None,
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+        );
+    }
+
     /// A session with no active goal — the common interactive case —
     /// must be a no-op: nothing to charge, no event to emit.
     #[test]
@@ -18208,6 +19549,158 @@ mod tests {
         );
     }
 
+    /// #1935 codex round 3+4 (stale wrap-up across restart) — a GoalWrapUp
+    /// refused at drain time because its goal is PAUSED must be durably
+    /// tombstoned, unlike a plain paused GoalContinue (the #1159 carve-out
+    /// above). Pre-round-3 the refusal only removed the in-memory entry;
+    /// restart restored the persisted record, and after the user REACTIVATED
+    /// the goal the admission gate (`active`) let the STALE wrap-up fire.
+    ///
+    /// Round 4: the tombstone alone then MASKED the remint — the wrap-up
+    /// dedupe key was `wrap_up/<profile>/<goal_id>`, and a prior Completed
+    /// record outranks a later Queued on supervisor replay, so a restart
+    /// before the remint dispatched dropped it while restoring
+    /// `wrap_up_emitted = true` → the re-budgeted goal could NEVER wrap up
+    /// again. The key now carries `wrap_up_generation` (bumped when
+    /// reactivation clears `wrap_up_emitted`), so the gen-0 tombstone never
+    /// masks the gen-1 remint. This test drives pause / reactivate through
+    /// the PRODUCTION persisted `set_goal` paths (no raw field edits — codex
+    /// round-3 flag), remints, replays the store, and asserts the fresh
+    /// wrap-up SURVIVES while the stale one stays dead.
+    #[test]
+    fn goal_wrap_up_refused_for_paused_goal_does_not_survive_restart() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store_dir = dir.path().join("supervisor");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(&store_dir)
+            .expect("configure store");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "wrapup-paused-restart");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "pause then reactivate".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain & complete the initial set_goal continuation so it can't
+        // pollute the post-restart pending count.
+        let initial = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        for item in &initial {
+            orchestrator.mark_continuation_started(item);
+            orchestrator.mark_continuation_completed(item, Some("processed".into()));
+        }
+
+        // Mint a REAL wrap-up through the production accountant (budget
+        // crossing), then pause the goal — through the PRODUCTION persisted
+        // `set_goal` path — before it drains.
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 200, 5);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            1,
+            "wrap-up queued before the pause",
+        );
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "pause then reactivate".into(),
+                status: Some("paused".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("user pauses the goal");
+
+        // Drain — the wrap-up admission gate refuses (paused), and the
+        // refusal must tombstone the DURABLE gen-0 record, not just the
+        // in-memory queue entry.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(drained.is_empty(), "paused goal's wrap-up must not drain");
+
+        // User reactivates through the PRODUCTION path: the over-budget guard
+        // requires raising the budget above the 1100 already spent. This
+        // clears `wrap_up_emitted` AND bumps `wrap_up_generation` → 1.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "pause then reactivate".into(),
+                status: Some("active".into()),
+                token_budget: Some(2_000),
+                transition_actor: None,
+            })
+            .expect("user reactivates with a raised budget");
+        // Reactivation enqueues a fresh GoalContinue; drain + complete it so
+        // the remint assertion below counts ONLY the wrap-up.
+        let resumed = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        for item in &resumed {
+            orchestrator.mark_continuation_started(item);
+            orchestrator.mark_continuation_completed(item, Some("processed".into()));
+        }
+
+        // REMINT: spend across the NEW budget. The fresh wrap-up rides the
+        // gen-1 dedupe key, so the gen-0 tombstone cannot mask its Queued
+        // event on replay.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 900, 5);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "the raised budget is exhausted again",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            1,
+            "the gen-1 wrap-up is queued in memory",
+        );
+
+        // Restart BEFORE the remint dispatches: replay the SAME store.
+        // Pre-round-4 the gen-less remint key was masked by the gen-0
+        // tombstone (Completed outranks Queued) → 0 pending → the goal could
+        // never wrap up. Post-fix the gen-1 wrap-up survives; the stale gen-0
+        // record stays dead.
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay store");
+        assert_eq!(
+            restarted.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            1,
+            "exactly the reminted gen-1 wrap-up survives the replay \
+             (0 = the tombstone masked the remint; 2 = the stale gen-0 rose again)",
+        );
+        let replayed = restarted.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(replayed.len(), 1, "the restored wrap-up is schedulable");
+        assert_eq!(replayed[0].reason, MasterContinuationReason::GoalWrapUp);
+    }
+
     /// #1159 codex P2 rev3 follow-up: `control_loop` does NOT remove
     /// a deleted loop from `state.loops` — it keeps the record with
     /// `status = "deleted"`. So a LoopFire queued before the delete
@@ -18530,13 +20023,19 @@ mod tests {
             usize::MAX,
         );
 
+        // #1935 round 3 — the completion gate now requires the one-lock
+        // (goal_id, objective) snapshot every caller grades against.
+        let snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
         // Plain content → no transition.
         assert!(!orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "still working on it",
             &GoalCompletionVerdict::Done,
-            None,
+            &snapshot,
             None,
         ));
         assert_eq!(
@@ -18550,7 +20049,7 @@ mod tests {
             "tenant-a",
             "All done. <goal:complete>",
             &GoalCompletionVerdict::Done,
-            None,
+            &snapshot,
             None,
         ));
         assert_eq!(
@@ -18588,6 +20087,10 @@ mod tests {
             })
             .expect("set active goal");
 
+        let snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
         // Sentinel content + NotDone verdict → goal stays Active.
         assert!(!orchestrator.maybe_complete_goal_from_model(
             &session_id,
@@ -18596,7 +20099,7 @@ mod tests {
             &GoalCompletionVerdict::NotDone {
                 reason: "evidence insufficient".to_string(),
             },
-            None,
+            &snapshot,
             None,
         ));
         assert_eq!(
@@ -18623,15 +20126,23 @@ mod tests {
                 transition_actor: None,
             })
             .expect("set active goal");
-        let goal_a_id = orchestrator.goal_id_for_session(&session_id);
+        let live_snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
 
-        // Done verdict with WRONG goal_id (stale) must NOT complete the goal.
+        // Done verdict with WRONG goal_id (stale snapshot) must NOT complete
+        // the goal.
+        let stale_snapshot = GoalVerificationSnapshot {
+            goal_id: "wrong-goal-id".to_owned(),
+            objective: live_snapshot.objective.clone(),
+            revision: live_snapshot.revision,
+        };
         assert!(!orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "Done. <goal:complete>",
             &GoalCompletionVerdict::Done,
-            Some("wrong-goal-id"), // Stale/incorrect ID
+            &stale_snapshot,
             None,
         ));
         assert_eq!(
@@ -18640,13 +20151,13 @@ mod tests {
             "stale goal_id must reject completion (TOCTOU fix)"
         );
 
-        // Done verdict with CORRECT goal_id DOES complete the goal.
+        // Done verdict with the LIVE snapshot DOES complete the goal.
         assert!(orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "Done. <goal:complete>",
             &GoalCompletionVerdict::Done,
-            goal_a_id.as_deref(), // Correct ID
+            &live_snapshot,
             None,
         ));
         assert_eq!(
@@ -18687,7 +20198,7 @@ mod tests {
             }
         }
 
-        let verdict = run_goal_completion_verifier(
+        let (verdict, _usage) = run_goal_completion_verifier_with_usage(
             Arc::new(BacktickProvider),
             "test objective",
             "test evidence",
@@ -20441,13 +21952,17 @@ mod tests {
             usize::MAX,
         );
 
+        let snapshot = orchestrator
+            .goal_verification_snapshot(&session_id, "tenant-a")
+            .expect("active goal snapshots");
+
         // Mid-body sentinel must NOT flip the goal.
         assert!(!orchestrator.maybe_complete_goal_from_model(
             &session_id,
             "tenant-a",
             "I am about to write <goal:complete> shortly, but step 2 first.",
             &GoalCompletionVerdict::Done,
-            None,
+            &snapshot,
             None,
         ));
         assert_eq!(
@@ -20461,7 +21976,7 @@ mod tests {
             "tenant-a",
             "All requested checks finished.\n\n<goal:complete>",
             &GoalCompletionVerdict::Done,
-            None,
+            &snapshot,
             None,
         ));
         assert_eq!(
@@ -21312,6 +22827,8 @@ mod tests {
             fleet_id: None,
             controller_workspace_root: None,
             controller_workspace_has_runtime_hint: None,
+            revision: 0,
+            wrap_up_generation: 0,
         };
         orchestrator.sync_transition_to_ledger_blocking(
             dir.path(),

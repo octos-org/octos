@@ -54,10 +54,9 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "api")]
 #[cfg(feature = "api")]
 use crate::api::agent_orchestrator::{
-    default_agent_orchestrator, run_goal_completion_verifier, upsert_background_task_agent,
+    default_agent_orchestrator, run_goal_completion_verifier_with_usage,
+    upsert_background_task_agent,
 };
-#[cfg(feature = "api")]
-use crate::api::goal_loop_runtime::GoalCompletionVerdict;
 #[cfg(feature = "api")]
 use crate::api::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
@@ -2802,6 +2801,12 @@ pub struct ActorFactory {
     pub llm_for_compaction: Arc<dyn LlmProvider>,
     /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
     pub llm_strong: Arc<dyn LlmProvider>,
+    /// #1935 — the INDEPENDENT goal-completion verifier lane (profile
+    /// `sub_providers` key `goal_verifier`, resolved at factory build via
+    /// `crate::runtime::profile::build_goal_verifier_provider`). `None` ⇒
+    /// the sentinel accountant grades on the session's own provider — the
+    /// pre-#1935 behavior, kept as the back-compat default.
+    pub goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
     pub memory: Arc<EpisodeStore>,
     pub system_prompt: Arc<std::sync::RwLock<crate::commands::gateway::prompt::GatewayPromptParts>>,
     pub hooks: Option<Arc<HookExecutor>>,
@@ -4003,6 +4008,7 @@ impl ActorFactory {
             consecutive_recovery_turns: Arc::new(StdMutex::new(0)),
             current_command_cmid: None,
             last_turn_total_tokens: 0,
+            goal_verifier_llm: self.goal_verifier_llm.clone(),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -4493,6 +4499,14 @@ struct SessionActor {
     /// (which let a goal recur past its token budget). Reset to 0 at the top
     /// of each turn so a failed/no-response turn charges nothing.
     last_turn_total_tokens: u64,
+
+    /// #1935 — the INDEPENDENT goal-completion verifier lane, threaded from
+    /// [`ActorFactory::goal_verifier_llm`]. Read by the goal accountant
+    /// (`maybe_advance_goal_runtime_after_turn`), which is `api`-gated like
+    /// the goal machinery itself — hence the `allow(dead_code)` when the
+    /// crate builds without the `api` feature.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
 }
 
 impl SessionActor {
@@ -5109,50 +5123,68 @@ impl SessionActor {
                 .unwrap_or_default()
         };
         // Loop-engineering completion gate: only spend the INDEPENDENT
-        // verifier LLM call when the agent actually CLAIMS completion.
-        let (verdict, expected_goal_id) = if orchestrator.goal_completion_claimed(&assistant_tail) {
-            let objective = orchestrator
-                .goal_objective_for_test(&self.session_key)
-                .unwrap_or_else(|| "unknown".to_string());
-            // Snapshot goal_id BEFORE the async verifier call to prevent
-            // completing the wrong goal if it changes during the await.
-            let goal_id = orchestrator.goal_id_for_session(&self.session_key);
+        // verifier LLM call when the agent actually CLAIMS completion — and
+        // only when a goal snapshot exists to verify against.
+        //
+        // #1935 codex round 3 (TOCTOU): the goal_id and the objective are
+        // captured together under ONE state lock
+        // (`goal_verification_snapshot`), so a clear/recreate between two
+        // separate reads can no longer pair the OLD objective with the NEW
+        // goal_id (or a same-objective recreate slip both checks).
+        // `maybe_complete_goal_from_model` re-checks BOTH snapshot fields
+        // after the verifier await. No goal / wrong profile ⇒ no snapshot ⇒
+        // no verifier spend and nothing to complete.
+        let verification = if orchestrator.goal_completion_claimed(&assistant_tail) {
+            orchestrator.goal_verification_snapshot(&self.session_key, profile_id)
+        } else {
+            None
+        };
+        if let Some(snapshot) = verification {
+            // #1935 — grade on the INDEPENDENT verifier lane when the profile
+            // configures one (`sub_providers` key `goal_verifier`); otherwise
+            // the session's own provider, unchanged.
+            let verifier_provider = self
+                .goal_verifier_llm
+                .clone()
+                .unwrap_or_else(|| self.agent.llm_provider());
             // #1958 (codex #3) — restore originating-session attribution around
             // the sentinel verifier (it runs outside the turn's routing scopes),
             // so a failover attributes to this session instead of publishing
             // unattributed. Autonomous turns are Normal policy → router only.
-            let verdict = octos_llm::with_router_context(
+            let (verdict, verifier_usage) = octos_llm::with_router_context(
                 octos_llm::RouterContext {
                     session_id: Some(self.session_key.to_string()),
                     ..Default::default()
                 },
-                run_goal_completion_verifier(
-                    self.agent.llm_provider(),
-                    &objective,
+                run_goal_completion_verifier_with_usage(
+                    verifier_provider,
+                    &snapshot.objective,
                     &assistant_tail,
                 ),
             )
             .await;
-            (verdict, goal_id)
-        } else {
-            (
-                GoalCompletionVerdict::NotDone {
-                    reason: "no completion claimed".to_string(),
-                },
-                None,
-            )
-        };
-        if orchestrator.maybe_complete_goal_from_model(
-            &self.session_key,
-            profile_id,
-            &assistant_tail,
-            &verdict,
-            expected_goal_id.as_deref(),
-            // #1957 (codex #1) — this interactive-chat goal path carries the
-            // profile data dir, so a sentinel completion syncs to the ledger.
-            Some(self.data_dir.as_path()),
-        ) {
-            return;
+            // #1958 — the verifier call is real goal spend: fold it into the
+            // goal's tokens_used BEFORE `maybe_complete_goal_from_model` can
+            // flip the goal (a `complete` goal can no longer be charged).
+            // `record_goal_turn` above only charged the turn's own tokens.
+            let _ = orchestrator.charge_goal_verifier_usage(
+                &self.session_key,
+                profile_id,
+                Some(&snapshot.goal_id),
+                &verifier_usage,
+            );
+            if orchestrator.maybe_complete_goal_from_model(
+                &self.session_key,
+                profile_id,
+                &assistant_tail,
+                &verdict,
+                &snapshot,
+                // #1957 (codex #1) — this interactive-chat goal path carries the
+                // profile data dir, so a sentinel completion syncs to the ledger.
+                Some(self.data_dir.as_path()),
+            ) {
+                return;
+            }
         }
         // Re-queue another continuation only if we are still idle AND
         // policy allows. The idle gate matches `drain_master_continuations`'s

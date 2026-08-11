@@ -769,6 +769,7 @@ mod tests {
             data_dir,
             config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
+            goal_verifier_llm: None,
             adaptive_router: None,
             runtime_qos_catalog: None,
             primary_model_id: "stub-model".to_string(),

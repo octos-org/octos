@@ -20,7 +20,7 @@
 
 use async_trait::async_trait;
 use eyre::Result;
-use octos_agent::tools::{Tool, ToolContext, ToolResult};
+use octos_agent::tools::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 use octos_core::SessionKey;
 use octos_fleet::{
     AcceptanceCriterion, BASE_TOOLS, FsGrant, NetworkGrant, TaskSpec, Verifier, WorkerGrant,
@@ -492,6 +492,15 @@ impl Tool for GoalPlanTool {
         "goal_plan"
     }
 
+    /// #1935 codex round 6 — goal_plan mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
     fn description(&self) -> &str {
         "Decompose THIS session's goal into a durable fleet of tasks that background workers \
          execute. Call once, early in a goal, after you understand the objective: pass a list \
@@ -671,6 +680,15 @@ impl Tool for GoalDispatchTool {
         "goal_dispatch"
     }
 
+    /// #1935 codex round 6 — goal_dispatch mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
     fn description(&self) -> &str {
         "Launch every currently-ready task of this goal's fleet onto background workers (call \
          goal_plan first to create the fleet). Ready = dependency-free or all deps succeeded. \
@@ -755,6 +773,15 @@ impl GoalGrantTool {
 impl Tool for GoalGrantTool {
     fn name(&self) -> &str {
         "goal_grant"
+    }
+
+    /// #1935 codex round 6 — goal_grant mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
     }
 
     fn description(&self) -> &str {
@@ -909,6 +936,15 @@ impl Tool for GoalDenyTool {
         "goal_deny"
     }
 
+    /// #1935 codex round 6 — goal_deny mutates the goal's fleet/binding state
+    /// through snapshot→await→commit sequences; two calls in one parallel
+    /// batch would interleave those windows (the goal_plan double-bind was
+    /// the observed instance). Serialize the whole family; each call is a
+    /// short control-plane operation, so exclusivity costs nothing.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
     fn description(&self) -> &str {
         "REFUSE a fleet worker's mid-task escalation: the blocked task cannot proceed without a \
          capability you are not willing to grant, so FAIL it (terminal). Use when goal_get shows a \
@@ -1015,6 +1051,12 @@ pub struct GoalUpdateTool {
     /// goal-row status + a `decisions` row into `<data_dir>/goal-ledgers/`.
     /// `None` on paths that never wired it (the sync is then skipped).
     data_dir: Option<std::path::PathBuf>,
+    /// #1935 — the INDEPENDENT verifier lane (profile `sub_providers` key
+    /// `goal_verifier`, resolved at profile build). When set, completion
+    /// claims are graded on THIS provider instead of the grading turn's own
+    /// `ctx.llm_provider`; `None` falls back to the turn provider — the
+    /// pre-#1935 behavior, kept as the back-compat default.
+    verifier_llm: Option<std::sync::Arc<dyn octos_llm::LlmProvider>>,
 }
 
 impl GoalUpdateTool {
@@ -1022,12 +1064,23 @@ impl GoalUpdateTool {
         Self {
             profile_id: profile_id.into(),
             data_dir: None,
+            verifier_llm: None,
         }
     }
 
     /// #1957 — set the profile data dir used to sync a transition to the ledger.
     pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
         self.data_dir = Some(data_dir);
+        self
+    }
+
+    /// #1935 — route completion verification through the profile's dedicated
+    /// `goal_verifier` sub-provider lane instead of the turn's own provider.
+    pub fn with_verifier_provider(
+        mut self,
+        provider: std::sync::Arc<dyn octos_llm::LlmProvider>,
+    ) -> Self {
+        self.verifier_llm = Some(provider);
         self
     }
 }
@@ -1133,40 +1186,69 @@ impl Tool for GoalUpdateTool {
         // completion, we call run_goal_completion_verifier to independently check
         // the objective against the model's evidence. Blocked transitions skip
         // verification (they're failure declarations, not success claims).
-        // #1958: the verifier makes a real LLM call — capture its token usage
-        // and stamp it on whatever ToolResult we return so the agent's usage
-        // aggregation (ToolResult.tokens_used) folds it into turn / goal-budget
-        // accounting instead of dropping it. `None` for a `blocked` transition
-        // (no verifier runs).
-        let mut verifier_usage: Option<octos_core::TokenUsage> = None;
+        //
+        // #1935 codex round 4 (A1) — this used to be the FOURTH verifier path
+        // still reading the objective and the goal id in SEPARATE lock
+        // acquisitions, re-reading the id after the await, and then
+        // transitioning unconditionally. It now takes the same one-lock
+        // `goal_verification_snapshot` as the three sentinel paths, grades
+        // `snapshot.objective`, and threads the snapshot INTO the guarded
+        // transition, which re-checks (id, objective, revision) under the
+        // mutation lock itself.
+        //
+        // #1935 codex round 5 — the verifier's spend is charged DIRECTLY to
+        // the goal here (the `allow_budget_limited` verifier-charge path),
+        // immediately after the verifier returns and BEFORE the transition,
+        // exactly once for BOTH verdicts. The former #1958 route — stamping
+        // `ToolResult.tokens_used` so the agent loop folds it into turn
+        // totals and the post-turn accountant charges the goal — was lost
+        // precisely when it succeeded: the tool completes the goal, and the
+        // post-turn charge is active-only, so it refused the now-complete
+        // goal and the stamped usage never landed. The stamp is REMOVED so
+        // no path double-charges (consumer trace: ToolResult.tokens_used →
+        // execute_tools aggregation → loop_runner `turn.record_usage` → turn
+        // totals → the post-turn goal charge; the sentinel paths' verifier
+        // calls never rode turn totals either, so goal accounting is now
+        // uniform across all four verifier sites — the only trade-off is the
+        // TURN cost display no longer counts this one out-of-band call).
+        let mut verified_snapshot: Option<
+            crate::api::agent_orchestrator::GoalVerificationSnapshot,
+        > = None;
         if status == "complete" {
             let orchestrator = default_agent_orchestrator();
-            let Some(objective) = orchestrator.goal_objective_for_test(&session_id) else {
+            let Some(snapshot) =
+                orchestrator.goal_verification_snapshot(&session_id, &self.profile_id)
+            else {
                 return Ok(ToolResult {
                     output: "goal_update: no goal objective found for verification".into(),
                     success: false,
                     ..Default::default()
                 });
             };
-            // Snapshot goal_id BEFORE the async verifier call to prevent
-            // completing the wrong goal if it changes during the await.
-            let expected_goal_id = orchestrator.goal_id_for_session(&session_id);
-            // The evidence is the model's reason for claiming completion.
+            // #1935 — grade on the INDEPENDENT verifier lane when the profile
+            // configures one; otherwise the turn's own provider (unchanged
+            // pre-#1935 behavior). The evidence is the model's reason for
+            // claiming completion.
+            let verifier_provider = self
+                .verifier_llm
+                .clone()
+                .unwrap_or_else(|| ctx.llm_provider.clone());
             let (verdict, usage) =
                 crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage(
-                    ctx.llm_provider.clone(),
-                    &objective,
+                    verifier_provider,
+                    &snapshot.objective,
                     reason,
                 )
                 .await;
-            // octos_llm::TokenUsage -> octos_core::TokenUsage (same fields).
-            verifier_usage = Some(octos_core::TokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-            });
+            // #1935 round 5 — exactly-once direct charge, while the goal is
+            // still active/budget_limited (a `complete` goal cannot be
+            // charged). Covers Done AND NotDone outcomes.
+            let _ = orchestrator.charge_goal_verifier_usage(
+                &session_id,
+                &self.profile_id,
+                Some(&snapshot.goal_id),
+                &usage,
+            );
             if !verdict.is_done() {
                 return Ok(ToolResult {
                     output: format!(
@@ -1179,36 +1261,25 @@ impl Tool for GoalUpdateTool {
                         }
                     ),
                     success: false,
-                    tokens_used: verifier_usage.clone(),
                     ..Default::default()
                 });
             }
-            // Verifier confirmed Done, but we must still revalidate goal identity
-            // to prevent stale verdicts (goal changed during the await).
-            let current_goal_id = orchestrator.goal_id_for_session(&session_id);
-            if expected_goal_id != current_goal_id {
-                return Ok(ToolResult {
-                    output: format!(
-                        "goal_update: goal changed during verification (was {:?}, now {:?}) — stale verdict rejected",
-                        expected_goal_id, current_goal_id
-                    ),
-                    success: false,
-                    tokens_used: verifier_usage.clone(),
-                    ..Default::default()
-                });
-            }
+            // The stale-verdict recheck happens INSIDE the guarded transition
+            // below, under the same lock that mutates — no racy re-read here.
+            verified_snapshot = Some(snapshot);
         }
 
-        // #1957 — pass the profile data dir so model_transition_goal syncs the
-        // transition into the ledger (goals-row status + a decision) using the
-        // snapshot it just transitioned. Done INSIDE model_transition_goal (not
-        // here) so it uses the correct goal without a racy re-fetch (codex #3).
+        // #1957 — pass the profile data dir so the transition syncs into the
+        // ledger (goals-row status + a decision) using the snapshot it just
+        // transitioned. Done INSIDE the transition (not here) so it uses the
+        // correct goal without a racy re-fetch (codex #3).
         match default_agent_orchestrator()
-            .model_transition_goal(
+            .model_transition_goal_guarded(
                 &session_id,
                 &self.profile_id,
                 status,
                 reason,
+                verified_snapshot.as_ref(),
                 self.data_dir.as_deref(),
             )
             .await
@@ -1219,13 +1290,11 @@ impl Tool for GoalUpdateTool {
                     serde_json::to_string_pretty(&goal).unwrap_or_else(|_| goal.to_string())
                 ),
                 success: true,
-                tokens_used: verifier_usage.clone(),
                 ..Default::default()
             }),
             Err(message) => Ok(ToolResult {
                 output: format!("goal_update: {message}"),
                 success: false,
-                tokens_used: verifier_usage.clone(),
                 ..Default::default()
             }),
         }
@@ -1251,6 +1320,18 @@ impl GoalCreateTool {
 impl Tool for GoalCreateTool {
     fn name(&self) -> &str {
         "goal_create"
+    }
+
+    /// #1935 codex round 7 — goal_create's admission ("no unfinished goal
+    /// exists") spans a check in `model_create_goal` and the create inside
+    /// `set_goal`, re-locking between them; two creates in one parallel batch
+    /// both passed the check and the loser overwrote the winner's objective.
+    /// The admission is now ALSO enforced atomically inside `set_goal`
+    /// (actor == "model" refuses the update branch for an unfinished goal),
+    /// and this override is the batch-level defense-in-depth, matching the
+    /// fleet-mutating family below.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
     }
 
     fn description(&self) -> &str {
@@ -1358,6 +1439,272 @@ impl Tool for GoalCreateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1935 — a call-counting scripted provider for verifier-lane routing
+    /// assertions: replies with a fixed verdict line and fixed token usage.
+    struct CountingVerifierProvider {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        reply: &'static str,
+        usage: octos_llm::TokenUsage,
+    }
+
+    #[async_trait]
+    impl octos_llm::LlmProvider for CountingVerifierProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(octos_llm::ChatResponse {
+                content: Some(self.reply.to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: self.usage.clone(),
+                provider_index: Some(0),
+            })
+        }
+        fn model_id(&self) -> &str {
+            "counting-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "counting-verifier"
+        }
+    }
+
+    /// #1935 — when the profile configures a `goal_verifier` sub-provider
+    /// lane, `goal_update(status="complete")` must run the INDEPENDENT
+    /// completion verifier on THAT lane, never on the grading turn's own
+    /// provider (`ctx.llm_provider`), and the verifier's token usage must
+    /// still be stamped on the ToolResult (#1958).
+    #[tokio::test]
+    async fn goal_update_routes_verifier_through_configured_lane() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        // Process-global orchestrator: unique key, never cleared (same idiom
+        // as the sibling goal_get tests).
+        let session = SessionKey("verifier-lane-prof:api:goal-update-lane".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "verifier-lane-prof".to_owned(),
+                objective: "route the verifier through the lane".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+
+        let lane_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let turn_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lane_provider = std::sync::Arc::new(CountingVerifierProvider {
+            calls: lane_calls.clone(),
+            reply: "DONE",
+            usage: octos_llm::TokenUsage {
+                input_tokens: 40,
+                output_tokens: 2,
+                ..Default::default()
+            },
+        });
+        let turn_provider = std::sync::Arc::new(CountingVerifierProvider {
+            calls: turn_calls.clone(),
+            // If the tool wrongly grades on the turn provider, the verdict
+            // flips NotDone and the assertions below fail loudly.
+            reply: "NOT_DONE: wrong lane",
+            usage: octos_llm::TokenUsage::default(),
+        });
+
+        let tool = GoalUpdateTool::new("verifier-lane-prof").with_verifier_provider(lane_provider);
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+        ctx.llm_provider = turn_provider;
+
+        let result = tool
+            .execute_with_context(&ctx, &json!({"status": "complete", "reason": "did it"}))
+            .await
+            .expect("goal_update runs");
+        assert!(result.success, "verified completion: {}", result.output);
+        assert_eq!(
+            lane_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured verifier lane grades the completion",
+        );
+        assert_eq!(
+            turn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the grading turn's own provider must NOT be consulted",
+        );
+        // #1935 round 5 — the verifier spend lands DIRECTLY on the GOAL
+        // (charged before the completion flip), not on the ToolResult stamp:
+        // the stamped route was rejected by the active-only post-turn charge
+        // exactly when the tool succeeded (the goal is complete by then).
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 42,
+            "verifier input+output charged to the goal before the flip",
+        );
+        assert!(
+            result.tokens_used.is_none(),
+            "the #1958 stamp is removed — the direct charge is the only route",
+        );
+    }
+
+    /// #1935 back-compat — without a configured lane the tool falls back to
+    /// the turn's own provider (`ctx.llm_provider`), the pre-#1935 behavior.
+    #[tokio::test]
+    async fn goal_update_verifier_falls_back_to_turn_provider_when_lane_unconfigured() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("verifier-fallback-prof:api:goal-update-fallback".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "verifier-fallback-prof".to_owned(),
+                objective: "fall back to the turn provider".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+
+        let turn_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let turn_provider = std::sync::Arc::new(CountingVerifierProvider {
+            calls: turn_calls.clone(),
+            reply: "DONE",
+            usage: octos_llm::TokenUsage {
+                input_tokens: 7,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        });
+
+        let tool = GoalUpdateTool::new("verifier-fallback-prof");
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+        ctx.llm_provider = turn_provider;
+
+        let result = tool
+            .execute_with_context(&ctx, &json!({"status": "complete", "reason": "done"}))
+            .await
+            .expect("goal_update runs");
+        assert!(result.success, "verified completion: {}", result.output);
+        assert_eq!(
+            turn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unconfigured lane ⇒ the turn's provider grades (unchanged behavior)",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session)
+            .expect("goal exists");
+        assert_eq!(tokens_used, 8, "verifier spend (7+1) charged to the goal");
+    }
+
+    /// #1935 codex round 5 — a NotDone refusal also charges the verifier's
+    /// spend to the goal exactly ONCE, directly (the removed ToolResult stamp
+    /// would have ridden the turn totals into a SECOND charge on the still-
+    /// active goal). Asserts the GOAL counter, not the ToolResult.
+    #[tokio::test]
+    async fn goal_update_notdone_refusal_charges_verifier_usage_once() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("verifier-notdone-prof:api:goal-update-notdone".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "verifier-notdone-prof".to_owned(),
+                objective: "refuse but charge once".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let verifier = std::sync::Arc::new(CountingVerifierProvider {
+            calls: calls.clone(),
+            reply: "NOT_DONE: evidence missing",
+            usage: octos_llm::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 8,
+                ..Default::default()
+            },
+        });
+        let tool = GoalUpdateTool::new("verifier-notdone-prof").with_verifier_provider(verifier);
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+
+        let result = tool
+            .execute_with_context(&ctx, &json!({"status": "complete", "reason": "not yet"}))
+            .await
+            .expect("goal_update runs");
+        assert!(!result.success, "NotDone verdict refuses the transition");
+        assert!(result.tokens_used.is_none(), "no stamp on refusal either");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 28,
+            "the refused verifier call is still real spend, charged exactly once",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session).as_deref(),
+            Some("active"),
+            "the goal stays active after the refusal",
+        );
+    }
+
+    /// #1935 codex round 6 — the fleet-mutating goal tools must not run in a
+    /// parallel batch: their snapshot→await→commit windows interleave (the
+    /// goal_plan double-bind was the observed instance). `goal_update` stays
+    /// Safe deliberately — its transition is CAS-guarded by the revision
+    /// snapshot, so a concurrent loser gets a clean stale-verdict error.
+    #[test]
+    fn goal_fleet_tools_are_concurrency_exclusive() {
+        assert_eq!(
+            GoalPlanTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        assert_eq!(
+            GoalDispatchTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        assert_eq!(
+            GoalGrantTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        assert_eq!(
+            GoalDenyTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        // #1935 round 7 — goal_create's admission spans two lock scopes; the
+        // batch must serialize it (plus the atomic set_goal guard).
+        assert_eq!(
+            GoalCreateTool::new("p").concurrency_class(),
+            ConcurrencyClass::Exclusive
+        );
+        // goal_get stays Safe NOT because it is read-only — its fleet
+        // snapshot carries the lazy backstop terminalization — but because
+        // that backstop drives `drive_goal_terminal_transition` with the
+        // in-hand fleet id, and `model_transition_goal_at_key` re-verifies
+        // the binding (`expected_fleet_id`) UNDER the state lock immediately
+        // before the flip (#1865 review FIX 2), so concurrent goal_get calls
+        // cannot terminalize a re-planned goal on stale evidence.
+        assert_eq!(
+            GoalGetTool::new("p").concurrency_class(),
+            ConcurrencyClass::Safe
+        );
+        // goal_update stays Safe: its transition is CAS-guarded by the
+        // revision snapshot, so a concurrent loser fails cleanly.
+        assert_eq!(
+            GoalUpdateTool::new("p").concurrency_class(),
+            ConcurrencyClass::Safe
+        );
+    }
 
     /// #1967 — `goal_get` must SURFACE open escalations: the rows are written
     /// when a goal-scoped peer parks (`model_goal_record_peer_escalation`) but
