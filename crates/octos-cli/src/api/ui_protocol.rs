@@ -13905,6 +13905,16 @@ fn build_peer_handoff_callback(
         // `stage_peer` writes it atomically BEFORE brief.md and rolls the
         // staging back on failure, so a peer is never visible-but-ownerless.
         let originator = originating_session.to_string();
+        // Peer-agent-based goal AUTO-BIND (#1953): if the master handed off
+        // WITHOUT an explicit goal_id but its session has an ACTIVE goal, bind
+        // the peer to that goal. The model (esp. k3) does not reliably thread
+        // goal_id — it parallelizes goal_create+peer_handoff (the id isn't
+        // available yet) or simply omits it — so relying on the LLM leaves
+        // every peer goal-less and the whole loop inert. The active goal is
+        // the correct default; an explicit goal_id still wins.
+        let resolved_goal_id: Option<String> = request.goal_id.clone().or_else(|| {
+            default_agent_orchestrator().active_goal_id(&originating_session, &profile_id)
+        });
         let staged = stage_peer(
             &peers_root,
             &workspace_root,
@@ -13913,9 +13923,8 @@ fn build_peer_handoff_callback(
             Some(originator.as_str()),
             &request.brief,
             request.worktree,
-            // Peer-agent-based goal: forward the goal context the model
-            // attached to the handoff. Either may be None (goal-less peer).
-            request.goal_id.as_deref(),
+            // Explicit goal_id wins; else the master's active goal (auto-bind).
+            resolved_goal_id.as_deref(),
             request.task_id.as_deref(),
         )
         .map_err(|err| err.message)?;
@@ -29829,6 +29838,16 @@ async fn run_standalone_turn(
     // idempotent no-op that also covers turns whose runtime re-materialized
     // (e.g. after cache eviction) without a fresh open.
     register_session_ledger_scope(&ledger, &session_runtime);
+    // Peer-goal soak fix (codex High #3): PIN this turn's cwd-scoped goal store
+    // key now, right after the scope was (re-)registered above, instead of
+    // re-resolving it at turn completion. `goal_scopes` is a process-global
+    // last-writer-wins map keyed by the plain wire id (`set_goal_scope`), so a
+    // second folder sharing this wire id that opens/activates mid-turn would
+    // overwrite it — and a turn-end re-resolve would then read that OTHER
+    // folder's goal and repaint it onto THIS connection's chip. Capturing here
+    // mirrors how the autonomous path pins `goal_ctx.goal_session_key` at
+    // dispatch.
+    let turn_pinned_goal_key = default_agent_orchestrator().scoped_goal_key(&session_id);
     let usage_profile_id = active_profile_id
         .clone()
         .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
@@ -33789,8 +33808,19 @@ async fn run_standalone_turn(
                 // Snapshot goal_id BEFORE the async verifier call to prevent
                 // completing the wrong goal if it changes during the await.
                 let goal_id = orchestrator.goal_id_for_session(goal_key);
-                let verdict =
-                    run_goal_completion_verifier(llm_provider.clone(), &objective, &reply).await;
+                // #1958 (codex #3) — the sentinel verifier runs AFTER the turn's
+                // routing scopes ended, so restore originating-session
+                // attribution around it (a failover would otherwise publish
+                // unattributed / under another session). Autonomous turns are
+                // Normal policy, so only the router context needs restoring.
+                let verdict = octos_llm::with_router_context(
+                    octos_llm::RouterContext {
+                        session_id: Some(session_id.to_string()),
+                        ..Default::default()
+                    },
+                    run_goal_completion_verifier(llm_provider.clone(), &objective, &reply),
+                )
+                .await;
                 (verdict, goal_id)
             } else {
                 (
@@ -33854,6 +33884,45 @@ async fn run_standalone_turn(
         // not generation-scoped), and then the old guard's Drop
         // wipes the NEW marker. Single-source-of-truth via the
         // guard avoids that.
+    }
+
+    // Peer-goal soak fix (bug 5): INTERACTIVE turns pass `goal_context = None`,
+    // so the post-turn chip repaint above (gated on `Some(goal_ctx)`) never
+    // runs. A model-driven `goal_update(complete|blocked)` during an
+    // interactive turn therefore left the goal chip stale at `active` while
+    // `goal_get` already reported `complete`. Emit the same ephemeral
+    // `SessionGoalUpdated` for interactive turns so the chip repaints live.
+    // Use the TURN-PINNED scoped key (codex High #3 — do not re-resolve the
+    // last-writer-wins scope map at turn end) and `usage_profile_id` (codex
+    // Med #4 — the runtime-resolved profile, which is `_main` for a
+    // profile-less session, not the `""` a raw `session_id.profile_id()` would
+    // yield → the `_main` goal would never match).
+    // `session_goal_updated_event_json` emits the wire id in the event for the
+    // client, and returns `None` (no emit) when this session has no goal, so a
+    // plain chat turn stays silent.
+    if goal_context.is_none() {
+        if let Some(goal_event_json) = default_agent_orchestrator()
+            .session_goal_updated_event_json(&turn_pinned_goal_key, &usage_profile_id)
+        {
+            match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
+                goal_event_json,
+            ) {
+                Ok(event) => {
+                    let _ = send_notification_ephemeral(
+                        &ws,
+                        &ledger,
+                        UiNotification::SessionGoalUpdated(event),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        session_id = %session_id,
+                        "interactive goal chip repaint produced an unparseable update event",
+                    );
+                }
+            }
+        }
     }
 
     // FIX-06: a turn that ends — for any reason — must drop its
@@ -36731,11 +36800,70 @@ fn send_notification_lifecycle_forced_backpressure_fixture(
     Err(SendError::LifecycleFailure(reason.into()))
 }
 
+/// #1959 — per-session monotonic guard for goal chip events. Returns `false`
+/// (DROP) when a `SessionGoalUpdated` / `SessionGoalCleared` carries a
+/// `generation` that is not greater than the last goal event already emitted
+/// for the same wire session — so a stale update that races behind a clear can
+/// never be delivered after it (the client would otherwise resurrect the
+/// cleared chip). Non-goal notifications and legacy `generation == 0` events
+/// (older backend, or events built before #1959) always pass. Both direct-send
+/// boundaries (`send_notification_durable` for the RPC-derived clear,
+/// `send_notification_ephemeral` for the interactive update) funnel through
+/// here, so ordering holds regardless of which path an event takes.
+fn goal_event_passes_generation_guard(notification: &UiNotification) -> bool {
+    // fn-local process-global: wire session id -> last emitted goal generation.
+    static GUARD: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
+    let (session, generation) = match notification {
+        UiNotification::SessionGoalUpdated(e) => (e.session_id.0.as_str(), e.generation),
+        UiNotification::SessionGoalCleared(e) => (e.session_id.0.as_str(), e.generation),
+        _ => return true,
+    };
+    let map = GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    goal_event_generation_admits(&mut guard, session, generation)
+}
+
+/// Pure core of [`goal_event_passes_generation_guard`] (extracted for testing:
+/// the outer fn's `static` map can't be reset between tests). Admits an event
+/// only when its `generation` strictly exceeds the last admitted generation for
+/// the session, recording it. Legacy `generation == 0` always admits and never
+/// updates the watermark (an old backend never stamps, so gating on it would
+/// wedge the chip).
+fn goal_event_generation_admits(
+    last_by_session: &mut HashMap<String, u64>,
+    session: &str,
+    generation: u64,
+) -> bool {
+    if generation == 0 {
+        return true;
+    }
+    let last = last_by_session.get(session).copied().unwrap_or(0);
+    if generation <= last {
+        return false;
+    }
+    // #1959 (codex #7) — bound the process-global watermark map. There is no
+    // session-close hook here, so cap growth: once the map is large, drop the
+    // watermarks. A reset only re-admits the NEXT event per session (each event
+    // has a fresh higher generation), so the worst case is losing stale-drop
+    // protection for one racy window after a reset — far rarer than the leak.
+    const MAX_TRACKED_SESSIONS: usize = 8192;
+    if last_by_session.len() >= MAX_TRACKED_SESSIONS && !last_by_session.contains_key(session) {
+        last_by_session.clear();
+    }
+    last_by_session.insert(session.to_string(), generation);
+    true
+}
+
 fn send_notification_durable(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
+    // #1959 — drop a goal chip event that a newer clear/update already
+    // superseded for this session (see the guard's doc comment).
+    if !goal_event_passes_generation_guard(&notification) {
+        return Ok(());
+    }
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
     // set `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
@@ -36790,6 +36918,11 @@ fn send_notification_ephemeral(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
+    // #1959 — drop a stale goal chip update that a newer clear already
+    // superseded for this session (see `goal_event_passes_generation_guard`).
+    if !goal_event_passes_generation_guard(&notification) {
+        return Ok(());
+    }
     // Ephemeral frames are NOT appended to the ledger — they are explicitly
     // non-durable per spec § 9. Drops never need a `replay_lossy` summary.
     // Every legacy `message/delta` send funnels through here exactly once

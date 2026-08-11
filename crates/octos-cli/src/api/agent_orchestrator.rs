@@ -868,18 +868,21 @@ type LoopRunnableFilter<'a> = dyn Fn(&SessionKey, &str) -> bool + 'a;
 impl InProcessAgentOrchestrator {
     /// Get the goal objective for a session (used by goal completion verifier).
     pub(crate) fn goal_objective_for_test(&self, session_id: &SessionKey) -> Option<String> {
-        self.state()
-            .goals
-            .get(session_id)
-            .map(|g| g.objective.clone())
+        // #1666 scoping (soak bug: goals stored under the cwd-scoped store
+        // identity via `model_create_goal`, but this looked up the RAW wire
+        // session id → miss → the completion verifier got "no goal objective
+        // found for verification" and goals stuck at `blocked`). Resolve the
+        // same scoped key `model_create_goal`/`model_goal_snapshot` use.
+        let key = self.scoped_goal_key(session_id);
+        self.state().goals.get(&key).map(|g| g.objective.clone())
     }
 
     /// Get the goal ID for a session (used by goal completion verifier to prevent stale verdicts).
     pub(crate) fn goal_id_for_session(&self, session_id: &SessionKey) -> Option<String> {
-        self.state()
-            .goals
-            .get(session_id)
-            .map(|g| g.goal_id.clone())
+        // Same #1666 scoping as `goal_objective_for_test` — resolve the scoped
+        // store key, not the raw wire session id.
+        let key = self.scoped_goal_key(session_id);
+        self.state().goals.get(&key).map(|g| g.goal_id.clone())
     }
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
         self.state
@@ -2463,8 +2466,13 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
         profile_id: &str,
     ) -> Option<String> {
+        // #1666 scoping: resolve the same cwd-scoped store key
+        // `model_create_goal` writes under (identity when no scope is
+        // registered). Used by peer_handoff auto-bind — a raw lookup would
+        // miss a scoped goal and stage the peer goal-less.
+        let key = self.scoped_goal_key(session_id);
         let state = self.state();
-        let goal = state.goals.get(session_id)?;
+        let goal = state.goals.get(&key)?;
         if goal.profile_id == profile_id && goal.status == "active" {
             Some(goal.goal_id.clone())
         } else {
@@ -2584,10 +2592,14 @@ impl InProcessAgentOrchestrator {
                 now_system,
             );
         }
+        // #1959 (codex #1) — stamp the generation like every other goal-event
+        // producer so the send guard can order this token-charge update.
+        let generation = next_goal_event_generation(&mut state);
         Some(json!({
             "session_id": session_id,
             "profile_id": profile_for_event,
             "goal": autonomy_goal_json(&snapshot),
+            "generation": generation,
             "transition_actor": "backend",
         }))
     }
@@ -3179,21 +3191,30 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
         profile_id: &str,
     ) -> Option<Value> {
-        let state = self.state();
-        let goal = state
-            .goals
-            .get(session_id)
-            .filter(|goal| goal.profile_id == profile_id)?;
+        let mut state = self.state();
+        // Build the goal JSON in a scoped borrow so the immutable `goal`
+        // reference is released before the mutable generation bump below.
+        let goal_json = {
+            let goal = state
+                .goals
+                .get(session_id)
+                .filter(|goal| goal.profile_id == profile_id)?;
+            autonomy_goal_json(goal)
+        };
         // #1666 residue — `session_id` here is the goal STORE identity (the
         // cwd-scoped key for an AppUI folder), but the client keys the goal
         // chip by the plain WIRE id and would drop an event carrying a scoped
         // key. Emit the wire id in the event while looking up under the scoped
         // key. Unscoped/gateway keys strip to themselves (no-op).
         let wire_id = wire_key_from_goal_key(session_id);
+        // #1959 — stamp a monotonic generation so a stale update can't
+        // resurrect a cleared goal on the client (see the field's doc comment).
+        let generation = next_goal_event_generation(&mut state);
         Some(json!({
             "session_id": wire_id,
             "profile_id": profile_id,
-            "goal": autonomy_goal_json(goal),
+            "goal": goal_json,
+            "generation": generation,
             "transition_actor": "backend",
         }))
     }
@@ -3246,11 +3267,17 @@ impl InProcessAgentOrchestrator {
         profile_id: &str,
         originator_session: &str,
     ) -> Value {
+        // #1666 scoped-key match (see model_goal_record_peer_finding): compare
+        // the originator's scoped key too, else a cwd-scoped goal is unreadable
+        // by its own peer.
+        let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
         let state = self.state();
         let found = state.goals.iter().find(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                && (key.to_string() == originator_session || key.base_key() == originator_session)
+                && (**key == originator_scoped
+                    || key.to_string() == originator_session
+                    || key.base_key() == originator_session)
         });
         match found {
             Some((_key, goal)) => json!({
@@ -3487,20 +3514,25 @@ impl InProcessAgentOrchestrator {
         content: &str,
     ) -> Result<String, String> {
         // Verify the goal exists under this profile AND that its owning
-        // session matches the peer's originator (the goal-binding check
-        // above). We walk the map once and capture the matching key for
-        // downstream use.
+        // session matches the peer's originator (the goal-binding check).
+        //
+        // The HashMap key is the SCOPED goal key (`scoped_goal_key`, #1666):
+        // for a cwd-scoped session it is `dev:local:tui#coding\0~cwd-<scope>`.
+        // The originator recorded on the peer is the plain wire id
+        // (`dev:local:tui#coding`). Neither `key.to_string()` (carries the
+        // scope suffix) nor `key.base_key()` (splits on `#` → `dev:local:tui`)
+        // can equal that plain id, so a scoped goal was rejected as "not
+        // owned" and the peer's finding never reached the ledger (soak
+        // #1953). Resolve the originator's OWN scoped key and compare directly
+        // — it equals the goal's stored key (the same resolution `active_goal_id`
+        // used to auto-bind the peer here in the first place).
+        let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
         let state = self.state();
         let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                // The HashMap key is the scoped goal key (the session that
-                // created the goal). The originator recorded on the peer
-                // staging is the wire-format session id; for the by-id path
-                // we compare against the scoped key's string form. Both
-                // shapes refer to the same master session when the peer was
-                // legitimately staged under this goal.
-                && (key.to_string() == originator_session
+                && (*key == originator_scoped
+                    || key.to_string() == originator_session
                     || key.base_key() == originator_session)
         });
         drop(state);
@@ -3613,13 +3645,17 @@ impl InProcessAgentOrchestrator {
         task_id: Option<&str>,
         question: &str,
     ) -> Result<String, String> {
-        // Same goal-binding check as `model_goal_record_peer_finding`: the
-        // goal record's owning session must match the peer's originator.
+        // Same goal-binding check as `model_goal_record_peer_finding` (incl.
+        // the #1666 scoped-key match): the goal record's owning session must
+        // match the peer's originator.
+        let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
         let state = self.state();
         let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
             goal.goal_id == goal_id
                 && goal.profile_id == profile_id
-                && (key.to_string() == originator_session || key.base_key() == originator_session)
+                && (*key == originator_scoped
+                    || key.to_string() == originator_session
+                    || key.base_key() == originator_session)
         });
         drop(state);
         if !goal_owner_matches {
@@ -5615,10 +5651,15 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             );
         }
         persist_goal_state(&state, &key, &goal, false);
+        // #1959 (codex #1) — stamp the generation so a user-set goal update
+        // participates in the send guard's ordering (it is durable, so an
+        // unstamped one could persist a clear->stale-update inversion).
+        let generation = next_goal_event_generation(&mut state);
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
             "goal": autonomy_goal_json(&goal),
+            "generation": generation,
             "transition_actor": transition_actor
         }))
     }
@@ -5647,11 +5688,17 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         if cleared {
             persist_goal_cleared(&state, &key, &request.profile_id);
         }
+        // #1959 — stamp the same monotonic generation as `SessionGoalUpdated`
+        // so the client can order a clear against a racing stale update. A
+        // stale update always bumps before this clear (its goal read preceded
+        // the removal above), so `update.generation < clear.generation`.
+        let generation = next_goal_event_generation(&mut state);
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
             "cleared": cleared,
             "goal": Value::Null,
+            "generation": generation,
             "transition_actor": "user"
         }))
     }
@@ -6037,6 +6084,14 @@ struct AutonomyRuntimeState {
     fleet_pool: Option<Arc<FleetWorkerPool>>,
     next_goal_seq: u64,
     next_loop_seq: u64,
+    /// #1959 — monotonic generation bumped every time a goal event
+    /// (`SessionGoalUpdated` / `SessionGoalCleared`) is built, under the state
+    /// lock. Stamped onto both events so the client can drop a stale update
+    /// that races behind a clear: in the race the stale update always bumps
+    /// (and stamps) BEFORE the clear (else its goal read would find nothing and
+    /// emit no event), so `stale_update.generation < clear.generation` always
+    /// holds and the client keeps the newer clear.
+    goal_event_generation: u64,
     /// #991 / M15-B — per-agent cancellation handles registered by
     /// `run_native_specialist` (and future specialist runners) so that
     /// `interrupt_agent` / `close_agent` can signal a *real* abort to
@@ -7213,6 +7268,20 @@ pub(crate) async fn run_goal_completion_verifier(
     objective: &str,
     evidence: &str,
 ) -> GoalCompletionVerdict {
+    run_goal_completion_verifier_with_usage(provider, objective, evidence)
+        .await
+        .0
+}
+
+/// Like [`run_goal_completion_verifier`], but also returns the verifier LLM
+/// call's [`TokenUsage`] so the caller can fold it into turn / goal-budget
+/// accounting (#1958). The verifier now makes a real provider call, so its
+/// tokens must not be silently dropped. On a provider error the usage is zero.
+pub(crate) async fn run_goal_completion_verifier_with_usage(
+    provider: Arc<dyn LlmProvider>,
+    objective: &str,
+    evidence: &str,
+) -> (GoalCompletionVerdict, octos_llm::TokenUsage) {
     let prompt = format!(
         "You are an INDEPENDENT completion verifier. Do not assume the work is \
 done just because the agent said so.\n\nGOAL OBJECTIVE:\n{objective}\n\nThe \
@@ -7232,12 +7301,15 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         context_management: None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
-    let verdict_text = match provider.chat(&messages, &[], &config).await {
-        Ok(response) => response.content.unwrap_or_default(),
+    let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {
+        Ok(response) => (response.content.unwrap_or_default(), response.usage),
         Err(error) => {
-            return GoalCompletionVerdict::NotDone {
-                reason: format!("verifier call failed: {error}"),
-            };
+            return (
+                GoalCompletionVerdict::NotDone {
+                    reason: format!("verifier call failed: {error}"),
+                },
+                octos_llm::TokenUsage::default(),
+            );
         }
     };
     // "Done" only on an explicit affirmative that is NOT negated. Checking the
@@ -7250,13 +7322,14 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         .next()
         .unwrap_or("")
         .to_ascii_uppercase();
-    if first_token == "DONE" {
+    let verdict = if first_token == "DONE" {
         GoalCompletionVerdict::Done
     } else {
         GoalCompletionVerdict::NotDone {
             reason: trimmed.chars().take(200).collect(),
         }
-    }
+    };
+    (verdict, usage)
 }
 
 fn enqueue_agent_terminal_continuations(
@@ -8008,6 +8081,17 @@ fn restored_agent_artifact(artifact: &SupervisorArtifactRecord) -> AgentArtifact
         path: Some(artifact.path.clone()),
         content: None,
     }
+}
+
+/// #1959 — bump and return the monotonic goal-event generation. EVERY producer
+/// of a `SessionGoalUpdated` / `SessionGoalCleared` event MUST stamp its event
+/// with this (under the state lock) so the per-session send guard can order it.
+/// An unstamped (`0`) event is always admitted by the guard and would reopen
+/// the stale-update-overtakes-clear race (codex #1 caught `set_goal` /
+/// `charge_active_goal_tokens` shipping unstamped).
+fn next_goal_event_generation(state: &mut AutonomyRuntimeState) -> u64 {
+    state.goal_event_generation += 1;
+    state.goal_event_generation
 }
 
 fn persist_goal_state(

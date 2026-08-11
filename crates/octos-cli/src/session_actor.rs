@@ -5117,10 +5117,20 @@ impl SessionActor {
             // Snapshot goal_id BEFORE the async verifier call to prevent
             // completing the wrong goal if it changes during the await.
             let goal_id = orchestrator.goal_id_for_session(&self.session_key);
-            let verdict = run_goal_completion_verifier(
-                self.agent.llm_provider(),
-                &objective,
-                &assistant_tail,
+            // #1958 (codex #3) — restore originating-session attribution around
+            // the sentinel verifier (it runs outside the turn's routing scopes),
+            // so a failover attributes to this session instead of publishing
+            // unattributed. Autonomous turns are Normal policy → router only.
+            let verdict = octos_llm::with_router_context(
+                octos_llm::RouterContext {
+                    session_id: Some(self.session_key.to_string()),
+                    ..Default::default()
+                },
+                run_goal_completion_verifier(
+                    self.agent.llm_provider(),
+                    &objective,
+                    &assistant_tail,
+                ),
             )
             .await;
             (verdict, goal_id)

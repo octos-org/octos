@@ -558,6 +558,14 @@ impl Agent {
     ) -> JoinHandle<ToolCallResult> {
         // Clone Arc-wrapped fields so the spawned task is 'static
         let tools = self.tools.clone();
+        // Peer-goal soak fix: pre-clone the real LLM provider + this agent's
+        // goal/task/originator identity so the spawned foreground ToolContext
+        // can carry them (see the fields below). Cannot borrow `self` inside
+        // the 'static spawned task.
+        let llm = self.llm.clone();
+        let ctx_goal_id = self.goal_id.clone();
+        let ctx_task_id = self.task_id.clone();
+        let ctx_originator_session = self.originator_session.clone();
         let reporter = self.reporter();
         let hooks = self.hooks.clone();
         let hook_ctx = self.hook_ctx();
@@ -626,6 +634,24 @@ impl Agent {
             TOOL_APPROVAL_CTX.try_with(std::sync::Arc::clone).ok();
         let captured_user_question_ctx: Option<std::sync::Arc<dyn UserQuestionRequester>> =
             USER_QUESTION_CTX.try_with(std::sync::Arc::clone).ok();
+        // #1958: tokio task-locals are not inherited across `tokio::spawn`, so
+        // a tool that makes its OWN `provider.chat()` sub-call (notably
+        // `goal_update`'s completion verifier via `run_goal_completion_verifier`)
+        // would otherwise run with the DEFAULT routing context — losing the
+        // turn's fail-fast policy and originating-session attribution (a
+        // verifier failover would then publish unattributed). Capture the call
+        // policy + router context here and re-establish them inside the spawned
+        // task around the tool future (below).
+        //
+        // Deliberately NOT the LANE context (codex #4): the wrap below applies
+        // to EVERY foreground tool, and a synchronous `spawn` child or an
+        // unresolved-model pipeline node that falls back to `self.llm` would
+        // otherwise be pinned to the parent turn's lane (e.g. a research child
+        // filtered to `CodeCapable`). The verifier is a simple completion check
+        // that routes fine on the default lane; attribution + policy are what
+        // matter, and neither regresses a lane-less child.
+        let captured_call_policy = octos_llm::current_llm_call_policy();
+        let captured_router_ctx = octos_llm::current_router_context();
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -2067,6 +2093,29 @@ impl Agent {
                 session_scope: session_scope.clone(),
                 // #1774: post-edit formatting opt-in for file tools.
                 format_after_edit,
+                // Peer-goal soak fix: the foreground tool ctx must carry the
+                // real LLM provider, not the NoopProvider from
+                // `ToolContext::zero()`. Tools that make their own LLM
+                // sub-calls (notably `goal_update`'s completion verifier via
+                // `run_goal_completion_verifier`) run through this ctx; without
+                // the real provider the verifier fails with "no real provider"
+                // and `goal_update(complete)` can never succeed. Mirror the
+                // approval path (`execute_approved_tool`), which already sets
+                // this.
+                llm_provider: llm.clone(),
+                // Peer-goal soak fix (codex High #1): thread this agent's
+                // goal/task/originator identity through to the foreground tool
+                // ctx. Peer boot sets these on the Agent (`with_goal_id` etc.),
+                // but they were dropped here — so a peer's `goal_get` took the
+                // session path (its own goal-less session → `status: none`) and
+                // `goal_update` missed its peer-reject branch. These are `None`
+                // for every master agent (interactive AND autonomous — the only
+                // production `Agent::with_goal_id` is the peer-boot guard;
+                // masters carry the goal via `goal_context`), so the master
+                // still reaches the master-completion path.
+                goal_id: ctx_goal_id.clone(),
+                task_id: ctx_task_id.clone(),
+                originator_session: ctx_originator_session.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
@@ -2090,6 +2139,17 @@ impl Agent {
                     .execute_with_context(&ctx, &tc_name, &effective_args)
                     .await
             });
+            // #1958: re-establish the turn's fail-fast policy + originating-
+            // session attribution (captured before the spawn) around the tool
+            // future, so a tool that makes its own provider.chat() call — the
+            // goal completion verifier — keeps them instead of the post-spawn
+            // defaults. Lane is intentionally NOT restored here (codex #4 — see
+            // the capture comment above). Independent of the approval/question
+            // bridges below; wrapped innermost so those still apply.
+            let exec_future = octos_llm::with_router_context(
+                captured_router_ctx,
+                octos_llm::with_llm_call_policy(captured_call_policy, exec_future),
+            );
             let result = match (&captured_approval_ctx, &captured_user_question_ctx) {
                 (Some(approval), Some(question)) => {
                     TOOL_APPROVAL_CTX
