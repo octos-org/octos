@@ -15001,11 +15001,22 @@ fn peer_respond_resolve(
 /// no per-turn auto-close. The TUI keeps the session alive across multiple
 /// turns; this function is called at every turn terminal to update the
 /// blackboard with the latest result (and a versioned historical copy).
+///
+/// #1965 — `tokens_consumed` is the turn's accumulated token spend (the same
+/// `final_tokens_consumed` total the master goal accountants charge from).
+/// When the peer is goal-bound, the finding write below charges it against
+/// the master goal's shared budget pool. Honesty (codex round): only a
+/// COMPLETED turn carries real usage — the agent loop bails with a bare
+/// `Err` that discards the turn's accumulated usage, so the errored /
+/// rate-limited arm threads 0, and an interrupted turn never reaches this
+/// writer at all. Those turns currently UNDER-charge the goal; preserving
+/// partial usage across the loop's error path is a tracked follow-up.
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
     outcome: TurnTerminalOutcome,
     content: &str,
+    tokens_consumed: u64,
 ) {
     let Some(slug) = session_id
         .topic()
@@ -15135,31 +15146,48 @@ fn write_peer_result_if_peer_session(
             // Best-effort: a ledger write failure must NOT fail the peer's
             // turn (the result.md is already written above and is the
             // authoritative output). We log and continue.
+            //
+            // #1965 — `tokens_consumed` charges the master goal's budget
+            // inside the recorder (it already holds the ownership-checked
+            // goal record) and lands as the Finding row's real `cost_tokens`.
+            // The returned `goal_still_active` is the POST-charge status:
+            // it gates the goal-progress wake below so a budget-crossing
+            // peer cannot queue one more uncharged master turn past the cap.
             let content_summary: String = body.chars().take(400).collect();
-            if let Err(err) = default_agent_orchestrator().model_goal_record_peer_finding(
-                &runtime.data_dir,
-                goal_id,
-                profile_id,
-                &originator,
-                slug,
-                task_id,
-                &format!("[{outcome_str}] {content_summary}"),
-            ) {
-                tracing::warn!(
-                    ?err,
-                    slug,
+            let goal_still_active = match default_agent_orchestrator()
+                .model_goal_record_peer_finding(
+                    &runtime.data_dir,
                     goal_id,
-                    "peer-goal: failed to record peer finding to goal ledger"
-                );
-            } else {
-                tracing::info!(
+                    profile_id,
+                    &originator,
                     slug,
-                    goal_id,
                     task_id,
-                    outcome = outcome_str,
-                    "peer-goal: recorded finding to goal ledger"
-                );
-            }
+                    &format!("[{outcome_str}] {content_summary}"),
+                    tokens_consumed,
+                ) {
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        slug,
+                        goal_id,
+                        "peer-goal: failed to record peer finding to goal ledger"
+                    );
+                    // Recording failed → the post-charge status is unknown;
+                    // keep the wake (pre-#1965 behaviour) so the master still
+                    // learns of the peer result.
+                    true
+                }
+                Ok((_, goal_still_active)) => {
+                    tracing::info!(
+                        slug,
+                        goal_id,
+                        task_id,
+                        outcome = outcome_str,
+                        "peer-goal: recorded finding to goal ledger"
+                    );
+                    goal_still_active
+                }
+            };
 
             // Peer-agent-based goal: wake the master session so it sees the
             // new finding on its next turn WITHOUT having to poll `goal_get`.
@@ -15171,35 +15199,55 @@ fn write_peer_result_if_peer_session(
             // Best-effort: if the wake channel is unavailable (e.g. master
             // session is offline), the ledger row above is still durable —
             // the master will see the finding on its next `goal_get`.
-            tracing::info!(
-                slug,
-                goal_id,
-                task_id,
-                originator,
-                outcome = outcome_str,
-                "peer-goal: waking master session"
-            );
-            // Enqueue the wake as an awaiting-input note on the master
-            // session. This is the same mechanism used for peer parking /
-            // approval wakes — it surfaces as a system message on the
-            // master's next turn.
-            let content_summary: String = body.chars().take(400).collect();
-            if let Err(err) = enqueue_goal_progress_wake(
-                &runtime.data_dir,
-                &originator,
-                goal_id,
-                slug,
-                turn_count,
-                outcome_str,
-                &content_summary,
-                profile_id,
-            ) {
-                tracing::warn!(
-                    ?err,
+            //
+            // #1965 codex round — gated on the goal still being ACTIVE after
+            // the charge above. This External "goal_progress" wake bypasses
+            // goal-status scheduling and is not goal-accounted, so an ungated
+            // wake right after the charge flipped the goal to
+            // `budget_limited` would queue exactly the post-budget master
+            // turn the flip exists to stop. The wrap-up continuation the flip
+            // enqueued carries the reorientation instead; still-active goals
+            // wake exactly as before.
+            if goal_still_active {
+                tracing::info!(
+                    slug,
+                    goal_id,
+                    task_id,
+                    originator,
+                    outcome = outcome_str,
+                    "peer-goal: waking master session"
+                );
+                // Enqueue the wake as an awaiting-input note on the master
+                // session. This is the same mechanism used for peer parking /
+                // approval wakes — it surfaces as a system message on the
+                // master's next turn.
+                let content_summary: String = body.chars().take(400).collect();
+                if let Err(err) = enqueue_goal_progress_wake(
+                    &runtime.data_dir,
+                    &originator,
+                    goal_id,
+                    slug,
+                    turn_count,
+                    outcome_str,
+                    &content_summary,
+                    profile_id,
+                ) {
+                    tracing::warn!(
+                        ?err,
+                        slug,
+                        goal_id,
+                        originator,
+                        "peer-goal: failed to enqueue master wake (ledger row is still durable)"
+                    );
+                }
+            } else {
+                tracing::info!(
                     slug,
                     goal_id,
                     originator,
-                    "peer-goal: failed to enqueue master wake (ledger row is still durable)"
+                    "peer-goal: goal no longer active after charge; skipping \
+                     goal-progress wake (the wrap-up continuation reorients \
+                     the master)"
                 );
             }
         }
@@ -32847,12 +32895,16 @@ async fn run_standalone_turn(
                     outcome: Some(TurnTerminalOutcome::Completed),
                 };
                 // #1801 v2: a peer session's terminal leaves its result on
-                // the blackboard (result.md beside the brief).
+                // the blackboard (result.md beside the brief). #1965 — the
+                // turn's accumulated spend (folded from this `done` event
+                // just above) rides along so a goal-bound peer charges the
+                // master goal's budget.
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
                     TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
+                    final_tokens_consumed,
                 );
                 // Peer-fleet auto-synthesis: a peer COMPLETING may be the last
                 // of its master's fleet — evaluate the fleet and, when every
@@ -32927,7 +32979,22 @@ async fn run_standalone_turn(
                 } else {
                     TurnTerminalOutcome::Errored
                 };
-                write_peer_result_if_peer_session(&state, &session_id, turn_outcome, &wire_msg);
+                // #1965 — thread the turn total here too so the wiring is
+                // outcome-independent, but be honest: on this arm it is
+                // ALWAYS 0 today. The agent loop bails with a bare `Err`
+                // that discards the turn's accumulated usage, and
+                // `final_tokens_consumed` only folds from `done` — so an
+                // errored/rate-limited peer turn UNDER-charges the goal (it
+                // burned real tokens before failing). Preserving partial
+                // usage across the loop's error path is a tracked follow-up;
+                // the master accountant shares the same gap.
+                write_peer_result_if_peer_session(
+                    &state,
+                    &session_id,
+                    turn_outcome,
+                    &wire_msg,
+                    final_tokens_consumed,
+                );
                 // codex #2 — an ERRORED/interrupted/rate-limited peer still
                 // wrote a result.md; evaluate the fleet here too so a fleet
                 // whose LAST peer errors still triggers synthesis (the error

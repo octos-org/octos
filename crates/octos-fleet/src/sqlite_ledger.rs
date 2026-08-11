@@ -236,14 +236,21 @@ impl GoalLedger {
     /// later call. `created_at_ms` and `revision` are preserved on conflict.
     ///
     /// #1957 codex #2 — the UPDATE is GUARDED so a stale snapshot cannot undo a
-    /// newer one. Two clauses:
+    /// newer one. Three clauses:
     ///  1. `updated_at_ms >=`: only overwrite when the incoming snapshot is at
     ///     least as new as the stored row. Both producers (the transition sync
     ///     and the finding/escalation path) capture `status` and `updated_at_ms`
     ///     together under the orchestrator state lock, so a stale status always
     ///     carries a stale timestamp and this clause rejects it. `>=` (not `>`)
     ///     keeps same-instant re-writes of the SAME state idempotent.
-    ///  2. never downgrade a `complete` row to a non-`complete` status. This is
+    ///  2. `tokens_used >=` (#1965 codex round): the counter is MONOTONIC per
+    ///     `goal_id` — every in-memory writer only ever `saturating_add`s, a
+    ///     replacement goal mints a FRESH goal_id (different ledger file), and
+    ///     re-activation never resets counters. Two peers finishing in the
+    ///     SAME millisecond tie on clause 1, so without this clause the
+    ///     smaller charge upserting second would roll the durable counter
+    ///     backwards while memory holds the higher total.
+    ///  3. never downgrade a `complete` row to a non-`complete` status. This is
     ///     defence-in-depth against the millisecond-resolution tie the `>=`
     ///     clause alone cannot break: `complete` is terminal for a given
     ///     `goal_id` (re-activation mints a FRESH goal_id), so no legitimate
@@ -263,6 +270,7 @@ impl GoalLedger {
                  continuations_used = excluded.continuations_used,
                  updated_at_ms = excluded.updated_at_ms
              WHERE excluded.updated_at_ms >= goals.updated_at_ms
+               AND excluded.tokens_used >= goals.tokens_used
                AND NOT (goals.status = 'complete' AND excluded.status <> 'complete')",
             params![
                 goal.goal_id,
@@ -781,7 +789,9 @@ mod tests {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
-            cost_tokens: 0,
+            // #1965 — a REAL cost, so the round-trip below proves the row
+            // persists the caller's spend instead of a hardcoded 0.
+            cost_tokens: 4_321,
             created_at_ms: 2000,
             created_by: "peer-a".to_string(),
         };
@@ -790,6 +800,10 @@ mod tests {
         let findings = ledger.list_findings_since("g1", 0).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].assertion, "test assertion");
+        assert_eq!(
+            findings[0].cost_tokens, 4_321,
+            "Finding row must persist the real cost_tokens (#1965)"
+        );
     }
 
     #[test]
@@ -1562,6 +1576,42 @@ mod digest_integration_tests {
         assert_eq!(
             got.continuations_used, 3,
             "stale continuations rejected too"
+        );
+
+        // #1965 codex round — the monotonic-counter clause, isolated from the
+        // complete-protection clause (fresh ACTIVE goal): two peers can finish
+        // in the SAME millisecond, so `updated_at_ms >=` alone admits the
+        // smaller charge upserting second and rolls the durable counter back
+        // while memory holds the higher total. tokens_used is MONOTONIC per
+        // goal_id (a replacement goal mints a fresh goal_id → different ledger
+        // file; re-activation never resets counters), so an equal-ms write
+        // carrying a LOWER tokens_used must be rejected...
+        let seed = |tokens_used: u64| Goal {
+            goal_id: "g2".to_string(),
+            objective: "concurrent peers".to_string(),
+            status: "active".to_string(),
+            tokens_used,
+            token_budget: 2000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 5000,
+            updated_at_ms: 5000, // every write in this block ties on ms
+        };
+        ledger.upsert_goal(&seed(300)).unwrap();
+        ledger.upsert_goal(&seed(100)).unwrap(); // equal-ms, LOWER → rejected
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().tokens_used,
+            300,
+            "an equal-ms upsert with a lower tokens_used must not roll the \
+             counter backwards"
+        );
+        // ...while an equal-ms write carrying a HIGHER tokens_used (the other
+        // peer's larger charge landing second) must still be accepted.
+        ledger.upsert_goal(&seed(450)).unwrap();
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().tokens_used,
+            450,
+            "an equal-ms upsert with a higher tokens_used must be accepted"
         );
     }
 

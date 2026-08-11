@@ -30548,6 +30548,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         &peer_key,
         TurnTerminalOutcome::Completed,
         "All three lenses agree.",
+        0,
     );
     let written =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
@@ -30570,7 +30571,13 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     );
     let ghost_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-never-staged");
-    write_peer_result_if_peer_session(&state, &ghost_key, TurnTerminalOutcome::Completed, "ghost");
+    write_peer_result_if_peer_session(
+        &state,
+        &ghost_key,
+        TurnTerminalOutcome::Completed,
+        "ghost",
+        0,
+    );
     assert!(
         !peers_root.join("never-staged").exists(),
         "an unstaged peer topic must not create directories"
@@ -30582,6 +30589,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         &coding_key,
         TurnTerminalOutcome::Completed,
         "not a peer",
+        0,
     );
 
     // Overwrite = latest state on result.md, versioned file for turn 2.
@@ -30590,6 +30598,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         &peer_key,
         TurnTerminalOutcome::Errored,
         "second turn failed",
+        0,
     );
     let rewritten =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();

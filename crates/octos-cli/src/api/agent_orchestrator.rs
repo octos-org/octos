@@ -3609,9 +3609,25 @@ impl InProcessAgentOrchestrator {
     /// result is frozen as a `Finding` row so the master can list findings
     /// across restarts even if the peer's `result.md` is later overwritten.
     ///
-    /// Returns the new finding's `finding_id`. Errors when the goal is not
-    /// found under this profile (a peer whose master is on a different
-    /// profile must not write into its ledger).
+    /// #1965 — `cost_tokens` is the peer turn's accumulated token spend. It
+    /// charges the master goal's `tokens_used` (one shared budget pool with
+    /// master turns) under the state lock, right on the ownership-checked
+    /// record this function already resolves, and lands verbatim on the
+    /// `Finding` row so cost-against-yield per path stays truthful. Honesty
+    /// note (codex round): today only a COMPLETED turn delivers real usage —
+    /// the agent loop bails with a bare `Err` that carries no usage, so
+    /// errored/rate-limited turns arrive here with 0 and interrupted turns
+    /// never reach the turn-terminal writer at all; those turns UNDER-charge.
+    /// Partial-usage preservation on failure is a tracked follow-up.
+    ///
+    /// Returns the new finding's `finding_id` plus `goal_still_active` — the
+    /// goal's POST-charge scheduling eligibility (`status == "active"`), so
+    /// the caller can skip the goal-progress master wake once the charge has
+    /// flipped the goal to `budget_limited` (a post-budget wake would queue
+    /// an uncharged, unaccounted master turn past the cap; the wrap-up
+    /// continuation the flip enqueued carries the reorientation instead).
+    /// Errors when the goal is not found under this profile (a peer whose
+    /// master is on a different profile must not write into its ledger).
     ///
     /// # Goal-binding check
     ///
@@ -3633,7 +3649,8 @@ impl InProcessAgentOrchestrator {
         peer_slug: &str,
         task_id: Option<&str>,
         content: &str,
-    ) -> Result<String, String> {
+        cost_tokens: u64,
+    ) -> Result<(String, bool), String> {
         // Verify the goal exists under this profile AND that its owning
         // session matches the peer's originator (the goal-binding check).
         //
@@ -3650,13 +3667,33 @@ impl InProcessAgentOrchestrator {
         let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
         // #1957 — capture the REAL goal record (not just verify ownership) so we
         // can sync its authoritative objective/status/tokens into the ledger
-        // instead of the old placeholder stub. `.find` yields `&(&K,&V)`, hence
-        // `**key` for the scoped-key compare.
+        // instead of the old placeholder stub.
+        //
+        // #1965 — the capture is now a CHARGE-then-capture: peer turns draw on
+        // the SAME budget pool as master turns, so before snapshotting we add
+        // the peer turn's `cost_tokens` to the ownership-checked goal, all
+        // under the state lock. Mirrors `charge_active_goal_tokens` (budget
+        // flip + one-shot wrap-up) MINUS the continuation / rate-window /
+        // elapsed-time bumps: a peer finding is not a continuation, and peer
+        // wall-clock overlaps the master's, so charging elapsed time here
+        // would double-count it. The flip is gated on `status == "active"`
+        // (#1696 parity) — a goal the model completed or the user paused
+        // mid-flight must not be yanked to `budget_limited` by a straggler
+        // peer, while the straggler's REAL spend still lands on `tokens_used`
+        // (the budget bounds TOTAL goal spend; overshoot is real). v1
+        // non-goals: no cross-session live chip event to the master's
+        // connection (no such transport exists — the flip still gates
+        // scheduling immediately and the master's next turn repaints the
+        // chip), and in-flight peers are not halted on exhaustion.
         let goal_row = {
-            let state = self.state();
-            state
+            let mut state = self.state();
+            let now = now_ms();
+            let now_system = SystemTime::now();
+            // `.find` yields `&(&K,&mut V)`, hence `**key` for the scoped-key
+            // compare.
+            let charged = state
                 .goals
-                .iter()
+                .iter_mut()
                 .find(|(key, goal)| {
                     goal.goal_id == goal_id
                         && goal.profile_id == profile_id
@@ -3664,17 +3701,55 @@ impl InProcessAgentOrchestrator {
                             || key.to_string() == originator_session
                             || key.base_key() == originator_session)
                 })
-                .map(|(_, goal)| octos_fleet::Goal {
+                .map(|(key, goal)| {
+                    goal.tokens_used = goal.tokens_used.saturating_add(cost_tokens);
+                    goal.updated_at_ms = now;
+                    let exhausted = goal.status == "active"
+                        && goal.token_budget > 0
+                        && goal.tokens_used >= goal.token_budget
+                        && !goal.wrap_up_emitted;
+                    let wrap_up_prompt = if exhausted {
+                        goal.status = "budget_limited".to_owned();
+                        goal.wrap_up_emitted = true;
+                        Some(goal_budget_wrap_up_prompt(
+                            &goal.goal_id,
+                            goal.tokens_used,
+                            goal.token_budget,
+                        ))
+                    } else {
+                        None
+                    };
+                    (key.clone(), goal.clone(), wrap_up_prompt)
+                });
+            charged.map(|(owning_key, snapshot, wrap_up_prompt)| {
+                persist_goal_state(&state, &owning_key, &snapshot, false);
+                if let Some(prompt) = wrap_up_prompt {
+                    enqueue_goal_wrap_up(
+                        &mut state,
+                        &owning_key,
+                        &snapshot.profile_id,
+                        &snapshot.goal_id,
+                        &snapshot.objective,
+                        prompt,
+                        now_system,
+                    );
+                }
+                // The FRESH snapshot (post-charge, post-flip) feeds the ledger
+                // upsert below, so the goals row finally carries real numbers.
+                octos_fleet::Goal {
                     goal_id: goal_id.to_owned(),
-                    objective: goal.objective.clone(),
-                    status: goal.status.clone(),
-                    tokens_used: goal.tokens_used,
-                    token_budget: goal.token_budget,
-                    continuations_used: goal.continuations_used,
+                    objective: snapshot.objective.clone(),
+                    status: snapshot.status.clone(),
+                    tokens_used: snapshot.tokens_used,
+                    token_budget: snapshot.token_budget,
+                    continuations_used: snapshot.continuations_used,
                     revision: 0, // preserved on conflict by upsert_goal
-                    created_at_ms: goal.created_at_ms.max(0) as u64,
-                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
-                })
+                    created_at_ms: snapshot.created_at_ms.max(0) as u64,
+                    updated_at_ms: snapshot.updated_at_ms.max(0) as u64,
+                }
+            })
+            // The state lock drops here — all ledger file I/O below runs
+            // unlocked (mirrors `charge_active_goal_tokens`).
         };
         let Some(goal_row) = goal_row else {
             return Err(format!(
@@ -3737,7 +3812,9 @@ impl InProcessAgentOrchestrator {
             config_version: None,
             derived_from: None,
             supersedes: Vec::new(),
-            cost_tokens: 0,
+            // #1965 — the peer turn's REAL spend (already charged to the
+            // master goal above), not a hardcoded 0.
+            cost_tokens,
             created_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -3747,7 +3824,10 @@ impl InProcessAgentOrchestrator {
         ledger
             .append_finding(&finding)
             .map_err(|e| format!("failed to append peer finding: {e}"))?;
-        Ok(finding_id)
+        // #1965 codex round — report the POST-charge scheduling eligibility
+        // from the same fresh snapshot the ledger row was built from, so the
+        // caller's wake gate and the durable row can never disagree.
+        Ok((finding_id, goal_row.status == "active"))
     }
 
     /// Peer-agent-based goal: record a peer escalation into the goal's
@@ -3758,6 +3838,11 @@ impl InProcessAgentOrchestrator {
     /// `originator_session` under `profile_id`, otherwise the write is
     /// refused (a peer whose master is on a different goal must not inject
     /// escalations into a foreign goal's ledger).
+    ///
+    /// #1965 — deliberately NO `cost_tokens` / budget charge here: an
+    /// escalation parks MID-turn, and the whole turn's spend is charged
+    /// exactly once by the turn-terminal finding write. Charging here too
+    /// would double-count the parked turn.
     ///
     /// Returns the new escalation's `escalation_id`.
     #[allow(clippy::too_many_arguments)]
@@ -15340,6 +15425,228 @@ mod tests {
         // not enqueue a duplicate wrap-up.
         let _ = orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 100, 1);
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// #1965 — a peer turn's token spend must charge the SAME shared budget
+    /// pool as master turns: recording the peer finding with `cost_tokens=N`
+    /// increments the master goal's `tokens_used` by N, keeps the fresh total
+    /// on the ledger goals row, and stamps the REAL cost on the Finding row.
+    /// The goal is registered under a cwd-SCOPED store key (#1666) while the
+    /// peer's originator is the plain wire id, so the charge must ride the
+    /// same three-way ownership match the finding write already uses.
+    #[test]
+    fn peer_finding_charges_master_goal_budget_under_scoped_key() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let wire = SessionKey("octos:local:tui#coding".into());
+        orchestrator.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: wire.clone(),
+                profile_id: "octos".into(),
+                objective: "peer-charged goal".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000_000),
+                transition_actor: None,
+            })
+            .expect("set scoped active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&wire, "octos")
+            .expect("active goal id resolves through the registered scope");
+
+        let (finding_id, goal_still_active) = orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "octos",
+                &wire.0, // originator = plain wire id, matched via scoped-key resolution
+                "researcher",
+                None,
+                "[completed] found the thing",
+                12_345,
+            )
+            .expect("record peer finding");
+        assert!(
+            goal_still_active,
+            "a charge far below the budget reports the goal still active \
+             (the caller keeps enqueueing the goal-progress wake)",
+        );
+
+        // The master goal absorbed the peer turn's spend — one shared pool —
+        // WITHOUT any continuation/rate-window side effects (a peer finding
+        // is not a continuation).
+        let scoped = SessionKey(format!("{}\u{0}~cwd-aaaa111122223333", wire.0));
+        let (tokens_used, continuations_used, rate_window_count) = orchestrator
+            .goal_counters_for_test(&scoped)
+            .expect("scoped goal exists");
+        assert_eq!(tokens_used, 12_345, "peer turn charges the master goal");
+        assert_eq!(
+            continuations_used, 0,
+            "a peer finding is NOT a continuation — must not bump continuations_used",
+        );
+        assert_eq!(
+            rate_window_count, 0,
+            "peer charge must not touch the autonomous rate window",
+        );
+
+        // The ledger goals row was upserted AFTER the charge, so it carries
+        // the fresh post-charge total, and the Finding row carries the real
+        // cost (pre-#1965 both were stuck at 0).
+        let ledger_path = data_dir
+            .path()
+            .join("goal-ledgers")
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open goal ledger");
+        let goal_row = ledger
+            .get_goal(&goal_id)
+            .expect("read goals row")
+            .expect("goals row exists");
+        assert_eq!(
+            goal_row.tokens_used, 12_345,
+            "ledger goals row reflects the fresh post-charge total",
+        );
+        let findings = ledger
+            .list_findings_since(&goal_id, 0)
+            .expect("list findings");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].finding_id, finding_id);
+        assert_eq!(
+            findings[0].cost_tokens, 12_345,
+            "Finding row must carry the peer turn's REAL cost_tokens",
+        );
+
+        // A second finding accumulates on the same pool.
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "octos",
+                &wire.0,
+                "researcher",
+                None,
+                "[completed] more work",
+                655,
+            )
+            .expect("record second peer finding");
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&scoped)
+            .expect("scoped goal exists");
+        assert_eq!(tokens_used, 13_000, "peer charges accumulate");
+    }
+
+    /// #1965 — crossing `token_budget` via a peer finding flips the goal to
+    /// `budget_limited`, sets `wrap_up_emitted`, and enqueues exactly ONE
+    /// wrap-up (mirroring `charge_active_goal_tokens`); a second finding
+    /// still charges (the overshoot is real spend) but must not enqueue a
+    /// duplicate wrap-up.
+    #[test]
+    fn peer_finding_crossing_budget_flips_goal_and_enqueues_one_wrap_up() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-peer-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "exhaust via peers".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .active_goal_id(&session_id, "tenant-a")
+            .expect("active goal id");
+        // Drain the initial GoalContinue set_goal enqueues so the only
+        // continuation left after the crossing below is the wrap-up.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        // 900 + 200 >= 1_000 → the peer turn crosses the budget.
+        let (_, goal_still_active) = orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "tenant-a",
+                &session_id.0,
+                "worker",
+                None,
+                "[completed] burned the budget",
+                200,
+            )
+            .expect("record crossing peer finding");
+        assert!(
+            !goal_still_active,
+            "the crossing call itself reports the flip so the caller can \
+             skip the post-budget goal-progress wake",
+        );
+
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "peer crossing flips the goal to budget_limited",
+        );
+        assert!(
+            orchestrator
+                .state()
+                .goals
+                .get(&session_id)
+                .map(|goal| goal.wrap_up_emitted)
+                .unwrap_or(false),
+            "crossing sets wrap_up_emitted so later charges cannot re-emit",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "exactly one wrap-up enqueued by the crossing finding",
+        );
+
+        // A straggler peer finishing after exhaustion still charges (its
+        // tokens were really consumed) but must not enqueue another wrap-up.
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "tenant-a",
+                &session_id.0,
+                "worker",
+                None,
+                "[completed] straggler",
+                50,
+            )
+            .expect("record straggler peer finding");
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "no duplicate wrap-up on a post-exhaustion finding",
+        );
+        let (tokens_used, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(
+            tokens_used, 1_150,
+            "post-exhaustion peer spend still counts — the pool tracks REAL total spend",
+        );
+
+        // The one queued continuation is the wrap-up, on its dedicated reason.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
+        assert_eq!(
+            drained[0].metadata.get("wrap_up").map(String::as_str),
+            Some("true"),
+        );
     }
 
     /// #1141 — when an AppUI goal turn exhausts `token_budget`,
