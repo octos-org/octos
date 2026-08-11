@@ -228,6 +228,40 @@ impl GoalLedger {
         Ok(())
     }
 
+    /// #1957 — upsert the goal row with its REAL fields. `create_goal` was the
+    /// only writer and callers used a placeholder (objective empty, status
+    /// stale, tokens 0) purely to satisfy the findings/escalations FK, so an
+    /// audit of the ledger saw no real goal state. This writes the authoritative
+    /// objective/status/tokens/budget on first use AND keeps them fresh on every
+    /// later call. `created_at_ms` and `revision` are preserved on conflict
+    /// (a sync is not a CAS update); everything mutable is overwritten.
+    pub fn upsert_goal(&self, goal: &Goal) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(goal_id) DO UPDATE SET
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 tokens_used = excluded.tokens_used,
+                 token_budget = excluded.token_budget,
+                 continuations_used = excluded.continuations_used,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                goal.goal_id,
+                goal.objective,
+                goal.status,
+                goal.tokens_used,
+                goal.token_budget,
+                goal.continuations_used,
+                goal.revision,
+                goal.created_at_ms,
+                goal.updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Get a goal by ID.
     pub fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
         let conn = self.conn.lock().unwrap();
@@ -1431,5 +1465,53 @@ mod digest_integration_tests {
         assert_eq!(status, "resolved");
         assert_eq!(resolution.as_deref(), Some("[answer] 7"));
         assert_eq!(resolved_by.as_deref(), Some("master-session"));
+    }
+
+    // #1957 — upsert_goal writes REAL fields on insert and refreshes the mutable
+    // ones on conflict, so the ledger goals-row is no longer a stale placeholder.
+    #[test]
+    fn upsert_goal_writes_real_fields_and_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "active".to_string(),
+                tokens_used: 100,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(got.objective, "compute 6x7");
+        assert_eq!(got.tokens_used, 100);
+        // Second upsert refreshes status/tokens; created_at is preserved.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 550,
+                token_budget: 2000,
+                continuations_used: 3,
+                revision: 0,
+                created_at_ms: 9999, // must be IGNORED on conflict
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(got.status, "complete", "status must refresh");
+        assert_eq!(got.tokens_used, 550, "tokens must refresh");
+        assert_eq!(got.continuations_used, 3);
+        assert_eq!(got.objective, "compute 6x7");
+        assert_eq!(
+            got.created_at_ms, 1000,
+            "created_at must be preserved on conflict"
+        );
     }
 }

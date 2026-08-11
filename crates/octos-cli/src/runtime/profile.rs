@@ -1196,7 +1196,10 @@ impl ProfileRuntime {
                     .with_data_dir(data_dir.to_path_buf()),
             );
             tools.register(crate::goal_tool::GoalCreateTool::new(profile.id.clone()));
-            tools.register(crate::goal_tool::GoalUpdateTool::new(profile.id.clone()));
+            tools.register(
+                crate::goal_tool::GoalUpdateTool::new(profile.id.clone())
+                    .with_data_dir(data_dir.to_path_buf()),
+            );
             // #1857 PR 5a — the goal keeper's fleet controls: decompose the
             // objective onto a durable fleet (`goal_plan`) and launch its ready
             // tasks onto the live worker pool (`goal_dispatch`). `goal_get`

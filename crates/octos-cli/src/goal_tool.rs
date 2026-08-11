@@ -961,13 +961,24 @@ impl Tool for GoalDenyTool {
 /// `goal_update` — model-owned terminal transitions ONLY.
 pub struct GoalUpdateTool {
     profile_id: String,
+    /// #1957 — profile's persistent data dir, so a transition can sync the
+    /// goal-row status + a `decisions` row into `<data_dir>/goal-ledgers/`.
+    /// `None` on paths that never wired it (the sync is then skipped).
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl GoalUpdateTool {
     pub fn new(profile_id: impl Into<String>) -> Self {
         Self {
             profile_id: profile_id.into(),
+            data_dir: None,
         }
+    }
+
+    /// #1957 — set the profile data dir used to sync a transition to the ledger.
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
     }
 }
 
@@ -1144,15 +1155,30 @@ impl Tool for GoalUpdateTool {
             status,
             reason,
         ) {
-            Ok(goal) => Ok(ToolResult {
-                output: format!(
-                    "goal transitioned to `{status}`:\n{}",
-                    serde_json::to_string_pretty(&goal).unwrap_or_else(|_| goal.to_string())
-                ),
-                success: true,
-                tokens_used: verifier_usage.clone(),
-                ..Default::default()
-            }),
+            Ok(goal) => {
+                // #1957 — sync the transition into the durable ledger (goal-row
+                // status + a decisions row), so the ledger reflects the FINAL
+                // status even when the completing turn recorded no new finding.
+                // Best-effort; only when this tool carries the profile data dir.
+                if let Some(data_dir) = self.data_dir.as_ref() {
+                    default_agent_orchestrator().model_goal_record_transition_to_ledger(
+                        data_dir,
+                        &session_id,
+                        &self.profile_id,
+                        status,
+                        reason,
+                    );
+                }
+                Ok(ToolResult {
+                    output: format!(
+                        "goal transitioned to `{status}`:\n{}",
+                        serde_json::to_string_pretty(&goal).unwrap_or_else(|_| goal.to_string())
+                    ),
+                    success: true,
+                    tokens_used: verifier_usage.clone(),
+                    ..Default::default()
+                })
+            }
             Err(message) => Ok(ToolResult {
                 output: format!("goal_update: {message}"),
                 success: false,

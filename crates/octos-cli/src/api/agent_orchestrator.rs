@@ -3482,6 +3482,72 @@ impl InProcessAgentOrchestrator {
         Ok(autonomy_goal_json(&snapshot))
     }
 
+    /// #1957 — sync a goal transition into the durable ledger: upsert the goal
+    /// row with its now-current status/tokens AND append a `decisions` row
+    /// recording the transition. Without this the ledger goals-row showed the
+    /// status as of the last peer finding (usually `active`, since completing a
+    /// goal records no finding) and the `decisions` table was never written at
+    /// all. Best-effort — a ledger failure never affects the in-memory
+    /// transition the caller already committed. Opens (creates) the ledger,
+    /// since a transition can be the FIRST ledger write for a finding-less goal.
+    pub(crate) fn model_goal_record_transition_to_ledger(
+        &self,
+        profile_data_dir: &std::path::Path,
+        session_id: &SessionKey,
+        profile_id: &str,
+        status: &str,
+        reason: &str,
+    ) {
+        let key = self.scoped_goal_key(session_id);
+        let goal_row = {
+            let state = self.state();
+            match state.goals.get(&key) {
+                Some(goal) if goal.profile_id == profile_id => octos_fleet::Goal {
+                    goal_id: goal.goal_id.clone(),
+                    objective: goal.objective.clone(),
+                    status: goal.status.clone(),
+                    tokens_used: goal.tokens_used,
+                    token_budget: goal.token_budget,
+                    continuations_used: goal.continuations_used,
+                    revision: 0,
+                    created_at_ms: goal.created_at_ms.max(0) as u64,
+                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
+                },
+                _ => return,
+            }
+        };
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        if std::fs::create_dir_all(&ledger_dir).is_err() {
+            return;
+        }
+        let ledger_path = ledger_dir.join(format!(
+            "{}.db",
+            sanitize_filename_for_ledger(&goal_row.goal_id)
+        ));
+        let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) else {
+            return;
+        };
+        let _ = ledger.upsert_goal(&goal_row);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let decision = octos_fleet::Decision {
+            decision_id: format!("dec-{}-{}", goal_row.goal_id, uuid::Uuid::now_v7()),
+            goal_id: goal_row.goal_id.clone(),
+            task_id: None,
+            question: format!("transition goal to `{status}`"),
+            options_considered: None,
+            choice: status.to_owned(),
+            rationale: reason.chars().take(1000).collect(),
+            based_on_findings: None,
+            based_on_rev: 0,
+            decided_at_ms: now_ms,
+            decided_by: session_id.to_string(),
+        };
+        let _ = ledger.append_decision(&decision);
+    }
+
     /// Peer-agent-based goal: record a peer finding into the goal's durable
     /// ledger. This is the persistence half of `model_goal_peer_findings`
     /// (which scans live `result.md` files): once a peer completes, its
@@ -3527,22 +3593,41 @@ impl InProcessAgentOrchestrator {
         // — it equals the goal's stored key (the same resolution `active_goal_id`
         // used to auto-bind the peer here in the first place).
         let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
-        let state = self.state();
-        let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
-            goal.goal_id == goal_id
-                && goal.profile_id == profile_id
-                && (*key == originator_scoped
-                    || key.to_string() == originator_session
-                    || key.base_key() == originator_session)
-        });
-        drop(state);
-        if !goal_owner_matches {
+        // #1957 — capture the REAL goal record (not just verify ownership) so we
+        // can sync its authoritative objective/status/tokens into the ledger
+        // instead of the old placeholder stub. `.find` yields `&(&K,&V)`, hence
+        // `**key` for the scoped-key compare.
+        let goal_row = {
+            let state = self.state();
+            state
+                .goals
+                .iter()
+                .find(|(key, goal)| {
+                    goal.goal_id == goal_id
+                        && goal.profile_id == profile_id
+                        && (**key == originator_scoped
+                            || key.to_string() == originator_session
+                            || key.base_key() == originator_session)
+                })
+                .map(|(_, goal)| octos_fleet::Goal {
+                    goal_id: goal_id.to_owned(),
+                    objective: goal.objective.clone(),
+                    status: goal.status.clone(),
+                    tokens_used: goal.tokens_used,
+                    token_budget: goal.token_budget,
+                    continuations_used: goal.continuations_used,
+                    revision: 0, // preserved on conflict by upsert_goal
+                    created_at_ms: goal.created_at_ms.max(0) as u64,
+                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
+                })
+        };
+        let Some(goal_row) = goal_row else {
             return Err(format!(
                 "goal `{goal_id}` is not owned by originator session `{originator_session}` \
                  under profile `{profile_id}` — refusing to record peer finding into a \
                  foreign goal's ledger"
             ));
-        }
+        };
         // The ledger is keyed by goal_id; open (creating on first use) the
         // per-profile goal ledger under the orchestrator's data dir. We use
         // a stable path so all peers of the same goal land in the same file.
@@ -3556,29 +3641,15 @@ impl InProcessAgentOrchestrator {
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
         let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
-        // FK constraint: findings reference goals(goal_id), so we must
-        // upsert the goal row BEFORE appending a finding. Without this,
-        // a fresh ledger would reject the append (codex PR review #3).
-        // We use a minimal goal stub (objective/status unknown at this
-        // layer; the master owns the authoritative record in the goal
-        // store). If the goal already exists, this is a no-op.
+        // FK constraint: findings reference goals(goal_id), so we must upsert
+        // the goal row BEFORE appending a finding. #1957 — write the goal's REAL
+        // objective/status/tokens/budget (captured above) so the ledger reflects
+        // the authoritative state, and keep it fresh on every finding.
+        let _ = ledger.upsert_goal(&goal_row);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let goal_stub = octos_fleet::Goal {
-            goal_id: goal_id.to_owned(),
-            objective: String::new(), // unknown at this layer; master owns it
-            status: "active".to_owned(),
-            tokens_used: 0,
-            token_budget: 0,
-            continuations_used: 0,
-            revision: 0, // assigned by store on update
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        };
-        // Ignore "already exists" errors (goal row already present).
-        let _ = ledger.create_goal(&goal_stub);
         // FK constraint: findings with task_id reference tasks(task_id), so
         // we must ALSO upsert a task stub when task_id is Some (codex PR
         // review merge blocker). Same minimal-stub pattern as goals above.
@@ -3649,22 +3720,39 @@ impl InProcessAgentOrchestrator {
         // the #1666 scoped-key match): the goal record's owning session must
         // match the peer's originator.
         let originator_scoped = self.scoped_goal_key(&SessionKey(originator_session.to_owned()));
-        let state = self.state();
-        let goal_owner_matches = state.goals.iter().any(|(key, goal)| {
-            goal.goal_id == goal_id
-                && goal.profile_id == profile_id
-                && (*key == originator_scoped
-                    || key.to_string() == originator_session
-                    || key.base_key() == originator_session)
-        });
-        drop(state);
-        if !goal_owner_matches {
+        // #1957 — capture the REAL goal so the ledger row carries its
+        // authoritative objective/status/tokens (see the finding path).
+        let goal_row = {
+            let state = self.state();
+            state
+                .goals
+                .iter()
+                .find(|(key, goal)| {
+                    goal.goal_id == goal_id
+                        && goal.profile_id == profile_id
+                        && (**key == originator_scoped
+                            || key.to_string() == originator_session
+                            || key.base_key() == originator_session)
+                })
+                .map(|(_, goal)| octos_fleet::Goal {
+                    goal_id: goal_id.to_owned(),
+                    objective: goal.objective.clone(),
+                    status: goal.status.clone(),
+                    tokens_used: goal.tokens_used,
+                    token_budget: goal.token_budget,
+                    continuations_used: goal.continuations_used,
+                    revision: 0,
+                    created_at_ms: goal.created_at_ms.max(0) as u64,
+                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
+                })
+        };
+        let Some(goal_row) = goal_row else {
             return Err(format!(
                 "goal `{goal_id}` is not owned by originator session `{originator_session}` \
                  under profile `{profile_id}` — refusing to record peer escalation into a \
                  foreign goal's ledger"
             ));
-        }
+        };
         let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
         std::fs::create_dir_all(&ledger_dir).map_err(|e| {
             format!(
@@ -3675,25 +3763,13 @@ impl InProcessAgentOrchestrator {
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
         let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
-        // FK constraint: escalations reference goals(goal_id), so we must
-        // upsert the goal row BEFORE appending an escalation (codex PR
-        // review #3). Same minimal-stub pattern as findings above.
+        // FK constraint: escalations reference goals(goal_id) — upsert the goal
+        // row (with REAL fields, #1957) BEFORE appending an escalation.
+        let _ = ledger.upsert_goal(&goal_row);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let goal_stub = octos_fleet::Goal {
-            goal_id: goal_id.to_owned(),
-            objective: String::new(),
-            status: "active".to_owned(),
-            tokens_used: 0,
-            token_budget: 0,
-            continuations_used: 0,
-            revision: 0, // assigned by store on update
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-        };
-        let _ = ledger.create_goal(&goal_stub);
         // FK constraint: escalations with task_id reference tasks(task_id),
         // so we must ALSO upsert a task stub when task_id is Some (codex PR
         // review merge blocker). Same minimal-stub pattern as findings above.
