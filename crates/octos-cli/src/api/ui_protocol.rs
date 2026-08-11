@@ -33865,6 +33865,48 @@ async fn run_standalone_turn(
         // guard avoids that.
     }
 
+    // Peer-goal soak fix (bug 5): INTERACTIVE turns pass `goal_context = None`,
+    // so the post-turn chip repaint above (gated on `Some(goal_ctx)`) never
+    // runs. A model-driven `goal_update(complete|blocked)` during an
+    // interactive turn therefore left the goal chip stale at `active` while
+    // `goal_get` already reported `complete`. Emit the same ephemeral
+    // `SessionGoalUpdated` for interactive turns so the chip repaints live.
+    // The goal record lives under the cwd-scoped store key; resolve it from the
+    // wire `session_id` (`scoped_goal_key` is idempotent for already-scoped and
+    // unscoped keys) — `session_goal_updated_event_json` emits the wire id in
+    // the event for the client, and returns `None` (no emit) when this session
+    // has no goal, so a plain chat turn stays silent.
+    if goal_context.is_none() {
+        let profile_for_goal = session_id
+            .profile_id()
+            .map(ToOwned::to_owned)
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_default();
+        let scoped_goal_key = default_agent_orchestrator().scoped_goal_key(&session_id);
+        if let Some(goal_event_json) = default_agent_orchestrator()
+            .session_goal_updated_event_json(&scoped_goal_key, &profile_for_goal)
+        {
+            match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
+                goal_event_json,
+            ) {
+                Ok(event) => {
+                    let _ = send_notification_ephemeral(
+                        &ws,
+                        &ledger,
+                        UiNotification::SessionGoalUpdated(event),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        session_id = %session_id,
+                        "interactive goal chip repaint produced an unparseable update event",
+                    );
+                }
+            }
+        }
+    }
+
     // FIX-06: a turn that ends — for any reason — must drop its
     // `approve_for_turn` policy entries so a subsequent turn can't reuse
     // them. The state-machine entry itself is intentionally retained here
