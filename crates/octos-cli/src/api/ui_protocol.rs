@@ -29838,6 +29838,16 @@ async fn run_standalone_turn(
     // idempotent no-op that also covers turns whose runtime re-materialized
     // (e.g. after cache eviction) without a fresh open.
     register_session_ledger_scope(&ledger, &session_runtime);
+    // Peer-goal soak fix (codex High #3): PIN this turn's cwd-scoped goal store
+    // key now, right after the scope was (re-)registered above, instead of
+    // re-resolving it at turn completion. `goal_scopes` is a process-global
+    // last-writer-wins map keyed by the plain wire id (`set_goal_scope`), so a
+    // second folder sharing this wire id that opens/activates mid-turn would
+    // overwrite it — and a turn-end re-resolve would then read that OTHER
+    // folder's goal and repaint it onto THIS connection's chip. Capturing here
+    // mirrors how the autonomous path pins `goal_ctx.goal_session_key` at
+    // dispatch.
+    let turn_pinned_goal_key = default_agent_orchestrator().scoped_goal_key(&session_id);
     let usage_profile_id = active_profile_id
         .clone()
         .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
@@ -33871,20 +33881,17 @@ async fn run_standalone_turn(
     // interactive turn therefore left the goal chip stale at `active` while
     // `goal_get` already reported `complete`. Emit the same ephemeral
     // `SessionGoalUpdated` for interactive turns so the chip repaints live.
-    // The goal record lives under the cwd-scoped store key; resolve it from the
-    // wire `session_id` (`scoped_goal_key` is idempotent for already-scoped and
-    // unscoped keys) — `session_goal_updated_event_json` emits the wire id in
-    // the event for the client, and returns `None` (no emit) when this session
-    // has no goal, so a plain chat turn stays silent.
+    // Use the TURN-PINNED scoped key (codex High #3 — do not re-resolve the
+    // last-writer-wins scope map at turn end) and `usage_profile_id` (codex
+    // Med #4 — the runtime-resolved profile, which is `_main` for a
+    // profile-less session, not the `""` a raw `session_id.profile_id()` would
+    // yield → the `_main` goal would never match).
+    // `session_goal_updated_event_json` emits the wire id in the event for the
+    // client, and returns `None` (no emit) when this session has no goal, so a
+    // plain chat turn stays silent.
     if goal_context.is_none() {
-        let profile_for_goal = session_id
-            .profile_id()
-            .map(ToOwned::to_owned)
-            .or_else(|| routed_profile_id.clone())
-            .unwrap_or_default();
-        let scoped_goal_key = default_agent_orchestrator().scoped_goal_key(&session_id);
         if let Some(goal_event_json) = default_agent_orchestrator()
-            .session_goal_updated_event_json(&scoped_goal_key, &profile_for_goal)
+            .session_goal_updated_event_json(&turn_pinned_goal_key, &usage_profile_id)
         {
             match serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
                 goal_event_json,

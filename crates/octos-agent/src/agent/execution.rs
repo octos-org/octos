@@ -558,10 +558,14 @@ impl Agent {
     ) -> JoinHandle<ToolCallResult> {
         // Clone Arc-wrapped fields so the spawned task is 'static
         let tools = self.tools.clone();
-        // Peer-goal soak fix: pre-clone the real LLM provider so the spawned
-        // foreground ToolContext can carry it (see the `llm_provider` field
-        // below). Cannot borrow `self` inside the 'static spawned task.
+        // Peer-goal soak fix: pre-clone the real LLM provider + this agent's
+        // goal/task/originator identity so the spawned foreground ToolContext
+        // can carry them (see the fields below). Cannot borrow `self` inside
+        // the 'static spawned task.
         let llm = self.llm.clone();
+        let ctx_goal_id = self.goal_id.clone();
+        let ctx_task_id = self.task_id.clone();
+        let ctx_originator_session = self.originator_session.clone();
         let reporter = self.reporter();
         let hooks = self.hooks.clone();
         let hook_ctx = self.hook_ctx();
@@ -2079,11 +2083,21 @@ impl Agent {
                 // the real provider the verifier fails with "no real provider"
                 // and `goal_update(complete)` can never succeed. Mirror the
                 // approval path (`execute_approved_tool`), which already sets
-                // this. NOTE: intentionally do NOT thread `goal_id` here — the
-                // master's `goal_update` relies on `ctx.goal_id == None` to
-                // fall through to the master-completion path instead of the
-                // peer-reject branch in `goal_tool`.
+                // this.
                 llm_provider: llm.clone(),
+                // Peer-goal soak fix (codex High #1): thread this agent's
+                // goal/task/originator identity through to the foreground tool
+                // ctx. Peer boot sets these on the Agent (`with_goal_id` etc.),
+                // but they were dropped here — so a peer's `goal_get` took the
+                // session path (its own goal-less session → `status: none`) and
+                // `goal_update` missed its peer-reject branch. These are `None`
+                // for every master agent (interactive AND autonomous — the only
+                // production `Agent::with_goal_id` is the peer-boot guard;
+                // masters carry the goal via `goal_context`), so the master
+                // still reaches the master-completion path.
+                goal_id: ctx_goal_id.clone(),
+                task_id: ctx_task_id.clone(),
+                originator_session: ctx_originator_session.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
