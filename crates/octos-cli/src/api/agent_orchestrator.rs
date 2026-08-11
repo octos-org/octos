@@ -3735,6 +3735,37 @@ impl InProcessAgentOrchestrator {
         Ok(escalation_id)
     }
 
+    /// #1961 — the resolution half of [`Self::model_goal_record_peer_escalation`].
+    /// When `peer_respond` answers a peer's parked question/approval, mark the
+    /// peer's OPEN escalation resolved in the goal ledger. Best-effort: returns
+    /// the number of rows updated, and a missing ledger / no-open-escalation is
+    /// a benign `Ok(0)` (a goal-less peer never recorded one). The ledger is
+    /// opened, not created — if the goal never recorded an escalation there is
+    /// nothing to resolve.
+    pub(crate) fn model_goal_resolve_peer_escalation(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+        peer_slug: &str,
+        resolution: &str,
+        resolved_by: &str,
+    ) -> Result<usize, String> {
+        let ledger_path = Self::goal_ledger_dir(profile_data_dir)
+            .join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
+        if !ledger_path.exists() {
+            return Ok(0);
+        }
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path)
+            .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        ledger
+            .resolve_escalation(peer_slug, resolution, resolved_by, now_ms)
+            .map_err(|e| format!("failed to resolve peer escalation: {e}"))
+    }
+
     /// Directory holding this profile's per-goal ledgers. Resolved under the
     /// profile's persistent `data_dir` so ledgers (a) survive restarts and
     /// `/tmp` cleanup, (b) are profile-isolated (a peer on profile A cannot

@@ -14868,6 +14868,9 @@ fn peer_respond_resolve(
         }
     };
 
+    // #1961 — the human-readable resolution to stamp on the goal-ledger
+    // escalation once the answer/decision is delivered below.
+    let escalation_resolution: String;
     match target.kind {
         PeerPendingKind::Approval => {
             let Some(decision) = req.decision.as_deref() else {
@@ -14877,6 +14880,7 @@ fn peer_respond_resolve(
                     id = target.id
                 ));
             };
+            escalation_resolution = format!("[approval] {decision}");
             let approval_id: ApprovalId =
                 serde_json::from_value(serde_json::Value::String(target.id.clone()))
                     .map_err(|_| format!("peer '{slug}' pending id is malformed"))?;
@@ -14914,6 +14918,18 @@ fn peer_respond_resolve(
                     id = target.id
                 ));
             };
+            escalation_resolution = format!(
+                "[answer] {}",
+                req_answers
+                    .iter()
+                    .map(|a| if a.selected_labels.is_empty() {
+                        a.free_text.clone().unwrap_or_default()
+                    } else {
+                        a.selected_labels.join("/")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
             let question_id: octos_core::ui_protocol::QuestionId =
                 serde_json::from_value(serde_json::Value::String(target.id.clone()))
                     .map_err(|_| format!("peer '{slug}' pending id is malformed"))?;
@@ -14941,6 +14957,32 @@ fn peer_respond_resolve(
                 .map_err(|err| {
                     format!("could not resolve peer '{slug}' question: {}", err.message)
                 })?;
+        }
+    }
+    // #1961 — the answer/decision was delivered above; mark this peer's OPEN
+    // escalation resolved in the goal ledger so its durable escalation history
+    // stops showing it as open. Best-effort: a goal-less peer, a missing
+    // ledger, or no open escalation is a benign no-op, and a ledger write
+    // failure must NOT fail the resume the caller already committed to.
+    if let Some(peer_dir) = staged_peer_dir(peers_root, &slug) {
+        let goal_id = peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
+            .and_then(|body| body.lines().next().map(|l| l.trim().to_owned()))
+            .filter(|s| !s.is_empty());
+        if let (Some(goal_id), Some(data_dir)) = (goal_id, peers_root.parent()) {
+            if let Err(err) = default_agent_orchestrator().model_goal_resolve_peer_escalation(
+                data_dir,
+                &goal_id,
+                &slug,
+                &escalation_resolution,
+                origin_session,
+            ) {
+                tracing::warn!(
+                    slug = %slug,
+                    goal_id = %goal_id,
+                    error = %err,
+                    "peer-goal: failed to resolve escalation in goal ledger (answer already delivered)"
+                );
+            }
         }
     }
     Ok(())
