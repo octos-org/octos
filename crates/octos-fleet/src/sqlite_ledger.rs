@@ -486,6 +486,30 @@ impl GoalLedger {
         Ok(rowid)
     }
 
+    /// #1961 — mark this peer's OPEN escalation resolved. `append_escalation`
+    /// only ever wrote the `open` row; without this the ledger's escalation
+    /// history showed every answered escalation as perpetually open. A peer
+    /// parks one prompt at a time (depth-1), so matching `peer_id` + the
+    /// `open` status resolves exactly the escalation just answered. Returns the
+    /// number of rows updated (0 when there was no open escalation — e.g. an
+    /// approval on a goal-less peer, or a double-resolve).
+    pub fn resolve_escalation(
+        &self,
+        peer_id: &str,
+        resolution: &str,
+        resolved_by: &str,
+        resolved_at_ms: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE escalations
+             SET status = 'resolved', resolution = ?1, resolved_by = ?2, resolved_at_ms = ?3
+             WHERE peer_id = ?4 AND status = 'open'",
+            params![resolution, resolved_by, resolved_at_ms, peer_id],
+        )?;
+        Ok(updated)
+    }
+
     /// Append a decision to the ledger.
     pub fn append_decision(&self, decision: &Decision) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
@@ -1348,5 +1372,64 @@ mod digest_integration_tests {
                 lifecycle, expected_status
             );
         }
+    }
+
+    // #1961 — an answered escalation must become `resolved` in the ledger.
+    #[test]
+    fn resolve_escalation_marks_the_open_row_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        let goal = Goal {
+            goal_id: "g1".to_string(),
+            objective: "test".to_string(),
+            status: "active".to_string(),
+            tokens_used: 0,
+            token_budget: 10000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&goal).unwrap();
+        let esc = Escalation {
+            escalation_id: "esc-picker-1".to_string(),
+            goal_id: "g1".to_string(),
+            task_id: None,
+            peer_id: "picker".to_string(),
+            question: "7 or 8?".to_string(),
+            context: None,
+            status: "open".to_string(),
+            default_action: None,
+            default_after_secs: None,
+            created_at_ms: 1000,
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        };
+        ledger.append_escalation(&esc).unwrap();
+
+        let updated = ledger
+            .resolve_escalation("picker", "[answer] 7", "master-session", 2000)
+            .unwrap();
+        assert_eq!(updated, 1, "the one open escalation must be resolved");
+
+        // A second resolve is a no-op (no open rows left) — idempotent.
+        let again = ledger
+            .resolve_escalation("picker", "[answer] 7", "master-session", 2001)
+            .unwrap();
+        assert_eq!(again, 0, "double-resolve must not update anything");
+
+        let conn = ledger.conn.lock().unwrap();
+        let (status, resolution, resolved_by): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolution, resolved_by FROM escalations WHERE escalation_id = 'esc-picker-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "resolved");
+        assert_eq!(resolution.as_deref(), Some("[answer] 7"));
+        assert_eq!(resolved_by.as_deref(), Some("master-session"));
     }
 }
