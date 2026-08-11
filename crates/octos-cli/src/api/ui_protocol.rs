@@ -36789,11 +36789,61 @@ fn send_notification_lifecycle_forced_backpressure_fixture(
     Err(SendError::LifecycleFailure(reason.into()))
 }
 
+/// #1959 — per-session monotonic guard for goal chip events. Returns `false`
+/// (DROP) when a `SessionGoalUpdated` / `SessionGoalCleared` carries a
+/// `generation` that is not greater than the last goal event already emitted
+/// for the same wire session — so a stale update that races behind a clear can
+/// never be delivered after it (the client would otherwise resurrect the
+/// cleared chip). Non-goal notifications and legacy `generation == 0` events
+/// (older backend, or events built before #1959) always pass. Both direct-send
+/// boundaries (`send_notification_durable` for the RPC-derived clear,
+/// `send_notification_ephemeral` for the interactive update) funnel through
+/// here, so ordering holds regardless of which path an event takes.
+fn goal_event_passes_generation_guard(notification: &UiNotification) -> bool {
+    // fn-local process-global: wire session id -> last emitted goal generation.
+    static GUARD: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
+    let (session, generation) = match notification {
+        UiNotification::SessionGoalUpdated(e) => (e.session_id.0.as_str(), e.generation),
+        UiNotification::SessionGoalCleared(e) => (e.session_id.0.as_str(), e.generation),
+        _ => return true,
+    };
+    let map = GUARD.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    goal_event_generation_admits(&mut guard, session, generation)
+}
+
+/// Pure core of [`goal_event_passes_generation_guard`] (extracted for testing:
+/// the outer fn's `static` map can't be reset between tests). Admits an event
+/// only when its `generation` strictly exceeds the last admitted generation for
+/// the session, recording it. Legacy `generation == 0` always admits and never
+/// updates the watermark (an old backend never stamps, so gating on it would
+/// wedge the chip).
+fn goal_event_generation_admits(
+    last_by_session: &mut HashMap<String, u64>,
+    session: &str,
+    generation: u64,
+) -> bool {
+    if generation == 0 {
+        return true;
+    }
+    let last = last_by_session.get(session).copied().unwrap_or(0);
+    if generation <= last {
+        return false;
+    }
+    last_by_session.insert(session.to_string(), generation);
+    true
+}
+
 fn send_notification_durable(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
+    // #1959 — drop a goal chip event that a newer clear/update already
+    // superseded for this session (see the guard's doc comment).
+    if !goal_event_passes_generation_guard(&notification) {
+        return Ok(());
+    }
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
     // set `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
@@ -36848,6 +36898,11 @@ fn send_notification_ephemeral(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
+    // #1959 — drop a stale goal chip update that a newer clear already
+    // superseded for this session (see `goal_event_passes_generation_guard`).
+    if !goal_event_passes_generation_guard(&notification) {
+        return Ok(());
+    }
     // Ephemeral frames are NOT appended to the ledger — they are explicitly
     // non-durable per spec § 9. Drops never need a `replay_lossy` summary.
     // Every legacy `message/delta` send funnels through here exactly once

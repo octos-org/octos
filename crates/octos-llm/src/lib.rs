@@ -47,8 +47,8 @@ pub use adaptive::{
     AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, AutoEscalationCallback,
     AutoEscalationConfig, AutoEscalationDecision, AutoEscalationEvent, BaselineEntry,
     FailoverEvent, MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, RouterContext,
-    SharedMetrics, SharedPolicy, SharedProviderMetrics, StatusCallback, derive_cold_start_catalog,
-    with_router_context,
+    SharedMetrics, SharedPolicy, SharedProviderMetrics, StatusCallback, current_router_context,
+    derive_cold_start_catalog, with_router_context,
 };
 pub use call_policy::{LlmCallPolicy, current_llm_call_policy, with_llm_call_policy};
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};

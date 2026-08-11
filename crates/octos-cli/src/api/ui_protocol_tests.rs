@@ -31519,3 +31519,39 @@ fn session_workspace_store_isolates_same_bare_session_id_by_profile() {
         None
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1959 — goal-event generation guard: a stale update can't overtake a clear.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn goal_event_generation_admits_should_drop_stale_update_after_clear() {
+    let mut last = std::collections::HashMap::new();
+    let s = "dev:local:tui#coding";
+    // The turn snapshots an update at generation 5 (admitted).
+    assert!(goal_event_generation_admits(&mut last, s, 5));
+    // A racing clear bumps to 6 and is emitted first (admitted).
+    assert!(goal_event_generation_admits(&mut last, s, 6));
+    // The stale update (generation 5) now arrives — MUST be dropped so it
+    // cannot resurrect the cleared chip.
+    assert!(!goal_event_generation_admits(&mut last, s, 5));
+    // An equal generation is also stale (strictly-greater rule).
+    assert!(!goal_event_generation_admits(&mut last, s, 6));
+    // A genuinely newer event still passes.
+    assert!(goal_event_generation_admits(&mut last, s, 7));
+}
+
+#[test]
+fn goal_event_generation_admits_should_be_per_session_and_pass_legacy_zero() {
+    let mut last = std::collections::HashMap::new();
+    // Sessions are independent: a high generation on A doesn't gate B.
+    assert!(goal_event_generation_admits(&mut last, "sessionA", 100));
+    assert!(goal_event_generation_admits(&mut last, "sessionB", 1));
+    // Legacy/unstamped events (generation 0) always pass and never move the
+    // watermark (an old backend never stamps, so gating would wedge the chip).
+    assert!(goal_event_generation_admits(&mut last, "sessionA", 0));
+    assert!(goal_event_generation_admits(&mut last, "sessionA", 0));
+    // A's watermark is still 100 from before — a lower real generation drops.
+    assert!(!goal_event_generation_admits(&mut last, "sessionA", 50));
+    assert!(goal_event_generation_admits(&mut last, "sessionA", 101));
+}

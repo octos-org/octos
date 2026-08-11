@@ -1072,6 +1072,12 @@ impl Tool for GoalUpdateTool {
         // completion, we call run_goal_completion_verifier to independently check
         // the objective against the model's evidence. Blocked transitions skip
         // verification (they're failure declarations, not success claims).
+        // #1958: the verifier makes a real LLM call — capture its token usage
+        // and stamp it on whatever ToolResult we return so the agent's usage
+        // aggregation (ToolResult.tokens_used) folds it into turn / goal-budget
+        // accounting instead of dropping it. `None` for a `blocked` transition
+        // (no verifier runs).
+        let mut verifier_usage: Option<octos_core::TokenUsage> = None;
         if status == "complete" {
             let orchestrator = default_agent_orchestrator();
             let Some(objective) = orchestrator.goal_objective_for_test(&session_id) else {
@@ -1085,12 +1091,21 @@ impl Tool for GoalUpdateTool {
             // completing the wrong goal if it changes during the await.
             let expected_goal_id = orchestrator.goal_id_for_session(&session_id);
             // The evidence is the model's reason for claiming completion.
-            let verdict = crate::api::agent_orchestrator::run_goal_completion_verifier(
-                ctx.llm_provider.clone(),
-                &objective,
-                reason,
-            )
-            .await;
+            let (verdict, usage) =
+                crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage(
+                    ctx.llm_provider.clone(),
+                    &objective,
+                    reason,
+                )
+                .await;
+            // octos_llm::TokenUsage -> octos_core::TokenUsage (same fields).
+            verifier_usage = Some(octos_core::TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+            });
             if !verdict.is_done() {
                 return Ok(ToolResult {
                     output: format!(
@@ -1103,6 +1118,7 @@ impl Tool for GoalUpdateTool {
                         }
                     ),
                     success: false,
+                    tokens_used: verifier_usage.clone(),
                     ..Default::default()
                 });
             }
@@ -1116,6 +1132,7 @@ impl Tool for GoalUpdateTool {
                         expected_goal_id, current_goal_id
                     ),
                     success: false,
+                    tokens_used: verifier_usage.clone(),
                     ..Default::default()
                 });
             }
@@ -1133,11 +1150,13 @@ impl Tool for GoalUpdateTool {
                     serde_json::to_string_pretty(&goal).unwrap_or_else(|_| goal.to_string())
                 ),
                 success: true,
+                tokens_used: verifier_usage.clone(),
                 ..Default::default()
             }),
             Err(message) => Ok(ToolResult {
                 output: format!("goal_update: {message}"),
                 success: false,
+                tokens_used: verifier_usage.clone(),
                 ..Default::default()
             }),
         }

@@ -3187,21 +3187,31 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
         profile_id: &str,
     ) -> Option<Value> {
-        let state = self.state();
-        let goal = state
-            .goals
-            .get(session_id)
-            .filter(|goal| goal.profile_id == profile_id)?;
+        let mut state = self.state();
+        // Build the goal JSON in a scoped borrow so the immutable `goal`
+        // reference is released before the mutable generation bump below.
+        let goal_json = {
+            let goal = state
+                .goals
+                .get(session_id)
+                .filter(|goal| goal.profile_id == profile_id)?;
+            autonomy_goal_json(goal)
+        };
         // #1666 residue — `session_id` here is the goal STORE identity (the
         // cwd-scoped key for an AppUI folder), but the client keys the goal
         // chip by the plain WIRE id and would drop an event carrying a scoped
         // key. Emit the wire id in the event while looking up under the scoped
         // key. Unscoped/gateway keys strip to themselves (no-op).
         let wire_id = wire_key_from_goal_key(session_id);
+        // #1959 — stamp a monotonic generation so a stale update can't
+        // resurrect a cleared goal on the client (see the field's doc comment).
+        state.goal_event_generation += 1;
+        let generation = state.goal_event_generation;
         Some(json!({
             "session_id": wire_id,
             "profile_id": profile_id,
-            "goal": autonomy_goal_json(goal),
+            "goal": goal_json,
+            "generation": generation,
             "transition_actor": "backend",
         }))
     }
@@ -5670,11 +5680,18 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         if cleared {
             persist_goal_cleared(&state, &key, &request.profile_id);
         }
+        // #1959 — stamp the same monotonic generation as `SessionGoalUpdated`
+        // so the client can order a clear against a racing stale update. A
+        // stale update always bumps before this clear (its goal read preceded
+        // the removal above), so `update.generation < clear.generation`.
+        state.goal_event_generation += 1;
+        let generation = state.goal_event_generation;
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
             "cleared": cleared,
             "goal": Value::Null,
+            "generation": generation,
             "transition_actor": "user"
         }))
     }
@@ -6060,6 +6077,14 @@ struct AutonomyRuntimeState {
     fleet_pool: Option<Arc<FleetWorkerPool>>,
     next_goal_seq: u64,
     next_loop_seq: u64,
+    /// #1959 — monotonic generation bumped every time a goal event
+    /// (`SessionGoalUpdated` / `SessionGoalCleared`) is built, under the state
+    /// lock. Stamped onto both events so the client can drop a stale update
+    /// that races behind a clear: in the race the stale update always bumps
+    /// (and stamps) BEFORE the clear (else its goal read would find nothing and
+    /// emit no event), so `stale_update.generation < clear.generation` always
+    /// holds and the client keeps the newer clear.
+    goal_event_generation: u64,
     /// #991 / M15-B — per-agent cancellation handles registered by
     /// `run_native_specialist` (and future specialist runners) so that
     /// `interrupt_agent` / `close_agent` can signal a *real* abort to
@@ -7236,6 +7261,20 @@ pub(crate) async fn run_goal_completion_verifier(
     objective: &str,
     evidence: &str,
 ) -> GoalCompletionVerdict {
+    run_goal_completion_verifier_with_usage(provider, objective, evidence)
+        .await
+        .0
+}
+
+/// Like [`run_goal_completion_verifier`], but also returns the verifier LLM
+/// call's [`TokenUsage`] so the caller can fold it into turn / goal-budget
+/// accounting (#1958). The verifier now makes a real provider call, so its
+/// tokens must not be silently dropped. On a provider error the usage is zero.
+pub(crate) async fn run_goal_completion_verifier_with_usage(
+    provider: Arc<dyn LlmProvider>,
+    objective: &str,
+    evidence: &str,
+) -> (GoalCompletionVerdict, octos_llm::TokenUsage) {
     let prompt = format!(
         "You are an INDEPENDENT completion verifier. Do not assume the work is \
 done just because the agent said so.\n\nGOAL OBJECTIVE:\n{objective}\n\nThe \
@@ -7255,12 +7294,15 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         context_management: None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
-    let verdict_text = match provider.chat(&messages, &[], &config).await {
-        Ok(response) => response.content.unwrap_or_default(),
+    let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {
+        Ok(response) => (response.content.unwrap_or_default(), response.usage),
         Err(error) => {
-            return GoalCompletionVerdict::NotDone {
-                reason: format!("verifier call failed: {error}"),
-            };
+            return (
+                GoalCompletionVerdict::NotDone {
+                    reason: format!("verifier call failed: {error}"),
+                },
+                octos_llm::TokenUsage::default(),
+            );
         }
     };
     // "Done" only on an explicit affirmative that is NOT negated. Checking the
@@ -7273,13 +7315,14 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         .next()
         .unwrap_or("")
         .to_ascii_uppercase();
-    if first_token == "DONE" {
+    let verdict = if first_token == "DONE" {
         GoalCompletionVerdict::Done
     } else {
         GoalCompletionVerdict::NotDone {
             reason: trimmed.chars().take(200).collect(),
         }
-    }
+    };
+    (verdict, usage)
 }
 
 fn enqueue_agent_terminal_continuations(

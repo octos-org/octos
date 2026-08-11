@@ -5898,6 +5898,14 @@ pub struct SessionGoalUpdatedEvent {
     pub profile_id: Option<String>,
     pub goal: UiGoalRecord,
     pub transition_actor: String,
+    /// #1959 — monotonic generation stamped by the backend on every goal
+    /// event. A client MUST drop a `SessionGoalUpdated` whose `generation` is
+    /// not greater than the last goal event it applied for this session, so a
+    /// stale update can't overtake a `SessionGoalCleared` and resurrect the
+    /// chip. `0` (the serde default) means an older backend that doesn't stamp;
+    /// clients treat `0` as "always apply" for backward compatibility.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5910,6 +5918,11 @@ pub struct SessionGoalClearedEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<UiGoalRecord>,
     pub transition_actor: String,
+    /// #1959 — see [`SessionGoalUpdatedEvent::generation`]. A clear carries a
+    /// generation strictly greater than any update it should supersede, so the
+    /// client keeps the clear and drops a later-arriving stale update.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// M15 recurring loop snapshot.

@@ -709,6 +709,16 @@ where
     ROUTER_CONTEXT.scope(ctx, fut).await
 }
 
+/// Snapshot the active [`RouterContext`]. Returns [`RouterContext::default`]
+/// (no originating session/turn) when no scope wraps the caller. Mirrors
+/// [`current_lane_context`](crate::current_lane_context) / [`current_llm_call_policy`](crate::current_llm_call_policy);
+/// used to re-establish the routing context across a `tokio::spawn` boundary
+/// (foreground tool tasks) so a tool's own LLM sub-call keeps the turn's
+/// failover attribution instead of publishing unattributed events.
+pub fn current_router_context() -> RouterContext {
+    ROUTER_CONTEXT.try_with(|c| c.clone()).unwrap_or_default()
+}
+
 /// Adaptive provider router with metrics-driven selection.
 ///
 /// Drop-in replacement for `ProviderChain`. Tracks latency and error rates
