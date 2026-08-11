@@ -1,25 +1,57 @@
 #![allow(dead_code)]
 //! Durable supervisor state store for supervised agent groups.
 //!
-//! The store is intentionally small: an append-only JSONL event ledger plus an
-//! optional snapshot file. It is standalone so the runtime can wire it in later
-//! without forcing API handlers to depend on supervisor internals.
+//! The store is intentionally small: an append-only JSONL event ledger plus a
+//! snapshot file. It is standalone so the runtime can wire it in later without
+//! forcing API handlers to depend on supervisor internals.
+//!
+//! Scaling model (#1974): appends assign sequences from an in-memory cursor
+//! that is revalidated cheaply against the ledger under the cross-process file
+//! lock (O(tail) instead of a full JSONL re-parse per append). Every
+//! [`SNAPSHOT_EVERY_APPENDS`] ledger rows, the appending process writes a
+//! durable snapshot and rotates the applied rows to a single `.jsonl.old`
+//! forensics generation, so `load_state` is snapshot + a short tail replay.
+//! Legacy dirs (JSONL only, no snapshot) load unchanged forever.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 const EVENTS_FILE_NAME: &str = "supervisor-events.jsonl";
+/// Single rotated ledger generation kept after each compaction, for
+/// forensics only — it is never replayed. BACK/DOWN-COMPAT: a downgraded,
+/// snapshot-UNAWARE binary (pre-#1974 builds) ignores the snapshot file and
+/// replays only the live `.jsonl` tail, i.e. it sees a truncated view of any
+/// store that has compacted; the most recent rotated prefix stays here for
+/// manual recovery. Binaries that DO know snapshots refuse a snapshot with a
+/// newer `schema_version` instead of misreading it (see `load_snapshot`).
+const EVENTS_ROTATED_FILE_NAME: &str = "supervisor-events.jsonl.old";
 const EVENTS_LOCK_FILE_NAME: &str = "supervisor-events.lock";
 const SNAPSHOT_FILE_NAME: &str = "supervisor-snapshot.json";
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const APPEND_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const APPEND_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const AUTO_GROUP_TERMINAL_MESSAGE: &str = "all supervised children reached a terminal state";
+
+/// Auto-snapshot/compaction cadence: once the live JSONL ledger holds this
+/// many rows, the next `append_event` writes a snapshot and rotates the
+/// applied rows away. 512 keeps the boot replay tail small (a few hundred KB
+/// of JSON at typical event sizes, parsed in milliseconds) while amortizing
+/// the full-state serialize + fsync cost over hundreds of appends. The trigger
+/// counts rows in the ledger — not per-process appends — so several writers
+/// sharing one ledger still compact once the tail crosses the threshold, and
+/// a fat legacy ledger is healed by its first post-upgrade append.
+pub const SNAPSHOT_EVERY_APPENDS: u64 = 512;
+
+/// Initial window for locating the final ledger line without reading the
+/// whole file; doubled until a full line is covered, so rows larger than this
+/// still resolve.
+const TAIL_PROBE_BYTES: u64 = 8 * 1024;
 
 pub type SupervisorMetadata = serde_json::Map<String, serde_json::Value>;
 
@@ -641,11 +673,39 @@ impl SupervisorState {
     }
 }
 
+/// In-memory cursor over the on-disk ledger, shared by every clone of a store
+/// (the orchestrator clones its store into drain loops and tasks). It is only
+/// read or written while the cross-process append file-lock is held; the
+/// mutex merely guards in-process memory access. A store instance with a cold
+/// or stale cursor never mis-assigns a sequence — `refresh_seq_cache_locked`
+/// revalidates against the file before every use.
+#[derive(Debug, Default)]
+struct SeqCache {
+    /// False until the first locked use seeds the cursor from disk.
+    seeded: bool,
+    /// Highest sequence known committed (ledger tail or snapshot).
+    last_sequence: u64,
+    /// Ledger byte length after the last observed write.
+    events_len: u64,
+    /// Rows currently in the live ledger (drives auto-compaction).
+    ledger_rows: u64,
+    /// Appends since the events file was last fsynced (batched-fsync mode).
+    appends_since_fsync: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SupervisorStore {
     root_dir: PathBuf,
     events_path: PathBuf,
+    rotated_events_path: PathBuf,
     snapshot_path: PathBuf,
+    /// Live-ledger row count that triggers snapshot + compaction on append;
+    /// `0` disables auto-compaction.
+    snapshot_every_appends: u64,
+    /// `Some(n)`: fsync the events file every n-th `append_event`;
+    /// `None` (default): appends are never fsynced (see `append_ledger_row`).
+    append_fsync_every: Option<u64>,
+    seq_cache: Arc<Mutex<SeqCache>>,
 }
 
 #[derive(Debug)]
@@ -664,9 +724,29 @@ impl SupervisorStore {
         let root_dir = root_dir.as_ref().to_path_buf();
         Self {
             events_path: root_dir.join(EVENTS_FILE_NAME),
+            rotated_events_path: root_dir.join(EVENTS_ROTATED_FILE_NAME),
             snapshot_path: root_dir.join(SNAPSHOT_FILE_NAME),
+            snapshot_every_appends: SNAPSHOT_EVERY_APPENDS,
+            append_fsync_every: None,
+            seq_cache: Arc::new(Mutex::new(SeqCache::default())),
             root_dir,
         }
+    }
+
+    /// Override the auto-snapshot cadence (live-ledger rows that trigger
+    /// snapshot + compaction on append). `0` disables auto-compaction.
+    pub fn with_snapshot_every_appends(mut self, every: u64) -> Self {
+        self.snapshot_every_appends = every;
+        self
+    }
+
+    /// Opt into batched append durability: fsync the events file every
+    /// `every`-th `append_event`. `0` keeps the default (no append fsync —
+    /// the documented trade-off on `append_ledger_row`). Snapshots are always
+    /// fsynced regardless of this setting.
+    pub fn with_append_fsync_every(mut self, every: u64) -> Self {
+        self.append_fsync_every = (every > 0).then_some(every);
+        self
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -677,17 +757,34 @@ impl SupervisorStore {
         &self.events_path
     }
 
+    /// Previous ledger generation rotated aside by the last compaction (kept
+    /// for forensics; replaced on each compaction, never replayed).
+    pub fn rotated_events_path(&self) -> &Path {
+        &self.rotated_events_path
+    }
+
     pub fn snapshot_path(&self) -> &Path {
         &self.snapshot_path
     }
 
+    /// Load the current state: snapshot (if any) plus a replay of the ledger
+    /// rows newer than the snapshot. Read-only — loading never writes.
+    ///
+    /// The ledger is read BEFORE the snapshot on purpose: a concurrent
+    /// snapshot + compaction (`snapshot_now` / auto-compaction) writes the new
+    /// snapshot first and only then rotates the ledger. Reading in the
+    /// opposite order could observe the OLD snapshot together with an
+    /// ALREADY-ROTATED (empty) ledger and silently drop the rotated window;
+    /// ledger-first, either the rows are still in the ledger we read, or the
+    /// snapshot we read afterwards already contains them.
     pub fn load_state(&self) -> io::Result<SupervisorState> {
+        let rows = self.read_ledger_rows()?;
         let snapshot = self.load_snapshot()?;
         let snapshot_last_sequence = snapshot.as_ref().map_or(0, |s| s.last_sequence);
         let mut state = snapshot.map_or_else(SupervisorState::default, |s| s.state);
         state.last_sequence = state.last_sequence.max(snapshot_last_sequence);
 
-        for row in self.read_ledger_rows()? {
+        for row in rows {
             if row.sequence > snapshot_last_sequence {
                 state.apply_ledger_row(&row);
             }
@@ -695,38 +792,81 @@ impl SupervisorStore {
         Ok(state)
     }
 
+    /// Load the snapshot, refusing one written by a NEWER binary: a
+    /// `schema_version` above what this build knows means fields we would
+    /// silently drop or misread, and a snapshot is the authoritative record
+    /// of compacted history — misinterpreting it corrupts state. (Downgrade
+    /// to a snapshot-UNAWARE binary is different: such builds ignore the
+    /// snapshot file entirely and replay only the live tail — see
+    /// `EVENTS_ROTATED_FILE_NAME` for what remains recoverable.)
     pub fn load_snapshot(&self) -> io::Result<Option<SupervisorSnapshot>> {
-        if !self.snapshot_path.exists() {
-            return Ok(None);
+        let body = match fs::read_to_string(&self.snapshot_path) {
+            Ok(body) => body,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let snapshot: SupervisorSnapshot = serde_json::from_str(&body).map_err(invalid_data)?;
+        if snapshot.schema_version > SNAPSHOT_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "supervisor snapshot {} has schema_version {} but this binary supports <= {}; \
+                     upgrade the binary, or move the snapshot aside to fall back to the live \
+                     ledger tail",
+                    self.snapshot_path.display(),
+                    snapshot.schema_version,
+                    SNAPSHOT_SCHEMA_VERSION
+                ),
+            ));
         }
-        let body = fs::read_to_string(&self.snapshot_path)?;
-        let snapshot = serde_json::from_str(&body).map_err(invalid_data)?;
         Ok(Some(snapshot))
     }
 
+    /// Write a durable snapshot of the current state WITHOUT compacting the
+    /// ledger (tmp + fsync + atomic rename + dir fsync). Takes the append
+    /// lock so it cannot race a compaction in another process. This is also
+    /// exactly the first half of a compaction cycle, so tests use it to
+    /// simulate a crash between "snapshot written" and "ledger rotated" —
+    /// `load_state` replays that layout idempotently.
     pub fn write_snapshot(&self) -> io::Result<SupervisorSnapshot> {
-        let state = self.load_state()?;
-        let snapshot = SupervisorSnapshot {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            written_at_ms: unix_time_millis(),
-            last_sequence: state.last_sequence,
-            state,
-        };
-        self.ensure_root_dir()?;
-        let body = serde_json::to_string_pretty(&snapshot).map_err(invalid_data)?;
-        let tmp_path = self.snapshot_path.with_extension("json.tmp");
-        fs::write(&tmp_path, body)?;
-        fs::rename(&tmp_path, &self.snapshot_path)?;
-        Ok(snapshot)
+        let _lock = self.acquire_append_lock()?;
+        self.write_snapshot_locked()
     }
 
+    /// Snapshot the current state and compact the ledger: rows covered by the
+    /// snapshot rotate to `supervisor-events.jsonl.old` (one generation kept
+    /// for forensics). Intended for shutdown paths and maintenance; appends
+    /// invoke the same cycle automatically every [`SNAPSHOT_EVERY_APPENDS`]
+    /// ledger rows.
+    ///
+    /// Crash-safe ordering: the snapshot is durable (file + dir fsync) before
+    /// the ledger is rotated. A crash in between leaves snapshot + full
+    /// ledger, which `load_state` replays idempotently (rows at or below
+    /// `snapshot.last_sequence` are skipped).
+    pub fn snapshot_now(&self) -> io::Result<SupervisorSnapshot> {
+        let _lock = self.acquire_append_lock()?;
+        let mut cache = self.lock_seq_cache();
+        self.snapshot_and_compact_locked(&mut cache)
+    }
+
+    /// Append an event, assigning the next ledger sequence.
+    ///
+    /// The sequence comes from the in-memory cursor, revalidated against the
+    /// file under the append lock (`refresh_seq_cache_locked`) — O(tail
+    /// probe) in the common case instead of the historical full-JSONL
+    /// re-parse per append. Every [`SNAPSHOT_EVERY_APPENDS`] ledger rows this
+    /// also snapshots + compacts the ledger (best effort: a failed compaction
+    /// never fails the already-durable append; the threshold stays exceeded
+    /// so the next append retries).
     pub fn append_event(
         &self,
         event_id: impl Into<String>,
         event: SupervisorEvent,
     ) -> io::Result<SupervisorEventLedgerRow> {
         let _lock = self.acquire_append_lock()?;
-        let sequence = self.load_state()?.last_sequence.saturating_add(1);
+        let mut cache = self.lock_seq_cache();
+        self.refresh_seq_cache_locked(&mut cache)?;
+        let sequence = cache.last_sequence.saturating_add(1);
         let mut event_id = event_id.into();
         if event_id.is_empty() {
             event_id = format!("event:{sequence}");
@@ -737,36 +877,58 @@ impl SupervisorStore {
             recorded_at_ms: unix_time_millis(),
             event,
         };
-        self.append_ledger_row(&row)?;
+        self.append_row_locked(&row, &mut cache)?;
+        if self.snapshot_every_appends > 0 && cache.ledger_rows >= self.snapshot_every_appends {
+            if let Err(err) = self.snapshot_and_compact_locked(&mut cache) {
+                tracing::warn!(
+                    error = %err,
+                    events_path = %self.events_path.display(),
+                    "supervisor ledger auto-compaction failed; will retry on a later append"
+                );
+            }
+        }
         Ok(row)
     }
 
-    /// Append one row to the event ledger. The write reaches the OS directly:
-    /// `std::fs::File` is unbuffered, so `write_all` issues the write syscall
-    /// and the trailing `flush()` is a no-op (there is no user-space buffer to
+    /// Append one raw row to the event ledger, bypassing sequence assignment
+    /// (callers own the sequence; used by tests and repair tooling). Takes
+    /// the same append file-lock as every other events-file writer — an
+    /// unlocked write could race a concurrent compaction and be rotated away
+    /// unreplayed (data loss despite `Ok`). Raw sequences MUST be above the
+    /// current maximum (and above any snapshot's `last_sequence`): replay
+    /// skips rows at or below the snapshot cutoff, so a back-dated raw row
+    /// would be ignored by `load_state`. Raw appends do not trigger
+    /// auto-compaction; the next `append_event` does, after reseeding.
+    ///
+    /// The write reaches the OS in a single unbuffered `write_all` (the
+    /// trailing `flush()` is a no-op; there is no user-space buffer to
     /// drain).
     ///
-    /// DURABILITY (KNOWN LIMITATION, accepted): the append is handed to the OS
-    /// but is NOT `fsync`-ed, so the OS page cache may briefly hold the last
-    /// appended row(s) before the disk physically commits. An ordinary process
-    /// crash (panic / kill / OOM) is safe — the OS still flushes its cache — but
-    /// a HARD power loss or kernel panic in that window can lose the most recent
-    /// append. This is a STORE-WIDE property: every
-    /// group / terminal / continuation record rides this path, not just peer
-    /// continuations, so an `fsync` here would be a store-wide latency cost.
-    /// Under the best-effort peer-delivery model (see `peer_send_input_authorized`)
-    /// a peer injection lost only to a simultaneous power cut is within the
-    /// documented semantics; revisit with a batched/periodic `fsync` if any
-    /// caller ever needs power-loss durability.
+    /// DURABILITY (KNOWN LIMITATION, accepted): by default the append is
+    /// handed to the OS but is NOT `fsync`-ed, so the OS page cache may
+    /// briefly hold the last appended row(s) before the disk physically
+    /// commits. An ordinary process crash (panic / kill / OOM) is safe — the
+    /// OS still flushes its cache — but a HARD power loss or kernel panic in
+    /// that window can lose the most recent append. This is a STORE-WIDE
+    /// property: every group / terminal / continuation record rides this
+    /// path, not just peer continuations, so an unconditional `fsync` here
+    /// would be a store-wide latency cost. Under the best-effort
+    /// peer-delivery model (see `peer_send_input_authorized`) a peer
+    /// injection lost only to a simultaneous power cut is within the
+    /// documented semantics. Callers that need bounded power-loss exposure
+    /// can opt into batched fsync via `with_append_fsync_every(n)` (applies
+    /// to `append_event`); snapshots are always fsynced (file + directory)
+    /// because compaction deletes the ledger rows they replace.
     pub fn append_ledger_row(&self, row: &SupervisorEventLedgerRow) -> io::Result<()> {
-        self.ensure_root_dir()?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.events_path)?;
-        serde_json::to_writer(&mut file, row).map_err(invalid_data)?;
-        file.write_all(b"\n")?;
-        file.flush()
+        let _lock = self.acquire_append_lock()?;
+        let mut cache = self.lock_seq_cache();
+        self.write_row_sealed_locked(row)?;
+        // Raw rows bypass sequence assignment; rather than guess at the
+        // ledger's shape (this path must keep working even on a ledger whose
+        // other rows are unparseable), drop the cursor and let the next
+        // sequenced append reseed from disk.
+        cache.seeded = false;
+        Ok(())
     }
 
     pub fn record_group_registered(
@@ -941,11 +1103,279 @@ impl SupervisorStore {
         )
     }
 
-    fn read_ledger_rows(&self) -> io::Result<Vec<SupervisorEventLedgerRow>> {
-        if !self.events_path.exists() {
-            return Ok(Vec::new());
+    /// Whole-line append (append lock must be held — EVERY events-file write
+    /// goes through here under the lock; an unlocked write could land between
+    /// a concurrent compaction's "snapshot rows" and "rotate ledger" steps
+    /// and be rotated away unreplayed). Returns the handle so callers can
+    /// fsync it.
+    ///
+    /// Two repairs happen inline:
+    /// - Torn tail: if the file is non-empty and does not end in a newline
+    ///   (a crash split an earlier append), a `\n` is written first so this
+    ///   row can never concatenate onto the torn content. The torn bytes are
+    ///   preserved, never truncated — they may be a complete row that merely
+    ///   lost its terminator.
+    /// - Fresh file: when this write CREATES the ledger (fresh store, or the
+    ///   first append after a compaction rotated it away), the parent
+    ///   directory is fsynced so the new name is durable — without this the
+    ///   batched append-fsync bound would be void (power loss could keep the
+    ///   snapshot but lose the new ledger's directory entry).
+    ///
+    /// The row and its terminator go down in a single `write_all`, keeping
+    /// the torn-write exposure to one syscall.
+    fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
+        self.ensure_root_dir()?;
+        let created = !self.events_path.exists();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(&self.events_path)?;
+        let len = file.metadata()?.len();
+        let mut payload = Vec::with_capacity(256);
+        if len > 0 {
+            file.seek(SeekFrom::Start(len - 1))?;
+            let mut last = [0_u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                payload.push(b'\n');
+            }
         }
-        let file = File::open(&self.events_path)?;
+        serde_json::to_writer(&mut payload, row).map_err(invalid_data)?;
+        payload.push(b'\n');
+        // O_APPEND: the write lands at EOF regardless of the read seek above.
+        file.write_all(&payload)?;
+        file.flush()?;
+        if created {
+            fsync_dir(&self.root_dir)?;
+        }
+        Ok(file)
+    }
+
+    /// Append a sequenced row while holding the append lock: write, apply
+    /// the batched fsync policy, and advance the in-memory cursor to the new
+    /// tail.
+    fn append_row_locked(
+        &self,
+        row: &SupervisorEventLedgerRow,
+        cache: &mut SeqCache,
+    ) -> io::Result<()> {
+        let file = self.write_row_sealed_locked(row)?;
+        if let Some(every) = self.append_fsync_every {
+            cache.appends_since_fsync = cache.appends_since_fsync.saturating_add(1);
+            if cache.appends_since_fsync >= every {
+                file.sync_data()?;
+                cache.appends_since_fsync = 0;
+            }
+        }
+        cache.last_sequence = cache.last_sequence.max(row.sequence);
+        // Exact length of the file we just extended; nothing else can write
+        // while we hold the lock.
+        cache.events_len = file.metadata()?.len();
+        cache.ledger_rows = cache.ledger_rows.saturating_add(1);
+        cache.seeded = true;
+        Ok(())
+    }
+
+    /// Snapshot writer (append lock must be held): atomic tmp + rename, with
+    /// the file fsynced before the rename and the directory fsynced after.
+    /// The fsyncs are load-bearing — a snapshot licenses compaction to delete
+    /// the ledger rows it covers, so it must be physically durable first.
+    fn write_snapshot_locked(&self) -> io::Result<SupervisorSnapshot> {
+        let state = self.load_state()?;
+        // `applied_event_ids` is retained in FULL across snapshots — it is
+        // the DURABLE dedup contract, not tail-epoch bookkeeping. The
+        // sequence cutoff only suppresses rows at or below the snapshot's
+        // `last_sequence`; a duplicate STABLE event id re-emitted at a HIGHER
+        // sequence (e.g. `record_group_registered` reuses
+        // `group_registered:<group_id>` verbatim) is suppressed only by this
+        // set, and re-applying it would clobber state that the id had
+        // already been suppressed for before the snapshot. RESIDUAL
+        // (documented, accepted): the set grows O(unique event ids) over the
+        // store's lifetime, and snapshots/boot parses grow with it. Pruning
+        // would require a per-kind id-stability audit; the current audit says
+        // NOTHING is provably prunable — every producer's id format can
+        // legitimately recur (`group_registered:<gid>` and
+        // `child_started:<gid>:<cid>` are stable by design; terminal ids key
+        // on `(kind, finished_at_ms)`; heartbeat ids embed a caller-owned
+        // `ping_id`; artifact ids key on `version`; continuation ids key on
+        // `attempt`/timestamps; the `event:<seq>` fallback trusts raw writers
+        // not to reuse sequences). Deferred until some kind gains a provably
+        // unique id.
+        let snapshot = SupervisorSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            written_at_ms: unix_time_millis(),
+            last_sequence: state.last_sequence,
+            state,
+        };
+        self.ensure_root_dir()?;
+        let body = serde_json::to_string_pretty(&snapshot).map_err(invalid_data)?;
+        let tmp_path = self.snapshot_path.with_extension("json.tmp");
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(body.as_bytes())?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, &self.snapshot_path)?;
+        fsync_dir(&self.root_dir)?;
+        Ok(snapshot)
+    }
+
+    /// Second half of the compaction cycle (append lock must be held): once
+    /// the snapshot is durable, rotate the fully-applied ledger to the single
+    /// `.jsonl.old` forensics generation and reset the cursor. On any partial
+    /// failure the cursor is left stale, which the next append detects and
+    /// repairs by reseeding from disk.
+    fn snapshot_and_compact_locked(&self, cache: &mut SeqCache) -> io::Result<SupervisorSnapshot> {
+        let snapshot = self.write_snapshot_locked()?;
+        if self.events_path.exists() {
+            match fs::remove_file(&self.rotated_events_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            fs::rename(&self.events_path, &self.rotated_events_path)?;
+            fsync_dir(&self.root_dir)?;
+        }
+        cache.seeded = true;
+        cache.last_sequence = cache.last_sequence.max(snapshot.last_sequence);
+        cache.events_len = 0;
+        cache.ledger_rows = 0;
+        // The snapshot fsync covered everything the ledger held.
+        cache.appends_since_fsync = 0;
+        Ok(snapshot)
+    }
+
+    fn lock_seq_cache(&self) -> MutexGuard<'_, SeqCache> {
+        match self.seq_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // A panic while holding the guard may have left a
+                // half-updated cursor; force a reseed from disk on next use.
+                let mut guard = poisoned.into_inner();
+                guard.seeded = false;
+                guard
+            }
+        }
+    }
+
+    /// Bring the in-memory cursor in line with the on-disk ledger. Must be
+    /// called under the append file-lock, so what it observes cannot change
+    /// until the lock is released.
+    ///
+    /// Fast path: the ledger's byte length is unchanged AND its final row
+    /// still carries our cached sequence (one bounded tail read). Both checks
+    /// are required — length alone would let a foreign compact-then-append
+    /// cycle that lands on the same byte length (an ABA) masquerade as "no
+    /// change", and the final sequence alone would miss growth. Under the
+    /// locking protocol any sequenced writer that touches the ledger changes
+    /// its length and/or its final sequence; raw `append_ledger_row` writers
+    /// additionally invalidate their own process's cursor outright.
+    ///
+    /// ANY other observation — first use, growth, shrink/rotation, tail
+    /// mismatch, unparseable tail — takes a full reseed. Compaction keeps the
+    /// ledger at most ~[`SNAPSHOT_EVERY_APPENDS`] rows, so reseeding is cheap;
+    /// boring-correct beats a cleverer partial rescan here.
+    fn refresh_seq_cache_locked(&self, cache: &mut SeqCache) -> io::Result<()> {
+        let disk_len = match fs::metadata(&self.events_path) {
+            Ok(meta) => meta.len(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err),
+        };
+
+        if cache.seeded
+            && disk_len > 0
+            && disk_len == cache.events_len
+            && self.read_last_row_sequence(disk_len)? == Some(cache.last_sequence)
+        {
+            return Ok(());
+        }
+        self.reseed_cache_locked(cache, disk_len)
+    }
+
+    /// Rebuild the cursor from disk: `max(snapshot.last_sequence, max row
+    /// sequence in the ledger)`. Under the lock, disk is authoritative — any
+    /// row this process ever appended is covered by the ledger or by a
+    /// snapshot that compacted it.
+    fn reseed_cache_locked(&self, cache: &mut SeqCache, disk_len: u64) -> io::Result<()> {
+        let snapshot_last = self
+            .load_snapshot()?
+            .map_or(0, |snapshot| snapshot.last_sequence);
+        let rows = self.read_ledger_rows()?;
+        let ledger_max = rows.iter().map(|row| row.sequence).max().unwrap_or(0);
+        cache.last_sequence = snapshot_last.max(ledger_max);
+        cache.events_len = disk_len;
+        cache.ledger_rows = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        cache.seeded = true;
+        Ok(())
+    }
+
+    /// Parse the sequence of the final non-empty ledger line, reading only a
+    /// bounded tail window (doubled until it covers a whole line). Returns
+    /// `Ok(None)` when the tail is not a parseable row (torn write, foreign
+    /// truncation); callers then fall back to a full reseed, which reports
+    /// corruption with precise line context.
+    fn read_last_row_sequence(&self, disk_len: u64) -> io::Result<Option<u64>> {
+        let mut file = match File::open(&self.events_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let mut window = TAIL_PROBE_BYTES;
+        loop {
+            let start = disk_len.saturating_sub(window);
+            let span = usize::try_from(disk_len - start).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ledger tail window exceeds addressable memory",
+                )
+            })?;
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0_u8; span];
+            file.read_exact(&mut buf)?;
+
+            let content_end = buf
+                .iter()
+                .rposition(|byte| !byte.is_ascii_whitespace())
+                .map_or(0, |idx| idx + 1);
+            if content_end == 0 {
+                if start == 0 {
+                    // Whitespace-only file: no rows.
+                    return Ok(None);
+                }
+                window = window.saturating_mul(2);
+                continue;
+            }
+            let content = &buf[..content_end];
+            match content.iter().rposition(|&byte| byte == b'\n') {
+                Some(newline) => {
+                    let line = &content[newline + 1..];
+                    return Ok(serde_json::from_slice::<SupervisorEventLedgerRow>(line)
+                        .ok()
+                        .map(|row| row.sequence));
+                }
+                None if start == 0 => {
+                    return Ok(serde_json::from_slice::<SupervisorEventLedgerRow>(content)
+                        .ok()
+                        .map(|row| row.sequence));
+                }
+                None => {
+                    // The final line starts before this window; widen it.
+                    window = window.saturating_mul(2);
+                }
+            }
+        }
+    }
+
+    fn read_ledger_rows(&self) -> io::Result<Vec<SupervisorEventLedgerRow>> {
+        // Open-and-match instead of exists()-then-open: a concurrent
+        // compaction may rotate the ledger away between the two, which must
+        // read as "no rows", not an error.
+        let file = match File::open(&self.events_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
         let reader = BufReader::new(file);
         let mut rows = Vec::new();
         for (idx, line) in reader.lines().enumerate() {
@@ -1073,6 +1503,23 @@ fn artifact_key(group_id: &str, artifact_id: &str) -> String {
 
 fn continuation_key(group_id: &str, continuation_id: &str) -> String {
     format!("{group_id}/{continuation_id}")
+}
+
+/// fsync a directory so a just-renamed file's directory entry is durable
+/// before dependent destructive steps (compaction) proceed. No-op on
+/// non-Unix: std cannot open directories for syncing there, so on Windows the
+/// rename ordering is only as durable as the filesystem makes it (the renames
+/// themselves stay atomic; this only affects hard power-loss ordering).
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 fn unix_time_millis() -> u64 {
@@ -1386,5 +1833,617 @@ mod tests {
         let restored: TerminalState = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.kind, TerminalKind::Failed);
         assert_eq!(restored.exit_code, Some(2));
+    }
+
+    // ---- #1974 scaling: cached sequence, production snapshots, compaction ----
+
+    fn test_ping(group: &str, child: &str, ping_id: &str, observed_at_ms: u64) -> HeartbeatPing {
+        HeartbeatPing {
+            group_id: group.to_string(),
+            child_id: child.to_string(),
+            ping_id: Some(ping_id.to_string()),
+            observed_at_ms,
+            state: Some("running".to_string()),
+            message: None,
+            progress_percent: None,
+            metadata: SupervisorMetadata::new(),
+        }
+    }
+
+    /// Reference state: full replay of every row ever appended, in order.
+    /// Snapshot + compaction must reproduce this exactly.
+    fn shadow_state(rows: &[SupervisorEventLedgerRow]) -> SupervisorState {
+        let mut state = SupervisorState::default();
+        for row in rows {
+            state.apply_ledger_row(row);
+        }
+        state
+    }
+
+    fn live_ledger_rows(store: &SupervisorStore) -> Vec<SupervisorEventLedgerRow> {
+        store.read_ledger_rows().unwrap()
+    }
+
+    fn rows_at(path: &Path) -> Vec<SupervisorEventLedgerRow> {
+        let body = fs::read_to_string(path).unwrap();
+        body.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn legacy_jsonl_only_ledger_loads_identically_and_load_is_read_only() {
+        let dir = TestDir::new("legacy");
+        let store = SupervisorStore::new(&dir.path);
+
+        // Build a legacy dir the way old builds did: JSONL rows only, no
+        // snapshot file anywhere.
+        let mut rows = Vec::new();
+        for idx in 1..=5_u64 {
+            let row = SupervisorEventLedgerRow {
+                event_id: format!("heartbeat:legacy:{idx}"),
+                sequence: idx,
+                recorded_at_ms: 1_000 + idx,
+                event: SupervisorEvent::Heartbeat {
+                    ping: test_ping(
+                        "group-legacy",
+                        &format!("child-{idx}"),
+                        &format!("ping-{idx}"),
+                        1_000 + idx,
+                    ),
+                },
+            };
+            store.append_ledger_row(&row).unwrap();
+            rows.push(row);
+        }
+        assert!(!store.snapshot_path().exists());
+
+        let fresh = SupervisorStore::new(&dir.path);
+        let state = fresh.load_state().unwrap();
+        assert_eq!(state, shadow_state(&rows));
+        assert_eq!(state.last_sequence, 5);
+        // Loading must never write: no snapshot, no rotation, ledger intact.
+        assert!(!fresh.snapshot_path().exists());
+        assert!(!fresh.rotated_events_path().exists());
+        assert_eq!(live_ledger_rows(&fresh).len(), 5);
+    }
+
+    #[test]
+    fn append_auto_snapshots_and_compacts_after_threshold() {
+        let dir = TestDir::new("auto-compact");
+        let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(8);
+
+        let mut rows = Vec::new();
+        for idx in 1..=20_u64 {
+            rows.push(
+                store
+                    .record_heartbeat(test_ping(
+                        "group-auto",
+                        &format!("child-{idx}"),
+                        &format!("ping-{idx}"),
+                        1_000 + idx,
+                    ))
+                    .unwrap(),
+            );
+        }
+        let sequences: Vec<u64> = rows.iter().map(|row| row.sequence).collect();
+        assert_eq!(sequences, (1..=20).collect::<Vec<_>>());
+
+        // Two compaction cycles happened (after rows 8 and 16): snapshot
+        // present, one rotated generation kept, live ledger holds the tail.
+        assert!(store.snapshot_path().exists());
+        assert!(store.rotated_events_path().exists());
+        let tail = live_ledger_rows(&store);
+        assert!(
+            tail.len() < 8,
+            "live ledger should be compacted, got {} rows",
+            tail.len()
+        );
+        assert_eq!(tail.first().map(|row| row.sequence), Some(17));
+
+        let snapshot = store.load_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.last_sequence, 16);
+
+        // Exactly one .old generation: the most recent rotated prefix.
+        let rotated = rows_at(store.rotated_events_path());
+        assert_eq!(rotated.first().map(|row| row.sequence), Some(9));
+        assert_eq!(rotated.last().map(|row| row.sequence), Some(16));
+
+        // Deep equality — including `applied_event_ids`: snapshot + tail
+        // replays to the same state as a full replay of every event ever
+        // appended. The id set is retained in full across snapshots (the
+        // durable dedup contract; see `write_snapshot_locked` for the
+        // documented growth residual).
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored, shadow_state(&rows));
+        assert_eq!(restored.last_sequence, 20);
+        assert_eq!(restored.applied_event_ids.len(), 20);
+    }
+
+    #[test]
+    fn default_snapshot_cadence_compacts_at_snapshot_every_appends() {
+        let dir = TestDir::new("default-cadence");
+        let store = SupervisorStore::new(&dir.path);
+        for idx in 1..=(SNAPSHOT_EVERY_APPENDS + 1) {
+            store
+                .record_heartbeat(test_ping(
+                    "group-cadence",
+                    "child-a",
+                    &format!("ping-{idx}"),
+                    idx,
+                ))
+                .unwrap();
+            if idx == SNAPSHOT_EVERY_APPENDS - 1 {
+                assert!(
+                    !store.snapshot_path().exists(),
+                    "must not snapshot before the cadence threshold"
+                );
+            }
+        }
+        assert!(store.snapshot_path().exists());
+        let snapshot = store.load_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.last_sequence, SNAPSHOT_EVERY_APPENDS);
+        assert_eq!(live_ledger_rows(&store).len(), 1);
+        assert_eq!(
+            store.load_state().unwrap().last_sequence,
+            SNAPSHOT_EVERY_APPENDS + 1
+        );
+    }
+
+    #[test]
+    fn sequences_stay_monotonic_across_writers_with_independent_caches() {
+        let dir = TestDir::new("cross-process");
+        // Two store instances with independent seq caches simulate two
+        // processes appending to the same ledger (the file lock is the only
+        // coordination between them).
+        let writer_a = SupervisorStore::new(&dir.path);
+        let writer_b = SupervisorStore::new(&dir.path);
+
+        // A seeds its cache with two appends (vec! evaluates in order).
+        let mut rows = vec![
+            writer_a
+                .record_heartbeat(test_ping("g", "a", "a-1", 1))
+                .unwrap(),
+            writer_a
+                .record_heartbeat(test_ping("g", "a", "a-2", 2))
+                .unwrap(),
+        ];
+        // B appends behind A's back (A's cache is now stale).
+        rows.push(
+            writer_b
+                .record_heartbeat(test_ping("g", "b", "b-1", 3))
+                .unwrap(),
+        );
+        rows.push(
+            writer_b
+                .record_heartbeat(test_ping("g", "b", "b-2", 4))
+                .unwrap(),
+        );
+        // A must detect the foreign growth and continue after B.
+        rows.push(
+            writer_a
+                .record_heartbeat(test_ping("g", "a", "a-3", 5))
+                .unwrap(),
+        );
+        // Raw out-of-band row (manual repair path) jumps the sequence forward;
+        // later writers must continue past it, never clobber.
+        let manual = SupervisorEventLedgerRow {
+            event_id: "manual:100".to_string(),
+            sequence: 100,
+            recorded_at_ms: 6,
+            event: SupervisorEvent::Heartbeat {
+                ping: test_ping("g", "manual", "m-1", 6),
+            },
+        };
+        writer_a.append_ledger_row(&manual).unwrap();
+        rows.push(manual);
+        rows.push(
+            writer_b
+                .record_heartbeat(test_ping("g", "b", "b-3", 7))
+                .unwrap(),
+        );
+
+        let sequences: Vec<u64> = rows.iter().map(|row| row.sequence).collect();
+        assert_eq!(sequences, vec![1, 2, 3, 4, 5, 100, 101]);
+        // No clobbers on disk either.
+        let on_disk: Vec<u64> = live_ledger_rows(&writer_a)
+            .iter()
+            .map(|row| row.sequence)
+            .collect();
+        assert_eq!(on_disk, sequences);
+        assert_eq!(writer_b.load_state().unwrap(), shadow_state(&rows));
+    }
+
+    #[test]
+    fn foreign_compaction_reseeds_stale_writer_and_sequences_continue() {
+        let dir = TestDir::new("foreign-compact");
+        let writer_a = SupervisorStore::new(&dir.path);
+        let writer_b = SupervisorStore::new(&dir.path);
+
+        let mut rows = Vec::new();
+        for idx in 1..=3_u64 {
+            rows.push(
+                writer_a
+                    .record_heartbeat(test_ping(
+                        "g",
+                        &format!("child-{idx}"),
+                        &format!("p-{idx}"),
+                        idx,
+                    ))
+                    .unwrap(),
+            );
+        }
+        // Another process snapshots + compacts; A's cache still points at the
+        // old fat ledger.
+        let snapshot = writer_b.snapshot_now().unwrap();
+        assert_eq!(snapshot.last_sequence, 3);
+        assert!(live_ledger_rows(&writer_b).is_empty());
+
+        let row = writer_a
+            .record_heartbeat(test_ping("g", "child-4", "p-4", 4))
+            .unwrap();
+        assert_eq!(row.sequence, 4);
+        rows.push(row);
+        assert_eq!(writer_a.load_state().unwrap(), shadow_state(&rows));
+
+        // Empty-ledger ABA: A compacts (its cache now says "empty ledger"),
+        // then B appends AND compacts again — the ledger is back at the same
+        // (zero) length but the snapshot moved. A must pick the sequence up
+        // from the snapshot, not its stale cache.
+        writer_a.snapshot_now().unwrap();
+        rows.push(
+            writer_b
+                .record_heartbeat(test_ping("g", "child-5", "p-5", 5))
+                .unwrap(),
+        );
+        assert_eq!(rows.last().unwrap().sequence, 5);
+        writer_b.snapshot_now().unwrap();
+        let row = writer_a
+            .record_heartbeat(test_ping("g", "child-6", "p-6", 6))
+            .unwrap();
+        assert_eq!(row.sequence, 6);
+        rows.push(row);
+        assert_eq!(writer_a.load_state().unwrap(), shadow_state(&rows));
+    }
+
+    #[test]
+    fn snapshot_without_compaction_is_idempotent_to_replay() {
+        let dir = TestDir::new("crash-window");
+        let store = SupervisorStore::new(&dir.path);
+        let mut rows = Vec::new();
+        for idx in 1..=5_u64 {
+            rows.push(
+                store
+                    .record_heartbeat(test_ping(
+                        "g",
+                        &format!("c-{idx}"),
+                        &format!("p-{idx}"),
+                        idx,
+                    ))
+                    .unwrap(),
+            );
+        }
+        // Simulate a crash between the two compaction halves: snapshot
+        // written and durable, ledger NOT rotated (`write_snapshot` is
+        // exactly that first half).
+        let snapshot = store.write_snapshot().unwrap();
+        assert_eq!(snapshot.last_sequence, 5);
+        assert_eq!(live_ledger_rows(&store).len(), 5);
+
+        // Snapshot + full (uncompacted) ledger must replay to the same state.
+        assert_eq!(
+            SupervisorStore::new(&dir.path).load_state().unwrap(),
+            shadow_state(&rows)
+        );
+
+        // Appends after the interrupted compaction keep working…
+        rows.push(
+            store
+                .record_heartbeat(test_ping("g", "c-6", "p-6", 6))
+                .unwrap(),
+        );
+        assert_eq!(rows.last().unwrap().sequence, 6);
+        assert_eq!(
+            SupervisorStore::new(&dir.path).load_state().unwrap(),
+            shadow_state(&rows)
+        );
+
+        // …and the next full cycle compacts the stale prefix away.
+        store.snapshot_now().unwrap();
+        assert!(live_ledger_rows(&store).is_empty());
+        assert_eq!(
+            SupervisorStore::new(&dir.path).load_state().unwrap(),
+            shadow_state(&rows)
+        );
+    }
+
+    #[test]
+    fn snapshot_now_on_fresh_and_legacy_stores_is_safe() {
+        let dir = TestDir::new("snapshot-now");
+        let store = SupervisorStore::new(&dir.path);
+
+        // Fresh dir: snapshot of the empty state, nothing to rotate.
+        let snapshot = store.snapshot_now().unwrap();
+        assert_eq!(snapshot.last_sequence, 0);
+        assert!(!store.rotated_events_path().exists());
+        assert_eq!(store.load_state().unwrap(), SupervisorState::default());
+
+        // Legacy ledger (raw rows, no prior snapshot): snapshot_now compacts
+        // it and preserves the state exactly.
+        let mut rows = Vec::new();
+        for idx in 1..=3_u64 {
+            let row = SupervisorEventLedgerRow {
+                event_id: format!("heartbeat:legacy:{idx}"),
+                sequence: idx,
+                recorded_at_ms: idx,
+                event: SupervisorEvent::Heartbeat {
+                    ping: test_ping("g", &format!("c-{idx}"), &format!("p-{idx}"), idx),
+                },
+            };
+            store.append_ledger_row(&row).unwrap();
+            rows.push(row);
+        }
+        let snapshot = store.snapshot_now().unwrap();
+        assert_eq!(snapshot.last_sequence, 3);
+        assert!(live_ledger_rows(&store).is_empty());
+        assert!(store.rotated_events_path().exists());
+        assert_eq!(store.load_state().unwrap(), shadow_state(&rows));
+
+        // Sequences continue after an explicit snapshot.
+        let row = store
+            .record_heartbeat(test_ping("g", "c-4", "p-4", 4))
+            .unwrap();
+        assert_eq!(row.sequence, 4);
+    }
+
+    #[test]
+    fn batched_append_fsync_mode_appends_and_loads() {
+        let dir = TestDir::new("batched-fsync");
+        // fsync effects are not observable through the fs API; this pins the
+        // builder and that batched-fsync mode does not corrupt the ledger.
+        let store = SupervisorStore::new(&dir.path).with_append_fsync_every(2);
+        let mut rows = Vec::new();
+        for idx in 1..=5_u64 {
+            rows.push(
+                store
+                    .record_heartbeat(test_ping(
+                        "g",
+                        &format!("c-{idx}"),
+                        &format!("p-{idx}"),
+                        idx,
+                    ))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(store.load_state().unwrap(), shadow_state(&rows));
+        assert_eq!(store.load_state().unwrap().last_sequence, 5);
+    }
+
+    // ---- #1974 codex round: locking, ABA, torn tail, schema guard ----
+
+    #[test]
+    fn contending_stores_never_lose_raw_appends_to_compaction() {
+        let dir = TestDir::new("contend");
+        // Two INDEPENDENT store instances (separate seq caches — a genuine
+        // two-writer setup, unlike the shared-Arc concurrency test above)
+        // hammer one dir from two threads in barrier-synchronized rounds:
+        // each round, thread A appends a sequenced event and runs a full
+        // snapshot_now compaction while thread B bursts raw
+        // `append_ledger_row` writes straight into A's compaction window.
+        // Pins the FIX-1 locking: an UNLOCKED raw append can land between
+        // compaction's "read + snapshot the rows" and "rotate the ledger"
+        // steps and be rotated away unreplayed — lost despite returning Ok.
+        // (Verified: with the lock removed from `append_ledger_row`, this
+        // test fails with lost raw children.)
+        let store_a = SupervisorStore::new(&dir.path);
+        let store_b = SupervisorStore::new(&dir.path);
+
+        const ROUNDS: u64 = 24;
+        const BURST: u64 = 12;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let a_barrier = Arc::clone(&barrier);
+        let thread_a = std::thread::spawn(move || {
+            let mut sequences = Vec::new();
+            for round in 0..ROUNDS {
+                a_barrier.wait();
+                sequences.push(
+                    store_a
+                        .record_heartbeat(test_ping(
+                            "g",
+                            &format!("a-{round}"),
+                            &format!("pa-{round}"),
+                            10 + round,
+                        ))
+                        .unwrap()
+                        .sequence,
+                );
+                store_a.snapshot_now().unwrap();
+            }
+            sequences
+        });
+        let b_barrier = Arc::clone(&barrier);
+        let thread_b = std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                b_barrier.wait();
+                for burst in 0..BURST {
+                    let idx = round * BURST + burst;
+                    // Raw rows carry caller-owned sequences. Stride by 1_000
+                    // so each stays strictly above anything the sequenced
+                    // writer (disk-max + 1 per append) can reach in between —
+                    // raw rows must land above every snapshot cutoff or
+                    // replay skips them by design (see `append_ledger_row`).
+                    let raw = SupervisorEventLedgerRow {
+                        event_id: format!("raw:{idx}"),
+                        sequence: 1_000_000 + idx * 1_000,
+                        recorded_at_ms: 50 + idx,
+                        event: SupervisorEvent::Heartbeat {
+                            ping: test_ping(
+                                "g",
+                                &format!("raw-{idx}"),
+                                &format!("pr-{idx}"),
+                                50 + idx,
+                            ),
+                        },
+                    };
+                    store_b.append_ledger_row(&raw).unwrap();
+                }
+            }
+        });
+
+        let a_sequences = thread_a.join().unwrap();
+        thread_b.join().unwrap();
+
+        // Assigned sequences are strictly increasing and duplicate-free.
+        assert!(
+            a_sequences.windows(2).all(|pair| pair[0] < pair[1]),
+            "assigned sequences not strictly increasing: {a_sequences:?}"
+        );
+        let unique: HashSet<u64> = a_sequences.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            a_sequences.len(),
+            "duplicate sequences: {a_sequences:?}"
+        );
+
+        // No row lost: every child written by either thread — sequenced or
+        // raw — must survive the racing compactions into the final state.
+        let state = SupervisorStore::new(&dir.path).load_state().unwrap();
+        for round in 0..ROUNDS {
+            assert!(
+                state
+                    .children
+                    .contains_key(&child_key("g", &format!("a-{round}"))),
+                "lost sequenced child a-{round}"
+            );
+        }
+        for idx in 0..ROUNDS * BURST {
+            assert!(
+                state
+                    .children
+                    .contains_key(&child_key("g", &format!("raw-{idx}"))),
+                "lost RAW child raw-{idx} to a racing compaction"
+            );
+        }
+    }
+
+    #[test]
+    fn same_length_ledger_with_different_tail_sequence_forces_reseed() {
+        let dir = TestDir::new("aba");
+        let store = SupervisorStore::new(&dir.path);
+        store
+            .record_heartbeat(test_ping("g", "c-1", "p-1", 1))
+            .unwrap();
+        store
+            .record_heartbeat(test_ping("g", "c-2", "p-2", 2))
+            .unwrap();
+
+        // Out-of-band, rewrite the ledger to the SAME byte length but with a
+        // different final sequence (2 -> 7): a foreign compact-then-append
+        // cycle can land on an identical length, so length alone must never
+        // validate the cursor (the ABA the fast path's content check kills).
+        let body = fs::read_to_string(store.events_path()).unwrap();
+        let forged = body.replace("\"sequence\":2", "\"sequence\":7");
+        assert_ne!(body, forged, "fixture must actually change the tail");
+        assert_eq!(body.len(), forged.len(), "fixture must keep the length");
+        fs::write(store.events_path(), forged).unwrap();
+
+        let row = store
+            .record_heartbeat(test_ping("g", "c-3", "p-3", 3))
+            .unwrap();
+        assert_eq!(
+            row.sequence, 8,
+            "stale cursor must reseed from disk, not reuse cached+1"
+        );
+    }
+
+    #[test]
+    fn append_seals_a_complete_row_missing_its_trailing_newline() {
+        let dir = TestDir::new("torn-tail");
+        let store = SupervisorStore::new(&dir.path);
+        store
+            .record_heartbeat(test_ping("g", "c-1", "p-1", 1))
+            .unwrap();
+
+        // Simulate a crash that persisted a complete final row but lost the
+        // trailing newline.
+        let mut content = fs::read(store.events_path()).unwrap();
+        assert_eq!(content.pop(), Some(b'\n'));
+        fs::write(store.events_path(), &content).unwrap();
+
+        // The next append must seal the torn tail with a newline first —
+        // never concatenate JSON onto it, and never truncate it.
+        let row = store
+            .record_heartbeat(test_ping("g", "c-2", "p-2", 2))
+            .unwrap();
+        assert_eq!(row.sequence, 2);
+        let rows = live_ledger_rows(&store);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn stable_event_id_stays_suppressed_across_snapshot_compaction() {
+        let dir = TestDir::new("dedup-across-snapshot");
+        let store = SupervisorStore::new(&dir.path);
+
+        // Register a group whose event id is STABLE (`group_registered:<id>`
+        // — the id constructor embeds no sequence or timestamp, so a
+        // re-registration reuses it verbatim).
+        let mut group = SupervisedGroupRecord::new("group-dup", 100);
+        group.objective = Some("original objective".to_string());
+        store.record_group_registered(group).unwrap();
+
+        // Snapshot + compact: the applied-id set must ride along in the
+        // snapshot — it is the durable dedup contract, not tail-epoch
+        // bookkeeping.
+        store.snapshot_now().unwrap();
+
+        // Re-emit the SAME event id at a HIGHER sequence (fresher
+        // updated_at, so a wrongly re-applied registration would visibly
+        // clobber the state). The sequence cutoff cannot suppress it — only
+        // the id set carried across the snapshot can.
+        let mut clobber = SupervisedGroupRecord::new("group-dup", 999);
+        clobber.objective = Some("clobbering duplicate".to_string());
+        store.record_group_registered(clobber).unwrap();
+
+        let state = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(
+            state.groups["group-dup"].objective.as_deref(),
+            Some("original objective"),
+            "duplicate stable event id after a snapshot+compaction cycle must stay suppressed"
+        );
+        assert_eq!(state.groups["group-dup"].updated_at_ms, 100);
+    }
+
+    #[test]
+    fn newer_snapshot_schema_version_is_refused() {
+        let dir = TestDir::new("schema-guard");
+        let store = SupervisorStore::new(&dir.path);
+        store
+            .record_heartbeat(test_ping("g", "c-1", "p-1", 1))
+            .unwrap();
+        store.snapshot_now().unwrap();
+
+        // A snapshot written by a FUTURE binary: refuse to load rather than
+        // silently misinterpret it.
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(store.snapshot_path()).unwrap()).unwrap();
+        snapshot["schema_version"] = serde_json::Value::from(SNAPSHOT_SCHEMA_VERSION + 1);
+        fs::write(
+            store.snapshot_path(),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let err = store.load_snapshot().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("schema_version"), "{err}");
+        let err = store.load_state().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
