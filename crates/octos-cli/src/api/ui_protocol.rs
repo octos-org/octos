@@ -33814,18 +33814,22 @@ async fn run_standalone_turn(
         default_agent_orchestrator()
             .record_goal_dispatch_timestamp_only(goal_key, &goal_ctx.profile_id);
         let pre = pre_assistant_count_for_post_turn.unwrap_or(0);
-        let assistant_reply: Option<String> = {
+        // #1957 (codex #1) — capture the session's data dir under the same lock
+        // so a sentinel completion below can sync to the goal ledger.
+        let (assistant_reply, goal_ledger_data_dir): (Option<String>, std::path::PathBuf) = {
             let mut guard = sessions_for_reschedule.lock().await;
+            let data_dir = guard.data_dir();
             let session = guard.get_or_create(&session_id).await;
             let history = session.get_history(usize::MAX);
-            history
+            let reply = history
                 .iter()
                 .filter(|message| matches!(message.role, MessageRole::Assistant))
                 .enumerate()
                 .filter(|(idx, _)| *idx >= pre)
                 .filter(|(_, message)| !message.content.is_empty())
                 .last()
-                .map(|(_, message)| message.content.clone())
+                .map(|(_, message)| message.content.clone());
+            (reply, data_dir)
         };
         let elapsed_seconds = goal_turn_start
             .map(|start| start.elapsed().as_secs())
@@ -33883,6 +33887,8 @@ async fn run_standalone_turn(
                 &reply,
                 &verdict,
                 expected_goal_id.as_deref(),
+                // #1957 (codex #1) — sync a sentinel completion into the ledger.
+                Some(goal_ledger_data_dir.as_path()),
             );
         }
         // #1696/#1698 — push the post-turn goal snapshot to the OWNING

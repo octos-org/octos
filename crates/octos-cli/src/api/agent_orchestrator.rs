@@ -3126,6 +3126,13 @@ impl InProcessAgentOrchestrator {
         assistant_content: &str,
         verdict: &GoalCompletionVerdict,
         expected_goal_id: Option<&str>,
+        // #1957 (codex #1) — profile data dir. The sentinel-driven completion
+        // path used to flip `status = "complete"` in memory only, leaving the
+        // durable ledger showing the goal still `active`. When `Some`, sync the
+        // completion into the ledger (guarded upsert + a decision row) using the
+        // snapshot we just flipped — same treatment as the `goal_update` tool
+        // path in `model_transition_goal`. `None` skips the sync (tests).
+        ledger_data_dir: Option<&std::path::Path>,
     ) -> bool {
         if !detect_goal_complete_sentinel(assistant_content) {
             return false;
@@ -3169,6 +3176,20 @@ impl InProcessAgentOrchestrator {
         goal.updated_at_ms = now_ms();
         let snapshot = goal.clone();
         persist_goal_state(&state, session_id, &snapshot, false);
+        // Drop the state lock before any ledger file I/O.
+        drop(state);
+        // #1957 (codex #1) — sync the sentinel completion into the durable
+        // ledger. `status_changed` is always true here: we returned early above
+        // if the goal was already `complete`, so this is a genuine transition.
+        if let Some(data_dir) = ledger_data_dir {
+            self.sync_transition_to_ledger(
+                data_dir,
+                &snapshot,
+                "goal completion sentinel confirmed by verifier",
+                session_id,
+                true,
+            );
+        }
         true
     }
 
@@ -3450,6 +3471,12 @@ impl InProcessAgentOrchestrator {
         profile_id: &str,
         status: &str,
         reason: &str,
+        // #1957 — profile data dir. When `Some`, this transition is synced into
+        // the goal ledger (goals-row status + a decision) using the in-hand
+        // snapshot below — NO re-resolution of the scope, so it cannot attach a
+        // decision to a different folder's goal (codex #3). `None` for callers
+        // that have no data dir (fleet/tests); those just skip the sync.
+        ledger_data_dir: Option<&std::path::Path>,
     ) -> Result<Value, String> {
         if !matches!(status, "complete" | "blocked") {
             return Err(format!(
@@ -3458,20 +3485,26 @@ impl InProcessAgentOrchestrator {
         }
         // #1666 residue — the `goal_update` tool addresses THIS folder's goal.
         let key = self.scoped_goal_key(session_id);
-        let mut state = self.state();
-        let Some(goal) = state.goals.get_mut(&key) else {
-            return Err("no goal is set for this session".to_owned());
+        // Do the mutation + persist under the lock, then DROP it before any
+        // ledger file I/O below.
+        let (snapshot, status_changed) = {
+            let mut state = self.state();
+            let Some(goal) = state.goals.get_mut(&key) else {
+                return Err("no goal is set for this session".to_owned());
+            };
+            if goal.profile_id != profile_id {
+                return Err("goal is outside this profile's scope".to_owned());
+            }
+            if goal.status == "complete" {
+                return Err("goal is already complete".to_owned());
+            }
+            let status_changed = goal.status != status;
+            goal.status = status.to_owned();
+            goal.updated_at_ms = now_ms();
+            let snapshot = goal.clone();
+            persist_goal_state(&state, &key, &snapshot, false);
+            (snapshot, status_changed)
         };
-        if goal.profile_id != profile_id {
-            return Err("goal is outside this profile's scope".to_owned());
-        }
-        if goal.status == "complete" {
-            return Err("goal is already complete".to_owned());
-        }
-        goal.status = status.to_owned();
-        goal.updated_at_ms = now_ms();
-        let snapshot = goal.clone();
-        persist_goal_state(&state, &key, &snapshot, false);
         tracing::info!(
             session = %session_id,
             goal_id = %snapshot.goal_id,
@@ -3479,71 +3512,78 @@ impl InProcessAgentOrchestrator {
             reason = %reason,
             "model transitioned goal via goal_update tool"
         );
+        // #1957 — sync the transition into the durable ledger using the snapshot
+        // we JUST transitioned (no re-fetch → codex #3). Best-effort. The
+        // guarded `upsert_goal` makes this newer state win over a stale
+        // finding-path upsert (codex #2), and a decision is appended only on a
+        // real status change (codex #5 — `blocked → blocked` retries add none).
+        if let Some(data_dir) = ledger_data_dir {
+            self.sync_transition_to_ledger(data_dir, &snapshot, reason, session_id, status_changed);
+        }
         Ok(autonomy_goal_json(&snapshot))
     }
 
-    /// #1957 — sync a goal transition into the durable ledger: upsert the goal
-    /// row with its now-current status/tokens AND append a `decisions` row
-    /// recording the transition. Without this the ledger goals-row showed the
-    /// status as of the last peer finding (usually `active`, since completing a
-    /// goal records no finding) and the `decisions` table was never written at
-    /// all. Best-effort — a ledger failure never affects the in-memory
-    /// transition the caller already committed. Opens (creates) the ledger,
-    /// since a transition can be the FIRST ledger write for a finding-less goal.
-    pub(crate) fn model_goal_record_transition_to_ledger(
+    /// #1957 — sync a JUST-transitioned goal snapshot into the durable ledger:
+    /// upsert the goals-row (guarded, so a stale finding upsert can't undo it)
+    /// AND — only when the status actually changed — append a `decisions` row.
+    /// Takes the caller's IN-HAND snapshot, never a re-fetch, so it always
+    /// targets the goal the transition mutated even if another folder re-bound
+    /// the same wire session concurrently (codex #3). Best-effort: a ledger
+    /// failure never affects the in-memory transition. Opens (creates) the
+    /// ledger, since a transition can be the FIRST ledger write for a
+    /// finding-less goal.
+    fn sync_transition_to_ledger(
         &self,
         profile_data_dir: &std::path::Path,
-        session_id: &SessionKey,
-        profile_id: &str,
-        status: &str,
+        snapshot: &AutonomyGoalRecord,
         reason: &str,
+        decided_by: &SessionKey,
+        status_changed: bool,
     ) {
-        let key = self.scoped_goal_key(session_id);
-        let goal_row = {
-            let state = self.state();
-            match state.goals.get(&key) {
-                Some(goal) if goal.profile_id == profile_id => octos_fleet::Goal {
-                    goal_id: goal.goal_id.clone(),
-                    objective: goal.objective.clone(),
-                    status: goal.status.clone(),
-                    tokens_used: goal.tokens_used,
-                    token_budget: goal.token_budget,
-                    continuations_used: goal.continuations_used,
-                    revision: 0,
-                    created_at_ms: goal.created_at_ms.max(0) as u64,
-                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
-                },
-                _ => return,
-            }
-        };
         let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
         if std::fs::create_dir_all(&ledger_dir).is_err() {
             return;
         }
         let ledger_path = ledger_dir.join(format!(
             "{}.db",
-            sanitize_filename_for_ledger(&goal_row.goal_id)
+            sanitize_filename_for_ledger(&snapshot.goal_id)
         ));
         let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) else {
             return;
         };
-        let _ = ledger.upsert_goal(&goal_row);
+        let _ = ledger.upsert_goal(&octos_fleet::Goal {
+            goal_id: snapshot.goal_id.clone(),
+            objective: snapshot.objective.clone(),
+            status: snapshot.status.clone(),
+            tokens_used: snapshot.tokens_used,
+            token_budget: snapshot.token_budget,
+            continuations_used: snapshot.continuations_used,
+            revision: 0,
+            created_at_ms: snapshot.created_at_ms.max(0) as u64,
+            updated_at_ms: snapshot.updated_at_ms.max(0) as u64,
+        });
+        // codex #5 — no decision row for a no-op (e.g. `blocked → blocked`
+        // retry after a lost response), so the audit trail can't fill with
+        // indistinguishable duplicates.
+        if !status_changed {
+            return;
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let decision = octos_fleet::Decision {
-            decision_id: format!("dec-{}-{}", goal_row.goal_id, uuid::Uuid::now_v7()),
-            goal_id: goal_row.goal_id.clone(),
+            decision_id: format!("dec-{}-{}", snapshot.goal_id, uuid::Uuid::now_v7()),
+            goal_id: snapshot.goal_id.clone(),
             task_id: None,
-            question: format!("transition goal to `{status}`"),
+            question: format!("transition goal to `{}`", snapshot.status),
             options_considered: None,
-            choice: status.to_owned(),
+            choice: snapshot.status.clone(),
             rationale: reason.chars().take(1000).collect(),
             based_on_findings: None,
             based_on_rev: 0,
             decided_at_ms: now_ms,
-            decided_by: session_id.to_string(),
+            decided_by: decided_by.to_string(),
         };
         let _ = ledger.append_decision(&decision);
     }
@@ -4451,6 +4491,9 @@ impl InProcessAgentOrchestrator {
                 // the goal even if a later read would fail. (The `goal_get` snapshot
                 // stays as a backstop for the non-deny paths.)
                 if fleet_un_completable {
+                    // Fleet-completion path: no profile data dir in scope, so the
+                    // ledger sync is skipped here (`None`). The interactive
+                    // goal_update path carries the data dir and syncs (#1957).
                     let _ = self.model_transition_goal(
                         session_id,
                         profile_id,
@@ -4459,6 +4502,7 @@ impl InProcessAgentOrchestrator {
                             "fleet cannot complete — task `{task_id}` was denied and will not \
                              re-run without a replan",
                         ),
+                        None,
                     );
                 }
                 Ok(json!({
@@ -4507,11 +4551,14 @@ impl InProcessAgentOrchestrator {
     ) -> bool {
         let un_completable = !complete && !failed_tasks.is_empty();
         if complete {
+            // Fleet-completion path: no data dir in scope → ledger sync skipped
+            // (`None`). Interactive goal_update carries the data dir (#1957).
             let _ = self.model_transition_goal(
                 session_id,
                 profile_id,
                 "complete",
                 "all fleet tasks accepted",
+                None,
             );
         } else if un_completable {
             let _ = self.model_transition_goal(
@@ -4523,6 +4570,7 @@ impl InProcessAgentOrchestrator {
                      replan: {}",
                     failed_tasks.join(", ")
                 ),
+                None,
             );
         }
         un_completable
@@ -14134,7 +14182,7 @@ mod tests {
 
         // Once COMPLETE, the model may replace it with a fresh active goal.
         orchestrator
-            .model_transition_goal(&session_id, "tenant-a", "complete", "done")
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
             .expect("complete the goal");
         let replaced = orchestrator
             .model_create_goal(&session_id, "tenant-a", "next objective", None)
@@ -14178,7 +14226,7 @@ mod tests {
         for status in ["paused", "active", "budget_limited", "cleared"] {
             assert!(
                 orchestrator
-                    .model_transition_goal(&session_id, "tenant-a", status, "nope")
+                    .model_transition_goal(&session_id, "tenant-a", status, "nope", None)
                     .is_err(),
                 "{status} must not be a model-allowed transition"
             );
@@ -14186,13 +14234,13 @@ mod tests {
         // Wrong profile is rejected.
         assert!(
             orchestrator
-                .model_transition_goal(&session_id, "tenant-b", "complete", "scope")
+                .model_transition_goal(&session_id, "tenant-b", "complete", "scope", None)
                 .is_err()
         );
 
         // complete works and returns the goal snapshot.
         let goal = orchestrator
-            .model_transition_goal(&session_id, "tenant-a", "complete", "haiku written")
+            .model_transition_goal(&session_id, "tenant-a", "complete", "haiku written", None)
             .expect("model completes");
         assert_eq!(goal["status"], json!("complete"));
         assert_eq!(
@@ -14202,7 +14250,7 @@ mod tests {
         // Double-complete refused.
         assert!(
             orchestrator
-                .model_transition_goal(&session_id, "tenant-a", "complete", "again")
+                .model_transition_goal(&session_id, "tenant-a", "complete", "again", None)
                 .is_err()
         );
 
@@ -14216,6 +14264,57 @@ mod tests {
             Some("complete"),
             "budget flip must not clobber a model-set terminal status"
         );
+    }
+
+    /// #1957 — a model `goal_update` completion must land in the DURABLE goal
+    /// ledger, not just the in-memory record. Before this fix a goal that
+    /// completed without ever recording a peer finding left the ledger's goals
+    /// row stuck at `active`; `model_transition_goal` now syncs the transition
+    /// straight from the snapshot it just flipped (no re-fetch → codex #3).
+    #[test]
+    fn model_transition_goal_syncs_final_status_into_the_ledger() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-ledger-sync");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "prove the ledger reflects completion".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session_id)
+            .expect("goal_id");
+
+        // Complete via the model path WITH the profile data dir → must sync.
+        // Note: no peer finding was ever recorded for this goal, so the ledger
+        // row is created for the FIRST time by the transition sync itself.
+        orchestrator
+            .model_transition_goal(
+                &session_id,
+                "tenant-a",
+                "complete",
+                "objective met",
+                Some(data_dir.path()),
+            )
+            .expect("model completes");
+
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query ledger")
+            .expect("goal row present in ledger");
+        assert_eq!(
+            row.status, "complete",
+            "the durable ledger must reflect the final `complete` status"
+        );
+        assert_eq!(row.objective, "prove the ledger reflects completion");
     }
 
     /// #1696 — `goal_get` snapshot: stable shape with remaining budget;
@@ -16091,6 +16190,7 @@ mod tests {
             "still working on it",
             &GoalCompletionVerdict::Done,
             None,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -16103,6 +16203,7 @@ mod tests {
             "tenant-a",
             "All done. <goal:complete>",
             &GoalCompletionVerdict::Done,
+            None,
             None,
         ));
         assert_eq!(
@@ -16149,6 +16250,7 @@ mod tests {
                 reason: "evidence insufficient".to_string(),
             },
             None,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -16183,6 +16285,7 @@ mod tests {
             "Done. <goal:complete>",
             &GoalCompletionVerdict::Done,
             Some("wrong-goal-id"), // Stale/incorrect ID
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -16197,6 +16300,7 @@ mod tests {
             "Done. <goal:complete>",
             &GoalCompletionVerdict::Done,
             goal_a_id.as_deref(), // Correct ID
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -17997,6 +18101,7 @@ mod tests {
             "I am about to write <goal:complete> shortly, but step 2 first.",
             &GoalCompletionVerdict::Done,
             None,
+            None,
         ));
         assert_eq!(
             orchestrator.goal_status_for_test(&session_id).as_deref(),
@@ -18009,6 +18114,7 @@ mod tests {
             "tenant-a",
             "All requested checks finished.\n\n<goal:complete>",
             &GoalCompletionVerdict::Done,
+            None,
             None,
         ));
         assert_eq!(

@@ -233,8 +233,14 @@ impl GoalLedger {
     /// stale, tokens 0) purely to satisfy the findings/escalations FK, so an
     /// audit of the ledger saw no real goal state. This writes the authoritative
     /// objective/status/tokens/budget on first use AND keeps them fresh on every
-    /// later call. `created_at_ms` and `revision` are preserved on conflict
-    /// (a sync is not a CAS update); everything mutable is overwritten.
+    /// later call. `created_at_ms` and `revision` are preserved on conflict.
+    ///
+    /// #1957 codex #2 — the UPDATE is GUARDED on `updated_at_ms`: it only
+    /// overwrites when the incoming snapshot is at least as new as the stored
+    /// row. Without this, a finding/escalation path that snapshotted an older
+    /// `active` state (then did file I/O before writing) could clobber a
+    /// concurrently-written `complete` back to `active`. A `>=` (not `>`) keeps
+    /// same-instant writers idempotent.
     pub fn upsert_goal(&self, goal: &Goal) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -246,7 +252,8 @@ impl GoalLedger {
                  tokens_used = excluded.tokens_used,
                  token_budget = excluded.token_budget,
                  continuations_used = excluded.continuations_used,
-                 updated_at_ms = excluded.updated_at_ms",
+                 updated_at_ms = excluded.updated_at_ms
+             WHERE excluded.updated_at_ms >= goals.updated_at_ms",
             params![
                 goal.goal_id,
                 goal.objective,
@@ -1512,6 +1519,39 @@ mod digest_integration_tests {
         assert_eq!(
             got.created_at_ms, 1000,
             "created_at must be preserved on conflict"
+        );
+
+        // Guard (issue #1957 codex #2): a STALE upsert — one whose
+        // `updated_at_ms` is OLDER than the row's — must NOT clobber the newer
+        // state. This is the finding-path-after-completion race: a peer finding
+        // lands and re-upserts the goal row with the goal's pre-completion
+        // status; without the `updated_at_ms >=` guard it would flip a
+        // `complete` goal back to `active` in the durable ledger.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "compute 6x7".to_string(),
+                status: "active".to_string(), // stale pre-completion status
+                tokens_used: 120,             // stale, lower spend
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1500, // OLDER than the row's 2000 → must be dropped
+            })
+            .unwrap();
+        let got = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            got.status, "complete",
+            "a stale (older updated_at_ms) upsert must not downgrade the status"
+        );
+        assert_eq!(
+            got.tokens_used, 550,
+            "a stale upsert must not roll the token counter backwards"
+        );
+        assert_eq!(
+            got.continuations_used, 3,
+            "stale continuations rejected too"
         );
     }
 }

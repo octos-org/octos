@@ -1149,36 +1149,26 @@ impl Tool for GoalUpdateTool {
             }
         }
 
+        // #1957 — pass the profile data dir so model_transition_goal syncs the
+        // transition into the ledger (goals-row status + a decision) using the
+        // snapshot it just transitioned. Done INSIDE model_transition_goal (not
+        // here) so it uses the correct goal without a racy re-fetch (codex #3).
         match default_agent_orchestrator().model_transition_goal(
             &session_id,
             &self.profile_id,
             status,
             reason,
+            self.data_dir.as_deref(),
         ) {
-            Ok(goal) => {
-                // #1957 — sync the transition into the durable ledger (goal-row
-                // status + a decisions row), so the ledger reflects the FINAL
-                // status even when the completing turn recorded no new finding.
-                // Best-effort; only when this tool carries the profile data dir.
-                if let Some(data_dir) = self.data_dir.as_ref() {
-                    default_agent_orchestrator().model_goal_record_transition_to_ledger(
-                        data_dir,
-                        &session_id,
-                        &self.profile_id,
-                        status,
-                        reason,
-                    );
-                }
-                Ok(ToolResult {
-                    output: format!(
-                        "goal transitioned to `{status}`:\n{}",
-                        serde_json::to_string_pretty(&goal).unwrap_or_else(|_| goal.to_string())
-                    ),
-                    success: true,
-                    tokens_used: verifier_usage.clone(),
-                    ..Default::default()
-                })
-            }
+            Ok(goal) => Ok(ToolResult {
+                output: format!(
+                    "goal transitioned to `{status}`:\n{}",
+                    serde_json::to_string_pretty(&goal).unwrap_or_else(|_| goal.to_string())
+                ),
+                success: true,
+                tokens_used: verifier_usage.clone(),
+                ..Default::default()
+            }),
             Err(message) => Ok(ToolResult {
                 output: format!("goal_update: {message}"),
                 success: false,
