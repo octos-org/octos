@@ -268,10 +268,12 @@ pub struct GoalGetTool {
     /// Peer-agent-based goal: the profile's persistent `data_dir`. When set,
     /// `goal_get` aggregates the latest `result.md` from every staged peer
     /// whose `goal` file points at the queried goal (under
-    /// `<data_dir>/peers/<slug>/goal`), AND the durable findings from the
-    /// goal's sqlite ledger (under `<data_dir>/goal-ledgers/<goal_id>.db`),
-    /// surfacing them as `peer_findings` and `ledger_findings` in the
-    /// snapshot. `None` preserves pre-peer-goal behaviour (no aggregation).
+    /// `<data_dir>/peers/<slug>/goal`), AND the durable findings + open
+    /// escalations from the goal's sqlite ledger (under
+    /// `<data_dir>/goal-ledgers/<goal_id>.db`), surfacing them as
+    /// `peer_findings`, `ledger_findings` and `open_escalations` (#1967) in
+    /// the snapshot. `None` preserves pre-peer-goal behaviour (no
+    /// aggregation).
     data_dir: Option<std::path::PathBuf>,
 }
 
@@ -425,6 +427,22 @@ impl Tool for GoalGetTool {
             if !ledger_findings.is_empty() {
                 if let Value::Object(map) = &mut snapshot {
                     map.insert("ledger_findings".to_owned(), Value::Array(ledger_findings));
+                }
+            }
+            // #1967 — fold in the goal's OPEN escalations (rows written when a
+            // goal-scoped peer parks on an approval/question). Until this read
+            // the escalations table was write-only: a master that missed the
+            // park-time wake could never rediscover a blocked peer from
+            // goal_get. Open rows only, compact shape (question ≤300 chars),
+            // omitted entirely when none are open.
+            let open_escalations =
+                orchestrator.model_goal_ledger_open_escalations(data_dir, &goal_id);
+            if !open_escalations.is_empty() {
+                if let Value::Object(map) = &mut snapshot {
+                    map.insert(
+                        "open_escalations".to_owned(),
+                        Value::Array(open_escalations),
+                    );
                 }
             }
         }
@@ -1305,6 +1323,92 @@ impl Tool for GoalCreateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1967 — `goal_get` must SURFACE open escalations: the rows are written
+    /// when a goal-scoped peer parks (`model_goal_record_peer_escalation`) but
+    /// until this fold no production read existed, so the master model could
+    /// never see them. Same data_dir gate as `ledger_findings`.
+    #[tokio::test]
+    async fn goal_get_includes_open_escalations_when_data_dir_set() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        // The tool reads the PROCESS-GLOBAL orchestrator: use a unique
+        // session/profile and never clear the shared state (sibling tests own
+        // their own keys — same idiom as the ui_protocol continuation tests).
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("esc-tenant:api:goal-get-open-escalations".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "esc-tenant".to_owned(),
+                objective: "surface open escalations".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session)
+            .expect("goal id minted");
+
+        // Seed the goal's ledger with ONE open escalation (goal ids are
+        // `goal_NN` — already filename-safe).
+        let data_dir = tempfile::tempdir().unwrap();
+        let ledger_dir = data_dir.path().join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger =
+            octos_fleet::GoalLedger::open(ledger_dir.join(format!("{goal_id}.db"))).unwrap();
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "surface open escalations".to_owned(),
+                status: "active".to_owned(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        ledger
+            .append_escalation(&octos_fleet::Escalation {
+                escalation_id: "esc-helper-1".to_owned(),
+                goal_id: goal_id.clone(),
+                task_id: None,
+                peer_id: "helper".to_owned(),
+                question: "[question] which port?".to_owned(),
+                context: None,
+                status: "open".to_owned(),
+                default_action: None,
+                default_after_secs: None,
+                created_at_ms: 1_000,
+                resolved_at_ms: None,
+                resolved_by: None,
+                resolution: None,
+            })
+            .unwrap();
+
+        let tool = GoalGetTool::new("esc-tenant").with_data_dir(data_dir.path().to_path_buf());
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+        let result = tool
+            .execute_with_context(&ctx, &json!({}))
+            .await
+            .expect("goal_get runs");
+        assert!(result.success, "goal_get succeeds: {}", result.output);
+        let snapshot: Value = serde_json::from_str(&result.output).expect("json snapshot");
+        let escalations = snapshot["open_escalations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("open_escalations folded in, got: {snapshot}"));
+        assert_eq!(escalations.len(), 1);
+        assert_eq!(escalations[0]["escalation_id"], json!("esc-helper-1"));
+        assert_eq!(escalations[0]["peer_id"], json!("helper"));
+        assert_eq!(escalations[0]["question"], json!("[question] which port?"));
+        assert!(
+            escalations[0]["age_seconds"].as_u64().is_some(),
+            "age_seconds present"
+        );
+    }
 
     #[test]
     fn goal_plan_absent_grant_is_minimal() {

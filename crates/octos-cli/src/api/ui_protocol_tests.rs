@@ -28051,6 +28051,77 @@ fn peer_close_callback_emits_closed_event_on_success_only() {
     assert_eq!(event.profile_id, "tenant-a");
 }
 
+/// #1967 — closing a goal-scoped peer must RESOLVE its open escalation row in
+/// the goal ledger. The close cancels the parked oneshot
+/// (`cancel_peer_pending_on_close`) and `peer_respond` refuses closed peers,
+/// so before this fix the row written at park time stayed `open` forever — a
+/// permanent phantom on the master's `goal_get` escalation surface.
+#[test]
+fn peer_close_resolves_open_goal_escalations_in_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "close-esc";
+    std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+    std::fs::write(peers_root.join(slug).join("brief.md"), "work").unwrap();
+    let owner = "tenant-a:api:master";
+    std::fs::write(peers_root.join(slug).join("originator"), owner).unwrap();
+    // Goal binding: first line goal_id, second (optional) task_id — the same
+    // layout `wake_master_on_peer_awaiting_input` reads when it WRITES the row.
+    std::fs::write(peers_root.join(slug).join("goal"), "g-close\ntask-9\n").unwrap();
+
+    // Seed the OPEN escalation the peer parked on (written at park time by
+    // `model_goal_record_peer_escalation`; seeded directly here).
+    let ledger_dir = tmp.path().join("goal-ledgers");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    let ledger = octos_fleet::GoalLedger::open(ledger_dir.join("g-close.db")).unwrap();
+    ledger
+        .upsert_goal(&octos_fleet::Goal {
+            goal_id: "g-close".to_owned(),
+            objective: "test".to_owned(),
+            status: "active".to_owned(),
+            tokens_used: 0,
+            token_budget: 1_000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        })
+        .unwrap();
+    ledger
+        .append_escalation(&octos_fleet::Escalation {
+            escalation_id: "esc-close-1".to_owned(),
+            goal_id: "g-close".to_owned(),
+            task_id: None,
+            peer_id: slug.to_owned(),
+            question: "[approval] run the migration?".to_owned(),
+            context: None,
+            status: "open".to_owned(),
+            default_action: None,
+            default_after_secs: None,
+            created_at_ms: 1_000,
+            resolved_at_ms: None,
+            resolved_by: None,
+            resolution: None,
+        })
+        .unwrap();
+
+    let close = build_peer_close_callback(
+        peers_root.clone(),
+        owner.to_owned(),
+        "tenant-a".to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
+    );
+    close(slug.to_owned()).expect("owner closes");
+
+    let open = ledger.list_open_escalations("g-close").unwrap();
+    assert!(
+        open.is_empty(),
+        "peer_close must resolve the orphaned escalation, still open: {open:?}"
+    );
+}
+
 /// PART C — a NAMED peer reserves the exact name-derived slug, stores the
 /// display name, and REJECTS a duplicate name (case-insensitive) or a name
 /// that derives an already-taken slug (no auto-suffix).
