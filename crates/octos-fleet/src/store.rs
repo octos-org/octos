@@ -56,14 +56,20 @@ const DB_FILENAME: &str = "fleet-kernel.redb";
 // Outcome / report types
 // ---------------------------------------------------------------------------
 
-/// Result of a launch CAS. The three rejections are *values*, not
+/// Result of a launch CAS. The rejections are *values*, not
 /// errors: they are ordinary control flow the keeper reasons over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchOutcome {
-    Launched { attempt_id: String },
+    Launched {
+        attempt_id: String,
+    },
     RejectedNotReady,
     RejectedDoubleLaunch,
     RejectedBudgetExceeded,
+    /// #1973 fix-round — the parent fleet is terminal
+    /// (`Complete`/`Failed`/`Cancelled`): `goal_clear` cancels the fleet, and
+    /// a keeper/pool racing that cancel must not launch new work onto it.
+    RejectedFleetTerminal,
 }
 
 /// Result of a complete CAS. `Superseded` means the four-part predicate
@@ -115,6 +121,11 @@ pub enum PlanMutateOutcome {
     RevisionMismatch {
         actual: u64,
     },
+    /// #1973 fix-round — the parent FLEET is terminal
+    /// (`Complete`/`Failed`/`Cancelled`, e.g. `goal_clear` cancelled it):
+    /// plan/grant mutations are refused with zero mutation, same in-txn fence
+    /// as the child CAS ops.
+    RejectedFleetTerminal,
     /// A `RetargetDeps`-style edit tried to change the dependency set of a
     /// task that is terminal (`Succeeded`/`Failed`) — detected **inside**
     /// the `replan` write-txn, so a task that completes between a caller's
@@ -284,7 +295,17 @@ impl FleetKernelStore {
     /// refuses to overwrite an existing plan (use [`FleetKernelStore::replan`]
     /// for edits) — a blind overwrite would silently drop tasks without
     /// advancing the generation fence.
-    pub async fn create_plan(&self, mut plan: DurablePlan) -> Result<()> {
+    ///
+    /// #1973 fix-round 4 — terminal-fleet fenced, same typed rejection as
+    /// `replan`/`set_task_grant`: `create_fleet → cancel_fleet → create_plan`
+    /// used to seed a plan onto the cancelled fleet (this fn opened only the
+    /// PLANS table). Now the fleet row is read in the SAME write txn: a
+    /// terminal fleet returns [`PlanMutateOutcome::RejectedFleetTerminal`]
+    /// with zero mutation, a MISSING/newer-schema fleet is a `bail!` (this
+    /// fn's native misuse idiom, like the duplicate-plan reject — a plan must
+    /// never exist without its fleet), and success is
+    /// [`PlanMutateOutcome::Mutated`] carrying the plan's initial revision.
+    pub async fn create_plan(&self, mut plan: DurablePlan) -> Result<PlanMutateOutcome> {
         ensure_key_safe(&[plan.fleet_id.as_str()])?;
         for t in &plan.tasks {
             ensure_key_safe(&[t.task_id.as_str()])?;
@@ -295,24 +316,46 @@ impl FleetKernelStore {
         plan.schema_version = SCHEMA_VERSION;
         let db = self.db.clone();
         let held = self.io_gate.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        tokio::task::spawn_blocking(move || -> Result<PlanMutateOutcome> {
             let _held = held;
             let wtx = db.begin_write()?;
-            {
+            let outcome = {
+                let fleets = wtx.open_table(FLEETS)?;
                 let mut plans = wtx.open_table(PLANS)?;
+
+                let Some(fj) = fleets
+                    .get(plan.fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                else {
+                    bail!("cannot create plan for unknown fleet {}", plan.fleet_id);
+                };
+                let Some(fleet) = decode_row::<FleetRecord>(&fj)? else {
+                    bail!("fleet {} is a newer schema", plan.fleet_id);
+                };
+                if fleet.fleet_id != plan.fleet_id {
+                    bail!("create_plan: fleet identity mismatch for {}", plan.fleet_id);
+                }
+                if !fleet_is_live(&fleet) {
+                    return Ok(PlanMutateOutcome::RejectedFleetTerminal);
+                }
+
                 if plans.get(plan.fleet_id.as_str())?.is_some() {
                     bail!(
                         "plan for fleet {} already exists; use replan",
                         plan.fleet_id
                     );
                 }
+                let revision = plan.revision;
                 plans.insert(
                     plan.fleet_id.as_str(),
                     serde_json::to_string(&plan)?.as_str(),
                 )?;
+                PlanMutateOutcome::Mutated { revision }
+            };
+            if matches!(outcome, PlanMutateOutcome::Mutated { .. }) {
+                wtx.commit()?;
             }
-            wtx.commit()?;
-            Ok(())
+            Ok(outcome)
         })
         .await
         .wrap_err("join create_plan")?
@@ -488,6 +531,13 @@ impl FleetKernelStore {
                 let Some(fleet) = decode_row::<FleetRecord>(&fj)? else {
                     bail!("fleet {fleet_id} is a newer schema");
                 };
+                // #1973 fix-round — terminal-fleet fence: no new children on a
+                // fleet `goal_clear` cancelled. `bail!` is this fn's native
+                // rejection idiom (it already errors on unknown fleet /
+                // duplicate child), so misuse stays an error, not a value.
+                if !fleet_is_live(&fleet) {
+                    bail!("cannot add child to terminal fleet {fleet_id}");
+                }
 
                 let ckey = child_key(&fleet_id, &child_id);
                 if children.get(ckey.as_str())?.is_some() {
@@ -537,7 +587,24 @@ impl FleetKernelStore {
             let _held = held;
             let wtx = db.begin_write()?;
             let promoted = {
+                let fleets = wtx.open_table(FLEETS)?;
                 let mut children = wtx.open_table(FLEET_CHILDREN)?;
+                // #1973 fix-round — terminal-fleet fence: a cancelled fleet's
+                // Planned children must not promote to Ready (they would look
+                // launchable to any direct reader). A missing/newer-schema/
+                // mismatched fleet row counts as not-live — promotion requires
+                // a live owner; a real decode error still propagates.
+                let fleet_live = match fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                {
+                    Some(fj) => decode_row::<FleetRecord>(&fj)?
+                        .is_some_and(|fleet| fleet.fleet_id == fleet_id && fleet_is_live(&fleet)),
+                    None => false,
+                };
+                if !fleet_live {
+                    return Ok(false);
+                }
                 let ckey = child_key(&fleet_id, &child_id);
                 let Some(cj) = children.get(ckey.as_str())?.map(|g| g.value().to_string()) else {
                     bail!("mark_ready: unknown child {child_id} in fleet {fleet_id}");
@@ -620,7 +687,24 @@ impl FleetKernelStore {
             let wtx = db.begin_write()?;
             let mut ready = Vec::new();
             {
+                let fleets = wtx.open_table(FLEETS)?;
                 let mut children = wtx.open_table(FLEET_CHILDREN)?;
+
+                // #1973 fix-round — terminal-fleet fence: a cancelled fleet has
+                // no launchable set — no promotions, empty result. Missing/
+                // newer-schema/mismatched fleet rows count as not-live; a real
+                // decode error still propagates.
+                let fleet_live = match fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                {
+                    Some(fj) => decode_row::<FleetRecord>(&fj)?
+                        .is_some_and(|fleet| fleet.fleet_id == fleet_id && fleet_is_live(&fleet)),
+                    None => false,
+                };
+                if !fleet_live {
+                    return Ok(Vec::new());
+                }
 
                 // Collect this fleet's children (owned, identity-checked) so
                 // the iterator's borrow is released before we mutate.
@@ -705,9 +789,7 @@ impl FleetKernelStore {
                         // Identity check (defense in depth, mirrors get_fleet):
                         // the row must own the key it lives under. Filter to the
                         // two live states — terminal fleets never re-dispatch.
-                        if rec.fleet_id == k.value()
-                            && matches!(rec.status, FleetStatus::Active | FleetStatus::Draining)
-                        {
+                        if rec.fleet_id == k.value() && fleet_is_live(&rec) {
                             out.push(rec);
                         }
                     }
@@ -732,6 +814,67 @@ impl FleetKernelStore {
             }
         }
         Ok(out)
+    }
+
+    /// Terminalize a fleet as `Cancelled` (#1973 fix B — the `goal_clear`
+    /// half of goal↔fleet lifecycle symmetry). `goal_clear` used to remove
+    /// the goal WITHOUT terminalizing its bound fleet, so the orphan stayed
+    /// `Active` in this store forever: every boot-resume pass re-scanned it
+    /// (and only the orchestrator-side orphan guard kept it from being woken).
+    ///
+    /// One write-txn: a **live** (`Active`/`Draining`) fleet becomes
+    /// `Cancelled` with `updated_at_ms = now_ms` and the call returns `true`.
+    /// A missing fleet, a newer-schema row, or an already-terminal fleet
+    /// (`Complete`/`Failed`/`Cancelled`) is a `false` no-op — cancellation
+    /// never resurrects or rewrites terminal history. Children and attempts
+    /// are deliberately left as-is HERE: the terminal status is itself the
+    /// fence (`launch_child`/`mark_running`/`complete_child`/
+    /// `record_escalation` all refuse under a terminal fleet, and
+    /// [`Self::fleets_with_ready_children`] filters on live status), and
+    /// [`Self::reconcile`] settles any still-live attempt + its reservation
+    /// on the next boot. No outbox event is appended — the goal that owned
+    /// the keeper is gone, so there is nobody to wake (and the outbox
+    /// consumer drops `ChildDone` wakes for `Cancelled` fleets anyway).
+    pub async fn cancel_fleet(&self, fleet_id: &str, now_ms: u64) -> Result<bool> {
+        ensure_key_safe(&[fleet_id])?;
+        let db = self.db.clone();
+        let fleet_id = fleet_id.to_string();
+        let held = self.io_gate.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let _held = held;
+            let wtx = db.begin_write()?;
+            let cancelled = {
+                let mut fleets = wtx.open_table(FLEETS)?;
+                let Some(fj) = fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                else {
+                    return Ok(false);
+                };
+                let Some(mut fleet) = decode_row::<FleetRecord>(&fj)? else {
+                    // Newer-schema row: leave it for the newer binary.
+                    return Ok(false);
+                };
+                // Identity check (defense in depth, mirrors get_fleet).
+                if fleet.fleet_id != fleet_id {
+                    bail!("cancel_fleet: fleet identity mismatch");
+                }
+                if !fleet_is_live(&fleet) {
+                    false
+                } else {
+                    fleet.status = FleetStatus::Cancelled;
+                    fleet.updated_at_ms = now_ms;
+                    fleets.insert(fleet_id.as_str(), serde_json::to_string(&fleet)?.as_str())?;
+                    true
+                }
+            };
+            if cancelled {
+                wtx.commit()?;
+            }
+            Ok(cancelled)
+        })
+        .await
+        .wrap_err("join cancel_fleet")?
     }
 
     // ---- CAS state transitions -------------------------------------------
@@ -806,6 +949,13 @@ impl FleetKernelStore {
                 };
                 if fleet.fleet_id != fleet_id {
                     return Ok(LaunchOutcome::RejectedNotReady);
+                }
+
+                // #1973 fix-round — terminal-fleet fence, checked in the SAME
+                // txn as every other predicate: a fleet `goal_clear` cancelled
+                // must not accept new launches from a racing keeper/pool.
+                if !fleet_is_live(&fleet) {
+                    return Ok(LaunchOutcome::RejectedFleetTerminal);
                 }
 
                 // Budget predicate — checked *before* any write, so a
@@ -958,6 +1108,12 @@ impl FleetKernelStore {
                     return Ok(MarkRunningOutcome::Superseded);
                 }
 
+                // #1973 fix-round — terminal-fleet fence (see `launch_child`):
+                // a child of a cancelled fleet must not advance to Running.
+                if !fleet_is_live(&fleet) {
+                    return Ok(MarkRunningOutcome::Superseded);
+                }
+
                 // Validate EVERYTHING before writing either row (P2-6). Each is
                 // a CAS-predicate fence — a miss is a lost race (`Superseded`).
                 if child.current_attempt_id.as_deref() != Some(attempt_id.as_str())
@@ -1059,6 +1215,16 @@ impl FleetKernelStore {
                     || attempt.attempt_id != attempt_id
                     || fleet.fleet_id != fleet_id
                 {
+                    return Ok(CompleteOutcome::Superseded);
+                }
+
+                // #1973 fix-round — terminal-fleet fence: a worker completing
+                // AFTER `goal_clear` cancelled the fleet must not mutate
+                // terminal history, settle budget, or append a `ChildDone`
+                // wake (the goal that owned the keeper is gone). The still-
+                // live attempt + its reservation are settled by `reconcile`'s
+                // terminal-fleet release at the next boot.
+                if !fleet_is_live(&fleet) {
                     return Ok(CompleteOutcome::Superseded);
                 }
 
@@ -1228,6 +1394,14 @@ impl FleetKernelStore {
                     return Ok(CompleteOutcome::Superseded);
                 }
 
+                // #1973 fix-round — terminal-fleet fence, same as
+                // `complete_child`: an escalation yielded after `goal_clear`
+                // cancelled the fleet must not mutate its rows or append a
+                // `ChildDone` wake (no keeper exists to decide it).
+                if !fleet_is_live(&fleet) {
+                    return Ok(CompleteOutcome::Superseded);
+                }
+
                 // Same four-part predicate as `complete_child` — a stale / late
                 // / superseded attempt cannot escalate.
                 let is_current = child.current_attempt_id.as_deref() == Some(attempt_id.as_str());
@@ -1389,6 +1563,14 @@ impl FleetKernelStore {
                 };
                 if fleet.fleet_id != fleet_id {
                     bail!("replan: fleet identity mismatch for {fleet_id}");
+                }
+                // #1973 fix-round — terminal-fleet fence: a replan interrupts
+                // attempts, releases budget, and RESURRECTS children — none of
+                // which may happen on a fleet `goal_clear` cancelled. Zero
+                // mutation. (`PlanEdit::RetargetDeps` routes through here, so
+                // it is fenced too.)
+                if !fleet_is_live(&fleet) {
+                    return Ok(PlanMutateOutcome::RejectedFleetTerminal);
                 }
                 let new_gen = fleet
                     .generation
@@ -1640,7 +1822,22 @@ impl FleetKernelStore {
             let _held = held;
             let wtx = db.begin_write()?;
             let outcome = {
+                let fleets = wtx.open_table(FLEETS)?;
                 let mut plans = wtx.open_table(PLANS)?;
+                // #1973 fix-round — terminal-fleet fence. Beyond the six ops
+                // the review listed, this keeps the invariant total: NO plan
+                // mutator (even a title-only edit) touches a terminal fleet.
+                let fleet_live = match fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                {
+                    Some(fj) => decode_row::<FleetRecord>(&fj)?
+                        .is_some_and(|fleet| fleet.fleet_id == fleet_id && fleet_is_live(&fleet)),
+                    None => false,
+                };
+                if !fleet_live {
+                    return Ok(PlanMutateOutcome::RejectedFleetTerminal);
+                }
                 let Some(pj) = plans.get(fleet_id.as_str())?.map(|g| g.value().to_string()) else {
                     bail!("retitle_task: no plan for fleet {fleet_id}");
                 };
@@ -1715,8 +1912,23 @@ impl FleetKernelStore {
             let _held = held;
             let wtx = db.begin_write()?;
             let outcome = {
+                let fleets = wtx.open_table(FLEETS)?;
                 let mut plans = wtx.open_table(PLANS)?;
                 let mut children = wtx.open_table(FLEET_CHILDREN)?;
+
+                // #1973 fix-round — terminal-fleet fence: a grant must not
+                // resurrect a cancelled fleet's Blocked child to Ready.
+                let fleet_live = match fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                {
+                    Some(fj) => decode_row::<FleetRecord>(&fj)?
+                        .is_some_and(|fleet| fleet.fleet_id == fleet_id && fleet_is_live(&fleet)),
+                    None => false,
+                };
+                if !fleet_live {
+                    return Ok(PlanMutateOutcome::RejectedFleetTerminal);
+                }
 
                 let Some(pj) = plans.get(fleet_id.as_str())?.map(|g| g.value().to_string()) else {
                     bail!("set_task_grant: no plan for fleet {fleet_id}");
@@ -1833,9 +2045,27 @@ impl FleetKernelStore {
             };
             let wtx = db.begin_write()?;
             let outcome = {
+                let fleets = wtx.open_table(FLEETS)?;
                 let mut children = wtx.open_table(FLEET_CHILDREN)?;
                 let mut plans = wtx.open_table(PLANS)?;
                 let mut outbox = wtx.open_table(OUTBOX)?;
+
+                // #1973 fix-round — terminal-fleet fence: a deny on a fleet
+                // `goal_clear` cancelled must not flip its Blocked child to
+                // Failed, bump the plan, or append a ChildDone wake. Same
+                // no-op shape as a not-Blocked deny.
+                let fleet_live = match fleets
+                    .get(fleet_id.as_str())?
+                    .map(|g| g.value().to_string())
+                {
+                    Some(fj) => decode_row::<FleetRecord>(&fj)?
+                        .is_some_and(|fleet| fleet.fleet_id == fleet_id && fleet_is_live(&fleet)),
+                    None => false,
+                };
+                if !fleet_live {
+                    return Ok(superseded);
+                }
+
                 let ckey = child_key(&fleet_id, &child_id);
                 let Some(cj) = children.get(ckey.as_str())?.map(|g| g.value().to_string()) else {
                     return Ok(superseded);
@@ -1952,9 +2182,12 @@ impl FleetKernelStore {
     /// **or** expired at `now_ms`), atomically mark the attempt
     /// `Interrupted`, **release its reservation** from the fleet budget
     /// (P1-1), clear `current_attempt_id`, and return the child to
-    /// `Ready`. Children of a `Cancelled` fleet are left terminal, never
-    /// resurrected (P2-7). The old attempt is never resurrected; all
-    /// reclamations commit together.
+    /// `Ready`. A **terminal** fleet's live attempts are settled the same
+    /// way but UNCONDITIONALLY (#1973 fix-round — before, `Cancelled`
+    /// fleets were skipped wholesale, pinning the attempt + reservation
+    /// forever), and their children are retired `Cancelled` instead of
+    /// `Ready` — never resurrected (P2-7). The old attempt is never
+    /// resurrected; all reclamations commit together.
     pub async fn reconcile(&self, now_ms: u64, owner_epoch: u64) -> Result<ReconcileReport> {
         let db = self.db.clone();
         let held = self.io_gate.clone().lock_owned().await;
@@ -2008,9 +2241,7 @@ impl FleetKernelStore {
                     if fleet.fleet_id != child.fleet_id {
                         continue;
                     }
-                    if fleet.status == FleetStatus::Cancelled {
-                        continue;
-                    }
+                    let fleet_live = fleet_is_live(&fleet);
 
                     let akey = attempt_key(&child.child_id, &aid);
                     let Some(aj) = attempts.get(akey.as_str())?.map(|g| g.value().to_string())
@@ -2034,10 +2265,19 @@ impl FleetKernelStore {
                     ) {
                         continue;
                     }
-                    let stale = attempt.lease.owner_epoch != owner_epoch
-                        || attempt.lease.expires_at_ms < now_ms;
-                    if !stale {
-                        continue;
+                    // A LIVE fleet's attempt is only reclaimed when its lease is
+                    // stale (foreign epoch or expired). A TERMINAL fleet's live
+                    // attempt is settled UNCONDITIONALLY (#1973 fix-round):
+                    // before, `Cancelled` fleets were skipped wholesale (P2-7),
+                    // permanently pinning the attempt + its reservation — and
+                    // the completion path can no longer settle it either, since
+                    // `complete_child` is now fenced on terminal fleets.
+                    if fleet_live {
+                        let stale = attempt.lease.owner_epoch != owner_epoch
+                            || attempt.lease.expires_at_ms < now_ms;
+                        if !stale {
+                            continue;
+                        }
                     }
 
                     let reserved = attempt.reserved_tokens;
@@ -2065,7 +2305,15 @@ impl FleetKernelStore {
                     )?;
 
                     let ckey = child_key(&child.fleet_id, &child.child_id);
-                    child.status = ChildStatus::Ready;
+                    // P2-7 still holds: a terminal fleet's child is NEVER
+                    // resurrected to `Ready` — it is retired terminal
+                    // (`Cancelled`) alongside its settled attempt. Only a live
+                    // fleet's child returns to `Ready` for this boot to relaunch.
+                    child.status = if fleet_live {
+                        ChildStatus::Ready
+                    } else {
+                        ChildStatus::Cancelled
+                    };
                     child.current_attempt_id = None;
                     child.updated_at_ms = now_ms;
                     children.insert(ckey.as_str(), serde_json::to_string(&child)?.as_str())?;
@@ -2496,6 +2744,15 @@ fn ensure_key_safe(components: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// #1973 fix-round — the ONE liveness predicate behind every terminal-fleet
+/// fence: only an `Active`/`Draining` fleet accepts mutations of its plan,
+/// children, attempts, or budget. `goal_clear` cancels the fleet, and every
+/// racing keeper/pool/worker op must refuse against the terminal record
+/// inside its own write txn.
+fn fleet_is_live(fleet: &FleetRecord) -> bool {
+    matches!(fleet.status, FleetStatus::Active | FleetStatus::Draining)
+}
+
 fn child_key(fleet_id: &str, child_id: &str) -> String {
     format!("{fleet_id}\0{child_id}")
 }
@@ -2673,6 +2930,454 @@ mod tests {
         assert_eq!(fleet.budget.token_budget, 500);
         assert_eq!(fleet.status, FleetStatus::Active);
         assert_eq!(fleet.generation, 0);
+    }
+
+    /// #1973 fix B — `goal_clear` must be able to terminalize the cleared
+    /// goal's fleet so the boot-resume sweep stops treating it as resumable.
+    /// `cancel_fleet` is that terminal op: live → `Cancelled` (true); already
+    /// terminal or missing → no-op (false, never resurrects/overwrites).
+    #[tokio::test]
+    async fn cancel_fleet_terminalizes_a_live_fleet_and_is_idempotent() {
+        let (_d, store) = fresh().await;
+        fleet_with_ready_child(&store, 1_000).await;
+
+        // The live fleet has a launchable child → visible to boot-resume.
+        assert_eq!(
+            store
+                .fleets_with_ready_children(500)
+                .await
+                .unwrap()
+                .iter()
+                .map(|f| f.fleet_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f1"],
+        );
+
+        assert!(store.cancel_fleet("f1", 700).await.unwrap(), "live → true");
+        let fleet = store.get_fleet("f1").await.unwrap().unwrap();
+        assert_eq!(fleet.status, FleetStatus::Cancelled);
+        assert_eq!(fleet.updated_at_ms, 700);
+
+        // The boot-resume sweep no longer sees it as resumable.
+        assert!(
+            store
+                .fleets_with_ready_children(800)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a cancelled fleet must not be boot-resumable",
+        );
+
+        // Idempotent: cancelling again is a no-op that keeps the terminal state.
+        assert!(!store.cancel_fleet("f1", 900).await.unwrap());
+        let fleet = store.get_fleet("f1").await.unwrap().unwrap();
+        assert_eq!(fleet.status, FleetStatus::Cancelled);
+        assert_eq!(fleet.updated_at_ms, 700, "no-op must not touch the record");
+
+        // Missing fleet: no-op, not an error (goal_clear is best-effort).
+        assert!(!store.cancel_fleet("ghost", 950).await.unwrap());
+    }
+
+    /// `cancel_fleet` never rewrites another terminal status (`Complete` stays
+    /// `Complete` — a finished fleet's history must not read as cancelled).
+    #[tokio::test]
+    async fn cancel_fleet_leaves_other_terminal_statuses_untouched() {
+        let (_d, store) = fresh().await;
+        fleet_with_ready_child(&store, 1_000).await;
+        let mut fleet = store.get_fleet("f1").await.unwrap().unwrap();
+        fleet.status = FleetStatus::Complete;
+        store
+            .write_raw_fleet("f1", &serde_json::to_string(&fleet).unwrap())
+            .await
+            .unwrap();
+
+        assert!(!store.cancel_fleet("f1", 900).await.unwrap());
+        assert_eq!(
+            store.get_fleet("f1").await.unwrap().unwrap().status,
+            FleetStatus::Complete,
+        );
+    }
+
+    /// #1973 fix-round — the terminal-fleet FENCE, swept across EVERY
+    /// mutating op. `cancel_fleet` alone was not a fence: none of these ops
+    /// consulted the parent fleet's status, so keeper/pool/worker calls racing
+    /// `goal_clear` could keep mutating children/attempts/plan/budget — and
+    /// `complete_child`/`record_escalation`/`deny_escalation` would append
+    /// `ChildDone` wakes for a keeper whose goal is gone. Every op now refuses
+    /// (via its own typed rejection value; `add_child` via its native `bail!`)
+    /// inside the SAME write txn as its other predicates, with ZERO mutation:
+    /// launch_child, mark_running, complete_child, record_escalation,
+    /// deny_escalation, set_task_grant, replan (RetargetDeps routes through
+    /// it), retitle_task, create_plan (round 4: `create_fleet → cancel_fleet
+    /// → create_plan` used to seed a plan onto the corpse), add_child,
+    /// mark_ready, resolve_and_collect_ready.
+    ///
+    /// INTENTIONALLY EXEMPT from the fence:
+    /// - `reconcile` — the one sanctioned mutator of a terminal fleet: it is
+    ///   the CLEANUP path, settling stranded live attempts + reservations
+    ///   in-txn (and retiring the children terminal, never `Ready`);
+    /// - `append_event` / `append_decision` — outbox/decision-LOG appends
+    ///   only, no fleet/child/attempt/plan/budget state;
+    /// - `claim_next` / `ack` — outbox claim bookkeeping only.
+    ///
+    /// Zero-mutation is proven by FULL-record comparison: every child,
+    /// every staged attempt, and the fleet record itself are snapshotted
+    /// right after the cancel and must be byte-identical (PartialEq) after
+    /// the sweep — plus an empty outbox probe.
+    #[tokio::test]
+    async fn terminal_fleet_fences_child_operations() {
+        let (_d, store) = fresh().await;
+        store
+            .create_fleet("f1", controller(), None, "default", 10_000, false, 0)
+            .await
+            .unwrap();
+        // f2: a cancelled fleet WITHOUT a plan — the create_plan fence target
+        // (with a plan present, the insert-only duplicate bail would mask it).
+        store
+            .create_fleet("f2", controller(), None, "default", 1_000, false, 0)
+            .await
+            .unwrap();
+        assert!(store.cancel_fleet("f2", 50).await.unwrap());
+        store
+            .create_plan(plan(
+                "f1",
+                0,
+                vec![
+                    plan_task("c1", &[]),
+                    plan_task("c2", &[]),
+                    plan_task("c3", &[]),
+                    plan_task("c4", &[]),
+                    plan_task("c5", &["c6"]),
+                    plan_task("c6", &[]),
+                ],
+            ))
+            .await
+            .unwrap();
+        for (cid, deps) in [
+            ("c1", vec![]),
+            ("c2", vec![]),
+            ("c3", vec![]),
+            ("c4", vec![]),
+            ("c5", vec!["c6".to_string()]),
+            ("c6", vec![]),
+        ] {
+            store.add_child("f1", cid, deps, 0).await.unwrap();
+        }
+
+        // Helper: launch (+ optionally mark running) a child pre-cancel.
+        async fn launch(store: &FleetKernelStore, cid: &str, run: bool) -> String {
+            let id = match store
+                .launch_child("f1", cid, 100, 100, EPOCH, TTL)
+                .await
+                .unwrap()
+            {
+                LaunchOutcome::Launched { attempt_id } => attempt_id,
+                other => panic!("{other:?}"),
+            };
+            if run {
+                assert_eq!(
+                    store.mark_running(cid, &id).await.unwrap(),
+                    MarkRunningOutcome::Running
+                );
+            }
+            id
+        }
+        // Pre-cancel shapes: c1 Running (a1), c2 Launching/Leased (a2),
+        // c3 Ready, c4 Blocked with a pending escalation, c5 Planned with its
+        // dep met (c6 Succeeded).
+        let a1 = launch(&store, "c1", true).await;
+        let a2 = launch(&store, "c2", false).await;
+        let a4 = launch(&store, "c4", true).await;
+        assert_eq!(
+            store
+                .record_escalation(
+                    "f1",
+                    "c4",
+                    &a4,
+                    EscalationRequest {
+                        requested_grant: crate::grant::WorkerGrant::minimal(),
+                        reason: "need more".into(),
+                    },
+                    50,
+                    EPOCH,
+                    150,
+                )
+                .await
+                .unwrap(),
+            CompleteOutcome::Completed,
+        );
+        let a6 = launch(&store, "c6", true).await;
+        assert_eq!(
+            store
+                .complete_child("f1", "c6", &a6, accepted(), snapshot(), 80, EPOCH, 160)
+                .await
+                .unwrap(),
+            CompleteOutcome::Completed,
+        );
+
+        // Drain the pre-cancel outbox so "no new events" is a clean probe.
+        while let Some(ev) = store.claim_next("probe", 10_000, TTL).await.unwrap() {
+            let token = ev.claim_token.as_deref().unwrap_or_default().to_owned();
+            store.ack(ev.sequence, "probe", &token).await.unwrap();
+        }
+
+        assert!(store.cancel_fleet("f1", 200).await.unwrap());
+        let fleet_at_cancel = store.get_fleet("f1").await.unwrap().unwrap();
+        let reserved_at_cancel = fleet_at_cancel.budget.tokens_reserved;
+        assert_eq!(reserved_at_cancel, 200, "c1 + c2 reservations held");
+
+        // FULL-record snapshots (round-4 codex: attempts were never re-read
+        // and only selected fields compared). Everything below must be
+        // byte-identical after the sweep.
+        let staged_attempts = [
+            ("c1", a1.clone()),
+            ("c2", a2.clone()),
+            ("c4", a4.clone()),
+            ("c6", a6.clone()),
+        ];
+        let mut attempts_at_cancel = Vec::new();
+        for (cid, aid) in &staged_attempts {
+            attempts_at_cancel.push(store.get_attempt(cid, aid).await.unwrap().unwrap());
+        }
+        let child_ids = ["c1", "c2", "c3", "c4", "c5", "c6"];
+        let mut children_at_cancel = Vec::new();
+        for cid in &child_ids {
+            children_at_cancel.push(store.get_child("f1", cid).await.unwrap().unwrap());
+        }
+        let plan_at_cancel = store.get_plan("f1").await.unwrap().unwrap();
+
+        // launch: a Ready child of a cancelled fleet must not launch.
+        assert_eq!(
+            store
+                .launch_child("f1", "c3", 100, 300, EPOCH, TTL)
+                .await
+                .unwrap(),
+            LaunchOutcome::RejectedFleetTerminal,
+        );
+        assert_eq!(
+            store.get_child("f1", "c3").await.unwrap().unwrap().status,
+            ChildStatus::Ready,
+            "the rejected child is left untouched",
+        );
+
+        // mark_running: a Leased attempt must not advance.
+        assert_eq!(
+            store.mark_running("c2", &a2).await.unwrap(),
+            MarkRunningOutcome::Superseded,
+        );
+        assert_eq!(
+            store.get_child("f1", "c2").await.unwrap().unwrap().status,
+            ChildStatus::Launching,
+            "no mutation on the fenced mark_running",
+        );
+
+        // complete: the racing worker's result is dropped with ZERO mutation.
+        assert_eq!(
+            store
+                .complete_child("f1", "c1", &a1, accepted(), snapshot(), 80, EPOCH, 400)
+                .await
+                .unwrap(),
+            CompleteOutcome::Superseded,
+        );
+        let c1 = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(c1.status, ChildStatus::Running, "child state untouched");
+        assert_eq!(c1.tokens_committed, 0, "no tokens committed");
+
+        // record_escalation: a racing escalation yield is dropped too.
+        assert_eq!(
+            store
+                .record_escalation(
+                    "f1",
+                    "c1",
+                    &a1,
+                    EscalationRequest {
+                        requested_grant: crate::grant::WorkerGrant::minimal(),
+                        reason: "late yield".into(),
+                    },
+                    40,
+                    EPOCH,
+                    410,
+                )
+                .await
+                .unwrap(),
+            CompleteOutcome::Superseded,
+        );
+        let c1 = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(c1.status, ChildStatus::Running);
+        assert!(c1.pending_escalation.is_none());
+
+        // deny_escalation: must not flip Blocked→Failed or bump the plan.
+        let deny = store
+            .deny_escalation("f1", "c4", "refused", 420)
+            .await
+            .unwrap();
+        assert_eq!(deny.settled, CompleteOutcome::Superseded);
+        assert!(!deny.fleet_un_completable);
+        let c4 = store.get_child("f1", "c4").await.unwrap().unwrap();
+        assert_eq!(c4.status, ChildStatus::Blocked, "deny fenced");
+        assert!(c4.pending_escalation.is_some(), "request left in place");
+
+        // set_task_grant: must not resurrect the Blocked child to Ready.
+        assert_eq!(
+            store
+                .set_task_grant("f1", 0, "c4", crate::grant::WorkerGrant::minimal(), 430)
+                .await
+                .unwrap(),
+            PlanMutateOutcome::RejectedFleetTerminal,
+        );
+        assert_eq!(
+            store.get_child("f1", "c4").await.unwrap().unwrap().status,
+            ChildStatus::Blocked,
+        );
+
+        // replan (RetargetDeps routes through it): must not interrupt
+        // attempts, release budget, or resurrect children.
+        assert_eq!(
+            store
+                .replan("f1", 0, plan("f1", 0, vec![plan_task("c1", &[])]), 440)
+                .await
+                .unwrap(),
+            PlanMutateOutcome::RejectedFleetTerminal,
+        );
+        // retitle_task: even a title-only plan edit is refused.
+        assert_eq!(
+            store
+                .retitle_task("f1", 0, "c3", "t", "d", 450)
+                .await
+                .unwrap(),
+            PlanMutateOutcome::RejectedFleetTerminal,
+        );
+        let plan_row = store.get_plan("f1").await.unwrap().unwrap();
+        assert_eq!(plan_row.revision, 0, "plan revision untouched");
+        assert_eq!(plan_row.tasks.len(), 6, "plan tasks untouched");
+
+        // add_child: refused via this fn's native error idiom.
+        assert!(
+            store
+                .add_child("f1", "c7", vec![], 460)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("terminal fleet"),
+        );
+        assert!(store.get_child("f1", "c7").await.unwrap().is_none());
+
+        // mark_ready: c5's dep (c6) Succeeded pre-cancel, but no promotion.
+        assert!(!store.mark_ready("f1", "c5", 470).await.unwrap());
+        assert_eq!(
+            store.get_child("f1", "c5").await.unwrap().unwrap().status,
+            ChildStatus::Planned,
+        );
+
+        // resolve_and_collect_ready: no promotions, empty launchable set.
+        assert!(
+            store
+                .resolve_and_collect_ready("f1", 480)
+                .await
+                .unwrap()
+                .is_empty(),
+        );
+        assert_eq!(
+            store.get_child("f1", "c5").await.unwrap().unwrap().status,
+            ChildStatus::Planned,
+            "the fenced resolve must not promote",
+        );
+
+        // create_plan (round 4): a cancelled fleet with NO plan yet must not
+        // have one seeded onto it — the exact create_fleet → cancel_fleet →
+        // create_plan sequence.
+        assert_eq!(
+            store
+                .create_plan(plan("f2", 0, vec![plan_task("x1", &[])]))
+                .await
+                .unwrap(),
+            PlanMutateOutcome::RejectedFleetTerminal,
+        );
+        assert!(
+            store.get_plan("f2").await.unwrap().is_none(),
+            "no plan may be seeded onto a terminal fleet",
+        );
+
+        // Nothing settled, nothing bumped, nothing woken — proven by FULL
+        // record equality against the at-cancel snapshots.
+        assert_eq!(
+            store.get_fleet("f1").await.unwrap().unwrap(),
+            fleet_at_cancel,
+            "the fleet record (budget, generation, timestamps) is untouched",
+        );
+        for (i, (cid, aid)) in staged_attempts.iter().enumerate() {
+            assert_eq!(
+                store.get_attempt(cid, aid).await.unwrap().unwrap(),
+                attempts_at_cancel[i],
+                "attempt {aid} of {cid} must be byte-identical after the sweep",
+            );
+        }
+        for (i, cid) in child_ids.iter().enumerate() {
+            assert_eq!(
+                store.get_child("f1", cid).await.unwrap().unwrap(),
+                children_at_cancel[i],
+                "child {cid} must be byte-identical after the sweep",
+            );
+        }
+        assert_eq!(
+            store.get_plan("f1").await.unwrap().unwrap(),
+            plan_at_cancel,
+            "the plan is untouched",
+        );
+        assert!(
+            store
+                .claim_next("probe", 20_000, TTL)
+                .await
+                .unwrap()
+                .is_none(),
+            "no fenced op may append an outbox event",
+        );
+    }
+
+    /// #1973 fix-round — reconcile SETTLES the stranded live attempts of a
+    /// terminal fleet (release the reservation, mark the attempt Interrupted,
+    /// clear `current_attempt_id`) while still never resurrecting the child to
+    /// `Ready`. Before, a Cancelled fleet was skipped wholesale, permanently
+    /// pinning its live attempt and `tokens_reserved`.
+    #[tokio::test]
+    async fn reconcile_releases_reservations_of_terminal_fleets() {
+        let (_d, store) = fresh().await;
+        fleet_with_ready_child(&store, 1_000).await;
+        let attempt_id = launch_running(&store).await;
+        assert!(store.cancel_fleet("f1", 500).await.unwrap());
+        assert_eq!(
+            store
+                .get_fleet("f1")
+                .await
+                .unwrap()
+                .unwrap()
+                .budget
+                .tokens_reserved,
+            100,
+            "the launch reservation is held at cancel time",
+        );
+
+        let report = store.reconcile(9_999, EPOCH + 999).await.unwrap();
+        assert_eq!(
+            report.interrupted.len(),
+            1,
+            "the terminal fleet's stranded attempt is settled (and reported)",
+        );
+
+        let fleet = store.get_fleet("f1").await.unwrap().unwrap();
+        assert_eq!(
+            fleet.budget.tokens_reserved, 0,
+            "the stranded reservation is released",
+        );
+        let attempt = store.get_attempt("c1", &attempt_id).await.unwrap().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::Interrupted);
+        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(
+            child.status,
+            ChildStatus::Cancelled,
+            "the child is retired terminal, NEVER resurrected to Ready (P2-7)",
+        );
+        assert_eq!(child.current_attempt_id, None);
     }
 
     #[tokio::test]
@@ -3300,7 +4005,10 @@ mod tests {
         );
     }
 
-    /// P2-7: a Cancelled fleet's stranded child must not be resurrected.
+    /// P2-7 (updated by the #1973 fix-round): a Cancelled fleet's stranded
+    /// child must not be RESURRECTED — but its live attempt IS settled now
+    /// (Interrupted + reservation released + attempt-id cleared) instead of
+    /// being skipped wholesale, which pinned the reservation forever.
     #[tokio::test]
     async fn reconcile_skips_children_of_cancelled_fleet() {
         let (_d, store) = fresh().await;
@@ -3316,12 +4024,15 @@ mod tests {
             .unwrap();
 
         let report = store.reconcile(9_999, EPOCH + 999).await.unwrap();
-        assert!(report.interrupted.is_empty(), "cancelled fleet is skipped");
-        // Child + attempt left as they were (not reset to Ready).
         assert_eq!(
-            store.get_child("f1", "c1").await.unwrap().unwrap().status,
-            ChildStatus::Running
+            report.interrupted.len(),
+            1,
+            "the terminal fleet's stranded attempt is settled",
         );
+        // Never resurrected to Ready — retired terminal instead.
+        let child = store.get_child("f1", "c1").await.unwrap().unwrap();
+        assert_eq!(child.status, ChildStatus::Cancelled);
+        assert_eq!(child.current_attempt_id, None);
         assert_eq!(
             store
                 .get_attempt("c1", &attempt_id)
@@ -3329,7 +4040,18 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            AttemptStatus::Running
+            AttemptStatus::Interrupted
+        );
+        assert_eq!(
+            store
+                .get_fleet("f1")
+                .await
+                .unwrap()
+                .unwrap()
+                .budget
+                .tokens_reserved,
+            0,
+            "the reservation is released, not pinned forever",
         );
     }
 

@@ -31635,3 +31635,80 @@ fn goal_event_generation_admits_should_be_per_session_and_pass_legacy_zero() {
     assert!(!goal_event_generation_admits(&mut last, "sessionA", 50));
     assert!(goal_event_generation_admits(&mut last, "sessionA", 101));
 }
+
+/// #1973 fix-round — the process-global event ledger's INIT (including disk
+/// recovery) runs exactly once even when N callers race the first
+/// `event_ledger()` call (global drain vs stdio connection at serve boot).
+/// Before, recovery ran BEFORE the `get_or_init` install: two racers could
+/// both replay the same JSONL and both synthesize orphan-terminal records,
+/// interleaving appends before one loser's ledger was discarded.
+///
+/// Drives the extracted once-init core (`event_ledger_init_once`) with its
+/// own `OnceLock` + 8 threads: exactly one runs the init closure (recovery
+/// is inside it), every caller gets the same `Arc`, and the seeded orphan is
+/// swept by exactly ONE synthesized terminal.
+#[test]
+fn event_ledger_recovery_runs_exactly_once_across_concurrent_initializers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let session_id = SessionKey("local:init-race-orphan".into());
+    // Seed a durable dir with a session whose last task row is NON-terminal,
+    // so the recovery has a real orphan sweep to perform.
+    {
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        let task: octos_core::ui_protocol::TaskUpdatedEvent = serde_json::from_value(json!({
+            "session_id": session_id.0.clone(),
+            "task_id": octos_core::TaskId::new().to_string(),
+            "title": "ghost task",
+            "state": "running",
+        }))
+        .expect("task event");
+        ledger.append_notification(UiNotification::TaskUpdated(task));
+    } // process "dies" — no terminal event
+
+    static ONCE: OnceLock<Arc<UiProtocolLedger>> = OnceLock::new();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let dir: PathBuf = temp.path().into();
+        handles.push(std::thread::spawn(move || {
+            event_ledger_init_once(&ONCE, Some(dir))
+        }));
+    }
+    let results: Vec<(Arc<UiProtocolLedger>, bool)> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join init thread"))
+        .collect();
+
+    let installs = results
+        .iter()
+        .filter(|(_, installed_now)| *installed_now)
+        .count();
+    assert_eq!(
+        installs, 1,
+        "exactly one caller may run the init closure (and thus the recovery)"
+    );
+    for (ledger, _) in &results {
+        assert!(
+            Arc::ptr_eq(ledger, &results[0].0),
+            "every racer must get the same installed ledger"
+        );
+    }
+
+    // The single recovery swept the orphan exactly once.
+    let (events, _) = results[0]
+        .0
+        .snapshot_with_cursor(&session_id, None)
+        .expect("snapshot");
+    let synthesized = events
+        .iter()
+        .filter(|event| match &event.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TaskUpdated(task)) => {
+                task.runtime_detail.as_deref() == Some("orphaned_by_restart")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        synthesized, 1,
+        "one recovery → one synthesized orphan terminal, never N interleaved sets"
+    );
+}

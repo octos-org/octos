@@ -614,6 +614,21 @@ impl ServeCommand {
             }
         };
 
+        // #1973 fix A — load the persisted cwd-scope registry BEFORE the
+        // supervisor store restores goals, so a goal stored under a scoped key
+        // (`<wire>\0~cwd-<scope>`) resolves — and its restored continuation is
+        // dispatchable — immediately at boot instead of only after a client
+        // reopens the session. Failure is non-fatal: the registry starts empty
+        // (the pre-sidecar behavior) and repopulates on session/open.
+        if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
+            .configure_goal_scopes_sidecar(data_dir.join("goal-scopes.json"))
+        {
+            tracing::warn!(
+                %error,
+                "failed to load goal-scopes sidecar; restored cwd-scoped goals stay \
+                 invisible until their session reopens"
+            );
+        }
         if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
             .configure_supervisor_store(data_dir.join("supervisor"))
         {
@@ -641,9 +656,22 @@ impl ServeCommand {
             // for. Park paused; `/goal resume` re-arms,
             // OCTOS_SOLO_RESUME_GOALS=1 opts out.
             if std::env::var("OCTOS_SOLO_RESUME_GOALS").ok().as_deref() != Some("1") {
+                // #1973 fix C — resolve each parked goal's PROFILE data dir so
+                // the park also flips the durable per-goal SQLite ledger row to
+                // `paused` (it used to keep saying `active` forever). A
+                // short-lived registry handle: the long-lived `profile_store`
+                // is built later in boot, and opening the store twice is just
+                // idempotent path math + create_dir_all.
+                let park_profile_registry =
+                    crate::profiles::ProfileStore::open(&state_home, &data_dir).ok();
+                let park_profile_data_dir = |profile_id: &str| -> Option<PathBuf> {
+                    let registry = park_profile_registry.as_ref()?;
+                    let profile = registry.get(profile_id).ok().flatten()?;
+                    Some(registry.resolve_data_dir(&profile))
+                };
                 for (goal_id, session_id) in
                     crate::api::agent_orchestrator::default_agent_orchestrator()
-                        .pause_restored_goals_for_solo_boot()
+                        .pause_restored_goals_for_solo_boot_with_ledger_sync(&park_profile_data_dir)
                 {
                     tracing::info!(
                         goal_id = %goal_id,
@@ -1404,6 +1432,24 @@ impl ServeCommand {
             preview_sweeper: Some(preview_sweeper),
         });
 
+        // mini5 soak gap #1 / #1973 fix E: drain queued master continuations
+        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
+        // even when NO ws/stdio client is connected. The per-connection
+        // `appui_continuation_tick` only runs inside a live handler loop, so a
+        // sub-agent finishing while the TUI is disconnected (or a continuation
+        // re-loaded after a serve restart) would otherwise sit undrained until
+        // a client reconnects. Shares the process-global active-turns registry
+        // with the per-connection ticks, so there is no double-run.
+        //
+        // #1973 fix E — spawned BEFORE the stdio early-return below, so
+        // `serve --stdio` (headless stdio deployments) gets the same
+        // continuation safety net and escalation-timeout sweep the HTTP serve
+        // always had. This is a deliberate behavior change for stdio serves:
+        // restored goal/loop continuations now drain even while the stdio
+        // client is idle or detached, instead of waiting for connection ticks.
+        // Everything the drain needs (the full AppState) is constructed above.
+        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
+
         if self.stdio {
             crate::api::ui_protocol::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");
@@ -1638,16 +1684,9 @@ impl ServeCommand {
             }
         }
 
-        // mini5 soak gap #1: drain queued master continuations
-        // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
-        // even when NO ws/stdio client is connected. The per-connection
-        // `appui_continuation_tick` only runs inside a live handler loop, so a
-        // sub-agent finishing while the TUI is disconnected (or a continuation
-        // re-loaded after a serve restart) would otherwise sit undrained until
-        // a client reconnects. Shares the process-global active-turns registry
-        // with the per-connection ticks, so there is no double-run.
-        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
-
+        // (#1973 fix E — the global master-continuation drain used to be
+        // spawned HERE, after the stdio early-return; it now spawns right
+        // before that branch so stdio serves share the safety net.)
         let app = build_router(state);
         let listener =
             http_listener.expect("non-stdio serve must bind its HTTP listener before AppState");
@@ -1861,6 +1900,44 @@ mod tests {
         assert!(
             stdio_task_query_store(true).is_some(),
             "stdio serve must wire a task_query_store"
+        );
+    }
+
+    /// #1973 fix E — a SOURCE-ORDER tripwire, stated plainly for what it is:
+    /// no unit-level harness can boot a real `octos serve --stdio` (the run()
+    /// method is a monolith that binds sockets, opens redb stores, and holds a
+    /// data-dir lock), so this test asserts the one thing the fix changed — in
+    /// `run()`, `spawn_global_master_continuation_drain` is called BEFORE the
+    /// stdio early-return (`stdio_connection`) — by scanning this file's own
+    /// source. It proves wiring ORDER at the call-site level, not runtime
+    /// behavior; a refactor that reorders the two lines trips it immediately.
+    #[test]
+    fn global_drain_spawns_before_the_stdio_early_return() {
+        let src = include_str!("serve.rs");
+        // Needles assembled at runtime so this test's own string literals
+        // cannot satisfy (or double-count) the search.
+        let spawn_needle = format!(
+            "spawn_global_master_continuation_drain{}",
+            "(state.clone());"
+        );
+        let stdio_needle = format!("ui_protocol::stdio_connection{}", "(state)");
+        let spawn_at = src
+            .find(&spawn_needle)
+            .expect("the global drain spawn call must exist in serve.rs");
+        let stdio_at = src
+            .find(&stdio_needle)
+            .expect("the stdio connection call must exist in serve.rs");
+        assert!(
+            spawn_at < stdio_at,
+            "the global master-continuation drain must be spawned BEFORE the stdio \
+             early-return, or headless `serve --stdio` loses its goal-continuation \
+             safety net and escalation-timeout sweep"
+        );
+        assert_eq!(
+            src.matches(&spawn_needle).count(),
+            1,
+            "exactly one drain spawn call site (the pre-#1973 post-stdio site was \
+             MOVED, not duplicated — two loops would burn duplicate sweep I/O)"
         );
     }
 

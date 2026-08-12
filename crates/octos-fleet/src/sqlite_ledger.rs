@@ -18,7 +18,9 @@ pub struct GoalLedger {
 pub struct Goal {
     pub goal_id: String,
     pub objective: String,
-    pub status: String, // active | complete | blocked | budget_limited | paused
+    // `cleared` (#1973 fix B) is the terminal a user `goal_clear` stamps; the
+    // upsert guard still refuses to downgrade a `complete` row to it.
+    pub status: String, // active | complete | blocked | budget_limited | paused | cleared
     pub tokens_used: u64,
     pub token_budget: u64,
     pub continuations_used: u32,
@@ -352,9 +354,17 @@ impl GoalLedger {
     ///     writer ever moves an existing `complete` row back to active/blocked.
     ///     `blocked` is deliberately NOT protected — a blocked goal is
     ///     user-resumable to `active` under the same id.
-    pub fn upsert_goal(&self, goal: &Goal) -> Result<()> {
+    ///
+    /// #1973 fix-round — returns whether the write was ADMITTED (`true`: the
+    /// row was inserted, or the guarded update fired), via SQLite's
+    /// rows-changed count. A guarded rejection returns `false`, so an
+    /// administrative STATUS sync (park/clear) whose snapshot carries stale
+    /// lower counters can detect the loss and retry once with max'd monotonic
+    /// fields — instead of silently leaving the row on its old status while a
+    /// decision row claims the transition happened.
+    pub fn upsert_goal(&self, goal: &Goal) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let admitted = conn.execute(
             "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(goal_id) DO UPDATE SET
@@ -379,7 +389,72 @@ impl GoalLedger {
                 goal.updated_at_ms,
             ],
         )?;
-        Ok(())
+        Ok(admitted > 0)
+    }
+
+    /// #1973 fix-round 3/4 — targeted STATUS compare-and-swap for an
+    /// administrative transition (park/clear) whose guarded [`Self::upsert_goal`]
+    /// was rejected by the monotonic-token clause. Flips ONLY the status (+
+    /// `updated_at_ms`); the row's counters are authoritative and untouched.
+    ///
+    /// A TRUE CAS (round-4 codex): the predicate requires the row to still
+    /// carry the EXACT `(expected_status, expected_updated_at_ms)` pair the
+    /// caller just read — so ANY interleaved write, including a same-status
+    /// counters refresh with a newer timestamp, changes the pair and defeats
+    /// the CAS (a status-only predicate admitted that interleave and could
+    /// stamp an older `updated_at_ms` over a newer row: a clock REGRESSION
+    /// that then let a delayed older transition pass the caller's ordering
+    /// gate). `status <> 'complete'` stays as belt-and-suspenders (complete
+    /// is terminal per goal_id; the caller never reads `complete` as its
+    /// expectation anyway). Returns whether a row changed — the caller's
+    /// decision-append gate; a defeated CAS is NOT re-attempted (one shot —
+    /// the newer state wins).
+    ///
+    /// Clock invariant: the caller gates the CAS on
+    /// `snapshot.updated_at_ms >= expected_updated_at_ms` (the row value it
+    /// read), and the CAS fires only while the row STILL carries exactly that
+    /// value — so the stamp written here is always `>=` the timestamp it
+    /// replaces. `updated_at_ms` never regresses. The one interleave the pair
+    /// cannot detect — an equal-timestamp, same-status write (counters-only,
+    /// same millisecond) — is safe by construction: the CAS writes only
+    /// status + timestamp, so the interleaved counters survive untouched.
+    pub fn cas_goal_status(
+        &self,
+        goal_id: &str,
+        new_status: &str,
+        expected_status: &str,
+        expected_updated_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE goals SET status = ?1, updated_at_ms = ?2
+             WHERE goal_id = ?3 AND status = ?4 AND updated_at_ms = ?5
+               AND status <> 'complete'",
+            params![
+                new_status,
+                updated_at_ms,
+                goal_id,
+                expected_status,
+                expected_updated_at_ms
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// #1973 fix-round — number of decision rows recorded for `goal_id`. The
+    /// audit-side counterpart to [`Self::append_decision`]: the transition
+    /// sync appends a decision ONLY when the goals-row actually reflects the
+    /// transition, and this reader lets callers (and tests) verify the two
+    /// never diverge.
+    pub fn count_decisions(&self, goal_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM decisions WHERE goal_id = ?1",
+            params![goal_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 
     /// Get a goal by ID.
@@ -2337,8 +2412,17 @@ mod digest_integration_tests {
             created_at_ms: 5000,
             updated_at_ms: 5000, // every write in this block ties on ms
         };
-        ledger.upsert_goal(&seed(300)).unwrap();
-        ledger.upsert_goal(&seed(100)).unwrap(); // equal-ms, LOWER → rejected
+        assert!(
+            ledger.upsert_goal(&seed(300)).unwrap(),
+            "the seeding insert is admitted"
+        );
+        // equal-ms, LOWER → rejected; #1973 fix-round: the rejection is now
+        // REPORTED (`false`) so an administrative status sync can detect the
+        // loss and retry with max'd counters instead of silently diverging.
+        assert!(
+            !ledger.upsert_goal(&seed(100)).unwrap(),
+            "a guarded rejection must report false"
+        );
         assert_eq!(
             ledger.get_goal("g2").unwrap().unwrap().tokens_used,
             300,
@@ -2347,12 +2431,142 @@ mod digest_integration_tests {
         );
         // ...while an equal-ms write carrying a HIGHER tokens_used (the other
         // peer's larger charge landing second) must still be accepted.
-        ledger.upsert_goal(&seed(450)).unwrap();
+        assert!(
+            ledger.upsert_goal(&seed(450)).unwrap(),
+            "an admitted refresh must report true"
+        );
         assert_eq!(
             ledger.get_goal("g2").unwrap().unwrap().tokens_used,
             450,
             "an equal-ms upsert with a higher tokens_used must be accepted"
         );
+    }
+
+    /// #1973 fix-round 3 — `cas_goal_status` flips ONLY the status of a row
+    /// still carrying the expected status; counters untouched; a mismatched
+    /// expectation or a `complete` row is a `false` no-op.
+    #[test]
+    fn cas_goal_status_updates_only_on_matching_expected_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("l.db")).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "obj".to_string(),
+                status: "active".to_string(),
+                tokens_used: 300,
+                token_budget: 2000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+
+        // Matching (status, updated_at_ms) pair → status lands, counters
+        // untouched.
+        assert!(
+            ledger
+                .cas_goal_status("g1", "paused", "active", 1000, 2000)
+                .unwrap()
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "paused");
+        assert_eq!(row.updated_at_ms, 2000);
+        assert_eq!(row.tokens_used, 300, "the CAS never touches counters");
+        assert_eq!(row.continuations_used, 1);
+
+        // Stale status expectation (row moved on) → no-op.
+        assert!(
+            !ledger
+                .cas_goal_status("g1", "cleared", "active", 2000, 3000)
+                .unwrap()
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "paused", "a lost CAS changes nothing");
+        assert_eq!(row.updated_at_ms, 2000);
+
+        // Stale TIMESTAMP expectation with a matching status: an interleaved
+        // write bumped the row after the read → the CAS must fail (round-4
+        // codex: predicating on status alone admitted this and could regress
+        // the row's clock).
+        assert!(
+            !ledger
+                .cas_goal_status("g1", "cleared", "paused", 1234, 4000)
+                .unwrap()
+        );
+        assert_eq!(ledger.get_goal("g1").unwrap().unwrap().status, "paused");
+
+        // Missing goal → no-op.
+        assert!(
+            !ledger
+                .cas_goal_status("ghost", "paused", "active", 1000, 3000)
+                .unwrap()
+        );
+
+        // Complete is terminal: even a MATCHING expectation pair is refused.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g2".to_string(),
+                objective: "obj".to_string(),
+                status: "complete".to_string(),
+                tokens_used: 10,
+                token_budget: 2000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        assert!(
+            !ledger
+                .cas_goal_status("g2", "cleared", "complete", 1000, 5000)
+                .unwrap()
+        );
+        assert_eq!(ledger.get_goal("g2").unwrap().unwrap().status, "complete");
+    }
+
+    /// #1973 fix-round 4 — codex: an INTERVENING SAME-STATUS write between
+    /// the caller's read and its CAS must defeat the CAS. With a status-only
+    /// predicate, `active@1000` read → concurrent `active@3000/tok600` upsert
+    /// → CAS(expected active) still matched and stamped `cleared@2000`,
+    /// REGRESSING the row's clock (which then let a delayed `blocked@2500`
+    /// pass the ordering gate and flip cleared→blocked). Predicating on the
+    /// exact `(status, updated_at_ms)` pair read makes any interleaved write
+    /// change the pair → CAS fails → the newer state wins (one shot, no
+    /// re-attempt).
+    #[test]
+    fn cas_goal_status_is_defeated_by_an_intervening_same_status_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("l.db")).unwrap();
+        let seed = |tokens_used: u64, updated_at_ms: u64| Goal {
+            goal_id: "g1".to_string(),
+            objective: "obj".to_string(),
+            status: "active".to_string(),
+            tokens_used,
+            token_budget: 2000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms,
+        };
+        ledger.upsert_goal(&seed(300, 1000)).unwrap();
+        // The caller reads (active, 1000)…
+        let read = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!((read.status.as_str(), read.updated_at_ms), ("active", 1000));
+        // …then a concurrent upsert lands the SAME status with newer fields.
+        assert!(ledger.upsert_goal(&seed(600, 3000)).unwrap());
+        // The CAS against the stale read must fail — and the newer row wins.
+        assert!(
+            !ledger
+                .cas_goal_status("g1", "cleared", "active", 1000, 2000)
+                .unwrap(),
+            "an interleaved write must defeat the CAS",
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(row.updated_at_ms, 3000, "no clock regression");
+        assert_eq!(row.tokens_used, 600, "the newer counters survive");
     }
 
     #[test]

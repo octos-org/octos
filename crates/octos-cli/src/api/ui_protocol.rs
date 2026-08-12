@@ -5066,40 +5066,72 @@ pub(super) async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
     if let Some(existing) = EVENT_LEDGER.get() {
         return existing.clone();
     }
+    // The data_dir read is the only async step; it runs OUTSIDE the once-init
+    // (two racers both computing it is benign — the loser's value is dropped).
     let data_dir = match &state.sessions {
         Some(sessions) => Some(sessions.lock().await.data_dir()),
         None => None,
     };
-    let config = match data_dir {
-        Some(dir) => LedgerConfig::durable(dir),
-        None => LedgerConfig::ephemeral(EVENT_LEDGER_RETAINED_PER_SESSION),
-    };
-    let ledger = if config.data_dir.is_some() {
-        let outcome = UiProtocolLedger::recover(config);
-        info!(
-            target = "octos::ledger",
-            sessions_recovered = outcome.sessions_recovered,
-            events_recovered = outcome.events_recovered,
-            "ui protocol ledger initialized with durable backing"
-        );
-        outcome.ledger
-    } else {
-        Arc::new(UiProtocolLedger::with_config(config))
-    };
-    let installed = EVENT_LEDGER.get_or_init(|| ledger.clone()).clone();
-    // Only spawn the sweep task on the install path. If two connections
-    // race here, only one wins the get_or_init and only that one starts
-    // the sweep.
-    if Arc::ptr_eq(&installed, &ledger) {
+    let (installed, installed_now) = event_ledger_init_once(&EVENT_LEDGER, data_dir);
+    // Only the caller whose closure actually ran spawns the sweep + observer,
+    // so a process never has two eviction tasks or competing observers.
+    if installed_now {
         let _handle = spawn_eviction_task(installed.clone());
         // Install the post-fsync observer that converts every successful
         // `add_message_with_seq` commit into a canonical v2 projection
-        // envelope. We install on the same
-        // path that wins the ledger get_or_init so a process never has
-        // two competing observers.
+        // envelope. Installed on the same path that won the once-init so a
+        // process never has two competing observers.
         install_message_commit_observer(installed.clone());
     }
     installed
+}
+
+/// #1973 fix-round — the once-init core of [`event_ledger`]: build the ledger
+/// (running DISK RECOVERY for a durable config) strictly INSIDE the
+/// `OnceLock::get_or_init` closure, which runs at most once per lock.
+///
+/// Before, recovery ran BEFORE `get_or_init`: two callers racing the first
+/// initialization (the global master-continuation drain and the stdio
+/// connection both call [`event_ledger`] at serve boot) could BOTH replay the
+/// same on-disk JSONL and BOTH synthesize orphan-terminal records —
+/// interleaving appends into the live log before one loser's ledger was
+/// discarded. `get_or_init` blocks the losing racer until the winner's
+/// closure returns; recovery is fast boot-time disk replay and runs once per
+/// process, so briefly parking a second initializer is the correct trade
+/// (and the pre-existing behavior already ran this same blocking I/O on the
+/// async path).
+///
+/// Returns the installed ledger plus whether THIS call ran the init closure —
+/// the caller uses that to spawn the eviction sweep / commit observer exactly
+/// once. Extracted (with the `OnceLock` injected) so a test can race N
+/// threads against a fresh lock and pin the exactly-once guarantee.
+fn event_ledger_init_once(
+    once: &'static OnceLock<Arc<UiProtocolLedger>>,
+    data_dir: Option<PathBuf>,
+) -> (Arc<UiProtocolLedger>, bool) {
+    let mut installed_now = false;
+    let installed = once
+        .get_or_init(|| {
+            installed_now = true;
+            let config = match data_dir {
+                Some(dir) => LedgerConfig::durable(dir),
+                None => LedgerConfig::ephemeral(EVENT_LEDGER_RETAINED_PER_SESSION),
+            };
+            if config.data_dir.is_some() {
+                let outcome = UiProtocolLedger::recover(config);
+                info!(
+                    target = "octos::ledger",
+                    sessions_recovered = outcome.sessions_recovered,
+                    events_recovered = outcome.events_recovered,
+                    "ui protocol ledger initialized with durable backing"
+                );
+                outcome.ledger
+            } else {
+                Arc::new(UiProtocolLedger::with_config(config))
+            }
+        })
+        .clone();
+    (installed, installed_now)
 }
 
 /// Install the durable-commit observer that records every successful
@@ -17064,24 +17096,60 @@ fn resolve_autonomy_profile_id(
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()))
 }
 
+/// #1973 fix B — how the autonomy RPC surface resolves a profile's data dir
+/// (for the `goal_clear` durable-ledger sync). `None` (unit tests, callers
+/// with no profile store) skips the sync — byte-identical legacy behavior.
+type ProfileDataDirResolver<'a> = &'a dyn Fn(&str) -> Option<PathBuf>;
+
+/// Legacy 3-arg entry point (test seam): no ledger resolver → `goal_clear`
+/// skips the durable-ledger sync, everything else is unchanged.
+#[cfg(test)]
 fn raw_autonomy_rpc(
     request: &RpcRequest<Value>,
     features: ConnectionUiFeatures,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
-    raw_autonomy_rpc_with_orchestrator(
+    raw_autonomy_rpc_with_ledger(request, features, connection_profile_id, None)
+}
+
+fn raw_autonomy_rpc_with_ledger(
+    request: &RpcRequest<Value>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    profile_data_dir_for: Option<ProfileDataDirResolver<'_>>,
+) -> Result<Value, RpcError> {
+    raw_autonomy_rpc_with_orchestrator_and_ledger(
         request,
         features,
         connection_profile_id,
         default_agent_orchestrator(),
+        profile_data_dir_for,
     )
 }
 
+/// Test seam kept signature-stable: the ledger resolver defaults to `None`.
+#[cfg(test)]
 fn raw_autonomy_rpc_with_orchestrator(
     request: &RpcRequest<Value>,
     features: ConnectionUiFeatures,
     connection_profile_id: Option<&str>,
     orchestrator: &dyn AgentOrchestrator,
+) -> Result<Value, RpcError> {
+    raw_autonomy_rpc_with_orchestrator_and_ledger(
+        request,
+        features,
+        connection_profile_id,
+        orchestrator,
+        None,
+    )
+}
+
+fn raw_autonomy_rpc_with_orchestrator_and_ledger(
+    request: &RpcRequest<Value>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    orchestrator: &dyn AgentOrchestrator,
+    profile_data_dir_for: Option<ProfileDataDirResolver<'_>>,
 ) -> Result<Value, RpcError> {
     use octos_core::ui_protocol::methods;
 
@@ -17249,10 +17317,18 @@ fn raw_autonomy_rpc_with_orchestrator(
                 params.profile_id.as_deref(),
                 connection_profile_id,
             )?;
-            orchestrator.clear_goal(GoalSessionRequest {
-                session_id: params.session_id,
-                profile_id,
-            })
+            // #1973 fix B — resolve the profile data dir so the clear also
+            // syncs the durable per-goal ledger row to `cleared` (best-effort;
+            // `None` — no store / unresolvable profile — is a plain clear).
+            let ledger_data_dir =
+                profile_data_dir_for.and_then(|resolve| resolve(profile_id.as_str()));
+            orchestrator.clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: params.session_id,
+                    profile_id,
+                },
+                ledger_data_dir.as_deref(),
+            )
         }
         methods::LOOP_CREATE => {
             let params: RawLoopCreateParams = parse_raw_params(request)?;
@@ -17379,7 +17455,20 @@ async fn handle_raw_appui_rpc(
 
     let result = match request.method.as_str() {
         method if is_autonomy_method(method) => {
-            raw_autonomy_rpc(request, features, connection_profile_id)
+            // #1973 fix B — profile data-dir resolver for the `goal_clear`
+            // durable-ledger sync (honors per-profile `data_dir` overrides via
+            // the store's own resolution).
+            let profile_data_dir_for = |profile_id: &str| -> Option<PathBuf> {
+                let store = state.profile_store.as_ref()?;
+                let profile = store.get(profile_id).ok().flatten()?;
+                Some(store.resolve_data_dir(&profile))
+            };
+            raw_autonomy_rpc_with_ledger(
+                request,
+                features,
+                connection_profile_id,
+                Some(&profile_data_dir_for),
+            )
         }
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
             Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
