@@ -160,6 +160,11 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
 
 # Unix-specific (O_NOFOLLOW for symlink-safe file I/O)
 libc = "0.2"
+# Safe openat/mkdirat for the #1976 write-grant component-wise confined walk
+# (closes the ancestor-symlink TOCTOU under the workspace-wide deny(unsafe_code)
+# lint — rustix wraps the raw syscalls in a safe API). Already vendored
+# transitively; pinned here as a direct dep of octos-agent.
+rustix = { version = "1", features = ["fs"] }
 
 # LRU cache
 lru = "0.16"

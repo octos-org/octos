@@ -158,6 +158,35 @@ pub struct WorkerGrant {
     /// Filesystem reach. Default [`FsGrant::Workspace`] (cwd-only).
     #[serde(default)]
     pub fs: FsGrant,
+    /// #1976 — per-path WRITE fence: a workspace-relative path allowlist the
+    /// worker may write; everything else in the workspace is read-only.
+    /// `None` (the default, and every pre-#1976 record) = no fence — the
+    /// binary `fs` scope alone governs writes, byte-for-byte the old worker.
+    /// `Some(vec![])` is a coherent READ-ONLY fence (write nothing).
+    ///
+    /// v1 pattern syntax (validated by [`WorkerGrant::validate`], enforced by
+    /// [`validate_write_path_pattern`]): relative paths with `/` separators,
+    /// `*` (any within one segment) and `?` (one char within a segment)
+    /// wildcards, literal everything else. NO `**`, `[...]`, `{...}` — the
+    /// syntax is deliberately the intersection the tool-layer matcher
+    /// (globset, `literal_separator`) and the sandbox translation (SBPL
+    /// regex) express IDENTICALLY, so the two layers can never disagree
+    /// about what is granted. Only coherent with [`FsGrant::Workspace`].
+    ///
+    /// `skip_serializing_if`: an unfenced grant serializes in the exact
+    /// pre-#1976 shape, so old readers of new records see no new keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_paths: Option<Vec<String>>,
+    /// #1976 — `create_only`: allowlisted paths may be CREATED but never
+    /// overwritten / edited / deleted (`O_CREAT|O_EXCL` semantics at the file
+    /// tools; `edit_file` is refused outright, allowlisted or not). Only
+    /// meaningful with a non-empty `write_paths` (validated). The sandbox
+    /// layer enforces the PATH fence only — no OS backend can distinguish
+    /// create-vs-overwrite, so the no-overwrite half of `create_only` is
+    /// tool-layer enforced (documented degradation, see
+    /// `octos_agent::sandbox::SandboxConfig::write_allow_globs`).
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub create_only: bool,
 }
 
 fn base_tools_vec() -> Vec<String> {
@@ -180,7 +209,17 @@ impl WorkerGrant {
             network: NetworkGrant::None,
             tools: base_tools_vec(),
             fs: FsGrant::default(),
+            // #1976: no per-path fence — the binary fs scope governs writes.
+            write_paths: None,
+            create_only: false,
         }
+    }
+
+    /// #1976 — whether this grant carries a per-path write fence.
+    /// `Some(_)` (even the empty read-only list) is a fence; `None` is the
+    /// pre-#1976 binary behaviour.
+    pub fn has_write_fence(&self) -> bool {
+        self.write_paths.is_some()
     }
 
     /// The granted tool names, deduplicated + sorted — the closed-worker audit
@@ -223,8 +262,96 @@ impl WorkerGrant {
                 }
             }
         }
+        // #1976 — per-path write fence coherence:
+        // - a fence under `fs: Host` is incoherent (Host lets the shell reach
+        //   everything the fence forbids; deny-wins → reject),
+        // - `create_only` without a fence has nothing to apply to,
+        // - `create_only` over an EMPTY allowlist grants the ability to
+        //   create nothing (issue: "empty list-with-create_only"),
+        // - every pattern must pass the v1 syntax (see
+        //   [`validate_write_path_pattern`]).
+        match &self.write_paths {
+            Some(paths) => {
+                if self.fs.is_host() {
+                    return Err(GrantError::WritePathsWithHostFs);
+                }
+                let all_blank = paths.iter().all(|p| p.trim().is_empty());
+                if self.create_only && all_blank {
+                    return Err(GrantError::EmptyWritePathsWithCreateOnly);
+                }
+                // An empty list without create_only is a valid read-only
+                // fence; blank ENTRIES in a non-empty list are still invalid
+                // patterns (caught below).
+                for pattern in paths {
+                    validate_write_path_pattern(pattern)?;
+                }
+            }
+            None => {
+                if self.create_only {
+                    return Err(GrantError::CreateOnlyWithoutWritePaths);
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// #1976 — validate ONE `fs.write` allowlist pattern against the v1 syntax:
+/// a workspace-RELATIVE `/`-separated path whose segments may use `*` / `?`
+/// wildcards. Rejects anything that could escape the workspace (`..`,
+/// absolute), inject into a sandbox profile (SBPL metacharacters, control
+/// bytes, `:` — the Docker mount-spec separator / Windows drive marker), or
+/// silently mean different things to the tool-layer matcher vs the sandbox
+/// regex translation (`**`, `[...]`, `{...}` are v1-unsupported for exactly
+/// that reason — the two layers must be provably aligned).
+pub fn validate_write_path_pattern(pattern: &str) -> Result<(), GrantError> {
+    let reject = |reason: &'static str| {
+        Err(GrantError::InvalidWritePath {
+            pattern: pattern.to_owned(),
+            reason,
+        })
+    };
+    if pattern.trim().is_empty() {
+        return reject("pattern is empty");
+    }
+    if pattern.starts_with('/') {
+        return reject("pattern must be workspace-relative, not absolute");
+    }
+    for byte in pattern.bytes() {
+        if byte < 0x20 || byte == 0x7F {
+            return reject("pattern contains control characters");
+        }
+    }
+    for ch in ['(', ')', '\\', '"'] {
+        if pattern.contains(ch) {
+            return reject("pattern contains sandbox-profile metacharacters ( ) \\ \"");
+        }
+    }
+    if pattern.contains(':') {
+        return reject("pattern must not contain `:` (mount-spec / drive separator)");
+    }
+    for ch in ['[', ']', '{', '}'] {
+        if pattern.contains(ch) {
+            return reject(
+                "glob classes/alternations are not supported in fs.write v1 (use * and ?)",
+            );
+        }
+    }
+    if pattern.contains("**") {
+        return reject("recursive `**` globs are not supported in fs.write v1");
+    }
+    for segment in pattern.split('/') {
+        match segment {
+            "" => return reject("empty path segment (`//` or trailing `/`)"),
+            "." | ".." => {
+                return reject(
+                    "`.` / `..` path segments are not allowed (write the plain relative path)",
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// A typed rejection of an incoherent [`WorkerGrant`].
@@ -236,6 +363,19 @@ pub enum GrantError {
     WebToolWithoutNetwork(String),
     /// A [`NetworkGrant::Hosts`] grant with an empty allowlist (fail-open trap).
     EmptyHostAllowlist,
+    /// #1976 — a per-path write fence combined with `fs: Host` (incoherent:
+    /// Host lets the shell reach everything the fence forbids).
+    WritePathsWithHostFs,
+    /// #1976 — `create_only` with no `write_paths` allowlist to apply to.
+    CreateOnlyWithoutWritePaths,
+    /// #1976 — `create_only` over an EMPTY allowlist (nothing creatable).
+    EmptyWritePathsWithCreateOnly,
+    /// #1976 — an `fs.write` pattern outside the v1 syntax (absolute, `..`,
+    /// `**`, glob classes, profile metacharacters, ...).
+    InvalidWritePath {
+        pattern: String,
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for GrantError {
@@ -255,6 +395,25 @@ impl std::fmt::Display for GrantError {
                 f,
                 "network mode `hosts` needs a non-empty allowlist — an empty list denies \
                  everything; use `none` for no network"
+            ),
+            GrantError::WritePathsWithHostFs => write!(
+                f,
+                "fs.write per-path grants require the workspace fs scope — `host` grants \
+                 full filesystem write, which contradicts a narrow write allowlist"
+            ),
+            GrantError::CreateOnlyWithoutWritePaths => write!(
+                f,
+                "fs.create_only requires an fs.write allowlist to apply to"
+            ),
+            GrantError::EmptyWritePathsWithCreateOnly => write!(
+                f,
+                "fs.create_only over an empty fs.write allowlist grants the ability to \
+                 create nothing — list the creatable paths or drop create_only"
+            ),
+            GrantError::InvalidWritePath { pattern, reason } => write!(
+                f,
+                "fs.write pattern `{pattern}` is invalid: {reason} (v1 patterns are \
+                 workspace-relative paths with `*` / `?` wildcards)"
             ),
         }
     }
@@ -370,6 +529,8 @@ mod tests {
             network: NetworkGrant::Hosts(vec!["example.com".into()]),
             tools: vec!["read_file".into(), "shell".into(), "web_fetch".into()],
             fs: FsGrant::Host,
+            write_paths: None,
+            create_only: false,
         };
         let json = serde_json::to_string(&g).unwrap();
         let back: WorkerGrant = serde_json::from_str(&json).unwrap();
@@ -386,5 +547,168 @@ mod tests {
             g.sorted_tools(),
             vec!["read_file".to_string(), "shell".to_string()]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1976 — per-path write grants (fs.write allowlist + create_only).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_paths_default_absent_and_back_compat() {
+        // #1976 back-compat: the minimal grant, `{}`, and a FULL old-shape
+        // grant JSON (written before per-path grants existed) all load with
+        // NO write fence — `write_paths: None`, `create_only: false` — i.e.
+        // byte-for-byte today's binary-fs worker.
+        let g = WorkerGrant::minimal();
+        assert_eq!(g.write_paths, None);
+        assert!(!g.create_only);
+        g.validate().expect("minimal stays valid");
+
+        let g: WorkerGrant = serde_json::from_str("{}").unwrap();
+        assert_eq!(g.write_paths, None);
+        assert!(!g.create_only);
+
+        let old = r#"{"network":"None","tools":["read_file"],"fs":"Workspace"}"#;
+        let g: WorkerGrant = serde_json::from_str(old).unwrap();
+        assert_eq!(g.write_paths, None);
+        assert!(!g.create_only);
+
+        // A grant WITHOUT a fence serializes WITHOUT the new keys, so an
+        // OLD reader of a NEW record sees exactly the old shape.
+        let json = serde_json::to_string(&WorkerGrant::minimal()).unwrap();
+        assert!(
+            !json.contains("write_paths") && !json.contains("create_only"),
+            "unfenced grant must serialize without #1976 keys: {json}"
+        );
+    }
+
+    #[test]
+    fn write_paths_round_trips_through_json() {
+        let g = WorkerGrant {
+            write_paths: Some(vec!["exemplar.card".into(), "cards/*.card".into()]),
+            create_only: true,
+            ..WorkerGrant::minimal()
+        };
+        g.validate().expect("a well-formed fence validates");
+        let json = serde_json::to_string(&g).unwrap();
+        let back: WorkerGrant = serde_json::from_str(&json).unwrap();
+        assert_eq!(g, back);
+        assert!(g.has_write_fence(), "Some(write_paths) is a fence");
+        assert!(
+            !WorkerGrant::minimal().has_write_fence(),
+            "None is no fence"
+        );
+    }
+
+    #[test]
+    fn write_paths_with_host_fs_is_rejected() {
+        // A narrow per-path WRITE fence combined with full-host fs is
+        // incoherent — `Host` would let the shell reach everything the
+        // fence forbids. Deny-wins: reject at validation.
+        let g = WorkerGrant {
+            fs: FsGrant::Host,
+            write_paths: Some(vec!["exemplar.card".into()]),
+            ..WorkerGrant::minimal()
+        };
+        assert_eq!(g.validate(), Err(GrantError::WritePathsWithHostFs));
+    }
+
+    #[test]
+    fn create_only_without_write_paths_is_rejected() {
+        // `create_only` modifies the allowlist; with no allowlist there is
+        // nothing it could apply to — an operator typo, not a policy.
+        let g = WorkerGrant {
+            create_only: true,
+            ..WorkerGrant::minimal()
+        };
+        assert_eq!(g.validate(), Err(GrantError::CreateOnlyWithoutWritePaths));
+    }
+
+    #[test]
+    fn empty_write_paths_with_create_only_is_rejected() {
+        // An EMPTY allowlist under create_only grants the ability to create
+        // nothing — incoherent (issue #1976: "empty list-with-create_only").
+        for paths in [vec![], vec!["  ".to_string()]] {
+            let g = WorkerGrant {
+                write_paths: Some(paths.clone()),
+                create_only: true,
+                ..WorkerGrant::minimal()
+            };
+            assert_eq!(
+                g.validate(),
+                Err(GrantError::EmptyWritePathsWithCreateOnly),
+                "paths {paths:?} + create_only must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn empty_write_paths_without_create_only_is_readonly_and_valid() {
+        // `write: []` (no create_only) is a coherent grant: the worker may
+        // read the workspace but write NOTHING via file tools or shell —
+        // previously inexpressible. Fail-closed, so it is allowed.
+        let g = WorkerGrant {
+            write_paths: Some(vec![]),
+            ..WorkerGrant::minimal()
+        };
+        g.validate().expect("write:[] is a valid read-only fence");
+        assert!(g.has_write_fence());
+    }
+
+    #[test]
+    fn write_path_patterns_are_validated() {
+        // v1 pattern syntax (#1976): workspace-RELATIVE, `*`/`?` wildcards
+        // only. Everything that could escape the workspace, inject into a
+        // sandbox profile (SBPL/Docker), or silently diverge between the
+        // tool-layer matcher and the sandbox translation is rejected at
+        // parse time.
+        let rejected = [
+            "/etc/passwd", // absolute
+            "../escape",   // parent traversal
+            "a/../b",      // inner traversal
+            "./x",         // `.` component (write the plain relative form)
+            "",            // empty
+            "   ",         // blank
+            "a(b",         // SBPL metacharacter
+            "a)b",         // SBPL metacharacter
+            "a\\b",        // SBPL metacharacter / Windows separator
+            "a\"b",        // SBPL metacharacter
+            "a[b]",        // glob class — unsupported in v1 (divergence risk)
+            "a{b}",        // glob alternation — unsupported in v1
+            "a:b",         // Docker mount-spec separator / Windows drive
+            "a\nb",        // control character (profile injection)
+            "cards/**",    // recursive glob — unsupported in v1
+            "**/x.card",   // recursive glob — unsupported in v1
+            "a//b",        // empty component
+            "trailing/",   // empty trailing component
+        ];
+        for pattern in rejected {
+            let g = WorkerGrant {
+                write_paths: Some(vec![pattern.to_string()]),
+                ..WorkerGrant::minimal()
+            };
+            assert!(
+                matches!(g.validate(), Err(GrantError::InvalidWritePath { .. })),
+                "pattern {pattern:?} must be rejected, got {:?}",
+                g.validate(),
+            );
+        }
+
+        let accepted = [
+            "exemplar.card",
+            "cards/*.card",
+            "a/b/c.txt",
+            "notes-?.md",
+            "*.card",
+            "out/*",
+        ];
+        for pattern in accepted {
+            let g = WorkerGrant {
+                write_paths: Some(vec![pattern.to_string()]),
+                ..WorkerGrant::minimal()
+            };
+            g.validate()
+                .unwrap_or_else(|e| panic!("pattern {pattern:?} must be accepted: {e}"));
+        }
     }
 }

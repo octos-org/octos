@@ -4804,6 +4804,128 @@ impl InProcessAgentOrchestrator {
         Ok((finding_id, goal_row.status == "active"))
     }
 
+    /// #1976 — record a fleet worker's per-path WRITE-grant violation as a
+    /// `[denied]`-class finding in the offending task's goal ledger. The wire
+    /// for the file tools' `WriteGrantViolationSink`: the tool already
+    /// returned the refusal to the model (never silent); THIS makes it
+    /// DURABLE audit alongside the peer/verifier findings the master lists.
+    ///
+    /// Unlike [`Self::model_goal_record_peer_finding`] this is HOST-generated
+    /// (not a model call), so there is no token charge and no originator
+    /// auth: the grant itself is the authority. The violation carries the
+    /// worker's `workspace` (`<fleet-work>/<fleet_id>/<task_id>`), from which
+    /// we recover `fleet_id`/`task_id` and resolve the goal that binds the
+    /// fleet under `profile_id`. Best-effort by contract — a resolution miss
+    /// or ledger error is logged and dropped (the tool refusal already
+    /// bounded the worker); it never blocks the worker.
+    pub(crate) fn record_fleet_write_grant_denial(
+        &self,
+        profile_data_dir: &std::path::Path,
+        profile_id: &str,
+        workspace: &std::path::Path,
+        detail: &str,
+    ) {
+        // `<...>/fleet-work/<fleet_id>/<task_id>` — the pool's per-attempt cwd.
+        let mut components = workspace.components().rev();
+        let task_id = components
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let fleet_id = components
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let (Some(task_id), Some(fleet_id)) = (task_id, fleet_id) else {
+            tracing::warn!(
+                workspace = %workspace.display(),
+                "write-grant denial: could not recover fleet/task from workspace path; dropping finding"
+            );
+            return;
+        };
+        // Resolve the goal that binds THIS fleet under this profile (the
+        // reverse of `goal_bound_fleet_id`). Capture the authoritative goal
+        // row so the ledger's goals FK row is real, mirroring the peer path.
+        let goal_row = {
+            let state = self.state();
+            state
+                .goals
+                .values()
+                .find(|goal| {
+                    goal.fleet_id.as_deref() == Some(fleet_id.as_str())
+                        && goal.profile_id == profile_id
+                })
+                .map(|goal| octos_fleet::Goal {
+                    goal_id: goal.goal_id.clone(),
+                    objective: goal.objective.clone(),
+                    status: goal.status.clone(),
+                    tokens_used: goal.tokens_used,
+                    token_budget: goal.token_budget,
+                    continuations_used: goal.continuations_used,
+                    revision: 0, // preserved on conflict by upsert_goal
+                    created_at_ms: goal.created_at_ms.max(0) as u64,
+                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
+                })
+        };
+        let Some(goal_row) = goal_row else {
+            tracing::warn!(
+                %fleet_id,
+                %profile_id,
+                "write-grant denial: no goal binds this fleet; dropping finding (tool already refused)"
+            );
+            return;
+        };
+        let goal_id = goal_row.goal_id.clone();
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        if let Err(e) = std::fs::create_dir_all(&ledger_dir) {
+            tracing::warn!(error = %e, "write-grant denial: cannot create ledger dir; dropping finding");
+            return;
+        }
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) else {
+            tracing::warn!(path = %ledger_path.display(), "write-grant denial: cannot open ledger; dropping finding");
+            return;
+        };
+        // FK: goals row before findings; task stub before a task-scoped finding.
+        let _ = ledger.upsert_goal(&goal_row);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let task_stub = octos_fleet::Task {
+            task_id: task_id.clone(),
+            goal_id: goal_id.clone(),
+            title: String::new(),
+            detail: String::new(),
+            status: "running".to_owned(),
+            assigned_peer: None,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        let _ = ledger.create_task(&task_stub);
+        let finding = octos_fleet::Finding {
+            rowid: None,
+            finding_id: format!("denied-{fleet_id}-{}", uuid::Uuid::now_v7()),
+            seq: 0,
+            task_id: Some(task_id),
+            goal_id,
+            // A denied write is a hard, evidenced CONSTRAINT the worker hit —
+            // high confidence (it is a fact: the write was refused).
+            kind: "constraint".to_owned(),
+            lifecycle: "observed".to_owned(),
+            confidence: "high".to_owned(),
+            review_state: "unreviewed".to_owned(),
+            assertion: detail.chars().take(500).collect(),
+            evidence: None,
+            config_version: None,
+            derived_from: None,
+            supersedes: Vec::new(),
+            cost_tokens: 0,
+            created_at_ms: now_ms,
+            created_by: "host:write-grant".to_owned(),
+        };
+        if let Err(e) = ledger.append_finding(&finding) {
+            tracing::warn!(error = %e, "write-grant denial: append_finding failed; dropping");
+        }
+    }
+
     /// Peer-agent-based goal: record a peer escalation into the goal's
     /// durable ledger. This is the WIRE for `append_escalation` — called
     /// when a goal-scoped peer parks on `awaiting_input` (approval /
