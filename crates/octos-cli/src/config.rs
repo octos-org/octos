@@ -2332,6 +2332,20 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_none_when_gateway_reasoning_is_disabled() {
+        let json = r#"{
+            "channels": [{"type": "cli"}],
+            "reasoning_effort": "none"
+        }"#;
+        let gw: GatewayConfig =
+            serde_json::from_str(json).expect("none should disable gateway reasoning");
+        assert_eq!(
+            serde_json::to_value(gw.reasoning_effort.unwrap()).unwrap(),
+            serde_json::json!("none")
+        );
+    }
+
+    #[test]
     fn test_gateway_config_defaults() {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();

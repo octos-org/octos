@@ -395,6 +395,7 @@ fn build_anthropic_thinking(effort: ReasoningEffort, max_tokens: u32) -> Option<
 
 fn anthropic_thinking_budget_tokens(effort: ReasoningEffort) -> u32 {
     match effort {
+        ReasoningEffort::Disabled => 0,
         ReasoningEffort::Low => 1_024,
         ReasoningEffort::Medium => 4_096,
         ReasoningEffort::High => 8_192,
@@ -1342,6 +1343,21 @@ mod tests {
         let body = serde_json::to_value(&request).unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8_192);
+    }
+
+    #[test]
+    fn should_omit_thinking_when_reasoning_is_disabled() {
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        let effort = serde_json::from_value(serde_json::json!("none"))
+            .expect("none should disable reasoning");
+        let config = ChatConfig {
+            reasoning_effort: Some(effort),
+            ..Default::default()
+        };
+
+        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]

@@ -434,6 +434,7 @@ fn build_gemini_generation_config(
 
     let thinking_config = config.reasoning_effort.map(|effort| {
         let budget = match effort {
+            ReasoningEffort::Disabled => Some(0),
             ReasoningEffort::Low => Some(1024),
             ReasoningEffort::Medium => Some(8192),
             // High and Max both let the model decide (unbounded thinking budget).
@@ -1814,6 +1815,19 @@ mod tests {
         let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
         let tc = gen_config.thinking_config.unwrap();
         assert!(tc.thinking_budget.is_none());
+    }
+
+    #[test]
+    fn should_set_zero_thinking_budget_when_reasoning_is_disabled() {
+        let effort = serde_json::from_value(serde_json::json!("none"))
+            .expect("none should disable reasoning");
+        let config = ChatConfig {
+            reasoning_effort: Some(effort),
+            ..Default::default()
+        };
+        let gen_config = build_gemini_generation_config(&config, "gemini/test").unwrap();
+        let tc = gen_config.thinking_config.unwrap();
+        assert_eq!(tc.thinking_budget, Some(0));
     }
 
     #[test]

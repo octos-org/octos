@@ -85,6 +85,7 @@ impl OpenAIResponsesProvider {
         // Reasoning effort maps to the reasoning object
         if let Some(effort) = &config.reasoning_effort {
             let effort_str = match effort {
+                crate::config::ReasoningEffort::Disabled => "none",
                 crate::config::ReasoningEffort::Low => "low",
                 crate::config::ReasoningEffort::Medium => "medium",
                 crate::config::ReasoningEffort::High => "high",
@@ -761,6 +762,21 @@ mod tests {
         let request = provider.build_request(&messages, &[], &config);
 
         assert_eq!(request["reasoning"]["effort"].as_str(), Some("high"));
+    }
+
+    #[test]
+    fn should_emit_none_when_reasoning_is_disabled() {
+        let provider = OpenAIResponsesProvider::new("test-key", "gpt-5");
+        let messages = vec![msg(MessageRole::User, "answer directly")];
+        let effort = serde_json::from_value(serde_json::json!("none"))
+            .expect("none should disable reasoning");
+        let config = ChatConfig {
+            reasoning_effort: Some(effort),
+            ..Default::default()
+        };
+        let request = provider.build_request(&messages, &[], &config);
+
+        assert_eq!(request["reasoning"]["effort"].as_str(), Some("none"));
     }
 
     #[test]

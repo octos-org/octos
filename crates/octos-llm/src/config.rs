@@ -17,7 +17,7 @@ pub struct ChatConfig {
     /// Stop sequences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
-    /// Reasoning effort for thinking models (low/medium/high).
+    /// Reasoning effort for thinking models (none/low/medium/high/max).
     /// Maps to provider-specific parameters (OpenAI reasoning.effort,
     /// Anthropic thinking budget, Gemini thinkingConfig).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +63,9 @@ fn default_strict() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    /// Disable reasoning where the provider supports it.
+    #[serde(rename = "none")]
+    Disabled,
     Low,
     Medium,
     High,
@@ -104,6 +107,16 @@ pub enum ToolChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_deserialize_disabled_reasoning_effort_from_none() {
+        let effort: ReasoningEffort = serde_json::from_value(serde_json::json!("none"))
+            .expect("none should disable reasoning");
+        assert_eq!(
+            serde_json::to_value(effort).unwrap(),
+            serde_json::json!("none")
+        );
+    }
 
     #[test]
     fn test_chat_config_defaults() {
