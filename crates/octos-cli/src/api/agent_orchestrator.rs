@@ -2894,21 +2894,31 @@ impl InProcessAgentOrchestrator {
         true
     }
 
+    /// Charge a completed turn's tokens to the session's goal.
+    ///
+    /// #1982 — returns the goal snapshot ONLY when the goal is TERMINAL
+    /// (`complete`/`blocked`) after the charge. A goal completed/blocked
+    /// mid-turn had its ledger goals-row frozen at the pre-completion total by
+    /// the mid-turn transition, and this post-turn charge persists only to the
+    /// supervisor store — so the durable ledger under-counts the goal's true
+    /// final cost and no later transition re-syncs it. The caller (which holds
+    /// the profile data dir) reconciles the ledger via
+    /// [`Self::reconcile_terminal_goal_ledger`]. Non-terminal goals return
+    /// `None`: their next transition re-syncs the ledger, so a per-turn ledger
+    /// write would be wasteful.
     pub(crate) fn record_goal_turn(
         &self,
         session_id: &SessionKey,
         profile_id: &str,
         tokens_consumed: u64,
         elapsed_seconds: u64,
-    ) {
+    ) -> Option<AutonomyGoalRecord> {
         let now = now_ms();
         let now_system = SystemTime::now();
         let mut state = self.state();
-        let Some(goal) = state.goals.get_mut(session_id) else {
-            return;
-        };
+        let goal = state.goals.get_mut(session_id)?;
         if goal.profile_id != profile_id {
-            return;
+            return None;
         }
         let wrap_up = record_goal_turn_internal(goal, tokens_consumed, elapsed_seconds, now);
         let goal_snapshot = goal.clone();
@@ -2923,6 +2933,47 @@ impl InProcessAgentOrchestrator {
             // key shape.
             enqueue_goal_wrap_up(&mut state, session_id, &goal_snapshot, prompt, now_system);
         }
+        if matches!(goal_snapshot.status.as_str(), "complete" | "blocked") {
+            Some(goal_snapshot)
+        } else {
+            None
+        }
+    }
+
+    /// #1982 — reconcile the durable goal-ledger `tokens_used` with the live
+    /// total after a goal completed/blocked MID-TURN (see
+    /// [`Self::record_goal_turn`]). `status_changed == false` runs the guarded
+    /// `upsert_goal` (which admits the higher tokens on a complete==complete /
+    /// blocked==blocked row) and appends NO decision row. A no-op when the goal
+    /// has no existing ledger under `ledger_data_dir` — this only corrects an
+    /// under-count, it never creates a ledger for a goal that never had one.
+    pub(crate) fn reconcile_terminal_goal_ledger(
+        &self,
+        decided_by: &SessionKey,
+        snapshot: &AutonomyGoalRecord,
+        ledger_data_dir: &std::path::Path,
+    ) {
+        // No-op if the goal never had a ledger: this only CORRECTS an
+        // under-count, it never creates a fresh ledger for a goal that never
+        // synced one (which would change existing non-peer-goal behavior).
+        let ledger_path = Self::goal_ledger_dir(ledger_data_dir).join(format!(
+            "{}.db",
+            sanitize_filename_for_ledger(&snapshot.goal_id)
+        ));
+        if !ledger_path.is_file() {
+            return;
+        }
+        // `status_changed == false` → the guarded `upsert_goal` admits the higher
+        // tokens (complete==complete / blocked==blocked passes the guard clauses)
+        // and returns before appending any decision row.
+        self.sync_transition_to_ledger_blocking(
+            ledger_data_dir,
+            snapshot,
+            "post-turn token reconcile",
+            decided_by,
+            false,
+            false,
+        );
     }
 
     /// #1650 — the `goal_id` of the session's active goal for
@@ -8803,7 +8854,7 @@ struct AutonomyAgentRecord {
 }
 
 #[derive(Debug, Clone)]
-struct AutonomyGoalRecord {
+pub(crate) struct AutonomyGoalRecord {
     profile_id: String,
     goal_id: String,
     objective: String,
@@ -14142,6 +14193,62 @@ mod tests {
                 .len(),
             1,
             "blocked → blocked re-transition must append NO duplicate decision",
+        );
+    }
+
+    /// #1982 — a goal COMPLETED mid-turn freezes its durable ledger
+    /// `tokens_used` at the pre-completion total, and the post-turn
+    /// `record_goal_turn` charges the full turn but persists only to the
+    /// supervisor store — so the ledger under-counts the goal's true final cost
+    /// (soak: 266K live vs 129K ledger). `record_goal_turn` hands back the
+    /// terminal snapshot; `reconcile_terminal_goal_ledger` re-syncs the ledger.
+    #[tokio::test]
+    async fn record_goal_turn_reconciles_ledger_tokens_when_goal_completed_mid_turn() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let wire = SessionKey::new("api", "goal-token-reconcile");
+
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: wire.clone(),
+                profile_id: "tenant-a".to_owned(),
+                objective: "reconcile tokens".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(2_000_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal_id");
+
+        // Complete mid-turn via the tool-supplied data dir → ledger row synced at
+        // the pre-turn total (0 spent so far).
+        orchestrator
+            .model_transition_goal(&wire, "tenant-a", "complete", "done", Some(data_dir.path()))
+            .await
+            .expect("complete");
+
+        // The full turn's spend is charged to the now-complete goal post-turn.
+        let terminal = orchestrator.record_goal_turn(&wire, "tenant-a", 191_064, 30);
+
+        let live = orchestrator.model_goal_snapshot(&wire, "tenant-a")["tokens_used"]
+            .as_u64()
+            .expect("tokens_used");
+        assert_eq!(live, 191_064, "live goal reflects the full turn spend");
+
+        // record_goal_turn hands back the terminal snapshot; the caller reconciles.
+        let snapshot = terminal.expect("terminal goal snapshot returned for reconcile");
+        orchestrator.reconcile_terminal_goal_ledger(&wire, &snapshot, data_dir.path());
+
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query ledger")
+            .expect("goals row present");
+        assert_eq!(
+            row.tokens_used, live,
+            "durable ledger must reflect the goal's true final cost after a mid-turn completion",
         );
     }
 
