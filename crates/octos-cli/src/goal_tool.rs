@@ -381,7 +381,9 @@ impl Tool for GoalGetTool {
             // `Err` (H3) when `goal.fleet_id` doesn't belong to this goal — surface
             // it instead of reading/completing a foreign fleet.
             let fleet = match orchestrator
-                .model_fleet_snapshot(&session_id, &self.profile_id)
+                // #1964 — pass the profile data dir so a fleet terminal the
+                // snapshot backstop detects syncs the per-goal ledger (#1957).
+                .model_fleet_snapshot(&session_id, &self.profile_id, self.data_dir.as_deref())
                 .await
             {
                 Ok(fleet) => fleet,
@@ -879,13 +881,25 @@ impl Tool for GoalGrantTool {
 /// PR B — `goal_deny`: REFUSE a worker's mid-task escalation, failing the task.
 pub struct GoalDenyTool {
     profile_id: String,
+    /// #1964 — profile's persistent data dir, so a deny that renders the fleet
+    /// un-completable syncs the goal-row status + a `decisions` row into
+    /// `<data_dir>/goal-ledgers/` (#1957). `None` on paths that never wired it
+    /// (the sync is then skipped).
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl GoalDenyTool {
     pub fn new(profile_id: impl Into<String>) -> Self {
         Self {
             profile_id: profile_id.into(),
+            data_dir: None,
         }
+    }
+
+    /// #1964 — mirrors `GoalGetTool::with_data_dir` / `GoalUpdateTool::with_data_dir`.
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
     }
 }
 
@@ -972,6 +986,8 @@ impl Tool for GoalDenyTool {
                 task_id,
                 reason,
                 fleet_now_ms(),
+                // #1964 — deny-driven goal terminals sync the per-goal ledger.
+                self.data_dir.as_deref(),
             )
             .await
         {
@@ -1187,13 +1203,16 @@ impl Tool for GoalUpdateTool {
         // transition into the ledger (goals-row status + a decision) using the
         // snapshot it just transitioned. Done INSIDE model_transition_goal (not
         // here) so it uses the correct goal without a racy re-fetch (codex #3).
-        match default_agent_orchestrator().model_transition_goal(
-            &session_id,
-            &self.profile_id,
-            status,
-            reason,
-            self.data_dir.as_deref(),
-        ) {
+        match default_agent_orchestrator()
+            .model_transition_goal(
+                &session_id,
+                &self.profile_id,
+                status,
+                reason,
+                self.data_dir.as_deref(),
+            )
+            .await
+        {
             Ok(goal) => Ok(ToolResult {
                 output: format!(
                     "goal transitioned to `{status}`:\n{}",

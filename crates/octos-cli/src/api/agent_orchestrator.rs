@@ -562,8 +562,20 @@ pub(crate) fn method_not_supported_error(
     .with_data(Value::Object(data))
 }
 
-#[derive(Debug, Default)]
+/// #1865 — `Clone` is shallow (an `Arc` bump over [`OrchestratorShared`]):
+/// clones share the SAME goals/fleet state. The eager fleet-convergence
+/// monitor (`spawn_fleet_settle_monitor`) needs a `'static` handle to THIS
+/// orchestrator instance inside a `tokio::spawn` — the process singleton
+/// (`default_agent_orchestrator`) is `&'static`, but tests drive LOCAL
+/// instances, so the handle must be an owned clone, not the static.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct InProcessAgentOrchestrator {
+    shared: Arc<OrchestratorShared>,
+}
+
+/// The shared innards of [`InProcessAgentOrchestrator`] (see its `Clone` note).
+#[derive(Debug, Default)]
+struct OrchestratorShared {
     state: StdMutex<AutonomyRuntimeState>,
     /// #1666 residue — per-project (cwd) scope for the goal/autonomy store,
     /// mirroring the ledger's `scopes` map (`ui_protocol_ledger.rs`).
@@ -571,10 +583,11 @@ pub(crate) struct InProcessAgentOrchestrator {
     /// goal set in one folder does NOT leak into a fresh session that reuses
     /// the same WIRE session key in another folder (same profile). Keyed by
     /// the plain wire session id; held under a SEPARATE lock from `state` so
-    /// [`Self::scoped_goal_key`] can be resolved without re-entering the state
-    /// mutex the goal handlers already hold. Empty (no scope) → the goal store
-    /// keys by the plain wire id, byte-identical to the legacy behavior and to
-    /// the gateway/session-actor path (which never registers a scope).
+    /// [`InProcessAgentOrchestrator::scoped_goal_key`] can be resolved without
+    /// re-entering the state mutex the goal handlers already hold. Empty (no
+    /// scope) → the goal store keys by the plain wire id, byte-identical to
+    /// the legacy behavior and to the gateway/session-actor path (which never
+    /// registers a scope).
     goal_scopes: StdMutex<HashMap<String, String>>,
 }
 
@@ -885,7 +898,8 @@ impl InProcessAgentOrchestrator {
         self.state().goals.get(&key).map(|g| g.goal_id.clone())
     }
     fn state(&self) -> std::sync::MutexGuard<'_, AutonomyRuntimeState> {
-        self.state
+        self.shared
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -893,7 +907,8 @@ impl InProcessAgentOrchestrator {
     #[cfg(test)]
     pub(crate) fn clear_for_test(&self) {
         *self.state() = AutonomyRuntimeState::default();
-        self.goal_scopes
+        self.shared
+            .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -907,6 +922,7 @@ impl InProcessAgentOrchestrator {
     /// [`UiProtocolLedger::set_session_scope`].
     pub(crate) fn set_goal_scope(&self, session_id: &SessionKey, scope: Option<String>) {
         let mut scopes = self
+            .shared
             .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -931,6 +947,7 @@ impl InProcessAgentOrchestrator {
     pub(crate) fn set_goal_scope_if_absent(&self, session_id: &SessionKey, scope: &str) -> bool {
         use std::collections::hash_map::Entry;
         match self
+            .shared
             .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -949,7 +966,8 @@ impl InProcessAgentOrchestrator {
     /// fleet-keeper re-seed uses it to gate a scoped seed on the wire's goal
     /// scope being absent (so a pair is only ever seeded into a FRESH wire).
     pub(crate) fn goal_scope(&self, session_id: &SessionKey) -> Option<String> {
-        self.goal_scopes
+        self.shared
+            .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(session_id.0.as_str())
@@ -963,6 +981,7 @@ impl InProcessAgentOrchestrator {
     /// isolates cwds exactly as the ledger already isolates transcripts.
     pub(crate) fn scoped_goal_key(&self, session_id: &SessionKey) -> SessionKey {
         let scopes = self
+            .shared
             .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1044,6 +1063,22 @@ impl InProcessAgentOrchestrator {
     /// accessor `model_dispatch_fleet` uses to launch a goal's ready tasks.
     pub(crate) fn fleet_pool(&self) -> Option<Arc<FleetWorkerPool>> {
         self.state().fleet_pool.clone()
+    }
+
+    /// #1865/#1964 — install the keeper profile's data dir for fleet-driven
+    /// goal-ledger syncs. Called at serve boot right beside
+    /// [`Self::set_fleet_pool`] (the pool and the ledger dir come from the SAME
+    /// keeper `ProfileRuntime`); the eager settle monitor reads it back via
+    /// [`Self::fleet_ledger_data_dir`] so a fleet-completed/blocked goal lands
+    /// in `<data_dir>/goal-ledgers/<goal_id>.db` like every other transition.
+    pub(crate) fn set_fleet_ledger_data_dir(&self, data_dir: std::path::PathBuf) {
+        self.state().fleet_ledger_data_dir = Some(data_dir);
+    }
+
+    /// The keeper profile's data dir for fleet-driven ledger syncs (see
+    /// [`Self::set_fleet_ledger_data_dir`]); `None` when never wired.
+    pub(crate) fn fleet_ledger_data_dir(&self) -> Option<std::path::PathBuf> {
+        self.state().fleet_ledger_data_dir.clone()
     }
 
     /// #1857 PR 4a — drain the fleet outbox once against this orchestrator's
@@ -3196,13 +3231,20 @@ impl InProcessAgentOrchestrator {
         // #1957 (codex #1) — sync the sentinel completion into the durable
         // ledger. `status_changed` is always true here: we returned early above
         // if the goal was already `complete`, so this is a genuine transition.
+        // Inline blocking core (this fn is sync; its sentinel call sites in
+        // session_actor/ui_protocol own their own threading) with
+        // `retry_contended_open: false` — the plain default-profile open, so
+        // this path's blocking behavior is exactly its pre-#1865 self (review
+        // round 3; the async facade + retry profile exist for the
+        // fleet/goal_update paths only).
         if let Some(data_dir) = ledger_data_dir {
-            self.sync_transition_to_ledger(
+            self.sync_transition_to_ledger_blocking(
                 data_dir,
                 &snapshot,
                 "goal completion sentinel confirmed by verifier",
                 session_id,
                 true,
+                false,
             );
         }
         true
@@ -3547,7 +3589,7 @@ impl InProcessAgentOrchestrator {
     /// the tool executor): the model may set ONLY `complete` or `blocked`.
     /// Structured successor to the `<goal:complete>` text sentinel
     /// ([`Self::maybe_complete_goal_from_model`], kept for back-compat).
-    pub(crate) fn model_transition_goal(
+    pub(crate) async fn model_transition_goal(
         &self,
         session_id: &SessionKey,
         profile_id: &str,
@@ -3557,25 +3599,74 @@ impl InProcessAgentOrchestrator {
         // the goal ledger (goals-row status + a decision) using the in-hand
         // snapshot below — NO re-resolution of the scope, so it cannot attach a
         // decision to a different folder's goal (codex #3). `None` for callers
-        // that have no data dir (fleet/tests); those just skip the sync.
+        // that have no data dir (tests); those just skip the sync.
         ledger_data_dir: Option<&std::path::Path>,
+    ) -> Result<Value, String> {
+        // #1666 residue — the `goal_update` tool addresses THIS folder's goal.
+        // `expected_fleet_id: None` — a model-claimed transition carries no
+        // fleet expectation (review FIX 2 guards only the fleet-driven paths).
+        let key = self.scoped_goal_key(session_id);
+        self.model_transition_goal_at_key(&key, profile_id, status, reason, ledger_data_dir, None)
+            .await
+    }
+
+    /// #1865 — the storage-key core of [`Self::model_transition_goal`]: takes
+    /// the goals-map key DIRECTLY (already scoped — or the fleet's persisted
+    /// `controller_session_key`, which IS the scoped key `goal_plan` bound).
+    /// The fleet paths (`drive_goal_terminal_transition`, and through it the
+    /// eager settle monitor) use this so a transition always lands on the
+    /// EXACT goal the fleet is bound to, even if the wire session's cwd scope
+    /// was re-registered while an attempt ran.
+    ///
+    /// #1865 review FIX 2 — `expected_fleet_id`: when `Some`, the transition
+    /// commits ONLY if the goal's CURRENT `fleet_id` still equals it, checked
+    /// UNDER the state lock immediately before the flip. The fleet callers'
+    /// out-of-lock fences (reconciler binding check, `resolve_owned_fleet`)
+    /// all run BEFORE awaits; a `goal_clear` + re-plan landing inside that
+    /// await window would otherwise let a STALE fleet's evidence terminalize
+    /// the REPLACEMENT goal. Fleet-driven callers pass their in-hand fleet id;
+    /// the `goal_update` wrapper passes `None` (no fleet expectation).
+    async fn model_transition_goal_at_key(
+        &self,
+        key: &SessionKey,
+        profile_id: &str,
+        status: &str,
+        reason: &str,
+        ledger_data_dir: Option<&std::path::Path>,
+        expected_fleet_id: Option<&str>,
     ) -> Result<Value, String> {
         if !matches!(status, "complete" | "blocked") {
             return Err(format!(
                 "status `{status}` is not a model-allowed transition (only complete|blocked)"
             ));
         }
-        // #1666 residue — the `goal_update` tool addresses THIS folder's goal.
-        let key = self.scoped_goal_key(session_id);
         // Do the mutation + persist under the lock, then DROP it before any
         // ledger file I/O below.
         let (snapshot, status_changed) = {
             let mut state = self.state();
-            let Some(goal) = state.goals.get_mut(&key) else {
+            let Some(goal) = state.goals.get_mut(key) else {
                 return Err("no goal is set for this session".to_owned());
             };
             if goal.profile_id != profile_id {
                 return Err("goal is outside this profile's scope".to_owned());
+            }
+            // Review FIX 2 — the authoritative, under-lock binding recheck.
+            if let Some(expected) = expected_fleet_id {
+                if goal.fleet_id.as_deref() != Some(expected) {
+                    tracing::warn!(
+                        session = %key,
+                        goal_id = %goal.goal_id,
+                        expected_fleet = %expected,
+                        bound_fleet = %goal.fleet_id.as_deref().unwrap_or("<none>"),
+                        "refusing fleet-driven goal transition: the goal's fleet \
+                         binding changed while the fleet state was being read \
+                         (stale monitor/backstop must not terminalize the \
+                         replacement goal)"
+                    );
+                    return Err(format!(
+                        "goal is no longer driven by fleet `{expected}`; transition refused"
+                    ));
+                }
             }
             if goal.status == "complete" {
                 return Err("goal is already complete".to_owned());
@@ -3584,11 +3675,11 @@ impl InProcessAgentOrchestrator {
             goal.status = status.to_owned();
             goal.updated_at_ms = now_ms();
             let snapshot = goal.clone();
-            persist_goal_state(&state, &key, &snapshot, false);
+            persist_goal_state(&state, key, &snapshot, false);
             (snapshot, status_changed)
         };
         tracing::info!(
-            session = %session_id,
+            session = %key,
             goal_id = %snapshot.goal_id,
             status = %status,
             reason = %reason,
@@ -3599,13 +3690,58 @@ impl InProcessAgentOrchestrator {
         // guarded `upsert_goal` makes this newer state win over a stale
         // finding-path upsert (codex #2), and a decision is appended only on a
         // real status change (codex #5 — `blocked → blocked` retries add none).
+        // Awaited (not detached) so a caller returning implies the ledger row
+        // is settled — the write itself runs on the blocking pool (FIX 1).
         if let Some(data_dir) = ledger_data_dir {
-            self.sync_transition_to_ledger(data_dir, &snapshot, reason, session_id, status_changed);
+            self.sync_transition_to_ledger(data_dir, &snapshot, reason, key, status_changed)
+                .await;
         }
         Ok(autonomy_goal_json(&snapshot))
     }
 
-    /// #1957 — sync a JUST-transitioned goal snapshot into the durable ledger:
+    /// #1957 — sync a JUST-transitioned goal snapshot into the durable ledger.
+    /// Async facade over [`Self::sync_transition_to_ledger_blocking`]: the
+    /// whole body (contended open + SQLite writes) is synchronous rusqlite
+    /// I/O — `GoalLedger::open_with_busy_retry` waits up to 1s PER lock
+    /// acquisition across ≤3 attempts, a practical worst case in single-digit
+    /// seconds (per-op timeout, NOT a wall-clock bound) — so it runs on the
+    /// BLOCKING pool via `tokio::task::spawn_blocking` (review FIX 1; same
+    /// treatment as the escalation timeout sweep). AWAITED, not detached, so
+    /// "the transition call returned" still implies "the ledger row is
+    /// settled" — multiple settling children may briefly occupy blocking-pool
+    /// threads, but they can no longer pin executor workers.
+    async fn sync_transition_to_ledger(
+        &self,
+        profile_data_dir: &std::path::Path,
+        snapshot: &AutonomyGoalRecord,
+        reason: &str,
+        decided_by: &SessionKey,
+        status_changed: bool,
+    ) {
+        let this = self.clone();
+        let profile_data_dir = profile_data_dir.to_path_buf();
+        let snapshot = snapshot.clone();
+        let reason = reason.to_owned();
+        let decided_by = decided_by.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            this.sync_transition_to_ledger_blocking(
+                &profile_data_dir,
+                &snapshot,
+                &reason,
+                &decided_by,
+                status_changed,
+                // Bounded-retry open profile — this closure is the ONLY place
+                // it is enabled, and it always runs on the blocking pool.
+                true,
+            );
+        })
+        .await;
+        if let Err(error) = joined {
+            tracing::warn!(%error, "goal-ledger transition sync task failed (best-effort)");
+        }
+    }
+
+    /// #1957 — the blocking core of [`Self::sync_transition_to_ledger`]:
     /// upsert the goals-row (guarded, so a stale finding upsert can't undo it)
     /// AND — only when the status actually changed — append a `decisions` row.
     /// Takes the caller's IN-HAND snapshot, never a re-fetch, so it always
@@ -3614,13 +3750,29 @@ impl InProcessAgentOrchestrator {
     /// failure never affects the in-memory transition. Opens (creates) the
     /// ledger, since a transition can be the FIRST ledger write for a
     /// finding-less goal.
-    fn sync_transition_to_ledger(
+    ///
+    /// #1865 review round 3 — `retry_contended_open` picks the open profile:
+    /// - `true` (the fleet/goal_update transition sync, reached ONLY through
+    ///   the `spawn_blocking` facade above): `open_with_busy_retry`, because
+    ///   two connections racing the FIRST WAL initialization of a fresh
+    ///   ledger can fail `database is locked` through the wal-index/shm
+    ///   recovery path the busy handler does not cover (the #1865 flake
+    ///   root-cause). Busy-only, ≤3 attempts, 1s per lock acquisition —
+    ///   practical worst case single-digit seconds, on the blocking pool.
+    /// - `false` (the sentinel completion path,
+    ///   [`Self::maybe_complete_goal_from_model`] — a sync fn whose call
+    ///   sites another lane owns): plain `GoalLedger::open`, i.e. rusqlite's
+    ///   default busy handling — the EXACT pre-#1865 blocking profile for
+    ///   that path (call sites untouched; this restores the core's behavior
+    ///   for them after this branch briefly routed them through the retry).
+    fn sync_transition_to_ledger_blocking(
         &self,
         profile_data_dir: &std::path::Path,
         snapshot: &AutonomyGoalRecord,
         reason: &str,
         decided_by: &SessionKey,
         status_changed: bool,
+        retry_contended_open: bool,
     ) {
         let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
         if std::fs::create_dir_all(&ledger_dir).is_err() {
@@ -3630,8 +3782,18 @@ impl InProcessAgentOrchestrator {
             "{}.db",
             sanitize_filename_for_ledger(&snapshot.goal_id)
         ));
-        let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) else {
-            return;
+        let opened = if retry_contended_open {
+            octos_fleet::GoalLedger::open_with_busy_retry(&ledger_path)
+        } else {
+            octos_fleet::GoalLedger::open(&ledger_path)
+        };
+        let ledger = match opened {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(%error, ledger = %ledger_path.display(),
+                    "goal-ledger open failed; transition sync skipped (best-effort)");
+                return;
+            }
         };
         let _ = ledger.upsert_goal(&octos_fleet::Goal {
             goal_id: snapshot.goal_id.clone(),
@@ -4576,13 +4738,20 @@ impl InProcessAgentOrchestrator {
         let mut rejected = Vec::new();
         for task_id in ready {
             match pool.dispatch(&fleet_id, &task_id).await {
-                // Production DROPS the JoinHandle (launch-and-return): the
-                // detached background run drives the attempt + appends the wake.
+                // Launch-and-return: the detached background run drives the
+                // attempt + appends the wake. #1865 — the JoinHandle is no
+                // longer DROPPED: the settle monitor awaits it and reconciles
+                // the goal the moment the attempt settles, so a fully-succeeded
+                // (or terminally-failed) fleet converges its goal WITHOUT the
+                // keeper model ever calling goal_get.
                 Ok(d) => match d.launch {
-                    LaunchOutcome::Launched { attempt_id } => dispatched.push(json!({
-                        "task_id": task_id,
-                        "attempt_id": attempt_id,
-                    })),
+                    LaunchOutcome::Launched { attempt_id } => {
+                        self.spawn_fleet_settle_monitor(&key, profile_id, &fleet_id, d.handle);
+                        dispatched.push(json!({
+                            "task_id": task_id,
+                            "attempt_id": attempt_id,
+                        }));
+                    }
                     other => rejected.push(json!({
                         "task_id": task_id,
                         "reason": format!("{other:?}"),
@@ -4768,6 +4937,11 @@ impl InProcessAgentOrchestrator {
         task_id: &str,
         reason: &str,
         now_ms: u64,
+        // #1964 — the profile data dir the `goal_deny` tool carries
+        // (`GoalDenyTool::with_data_dir`), so a deny-driven goal terminal syncs
+        // the per-goal ledger like every other transition (#1957). `None`
+        // skips the sync.
+        ledger_data_dir: Option<&std::path::Path>,
     ) -> Result<Value, String> {
         let key = self.scoped_goal_key(session_id);
         let pool = self.fleet_pool();
@@ -4818,19 +4992,26 @@ impl InProcessAgentOrchestrator {
                 // the goal even if a later read would fail. (The `goal_get` snapshot
                 // stays as a backstop for the non-deny paths.)
                 if fleet_un_completable {
-                    // Fleet-completion path: no profile data dir in scope, so the
-                    // ledger sync is skipped here (`None`). The interactive
-                    // goal_update path carries the data dir and syncs (#1957).
-                    let _ = self.model_transition_goal(
-                        session_id,
-                        profile_id,
-                        "blocked",
-                        &format!(
-                            "fleet cannot complete — task `{task_id}` was denied and will not \
-                             re-run without a replan",
-                        ),
-                        None,
-                    );
+                    // #1964 — the deny-driven terminal now syncs the per-goal
+                    // ledger through the tool-supplied data dir (was `None`,
+                    // which silently skipped the sync on this path). At-key:
+                    // the deny already resolved + ownership-gated `key`, so the
+                    // transition lands on that exact goal — and re-verifies the
+                    // fleet binding under the state lock (review FIX 2), since
+                    // the deny's own awaits are a re-plan window too.
+                    let _ = self
+                        .model_transition_goal_at_key(
+                            &key,
+                            profile_id,
+                            "blocked",
+                            &format!(
+                                "fleet cannot complete — task `{task_id}` was denied and will \
+                                 not re-run without a replan",
+                            ),
+                            ledger_data_dir,
+                            Some(&fleet_id),
+                        )
+                        .await;
                 }
                 Ok(json!({
                     "status": "denied",
@@ -4853,10 +5034,11 @@ impl InProcessAgentOrchestrator {
 
     /// PR B (codex round-3, defect 2) — resolve the goal to its terminal status
     /// from the CURRENT fleet completion state. Shared by `model_fleet_snapshot`
-    /// (the lazy `goal_get` backstop) and `model_deny_escalation` (the eager deny
-    /// path), so the un-completable rule lives in ONE place and a denied/failed
-    /// task drives the goal terminal identically whether or not the keeper reads
-    /// `goal_get`.
+    /// (the lazy `goal_get` backstop), `model_deny_escalation` (the eager deny
+    /// path), and the #1865 eager settle monitor
+    /// ([`Self::reconcile_fleet_goal_terminal`]), so the un-completable rule
+    /// lives in ONE place and a denied/failed/accepted task drives the goal
+    /// terminal identically whether or not the keeper reads `goal_get`.
     ///
     /// - `complete` (every task `Succeeded`/`Accepted`) → transition the goal
     ///   `complete`;
@@ -4864,43 +5046,193 @@ impl InProcessAgentOrchestrator {
     ///   `Succeeded`, so `is_complete` is false forever and any dependents wedge
     ///   `Planned`) → transition the goal `blocked`.
     ///
+    /// `key` is the goals-map storage key (the SCOPED goal key == the fleet's
+    /// persisted `controller_session_key`), NOT the plain wire id — the fleet
+    /// paths must land on the exact goal the fleet is bound to even if the
+    /// wire's cwd scope moved while an attempt ran.
+    ///
+    /// #1865 (deliberate design decision) — fleet completion is EVIDENCE-gated,
+    /// NOT verifier-gated: every task reached `Succeeded` only through the
+    /// kernel's acceptance gate (mechanical criteria verified per attempt) or
+    /// an explicit keeper grant/deny decision, so "all tasks accepted" IS the
+    /// completion evidence. The LLM completion verifier
+    /// ([`run_goal_completion_verifier`]) exists to audit MODEL-CLAIMED
+    /// completions (a `goal_update`/sentinel where the only evidence is the
+    /// model's own say-so) and is intentionally NOT called here — adding it
+    /// would gate durable, already-verified fleet evidence behind a fallible
+    /// LLM call (and a new failure mode: a fully-accepted fleet stuck active
+    /// because a verifier call errored).
+    ///
     /// Returns whether the fleet is un-completable (a failed task strands it) so a
-    /// caller (the snapshot) can surface it. Idempotent: `model_transition_goal`
+    /// caller (the snapshot) can surface it. Idempotent: the transition
     /// no-ops once the goal is already `complete`, and a `blocked → blocked`
-    /// re-transition is harmless — so the eager deny path and the snapshot backstop
-    /// can both run without conflict.
-    fn drive_goal_terminal_transition(
+    /// re-transition is harmless (and appends no duplicate ledger decision) —
+    /// so the eager paths and the snapshot backstop can all run without
+    /// conflict.
+    ///
+    /// #1964 residue — `ledger_data_dir` threads the keeper profile's data dir
+    /// into the transition so fleet-driven terminals sync the per-goal SQLite
+    /// ledger exactly like `goal_update`/sentinel transitions do (#1957);
+    /// `None` skips the sync (no ledger in scope).
+    ///
+    /// #1865 review FIX 2 — `expected_fleet_id` is the fleet whose state
+    /// `complete`/`failed_tasks` were computed FROM; the transition re-verifies
+    /// the goal still binds it under the state lock (see
+    /// [`Self::model_transition_goal_at_key`]), so evidence read from a fleet
+    /// that was superseded mid-read can never terminalize the replacement goal.
+    async fn drive_goal_terminal_transition(
         &self,
-        session_id: &SessionKey,
+        key: &SessionKey,
         profile_id: &str,
         complete: bool,
         failed_tasks: &[&str],
+        ledger_data_dir: Option<&std::path::Path>,
+        expected_fleet_id: Option<&str>,
     ) -> bool {
         let un_completable = !complete && !failed_tasks.is_empty();
         if complete {
-            // Fleet-completion path: no data dir in scope → ledger sync skipped
-            // (`None`). Interactive goal_update carries the data dir (#1957).
-            let _ = self.model_transition_goal(
-                session_id,
-                profile_id,
-                "complete",
-                "all fleet tasks accepted",
-                None,
-            );
+            let _ = self
+                .model_transition_goal_at_key(
+                    key,
+                    profile_id,
+                    "complete",
+                    "all fleet tasks accepted",
+                    ledger_data_dir,
+                    expected_fleet_id,
+                )
+                .await;
         } else if un_completable {
-            let _ = self.model_transition_goal(
-                session_id,
-                profile_id,
-                "blocked",
-                &format!(
-                    "fleet cannot complete — task(s) failed and will not re-run without a \
-                     replan: {}",
-                    failed_tasks.join(", ")
-                ),
-                None,
-            );
+            let _ = self
+                .model_transition_goal_at_key(
+                    key,
+                    profile_id,
+                    "blocked",
+                    &format!(
+                        "fleet cannot complete — task(s) failed and will not re-run without a \
+                         replan: {}",
+                        failed_tasks.join(", ")
+                    ),
+                    ledger_data_dir,
+                    expected_fleet_id,
+                )
+                .await;
         }
         un_completable
+    }
+
+    /// #1865 — EAGER fleet→goal convergence, invoked from the settle monitor
+    /// ([`Self::spawn_fleet_settle_monitor`]) the moment a dispatched attempt's
+    /// background run resolves (its terminal store write — `complete_child` /
+    /// `record_escalation` — has already committed by then, see
+    /// `octos_fleet_worker::run_attempt`). Recomputes the fleet's completion
+    /// state from the store and drives the SAME
+    /// [`Self::drive_goal_terminal_transition`] the `goal_get` snapshot
+    /// backstop uses — so a fully-succeeded fleet completes its goal (and a
+    /// terminally-failed task blocks it) WITHOUT the keeper model ever calling
+    /// `goal_get`. Best-effort by design: every early return leaves the goal
+    /// to the existing lazy backstop (`model_fleet_snapshot`), which stays in
+    /// place unchanged.
+    ///
+    /// Ownership: the goal may have been cleared or re-planned onto a NEW
+    /// fleet while the attempt ran. TWO fences, one per direction:
+    /// [`Self::goal_bound_fleet_id`] confirms the goal at `key` still binds
+    /// THIS `fleet_id` (an orphaned fleet's record keeps its old controller
+    /// key, so the fleet-side check alone can't see a re-plan — the lazy
+    /// backstop is immune because it re-reads `goal.fleet_id` fresh, and this
+    /// makes the monitor match it), and [`Self::resolve_owned_fleet`]
+    /// re-validates the fleet record's controller/profile. Either miss →
+    /// stale monitor → no transition.
+    pub(crate) async fn reconcile_fleet_goal_terminal(
+        &self,
+        key: &SessionKey,
+        profile_id: &str,
+        fleet_id: &str,
+    ) {
+        if self.goal_bound_fleet_id(key).as_deref() != Some(fleet_id) {
+            return;
+        }
+        let Some(store) = self.fleet_store() else {
+            return;
+        };
+        let Ok(fleet) = Self::resolve_owned_fleet(Arc::new(store), fleet_id, key, profile_id).await
+        else {
+            return;
+        };
+        let Ok(view) = fleet.view().await else {
+            return;
+        };
+        let complete = fleet.is_complete().await.unwrap_or(false);
+        let failed_tasks: Vec<&str> = view
+            .tasks
+            .iter()
+            .filter(|t| t.status == octos_fleet::ChildStatus::Failed)
+            .map(|t| t.task_id.as_str())
+            .collect();
+        // #1964 — the keeper profile's data dir installed at serve boot beside
+        // the pool, so the eager transition syncs the per-goal ledger.
+        let ledger_data_dir = self.fleet_ledger_data_dir();
+        self.drive_goal_terminal_transition(
+            key,
+            profile_id,
+            complete,
+            &failed_tasks,
+            ledger_data_dir.as_deref(),
+            // FIX 2 — the transition re-verifies this binding under the state
+            // lock: the fence above ran BEFORE the view/is_complete awaits.
+            Some(fleet_id),
+        )
+        .await;
+    }
+
+    /// #1865 — attach the eager convergence monitor to ONE dispatched attempt:
+    /// await the pool's background-run [`tokio::task::JoinHandle`] (production
+    /// previously just dropped it) and then reconcile the fleet's goal. This is
+    /// the INGESTION point for fleet child terminal states: `run_attempt`
+    /// returns only AFTER its terminal store write committed, so when the LAST
+    /// gating child settles, the reconcile that follows sees the complete /
+    /// un-completable fleet and drives the goal terminal — no `goal_get`
+    /// needed.
+    ///
+    /// #1865 review FIX 3 — a `JoinError` (panic/abort) means the attempt did
+    /// NOT settle its own child: the drop-guard's `Terminated` settle is
+    /// SPAWNED separately (see `octos_fleet_worker::LaunchGuard`) and usually
+    /// commits AFTER this handle resolves, so the immediate reconcile can read
+    /// a still-`Running` child and no-op. On that path only, ONE delayed
+    /// re-reconcile (~2s — generous against a spawned store write that takes
+    /// milliseconds) runs so the panic path converges autonomously instead of
+    /// waiting for the keeper's next `goal_get`. Still best-effort: a drop
+    /// settle slower than the delay (or lost to runtime shutdown) is covered
+    /// by the lazy backstop, exactly as before.
+    fn spawn_fleet_settle_monitor(
+        &self,
+        key: &SessionKey,
+        profile_id: &str,
+        fleet_id: &str,
+        handle: Option<tokio::task::JoinHandle<octos_fleet_worker::AttemptOutcome>>,
+    ) {
+        let Some(handle) = handle else { return };
+        let orchestrator = self.clone();
+        let key = key.clone();
+        let profile_id = profile_id.to_owned();
+        let fleet_id = fleet_id.to_owned();
+        tokio::spawn(async move {
+            let joined = handle.await;
+            orchestrator
+                .reconcile_fleet_goal_terminal(&key, &profile_id, &fleet_id)
+                .await;
+            if let Err(join_error) = joined {
+                tracing::warn!(
+                    %fleet_id,
+                    error = %join_error,
+                    "fleet attempt task did not settle cleanly (panic/abort); \
+                     scheduling one delayed goal reconcile for the drop-guard settle"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                orchestrator
+                    .reconcile_fleet_goal_terminal(&key, &profile_id, &fleet_id)
+                    .await;
+            }
+        });
     }
 
     /// #1857 PR 5a — the fleet plan view for the `goal_get` tool: objective,
@@ -4921,6 +5253,11 @@ impl InProcessAgentOrchestrator {
         &self,
         session_id: &SessionKey,
         profile_id: &str,
+        // #1964 — the profile data dir the `goal_get` tool carries
+        // (`GoalGetTool::with_data_dir`), so the snapshot backstop's goal
+        // terminal syncs the per-goal ledger like every other transition
+        // (#1957). `None` skips the sync.
+        ledger_data_dir: Option<&std::path::Path>,
     ) -> Result<Option<Value>, String> {
         let key = self.scoped_goal_key(session_id);
         let fleet_id = {
@@ -4970,13 +5307,25 @@ impl InProcessAgentOrchestrator {
             .filter(|t| t.status == octos_fleet::ChildStatus::Failed)
             .map(|t| t.task_id.as_str())
             .collect();
-        // Shared with the eager deny path (`model_deny_escalation`): the SAME
-        // un-completable rule + goal-terminal transition. Here it is the BACKSTOP
-        // (a normally-`Failed` task reached via the keeper's goal_get wake still
-        // resolves the goal); the deny path drives it eagerly so a keeper that
-        // never reads goal_get is also covered.
-        let un_completable =
-            self.drive_goal_terminal_transition(session_id, profile_id, complete, &failed_tasks);
+        // Shared with the eager paths (`model_deny_escalation` + the #1865
+        // settle monitor): the SAME un-completable rule + goal-terminal
+        // transition. Here it is the BACKSTOP (a terminal state reached with no
+        // live monitor — e.g. across a restart — still resolves the goal on the
+        // keeper's next goal_get); the eager paths cover a keeper that never
+        // reads goal_get. `Some(&fleet_id)` — the completion evidence above was
+        // read from THIS fleet, so the transition re-verifies the binding under
+        // the state lock (review FIX 2; the view/is_complete awaits are a
+        // re-plan window for the backstop too).
+        let un_completable = self
+            .drive_goal_terminal_transition(
+                &key,
+                profile_id,
+                complete,
+                &failed_tasks,
+                ledger_data_dir,
+                Some(&fleet_id),
+            )
+            .await;
         let tasks: Vec<Value> = view
             .tasks
             .iter()
@@ -6564,6 +6913,15 @@ struct AutonomyRuntimeState {
     /// keeper profile's `ProfileRuntime` (`set_fleet_pool`); `None` on the
     /// chat/gateway boot paths and in unit tests that don't dispatch.
     fleet_pool: Option<Arc<FleetWorkerPool>>,
+    /// #1865/#1964 — the KEEPER profile's persistent data dir (the same
+    /// `ProfileRuntime::data_dir` serve boot builds the pool from, and the same
+    /// dir the profile's `goal_get`/`goal_update` tools carry via
+    /// `.with_data_dir`). The eager settle monitor reads it so fleet-driven
+    /// goal terminals sync `<data_dir>/goal-ledgers/<goal_id>.db` like every
+    /// other transition (#1957). `None` when no pool/ledger is wired (chat/
+    /// gateway boots, tests that don't assert the ledger) — the sync is then
+    /// skipped, never fabricated.
+    fleet_ledger_data_dir: Option<std::path::PathBuf>,
     next_goal_seq: u64,
     next_loop_seq: u64,
     /// #1959 — monotonic generation bumped every time a goal event
@@ -10333,7 +10691,7 @@ mod tests {
             Some("active"),
         );
         let snap = orchestrator
-            .model_fleet_snapshot(&wire, "tenant-a")
+            .model_fleet_snapshot(&wire, "tenant-a", None)
             .await
             .expect("snapshot must not error for an owned fleet")
             .expect("fleet snapshot present");
@@ -10791,7 +11149,7 @@ mod tests {
         orchestrator.set_goal_fleet_id_for_test(&wire, "foreign-get");
 
         let err = orchestrator
-            .model_fleet_snapshot(&wire, "tenant-a")
+            .model_fleet_snapshot(&wire, "tenant-a", None)
             .await
             .expect_err("goal_get must refuse a foreign fleet binding");
         assert!(
@@ -10987,6 +11345,7 @@ mod tests {
                 "t1",
                 "no budget for that host",
                 now_ms_u64(),
+                None,
             )
             .await
             .expect("deny");
@@ -11011,7 +11370,7 @@ mod tests {
         // The goal_get snapshot remains a correct BACKSTOP: it re-detects the
         // un-completable fleet (idempotent) and still surfaces the failed task.
         let snap = orchestrator
-            .model_fleet_snapshot(&wire, "tenant-a")
+            .model_fleet_snapshot(&wire, "tenant-a", None)
             .await
             .expect("snapshot")
             .expect("present");
@@ -11062,6 +11421,7 @@ mod tests {
                 "t1",
                 "no budget for that host",
                 now_ms_u64(),
+                None,
             )
             .await
             .expect("deny");
@@ -11132,7 +11492,7 @@ mod tests {
         // fallible post-deny read stands between the durable failure and the
         // goal-terminal transition.
         orchestrator
-            .model_deny_escalation(&wire, "tenant-a", "a", "no budget", now_ms_u64())
+            .model_deny_escalation(&wire, "tenant-a", "a", "no budget", now_ms_u64(), None)
             .await
             .expect("deny");
 
@@ -11204,7 +11564,7 @@ mod tests {
             Some("active"),
         );
         let snap = orchestrator
-            .model_fleet_snapshot(&wire, "tenant-a")
+            .model_fleet_snapshot(&wire, "tenant-a", None)
             .await
             .expect("snapshot")
             .expect("present");
@@ -11215,6 +11575,510 @@ mod tests {
             Some("blocked"),
             "a normally-failed task must resolve the goal via the snapshot backstop",
         );
+    }
+
+    /// #1865 — EAGER convergence: a fleet whose LAST gating child settles
+    /// `Succeeded` through the ORCHESTRATOR dispatch path must flip the goal to
+    /// `complete` WITHOUT any `goal_get` / `model_fleet_snapshot` call. This is
+    /// the issue's acceptance: a keeper model that never reads `goal_get` after
+    /// its wake must not leave a fully-succeeded fleet's goal perpetually
+    /// `active`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fleet_all_accepted_converges_goal_without_goal_get() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store.clone(), work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+
+        let wire = SessionKey::new("api", "keeper-eager-complete");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+
+        // Launch through the ORCHESTRATOR dispatch path (the ingestion seam) —
+        // exactly what the keeper's goal_dispatch tool calls.
+        let dispatch = orchestrator
+            .model_dispatch_fleet(&wire, "tenant-a", now_ms_u64())
+            .await
+            .expect("dispatch");
+        assert_eq!(
+            dispatch["dispatched_count"],
+            json!(1),
+            "launched: {dispatch}"
+        );
+
+        // The child settles `Succeeded` in the detached background run; the
+        // goal must then converge to `complete` with NO goal_get in this test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if orchestrator.goal_status_for_test(&wire).as_deref() == Some("complete") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "goal did not converge to complete within 10s without goal_get \
+                 (status: {:?}; child: {:?})",
+                orchestrator.goal_status_for_test(&wire),
+                store
+                    .get_child(&fleet_id, "t1")
+                    .await
+                    .unwrap()
+                    .map(|c| c.status),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// #1865 (mirror) — a fleet child that terminally FAILS through the pool
+    /// dispatch path (acceptance rejected via the normal `complete_child`, no
+    /// deny involved) must flip the goal to `blocked` WITHOUT any goal_get:
+    /// the un-completable rule (a `Failed` task can never become `Succeeded`)
+    /// is driven eagerly at ingestion, not only by the snapshot backstop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fleet_terminal_failure_converges_goal_blocked_without_goal_get() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store.clone(), work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+
+        let wire = SessionKey::new("api", "keeper-eager-blocked");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator
+            .set_goal_workspace_root(&scoped, Some(work.path().to_string_lossy().into_owned()));
+        // One task whose acceptance CANNOT pass (a file the attempt never
+        // writes), so the mock attempt completes `Rejected` → the child ends
+        // terminally `Failed` through the normal completion path.
+        let tasks = vec![TaskSpec {
+            task_id: "t1".to_owned(),
+            title: "will fail acceptance".to_owned(),
+            detail: "no-op".to_owned(),
+            deps: Vec::new(),
+            acceptance: vec![octos_fleet::AcceptanceCriterion {
+                id: "must-exist".into(),
+                description: "requires a file the attempt never writes".into(),
+                verifier: octos_fleet::Verifier::FileExists {
+                    path: "never-written.txt".into(),
+                },
+            }],
+            grant: octos_fleet::WorkerGrant::minimal(),
+        }];
+        orchestrator
+            .model_create_fleet_plan(&wire, "tenant-a", tasks, 1_000)
+            .await
+            .expect("plan");
+
+        orchestrator
+            .model_dispatch_fleet(&wire, "tenant-a", now_ms_u64())
+            .await
+            .expect("dispatch");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if orchestrator.goal_status_for_test(&wire).as_deref() == Some("blocked") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "goal did not converge to blocked within 10s without goal_get (status: {:?})",
+                orchestrator.goal_status_for_test(&wire),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Poll until the goal at `wire` reads `want` (10s deadline) — the eager
+    /// settle monitor flips it asynchronously after the attempt settles.
+    async fn wait_for_goal_status(
+        orchestrator: &InProcessAgentOrchestrator,
+        wire: &SessionKey,
+        want: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while orchestrator.goal_status_for_test(wire).as_deref() != Some(want) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "goal did not reach `{want}` within 10s (status: {:?})",
+                orchestrator.goal_status_for_test(wire),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// #1964 — the EAGER fleet completion syncs the per-goal SQLite ledger
+    /// (goals-row status + exactly ONE decisions row) when the keeper data dir
+    /// is in scope, AND a subsequent `model_fleet_snapshot` backstop re-run is
+    /// idempotent: status and decision COUNT are unchanged (the `complete →
+    /// complete` re-transition is refused, so no duplicate audit row). Ledger
+    /// assertion idiom mirrors `model_transition_goal_syncs_final_status_into_
+    /// the_ledger`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eager_fleet_completion_syncs_goal_ledger_once() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let (_md, pool) = mock_fleet_pool(store.clone(), work.path(), 100).await;
+        orchestrator.set_fleet_pool(pool);
+        // The serve-boot wiring under test: the keeper profile's data dir is
+        // installed beside the pool, so the settle monitor can sync the ledger.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        orchestrator.set_fleet_ledger_data_dir(data_dir.path().to_path_buf());
+
+        let wire = SessionKey::new("api", "keeper-eager-ledger");
+        seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal_id");
+
+        orchestrator
+            .model_dispatch_fleet(&wire, "tenant-a", now_ms_u64())
+            .await
+            .expect("dispatch");
+        wait_for_goal_status(&orchestrator, &wire, "complete").await;
+
+        // The in-memory flip is observable BEFORE the (best-effort) ledger
+        // sync finishes — and the sync writes the goals-row THEN the decision
+        // — so poll the LEDGER for BOTH writes to the same 10s deadline
+        // instead of opening it once and asserting mid-sync state.
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (ledger, decisions) = loop {
+            if let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path) {
+                let status = ledger.get_goal(&goal_id).ok().flatten().map(|g| g.status);
+                let decisions = ledger.list_decisions(&goal_id).unwrap_or_default();
+                if status.as_deref() == Some("complete") && !decisions.is_empty() {
+                    break (ledger, decisions);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the eager fleet completion did not land in the durable ledger within 10s (#1964)",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly ONE audit decision for the one real transition: {decisions:?}",
+        );
+        assert_eq!(decisions[0].choice, "complete");
+
+        // Idempotence: the goal_get snapshot backstop re-runs the SAME
+        // reconciliation — status and decision count must not change.
+        let snap = orchestrator
+            .model_fleet_snapshot(&wire, "tenant-a", Some(data_dir.path()))
+            .await
+            .expect("snapshot")
+            .expect("present");
+        assert_eq!(snap["complete"], json!(true));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("complete"),
+            "backstop re-run must not disturb the terminal status",
+        );
+        assert_eq!(
+            ledger
+                .list_decisions(&goal_id)
+                .expect("list decisions")
+                .len(),
+            1,
+            "the refused complete→complete re-transition must append NO duplicate decision",
+        );
+    }
+
+    /// #1964 — a `goal_deny` that renders the fleet un-completable syncs the
+    /// per-goal ledger (goals-row `blocked` + ONE decisions row) through the
+    /// tool-supplied data dir — this path passed `None` before and never
+    /// reached the ledger. The snapshot backstop's `blocked → blocked`
+    /// re-transition appends no duplicate (status_changed == false).
+    #[tokio::test]
+    async fn deny_terminal_syncs_goal_ledger() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+        let data_dir = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-deny-ledger");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal_id");
+        block_task_on_escalation(&store, &fleet_id, "t1").await;
+
+        orchestrator
+            .model_deny_escalation(
+                &wire,
+                "tenant-a",
+                "t1",
+                "no budget",
+                now_ms_u64(),
+                Some(data_dir.path()),
+            )
+            .await
+            .expect("deny");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("blocked"),
+        );
+
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query ledger")
+            .expect("goals row present");
+        assert_eq!(
+            row.status, "blocked",
+            "the deny-driven terminal must land in the durable ledger (#1964)"
+        );
+        let decisions = ledger.list_decisions(&goal_id).expect("list decisions");
+        assert_eq!(
+            decisions.len(),
+            1,
+            "one decision for the deny: {decisions:?}"
+        );
+        assert_eq!(decisions[0].choice, "blocked");
+
+        // Backstop re-run: blocked → blocked is a no-op for the audit trail.
+        orchestrator
+            .model_fleet_snapshot(&wire, "tenant-a", Some(data_dir.path()))
+            .await
+            .expect("snapshot")
+            .expect("present");
+        assert_eq!(
+            ledger
+                .list_decisions(&goal_id)
+                .expect("list decisions")
+                .len(),
+            1,
+            "blocked → blocked re-transition must append NO duplicate decision",
+        );
+    }
+
+    /// #1865 — a STALE settle monitor (its fleet was superseded: the goal now
+    /// binds a DIFFERENT fleet_id) must NOT transition the goal from the
+    /// orphaned fleet's state. The orphaned fleet's record keeps its old
+    /// controller key, so only the goal-side binding fence catches this — the
+    /// same fresh `goal.fleet_id` read that already protects the lazy
+    /// backstop. Positive control: with the binding restored, the SAME
+    /// reconcile completes the goal.
+    #[tokio::test]
+    async fn stale_fleet_settle_monitor_does_not_transition_a_rebound_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-stale-monitor");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        let scoped = orchestrator.scoped_goal_key(&wire);
+
+        // Drive t1 all the way to Succeeded directly on the store, so the
+        // fleet IS complete — the only thing standing between the reconcile
+        // and a goal flip is the binding fence under test.
+        let attempt = match store
+            .launch_child(&fleet_id, "t1", 100, now_ms_u64(), 1, 60_000)
+            .await
+            .unwrap()
+        {
+            LaunchOutcome::Launched { attempt_id } => attempt_id,
+            other => panic!("launch t1: {other:?}"),
+        };
+        store.mark_running("t1", &attempt).await.unwrap();
+        store
+            .complete_child(
+                &fleet_id,
+                "t1",
+                &attempt,
+                AcceptanceVerdict::Accepted { evidence: vec![] },
+                octos_fleet::ChildResultSnapshot::default(),
+                10,
+                1,
+                now_ms_u64(),
+            )
+            .await
+            .unwrap();
+
+        // Supersede the fleet: the goal now binds a different fleet id (what a
+        // goal_clear + re-plan does to an in-flight fleet's monitor).
+        orchestrator.set_goal_fleet_id_for_test(&wire, "a-newer-fleet");
+        orchestrator
+            .reconcile_fleet_goal_terminal(&scoped, "tenant-a", &fleet_id)
+            .await;
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+            "a stale monitor must not complete the goal from a superseded fleet",
+        );
+
+        // Review FIX 2 — the AWAIT-WINDOW variant: the reconciler's outer
+        // fence passes (binding == this fleet at check time) and the binding
+        // moves DURING its view()/is_complete() awaits. There is no seam to
+        // pause inside those awaits, so express the window at its sync
+        // boundary: drive the terminal transition with completion evidence
+        // computed FROM this fleet while the goal is bound to the newer one —
+        // exactly the state the transition sees when the rebind lands
+        // mid-read. The under-lock recheck (`expected_fleet_id`) must refuse.
+        orchestrator
+            .drive_goal_terminal_transition(&scoped, "tenant-a", true, &[], None, Some(&fleet_id))
+            .await;
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+            "evidence read from a superseded fleet must be refused by the \
+             under-lock binding recheck even after the outer fence passed",
+        );
+
+        // Positive control — restore the binding; the same reconcile converges.
+        orchestrator.set_goal_fleet_id_for_test(&wire, &fleet_id);
+        orchestrator
+            .reconcile_fleet_goal_terminal(&scoped, "tenant-a", &fleet_id)
+            .await;
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("complete"),
+            "with the binding intact the reconcile must complete the goal",
+        );
+    }
+
+    /// #1865 review FIX 2 (unit) — `model_transition_goal_at_key`'s under-lock
+    /// binding recheck: a fleet-driven transition whose `expected_fleet_id` no
+    /// longer matches the goal's CURRENT binding is refused (no status change),
+    /// and the matching expectation commits. This is the authoritative guard
+    /// the fences route into; it needs no store because the check reads only
+    /// the in-memory goal record.
+    #[tokio::test]
+    async fn transition_at_key_refuses_a_moved_fleet_binding() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "keeper-atkey-recheck");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let scoped = orchestrator.scoped_goal_key(&wire);
+        orchestrator.set_goal_fleet_id_for_test(&wire, "fleet-current");
+
+        // Evidence from a fleet the goal no longer binds → refused, no flip.
+        let err = orchestrator
+            .model_transition_goal_at_key(
+                &scoped,
+                "tenant-a",
+                "complete",
+                "all fleet tasks accepted",
+                None,
+                Some("fleet-superseded"),
+            )
+            .await
+            .expect_err("a moved binding must refuse the transition");
+        assert!(
+            err.contains("no longer driven by fleet"),
+            "unexpected refusal message: {err}",
+        );
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("active"),
+        );
+
+        // The matching expectation commits.
+        orchestrator
+            .model_transition_goal_at_key(
+                &scoped,
+                "tenant-a",
+                "complete",
+                "all fleet tasks accepted",
+                None,
+                Some("fleet-current"),
+            )
+            .await
+            .expect("matching binding transitions");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("complete"),
+        );
+    }
+
+    /// #1865 review FIX 3 — a PANICKED attempt (JoinError) whose child is
+    /// settled `Terminated` by the separately-spawned drop-guard AFTER the
+    /// monitor's immediate reconcile must still converge the goal: the monitor
+    /// schedules ONE delayed re-reconcile (~2s) on the JoinError path.
+    ///
+    /// Coverage honesty: there is no seam between the two reconcile passes, so
+    /// the test stages the drop-guard settle 300ms after the monitor starts —
+    /// the immediate pass (runs within milliseconds of the JoinError) sees a
+    /// still-`Running` child and no-ops, and only the delayed pass can observe
+    /// the `Failed` child. A pathologically slow first pass (>300ms) would
+    /// converge through it instead; the margins make that vanishingly rare,
+    /// and the asserted OUTCOME (autonomous convergence, no goal_get) is the
+    /// fix's contract either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicked_attempt_converges_goal_via_delayed_reconcile() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let (_sd, store) = fleet_test_store().await;
+        orchestrator.set_fleet_store(store.clone());
+        let work = tempfile::TempDir::new().unwrap();
+
+        let wire = SessionKey::new("api", "keeper-panic-monitor");
+        let fleet_id = seed_planned_goal(&orchestrator, &wire, work.path()).await;
+        let scoped = orchestrator.scoped_goal_key(&wire);
+
+        // The attempt is live (Running, non-terminal) when its task panics.
+        let attempt = match store
+            .launch_child(&fleet_id, "t1", 100, now_ms_u64(), 1, 60_000)
+            .await
+            .unwrap()
+        {
+            LaunchOutcome::Launched { attempt_id } => attempt_id,
+            other => panic!("launch t1: {other:?}"),
+        };
+        store.mark_running("t1", &attempt).await.unwrap();
+
+        // The drop-guard stand-in: settle the child `Terminated` 300ms later,
+        // i.e. AFTER the monitor's immediate reconcile pass.
+        let guard_store = store.clone();
+        let guard_fleet = fleet_id.clone();
+        let guard_attempt = attempt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = guard_store
+                .complete_child(
+                    &guard_fleet,
+                    "t1",
+                    &guard_attempt,
+                    AcceptanceVerdict::Terminated {
+                        reason: "attempt interrupted before completion".into(),
+                    },
+                    octos_fleet::ChildResultSnapshot::default(),
+                    0,
+                    1,
+                    now_ms_u64(),
+                )
+                .await;
+        });
+
+        // A JoinHandle that resolves as a JoinError (task panicked).
+        let handle: tokio::task::JoinHandle<octos_fleet_worker::AttemptOutcome> =
+            tokio::spawn(async { panic!("simulated fleet worker panic") });
+        orchestrator.spawn_fleet_settle_monitor(&scoped, "tenant-a", &fleet_id, Some(handle));
+
+        // Converges to blocked WITHOUT any goal_get: the terminally-Failed
+        // (Terminated) child makes the fleet un-completable; only the delayed
+        // reconcile can see it (see the timing note above).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if orchestrator.goal_status_for_test(&wire).as_deref() == Some("blocked") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "panicked attempt did not converge the goal within 10s (status: {:?}, child: {:?})",
+                orchestrator.goal_status_for_test(&wire),
+                store
+                    .get_child(&fleet_id, "t1")
+                    .await
+                    .unwrap()
+                    .map(|c| c.status),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     /// codex round-2 (defect 4) — grant and deny are MUTUALLY EXCLUSIVE at the
@@ -11233,7 +12097,7 @@ mod tests {
 
         // Deny wins.
         orchestrator
-            .model_deny_escalation(&wire, "tenant-a", "t1", "no", now_ms_u64())
+            .model_deny_escalation(&wire, "tenant-a", "t1", "no", now_ms_u64(), None)
             .await
             .expect("deny");
 
@@ -11297,7 +12161,7 @@ mod tests {
         );
         // deny must refuse too.
         let deny_err = orchestrator
-            .model_deny_escalation(&wire, "tenant-a", "t1", "x", now_ms_u64())
+            .model_deny_escalation(&wire, "tenant-a", "t1", "x", now_ms_u64(), None)
             .await
             .expect_err("deny must refuse a foreign fleet binding");
         assert!(
@@ -11327,7 +12191,7 @@ mod tests {
         block_task_on_escalation(&store, &fleet_id, "t1").await;
 
         let snap = orchestrator
-            .model_fleet_snapshot(&wire, "tenant-a")
+            .model_fleet_snapshot(&wire, "tenant-a", None)
             .await
             .expect("snapshot must not error for an owned fleet")
             .expect("fleet snapshot present");
@@ -14477,8 +15341,8 @@ mod tests {
     /// #1696 — the model-owned transition matrix: complete|blocked only,
     /// profile-scoped, refuses double-complete; the post-turn budget flip
     /// must not overwrite a mid-turn model transition.
-    #[test]
-    fn model_create_goal_gates_on_unfinished_goal() {
+    #[tokio::test]
+    async fn model_create_goal_gates_on_unfinished_goal() {
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey::with_profile("tenant-a", "api", "goal-create");
 
@@ -14519,6 +15383,7 @@ mod tests {
         // Once COMPLETE, the model may replace it with a fresh active goal.
         orchestrator
             .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
             .expect("complete the goal");
         let replaced = orchestrator
             .model_create_goal(&session_id, "tenant-a", "next objective", None)
@@ -14543,8 +15408,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_transition_goal_enforces_ownership_matrix() {
+    #[tokio::test]
+    async fn model_transition_goal_enforces_ownership_matrix() {
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey::with_profile("tenant-a", "api", "goal-tool");
         orchestrator
@@ -14563,6 +15428,7 @@ mod tests {
             assert!(
                 orchestrator
                     .model_transition_goal(&session_id, "tenant-a", status, "nope", None)
+                    .await
                     .is_err(),
                 "{status} must not be a model-allowed transition"
             );
@@ -14571,12 +15437,14 @@ mod tests {
         assert!(
             orchestrator
                 .model_transition_goal(&session_id, "tenant-b", "complete", "scope", None)
+                .await
                 .is_err()
         );
 
         // complete works and returns the goal snapshot.
         let goal = orchestrator
             .model_transition_goal(&session_id, "tenant-a", "complete", "haiku written", None)
+            .await
             .expect("model completes");
         assert_eq!(goal["status"], json!("complete"));
         assert_eq!(
@@ -14587,6 +15455,7 @@ mod tests {
         assert!(
             orchestrator
                 .model_transition_goal(&session_id, "tenant-a", "complete", "again", None)
+                .await
                 .is_err()
         );
 
@@ -14607,8 +15476,8 @@ mod tests {
     /// completed without ever recording a peer finding left the ledger's goals
     /// row stuck at `active`; `model_transition_goal` now syncs the transition
     /// straight from the snapshot it just flipped (no re-fetch → codex #3).
-    #[test]
-    fn model_transition_goal_syncs_final_status_into_the_ledger() {
+    #[tokio::test]
+    async fn model_transition_goal_syncs_final_status_into_the_ledger() {
         let orchestrator = InProcessAgentOrchestrator::default();
         let data_dir = tempfile::TempDir::new().unwrap();
         let session_id = SessionKey::with_profile("tenant-a", "api", "goal-ledger-sync");
@@ -14637,6 +15506,7 @@ mod tests {
                 "objective met",
                 Some(data_dir.path()),
             )
+            .await
             .expect("model completes");
 
         let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())

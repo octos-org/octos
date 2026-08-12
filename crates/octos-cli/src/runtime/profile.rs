@@ -1209,9 +1209,14 @@ impl ProfileRuntime {
             // PR B — the keeper's escalation controls: approve a worker's
             // mid-task grant-widen request (`goal_grant`, resumes the task) or
             // refuse it (`goal_deny`, fails the task). A Blocked task surfaced by
-            // goal_get needs exactly one of these.
+            // goal_get needs exactly one of these. #1964 — `goal_deny` carries
+            // the profile data_dir like goal_get/goal_update, so a deny that
+            // renders the fleet un-completable syncs the per-goal ledger.
             tools.register(crate::goal_tool::GoalGrantTool::new(profile.id.clone()));
-            tools.register(crate::goal_tool::GoalDenyTool::new(profile.id.clone()));
+            tools.register(
+                crate::goal_tool::GoalDenyTool::new(profile.id.clone())
+                    .with_data_dir(data_dir.to_path_buf()),
+            );
         }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank

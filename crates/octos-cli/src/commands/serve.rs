@@ -1006,6 +1006,14 @@ impl ServeCommand {
                         );
                         crate::api::agent_orchestrator::default_agent_orchestrator()
                             .set_fleet_pool(Arc::new(pool));
+                        // #1865/#1964 — the keeper profile's data dir, installed
+                        // beside the pool it belongs to: the eager fleet settle
+                        // monitor syncs fleet-driven goal terminals into
+                        // `<data_dir>/goal-ledgers/` (the SAME dir the profile's
+                        // goal_get/goal_update/goal_deny tools carry via
+                        // `.with_data_dir` in runtime/profile.rs).
+                        crate::api::agent_orchestrator::default_agent_orchestrator()
+                            .set_fleet_ledger_data_dir(rt.data_dir.clone());
                         tracing::info!(
                             keeper_profile = %rt.profile_id,
                             "fleet worker pool installed (goal keeper dispatch enabled)"
