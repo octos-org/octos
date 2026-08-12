@@ -7397,6 +7397,26 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // stage the wrap-up prompt here and enqueue it AFTER the mutable
         // `goal` borrow ends (the wrap-up enqueue needs `&mut state`).
         let mut pending_wrap_up: Option<String> = None;
+        // #1975 — a USER/backend replace of a COMPLETE goal must mint a FRESH
+        // goal_id with zeroed counters, exactly as `model_create_goal`'s Fix B
+        // does for the model path. Reusing the finished record carries its old
+        // goal_id + spent `tokens_used` into the new budget (a fresh 300K budget
+        // "born 85% spent") and lands new activity in the OLD goal's ledger file,
+        // whose complete-protection then rejects the active-state refreshes.
+        // Dropping the terminal record here forces the create branch below.
+        // `clear_goal` already removes its record, so `complete` is the only
+        // terminal state that can reach the update branch; a requested `complete`
+        // status keeps an idempotent re-complete in place; the profile match
+        // preserves the update branch's cross-profile guard (which still fires
+        // for a mismatched profile because we only remove on a match).
+        if requested_status != Some("complete")
+            && state
+                .goals
+                .get(&key)
+                .is_some_and(|g| g.status == "complete" && g.profile_id == request.profile_id)
+        {
+            state.goals.remove(&key);
+        }
         let goal = if let Some(goal) = state.goals.get_mut(&key) {
             if goal.profile_id != request.profile_id {
                 return Err(autonomy_error(
@@ -17740,6 +17760,71 @@ mod tests {
         );
         assert_eq!(
             replaced["objective"],
+            json!("next objective"),
+            "the replacement carries the new objective"
+        );
+    }
+
+    /// #1975 — the USER path (`set_goal` with the default "user" actor, i.e. the
+    /// `/goal` command) must mint a FRESH goal_id with zeroed counters when it
+    /// replaces a COMPLETE goal — exactly like the model path (Fix B). The bug:
+    /// `set_goal`'s update branch resurrected the finished record, carrying its
+    /// goal_id and spent `tokens_used` into the new budget (a fresh 300K budget
+    /// "born 85% spent") and landing new activity in the old goal's ledger file,
+    /// whose complete-protection then rejects the active-state refreshes.
+    #[tokio::test]
+    async fn should_mint_fresh_goal_id_and_reset_tokens_when_user_replaces_complete_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-user-reuse", "api", "goal-set");
+
+        // USER create (transition_actor defaults to "user").
+        let first = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-user-reuse".to_owned(),
+                objective: "first objective".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(2_000),
+                transition_actor: None,
+            })
+            .expect("user create when none exists");
+        let first_goal_id = first["goal"]["goal_id"]
+            .as_str()
+            .expect("goal_id")
+            .to_owned();
+
+        // Spend tokens, then complete it so the carried-over spend is observable.
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 1_500);
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-user-reuse", "complete", "done", None)
+            .await
+            .expect("complete the goal");
+
+        // USER replace of the COMPLETE goal — must mint a fresh identity.
+        let replaced = orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-user-reuse".to_owned(),
+                objective: "next objective".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(300_000),
+                transition_actor: None,
+            })
+            .expect("user replace of a complete goal");
+
+        assert_ne!(
+            replaced["goal"]["goal_id"].as_str().expect("goal_id"),
+            first_goal_id,
+            "a user replace of a complete goal must mint a fresh goal_id, not reuse the finished one"
+        );
+        assert_eq!(
+            replaced["goal"]["tokens_used"],
+            json!(0),
+            "the replacement goal's token counter must reset to zero, not carry the finished goal's spend"
+        );
+        assert_eq!(replaced["goal"]["status"], json!("active"));
+        assert_eq!(
+            replaced["goal"]["objective"],
             json!("next objective"),
             "the replacement carries the new objective"
         );
