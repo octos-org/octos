@@ -814,6 +814,10 @@ mod tests {
         assert_eq!(SandboxConfig::default().write_allow_globs, None);
     }
 
+    // #1976/#1987 — Bwrap/Docker/macOS backend command shapes are
+    // host-specific; a Windows host has no bwrap/SBPL and its cwd
+    // (`C:\\...`) fails the Docker path validator. Gate off Windows.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn fence_degrades_bwrap_to_ro_workspace() {
         // #1976 honest degradation: bwrap binds are CONCRETE paths — a glob
@@ -848,6 +852,10 @@ mod tests {
         );
     }
 
+    // #1976/#1987 — Bwrap/Docker/macOS backend command shapes are
+    // host-specific; a Windows host has no bwrap/SBPL and its cwd
+    // (`C:\\...`) fails the Docker path validator. Gate off Windows.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn fence_degrades_docker_mount_to_ro() {
         // #1976 honest degradation: Docker mounts are concrete too — a
@@ -871,6 +879,10 @@ mod tests {
         );
     }
 
+    // #1976/#1987 — Bwrap/Docker/macOS backend command shapes are
+    // host-specific; a Windows host has no bwrap/SBPL and its cwd
+    // (`C:\\...`) fails the Docker path validator. Gate off Windows.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn fence_reaches_macos_backend_as_globs() {
         // macOS is the one backend that EXPRESSES the fence (SBPL regex);

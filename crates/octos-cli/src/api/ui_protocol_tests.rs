@@ -2048,7 +2048,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         | methods::LOOP_DELETE
         | methods::LOOP_PAUSE
         | methods::LOOP_RESUME
-        | methods::LOOP_FIRE_NOW => json!({}),
+        | methods::LOOP_FIRE_NOW
+        | methods::MONITOR_CREATE
+        | methods::MONITOR_LIST
+        | methods::MONITOR_PAUSE
+        | methods::MONITOR_RESUME
+        | methods::MONITOR_DELETE => json!({}),
         methods::PROFILE_LOCAL_CREATE => json!({
             "name": "Dispatch Parity",
             "username": "dispatch-parity",
@@ -10404,6 +10409,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
             coding_loop_runtime_v1: false,
+            coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
             user_question_v1: false,
@@ -10471,6 +10477,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
             coding_loop_runtime_v1: false,
+            coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
             user_question_v1: false,
@@ -10583,6 +10590,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
             coding_loop_runtime_v1: false,
+            coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
             user_question_v1: false,
@@ -10650,6 +10658,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
             coding_loop_runtime_v1: false,
+            coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
             user_question_v1: false,
@@ -10710,6 +10719,7 @@ fn shell_approval_still_emits_risk_field() {
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
             coding_loop_runtime_v1: false,
+            coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
             user_question_v1: false,
@@ -10813,6 +10823,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
             coding_loop_runtime_v1: false,
+            coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
             user_question_v1: false,
@@ -12894,6 +12905,115 @@ fn plan_updated_gated_by_plan_todos_capability() {
     assert!(live_event_passes_capability_filter(&event, negotiated));
 }
 
+/// #1977 blocker 6 — `monitor/*` notifications are gated by
+/// `coding.monitor_runtime.v1`. A connection that sent a feature header but did
+/// NOT negotiate monitor runtime must never receive a `monitor/updated` (or
+/// `monitor/fired` / `monitor/expired`) produced by another connection on a
+/// shared session stream — on the live broadcast OR reconnect replay.
+#[test]
+fn monitor_notifications_gated_by_monitor_runtime_capability() {
+    use octos_core::ui_protocol::{MonitorFiredEvent, MonitorUpdatedEvent, UiMonitorRecord};
+    let record = UiMonitorRecord {
+        monitor_id: "monitor_01".into(),
+        session_id: SessionKey("local:test".into()),
+        profile_id: Some("main".into()),
+        name: "watch".into(),
+        argv: vec!["true".into()],
+        filter_regex: None,
+        mode: "poll".into(),
+        interval_seconds: Some(3),
+        batch_ms: 200,
+        max_events_per_hour: 60,
+        persistent: false,
+        status: "active".into(),
+        pause_reason: None,
+        goal_id: None,
+        last_fired_at_ms: None,
+        fires_used: 0,
+        expires_at_ms: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let updated =
+        UiProtocolLedgerEvent::Notification(UiNotification::MonitorUpdated(MonitorUpdatedEvent {
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("main".into()),
+            monitor_id: Some("monitor_01".into()),
+            monitor_state: record,
+            ok: Some(true),
+            status: Some("active".into()),
+            deleted: None,
+        }));
+    let fired =
+        UiProtocolLedgerEvent::Notification(UiNotification::MonitorFired(MonitorFiredEvent {
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("main".into()),
+            monitor_id: "monitor_01".into(),
+            name: Some("watch".into()),
+            line_count: Some(1),
+            fired_at_ms: Some(0),
+        }));
+
+    // A header-present connection WITHOUT monitor runtime is denied.
+    let denied = ConnectionUiFeatures {
+        header_present: true,
+        coding_autonomy_v1: true,
+        coding_monitor_runtime_v1: false,
+        ..Default::default()
+    };
+    assert!(
+        !live_event_passes_capability_filter(&updated, denied),
+        "monitor/updated must be filtered from a non-negotiating connection"
+    );
+    assert!(
+        !live_event_passes_capability_filter(&fired, denied),
+        "monitor/fired must be filtered from a non-negotiating connection"
+    );
+
+    // A negotiated connection receives them.
+    let negotiated = ConnectionUiFeatures {
+        header_present: true,
+        coding_autonomy_v1: true,
+        coding_monitor_runtime_v1: true,
+        ..Default::default()
+    };
+    assert!(live_event_passes_capability_filter(&updated, negotiated));
+    assert!(live_event_passes_capability_filter(&fired, negotiated));
+}
+
+/// #1977 blocker 6 — an unknown `mode` in `monitor/create` is a typed
+/// `monitor_invalid_spec` error, not a silent fallback to poll. The rejection
+/// happens in the dispatch handler BEFORE the orchestrator is called.
+#[test]
+fn monitor_create_unknown_mode_is_invalid_spec() {
+    let features = ConnectionUiFeatures::stdio_defaults();
+    let session_id = SessionKey::new("tenant-a", "mon-mode");
+    let orchestrator = RecordingOrchestrator::default();
+    let request = RpcRequest::new(
+        "m-1",
+        methods::MONITOR_CREATE,
+        json!({
+            "session_id": session_id.clone(),
+            "profile_id": "tenant-a",
+            "name": "watch",
+            "argv": ["true"],
+            "mode": "bogus"
+        }),
+    );
+    let error = raw_autonomy_rpc_with_orchestrator(&request, features, None, &orchestrator)
+        .expect_err("unknown mode must be rejected");
+    let data = error.data.expect("invalid-spec error data");
+    assert_eq!(data["kind"], "monitor_invalid_spec");
+    assert!(
+        orchestrator
+            .calls
+            .lock()
+            .expect("recorded calls")
+            .is_empty(),
+        "an unknown mode must fail before orchestrator dispatch"
+    );
+}
+
 #[tokio::test]
 async fn session_open_does_not_duplicate_pending_question_already_in_cursor_replay() {
     // #3: a question already carried by the cursor replay window must not
@@ -13229,6 +13349,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
             coding_loop_runtime_v1: false,
+            coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
             user_question_v1: false,
@@ -14664,6 +14785,32 @@ impl AgentOrchestrator for RecordingOrchestrator {
             LoopControlKind::FireNow => "fire_now",
         };
         self.record(format!("control_loop:{kind}:{}", request.loop_id))
+    }
+
+    fn create_monitor(
+        &self,
+        request: crate::api::agent_orchestrator::MonitorCreateRequest,
+    ) -> Result<Value, RpcError> {
+        self.record(format!("create_monitor:{}", request.session_id))
+    }
+
+    fn list_monitors(
+        &self,
+        request: crate::api::agent_orchestrator::MonitorListRequest,
+    ) -> Result<Value, RpcError> {
+        self.record(format!("list_monitors:{}", request.profile_id))
+    }
+
+    fn control_monitor(
+        &self,
+        request: crate::api::agent_orchestrator::MonitorControlRequest,
+    ) -> Result<Value, RpcError> {
+        let kind = match request.kind {
+            crate::api::agent_orchestrator::MonitorControlKind::Pause => "pause",
+            crate::api::agent_orchestrator::MonitorControlKind::Resume => "resume",
+            crate::api::agent_orchestrator::MonitorControlKind::Delete => "delete",
+        };
+        self.record(format!("control_monitor:{kind}:{}", request.monitor_id))
     }
 }
 

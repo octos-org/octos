@@ -439,6 +439,8 @@ Supervised review and M15 agent/goal/loop autonomy (capability-gated, accepted
 - `session/goal/get`, `session/goal/set`, `session/goal/clear`
 - `loop/create`, `loop/list`, `loop/delete`, `loop/pause`, `loop/resume`,
   `loop/fire_now`
+- `monitor/create`, `monitor/list`, `monitor/pause`, `monitor/resume`,
+  `monitor/delete`
 
 Router (Wave4-A):
 
@@ -598,6 +600,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 - `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
 - `session/goal/updated`, `session/goal/cleared`
 - `loop/updated`, `loop/fired`, `loop/completed`
+- `monitor/updated`, `monitor/fired`, `monitor/expired`
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
