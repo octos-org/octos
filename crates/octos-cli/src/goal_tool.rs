@@ -143,10 +143,15 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
 /// Wire shape:
 /// `{ "network": { "mode": "none"|"hosts"|"full", "hosts": ["example.com"] },
 ///    "tools": ["read_file", ..., "web_fetch"],
-///    "fs": "workspace"|"host" }`
+///    "fs": "workspace"|"host"
+///        | { "write": ["exemplar.card", "cards/*.card"], "create_only": true } }`
 ///
-/// `fs` is the coarse binary scope (v1 has no per-path allowlist — see
-/// [`parse_fs`]), NOT a `{read, write}` path object.
+/// `fs` is the coarse binary scope as a STRING, or (#1976) the per-path WRITE
+/// fence as an OBJECT: a workspace-relative allowlist of writable paths
+/// (`*`/`?` globs) with optional `create_only` (allowlisted paths may be
+/// created but never overwritten/edited). The object form always implies the
+/// workspace scope — reads stay workspace-wide, writes narrow to the list.
+/// See [`parse_fs`].
 fn parse_grant(value: Option<&Value>, task_id: &str) -> Result<WorkerGrant, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(WorkerGrant::minimal()),
@@ -181,11 +186,17 @@ fn parse_grant(value: Option<&Value>, task_id: &str) -> Result<WorkerGrant, Stri
     };
 
     let fs = match obj.get("fs") {
-        None | Some(Value::Null) => FsGrant::Workspace,
+        None | Some(Value::Null) => ParsedFs::default(),
         Some(fs) => parse_fs(fs, task_id)?,
     };
 
-    let grant = WorkerGrant { network, tools, fs };
+    let grant = WorkerGrant {
+        network,
+        tools,
+        fs: fs.scope,
+        write_paths: fs.write_paths,
+        create_only: fs.create_only,
+    };
     grant
         .validate()
         .map_err(|e| format!("task `{task_id}`: {e}"))?;
@@ -233,17 +244,83 @@ fn parse_network(value: &Value, task_id: &str) -> Result<NetworkGrant, String> {
     }
 }
 
-/// Parse the coarse `fs` scope — the string `"workspace"` (cwd-only, the
-/// default) or `"host"` (full daemon-user read+write). v1 is deliberately
-/// binary: the native tools have no per-path allowlist, so a narrow-paths grant
-/// is not offered here (it would falsely promise narrow but deliver host-wide).
-fn parse_fs(value: &Value, task_id: &str) -> Result<FsGrant, String> {
+/// The parsed `fs` lane of a grant: the coarse scope plus (#1976) the
+/// optional per-path write fence. Default = workspace scope, no fence —
+/// exactly the pre-#1976 behaviour for an absent `fs`.
+#[derive(Default)]
+struct ParsedFs {
+    scope: FsGrant,
+    write_paths: Option<Vec<String>>,
+    create_only: bool,
+}
+
+/// Parse the `fs` lane — either the coarse binary scope as a STRING
+/// (`"workspace"` cwd-only, the default; `"host"` full daemon-user
+/// read+write) or (#1976) the per-path WRITE fence as an OBJECT:
+/// `{ "write": ["exemplar.card", "cards/*.card"], "create_only": true }`.
+/// The object form always implies the workspace scope (a fence under `host`
+/// is incoherent — `WorkerGrant::validate` also rejects the programmatic
+/// combination); pattern syntax is validated there too (`*`/`?` globs,
+/// relative, no `..`). `write` is REQUIRED in the object form so `fs: {}`
+/// cannot silently mean "no fence".
+fn parse_fs(value: &Value, task_id: &str) -> Result<ParsedFs, String> {
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if key != "write" && key != "create_only" {
+                return Err(format!(
+                    "task `{task_id}`: unknown `grant.fs` key `{key}` (use `write` and \
+                     `create_only`)"
+                ));
+            }
+        }
+        let write_paths = match obj.get("write") {
+            Some(Value::Array(items)) => {
+                let mut paths = Vec::with_capacity(items.len());
+                for item in items {
+                    let pattern = item.as_str().map(str::trim).ok_or_else(|| {
+                        format!(
+                            "task `{task_id}`: each `grant.fs.write` entry must be a \
+                             workspace-relative path pattern"
+                        )
+                    })?;
+                    paths.push(pattern.to_owned());
+                }
+                paths
+            }
+            _ => {
+                return Err(format!(
+                    "task `{task_id}`: `grant.fs.write` (array of workspace-relative path \
+                     patterns) is required in the object form of `grant.fs`"
+                ));
+            }
+        };
+        let create_only = match obj.get("create_only") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => {
+                return Err(format!(
+                    "task `{task_id}`: `grant.fs.create_only` must be a boolean"
+                ));
+            }
+        };
+        return Ok(ParsedFs {
+            scope: FsGrant::Workspace,
+            write_paths: Some(write_paths),
+            create_only,
+        });
+    }
     let mode = value.as_str().map(str::trim).ok_or_else(|| {
-        format!("task `{task_id}`: `grant.fs` must be the string \"workspace\" or \"host\"")
+        format!(
+            "task `{task_id}`: `grant.fs` must be the string \"workspace\" or \"host\", or \
+             the per-path object {{\"write\": [...], \"create_only\": bool}}"
+        )
     })?;
     match mode.to_ascii_lowercase().as_str() {
-        "workspace" => Ok(FsGrant::Workspace),
-        "host" => Ok(FsGrant::Host),
+        "workspace" => Ok(ParsedFs::default()),
+        "host" => Ok(ParsedFs {
+            scope: FsGrant::Host,
+            ..ParsedFs::default()
+        }),
         other => Err(format!(
             "task `{task_id}`: unknown fs scope `{other}` (use \"workspace\" or \"host\")"
         )),
@@ -584,9 +661,26 @@ impl Tool for GoalPlanTool {
                                         "description": "The tools the worker may hold. Omit = the base file tools (read_file/write_file/edit_file/glob/grep/list_dir/shell). Add web_fetch/web_search (each REQUIRES a network grant)."
                                     },
                                     "fs": {
-                                        "type": "string",
-                                        "enum": ["workspace", "host"],
-                                        "description": "Filesystem reach. Omit = workspace (the worker's own scratch dir only, read+write). host = FULL daemon-user filesystem read+write (broad — grant only when a task genuinely needs host access). v1 is binary: narrow per-path grants are not yet supported."
+                                        "description": "Filesystem reach. Omit = workspace (the worker's own scratch dir only, read+write). String \"host\" = FULL daemon-user filesystem read+write (broad — grant only when a task genuinely needs host access). OBJECT = per-path WRITE fence (#1976): {\"write\": [\"exemplar.card\", \"cards/*.card\"], \"create_only\": true} — the worker may WRITE only the listed workspace-relative paths (globs: * and ? within one path segment; no **), everything else is read-only, kernel-enforced (file tools + shell sandbox). create_only additionally means listed paths may be CREATED but never overwritten/edited.",
+                                        "oneOf": [
+                                            { "type": "string", "enum": ["workspace", "host"] },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "write": {
+                                                        "type": "array",
+                                                        "items": { "type": "string" },
+                                                        "description": "Workspace-relative writable path patterns (* and ? globs). Everything else is read-only."
+                                                    },
+                                                    "create_only": {
+                                                        "type": "boolean",
+                                                        "description": "Listed paths may be created but never overwritten, edited, or deleted."
+                                                    }
+                                                },
+                                                "required": ["write"],
+                                                "additionalProperties": false
+                                            }
+                                        ]
                                     }
                                 },
                                 "additionalProperties": false
@@ -816,7 +910,21 @@ impl Tool for GoalGrantTool {
                             "additionalProperties": false
                         },
                         "tools": { "type": "array", "items": { "type": "string" } },
-                        "fs": { "type": "string", "enum": ["workspace", "host"] }
+                        "fs": {
+                            "description": "\"workspace\" | \"host\", or the #1976 per-path write fence object {\"write\": [globs], \"create_only\": bool} (same shape as goal_plan's task grant).",
+                            "oneOf": [
+                                { "type": "string", "enum": ["workspace", "host"] },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "write": { "type": "array", "items": { "type": "string" } },
+                                        "create_only": { "type": "boolean" }
+                                    },
+                                    "required": ["write"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        }
                     },
                     "additionalProperties": false
                 }
@@ -1928,6 +2036,102 @@ mod tests {
         let specs = parse_task_specs(&full).expect("parses");
         assert_eq!(specs[0].grant.network, NetworkGrant::Full);
         assert_eq!(specs[0].grant.fs, FsGrant::Workspace);
+    }
+
+    #[test]
+    fn goal_plan_parses_per_path_write_grant() {
+        // #1976 — the object form of `fs` expresses a per-path WRITE fence:
+        // `{ "write": [globs], "create_only": bool }`. The fs scope stays
+        // Workspace (a fence is only coherent there) and the allowlist +
+        // create_only land on the grant verbatim.
+        let args = json!({
+            "tasks": [ {
+                "task_id": "refine",
+                "title": "refine the exemplar",
+                "grant": {
+                    "fs": { "write": ["exemplar.card", "cards/*.card"], "create_only": true }
+                }
+            } ]
+        });
+        let specs = parse_task_specs(&args).expect("parses");
+        let grant = &specs[0].grant;
+        assert_eq!(grant.fs, FsGrant::Workspace);
+        assert_eq!(
+            grant.write_paths,
+            Some(vec![
+                "exemplar.card".to_string(),
+                "cards/*.card".to_string()
+            ]),
+        );
+        assert!(grant.create_only);
+        // Omitted create_only defaults false; entries are trimmed.
+        let plain = json!({
+            "tasks": [ {
+                "task_id": "t",
+                "title": "t",
+                "grant": { "fs": { "write": ["  out.txt  "] } }
+            } ]
+        });
+        let specs = parse_task_specs(&plain).expect("parses");
+        assert_eq!(
+            specs[0].grant.write_paths,
+            Some(vec!["out.txt".to_string()])
+        );
+        assert!(!specs[0].grant.create_only);
+    }
+
+    #[test]
+    fn goal_plan_rejects_malformed_per_path_write_grant() {
+        // #1976 — parse/validation failures surface as plan-time errors, so
+        // an inexpressible fence can never reach the store: traversal,
+        // absolute paths, create_only-with-nothing, unknown keys, and
+        // non-boolean create_only are all named in the error.
+        let cases: [(Value, &str); 6] = [
+            (json!({ "write": ["../escape"] }), "fs.write"),
+            (json!({ "write": ["/etc/passwd"] }), "fs.write"),
+            (json!({ "write": [], "create_only": true }), "create_only"),
+            (json!({ "create_only": true }), "write"),
+            (json!({ "write": ["ok.txt"], "surprise": 1 }), "surprise"),
+            (
+                json!({ "write": ["ok.txt"], "create_only": "yes" }),
+                "create_only",
+            ),
+        ];
+        for (fs, needle) in cases {
+            let args = json!({
+                "tasks": [ {
+                    "task_id": "t1",
+                    "title": "do it",
+                    "grant": { "fs": fs }
+                } ]
+            });
+            let err = parse_task_specs(&args).expect_err("malformed fence rejected");
+            assert!(
+                err.contains(needle),
+                "error for fs={} must mention `{needle}`: {err}",
+                args["tasks"][0]["grant"]["fs"],
+            );
+        }
+    }
+
+    #[test]
+    fn goal_plan_rejects_per_path_write_grant_with_host_fs() {
+        // #1976 — the object form always implies workspace scope; a fence
+        // cannot be combined with `host` (there is no syntax for it: `fs` is
+        // ONE field), and the fleet-side validate() also rejects the
+        // programmatic combination. Assert the parse-level story: `host`
+        // still parses as the binary grant with NO fence.
+        let args = json!({
+            "tasks": [ {
+                "task_id": "t1",
+                "title": "do it",
+                "grant": { "fs": "host" }
+            } ]
+        });
+        let specs = parse_task_specs(&args).expect("binary host grant parses");
+        assert_eq!(specs[0].grant.fs, FsGrant::Host);
+        assert_eq!(specs[0].grant.write_paths, None);
+        assert!(!specs[0].grant.create_only);
     }
 
     #[test]

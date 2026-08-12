@@ -793,6 +793,7 @@ pub mod synthesize_research;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
+pub mod write_grant;
 
 pub mod admin;
 pub mod browser;
@@ -860,6 +861,9 @@ pub use synthesize_research::SynthesizeResearchTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
+pub use write_grant::{
+    DENIED_MARKER, WriteGrantViolation, WriteGrantViolationSink, WritePathGrant,
+};
 
 pub use browser::BrowserTool;
 pub use check::CheckTool;
@@ -1334,6 +1338,12 @@ pub async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()>
     .await
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
+
+// #1976 note: `create_only` (`O_CREAT|O_EXCL`) enforcement moved into the
+// component-wise confined `openat` walk in `tools::write_grant::open_confined`
+// (which also closes the ancestor-symlink TOCTOU a whole-path lexical open
+// cannot). A standalone leaf-only exclusive writer would re-introduce that
+// divergence, so it is intentionally absent here.
 
 /// Convert a file I/O error to a ToolResult, handling symlink and not-found cases.
 pub fn file_io_error(e: std::io::Error, display_path: &str) -> ToolResult {

@@ -451,6 +451,7 @@ fn should_restrict_reads_when_configured() {
         repo_git_write: None,
         docker: octos_agent::sandbox::DockerConfig::default(),
         read_allow_paths: vec!["/usr".into(), "/opt/custom".into()],
+        write_allow_globs: None,
         profile_name: None,
     };
     let sandbox = octos_agent::create_sandbox(&config);
@@ -678,6 +679,7 @@ fn should_block_dangerous_docker_cwd() {
         repo_git_write: None,
         docker: DockerConfig::default(),
         read_allow_paths: Vec::new(),
+        write_allow_globs: None,
         profile_name: None,
     });
 

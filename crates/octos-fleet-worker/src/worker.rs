@@ -279,6 +279,14 @@ pub async fn run_attempt(
     let grant = SandboxGrant {
         allow_network: task_view.grant.network.allows_raw_egress(),
         repo_git_dir: worktree.map(|w| w.git_dir.clone()),
+        // #1976 — project the per-path write fence into the sandbox scope so
+        // the SHELL is bounded to the same allowlist as the file tools (macOS
+        // OS-enforced; other backends degrade to read-only workspace). A
+        // fence and a worktree (`FsGrant::Host`) are mutually exclusive by
+        // construction — `validate()` rejects `write_paths` under `Host`, and
+        // the pool only allocates a worktree for a full-trust Host grant — so
+        // `write_allow_globs` and `repo_git_dir` are never both `Some`.
+        write_allow_globs: task_view.grant.write_paths.clone(),
     };
 
     // P1-3-fix: ONE sandbox instance for the whole attempt, shared by the
@@ -1423,6 +1431,7 @@ mod tests {
             grants.contains(&SandboxGrant {
                 allow_network: false,
                 repo_git_dir: None,
+                write_allow_globs: None,
             }),
             "a minimal scratch worker gets the base sandbox (no network, cwd-only): {grants:?}",
         );
@@ -1430,6 +1439,7 @@ mod tests {
             grants.contains(&SandboxGrant {
                 allow_network: true,
                 repo_git_dir: None,
+                write_allow_globs: None,
             }),
             "a Full-network SCRATCH worker gets network but NOT the .git write: {grants:?}",
         );
@@ -1437,6 +1447,7 @@ mod tests {
             grants.contains(&SandboxGrant {
                 allow_network: true,
                 repo_git_dir: Some(std::path::PathBuf::from("/nonexistent-repo/.git")),
+                write_allow_globs: None,
             }),
             "a WORKTREE attempt gets repo_git_dir = <repo>/.git: {grants:?}",
         );

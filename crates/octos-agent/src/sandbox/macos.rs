@@ -93,6 +93,41 @@ fn canonicalize_lexical(path: &Path) -> std::path::PathBuf {
     }
 }
 
+/// #1976 — translate ONE v1 write-grant glob into an anchored SBPL regex
+/// under the (canonical) workspace root. The translation is the EXACT mirror
+/// of the tool-layer matcher (`globset` with `literal_separator`): `*` →
+/// `[^/]*`, `?` → `[^/]`, everything else a regex-escaped literal. v1 grant
+/// validation already rejected `**`/classes/alternations, so the two layers
+/// provably grant the same path set.
+pub(crate) fn glob_to_sbpl_regex(real_cwd: &str, glob: &str) -> String {
+    let mut pattern = String::with_capacity(real_cwd.len() + glob.len() + 8);
+    pattern.push('^');
+    for ch in real_cwd.chars() {
+        push_regex_escaped(&mut pattern, ch);
+    }
+    pattern.push('/');
+    for ch in glob.chars() {
+        match ch {
+            '*' => pattern.push_str("[^/]*"),
+            '?' => pattern.push_str("[^/]"),
+            other => push_regex_escaped(&mut pattern, other),
+        }
+    }
+    pattern.push('$');
+    pattern
+}
+
+/// Escape a literal char for a POSIX-ERE SBPL regex.
+fn push_regex_escaped(out: &mut String, ch: char) {
+    if matches!(
+        ch,
+        '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\'
+    ) {
+        out.push('\\');
+    }
+    out.push(ch);
+}
+
 /// macOS sandbox using sandbox-exec.
 pub struct MacosSandbox {
     pub(crate) allow_network: bool,
@@ -115,6 +150,20 @@ pub struct MacosSandbox {
     /// gate (`supports_repo_git_write`) enforces that. Default `None` = today's
     /// cwd-only writable behaviour. The operator's explicit grant, NOT a fence.
     pub(crate) repo_git_write: Option<PathBuf>,
+    /// #1976 — per-path WRITE fence: workspace-relative globs (`*`/`?` within
+    /// one segment) naming the ONLY workspace paths the shell may write.
+    /// `Some(globs)` REPLACES the broad cwd `file-write*` subpath grant with
+    /// one `(allow file-write* (regex ...))` per glob (see
+    /// [`glob_to_sbpl_regex`] — the translation mirrors the tool-layer
+    /// globset semantics exactly), moves TMPDIR outside the workspace (the
+    /// `<cwd>/tmp` scratch is no longer writable), and — deny-wins — narrows
+    /// even `workspace_write=true`. An incoherent pairing with
+    /// `repo_git_write` (validated impossible upstream: a fence excludes
+    /// `FsGrant::Host`) resolves to the FENCE. macOS is the one backend that
+    /// expresses the fence at the OS; what it CANNOT express is
+    /// create-vs-overwrite, so `create_only`'s no-overwrite half remains
+    /// tool-layer enforced (documented on `SandboxConfig::write_allow_globs`).
+    pub(crate) write_allow_globs: Option<Vec<String>>,
 }
 
 impl Sandbox for MacosSandbox {
@@ -210,7 +259,16 @@ impl Sandbox for MacosSandbox {
             rules.join("\n")
         };
 
-        // Workspace write rule. Three cases:
+        // Workspace write rule. Four cases:
+        // - #1976 `write_allow_globs` (a per-path write fence): one
+        //   `(allow file-write* (regex ...))` per granted glob REPLACES the
+        //   broad cwd subpath grant — the shell can create/write ONLY the
+        //   allowlisted paths, `(deny default)` refuses everything else in
+        //   the workspace. Deny-wins over `workspace_write` AND over
+        //   `repo_git_write` (that pairing is validated impossible upstream —
+        //   a fence excludes `FsGrant::Host` — but if constructed anyway the
+        //   FENCE is emitted). A glob with SBPL metacharacters (unreachable
+        //   via a validated grant) is SKIPPED fail-closed, never injected.
         // - `repo_git_write` (a fleet worktree worker granted `FsGrant::Host`):
         //   grant `file-write*` to the cwd checkout AND a `(subpath "<repo>/.git")`
         //   so `git commit` can reach objects/refs/worktree-admin OUTSIDE the cwd.
@@ -226,7 +284,32 @@ impl Sandbox for MacosSandbox {
         //   denies the write. `/dev/null` stays writable regardless so shell
         //   redirections and git internals still function.
         let cwd_write_rule = format!("(allow file-write* (subpath \"{cwd}\"))\n", cwd = real_cwd);
-        let workspace_write_rule = if let Some(git_dir) = &self.repo_git_write {
+        let workspace_write_rule = if let Some(globs) = &self.write_allow_globs {
+            let mut rules = String::new();
+            for glob in globs {
+                if glob.bytes().any(|b| {
+                    b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"'
+                }) {
+                    tracing::error!(
+                        glob = %glob,
+                        "write_allow_globs entry contains SBPL metacharacters, skipping \
+                         (the path is simply not writable — fail closed)"
+                    );
+                    continue;
+                }
+                rules.push_str(&format!(
+                    "(allow file-write* (regex #\"{}\"))\n",
+                    glob_to_sbpl_regex(&real_cwd, glob)
+                ));
+            }
+            if self.repo_git_write.is_some() {
+                tracing::error!(
+                    "write_allow_globs and repo_git_write are mutually exclusive (a fence \
+                     excludes FsGrant::Host); emitting the FENCE only (deny-wins)"
+                );
+            }
+            rules
+        } else if let Some(git_dir) = &self.repo_git_write {
             let real_git = std::fs::canonicalize(git_dir)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| git_dir.to_string_lossy().to_string());
@@ -247,17 +330,22 @@ impl Sandbox for MacosSandbox {
             String::new()
         };
 
+        // #1976: a fenced workspace is read-only OUTSIDE the granted globs, so
+        // `<cwd>/tmp` is not writable — scratch must live outside, exactly
+        // like the read-only profile.
+        let workspace_scratch_writable = self.workspace_write && self.write_allow_globs.is_none();
+
         // Choose a scratch temp dir for TMPDIR/TEMP/TMP.
         //
         // - Writable workspace: keep the historical `<cwd>/tmp` (covered by the
         //   cwd file-write* grant above).
-        // - Read-only workspace (P2, codex): NEVER create or point TMPDIR under
-        //   the workspace — that would mutate it BEFORE sandbox-exec even runs.
-        //   Use a private dir OUTSIDE the workspace and grant SBPL write to
-        //   THAT instead, so read-only truly means no workspace mutation while
-        //   tools that need scratch space (Python tempfile, compilers) still
-        //   work.
-        let user_tmp = if self.workspace_write {
+        // - Read-only OR fenced workspace (P2, codex; #1976): NEVER create or
+        //   point TMPDIR under the workspace — that would mutate it BEFORE
+        //   sandbox-exec even runs. Use a private dir OUTSIDE the workspace and
+        //   grant SBPL write to THAT instead, so read-only truly means no
+        //   workspace mutation while tools that need scratch space (Python
+        //   tempfile, compilers) still work.
+        let user_tmp = if workspace_scratch_writable {
             cwd.join("tmp")
         } else {
             // `std::env::temp_dir()` honours `$TMPDIR`, which a hostile parent
@@ -273,12 +361,12 @@ impl Sandbox for MacosSandbox {
         // (writable) workspace; for the read-only case it is outside it.
         let _ = std::fs::create_dir_all(&user_tmp);
 
-        // For the read-only case, grant SBPL file-write* to the external temp
-        // dir's real path so scratch writes succeed there (not in the
-        // workspace). The path is validated for SBPL metacharacters; if it is
-        // unexpectedly unsafe we simply omit the grant (fail-closed: scratch
-        // writes fail rather than the profile being injectable).
-        let external_tmp_write_rule = if self.workspace_write {
+        // For the read-only / fenced case, grant SBPL file-write* to the
+        // external temp dir's real path so scratch writes succeed there (not
+        // in the workspace). The path is validated for SBPL metacharacters;
+        // if it is unexpectedly unsafe we simply omit the grant (fail-closed:
+        // scratch writes fail rather than the profile being injectable).
+        let external_tmp_write_rule = if workspace_scratch_writable {
             String::new()
         } else {
             let real_tmp_path =
@@ -361,6 +449,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -405,6 +494,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: Some(PathBuf::from("/tmp/controller-repo/.git")),
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("git commit -am wip", Path::new("/tmp/ws"));
         let args: Vec<_> = cmd
@@ -446,6 +536,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = plain.wrap_command("echo hi", Path::new("/tmp/ws"));
         let args: Vec<_> = cmd
@@ -473,6 +564,7 @@ mod tests {
             read_allow_paths: vec!["/opt/custom".to_string()],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         assert!(
             !sb.supports_repo_git_write(),
@@ -488,6 +580,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/\x01bad"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -510,6 +603,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         // Parentheses, backslash, and quote should all be rejected
         for path in &[
@@ -540,6 +634,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -561,6 +656,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo ok", Path::new("/Users/test/project"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -575,6 +671,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("ls", Path::new("/tmp/evil\x7Fpath"));
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -591,6 +688,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -620,6 +718,7 @@ mod tests {
             read_allow_paths: vec!["/custom/path".to_string()],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
         let args: Vec<_> = cmd
@@ -669,6 +768,7 @@ mod tests {
             ],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -706,6 +806,7 @@ mod tests {
             read_allow_paths: vec!["/path/with(parens)".to_string()],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -735,6 +836,7 @@ mod tests {
             ],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", Path::new("/tmp/test"));
         let args: Vec<_> = cmd
@@ -773,6 +875,7 @@ mod tests {
             read_allow_paths: vec![],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let mut cmd = sb.wrap_command(
             "touch /tmp/sandbox_escape_test_file 2>&1; echo exit=$?",
@@ -799,6 +902,7 @@ mod tests {
             read_allow_paths: vec![],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let mut cmd = sb.wrap_command("touch test_file && echo ok", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -832,6 +936,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: false,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("touch newfile", cwd);
         let args: Vec<_> = cmd
@@ -869,6 +974,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("touch newfile", cwd);
         let args: Vec<_> = cmd
@@ -901,6 +1007,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: false,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
 
@@ -945,6 +1052,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: false,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
         let args: Vec<_> = cmd
@@ -1119,6 +1227,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             workspace_write: false,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let cmd = sb.wrap_command("echo hi", cwd);
 
@@ -1165,6 +1274,7 @@ mod tests {
             read_allow_paths: vec![],
             workspace_write: false,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let mut cmd = sb.wrap_command("echo hello; :", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -1190,6 +1300,7 @@ mod tests {
             read_allow_paths: vec![],
             workspace_write: false,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let mut cmd = sb.wrap_command("touch newfile 2>&1; echo exit=$?", cwd);
         let output = cmd.output().await.expect("sandbox-exec should run");
@@ -1218,6 +1329,7 @@ mod tests {
             read_allow_paths: vec!["/nonexistent/path".to_string()],
             workspace_write: true,
             repo_git_write: None,
+            write_allow_globs: None,
         };
         let real_secret =
             std::fs::canonicalize(&secret_file).unwrap_or_else(|_| secret_file.clone());
@@ -1231,6 +1343,217 @@ mod tests {
         assert!(
             !stdout.contains("top-secret-data"),
             "sandbox should block reading files outside allowed paths, got: {stdout}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1976: per-path write fence (write_allow_globs → SBPL regex rules).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn glob_translation_matches_tool_layer_semantics() {
+        // The SBPL regex must express EXACTLY the tool-layer globset contract:
+        // `*` → [^/]* and `?` → [^/] (never crossing `/`), everything else a
+        // regex-escaped literal, anchored under the canonical cwd.
+        assert_eq!(
+            glob_to_sbpl_regex("/ws/dir", "cards/*.card"),
+            r"^/ws/dir/cards/[^/]*\.card$",
+        );
+        assert_eq!(
+            glob_to_sbpl_regex("/ws/dir", "notes-?.md"),
+            r"^/ws/dir/notes-[^/]\.md$",
+        );
+        // Regex specials in the CWD (dots, pluses) are escaped so a
+        // `/ws/v1.2` cwd cannot accidentally match `/ws/v1x2`.
+        assert_eq!(
+            glob_to_sbpl_regex("/ws/v1.2+a", "out.txt"),
+            r"^/ws/v1\.2\+a/out\.txt$",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_fence_emits_regex_rules_not_cwd_subpath() {
+        // A fenced profile grants file-write* per GLOB (regex), NEVER the
+        // broad cwd subpath — the fence narrows workspace_write=true.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        let real_cwd = std::fs::canonicalize(cwd)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+            write_allow_globs: Some(vec![
+                "exemplar.card".to_string(),
+                "cards/*.card".to_string(),
+            ]),
+        };
+        let cmd = sb.wrap_command("echo hi", cwd);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert!(
+            !profile.contains(&format!(r#"(allow file-write* (subpath "{real_cwd}"))"#)),
+            "a fenced profile must NOT grant the broad cwd write, profile:\n{profile}"
+        );
+        assert_eq!(
+            profile.matches("(allow file-write* (regex #\"").count(),
+            2,
+            "one regex write rule per granted glob, profile:\n{profile}"
+        );
+        assert!(
+            !profile.contains("(allow file-write*)"),
+            "never a global write grant, profile:\n{profile}"
+        );
+        // Reads stay workspace-wide (non-goal: no per-path READ fence) and
+        // /dev/null stays writable.
+        assert!(profile.contains("(allow file-read*)"));
+        assert!(profile.contains(r#"(allow file-write* (literal "/dev/null"))"#));
+
+        // TMPDIR must live OUTSIDE the fenced workspace — `<cwd>/tmp` is not
+        // granted, so pointing scratch there would break every tool needing
+        // temp space (mirrors the read-only workspace behaviour).
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        let tmpdir = envs
+            .get("TMPDIR")
+            .and_then(|v| v.clone())
+            .expect("TMPDIR must be set");
+        assert!(
+            !std::path::Path::new(&tmpdir).starts_with(cwd),
+            "TMPDIR must not point inside the fenced workspace, got {tmpdir}"
+        );
+        assert!(
+            !cwd.join("tmp").exists(),
+            "fenced wrapper must not create <cwd>/tmp"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_fence_skips_unsafe_globs_fail_closed() {
+        // A glob with SBPL metacharacters (unreachable via a validated grant,
+        // but this layer fails closed on its own): the rule is OMITTED — the
+        // path is simply not writable — and no injected rule appears.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+            write_allow_globs: Some(vec![
+                "ok.txt".to_string(),
+                "evil\")\n(allow file-write* (subpath \"/".to_string(),
+            ]),
+        };
+        let cmd = sb.wrap_command("echo hi", tmp.path());
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("should have SBPL profile");
+        assert_eq!(
+            profile.matches("(allow file-write* (regex #\"").count(),
+            1,
+            "only the safe glob is granted, profile:\n{profile}"
+        );
+        assert!(
+            !profile.contains(r#"(allow file-write* (subpath "/"))"#),
+            "injected root write must not appear, profile:\n{profile}"
+        );
+    }
+
+    /// LIVE acceptance for #1976 (macOS only — sandbox-exec ships with the
+    /// OS, so this runs on any mac; Linux CI skips via cfg, which is the
+    /// honest platform boundary: bwrap cannot express the fence at all).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn write_fence_enforced_by_sandbox_exec_live() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let cwd = tmp.path();
+        // Parent dirs of granted paths must exist (or be granted themselves)
+        // for SHELL writes — the sandbox cannot create `cards/` since the
+        // directory path is not in the allowlist. Documented degradation.
+        std::fs::create_dir(cwd.join("cards")).expect("pre-create cards/");
+
+        let sb = MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+            write_allow_globs: Some(vec![
+                "exemplar.card".to_string(),
+                "cards/*.card".to_string(),
+            ]),
+        };
+
+        // CAN create an allowlisted file via shell redirect (the fence is a
+        // grant, not a lockout).
+        let mut ok = sb.wrap_command("echo v1 > exemplar.card && echo created=$?", cwd);
+        let out = ok.output().await.expect("sandbox-exec should run");
+        assert!(
+            cwd.join("exemplar.card").exists(),
+            "granted shell redirect must succeed, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let mut ok2 = sb.wrap_command("echo a > cards/a.card", cwd);
+        let _ = ok2.output().await.expect("sandbox-exec should run");
+        assert!(
+            cwd.join("cards/a.card").exists(),
+            "granted glob shell redirect must succeed"
+        );
+
+        // CANNOT write a non-allowlisted path via shell (OS-enforced fence).
+        let mut denied = sb.wrap_command("echo nope > app.md 2>/dev/null; echo exit=$?", cwd);
+        let out = denied.output().await.expect("sandbox-exec should run");
+        assert!(
+            !cwd.join("app.md").exists(),
+            "the OS fence must deny app.md, stdout={}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+
+        // CANNOT bypass via rename/mv: the target path is not granted, so
+        // rename fails and the source survives.
+        let mut mv = sb.wrap_command("mv exemplar.card app.md 2>/dev/null; echo exit=$?", cwd);
+        let _ = mv.output().await.expect("sandbox-exec should run");
+        assert!(
+            cwd.join("exemplar.card").exists() && !cwd.join("app.md").exists(),
+            "mv to a non-granted path must fail"
+        );
+
+        // Documented degradation: the OS layer CANNOT distinguish create from
+        // overwrite, so a shell append/overwrite of a GRANTED path succeeds —
+        // create_only's no-overwrite half is tool-layer-enforced only.
+        let mut append = sb.wrap_command("echo v2 >> exemplar.card; echo exit=$?", cwd);
+        let out = append.output().await.expect("sandbox-exec should run");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("exit=0"),
+            "shell append to a granted path is OS-allowed (documented) — create_only \
+             overwrite protection lives at the file-tool layer"
         );
     }
 }

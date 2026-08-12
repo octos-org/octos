@@ -87,6 +87,29 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub read_allow_paths: Vec<String>,
 
+    /// #1976 — per-path WRITE fence for the shell: workspace-relative globs
+    /// (`*` / `?` within one segment — the same v1 syntax as
+    /// `WorkerGrant::write_paths`, whose grant this projects) naming the ONLY
+    /// paths shell commands may write inside the workspace. `None` (default,
+    /// every pre-#1976 config) = `workspace_write` alone governs writes.
+    ///
+    /// Backend coverage (deny-wins everywhere — no backend widens the fence):
+    /// - **macOS (sandbox-exec)** expresses it exactly: one
+    ///   `(allow file-write* (regex ...))` per glob replaces the broad cwd
+    ///   subpath grant; TMPDIR moves outside the workspace like the
+    ///   read-only profile. The OS cannot distinguish create-vs-overwrite,
+    ///   so `create_only`'s no-overwrite half stays TOOL-layer enforced.
+    /// - **bwrap / Landlock / AppContainer** cannot bind/grant a glob (or a
+    ///   create-target that does not exist yet): the workspace degrades to
+    ///   READ-ONLY for the shell (fail closed; granted paths stay writable
+    ///   via the fenced file tools), warned at sandbox construction.
+    /// - **Docker** mounts the workspace `:ro` under a fence (same honest
+    ///   degradation).
+    /// - **NoSandbox** enforces nothing — construction warns that the shell
+    ///   fence is UNENFORCED (tool-layer enforcement still applies).
+    #[serde(default)]
+    pub write_allow_globs: Option<Vec<String>>,
+
     /// Profile name for sandbox isolation (used as AppContainer profile ID on Windows).
     #[serde(default)]
     pub profile_name: Option<String>,
@@ -131,6 +154,7 @@ impl Default for SandboxConfig {
             repo_git_write: None,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
+            write_allow_globs: None,
             profile_name: None,
         }
     }
@@ -290,18 +314,67 @@ impl Sandbox for NoSandbox {
     }
 }
 
+/// #1976 — the effective `workspace_write` for a backend that CANNOT express
+/// a per-path write fence (bwrap/Landlock/AppContainer binds and grants are
+/// concrete paths; a glob — or a create-target that does not exist yet —
+/// cannot be bound). Deny-wins: under a fence the workspace degrades to
+/// READ-ONLY for the shell (granted paths stay writable via the fenced file
+/// tools), warned once per sandbox construction (≈ once per spawned attempt).
+fn fence_degraded_workspace_write(config: &SandboxConfig, backend: &str) -> bool {
+    if config.write_allow_globs.is_some() {
+        tracing::warn!(
+            backend,
+            "per-path write grant: {backend} cannot express per-path shell writes; \
+             the workspace is READ-ONLY for the shell on this backend (granted paths \
+             remain writable via the fenced file tools only)",
+        );
+        return false;
+    }
+    config.workspace_write
+}
+
+/// #1976 — Docker's projection of the same degradation: a fenced workspace
+/// mounts `:ro` (mount targets are concrete paths, same limitation as bwrap).
+fn fence_degraded_docker(config: &SandboxConfig) -> DockerConfig {
+    let mut docker = config.docker.clone();
+    if config.write_allow_globs.is_some() && docker.mount_mode == MountMode::ReadWrite {
+        tracing::warn!(
+            "per-path write grant: docker cannot express per-path shell writes; \
+             the workspace mounts READ-ONLY (granted paths remain writable via the \
+             fenced file tools only)",
+        );
+        docker.mount_mode = MountMode::ReadOnly;
+    }
+    docker
+}
+
+/// #1976 — a fenced config resolving to NO sandbox leaves the shell fence
+/// unenforced entirely; never let that pass silently.
+fn warn_fence_unenforced(config: &SandboxConfig) {
+    if config.write_allow_globs.is_some() {
+        tracing::warn!(
+            "per-path write grant: no sandbox backend — the SHELL write fence is \
+             UNENFORCED (file-tool enforcement still applies)",
+        );
+    }
+}
+
 /// Create a sandbox from config.
 pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
     if !config.enabled {
         tracing::info!("sandbox disabled, shell commands run without isolation");
+        warn_fence_unenforced(config);
         return Box::new(NoSandbox);
     }
 
     match &config.mode {
-        SandboxMode::None => Box::new(NoSandbox),
+        SandboxMode::None => {
+            warn_fence_unenforced(config);
+            Box::new(NoSandbox)
+        }
         SandboxMode::Bwrap => Box::new(BwrapSandbox {
             allow_network: config.allow_network,
-            workspace_write: config.workspace_write,
+            workspace_write: fence_degraded_workspace_write(config, "bwrap"),
             repo_git_write: config.repo_git_write.clone(),
         }),
         SandboxMode::Landlock => {
@@ -311,7 +384,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
-                    workspace_write: config.workspace_write,
+                    workspace_write: fence_degraded_workspace_write(config, "landlock"),
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -319,6 +392,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 tracing::warn!(
                     "Landlock/seccomp is only available on Linux, falling back to NoSandbox"
                 );
+                warn_fence_unenforced(config);
                 Box::new(NoSandbox)
             }
         }
@@ -327,9 +401,11 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             read_allow_paths: config.read_allow_paths.clone(),
             workspace_write: config.workspace_write,
             repo_git_write: config.repo_git_write.clone(),
+            // #1976: macOS EXPRESSES the fence (per-glob SBPL regex rules).
+            write_allow_globs: config.write_allow_globs.clone(),
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
-            config: config.docker.clone(),
+            config: fence_degraded_docker(config),
             allow_network: config.allow_network,
         }),
         SandboxMode::AppContainer => {
@@ -339,7 +415,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                     allow_network: config.allow_network,
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
-                    workspace_write: config.workspace_write,
+                    workspace_write: fence_degraded_workspace_write(config, "appcontainer"),
                 })
             }
             #[cfg(not(windows))]
@@ -347,6 +423,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 tracing::warn!(
                     "AppContainer is only available on Windows, falling back to NoSandbox"
                 );
+                warn_fence_unenforced(config);
                 Box::new(NoSandbox)
             }
         }
@@ -400,6 +477,8 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 read_allow_paths: config.read_allow_paths.clone(),
                 workspace_write: config.workspace_write,
                 repo_git_write: config.repo_git_write.clone(),
+                // #1976: macOS EXPRESSES the fence (per-glob regex rules).
+                write_allow_globs: config.write_allow_globs.clone(),
             });
         }
     }
@@ -409,7 +488,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
         if bwrap_works() {
             return Box::new(BwrapSandbox {
                 allow_network: config.allow_network,
-                workspace_write: config.workspace_write,
+                workspace_write: fence_degraded_workspace_write(config, "bwrap"),
                 repo_git_write: config.repo_git_write.clone(),
             });
         }
@@ -418,7 +497,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
                 profile_name: config.profile_name.clone(),
-                workspace_write: config.workspace_write,
+                workspace_write: fence_degraded_workspace_write(config, "landlock"),
             });
         }
     }
@@ -430,14 +509,14 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 allow_network: config.allow_network,
                 read_allow_paths: config.read_allow_paths.clone(),
                 profile_name: config.profile_name.clone(),
-                workspace_write: config.workspace_write,
+                workspace_write: fence_degraded_workspace_write(config, "appcontainer"),
             });
         }
     }
 
     if which_exists("docker") {
         Box::new(DockerSandbox {
-            config: config.docker.clone(),
+            config: fence_degraded_docker(config),
             allow_network: config.allow_network,
         })
     } else {
@@ -446,6 +525,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
              Shell commands will run WITHOUT isolation. \
              Install a sandbox backend or set sandbox.enabled = false to silence this warning."
         );
+        warn_fence_unenforced(config);
         Box::new(NoSandbox)
     }
 }
@@ -711,6 +791,7 @@ mod tests {
             repo_git_write: None,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
+            write_allow_globs: None,
             profile_name: None,
         };
         let sb = create_sandbox(&config);
@@ -721,6 +802,100 @@ mod tests {
         assert_eq!(prog, "cmd");
         #[cfg(not(windows))]
         assert_eq!(prog, "sh");
+    }
+
+    // --- #1976: per-path write fence (write_allow_globs) ---
+
+    #[test]
+    fn sandbox_config_write_allow_globs_defaults_none() {
+        // Back-compat: configs written before #1976 carry no fence.
+        let config: SandboxConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.write_allow_globs, None);
+        assert_eq!(SandboxConfig::default().write_allow_globs, None);
+    }
+
+    #[test]
+    fn fence_degrades_bwrap_to_ro_workspace() {
+        // #1976 honest degradation: bwrap binds are CONCRETE paths — a glob
+        // (or a create-target that does not exist yet) cannot be bind-mounted,
+        // so a fenced workspace is bound READ-ONLY for the shell (fail
+        // closed; granted paths stay writable via the fenced file tools).
+        let config = SandboxConfig {
+            mode: SandboxMode::Bwrap,
+            workspace_write: true,
+            write_allow_globs: Some(vec!["exemplar.card".to_string()]),
+            ..SandboxConfig::default()
+        };
+        let sb = create_sandbox(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = sb.wrap_command("echo hi", dir.path());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let cwd_str = dir.path().to_string_lossy().to_string();
+        // The workspace is bound with `--ro-bind` (read-only), not the
+        // read-write `--bind`. (`--chdir <cwd>` also names cwd_str, so match
+        // the bind flags specifically, not merely "cwd appears as w[1]".)
+        let bound_ro = args
+            .windows(2)
+            .any(|w| w[0] == "--ro-bind" && w[1] == cwd_str);
+        let bound_rw = args.windows(2).any(|w| w[0] == "--bind" && w[1] == cwd_str);
+        assert!(
+            bound_ro && !bound_rw,
+            "a fenced workspace must be read-only (--ro-bind) under bwrap, args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn fence_degrades_docker_mount_to_ro() {
+        // #1976 honest degradation: Docker mounts are concrete too — a
+        // fenced workspace mounts `:ro` (fail closed for the shell).
+        let config = SandboxConfig {
+            mode: SandboxMode::Docker,
+            write_allow_globs: Some(vec!["exemplar.card".to_string()]),
+            ..SandboxConfig::default()
+        };
+        let sb = create_sandbox(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = sb.wrap_command("echo hi", dir.path());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.iter().any(|a| a.ends_with(":/workspace:ro")),
+            "a fenced workspace must mount read-only under docker, args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn fence_reaches_macos_backend_as_globs() {
+        // macOS is the one backend that EXPRESSES the fence (SBPL regex);
+        // create_sandbox must thread the globs through, not degrade them.
+        let config = SandboxConfig {
+            mode: SandboxMode::Macos,
+            write_allow_globs: Some(vec!["exemplar.card".to_string()]),
+            ..SandboxConfig::default()
+        };
+        let sb = create_sandbox(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = sb.wrap_command("echo hi", dir.path());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let profile = args
+            .iter()
+            .find(|a| a.contains("deny default"))
+            .expect("SBPL profile present");
+        assert!(
+            profile.contains("(allow file-write* (regex #\""),
+            "macOS must emit per-glob regex write rules, profile: {profile}"
+        );
     }
 
     // --- is_noop contract (fail-closed callers depend on this) ---

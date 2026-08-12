@@ -995,16 +995,56 @@ impl ServeCommand {
                                 let mut cfg = sandbox_cfg.clone();
                                 cfg.allow_network = grant.allow_network;
                                 cfg.repo_git_write = grant.repo_git_dir;
+                                // #1976 — fold the per-path SHELL write fence
+                                // onto the base config. macOS enforces it as
+                                // SBPL regex rules; bwrap/docker degrade the
+                                // workspace to read-only for the shell (warned
+                                // in create_sandbox). Deny-wins with the file
+                                // tools' own fence.
+                                cfg.write_allow_globs = grant.write_allow_globs;
                                 Arc::<dyn octos_agent::sandbox::Sandbox>::from(
                                     octos_agent::sandbox::create_sandbox(&cfg),
                                 )
                             },
                         );
-                        let factory = Arc::new(octos_fleet_worker::AgentFactory::new(
-                            rt.llm.clone(),
-                            rt.memory.clone(),
-                            sandbox_factory,
-                        ));
+                        // #1976 — the `[denied]` write-grant violation sink:
+                        // a fenced worker's refused write is returned to the
+                        // model by the tool AND recorded here as a durable
+                        // `[denied]`-class finding on the offending task's
+                        // goal ledger. Detached to the blocking pool (sqlite
+                        // I/O) so a rare violation never stalls the worker's
+                        // async turn. Best-effort — the tool refusal already
+                        // bounded the write.
+                        let denial_data_dir = rt.data_dir.clone();
+                        let denial_profile_id = rt.profile_id.clone();
+                        let violation_sink: octos_agent::tools::write_grant::WriteGrantViolationSink =
+                            Arc::new(move |v: octos_agent::tools::write_grant::WriteGrantViolation| {
+                                let data_dir = denial_data_dir.clone();
+                                let profile_id = denial_profile_id.clone();
+                                let record = move || {
+                                    crate::api::agent_orchestrator::default_agent_orchestrator()
+                                        .record_fleet_write_grant_denial(
+                                            &data_dir,
+                                            &profile_id,
+                                            &v.workspace,
+                                            &v.detail,
+                                        );
+                                };
+                                match tokio::runtime::Handle::try_current() {
+                                    Ok(handle) => {
+                                        handle.spawn_blocking(record);
+                                    }
+                                    Err(_) => record(),
+                                }
+                            });
+                        let factory = Arc::new(
+                            octos_fleet_worker::AgentFactory::new(
+                                rt.llm.clone(),
+                                rt.memory.clone(),
+                                sandbox_factory,
+                            )
+                            .with_violation_sink(violation_sink),
+                        );
                         let cfg = octos_fleet_worker::PoolConfig {
                             global_concurrency: FLEET_POOL_GLOBAL_CONCURRENCY,
                             per_fleet_concurrency: FLEET_POOL_PER_FLEET_CONCURRENCY,

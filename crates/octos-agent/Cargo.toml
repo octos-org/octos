@@ -107,6 +107,13 @@ keyring = { workspace = true, features = ["linux-native"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
 
+# #1976 — safe openat/mkdirat for the write-grant component-wise confined walk
+# (closes the ancestor-symlink TOCTOU under the workspace-wide
+# deny(unsafe_code) lint). Unix only; the Windows path uses the symlink-check
+# fallback documented in `tools::write_grant`.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [features]
 # `browser` is ON by default: it gates the headless-Chrome (CDP) search
 # provider that `web_search` uses as a last-resort fallback (after every HTTP

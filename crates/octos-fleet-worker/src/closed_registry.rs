@@ -26,6 +26,7 @@ use eyre::{Result, eyre};
 use octos_agent::policy::{ApprovalPolicy, EffectivePermissions, FilesystemScope};
 use octos_agent::sandbox::Sandbox;
 use octos_agent::tools::policy::ToolPolicy;
+use octos_agent::tools::write_grant::{WriteGrantViolationSink, WritePathGrant};
 use octos_agent::tools::{
     EditFileTool, GlobTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, ToolRegistry,
     WebFetchTool, WebSearchTool, WriteFileTool,
@@ -94,13 +95,38 @@ pub fn build_fleet_worker_registry(
     max_shell_timeout_secs: u64,
     grant: &WorkerGrant,
     escalation: EscalationSlot,
+    // #1976 — optional `[denied]`-violation audit sink. `Some` on the AGENT
+    // path (the fleet host wires it to the goal ledger); `None` on the
+    // acceptance-validator path (validators never call file tools) and in the
+    // pure unit tests. The tool refusal is returned to the model regardless;
+    // the sink is the DURABLE audit trail on top of it.
+    violation_sink: Option<WriteGrantViolationSink>,
 ) -> Result<ToolRegistry> {
     // Reject an incoherent grant up front (unknown tool / web tool with no
-    // network) — validated at parse time too, so this is defense-in-depth: an
-    // unknown tool can never reach a live worker.
+    // network, or an incoherent per-path write fence — #1976) — validated at
+    // parse time too, so this is defense-in-depth: an unknown tool or an
+    // inexpressible fence can never reach a live worker.
     grant
         .validate()
         .map_err(|e| eyre!("fleet worker: invalid grant: {e}"))?;
+
+    // #1976 — build the per-path write fence from the grant's `write_paths`
+    // (`None` = no fence, byte-for-byte the pre-#1976 worker). Compiled ONCE
+    // here and cloned onto write_file + edit_file so both enforce the same
+    // allowlist. A pattern the fleet-side `validate()` already accepted must
+    // compile here too; a mismatch fails the build (fail closed) rather than
+    // silently dropping the fence.
+    let write_fence: Option<WritePathGrant> = match &grant.write_paths {
+        Some(paths) => {
+            let mut fence = WritePathGrant::new(paths, grant.create_only)
+                .map_err(|e| eyre!("fleet worker: invalid write grant: {e}"))?;
+            if let Some(sink) = violation_sink.clone() {
+                fence = fence.with_violation_sink(sink);
+            }
+            Some(fence)
+        }
+        None => None,
+    };
 
     // P1-3-enforce (document, don't type-enforce): the API cannot police
     // sandbox quality, but a no-op sandbox leaves the shell's network reach and
@@ -148,16 +174,28 @@ pub fn build_fleet_worker_registry(
                     .with_max_timeout_secs(max_shell_timeout_secs),
             ),
             "read_file" => r.register(ReadFileTool::new(cwd).with_filesystem_scope(scope)),
-            "write_file" => r.register(
-                WriteFileTool::new(cwd)
+            // #1976 — write_file / edit_file carry the per-path write fence
+            // when granted (deny-wins on top of the fs scope). Under
+            // `create_only` write_file opens `O_CREAT|O_EXCL` and edit_file
+            // is refused outright — enforced inside the tools.
+            "write_file" => {
+                let mut tool = WriteFileTool::new(cwd)
                     .with_filesystem_scope(scope)
-                    .with_file_access(access),
-            ),
-            "edit_file" => r.register(
-                EditFileTool::new(cwd)
+                    .with_file_access(access);
+                if let Some(fence) = &write_fence {
+                    tool = tool.with_write_grant(fence.clone());
+                }
+                r.register(tool);
+            }
+            "edit_file" => {
+                let mut tool = EditFileTool::new(cwd)
                     .with_filesystem_scope(scope)
-                    .with_file_access(access),
-            ),
+                    .with_file_access(access);
+                if let Some(fence) = &write_fence {
+                    tool = tool.with_write_grant(fence.clone());
+                }
+                r.register(tool);
+            }
             "glob" => r.register(GlobTool::new(cwd).with_filesystem_scope(scope)),
             "grep" => r.register(GrepTool::new(cwd).with_filesystem_scope(scope)),
             "list_dir" => r.register(ListDirTool::new(cwd).with_filesystem_scope(scope)),
@@ -309,6 +347,7 @@ mod tests {
             30,
             &grant,
             slot(),
+            None,
         )
         .expect("minimal grant builds");
 
@@ -393,6 +432,7 @@ mod tests {
                 30,
                 &grant,
                 slot(),
+                None,
             )
             .expect("grant builds");
             assert!(
@@ -427,8 +467,10 @@ mod tests {
                 t
             },
             fs: FsGrant::Host,
+            write_paths: None,
+            create_only: false,
         };
-        let reg = build_fleet_worker_registry(cwd, Arc::new(NoSandbox), 30, &grant, slot())
+        let reg = build_fleet_worker_registry(cwd, Arc::new(NoSandbox), 30, &grant, slot(), None)
             .expect("expanded grant builds");
 
         assert!(reg.get("web_fetch").is_some(), "granted web_fetch present");
@@ -470,6 +512,7 @@ mod tests {
             30,
             &grant,
             slot(),
+            None,
         )
         .expect("hosts grant builds");
         assert!(reg.get("web_fetch").is_some());
@@ -499,6 +542,7 @@ mod tests {
             30,
             &grant,
             slot(),
+            None,
         )
         .expect("full grant builds");
         assert!(reg.get("web_fetch").is_some());
@@ -526,6 +570,7 @@ mod tests {
             30,
             &grant,
             slot(),
+            None,
         );
         let err = result
             .err()
@@ -549,6 +594,7 @@ mod tests {
             30,
             &WorkerGrant::minimal(),
             slot(),
+            None,
         )
         .expect("minimal grant builds");
         let shell = reg.get("shell").expect("shell tool present");
@@ -572,6 +618,69 @@ mod tests {
             "trailing-& background must be refused, got: {}",
             ampersand.output
         );
+    }
+
+    /// #1976 — a `write_paths` grant BINDS into the built registry: the
+    /// worker's write_file enforces the allowlist (create allowed inside,
+    /// refused outside) and the factory's violation sink records the
+    /// `[denied]` audit. This is the worker-side wiring acceptance (the
+    /// enforcement mechanics themselves are proved in octos-agent).
+    #[tokio::test]
+    async fn write_grant_binds_into_worker_registry_and_records_denials() {
+        use octos_agent::tools::write_grant::{DENIED_MARKER, WriteGrantViolation};
+        use std::sync::Mutex;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let grant = WorkerGrant {
+            write_paths: Some(vec!["exemplar.card".into()]),
+            create_only: true,
+            ..WorkerGrant::minimal()
+        };
+        let seen: Arc<Mutex<Vec<WriteGrantViolation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let reg = build_fleet_worker_registry(
+            cwd.path(),
+            Arc::new(NoSandbox),
+            30,
+            &grant,
+            slot(),
+            Some(Arc::new(move |v| sink_seen.lock().unwrap().push(v))),
+        )
+        .expect("fenced grant builds");
+
+        let write_file = reg.get("write_file").expect("write_file present");
+        // Allowlisted create passes.
+        let ok = write_file
+            .execute(&serde_json::json!({"path": "exemplar.card", "content": "v1\n"}))
+            .await
+            .unwrap();
+        assert!(ok.success, "granted create must pass: {}", ok.output);
+        // Non-allowlisted write is refused + recorded.
+        let denied = write_file
+            .execute(&serde_json::json!({"path": "app.md", "content": "no\n"}))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert!(denied.output.contains(DENIED_MARKER), "{}", denied.output);
+        assert!(!cwd.path().join("app.md").exists());
+        // create_only edit_file is refused outright.
+        let edit = reg.get("edit_file").expect("edit_file present");
+        let edit_denied = edit
+            .execute(&serde_json::json!({
+                "path": "exemplar.card", "old_string": "v1", "new_string": "v2",
+            }))
+            .await
+            .unwrap();
+        assert!(!edit_denied.success, "create_only refuses edit");
+
+        let events = seen.lock().unwrap();
+        assert!(
+            events.len() >= 2,
+            "each refusal records to the sink, got {}",
+            events.len()
+        );
+        assert!(events.iter().all(|v| v.detail.contains(DENIED_MARKER)));
+        assert_eq!(events[0].workspace, cwd.path());
     }
 
     /// Discriminator: proves the audit above is not vacuous — the FULL

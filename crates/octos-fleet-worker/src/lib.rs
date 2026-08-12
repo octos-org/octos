@@ -56,6 +56,7 @@ use std::time::Duration;
 
 use eyre::Result;
 use octos_agent::sandbox::Sandbox;
+use octos_agent::tools::write_grant::WriteGrantViolationSink;
 use octos_agent::{Agent, AgentConfig, ToolRegistry};
 use octos_core::AgentId;
 use octos_fleet::WorkerGrant;
@@ -91,6 +92,13 @@ pub struct SandboxGrant {
     /// The repo `.git` common dir to rw-bind beyond the cwd (operator
     /// `FsGrant::Host` worktree worker), or `None` for a cwd-only worker.
     pub repo_git_dir: Option<PathBuf>,
+    /// #1976 — the per-path SHELL write fence: the grant's `write_paths`
+    /// (workspace-relative globs), or `None` for an unfenced worker. The host
+    /// factory folds this onto `SandboxConfig::write_allow_globs`; macOS
+    /// expresses it as SBPL regex rules, other backends degrade the workspace
+    /// to read-only for the shell (documented on the config field). Mutually
+    /// exclusive with `repo_git_dir` (a fence excludes `FsGrant::Host`).
+    pub write_allow_globs: Option<Vec<String>>,
 }
 
 /// A per-attempt sandbox factory: given a working directory AND the
@@ -120,6 +128,11 @@ pub struct AgentFactory {
     sandbox_factory: SandboxFactory,
     max_iterations: u32,
     max_tokens: Option<u32>,
+    /// #1976 — optional `[denied]` write-grant violation sink, threaded onto
+    /// every AGENT registry this factory builds. The host (serve.rs) wires it
+    /// to the goal ledger so a fenced worker's refusal is durable, not just a
+    /// transcript line. `None` (default) = tool-error + tracing only.
+    violation_sink: Option<WriteGrantViolationSink>,
 }
 
 impl AgentFactory {
@@ -142,6 +155,7 @@ impl AgentFactory {
             sandbox_factory,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_tokens: None,
+            violation_sink: None,
         }
     }
 
@@ -169,6 +183,15 @@ impl AgentFactory {
     /// Override the per-attempt total-token ceiling (`None` = unlimited).
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// #1976 — set the `[denied]` write-grant violation sink threaded onto
+    /// every AGENT registry (fenced write_file / edit_file record here on a
+    /// refusal). The host builds one that appends a `[denied]`-class finding
+    /// to the offending task's goal ledger.
+    pub fn with_violation_sink(mut self, sink: WriteGrantViolationSink) -> Self {
+        self.violation_sink = Some(sink);
         self
     }
 
@@ -207,7 +230,18 @@ impl AgentFactory {
         grant: &WorkerGrant,
         escalation: EscalationSlot,
     ) -> Result<ToolRegistry> {
-        build_fleet_worker_registry(cwd, sandbox, max_shell_timeout_secs, grant, escalation)
+        // #1976 — thread the factory's violation sink onto the granted
+        // registry. Harmless on the acceptance-validator registry (validators
+        // run `CommandExit` shells, never file tools, so the fence never
+        // fires there); load-bearing on the agent registry.
+        build_fleet_worker_registry(
+            cwd,
+            sandbox,
+            max_shell_timeout_secs,
+            grant,
+            escalation,
+            self.violation_sink.clone(),
+        )
     }
 
     /// The [`AgentConfig`] for an attempt bounded by `deadline`. The per-tool

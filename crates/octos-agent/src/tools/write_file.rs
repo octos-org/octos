@@ -7,6 +7,7 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tracing::warn;
 
+use super::write_grant::WritePathGrant;
 use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 use crate::policy::{FileAccessMode, FilesystemScope};
 
@@ -18,6 +19,9 @@ pub struct WriteFileTool {
     filesystem_scope: FilesystemScope,
     /// Whether writes are permitted.
     file_access: FileAccessMode,
+    /// #1976 — optional per-path write fence. `None` (default, every
+    /// pre-#1976 construction) = writes governed by scope/access alone.
+    write_grant: Option<WritePathGrant>,
 }
 
 impl WriteFileTool {
@@ -27,6 +31,7 @@ impl WriteFileTool {
             base_dir: base_dir.into(),
             filesystem_scope: FilesystemScope::Workspace,
             file_access: FileAccessMode::ReadWrite,
+            write_grant: None,
         }
     }
 
@@ -39,6 +44,15 @@ impl WriteFileTool {
     /// Set the effective file access mode.
     pub fn with_file_access(mut self, file_access: FileAccessMode) -> Self {
         self.file_access = file_access;
+        self
+    }
+
+    /// #1976 — bind a per-path write fence: only allowlisted
+    /// workspace-relative paths are writable (canonical match, deny-wins on
+    /// top of scope/access); under `create_only` they may be CREATED but
+    /// never overwritten (`O_CREAT|O_EXCL`).
+    pub fn with_write_grant(mut self, write_grant: WritePathGrant) -> Self {
+        self.write_grant = Some(write_grant);
         self
     }
 }
@@ -154,22 +168,84 @@ impl Tool for WriteFileTool {
             },
         };
 
-        // Create parent directories if needed
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .wrap_err_with(|| format!("failed to create directories: {}", parent.display()))?;
+        // #1976 — per-path write fence. SECURITY ROUND (codex): the allowlist
+        // decision and the actual open must target the SAME resolved object,
+        // or an attacker who swaps a checked ancestor dir for a symlink
+        // between check and open escapes (leaf `O_NOFOLLOW` guards only the
+        // leaf). So a fenced write does NOT reuse the generic lexical
+        // `write_no_follow` below: `check_write` returns the workspace-relative
+        // path, and `confined_write` re-opens it via a component-wise
+        // `O_NOFOLLOW` `openat` walk — a symlinked (or swapped-to-symlink)
+        // ancestor fails `ELOOP`/`ENOTDIR` at its own component. `create_only`
+        // becomes `O_CREAT|O_EXCL` on that same walked leaf.
+        let fenced = if let Some(grant) = &self.write_grant {
+            let workspace_root = ctx
+                .session_scope
+                .as_ref()
+                .map(|scope| scope.workspace().to_path_buf())
+                .unwrap_or_else(|| self.base_dir.clone());
+            let rel = match grant.check_write(&workspace_root, &path, &input.path, self.name()) {
+                Ok(rel) => rel,
+                Err(denied) => {
+                    return Ok(ToolResult {
+                        output: denied,
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
+            if let Err(e) = super::write_grant::confined_write(
+                workspace_root.clone(),
+                rel,
+                input.content.as_bytes().to_vec(),
+                grant.create_only(),
+            )
+            .await
+            {
+                return Ok(ToolResult {
+                    output: grant.map_confined_error(&e, &workspace_root, &input.path, self.name()),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            true
+        } else {
+            false
+        };
+
+        if !fenced {
+            // Create parent directories if needed (generic, unfenced path).
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.wrap_err_with(|| {
+                    format!("failed to create directories: {}", parent.display())
+                })?;
+            }
+            // Write file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race).
+            if let Err(e) = super::write_no_follow(&path, input.content.as_bytes()).await {
+                return Ok(super::file_io_error(e, &input.path));
+            }
         }
 
-        // Write file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
-        if let Err(e) = super::write_no_follow(&path, input.content.as_bytes()).await {
-            return Ok(super::file_io_error(e, &input.path));
-        }
+        // #1976 SECURITY ROUND 2 (codex): a per-path write fence makes this a
+        // LEAF-FILE operation, not a project mutation — so the post-write
+        // processors that re-resolve the LEXICAL path are SKIPPED under a
+        // fence. Both would breach the fence: the formatter would run an
+        // external tool on a lexical filename, and `snapshot_workspace_change`
+        // lexically derives a repo root and unconditionally creates
+        // dirs/`.gitignore`/`.git`/objects/commits at NON-granted sibling
+        // paths (and an ancestor swap before it re-opens the very TOCTOU the
+        // confined write just closed). A fenced worker is allowlisted to
+        // specific files; it must not trigger repo snapshotting of
+        // lexically-derived siblings. Cache invalidation stays — it is a pure
+        // in-memory, path-keyed operation with no filesystem re-resolution.
+        // `fenced` (set on the confined-write path above) is true iff a fence
+        // is bound: reaching here with `write_grant` Some implies `fenced`.
 
         // #1774: opt-in post-edit formatting. Runs BEFORE cache invalidation
         // and the git snapshot so both observe the final on-disk content.
         // Best-effort by contract — a formatter failure never fails the write.
-        let format_note = if ctx.format_after_edit {
+        // Never runs under a fence (see above).
+        let format_note = if ctx.format_after_edit && !fenced {
             crate::format::post_edit_format_note(&path, &input.content).await
         } else {
             None
@@ -182,14 +258,16 @@ impl Tool for WriteFileTool {
             cache.invalidate(&path);
         }
 
-        if let Err(error) =
-            crate::workspace_git::snapshot_workspace_change(&self.base_dir, &path, "write_file")
-        {
-            warn!(
-                path = %input.path,
-                error = %error,
-                "workspace git snapshot failed after write_file"
-            );
+        if !fenced {
+            if let Err(error) =
+                crate::workspace_git::snapshot_workspace_change(&self.base_dir, &path, "write_file")
+            {
+                warn!(
+                    path = %input.path,
+                    error = %error,
+                    "workspace git snapshot failed after write_file"
+                );
+            }
         }
 
         let line_count = input.content.lines().count();
@@ -607,6 +685,220 @@ mod tests {
         assert!(
             on_disk.contains("fn main() {"),
             "file must be rustfmt-formatted on disk: {on_disk}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1976: per-path write-grant enforcement.
+    // -----------------------------------------------------------------------
+
+    fn fenced_tool(dir: &std::path::Path, patterns: &[&str], create_only: bool) -> WriteFileTool {
+        let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
+        WriteFileTool::new(dir).with_write_grant(
+            crate::tools::write_grant::WritePathGrant::new(&owned, create_only)
+                .expect("test grant compiles"),
+        )
+    }
+
+    #[tokio::test]
+    async fn write_grant_allows_creating_allowlisted_file() {
+        // Acceptance (#1976): a worker granted write:["exemplar.card"],
+        // create_only CAN create exemplar.card via write_file.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fenced_tool(dir.path(), &["exemplar.card"], true);
+
+        let result = tool
+            .execute(&serde_json::json!({"path": "exemplar.card", "content": "v1\n"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "granted create must pass: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("exemplar.card")).unwrap(),
+            "v1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_grant_denies_non_allowlisted_path() {
+        // Acceptance (#1976): the same worker CANNOT write app.md — typed
+        // `[denied]` refusal, file never created, violation never silent.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fenced_tool(dir.path(), &["exemplar.card"], true);
+
+        let result = tool
+            .execute(&serde_json::json!({"path": "app.md", "content": "nope\n"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .output
+                .contains(crate::tools::write_grant::DENIED_MARKER),
+            "refusal must carry the [denied] class: {}",
+            result.output
+        );
+        assert!(
+            !dir.path().join("app.md").exists(),
+            "refused write must not create the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_grant_create_only_refuses_overwrite() {
+        // Acceptance (#1976): create_only = O_CREAT|O_EXCL semantics — the
+        // first create passes, the second write to the SAME allowlisted path
+        // is refused and the content is untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fenced_tool(dir.path(), &["exemplar.card"], true);
+
+        let first = tool
+            .execute(&serde_json::json!({"path": "exemplar.card", "content": "v1\n"}))
+            .await
+            .unwrap();
+        assert!(first.success, "{}", first.output);
+
+        let second = tool
+            .execute(&serde_json::json!({"path": "exemplar.card", "content": "v2\n"}))
+            .await
+            .unwrap();
+        assert!(!second.success, "overwrite must be refused");
+        assert!(
+            second.output.contains("already exists"),
+            "typed create-only refusal: {}",
+            second.output
+        );
+        assert!(
+            second
+                .output
+                .contains(crate::tools::write_grant::DENIED_MARKER)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("exemplar.card")).unwrap(),
+            "v1\n",
+            "refused overwrite must leave the original bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_grant_without_create_only_allows_overwrite_of_allowlisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fenced_tool(dir.path(), &["exemplar.card"], false);
+        for content in ["v1\n", "v2\n"] {
+            let result = tool
+                .execute(&serde_json::json!({"path": "exemplar.card", "content": content}))
+                .await
+                .unwrap();
+            assert!(result.success, "{}", result.output);
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("exemplar.card")).unwrap(),
+            "v2\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_grant_symlinked_ancestor_cannot_reach_allowlisted_name() {
+        // Acceptance (#1976): CANNOT bypass via symlink — `cards` symlinked
+        // outside the workspace makes `cards/a.card` (lexically allowlisted)
+        // resolve outside; the canonical match denies it.
+        use std::os::unix::fs::symlink;
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), ws.path().join("cards")).unwrap();
+
+        let tool = fenced_tool(ws.path(), &["cards/*.card"], false);
+        let result = tool
+            .execute(&serde_json::json!({"path": "cards/a.card", "content": "leak\n"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "symlink bypass must be refused");
+        assert!(
+            !outside.path().join("a.card").exists(),
+            "nothing may land at the symlink target"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_grant_skips_workspace_git_snapshot() {
+        // #1976 security round 2 (codex): a fenced write to an allowlisted
+        // sites/<slug>/index.html must NOT trigger workspace-git snapshotting,
+        // which lexically derives repo root sites/<slug>/ and creates
+        // .gitignore/.git there — NON-granted paths (and reopens the
+        // ancestor-swap window). Assert the snapshot was skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fenced_tool(dir.path(), &["sites/demo/index.html"], false);
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "sites/demo/index.html",
+                "content": "<h1>hi</h1>\n",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "granted create must pass: {}",
+            result.output
+        );
+        assert!(dir.path().join("sites/demo/index.html").exists());
+        assert!(
+            !dir.path().join("sites/demo/.git").exists(),
+            "fence must skip git init",
+        );
+        assert!(
+            !dir.path().join("sites/demo/.gitignore").exists(),
+            "fence must skip .gitignore creation",
+        );
+
+        // Control: the SAME shape WITHOUT a fence DOES snapshot (writes
+        // .gitignore at the derived repo root before git init), so the skip
+        // assertion above is not vacuous.
+        let unfenced = WriteFileTool::new(dir.path());
+        let ctrl = unfenced
+            .execute(&serde_json::json!({
+                "path": "sites/other/index.html",
+                "content": "<h1>c</h1>\n",
+            }))
+            .await
+            .unwrap();
+        assert!(ctrl.success, "{}", ctrl.output);
+        assert!(
+            dir.path().join("sites/other/.gitignore").exists(),
+            "unfenced write must snapshot (control) — else the skip is vacuous",
+        );
+    }
+
+    #[tokio::test]
+    async fn write_grant_skips_post_edit_formatting() {
+        // #1976 security round 2: format-under-fence is a no-op — the external
+        // formatter (which re-resolves the lexical path) is skipped even with
+        // format_after_edit ON, and the bytes stay exactly as written.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fenced_tool(dir.path(), &["gen.rs"], false);
+        let mut ctx = ToolContext::zero();
+        ctx.format_after_edit = true;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "gen.rs", "content": "fn main(){let x=1;}\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains("reformatted") && !result.output.contains("Note:"),
+            "no formatter must run under a fence: {}",
+            result.output,
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("gen.rs")).unwrap(),
+            "fn main(){let x=1;}\n",
+            "fenced write must leave the bytes unformatted",
         );
     }
 

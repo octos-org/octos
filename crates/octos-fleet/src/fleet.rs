@@ -2105,6 +2105,8 @@ mod tests {
             network: crate::grant::NetworkGrant::Hosts(vec!["example.com".into()]),
             tools: vec!["read_file".into(), "write_file".into(), "web_fetch".into()],
             fs: crate::grant::FsGrant::default(),
+            write_paths: None,
+            create_only: false,
         };
         let task = TaskSpec {
             task_id: "a".into(),

@@ -720,6 +720,8 @@ mod tests {
                 network: NetworkGrant::Hosts(vec!["example.com".into()]),
                 tools: vec!["read_file".into(), "write_file".into(), "web_fetch".into()],
                 fs: FsGrant::Host,
+                write_paths: None,
+                create_only: false,
             },
         };
         // PlanTask is nested inside DurablePlan (which carries schema_version);

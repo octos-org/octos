@@ -208,7 +208,17 @@ fn parse_requested_grant(value: Option<&Value>) -> WorkerGrant {
         _ => FsGrant::Workspace,
     };
 
-    WorkerGrant { network, tools, fs }
+    WorkerGrant {
+        network,
+        tools,
+        fs,
+        // #1976 — the escalate valve's REQUESTED grant stays binary in v1: a
+        // fenced worker asking for more asks for the coarse scopes; only the
+        // keeper's `goal_grant` (which parses the full object form) can set a
+        // per-path fence. The request is advisory anyway — the keeper decides.
+        write_paths: None,
+        create_only: false,
+    }
 }
 
 #[cfg(test)]
