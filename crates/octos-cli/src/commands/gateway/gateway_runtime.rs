@@ -1428,6 +1428,10 @@ impl GatewayRuntime {
             plugin_require_signed: config.plugins.require_signed,
             llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
                 .unwrap_or_else(|_| llm_for_compaction.clone()),
+            // #1935 — the INDEPENDENT goal-completion verifier lane
+            // (`sub_providers` key `goal_verifier`); `None` ⇒ the sentinel
+            // accountant grades on the session's own provider (unchanged).
+            goal_verifier_llm: crate::runtime::profile::build_goal_verifier_provider(&config),
             task_query_store: task_query_store.clone(),
             subagent_output_router: subagent_output_router.clone(),
         };

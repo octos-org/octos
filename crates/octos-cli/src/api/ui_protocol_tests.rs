@@ -24345,6 +24345,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         data_dir: data_dir.to_path_buf(),
         config: crate::config::Config::default(),
         llm,
+        goal_verifier_llm: None,
         adaptive_router: None,
         runtime_qos_catalog: None,
         primary_model_id: "m11e-stub".to_string(),
@@ -31711,4 +31712,277 @@ fn event_ledger_recovery_runs_exactly_once_across_concurrent_initializers() {
         synthesized, 1,
         "one recovery → one synthesized orphan terminal, never N interleaved sets"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #1935 — interactive-turn goal-completion sentinel (serve path). Before this,
+// sentinel detection + the independent verifier lived ONLY inside the
+// autonomous `goal_context` accountant: an INTERACTIVE turn whose reply ended
+// in `<goal:complete>` did nothing (only the explicit goal_update tool
+// worked). `run_interactive_sentinel_completion` is the extracted, testable
+// sentinel block `run_standalone_turn`'s interactive branch now calls.
+// ---------------------------------------------------------------------------
+
+/// Call-counting scripted verifier provider for the sentinel tests.
+struct ScriptedSentinelVerifier {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    reply: &'static str,
+    usage: octos_llm::TokenUsage,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for ScriptedSentinelVerifier {
+    async fn chat(
+        &self,
+        _messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(octos_llm::ChatResponse {
+            content: Some(self.reply.to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: self.usage.clone(),
+            provider_index: Some(0),
+        })
+    }
+    fn model_id(&self) -> &str {
+        "scripted-sentinel-verifier"
+    }
+    fn provider_name(&self) -> &str {
+        "scripted-sentinel-verifier"
+    }
+}
+
+/// Done verdict + trailing sentinel: the ACTIVE goal — stored under the
+/// cwd-SCOPED key (#1666) exactly as an AppUI folder session stores it —
+/// flips to `complete`, and the verifier's own token spend is charged into
+/// the goal's `tokens_used` BEFORE the flip (#1958).
+#[tokio::test]
+async fn interactive_sentinel_done_verdict_completes_scoped_goal() {
+    let orchestrator = InProcessAgentOrchestrator::default();
+    let wire = SessionKey::with_profile("sent-prof", "appui", "interactive-done");
+    orchestrator.set_goal_scope(&wire, Some("aaaa111122223333".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: "sent-prof".into(),
+            objective: "ship the interactive sentinel".into(),
+            status: Some("active".into()),
+            token_budget: Some(50_000),
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let pinned = orchestrator.scoped_goal_key(&wire);
+    assert_ne!(pinned, wire, "scope registration must be in effect");
+    let bound_goal_id = orchestrator
+        .active_goal_id(&wire, "sent-prof")
+        .expect("goal binds at dispatch time");
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = std::sync::Arc::new(ScriptedSentinelVerifier {
+        calls: calls.clone(),
+        reply: "DONE",
+        usage: octos_llm::TokenUsage {
+            input_tokens: 33,
+            output_tokens: 3,
+            ..Default::default()
+        },
+    });
+
+    let completed = run_interactive_sentinel_completion(
+        &orchestrator,
+        verifier,
+        &pinned,
+        "sent-prof",
+        &bound_goal_id,
+        "All acceptance criteria pass.\n\n<goal:complete>",
+        None,
+    )
+    .await;
+    assert!(completed, "verified sentinel must complete the goal");
+    assert_eq!(
+        orchestrator.goal_status_for_test(&pinned).as_deref(),
+        Some("complete"),
+        "the SCOPED goal record flips to complete",
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one verifier call is spent",
+    );
+    let (tokens_used, continuations_used, _) = orchestrator
+        .goal_counters_for_test(&pinned)
+        .expect("goal exists under the scoped key");
+    assert_eq!(
+        tokens_used, 36,
+        "verifier usage charged into the goal before the completion flip",
+    );
+    assert_eq!(
+        continuations_used, 0,
+        "an interactive sentinel is not a continuation",
+    );
+}
+
+/// NotDone verdict: the goal STAYS active (the agent's sentinel is only a
+/// claim), but the verifier's real spend is still charged.
+#[tokio::test]
+async fn interactive_sentinel_notdone_verdict_leaves_goal_active() {
+    let orchestrator = InProcessAgentOrchestrator::default();
+    let wire = SessionKey::with_profile("sent-prof", "appui", "interactive-notdone");
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: "sent-prof".into(),
+            objective: "objective with unmet criteria".into(),
+            status: Some("active".into()),
+            token_budget: Some(50_000),
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let bound_goal_id = orchestrator
+        .active_goal_id(&wire, "sent-prof")
+        .expect("goal binds at dispatch time");
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = std::sync::Arc::new(ScriptedSentinelVerifier {
+        calls: calls.clone(),
+        reply: "NOT_DONE: evidence is missing",
+        usage: octos_llm::TokenUsage {
+            input_tokens: 20,
+            output_tokens: 8,
+            ..Default::default()
+        },
+    });
+
+    let completed = run_interactive_sentinel_completion(
+        &orchestrator,
+        verifier,
+        &wire,
+        "sent-prof",
+        &bound_goal_id,
+        "I believe this is finished. <goal:complete>",
+        None,
+    )
+    .await;
+    assert!(!completed, "NotDone verdict must refuse the completion");
+    assert_eq!(
+        orchestrator.goal_status_for_test(&wire).as_deref(),
+        Some("active"),
+        "the goal stays active for the next turn / scheduler tick",
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let (tokens_used, _, _) = orchestrator
+        .goal_counters_for_test(&wire)
+        .expect("goal exists");
+    assert_eq!(tokens_used, 28, "the NotDone verifier call is still spend");
+}
+
+/// Stale dispatch-time binding: when the goal bound at turn start is no
+/// longer the session's current goal (mid-turn clear + recreate), the
+/// sentinel path must refuse WITHOUT spending a verifier call — a Done
+/// verdict for the old objective must never complete the replacement goal.
+#[tokio::test]
+async fn interactive_sentinel_refuses_stale_goal_binding() {
+    let orchestrator = InProcessAgentOrchestrator::default();
+    let wire = SessionKey::with_profile("sent-prof", "appui", "interactive-stale");
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: "sent-prof".into(),
+            objective: "the replacement goal".into(),
+            status: Some("active".into()),
+            token_budget: Some(50_000),
+            transition_actor: None,
+        })
+        .expect("set active goal");
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = std::sync::Arc::new(ScriptedSentinelVerifier {
+        calls: calls.clone(),
+        reply: "DONE",
+        usage: octos_llm::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            ..Default::default()
+        },
+    });
+
+    let completed = run_interactive_sentinel_completion(
+        &orchestrator,
+        verifier,
+        &wire,
+        "sent-prof",
+        "goal_replaced_before_this_turn", // stale dispatch-time binding
+        "Finished. <goal:complete>",
+        None,
+    )
+    .await;
+    assert!(!completed, "stale binding must refuse the completion");
+    assert_eq!(
+        orchestrator.goal_status_for_test(&wire).as_deref(),
+        Some("active"),
+        "the CURRENT goal is untouched by the stale claim",
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no verifier call is spent on a claim for a replaced goal",
+    );
+}
+
+/// No completion claim in the reply: the verifier must not be consulted at
+/// all (the independent check is spent ONLY on actual claims) and nothing
+/// changes on the goal.
+#[tokio::test]
+async fn interactive_sentinel_skips_verifier_without_completion_claim() {
+    let orchestrator = InProcessAgentOrchestrator::default();
+    let wire = SessionKey::with_profile("sent-prof", "appui", "interactive-noclaim");
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: "sent-prof".into(),
+            objective: "long-running objective".into(),
+            status: Some("active".into()),
+            token_budget: Some(50_000),
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let bound_goal_id = orchestrator
+        .active_goal_id(&wire, "sent-prof")
+        .expect("goal binds at dispatch time");
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = std::sync::Arc::new(ScriptedSentinelVerifier {
+        calls: calls.clone(),
+        reply: "DONE",
+        usage: octos_llm::TokenUsage::default(),
+    });
+
+    let completed = run_interactive_sentinel_completion(
+        &orchestrator,
+        verifier,
+        &wire,
+        "sent-prof",
+        &bound_goal_id,
+        "Made progress on step 2 of 5; continuing next turn.",
+        None,
+    )
+    .await;
+    assert!(!completed);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no claim ⇒ no verifier spend",
+    );
+    assert_eq!(
+        orchestrator.goal_status_for_test(&wire).as_deref(),
+        Some("active"),
+    );
+    let (tokens_used, _, _) = orchestrator
+        .goal_counters_for_test(&wire)
+        .expect("goal exists");
+    assert_eq!(tokens_used, 0, "nothing charged without a claim");
 }

@@ -89,14 +89,13 @@ use super::agent_orchestrator::{
     InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
     LoopListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
     default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
-    parse_agent_output_cursor, run_goal_completion_verifier, upsert_background_task_agent,
-    wire_key_from_goal_key,
+    parse_agent_output_cursor, run_goal_completion_verifier_with_usage,
+    upsert_background_task_agent, wire_key_from_goal_key,
 };
 #[cfg(test)]
 use super::agent_orchestrator::{
     AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
 };
-use super::goal_loop_runtime::GoalCompletionVerdict;
 use super::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState,
 };
@@ -30003,6 +30002,101 @@ impl ChildStreamCoalescer {
     }
 }
 
+/// #1935 — interactive-turn goal-completion sentinel (serve path only).
+///
+/// Sentinel detection + the independent verifier used to live ONLY inside the
+/// autonomous `goal_context` accountant, so an INTERACTIVE turn (goal_context
+/// `None`) whose final reply ended in `<goal:complete>` did nothing — only the
+/// explicit `goal_update` tool could complete a goal interactively. This is
+/// the extracted, testable sentinel block `run_standalone_turn`'s interactive
+/// charge path calls for a COMPLETED turn with a dispatch-time goal binding.
+///
+/// Semantics (mirroring the autonomous block):
+/// - Spend the verifier LLM call ONLY when the reply actually claims
+///   completion (`goal_completion_claimed`).
+/// - Stale-goal protection: `bound_goal_id` is the goal snapshotted at
+///   dispatch time (the `interactive_goal_binding` idiom). A
+///   `goal_verification_snapshot` — goal_id + objective captured under ONE
+///   state lock (#1935 codex round 3 TOCTOU) — must still match that
+///   binding, or we refuse WITHOUT spending the verifier call;
+///   `maybe_complete_goal_from_model` re-checks BOTH snapshot fields after
+///   the await, rejecting a mid-verify swap or objective edit.
+/// - #1958 — the verifier's own token usage is charged into the goal (via
+///   the interactive charge path) BEFORE the completion flip, since a
+///   `complete` goal can no longer be charged. The chip repaint is left to
+///   the caller's unconditional interactive `SessionGoalUpdated` push.
+/// - All goal reads/writes go through `pinned_goal_key` — the cwd-SCOPED
+///   store key pinned at turn start (`turn_pinned_goal_key` idiom, codex
+///   High #3) — never a turn-end re-resolve of the last-writer-wins scope
+///   map. The router context restores wire-session attribution around the
+///   verifier call exactly like the autonomous sites (#1958 codex #3).
+///
+/// Returns whether the goal was flipped to `complete`.
+async fn run_interactive_sentinel_completion(
+    orchestrator: &InProcessAgentOrchestrator,
+    verifier_provider: Arc<dyn octos_llm::LlmProvider>,
+    pinned_goal_key: &SessionKey,
+    charge_profile: &str,
+    bound_goal_id: &str,
+    reply: &str,
+    ledger_data_dir: Option<&Path>,
+) -> bool {
+    // Loop-engineering completion gate: only spend the INDEPENDENT verifier
+    // LLM call when the agent actually CLAIMS completion.
+    if !orchestrator.goal_completion_claimed(reply) {
+        return false;
+    }
+    // #1935 codex round 3 (TOCTOU) — one-lock snapshot of (goal_id,
+    // objective); no goal / wrong profile ⇒ nothing to verify.
+    let Some(snapshot) = orchestrator.goal_verification_snapshot(pinned_goal_key, charge_profile)
+    else {
+        return false;
+    };
+    // Dispatch-time binding check: a goal cleared+recreated mid-turn must
+    // neither be graded against the OLD turn's claim nor spend a verifier
+    // call on it.
+    if snapshot.goal_id != bound_goal_id {
+        tracing::warn!(
+            session_id = %pinned_goal_key,
+            bound_goal_id = %bound_goal_id,
+            current_goal_id = %snapshot.goal_id,
+            "interactive sentinel: goal changed since dispatch — stale claim refused"
+        );
+        return false;
+    }
+    // #1958 (codex #3) — the sentinel verifier runs AFTER the turn's routing
+    // scopes ended; restore originating-session attribution around it. The
+    // event carries the WIRE id, so strip the cwd scope off the pinned key.
+    let (verdict, verifier_usage) = octos_llm::with_router_context(
+        octos_llm::RouterContext {
+            session_id: Some(wire_key_from_goal_key(pinned_goal_key).to_string()),
+            ..Default::default()
+        },
+        run_goal_completion_verifier_with_usage(verifier_provider, &snapshot.objective, reply),
+    )
+    .await;
+    // #1958 — fold the verifier's real spend into the goal before the flip.
+    // The returned chip event is intentionally dropped: the caller's
+    // unconditional interactive repaint pushes the final snapshot.
+    let _ = orchestrator.charge_goal_verifier_usage(
+        pinned_goal_key,
+        charge_profile,
+        Some(&snapshot.goal_id),
+        &verifier_usage,
+    );
+    orchestrator.maybe_complete_goal_from_model(
+        pinned_goal_key,
+        charge_profile,
+        reply,
+        &verdict,
+        // #1935 codex round 3 — both snapshot fields are re-checked against
+        // the live record inside; a mid-verify swap or objective edit refuses.
+        &snapshot,
+        // #1957 (codex #1) — sync a sentinel completion into the ledger.
+        ledger_data_dir,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -30317,7 +30411,13 @@ async fn run_standalone_turn(
     // (the pattern is identical: enumerate + filter idx >= pre +
     // non-empty + last). Snapshot once when either context is Some
     // so we don't lock `sessions` twice on the hot path.
-    let needs_pre_assistant_count = loop_id_for_self_paced.is_some() || goal_context.is_some();
+    //
+    // #1935 — an INTERACTIVE turn bound to an active goal also needs the
+    // pre-count: its post-turn sentinel detector reads the same "last
+    // assistant message persisted by THIS turn" to spot a trailing
+    // `<goal:complete>` claim.
+    let needs_pre_assistant_count =
+        loop_id_for_self_paced.is_some() || goal_context.is_some() || interactive_goal_id.is_some();
     let pre_assistant_count_for_post_turn: Option<usize> = if needs_pre_assistant_count {
         let mut guard = sessions.lock().await;
         let session = guard.get_or_create(&session_id).await;
@@ -33495,6 +33595,58 @@ async fn run_standalone_turn(
                     }
                 }
             }
+            // #1935 — interactive sentinel detection: a completed
+            // interactive turn whose final reply claims `<goal:complete>`
+            // runs the INDEPENDENT verifier and, on a Done verdict, flips
+            // the bound goal to `complete` — parity with the autonomous
+            // `goal_context` accountant below, which was previously the
+            // ONLY sentinel path (an interactive completion claim did
+            // nothing unless the model used the `goal_update` tool).
+            // Detection reads the LAST assistant message persisted by THIS
+            // turn (the shared pre-count pattern). Runs while the in-flight
+            // guard is still held, so a concurrent `GoalContinue` drain
+            // stays deferred until the verdict lands. The chip repaint is
+            // NOT pushed here — the unconditional interactive
+            // `SessionGoalUpdated` push at the end of this function emits
+            // the final snapshot (including the completion + the verifier
+            // charge) via the same `turn_pinned_goal_key`.
+            let pre = pre_assistant_count_for_post_turn.unwrap_or(0);
+            let interactive_reply: Option<String> = {
+                let mut guard = sessions_for_reschedule.lock().await;
+                let session = guard.get_or_create(&session_id).await;
+                let history = session.get_history(usize::MAX);
+                history
+                    .iter()
+                    .filter(|message| matches!(message.role, MessageRole::Assistant))
+                    .enumerate()
+                    .filter(|(idx, _)| *idx >= pre)
+                    .filter(|(_, message)| !message.content.is_empty())
+                    .last()
+                    .map(|(_, message)| message.content.clone())
+            };
+            if let Some(reply) = interactive_reply {
+                // #1935 — grade on the INDEPENDENT verifier lane when the
+                // profile configures one (`sub_providers` key
+                // `goal_verifier`); otherwise the turn's own provider.
+                let verifier_provider = session_runtime
+                    .profile
+                    .goal_verifier_llm
+                    .clone()
+                    .unwrap_or_else(|| llm_provider.clone());
+                let _ = run_interactive_sentinel_completion(
+                    default_agent_orchestrator(),
+                    verifier_provider,
+                    &turn_pinned_goal_key,
+                    &goal_charge_profile,
+                    charge_goal_id,
+                    &reply,
+                    // #1957 (codex #1) — the goal ledger lives under the
+                    // PROFILE data dir, not the session store root (see the
+                    // autonomous accountant's `goal_ledger_data_dir` note).
+                    Some(session_runtime.profile.data_dir.as_path()),
+                )
+                .await;
+            }
         }
     }
     // #1650 — release the in-flight marker now that the charge has
@@ -34223,53 +34375,79 @@ async fn run_standalone_turn(
         );
         if let Some(reply) = assistant_reply {
             // Loop-engineering completion gate: only spend the INDEPENDENT
-            // verifier LLM call when the agent actually CLAIMS completion.
-            // The verifier judges the objective against the reply evidence
-            // and returns Done/NotDone; maybe_complete_goal_from_model then
-            // requires both the sentinel AND a Done verdict.
-            let (verdict, expected_goal_id) = if orchestrator.goal_completion_claimed(&reply) {
-                let objective = orchestrator
-                    .goal_objective_for_test(goal_key)
-                    .unwrap_or_else(|| "unknown".to_string());
-                // Snapshot goal_id BEFORE the async verifier call to prevent
-                // completing the wrong goal if it changes during the await.
-                let goal_id = orchestrator.goal_id_for_session(goal_key);
+            // verifier LLM call when the agent actually CLAIMS completion —
+            // and only when a goal snapshot exists to verify against. The
+            // verifier judges the objective against the reply evidence and
+            // returns Done/NotDone; maybe_complete_goal_from_model then
+            // requires the sentinel AND a Done verdict AND a live record
+            // still matching the snapshot.
+            //
+            // #1935 codex round 3 (TOCTOU): goal_id + objective are captured
+            // together under ONE state lock (`goal_verification_snapshot`),
+            // so a clear/recreate between two separate reads can no longer
+            // pair the OLD objective with the NEW goal_id (or a
+            // same-objective recreate slip both checks). No goal / wrong
+            // profile ⇒ no snapshot ⇒ no verifier spend.
+            let verification = if orchestrator.goal_completion_claimed(&reply) {
+                orchestrator.goal_verification_snapshot(goal_key, &goal_ctx.profile_id)
+            } else {
+                None
+            };
+            if let Some(snapshot) = verification {
+                // #1935 — grade on the INDEPENDENT verifier lane when the
+                // profile configures one (`sub_providers` key `goal_verifier`);
+                // otherwise the turn's own provider, unchanged.
+                let verifier_provider = session_runtime
+                    .profile
+                    .goal_verifier_llm
+                    .clone()
+                    .unwrap_or_else(|| llm_provider.clone());
                 // #1958 (codex #3) — the sentinel verifier runs AFTER the turn's
                 // routing scopes ended, so restore originating-session
                 // attribution around it (a failover would otherwise publish
                 // unattributed / under another session). Autonomous turns are
                 // Normal policy, so only the router context needs restoring.
-                let verdict = octos_llm::with_router_context(
+                let (verdict, verifier_usage) = octos_llm::with_router_context(
                     octos_llm::RouterContext {
                         session_id: Some(session_id.to_string()),
                         ..Default::default()
                     },
-                    run_goal_completion_verifier(llm_provider.clone(), &objective, &reply),
+                    run_goal_completion_verifier_with_usage(
+                        verifier_provider,
+                        &snapshot.objective,
+                        &reply,
+                    ),
                 )
                 .await;
-                (verdict, goal_id)
-            } else {
-                (
-                    GoalCompletionVerdict::NotDone {
-                        reason: "no completion claimed".to_string(),
-                    },
-                    None,
-                )
-            };
-            // `maybe_complete_goal_from_model` is idempotent and only
-            // flips when `detect_goal_complete_sentinel` matches the
-            // tail of the reply AND the verdict is Done. The return value
-            // is intentionally unused — the goal is either complete now or
-            // stays active and the next scheduler tick decides whether to re-queue.
-            let _ = orchestrator.maybe_complete_goal_from_model(
-                goal_key,
-                &goal_ctx.profile_id,
-                &reply,
-                &verdict,
-                expected_goal_id.as_deref(),
-                // #1957 (codex #1) — sync a sentinel completion into the ledger.
-                Some(goal_ledger_data_dir.as_path()),
-            );
+                // #1958 — the verifier call is real goal spend: fold it into
+                // the goal's tokens_used via the scoped key, BEFORE the
+                // completion flip below (a `complete` goal can no longer be
+                // charged). The returned chip event is dropped on purpose —
+                // the unconditional post-accountant push below emits the
+                // final snapshot (including this charge) to the owning
+                // connection.
+                let _ = orchestrator.charge_goal_verifier_usage(
+                    goal_key,
+                    &goal_ctx.profile_id,
+                    Some(&snapshot.goal_id),
+                    &verifier_usage,
+                );
+                // `maybe_complete_goal_from_model` is idempotent and only
+                // flips when `detect_goal_complete_sentinel` matches the
+                // tail of the reply AND the verdict is Done. The return value
+                // is intentionally unused — the goal is either complete now or
+                // stays active and the next scheduler tick decides whether to
+                // re-queue.
+                let _ = orchestrator.maybe_complete_goal_from_model(
+                    goal_key,
+                    &goal_ctx.profile_id,
+                    &reply,
+                    &verdict,
+                    &snapshot,
+                    // #1957 (codex #1) — sync a sentinel completion into the ledger.
+                    Some(goal_ledger_data_dir.as_path()),
+                );
+            }
         }
         // #1696/#1698 — push the post-turn goal snapshot to the OWNING
         // connection so autonomous transitions repaint the chip live:
