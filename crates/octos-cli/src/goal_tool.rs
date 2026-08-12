@@ -1200,6 +1200,62 @@ impl GoalUpdateTool {
     }
 }
 
+/// Max ledger findings folded into the completion evidence, and the per-finding
+/// assertion budget, so a large ledger cannot blow the verifier's input context.
+const MAX_LEDGER_EVIDENCE_FINDINGS: usize = 24;
+const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 600;
+
+/// Assemble the completion evidence the INDEPENDENT verifier judges.
+///
+/// The verifier grades whether the objective is met by "concrete evidence in
+/// the reply" ([`crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage`]).
+/// For a single-agent goal that reply IS the evidence. But in the PEER-GOAL
+/// model the concrete evidence is recorded by goal-scoped peers into the durable
+/// ledger, NOT re-typed into the master's completion reply — so a
+/// genuinely-complete goal (findings recorded, coverage proven) was rejected as
+/// "merely asserted" and the master looped retrying (observed live: 8 retries /
+/// 527K goal tokens before a human interrupt, with the verifier itself naming
+/// "no ledger content" as the gap). Folding the durable ledger findings into the
+/// evidence lets the verifier judge against what was actually recorded.
+///
+/// `ledger_findings` are the `{created_by, kind, assertion, ...}` objects from
+/// [`crate::api::agent_orchestrator::AgentOrchestrator::model_goal_ledger_findings`].
+/// Empty (single-agent goals, or no ledger) returns the reason unchanged —
+/// exact pre-existing behavior.
+fn completion_evidence_with_ledger(reason: &str, ledger_findings: &[Value]) -> String {
+    if ledger_findings.is_empty() {
+        return reason.to_string();
+    }
+    let mut rendered = String::new();
+    for (i, f) in ledger_findings
+        .iter()
+        .take(MAX_LEDGER_EVIDENCE_FINDINGS)
+        .enumerate()
+    {
+        let by = f.get("created_by").and_then(Value::as_str).unwrap_or("?");
+        let kind = f.get("kind").and_then(Value::as_str).unwrap_or("finding");
+        let assertion = f.get("assertion").and_then(Value::as_str).unwrap_or("");
+        let assertion = octos_core::truncated_utf8(
+            assertion,
+            MAX_LEDGER_EVIDENCE_ASSERTION_CHARS,
+            " …[truncated]",
+        );
+        rendered.push_str(&format!("{}. [{by}] ({kind}) {assertion}\n", i + 1));
+    }
+    let extra = ledger_findings
+        .len()
+        .saturating_sub(MAX_LEDGER_EVIDENCE_FINDINGS);
+    if extra > 0 {
+        rendered.push_str(&format!(
+            "… (+{extra} more finding(s) recorded in the ledger)\n"
+        ));
+    }
+    format!(
+        "{reason}\n\n--- Durable goal-ledger findings (recorded by goal-scoped \
+peers/tasks; the authoritative evidence of the work performed) ---\n{rendered}"
+    )
+}
+
 #[async_trait]
 impl Tool for GoalUpdateTool {
     fn name(&self) -> &str {
@@ -1348,11 +1404,23 @@ impl Tool for GoalUpdateTool {
                 .verifier_llm
                 .clone()
                 .unwrap_or_else(|| ctx.llm_provider.clone());
+            // In the peer-goal model the concrete completion evidence lives in
+            // the durable ledger (goal-scoped peers record findings there), not
+            // in the master's reply. Fold those findings into the evidence so the
+            // reply-only verifier can confirm a genuinely-complete goal instead
+            // of looping on "no ledger content". Empty ledger (single-agent goal,
+            // or no data_dir wired) → reason unchanged.
+            let ledger_findings = self
+                .data_dir
+                .as_ref()
+                .map(|dd| orchestrator.model_goal_ledger_findings(dd, &snapshot.goal_id))
+                .unwrap_or_default();
+            let evidence = completion_evidence_with_ledger(reason, &ledger_findings);
             let (verdict, usage) =
                 crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage(
                     verifier_provider,
                     &snapshot.objective,
-                    reason,
+                    &evidence,
                 )
                 .await;
             // #1935 round 5 — exactly-once direct charge, while the goal is
@@ -1945,6 +2013,210 @@ mod tests {
         fn provider_name(&self) -> &str {
             "counting-verifier"
         }
+    }
+
+    /// Captures the Debug of the messages the verifier is called with, so a
+    /// test can assert exactly what evidence reached the independent verifier.
+    struct CapturingVerifierProvider {
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
+        reply: &'static str,
+    }
+
+    #[async_trait]
+    impl octos_llm::LlmProvider for CapturingVerifierProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            *self.captured.lock().unwrap() = format!("{messages:?}");
+            Ok(octos_llm::ChatResponse {
+                content: Some(self.reply.to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: Some(0),
+            })
+        }
+        fn model_id(&self) -> &str {
+            "capturing-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "capturing-verifier"
+        }
+    }
+
+    #[test]
+    fn completion_evidence_folds_ledger_findings_into_the_reply() {
+        let findings = vec![
+            json!({"created_by":"peer:audit-auth","kind":"observation","assertion":"PLANTED_AUTH hardcoded credential DB_PASSWORD at src/auth.py:2"}),
+            json!({"created_by":"peer:audit-parse","kind":"observation","assertion":"PLANTED_PARSE off-by-one buf[len(buf)] at src/parse.py:3"}),
+        ];
+        let evidence =
+            completion_evidence_with_ledger("both files audited; findings recorded", &findings);
+        // the master's own reply is preserved
+        assert!(
+            evidence.contains("both files audited"),
+            "reply preserved: {evidence}"
+        );
+        // AND the concrete ledger evidence the reply-only verifier previously missed
+        assert!(
+            evidence.contains("PLANTED_AUTH"),
+            "auth finding must reach the verifier: {evidence}"
+        );
+        assert!(
+            evidence.contains("PLANTED_PARSE"),
+            "parse finding must reach the verifier: {evidence}"
+        );
+        assert!(
+            evidence.contains("peer:audit-auth"),
+            "finding author attributed: {evidence}"
+        );
+    }
+
+    #[test]
+    fn completion_evidence_is_reply_only_when_ledger_empty() {
+        // back-compat: single-agent goals (no ledger findings) unchanged.
+        assert_eq!(
+            completion_evidence_with_ledger("done: X and Y verified", &[]),
+            "done: X and Y verified",
+        );
+    }
+
+    #[test]
+    fn completion_evidence_bounds_a_large_ledger() {
+        let findings: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({"created_by":"peer:x","kind":"observation","assertion":format!("finding number {i}")})
+            })
+            .collect();
+        let evidence = completion_evidence_with_ledger("all done", &findings);
+        assert!(evidence.contains("finding number 0"));
+        assert!(
+            !evidence.contains("finding number 30"),
+            "must not dump all 100 findings: {evidence}"
+        );
+        assert!(
+            evidence.contains("+76 more"),
+            "the capped remainder is noted: {evidence}"
+        );
+    }
+
+    #[test]
+    fn completion_evidence_truncates_a_giant_assertion() {
+        let big = "Z".repeat(5000);
+        let findings = vec![json!({"created_by":"peer:x","kind":"observation","assertion":big})];
+        let evidence = completion_evidence_with_ledger("done", &findings);
+        assert!(
+            evidence.len() < 2000,
+            "a giant assertion is bounded: len={}",
+            evidence.len()
+        );
+    }
+
+    /// The peer-goal convergence fix (soaked live 2026-08-12): `goal_update`
+    /// completion must fold the DURABLE ledger findings into the evidence the
+    /// independent verifier judges — not only the master's reply. Without this a
+    /// genuinely-complete peer goal (findings recorded, coverage proven) is
+    /// rejected as "merely asserted" and the master loops. Proven here by
+    /// capturing the exact prompt the verifier receives.
+    #[tokio::test]
+    async fn goal_update_folds_ledger_findings_into_verifier_evidence() {
+        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("ledger-evidence-prof:api:goal-update-ledger".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "ledger-evidence-prof".to_owned(),
+                objective: "audit every file under src/ and record findings".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session)
+            .expect("goal id minted");
+
+        // Seed the goal's DURABLE ledger with a peer finding whose assertion is a
+        // distinctive marker the master's reply does NOT contain.
+        let data_dir = tempfile::tempdir().unwrap();
+        let ledger_dir = data_dir.path().join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger =
+            octos_fleet::GoalLedger::open(ledger_dir.join(format!("{goal_id}.db"))).unwrap();
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: goal_id.clone(),
+                objective: "audit every file under src/ and record findings".to_owned(),
+                status: "active".to_owned(),
+                tokens_used: 0,
+                token_budget: 10_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        ledger
+            .append_finding(&octos_fleet::Finding {
+                rowid: None,
+                finding_id: "f-1".to_owned(),
+                seq: 1,
+                task_id: None,
+                goal_id: goal_id.clone(),
+                kind: "observation".to_owned(),
+                lifecycle: "observed".to_owned(),
+                confidence: "high".to_owned(),
+                review_state: "unreviewed".to_owned(),
+                assertion: "PLANTED_LEDGER_EVIDENCE off-by-one over-read at src/parse.py:3"
+                    .to_owned(),
+                evidence: None,
+                config_version: None,
+                derived_from: None,
+                supersedes: Vec::new(),
+                cost_tokens: 0,
+                created_at_ms: 1_000,
+                created_by: "peer:audit-parse".to_owned(),
+            })
+            .unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let verifier = std::sync::Arc::new(CapturingVerifierProvider {
+            captured: captured.clone(),
+            reply: "DONE",
+        });
+
+        let tool = GoalUpdateTool::new("ledger-evidence-prof")
+            .with_data_dir(data_dir.path().to_path_buf())
+            .with_verifier_provider(verifier);
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &json!({
+                    "status": "complete",
+                    "reason": "Both files under src/ audited; findings recorded in the ledger."
+                }),
+            )
+            .await
+            .expect("goal_update runs");
+        assert!(result.success, "verified completion: {}", result.output);
+
+        let prompt = captured.lock().unwrap().clone();
+        assert!(
+            prompt.contains("PLANTED_LEDGER_EVIDENCE"),
+            "the durable ledger finding must reach the independent verifier's evidence; prompt was:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Both files under src/ audited"),
+            "the master's own reply is also present: {prompt}"
+        );
     }
 
     /// #1935 — when the profile configures a `goal_verifier` sub-provider

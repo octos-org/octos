@@ -443,6 +443,14 @@ jobs:
       - name: Peer staging + worktree fencing (octos-cli)
         run: cargo test -p octos-cli --features api peer
 
+      # The goal-completion verifier's ledger-evidence fold lives in the
+      # `api`-gated goal_tool module, so the unfeatured runs above never compile
+      # it. Guards the peer-goal convergence fix (#1989): a genuinely-complete
+      # goal must verify against the durable ledger findings, not the master's
+      # reply alone, or the master loops until its token budget drains.
+      - name: Goal completion verifier ledger evidence (octos-cli)
+        run: cargo test -p octos-cli --features api -- completion_evidence goal_update_folds_ledger --nocapture
+
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
