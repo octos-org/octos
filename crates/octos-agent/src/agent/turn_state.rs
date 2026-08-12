@@ -191,6 +191,13 @@ impl LoopTurnState {
         });
     }
 
+    // NOTE: `attach_partial_usage` / `PartialTurnUsage` (below) is how an
+    // error EXIT of the loop carries this `total_usage` out. The happy path
+    // returns it via `ConversationResponse.token_usage` / `TaskResult`, but a
+    // bare `return Err(report)` on an error/interrupt would otherwise drop it
+    // (`eyre::Report` has no usage channel), so an errored/rate-limited peer
+    // or goal turn charges 0 tokens (issue #1969).
+
     // NOTE: `new_messages` / `new_output_start` were removed in NEW-16
     // (fix/persist-from-append-only-turn-log-not-mutated-buffer).
     //
@@ -209,9 +216,88 @@ impl LoopTurnState {
     // shift OLD rows into it.
 }
 
+/// Downcastable carrier for a turn's accumulated token usage, attached to the
+/// eyre error when the agent loop bails on an error/interrupt (issue #1969).
+///
+/// The happy path surfaces per-turn usage via `ConversationResponse.token_usage`
+/// / `TaskResult.token_usage`. Every error exit, though, was a bare
+/// `return Err(report)` and `eyre::Report` has no usage channel — so the
+/// turn's real spend was dropped and a downstream peer/goal accountant charged
+/// 0 tokens for a turn that had already burned real tokens before failing.
+///
+/// Attach via [`attach_partial_usage`]. It uses eyre's `wrap_err`, which is the
+/// ONE attachment mechanism that keeps the wrapped report downcastable to BOTH
+/// this carrier AND the original error (e.g. `LlmError`). That dual-downcast is
+/// load-bearing: `HarnessError::classify_report` and the CLI's
+/// `classify_runtime_error_message` reach the underlying `LlmError` (via
+/// `Report::downcast_ref` and via `chain()` + std downcast respectively) to
+/// drive retry/breaker classification, and must keep working through the
+/// wrapper.
+#[derive(Debug, Clone)]
+pub struct PartialTurnUsage {
+    /// The turn's accumulated usage at the moment it bailed.
+    pub total: TokenUsage,
+    /// The wrapped error's outer `Display`, captured at attach time. Because
+    /// `wrap_err` makes THIS carrier the outermost layer, reproducing the
+    /// original message here keeps `report.to_string()` (and the
+    /// `classify_runtime_error_message` fallback) reporting the real error
+    /// instead of a usage note.
+    display: String,
+}
+
+impl std::fmt::Display for PartialTurnUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+
+/// Attach a turn's accumulated `total` usage to an outgoing error WITHOUT
+/// hiding the original error (issue #1969).
+///
+/// `wrap_err` layers a [`PartialTurnUsage`] context over `err`; the inner
+/// error stays reachable through both eyre's `Report::downcast_ref` and
+/// `chain()` + std downcast, so classification/retry logic is unchanged. The
+/// captured display string keeps the wrapper's own `Display` equal to the
+/// original error's outer message.
+pub(crate) fn attach_partial_usage(err: eyre::Report, total: TokenUsage) -> eyre::Report {
+    let display = err.to_string();
+    err.wrap_err(PartialTurnUsage { total, display })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_carry_usage_and_preserve_inner_error_when_attached() {
+        use octos_llm::LlmError;
+        // A Report built FROM an LlmError, mirroring the loop's LLM bail.
+        let report: eyre::Report = LlmError::rate_limited(Some(2)).into();
+        let original = report.to_string();
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+
+        let wrapped = attach_partial_usage(report, usage);
+
+        // Carrier is extractable with the accumulated totals.
+        let carried = wrapped
+            .downcast_ref::<PartialTurnUsage>()
+            .expect("carrier attached");
+        assert_eq!(carried.total.input_tokens, 1_000);
+        assert_eq!(carried.total.output_tokens, 500);
+        // Inner LlmError still reachable (classification/retry logic).
+        assert!(wrapped.downcast_ref::<LlmError>().is_some());
+        assert!(
+            wrapped
+                .chain()
+                .any(|c| c.downcast_ref::<LlmError>().is_some())
+        );
+        // Outer Display unchanged (no usage note buried the real message).
+        assert_eq!(wrapped.to_string(), original);
+    }
 
     #[test]
     fn records_explicit_budget_terminal_reason() {

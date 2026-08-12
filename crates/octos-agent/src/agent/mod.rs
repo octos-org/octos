@@ -39,6 +39,7 @@ use verifier::AgentVerifierConfig;
 
 pub use message_repair::normalize_tool_call_id;
 pub use realtime::RealtimeController;
+pub use turn_state::PartialTurnUsage;
 
 tokio::task_local! {
     /// Task-local reporter override.  When set (via `TASK_REPORTER.scope()`),
