@@ -15236,12 +15236,14 @@ fn peer_respond_resolve(
 /// #1965 — `tokens_consumed` is the turn's accumulated token spend (the same
 /// `final_tokens_consumed` total the master goal accountants charge from).
 /// When the peer is goal-bound, the finding write below charges it against
-/// the master goal's shared budget pool. Honesty (codex round): only a
-/// COMPLETED turn carries real usage — the agent loop bails with a bare
-/// `Err` that discards the turn's accumulated usage, so the errored /
-/// rate-limited arm threads 0, and an interrupted turn never reaches this
-/// writer at all. Those turns currently UNDER-charge the goal; preserving
-/// partial usage across the loop's error path is a tracked follow-up.
+/// the master goal's shared budget pool. #1969 — both COMPLETED and
+/// ERRORED/rate-limited turns now carry real usage: the agent loop attaches
+/// the turn total to the bailed error (`PartialTurnUsage`) and the `error`
+/// arm folds it into `final_tokens_consumed`, so a peer that burned tokens
+/// before failing charges its real spend. Residual gap: an INTERRUPTED turn
+/// aborts the agent task before it can report usage (and this path has no
+/// shared token tracker to read post-abort), so it still threads 0 and never
+/// reaches this writer — tracked as a follow-up.
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
@@ -33277,9 +33279,36 @@ async fn run_standalone_turn(
                 // — HTTP 403 ..."` instead. Downcast and re-classify
                 // so the SPA sees the actionable text.
                 let wire_message = classify_runtime_error_message(&error);
+                // #1969 — the agent loop now attaches the turn's accumulated
+                // usage to the bailed error (`PartialTurnUsage`, via
+                // `attach_partial_usage`). Surface it on the error event —
+                // mirroring the `done` event's `tokens_in`/`tokens_out`/
+                // `tokens_cache` — so the drain loop can fold it into
+                // `final_tokens_consumed`. Without this an errored/rate-limited
+                // peer or goal turn that burned real tokens before failing
+                // under-charges the goal by 0. `downcast_ref` still sees the
+                // carrier through the `LlmError` classification above (both stay
+                // reachable: `wrap_err` layers the carrier without hiding the
+                // inner error). Absent carrier (non-loop error) → zeros, the
+                // pre-#1969 behaviour.
+                let (err_tokens_in, err_tokens_out, err_tokens_cache) = error
+                    .downcast_ref::<octos_agent::PartialTurnUsage>()
+                    .map(|partial| {
+                        let usage = &partial.total;
+                        (
+                            u64::from(usage.input_tokens),
+                            u64::from(usage.output_tokens),
+                            u64::from(usage.cache_read_tokens)
+                                + u64::from(usage.cache_write_tokens),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0));
                 let error = json!({
                     "type": "error",
                     "message": wire_message,
+                    "tokens_in": err_tokens_in,
+                    "tokens_out": err_tokens_out,
+                    "tokens_cache": err_tokens_cache,
                 });
                 let _ = progress_tx_for_result.send(error.to_string()).await;
             }
@@ -33555,6 +33584,24 @@ async fn run_standalone_turn(
                     .and_then(Value::as_str)
                     .unwrap_or("turn failed")
                     .to_string();
+                // #1969 — fold the errored turn's accumulated usage into
+                // `final_tokens_consumed` BEFORE the peer-result write and the
+                // post-turn `record_goal_turn`, mirroring the `done` arm. The
+                // agent loop now attaches the turn total to the bailed error
+                // and the agent task surfaces it on this event, so a peer/goal
+                // turn that burned tokens before failing charges its real spend
+                // instead of under-charging 0. Absent (older/malformed payload,
+                // or a non-loop error with no carrier) → 0, as before.
+                let tokens_in = event.get("tokens_in").and_then(Value::as_u64).unwrap_or(0);
+                let tokens_out = event.get("tokens_out").and_then(Value::as_u64).unwrap_or(0);
+                let tokens_cache = event
+                    .get("tokens_cache")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                final_tokens_consumed = final_tokens_consumed
+                    .saturating_add(tokens_in)
+                    .saturating_add(tokens_out)
+                    .saturating_add(tokens_cache);
                 // Voice fail-fast: a classified `TurnFailure` rode the side
                 // channel. Speak a short apology through the SAME TTS worker as
                 // a normal reply, and DRAIN the worker before the terminal so
@@ -33597,15 +33644,10 @@ async fn run_standalone_turn(
                 } else {
                     TurnTerminalOutcome::Errored
                 };
-                // #1965 — thread the turn total here too so the wiring is
-                // outcome-independent, but be honest: on this arm it is
-                // ALWAYS 0 today. The agent loop bails with a bare `Err`
-                // that discards the turn's accumulated usage, and
-                // `final_tokens_consumed` only folds from `done` — so an
-                // errored/rate-limited peer turn UNDER-charges the goal (it
-                // burned real tokens before failing). Preserving partial
-                // usage across the loop's error path is a tracked follow-up;
-                // the master accountant shares the same gap.
+                // #1965/#1969 — `final_tokens_consumed` now carries the errored
+                // turn's real accumulated spend (folded from this event's token
+                // fields just above), so a goal-bound peer that rate-limited
+                // mid-run charges the master goal instead of 0.
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
@@ -34523,10 +34565,15 @@ async fn run_standalone_turn(
     //      stops recurrence.
     //
     // Token usage comes from `final_tokens_consumed` — populated when the
-    // agent_task's `done` JSON event traversed the main `select!` loop
-    // (`tokens_in + tokens_out`). On interrupt / agent error the value
-    // remains zero, which is the correct conservative behaviour: an
-    // interrupted turn should not exhaust the goal's token budget.
+    // agent_task's `done` OR `error` JSON event traversed the main `select!`
+    // loop (`tokens_in + tokens_out + tokens_cache`). #1969: an ERRORED /
+    // rate-limited turn now charges its real accumulated spend (the loop
+    // attaches the turn total to the bailed error and the `error` arm folds
+    // it), closing the under-charge where a goal turn burned tokens then
+    // failed. On INTERRUPT the value remains zero: the agent task is aborted
+    // before it can report usage and this path holds no shared token tracker
+    // to read post-abort — an interrupted turn simply does not exhaust the
+    // goal's budget (tracked follow-up).
     if let Some(goal_ctx) = goal_context.as_ref() {
         // #1140 codex P2 re-review #2: the turn-start dispatch stamp
         // can go stale on long goal turns (model + tool work > 30s

@@ -79,8 +79,8 @@ pub use abi_schema::{
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
-    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, PromptSegmentProvider,
-    RealtimeController, TASK_REPORTER, TokenTracker,
+    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, PartialTurnUsage,
+    PromptSegmentProvider, RealtimeController, TASK_REPORTER, TokenTracker,
     loop_state::{
         LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
         SHELL_SPIRAL_VARIANT,

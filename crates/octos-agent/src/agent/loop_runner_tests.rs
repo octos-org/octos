@@ -3611,6 +3611,103 @@ async fn doom_loop_aborts_turn_when_third_identical_call_arrives() {
     );
 }
 
+/// #1969 mock: call 1 returns a tool_use that burns real tokens
+/// (input=1000, output=500); call 2 rate-limits. Under FailFast the loop
+/// bails on call 2 — and the accumulated usage from call 1 must ride out on
+/// the error instead of being dropped by the bare `return Err(report)`.
+struct UsageThenRateLimitProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for UsageThenRateLimitProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let n = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        if n == 0 {
+            Ok(tool_use(
+                vec![ToolCall {
+                    id: "call_0".to_string(),
+                    name: "noop_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                1000,
+                500,
+            ))
+        } else {
+            // Typed provider rate-limit; under FailFast the loop bails here.
+            Err(LlmError::rate_limited(Some(2)).into())
+        }
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn should_surface_accumulated_usage_when_llm_errors_after_prior_iteration() {
+    // #1969: the turn accumulates usage in `LoopTurnState.total_usage` and the
+    // happy path returns it via `ConversationResponse.token_usage`. Every error
+    // exit was a bare `return Err(report)`, dropping that usage — so an
+    // errored/rate-limited peer or goal turn charged 0 tokens despite having
+    // burned real tokens on earlier iterations. The bailed error must now carry
+    // the accumulated usage, WITHOUT hiding the underlying `LlmError` that
+    // retry/breaker classification depends on.
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(UsageThenRateLimitProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "noop_tool",
+        "ok",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("usage-error"), provider_arc, tools, memory);
+
+    // FailFast makes call 2's rate-limit terminal (no retry/failover), so the
+    // loop bails deterministically after recording call 1's usage.
+    let err = octos_llm::with_llm_call_policy(
+        octos_llm::LlmCallPolicy::FailFast,
+        agent.process_message("please work", &[], vec![]),
+    )
+    .await
+    .expect_err("rate-limit under FailFast must bail the turn");
+
+    // Constraint: the underlying LlmError must remain downcastable so
+    // `classify_report` / retry-breaker logic still sees the rate limit.
+    assert!(
+        err.downcast_ref::<octos_llm::LlmError>().is_some(),
+        "underlying LlmError must stay downcastable through the usage carrier"
+    );
+
+    // The bailed error carries call 1's accumulated usage.
+    let partial = err
+        .downcast_ref::<crate::PartialTurnUsage>()
+        .expect("bailed error must carry the turn's accumulated usage");
+    assert_eq!(
+        partial.total.input_tokens, 1000,
+        "accumulated input tokens from iteration 1 must survive the error exit"
+    );
+    assert_eq!(
+        partial.total.output_tokens, 500,
+        "accumulated output tokens from iteration 1 must survive the error exit"
+    );
+}
+
 /// LLM mock that alternates between two different argument sets for the
 /// same tool. The doom guard (consecutive identical) must never fire;
 /// the cycle detector (`LoopDetector::record`) owns alternating

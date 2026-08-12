@@ -16,7 +16,7 @@ use super::budget::BudgetStop;
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
-use super::turn_state::{LoopRetryReason, LoopTurnState};
+use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
 use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::harness_errors::HarnessError;
@@ -1163,7 +1163,11 @@ impl Agent {
                     // with a typed error if the controller reports stalled.
                     // A None controller / disabled config is a no-op so the
                     // 830+ existing tests see identical behavior.
-                    self.beat_heartbeat(iteration)?;
+                    // #1969: a heartbeat interrupt/stall is an error EXIT too —
+                    // carry the turn's accumulated usage out with it.
+                    if let Err(e) = self.beat_heartbeat(iteration) {
+                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                    }
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
 
@@ -1259,7 +1263,7 @@ impl Agent {
                                 if let Some(sink) = &self.voice_failure_sink {
                                     let _ = sink.send(crate::TurnFailure::EmptyResponse);
                                 }
-                                return Err(e);
+                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
                             }
                             // Empty response after retries -- try once more (adaptive router
                             // may select a different provider on this second attempt).
@@ -1285,7 +1289,7 @@ impl Agent {
                                 Ok(r) => r,
                                 Err(e) => {
                                     if self.failfast_llm_bail(&e) {
-                                        return Err(e);
+                                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
                                     }
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
@@ -1294,14 +1298,14 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(e),
+                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
                                     }
                                 }
                             }
                         }
                         Err(e) => {
                             if self.failfast_llm_bail(&e) {
-                                return Err(e);
+                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
                             }
                             match self.handle_loop_error_with_dispatch(
                                 &e,
@@ -1310,7 +1314,7 @@ impl Agent {
                                 &mut messages,
                             ) {
                                 LoopErrorAction::Retry => continue,
-                                LoopErrorAction::Bail => return Err(e),
+                                LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
                             }
                         }
                     };
@@ -1695,7 +1699,7 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(e),
+                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
                                     }
                                 }
                             };
@@ -1746,7 +1750,7 @@ impl Agent {
                                     &mut messages,
                                 ) {
                                     LoopErrorAction::Retry => continue,
-                                    LoopErrorAction::Bail => return Err(e),
+                                    LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
                                 }
                             }
 
@@ -2147,7 +2151,10 @@ impl Agent {
                 let iter_start = Instant::now();
                 // Realtime heartbeat beat + stall check (no-op when realtime
                 // is disabled or unattached).
-                self.beat_heartbeat(iteration)?;
+                // #1969: carry accumulated usage out on an interrupt/stall exit.
+                if let Err(e) = self.beat_heartbeat(iteration) {
+                    return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                }
                 self.reporter()
                     .report(ProgressEvent::Thinking { iteration });
 
@@ -2186,7 +2193,7 @@ impl Agent {
                     Ok(pair) => pair,
                     Err(e) => {
                         if self.failfast_llm_bail(&e) {
-                            return Err(e);
+                            return Err(attach_partial_usage(e, turn.total_usage().clone()));
                         }
                         match self.handle_loop_error_with_dispatch(
                             &e,
@@ -2195,7 +2202,7 @@ impl Agent {
                             &mut messages,
                         ) {
                             LoopErrorAction::Retry => continue,
-                            LoopErrorAction::Bail => return Err(e),
+                            LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
                         }
                     }
                 };
@@ -2422,7 +2429,7 @@ impl Agent {
                                 &mut messages,
                             ) {
                                 LoopErrorAction::Retry => continue,
-                                LoopErrorAction::Bail => return Err(e),
+                                LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
                             }
                         }
                         if let Err(e) = self
@@ -2442,7 +2449,7 @@ impl Agent {
                                 &mut messages,
                             ) {
                                 LoopErrorAction::Retry => continue,
-                                LoopErrorAction::Bail => return Err(e),
+                                LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
                             }
                         }
                     }
