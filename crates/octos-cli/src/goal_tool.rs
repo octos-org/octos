@@ -27,7 +27,14 @@ use octos_fleet::{
 };
 use serde_json::{Value, json};
 
-use crate::api::agent_orchestrator::default_agent_orchestrator;
+use crate::api::agent_orchestrator::{
+    AgentOrchestrator, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
+    MonitorListRequest, default_agent_orchestrator,
+};
+use crate::api::monitor_runtime::{
+    MONITOR_DEFAULT_BATCH_MS, MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR, MONITOR_MIN_POLL_INTERVAL_SECS,
+    MonitorMode, MonitorSpec,
+};
 
 /// PR 5a — wall-clock milliseconds for a fleet op (create / dispatch). Matches
 /// the pool's own clock (`chrono::Utc::now().timestamp_millis()`), clamped
@@ -1537,6 +1544,364 @@ impl Tool for GoalCreateTool {
             }),
             Err(message) => Ok(ToolResult {
                 output: format!("goal_create: {message}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// #1977 — `monitor_create`: arm a zero-token background event watcher. A
+/// monitor is a cheap probe subprocess (sanitized env, host-user authority,
+/// NOT confined by a sandbox backend — a tracked follow-up) whose FILTERED
+/// output lines wake this session's master turn — the model runs ONLY when an
+/// event appears, unlike `/loop` which burns a full turn every tick.
+/// Keeper-gated (peers cannot arm monitors) exactly like the `goal_plan`
+/// family.
+pub struct MonitorCreateTool {
+    profile_id: String,
+    data_dir: Option<std::path::PathBuf>,
+}
+
+impl MonitorCreateTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+            data_dir: None,
+        }
+    }
+
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for MonitorCreateTool {
+    fn name(&self) -> &str {
+        "monitor_create"
+    }
+
+    /// Monitor creation mutates the process-global monitor registry and is
+    /// admission-checked against a per-session quota; serialize the family
+    /// like the goal-mutating tools so a parallel batch can't race the quota.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
+    fn description(&self) -> &str {
+        // Truthfulness (codex round blocker 5): the probe runs a keeper-provided
+        // command with sanitized env (BLOCKED_ENV_VARS + credential-looking
+        // names stripped) and HOST-USER authority in the profile data dir. It
+        // is NOT confined by a sandbox backend (bwrap / sandbox-exec) — full
+        // sandbox-backend confinement of the probe is a tracked follow-up
+        // (#1977 residual). Do not describe it as "sandboxed".
+        "Arm a ZERO-TOKEN background monitor: a cheap probe process whose FILTERED output lines \
+         wake you ONLY when something changes — no model tokens are spent while it is quiet. \
+         Use this instead of a /loop when you want \"wake me WHEN Y happens\" rather than \
+         \"do X every N\" (e.g. watch a sqlite row, tail a log for an error line, poll a status \
+         endpoint). `argv` is the probe command, run as a subprocess with sanitized environment \
+         (secret and injection env vars stripped) and your host-user authority in the profile \
+         data dir — it is NOT confined by a sandbox backend, so only run commands you would run \
+         yourself. In poll mode (default) argv runs every `interval_seconds` and you are woken \
+         when its FILTERED output CHANGES; in stream mode argv runs once and every filtered \
+         stdout line is an event. `filter_regex` keeps only matching lines. A monitor that \
+         floods (more than `max_events_per_hour`) auto-pauses with a durable note. \
+         Non-persistent monitors expire after `timeout_secs`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Short human-readable label." },
+                "argv": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The probe command as an argument vector (no shell). e.g. [\"sqlite3\", \"state.db\", \"select status from job\"]."
+                },
+                "filter_regex": {
+                    "type": "string",
+                    "description": "Optional regex; only stdout lines matching it count as events. Omit to match every non-empty line."
+                },
+                "mode": { "type": "string", "enum": ["poll", "stream"], "description": "poll (default): re-run argv on an interval, wake on CHANGE. stream: follow argv's stdout line-by-line." },
+                "interval_seconds": { "type": "integer", "description": "Poll cadence in seconds (poll mode; default 1)." },
+                "timeout_secs": { "type": "integer", "description": "Auto-expire after this many seconds unless persistent." },
+                "persistent": { "type": "boolean", "description": "Never auto-expire (still never survives a server restart as a process; its spec re-arms)." },
+                "max_events_per_hour": { "type": "integer", "description": "Flood cap; over this the monitor auto-pauses (default 60)." }
+            },
+            "required": ["name", "argv"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "monitor_create: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        // Keeper-gated: a peer must not arm monitors that would wake the
+        // master on its behalf — the master owns its own event watchers.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "monitor_create: peers cannot arm monitors — only the master session \
+                         can. Report what you would watch to the master instead."
+                    .into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let argv: Vec<String> = match args.get("argv").and_then(Value::as_array) {
+            Some(items) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            None => Vec::new(),
+        };
+        let filter_regex = args
+            .get("filter_regex")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        // Unknown mode is rejected (blocker 6), not silently coerced to poll.
+        // The schema enum already constrains the model; this is defense in
+        // depth for a direct/unchecked call.
+        let mode = match args.get("mode").and_then(Value::as_str).map(str::trim) {
+            None | Some("") | Some("poll") => MonitorMode::Poll {
+                interval_secs: args
+                    .get("interval_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(MONITOR_MIN_POLL_INTERVAL_SECS),
+            },
+            Some("stream") => MonitorMode::Stream,
+            Some(other) => {
+                return Ok(ToolResult {
+                    output: format!(
+                        "monitor_create: unknown mode `{other}` (use `poll` or `stream`)"
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+        let spec = MonitorSpec {
+            name,
+            argv,
+            filter_regex,
+            batch_ms: MONITOR_DEFAULT_BATCH_MS,
+            mode,
+            timeout_secs: args.get("timeout_secs").and_then(Value::as_u64),
+            persistent: args
+                .get("persistent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            max_events_per_hour: args
+                .get("max_events_per_hour")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR),
+            goal_id: ctx.goal_id.clone(),
+            // Default probe cwd: the profile data dir (ToolContext carries no
+            // workspace root). NOT a sandbox boundary — the probe runs at
+            // host-user authority; the model may pass absolute paths in argv
+            // when it must reach a specific file.
+            cwd: self.data_dir.clone(),
+        };
+        match default_agent_orchestrator().create_monitor(MonitorCreateRequest {
+            session_id,
+            profile_id: self.profile_id.clone(),
+            spec,
+            data_dir: self.data_dir.clone(),
+        }) {
+            Ok(value) => Ok(ToolResult {
+                output: format!(
+                    "monitor created:\n{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(err) => Ok(ToolResult {
+                output: format!("monitor_create: {}", err.message),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// #1977 — `monitor_list`: read the current session's armed monitors.
+pub struct MonitorListTool {
+    profile_id: String,
+}
+
+impl MonitorListTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MonitorListTool {
+    fn name(&self) -> &str {
+        "monitor_list"
+    }
+
+    fn description(&self) -> &str {
+        "List the monitors armed for this session, with their status (active / paused / \
+         expired), mode, and why a paused monitor paused (e.g. flooded)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, _args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "monitor_list: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        // Keeper-gated (codex round blocker 5): monitors belong to the master.
+        // Fence a peer out of even enumerating them, matching monitor_create /
+        // monitor_delete — so the whole family is peer-fenced, not just the
+        // mutators.
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "monitor_list: peers cannot manage the master's monitors.".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        match default_agent_orchestrator().list_monitors(MonitorListRequest {
+            session_id: Some(session_id),
+            profile_id: self.profile_id.clone(),
+        }) {
+            Ok(value) => Ok(ToolResult {
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                success: true,
+                ..Default::default()
+            }),
+            Err(err) => Ok(ToolResult {
+                output: format!("monitor_list: {}", err.message),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// #1977 — `monitor_delete`: disarm a monitor by id. Keeper-gated.
+pub struct MonitorDeleteTool {
+    profile_id: String,
+}
+
+impl MonitorDeleteTool {
+    pub fn new(profile_id: impl Into<String>) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MonitorDeleteTool {
+    fn name(&self) -> &str {
+        "monitor_delete"
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
+    fn description(&self) -> &str {
+        "Disarm a monitor by its `monitor_id` (from monitor_list). Its watcher process is \
+         torn down. Use this when a watch is no longer needed."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "monitor_id": { "type": "string", "description": "The monitor to disarm (from monitor_list)." }
+            },
+            "required": ["monitor_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let Some(session_id) = session_from_ctx(ctx) else {
+            return Ok(ToolResult {
+                output: "monitor_delete: no session context for this turn".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        if is_peer_session(&session_id) {
+            return Ok(ToolResult {
+                output: "monitor_delete: peers cannot manage the master's monitors.".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let Some(monitor_id) = args
+            .get("monitor_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "monitor_delete: `monitor_id` is required".into(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        match default_agent_orchestrator().control_monitor(MonitorControlRequest {
+            monitor_id: monitor_id.to_owned(),
+            session_id: Some(session_id),
+            profile_id: self.profile_id.clone(),
+            kind: MonitorControlKind::Delete,
+        }) {
+            Ok(value) => Ok(ToolResult {
+                output: format!(
+                    "monitor deleted:\n{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Err(err) => Ok(ToolResult {
+                output: format!("monitor_delete: {}", err.message),
                 success: false,
                 ..Default::default()
             }),

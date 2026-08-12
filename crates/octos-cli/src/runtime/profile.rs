@@ -1312,6 +1312,16 @@ impl ProfileRuntime {
                 crate::goal_tool::GoalDenyTool::new(profile.id.clone())
                     .with_data_dir(data_dir.to_path_buf()),
             );
+            // #1977 — zero-token event watchers. Keeper-gated like the
+            // goal_plan family (peers cannot arm monitors). `monitor_create`
+            // carries the profile data_dir so the probe's sandboxed cwd and
+            // the monitor-notes wake sidecar both root there.
+            tools.register(
+                crate::goal_tool::MonitorCreateTool::new(profile.id.clone())
+                    .with_data_dir(data_dir.to_path_buf()),
+            );
+            tools.register(crate::goal_tool::MonitorListTool::new(profile.id.clone()));
+            tools.register(crate::goal_tool::MonitorDeleteTool::new(profile.id.clone()));
         }
 
         // Step 17: re-apply tool policy AFTER plugin / memory-bank

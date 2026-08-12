@@ -53,22 +53,22 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
-    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
-    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -87,9 +87,10 @@ use super::agent_orchestrator::{
     AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
     AgentRequest, AgentUpsert, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest,
     InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
-    LoopListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
+    LoopListRequest, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
+    MonitorListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
     default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
-    parse_agent_output_cursor, run_goal_completion_verifier_with_usage,
+    monitor_invalid_spec_error, parse_agent_output_cursor, run_goal_completion_verifier_with_usage,
     upsert_background_task_agent, wire_key_from_goal_key,
 };
 #[cfg(test)]
@@ -97,7 +98,7 @@ use super::agent_orchestrator::{
     AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
 };
 use super::master_continuation_scheduler::{
-    MasterContinuationReason, MasterContinuationRuntimeState,
+    MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
 };
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
@@ -1852,6 +1853,8 @@ struct ConnectionUiFeatures {
     coding_goal_runtime_v1: bool,
     /// UPCR-2026-021 M15 recurring loop runtime group.
     coding_loop_runtime_v1: bool,
+    /// #1977 zero-token monitor runtime group.
+    coding_monitor_runtime_v1: bool,
     /// UPCR-2026-019 typed backend-owned product review workflow.
     review_start_v1: bool,
     /// M16 backend-owned context generation/checkpoint/compaction lifecycle.
@@ -1942,6 +1945,11 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
             ),
+            coding_monitor_runtime_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+            ),
             review_start_v1: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_REVIEW_START_V1),
             context_lifecycle_v1: has_ui_feature(
                 headers,
@@ -1996,6 +2004,7 @@ impl ConnectionUiFeatures {
             coding_agent_control_v1: true,
             coding_goal_runtime_v1: true,
             coding_loop_runtime_v1: true,
+            coding_monitor_runtime_v1: true,
             review_start_v1: true,
             context_lifecycle_v1: true,
             user_question_v1: true,
@@ -2038,6 +2047,7 @@ impl ConnectionUiFeatures {
             coding_agent_control_v1: has(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
             coding_goal_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1),
             coding_loop_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
+            coding_monitor_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1),
             review_start_v1: has(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
             context_lifecycle_v1: has(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
@@ -2121,6 +2131,9 @@ impl ConnectionUiFeatures {
             if self.coding_loop_runtime_v1 {
                 requested.push(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1);
             }
+            if self.coding_monitor_runtime_v1 {
+                requested.push(UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1);
+            }
         }
         if self.context_lifecycle_v1 {
             requested.push(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1);
@@ -2158,6 +2171,10 @@ impl ConnectionUiFeatures {
 
     fn loop_runtime_available(self) -> bool {
         !self.header_present || (self.coding_autonomy_v1 && self.coding_loop_runtime_v1)
+    }
+
+    fn monitor_runtime_available(self) -> bool {
+        !self.header_present || (self.coding_autonomy_v1 && self.coding_monitor_runtime_v1)
     }
 
     fn review_start_available(self) -> bool {
@@ -8775,6 +8792,42 @@ struct RawLoopCreateParams {
 #[derive(Debug, Deserialize)]
 struct RawLoopIdParams {
     loop_id: String,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+/// #1977 `monitor/create` params. `argv` is the sandboxed probe command;
+/// `mode` selects poll (default, with `interval_seconds`) or stream.
+#[derive(Debug, Deserialize)]
+struct RawMonitorCreateParams {
+    session_id: SessionKey,
+    #[serde(default)]
+    profile_id: Option<String>,
+    name: String,
+    argv: Vec<String>,
+    #[serde(default)]
+    filter_regex: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    interval_seconds: Option<u64>,
+    #[serde(default)]
+    batch_ms: Option<u32>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    persistent: Option<bool>,
+    #[serde(default)]
+    max_events_per_hour: Option<u32>,
+    #[serde(default)]
+    goal_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMonitorIdParams {
+    monitor_id: String,
     #[serde(default)]
     session_id: Option<SessionKey>,
     #[serde(default)]
@@ -15727,7 +15780,7 @@ fn read_and_clear_goal_progress_notes(
 ///   orphaned (unfindable by release N+1). The wake is best-effort (the
 ///   goal ledger is the source of truth), so this is acceptable — but do
 ///   NOT rely on this filename for anything durable.
-fn hash_session_for_inbox(session_id: &str) -> String {
+pub(crate) fn hash_session_for_inbox(session_id: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -17032,6 +17085,11 @@ fn is_autonomy_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::LOOP_PAUSE
             | octos_core::ui_protocol::methods::LOOP_RESUME
             | octos_core::ui_protocol::methods::LOOP_FIRE_NOW
+            | octos_core::ui_protocol::methods::MONITOR_CREATE
+            | octos_core::ui_protocol::methods::MONITOR_LIST
+            | octos_core::ui_protocol::methods::MONITOR_PAUSE
+            | octos_core::ui_protocol::methods::MONITOR_RESUME
+            | octos_core::ui_protocol::methods::MONITOR_DELETE
     )
 }
 
@@ -17055,6 +17113,11 @@ fn autonomy_method_available(method: &str, features: ConnectionUiFeatures) -> bo
         | octos_core::ui_protocol::methods::LOOP_PAUSE
         | octos_core::ui_protocol::methods::LOOP_RESUME
         | octos_core::ui_protocol::methods::LOOP_FIRE_NOW => features.loop_runtime_available(),
+        octos_core::ui_protocol::methods::MONITOR_CREATE
+        | octos_core::ui_protocol::methods::MONITOR_LIST
+        | octos_core::ui_protocol::methods::MONITOR_PAUSE
+        | octos_core::ui_protocol::methods::MONITOR_RESUME
+        | octos_core::ui_protocol::methods::MONITOR_DELETE => features.monitor_runtime_available(),
         _ => false,
     }
 }
@@ -17376,6 +17439,91 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
             };
             orchestrator.control_loop(LoopControlRequest {
                 loop_id: params.loop_id,
+                session_id: params.session_id,
+                profile_id,
+                kind,
+            })
+        }
+        methods::MONITOR_CREATE => {
+            let params: RawMonitorCreateParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                Some(&params.session_id),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            // The profile data dir roots the monitor-notes sidecar AND is
+            // the probe's default cwd (a session workspace root is not
+            // resolvable from this pure handler; the profile data dir is the
+            // default — NOT a sandbox boundary, same as serve-mode goal tools).
+            let data_dir = profile_data_dir_for.and_then(|resolve| resolve(profile_id.as_str()));
+            // #1977 blocker 6 — an UNKNOWN mode is a typed `monitor_invalid_spec`
+            // error, NOT a silent fallback to poll (which would arm a different
+            // watcher than the caller asked for).
+            let mode = match params.mode.as_deref().map(str::trim) {
+                None | Some("") | Some("poll") => crate::api::monitor_runtime::MonitorMode::Poll {
+                    interval_secs: params
+                        .interval_seconds
+                        .unwrap_or(crate::api::monitor_runtime::MONITOR_MIN_POLL_INTERVAL_SECS),
+                },
+                Some("stream") => crate::api::monitor_runtime::MonitorMode::Stream,
+                Some(other) => {
+                    return Err(monitor_invalid_spec_error(
+                        &params.session_id,
+                        &profile_id,
+                        format!("unknown monitor mode `{other}` (use `poll` or `stream`)"),
+                    ));
+                }
+            };
+            let spec = crate::api::monitor_runtime::MonitorSpec {
+                name: params.name,
+                argv: params.argv,
+                filter_regex: params.filter_regex,
+                batch_ms: params
+                    .batch_ms
+                    .unwrap_or(crate::api::monitor_runtime::MONITOR_DEFAULT_BATCH_MS),
+                mode,
+                timeout_secs: params.timeout_secs,
+                persistent: params.persistent.unwrap_or(false),
+                max_events_per_hour: params
+                    .max_events_per_hour
+                    .unwrap_or(crate::api::monitor_runtime::MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR),
+                goal_id: params.goal_id,
+                cwd: data_dir.clone(),
+            };
+            orchestrator.create_monitor(MonitorCreateRequest {
+                session_id: params.session_id,
+                profile_id,
+                spec,
+                data_dir,
+            })
+        }
+        methods::MONITOR_LIST => {
+            let params: RawAutonomyListParams = parse_optional_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.list_monitors(MonitorListRequest {
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::MONITOR_PAUSE | methods::MONITOR_RESUME | methods::MONITOR_DELETE => {
+            let params: RawMonitorIdParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            let kind = match method {
+                methods::MONITOR_PAUSE => MonitorControlKind::Pause,
+                methods::MONITOR_RESUME => MonitorControlKind::Resume,
+                methods::MONITOR_DELETE => MonitorControlKind::Delete,
+                _ => unreachable!("monitor control method matched above"),
+            };
+            orchestrator.control_monitor(MonitorControlRequest {
+                monitor_id: params.monitor_id,
                 session_id: params.session_id,
                 profile_id,
                 kind,
@@ -18968,6 +19116,23 @@ fn live_event_passes_capability_filter(
     }
     if !features.skill_action_jobs_available() {
         if let UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(_)) = event
+        {
+            return false;
+        }
+    }
+    // #1977 blocker 6 — `monitor/*` notifications only reach connections that
+    // negotiated `coding.monitor_runtime.v1`. Without this gate an old client
+    // (no monitor capability) sharing a session stream could receive a
+    // `monitor/updated` / `monitor/fired` / `monitor/expired` produced by
+    // another connection's RPC — a capability-contract violation. Applies on
+    // both the live broadcast and reconnect replay (both call this filter),
+    // mirroring the user_question / plan_todos gating discipline above.
+    if !features.monitor_runtime_available() {
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::MonitorUpdated(_)
+            | UiNotification::MonitorFired(_)
+            | UiNotification::MonitorExpired(_),
+        ) = event
         {
             return false;
         }
@@ -21285,6 +21450,15 @@ async fn maybe_spawn_appui_master_continuation_runner(
     ) {
         let _ = send_notification_durable(ws, ledger, notification);
     }
+    // #1977 blocker 8 — emit `monitor/fired` when a monitor wake drains, so a
+    // negotiated UI sees the event live (the capability filter gates it to
+    // connections that requested `coding.monitor_runtime.v1`). The wake itself
+    // is delivered by the continuation turn + notes injection regardless; this
+    // is the UI-liveness signal.
+    if let Some(notification) = monitor_fired_notification(&session_id, &profile_id, &continuation)
+    {
+        let _ = send_notification_durable(ws, ledger, notification);
+    }
 
     let turn_id = TurnId::new();
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
@@ -21773,6 +21947,25 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
         let mut last_escalation_sweep: Option<std::time::Instant> = None;
         loop {
             tick.tick().await;
+
+            // #1977 — MonitorRuntime reconcile pass. This is BOTH the boot
+            // re-arm (the first tick after a serve restart spawns a fresh
+            // watcher for every persisted `active` monitor — the loop
+            // boot-re-arm precedent, #1879) AND the self-heal (a watcher
+            // whose task died is respawned; a paused/expired/deleted
+            // monitor's watcher is torn down). It also expires overdue
+            // non-persistent monitors with a durable note. Pure convergence,
+            // so running it every tick is idempotent. The child PROCESS never
+            // survives a restart — only the spec does — so a fresh watcher +
+            // fresh child is spawned here; a stale child from the prior
+            // lifetime was reaped on shutdown (`kill_on_drop`) or orphaned to
+            // init with its pipe reader gone (it can no longer wake anything).
+            {
+                let desired = default_agent_orchestrator().monitor_reconcile_pass();
+                let sink: std::sync::Arc<dyn crate::api::monitor_runtime::MonitorSink> =
+                    std::sync::Arc::new(crate::api::agent_orchestrator::OrchestratorMonitorSink);
+                crate::api::monitor_runtime::monitor_process_runtime().reconcile(desired, sink);
+            }
 
             // #1967 — resolve expired open escalations across every profile's
             // goal ledgers. Ledger-truth + master-visibility only: a live
@@ -31795,6 +31988,22 @@ async fn run_standalone_turn(
             prompt.push_str("\n\n");
             prompt.push_str(&notes);
         }
+        // #1977 Monitor WAKE — read and CLEAR any pending monitor event
+        // notes for THIS session (staged by `handle_monitor_batch` when a
+        // background monitor's filtered probe output changed). Same
+        // read-and-clear-once idiom as the goal-progress notes above, but a
+        // SEPARATE sidecar file (`inbox/<hash>.monitor-notes`) so a flooding
+        // monitor's oversize-skip and the "### Monitor events" header never
+        // bleed into the peer-goal channel. The `External("monitor_fired")`
+        // continuation prompt also carries a capped preview in metadata, so
+        // the wake is self-contained even when this read races another turn.
+        if let Some(notes) = crate::api::monitor_runtime::read_and_clear_monitor_notes(
+            &session_runtime.profile.data_dir,
+            &session_id.to_string(),
+        ) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&notes);
+        }
         prompt
     })
     .with_session_usage_base(session_usage_base.clone())
@@ -36469,7 +36678,7 @@ fn autonomy_rpc_evidence_to_dir(dir: &Path, method: &str, result: &Value) -> Vec
 fn autonomy_rpc_notifications(method: &str, result: &Value) -> Vec<UiNotification> {
     use octos_core::ui_protocol::methods;
     use octos_core::ui_protocol::{
-        LoopUpdatedEvent, SessionGoalClearedEvent, SessionGoalUpdatedEvent,
+        LoopUpdatedEvent, MonitorUpdatedEvent, SessionGoalClearedEvent, SessionGoalUpdatedEvent,
     };
     let mut notifications = Vec::new();
     match method {
@@ -36497,6 +36706,19 @@ fn autonomy_rpc_notifications(method: &str, result: &Value) -> Vec<UiNotificatio
         | methods::LOOP_DELETE => {
             if let Ok(event) = serde_json::from_value::<LoopUpdatedEvent>(result.clone()) {
                 notifications.push(UiNotification::LoopUpdated(event));
+            }
+        }
+        // #1977 — monitor create + pause/resume/delete all return a
+        // `monitor` snapshot; emit `monitor/updated` so a tracking UI sees
+        // the new state without re-polling. `monitor/fired` and
+        // `monitor/expired` are emitted at their own runtime sites (the
+        // wake enqueue / the expiry sweep), never from an RPC result.
+        methods::MONITOR_CREATE
+        | methods::MONITOR_PAUSE
+        | methods::MONITOR_RESUME
+        | methods::MONITOR_DELETE => {
+            if let Ok(event) = serde_json::from_value::<MonitorUpdatedEvent>(result.clone()) {
+                notifications.push(UiNotification::MonitorUpdated(event));
             }
         }
         _ => {}
@@ -36539,6 +36761,48 @@ fn record_autonomy_rpc_evidence(method: &str, result: &Value) -> Vec<UiNotificat
 /// transcript row or loop-ledger entry. Returns the notification(s) to
 /// dispatch and (when an evidence dir is set) appends the matching
 /// loop/goal-ledger line.
+/// #1977 blocker 8 — build the `monitor/fired` notification for a draining
+/// monitor wake continuation (reason `External("monitor_fired")`), reading the
+/// monitor id / name / event count from the continuation metadata the enqueue
+/// stuffed there. `None` for any other continuation. The capability filter
+/// gates the result to connections that negotiated `coding.monitor_runtime.v1`.
+fn monitor_fired_notification(
+    session_id: &SessionKey,
+    profile_id: &str,
+    continuation: &QueuedMasterContinuation,
+) -> Option<UiNotification> {
+    use octos_core::ui_protocol::MonitorFiredEvent;
+    match &continuation.reason {
+        MasterContinuationReason::External(kind)
+            if kind == crate::api::agent_orchestrator::MONITOR_FIRED_EXTERNAL_KIND => {}
+        _ => return None,
+    }
+    let monitor_id = continuation
+        .metadata
+        .get(crate::api::agent_orchestrator::MONITOR_META_ID)?
+        .clone();
+    let name = continuation
+        .metadata
+        .get(crate::api::agent_orchestrator::MONITOR_META_NAME)
+        .cloned();
+    let line_count = continuation
+        .metadata
+        .get(crate::api::agent_orchestrator::MONITOR_META_LINE_COUNT)
+        .and_then(|value| value.parse::<u64>().ok());
+    let fired_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok());
+    Some(UiNotification::MonitorFired(MonitorFiredEvent {
+        session_id: session_id.clone(),
+        profile_id: Some(profile_id.to_owned()),
+        monitor_id,
+        name,
+        line_count,
+        fired_at_ms,
+    }))
+}
+
 fn scheduled_continuation_notifications(
     session_id: &SessionKey,
     profile_id: &str,
@@ -37716,6 +37980,11 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::LoopUpdated(_)
             | UiNotification::LoopFired(_)
             | UiNotification::LoopCompleted(_)
+            // #1977 monitor notifications are stateless lifecycle pushes
+            // (no durable cursor of their own), like the loop family.
+            | UiNotification::MonitorUpdated(_)
+            | UiNotification::MonitorFired(_)
+            | UiNotification::MonitorExpired(_)
             // M16 context lifecycle notifications carry context generation
             // hashes, not replay cursors. The durable ledger cursor is on
             // the surrounding LedgeredUiProtocolEvent.

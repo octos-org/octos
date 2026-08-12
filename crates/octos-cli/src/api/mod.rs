@@ -24,6 +24,7 @@ mod handlers;
 pub(crate) mod master_continuation_scheduler;
 mod memory_panel;
 pub mod metrics;
+pub(crate) mod monitor_runtime;
 pub(crate) mod ominix_runtime;
 pub mod preview;
 pub mod preview_tokens;
