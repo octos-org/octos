@@ -111,6 +111,18 @@ pub struct ChatCommand {
     #[arg(long)]
     pub profile: Option<String>,
 
+    /// Enable the GOAL tools (`goal_create` / `goal_get` / `goal_update`) in
+    /// this chat session. A goal is a durable objective + token budget that
+    /// SURVIVES across `octos chat` invocations: state lives in the profile's
+    /// supervisor store, so a later `octos chat --goals` in the same profile
+    /// re-reads the same goal. Off by default — the tool surface is unchanged
+    /// unless you ask for it.
+    ///
+    /// Peers are NOT part of this: `peer_handoff` and the autonomous
+    /// continuation loop still require `octos serve`.
+    #[arg(long)]
+    pub goals: bool,
+
     /// FULL AUTONOMY ("yolo"): bypass all approvals AND the sandbox — the
     /// agent can edit any file and run any command with network access,
     /// without asking. Equivalent to `--sandbox danger-full-access`. Only
@@ -674,6 +686,22 @@ where
         .await
 }
 
+/// The goal tools `octos chat --goals` registers. Also the exact set added to
+/// an allow-list profile surface so `filter_by_profile` keeps them.
+const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
+
+/// Stable goal session key for `octos chat --goals`.
+///
+/// Chat has no wire session, but the goal tools resolve their session from
+/// `ToolContext::parent_session_key`, and the orchestrator keys durable goal
+/// state by that session. Minting the SAME key on every run is precisely what
+/// makes a chat goal outlive the process. Scoped by profile so two profiles
+/// don't share one goal; the `cli` segment keeps it from colliding with a
+/// `serve` wire session (`<profile>:local:<name>` / `<profile>:api:<name>`).
+fn chat_goal_session_key(profile_id: &str) -> String {
+    format!("{profile_id}:cli:chat")
+}
+
 async fn process_chat_turn(
     agent: &Agent,
     input: &str,
@@ -955,7 +983,7 @@ impl ChatCommand {
         // tool-surface definition, so fall back to the default `coding` surface
         // instead of erroring — gated on `profile_is_serve` so an actually-unknown
         // profile name still fails loudly.
-        let (profile, profile_source_label) = match resolve_profile(&self.profile) {
+        let (mut profile, profile_source_label) = match resolve_profile(&self.profile) {
             Ok(resolved) => resolved,
             Err(_) if profile_is_serve => {
                 tracing::info!(
@@ -977,6 +1005,27 @@ impl ChatCommand {
             profile.name,
             profile_source_label
         );
+
+        // Phase 1 — `--goals` must survive the profile's tool filter. The
+        // default `coding` surface is an ALLOW LIST (group:fs, group:runtime,
+        // group:search, group:memory, spawn, ask_user_question), so goal tools
+        // would be registered and then dropped from `specs()` by
+        // `filter_by_profile` — the model would never see them. Widen the list
+        // for exactly the three goal tools when the operator asked for goals.
+        // Deny lists and the pass-through `Default` mode need no change (the
+        // goal tools appear in neither), and an EMPTY allow list is already
+        // pass-through, so leave that alone too.
+        if self.goals {
+            if let octos_agent::profile::ProfileTools::AllowList { tools } = &mut profile.tools {
+                if !tools.is_empty() {
+                    for name in CHAT_GOAL_TOOLS {
+                        if !tools.iter().any(|entry| entry == name) {
+                            tools.push((*name).to_owned());
+                        }
+                    }
+                }
+            }
+        }
 
         // yolo GAP #3: resolve the effective permissions from the CLI flags
         // (codex parity: --yolo / --sandbox / --ask-for-approval). `octos
@@ -1224,6 +1273,55 @@ impl ChatCommand {
             );
         }
 
+        // Phase 1 — durable GOALS in `octos chat` (opt-in via `--goals`).
+        //
+        // The goal state engine moved out of the api-gated tree (Phase 0), so
+        // these tools now compile without `--features api` and `octos chat` can
+        // carry an objective + token budget that SURVIVES the process: state
+        // lives in the profile's supervisor store, which we configure below, so
+        // a later `octos chat --goals` in the same profile rehydrates the same
+        // goal (`goal_get` re-reads objective, status, spend, and — when a
+        // ledger exists — peer findings written by a `serve`-side run).
+        //
+        // NOT included here: peers (`peer_handoff`) and the autonomous
+        // continuation loop. Both need the multi-session host that only `serve`
+        // provides today; a one-shot/REPL chat cannot drive the async
+        // escalate -> wake -> respond cycle.
+        let goal_session_key = if self.goals {
+            let profile_id = self
+                .profile
+                .clone()
+                .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_owned());
+            // Rehydrate persisted goals (and any pending continuations) before
+            // the first turn. A failure here is non-fatal: goals then behave as
+            // in-memory-only for this run rather than taking the session down.
+            let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+            if let Err(error) = orchestrator.configure_supervisor_store(data_dir.join("supervisor"))
+            {
+                eprintln!(
+                    "warning: goal state could not be loaded from {}: {error} \
+                     (goals will not persist across runs)",
+                    data_dir.join("supervisor").display()
+                );
+            }
+            tools.register(
+                crate::goal_tool::GoalGetTool::new(profile_id.clone())
+                    .with_data_dir(data_dir.clone()),
+            );
+            tools.register(crate::goal_tool::GoalCreateTool::new(profile_id.clone()));
+            tools.register(
+                crate::goal_tool::GoalUpdateTool::new(profile_id.clone())
+                    .with_data_dir(data_dir.clone()),
+            );
+            // The goal tools resolve their session from
+            // `ToolContext::parent_session_key`. Chat has no wire session, so
+            // mint a stable one per profile: the SAME key every run is what
+            // makes the goal durable across invocations.
+            Some(chat_goal_session_key(&profile_id))
+        } else {
+            None
+        };
+
         // Apply tool policy from config
         if let Some(ref policy) = config.tool_policy {
             tools.apply_policy(policy);
@@ -1433,6 +1531,12 @@ impl ChatCommand {
             .with_subagent_summary_generator(subagent_summary_generator);
         if let Some(session_scope) = session_scope {
             agent = agent.with_session_scope(session_scope);
+        }
+        // Phase 1 — the goal tools resolve their session (hence the durable
+        // goal record) from `ToolContext::parent_session_key`. Without this the
+        // tools are registered but every call reports "no goal".
+        if let Some(ref key) = goal_session_key {
+            agent = agent.with_parent_session_key(key.clone());
         }
 
         // M8.3: if the profile declares a system_prompt_template, try to
@@ -3205,6 +3309,87 @@ fn create_custom_provider(
             Ok(Arc::new(provider))
         }
         other => eyre::bail!("unsupported custom api_type '{other}'; use openai or anthropic"),
+    }
+}
+
+#[cfg(test)]
+mod chat_goal_tests {
+    use super::*;
+
+    /// The durability contract for `octos chat --goals`: the goal session key
+    /// must be STABLE across runs (same profile -> same key, so a later chat
+    /// rehydrates the same goal) and SCOPED per profile (so two profiles never
+    /// share one goal record).
+    #[test]
+    fn should_mint_a_stable_per_profile_key_when_chat_goals_are_enabled() {
+        assert_eq!(
+            chat_goal_session_key("dev"),
+            chat_goal_session_key("dev"),
+            "same profile must map to the same key on every run — this is what \
+             makes a chat goal survive the process",
+        );
+        assert_ne!(
+            chat_goal_session_key("dev"),
+            chat_goal_session_key("prod"),
+            "different profiles must not share a goal record",
+        );
+        // The `cli` segment keeps chat goals off serve's wire-session keys
+        // (`<profile>:local:<name>` / `<profile>:api:<name>`).
+        assert_eq!(chat_goal_session_key("dev"), "dev:cli:chat");
+    }
+
+    /// Registering the goal tools is NOT enough: chat's default `coding`
+    /// profile is an ALLOW LIST, so `filter_by_profile` silently drops any tool
+    /// not named in it — the tools were registered and the model still could
+    /// not see them (observed live: tool count identical with and without
+    /// `--goals`). The allow list must be widened for exactly the goal tools.
+    #[test]
+    fn should_keep_goal_tools_when_the_profile_surface_is_an_allow_list() {
+        use octos_agent::profile::ProfileTools;
+        let coding = ProfileTools::AllowList {
+            tools: vec![
+                "group:fs".to_owned(),
+                "group:runtime".to_owned(),
+                "spawn".to_owned(),
+            ],
+        };
+        // Baseline: the untouched surface drops every goal tool.
+        for name in CHAT_GOAL_TOOLS {
+            assert!(
+                !coding.allows(name),
+                "{name} must be filtered out before the fix — otherwise this \
+                 test proves nothing",
+            );
+        }
+        // Apply the same widening `--goals` performs.
+        let mut widened = coding.clone();
+        if let ProfileTools::AllowList { tools } = &mut widened {
+            for name in CHAT_GOAL_TOOLS {
+                tools.push((*name).to_owned());
+            }
+        }
+        for name in CHAT_GOAL_TOOLS {
+            assert!(widened.allows(name), "{name} must survive the filter");
+        }
+        // And the widening must not smuggle in anything else.
+        assert!(!widened.allows("web_search"));
+        assert!(!widened.allows("peer_handoff"));
+    }
+
+    /// `--goals` is opt-in: the default chat tool surface must be unchanged.
+    #[test]
+    fn should_default_goals_to_off() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+        assert!(
+            !TestCli::parse_from(["octos-chat"]).chat.goals,
+            "goal tools must not appear in the default chat tool surface",
+        );
+        assert!(TestCli::parse_from(["octos-chat", "--goals"]).chat.goals);
     }
 }
 
