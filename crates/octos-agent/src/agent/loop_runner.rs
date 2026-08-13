@@ -825,10 +825,16 @@ impl Agent {
         history: &[Message],
         media: Vec<String>,
         attachments: TurnAttachmentContext,
-        tracker: &TokenTracker,
+        tracker: std::sync::Arc<TokenTracker>,
     ) -> Result<ConversationResponse> {
-        self.process_message_inner(user_content, history, media, attachments, Some(tracker))
-            .await
+        self.process_message_inner(
+            user_content,
+            history,
+            media,
+            attachments,
+            Some(tracker.as_ref()),
+        )
+        .await
     }
 
     async fn process_message_inner(

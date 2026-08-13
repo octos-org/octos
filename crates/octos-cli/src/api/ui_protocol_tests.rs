@@ -17744,6 +17744,27 @@ fn ws_connection_for_test(
     (WsConnection::new(tx), rx)
 }
 
+/// #1969 — an interrupted goal/peer turn must charge its partial spend from the
+/// live tracker (the drain loop breaks before the done/error arm folds usage),
+/// while a completed/errored turn keeps the folded total.
+#[test]
+fn interrupted_goal_charge_falls_back_to_tracker_only_when_interrupted_with_zero_folded() {
+    let tracker = octos_agent::TokenTracker::new();
+    tracker
+        .input_tokens
+        .store(1_000, std::sync::atomic::Ordering::Relaxed);
+    tracker
+        .output_tokens
+        .store(500, std::sync::atomic::Ordering::Relaxed);
+
+    // interrupted + nothing folded → charge the tracker's accumulated spend
+    assert_eq!(interrupted_goal_charge(true, 0, &tracker), 1_500);
+    // NOT interrupted → keep the folded value (0 here), never read the tracker
+    assert_eq!(interrupted_goal_charge(false, 0, &tracker), 0);
+    // interrupted but a real total was already folded → never override it
+    assert_eq!(interrupted_goal_charge(true, 42, &tracker), 42);
+}
+
 #[tokio::test]
 async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
     let (ws, mut rx) = ws_connection_for_test(32);

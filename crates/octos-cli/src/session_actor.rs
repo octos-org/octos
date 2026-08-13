@@ -7648,7 +7648,7 @@ impl SessionActor {
                             &history_for_agent,
                             media,
                             attachments,
-                            &tracker,
+                            std::sync::Arc::clone(&tracker),
                         ),
                     ),
                 ),
@@ -9382,7 +9382,7 @@ impl SessionActor {
                         attachment_prompt,
                         Self::inbound_live_video(&inbound),
                     ),
-                    &token_tracker,
+                    std::sync::Arc::clone(&token_tracker),
                 ),
             ),
         )

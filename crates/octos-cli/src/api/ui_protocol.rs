@@ -30292,6 +30292,33 @@ async fn run_interactive_sentinel_completion(
     )
 }
 
+/// #1969 — resolve the token charge for a turn that may have been INTERRUPTED.
+/// The AppUI drain loop breaks on interrupt before the done/error arm folds the
+/// turn's usage into `folded`, so an interrupted goal/peer turn would charge 0.
+/// When interrupted with nothing folded, fall back to the live `tracker` (which
+/// accumulated usage as the turn ran) so the partial spend still charges. A
+/// non-interrupted turn — or one that already folded a nonzero total — is
+/// unchanged. The tracker mirrors input/output tokens only (no cache).
+fn interrupted_goal_charge(
+    interrupt_observed: bool,
+    folded: u64,
+    tracker: &octos_agent::TokenTracker,
+) -> u64 {
+    if interrupt_observed && folded == 0 {
+        u64::from(
+            tracker
+                .input_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ) + u64::from(
+            tracker
+                .output_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    } else {
+        folded
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -32603,6 +32630,12 @@ async fn run_standalone_turn(
     if let Some(flag) = turn_dispatched.as_ref() {
         flag.store(true, std::sync::atomic::Ordering::Release);
     }
+    // #1969 — shared token tracker: `token_tracker_task` is moved into the
+    // spawned agent task below; the original `token_tracker` stays in THIS scope
+    // so the drain loop can read an interrupted turn's partial spend after the
+    // task future is dropped.
+    let token_tracker = std::sync::Arc::new(octos_agent::TokenTracker::new());
+    let token_tracker_task = std::sync::Arc::clone(&token_tracker);
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -32626,11 +32659,16 @@ async fn run_standalone_turn(
             live_video: params.live_video,
             ..Default::default()
         };
-        let message_future = request_agent.process_message_with_attachments(
+        // #1969 — feed the shared token tracker (its clone `token_tracker_task`
+        // was moved into this spawned agent task; the original stays in the
+        // outer scope) so an INTERRUPTED turn's partial spend is readable after
+        // the drain loop. Mirrors the pattern `session_actor` already uses.
+        let message_future = request_agent.process_message_tracked_with_attachments(
             &prompt,
             &history,
             turn_media_paths,
             turn_attachments,
+            token_tracker_task,
         );
         let scoped_message_future: std::pin::Pin<
             Box<
@@ -33730,6 +33768,15 @@ async fn run_standalone_turn(
             }
         }
     }
+
+    // #1969 — an interrupt breaks the drain loop above before the done/error
+    // arm folds the turn's token usage, so `final_tokens_consumed` is still 0.
+    // Read the live tracker so an INTERRUPTED master/peer goal turn charges its
+    // real partial spend via `record_goal_turn` below instead of 0. The
+    // interactive accountant that follows is gated on a Completed terminal, so
+    // it stays unaffected.
+    final_tokens_consumed =
+        interrupted_goal_charge(interrupt_observed, final_tokens_consumed, &token_tracker);
 
     // #1650 — interactive goal accountant. Placed HERE — immediately
     // after the turn loop and BEFORE the voice-TTS / spawn_only
