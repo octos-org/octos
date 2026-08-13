@@ -14,6 +14,17 @@ pub use octos_store::admin_token_store;
 pub mod api;
 pub use octos_store::approvals_audit;
 pub mod auth;
+// Goal / autonomy state engine. Deliberately NOT `api`-gated: it touches no
+// axum / AppState / WebSocket type, and `goal_tool` + the SessionActor goal
+// glue need it in unfeatured builds (`octos chat`).
+//
+// Parts of the engine (the specialist runner, the monitor process runtime,
+// the fleet-wake outbox) are still reached only from the `api` WS surface, so
+// an unfeatured build sees them as dead. That is an artifact of the consumer
+// being absent, not of the code being unreachable — the `api` build keeps
+// full `dead_code` enforcement.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod autonomy;
 pub use octos_services::cli_agent_adapter;
 pub mod commands;
 pub use octos_services::compaction;
@@ -27,7 +38,6 @@ pub mod content_catalog;
 pub(crate) mod context_manager;
 pub mod cron_tool;
 pub mod gateway_dispatcher;
-#[cfg(feature = "api")]
 pub mod goal_tool;
 #[cfg(feature = "api")]
 pub use octos_store::login_allowlist;

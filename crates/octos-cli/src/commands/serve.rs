@@ -620,7 +620,7 @@ impl ServeCommand {
         // dispatchable — immediately at boot instead of only after a client
         // reopens the session. Failure is non-fatal: the registry starts empty
         // (the pre-sidecar behavior) and repopulates on session/open.
-        if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
+        if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
             .configure_goal_scopes_sidecar(data_dir.join("goal-scopes.json"))
         {
             tracing::warn!(
@@ -629,7 +629,7 @@ impl ServeCommand {
                  invisible until their session reopens"
             );
         }
-        if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
+        if let Err(error) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
             .configure_supervisor_store(data_dir.join("supervisor"))
         {
             tracing::warn!(
@@ -642,7 +642,7 @@ impl ServeCommand {
             // firing model turns on a single-operator box. Park them paused;
             // `/loop resume <id>` re-arms, OCTOS_SOLO_RESUME_LOOPS=1 opts out.
             for (loop_id, session_id) in
-                crate::api::agent_orchestrator::default_agent_orchestrator()
+                crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                     .pause_restored_loops_for_solo_boot()
             {
                 tracing::info!(
@@ -670,7 +670,7 @@ impl ServeCommand {
                     Some(registry.resolve_data_dir(&profile))
                 };
                 for (goal_id, session_id) in
-                    crate::api::agent_orchestrator::default_agent_orchestrator()
+                    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                         .pause_restored_goals_for_solo_boot_with_ledger_sync(&park_profile_data_dir)
                 {
                     tracing::info!(
@@ -702,7 +702,7 @@ impl ServeCommand {
         let mut fleet_reconciled = false;
         match octos_fleet::FleetKernelStore::open(data_dir.join("fleet-kernel")).await {
             Ok(fleet_store) => {
-                crate::api::agent_orchestrator::default_agent_orchestrator()
+                crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                     .set_fleet_store(fleet_store.clone());
                 // #1857 PR 5a — BOOT RECOVERY: interrupt any attempt still
                 // holding a stale (prior-epoch) lease, release its budget
@@ -729,7 +729,7 @@ impl ServeCommand {
                          dispatch). Stale leases still expire on their TTL."
                     );
                 }
-                crate::api::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
+                crate::autonomy::fleet_wake::spawn_fleet_outbox_consumer(fleet_store);
                 tracing::info!("fleet-kernel outbox consumer started");
             }
             Err(error) => {
@@ -933,7 +933,7 @@ impl ServeCommand {
         //
         // Fix (HIGH 2): gated on `fleet_reconciled` — a store that failed its
         // boot reconcile must not accept new dispatch, so no pool is installed.
-        if let Some(fleet_store) = crate::api::agent_orchestrator::default_agent_orchestrator()
+        if let Some(fleet_store) = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
             .fleet_store()
             .filter(|_| fleet_reconciled)
         {
@@ -1022,7 +1022,7 @@ impl ServeCommand {
                                 let data_dir = denial_data_dir.clone();
                                 let profile_id = denial_profile_id.clone();
                                 let record = move || {
-                                    crate::api::agent_orchestrator::default_agent_orchestrator()
+                                    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                                         .record_fleet_write_grant_denial(
                                             &data_dir,
                                             &profile_id,
@@ -1072,7 +1072,7 @@ impl ServeCommand {
                             cfg,
                             Arc::new(|| chrono::Utc::now().timestamp_millis().max(0) as u64),
                         );
-                        crate::api::agent_orchestrator::default_agent_orchestrator()
+                        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                             .set_fleet_pool(Arc::new(pool));
                         // #1865/#1964 — the keeper profile's data dir, installed
                         // beside the pool it belongs to: the eager fleet settle
@@ -1080,7 +1080,7 @@ impl ServeCommand {
                         // `<data_dir>/goal-ledgers/` (the SAME dir the profile's
                         // goal_get/goal_update/goal_deny tools carry via
                         // `.with_data_dir` in runtime/profile.rs).
-                        crate::api::agent_orchestrator::default_agent_orchestrator()
+                        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                             .set_fleet_ledger_data_dir(rt.data_dir.clone());
                         tracing::info!(
                             keeper_profile = %rt.profile_id,
@@ -1107,7 +1107,8 @@ impl ServeCommand {
         // ready set. Gated on a reconciled store AND an installed pool (no pool ⇒
         // nothing to dispatch onto). Re-fetch the store here: the local binding
         // was moved into the outbox consumer / worker pool above.
-        let boot_resume_orchestrator = crate::api::agent_orchestrator::default_agent_orchestrator();
+        let boot_resume_orchestrator =
+            crate::autonomy::agent_orchestrator::default_agent_orchestrator();
         let boot_resume_store =
             if fleet_reconciled && boot_resume_orchestrator.fleet_pool().is_some() {
                 boot_resume_orchestrator.fleet_store()
@@ -1116,7 +1117,7 @@ impl ServeCommand {
             };
         if let Some(store) = boot_resume_store {
             let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-            match crate::api::fleet_wake::enqueue_fleet_boot_resume_wakes(
+            match crate::autonomy::fleet_wake::enqueue_fleet_boot_resume_wakes(
                 &store,
                 boot_resume_orchestrator,
                 now_ms,

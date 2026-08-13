@@ -181,7 +181,7 @@ pub(crate) const PEER_FLEET_SYNTHESIS_META_SLUGS: &str = "peer_fleet_slugs";
 const PEER_FLEET_SYNTHESIS_GROUP: &str = "peer-fleet-synthesis";
 
 /// Fleet-keeper WAKE (#1857 PR 4a) — kind label for the `External(_)` master
-/// continuation the fleet outbox consumer (`api::fleet_wake`) enqueues on a
+/// continuation the fleet outbox consumer (`autonomy::fleet_wake`) enqueues on a
 /// fleet's controller session when a `ChildDone` / `FleetDrained` event lands.
 /// It directs the keeper to advance the durable plan by one bounded step. Flows
 /// through the same hardened `External` drain path as the peer wakes; the drain
@@ -262,7 +262,7 @@ pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input"
 pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 
 /// #1977 Monitor WAKE — kind label for the `External(_)` master continuation a
-/// [`crate::api::monitor_runtime`] watcher enqueues when its filtered probe
+/// [`crate::autonomy::monitor_runtime`] watcher enqueues when its filtered probe
 /// output changes (poll) or a stream batch lands. Rides the SAME hardened
 /// `External` drain path (idle-gated, deduped, rate-disciplined) as the peer
 /// wakes — no new scheduler. The matched lines are staged for prompt injection
@@ -472,7 +472,7 @@ pub(crate) struct LoopControlRequest {
 pub(crate) struct MonitorCreateRequest {
     pub(crate) session_id: SessionKey,
     pub(crate) profile_id: String,
-    pub(crate) spec: crate::api::monitor_runtime::MonitorSpec,
+    pub(crate) spec: crate::autonomy::monitor_runtime::MonitorSpec,
     pub(crate) data_dir: Option<std::path::PathBuf>,
 }
 
@@ -1366,7 +1366,7 @@ impl InProcessAgentOrchestrator {
 
     /// #1857 PR 4a — install the durable fleet-kernel store (opened async at
     /// serve boot). Mirrors `configure_supervisor_store`; the fleet outbox
-    /// consumer (`api::fleet_wake`) drives its drain against this orchestrator.
+    /// consumer (`autonomy::fleet_wake`) drives its drain against this orchestrator.
     pub(crate) fn set_fleet_store(&self, store: FleetKernelStore) {
         let mut state = self.state();
         state.fleet_store = Some(store);
@@ -1418,7 +1418,7 @@ impl InProcessAgentOrchestrator {
 
     /// #1857 PR 4a — drain the fleet outbox once against this orchestrator's
     /// continuation scheduler. Thin wrapper over the singleton-free core
-    /// [`crate::api::fleet_wake::drain_fleet_outbox_once`]: it supplies a
+    /// [`crate::autonomy::fleet_wake::drain_fleet_outbox_once`]: it supplies a
     /// `commit_wake` closure that takes the `StdMutex` guard **only** for the
     /// synchronous enqueue + durable persist, so the core's async store I/O
     /// never runs under the guard.
@@ -8019,7 +8019,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         } else {
             let timeout_secs = spec
                 .timeout_secs
-                .unwrap_or(crate::api::monitor_runtime::MONITOR_DEFAULT_TIMEOUT_SECS);
+                .unwrap_or(crate::autonomy::monitor_runtime::MONITOR_DEFAULT_TIMEOUT_SECS);
             i64::try_from(timeout_secs)
                 .ok()
                 .and_then(|secs| secs.checked_mul(1_000))
@@ -8501,7 +8501,7 @@ impl InProcessAgentOrchestrator {
     /// #1977 — expiry + desired-watcher-set pass, run by the global drain
     /// every tick. Expires overdue non-persistent monitors (durable note,
     /// terminal persist) and returns the watch configs for every ACTIVE
-    /// monitor — [`crate::api::monitor_runtime::MonitorProcessRuntime::reconcile`]
+    /// monitor — [`crate::autonomy::monitor_runtime::MonitorProcessRuntime::reconcile`]
     /// converges the live watcher set onto it. Because the pass is pure
     /// convergence, running it at boot IS the re-arm (loops' boot re-arm
     /// precedent) and running it after a watcher death IS the self-heal.
@@ -8747,14 +8747,14 @@ struct AutonomyRuntimeState {
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
     /// #1977 — durable monitor records (specs + wake accounting). The live
-    /// watcher PROCESSES live in [`crate::api::monitor_runtime`]'s global
+    /// watcher PROCESSES live in [`crate::autonomy::monitor_runtime`]'s global
     /// registry; the global drain reconciles that registry against the
     /// `status == "active"` subset of this map every tick.
     monitors: HashMap<String, AutonomyMonitorRecord>,
     continuations: MasterContinuationScheduler,
     supervisor_store: Option<SupervisorStore>,
     /// #1857 PR 4a — durable fleet-kernel store, opened at serve boot beside
-    /// `supervisor_store`. The fleet outbox consumer (`api::fleet_wake`) drains
+    /// `supervisor_store`. The fleet outbox consumer (`autonomy::fleet_wake`) drains
     /// it against `continuations`. `None` until `set_fleet_store` (never wired
     /// on the chat/gateway boot paths, which have no fleet kernel).
     fleet_store: Option<FleetKernelStore>,
@@ -9467,7 +9467,7 @@ fn autonomy_error(
 
 /// #1977 blocker 6 — the typed `monitor_invalid_spec` RPC error for the raw
 /// dispatch layer (e.g. an unknown `mode`), matching the shape `create_monitor`
-/// produces when [`crate::api::monitor_runtime::MonitorSpec::validate`] fails.
+/// produces when [`crate::autonomy::monitor_runtime::MonitorSpec::validate`] fails.
 pub(crate) fn monitor_invalid_spec_error(
     session_id: &SessionKey,
     profile_id: &str,
@@ -10773,12 +10773,12 @@ fn restore_monitor_from_group(state: &mut AutonomyRuntimeState, group: &Supervis
         interval_seconds: supervisor_metadata_u64(&group.metadata, "interval_seconds"),
         batch_ms: supervisor_metadata_u64(&group.metadata, "batch_ms")
             .unwrap_or(u64::from(
-                crate::api::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
             ))
             .min(u64::from(u32::MAX)) as u32,
         max_events_per_hour: supervisor_metadata_u64(&group.metadata, "max_events_per_hour")
             .unwrap_or(u64::from(
-                crate::api::monitor_runtime::MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR,
+                crate::autonomy::monitor_runtime::MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR,
             ))
             .min(u64::from(u32::MAX)) as u32,
         persistent: supervisor_metadata_bool(&group.metadata, "persistent").unwrap_or(false),
@@ -21311,7 +21311,7 @@ mod tests {
     /// pause intent.
     #[test]
     fn due_loop_targets_pending_sweep_filters_paused_goal_continuations() {
-        use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+        use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey::with_profile("tenant-a", "api", "paused-goal-stale");
         orchestrator
@@ -21436,7 +21436,7 @@ mod tests {
     /// pre-#1131 code emitted on budget exhaustion.
     #[test]
     fn legacy_goal_continue_with_wrap_up_metadata_promotes_to_wrap_up() {
-        use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+        use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
 
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey::with_profile("tenant-a", "api", "legacy-wrap-up");
@@ -24764,12 +24764,15 @@ mod tests {
 
     // ---- #1977 MonitorRuntime: orchestrator-seam acceptance tests ---------
 
-    fn monitor_spec(name: &str, mode: MonitorMode) -> crate::api::monitor_runtime::MonitorSpec {
-        crate::api::monitor_runtime::MonitorSpec {
+    fn monitor_spec(
+        name: &str,
+        mode: MonitorMode,
+    ) -> crate::autonomy::monitor_runtime::MonitorSpec {
+        crate::autonomy::monitor_runtime::MonitorSpec {
             name: name.to_owned(),
             argv: vec!["sh".into(), "-c".into(), "true".into()],
             filter_regex: None,
-            batch_ms: crate::api::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+            batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
             mode,
             timeout_secs: None,
             persistent: false,
@@ -24783,7 +24786,7 @@ mod tests {
         orchestrator: &InProcessAgentOrchestrator,
         session: &SessionKey,
         profile: &str,
-        spec: crate::api::monitor_runtime::MonitorSpec,
+        spec: crate::autonomy::monitor_runtime::MonitorSpec,
         data_dir: Option<std::path::PathBuf>,
     ) -> String {
         let value = orchestrator
@@ -24922,7 +24925,7 @@ mod tests {
 
         // The pause left a DURABLE note (no silent caps).
         let notes =
-            crate::api::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
+            crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
                 .expect("a durable flood note was staged");
         assert!(
             notes.contains("AUTO-PAUSED"),
@@ -25437,7 +25440,7 @@ mod tests {
         let (status, _) = orchestrator.monitor_status_for_test("monitor_01").unwrap();
         assert_eq!(status, "expired");
         let notes =
-            crate::api::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
+            crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
                 .expect("expiry note");
         assert!(
             notes.contains("EXPIRED"),

@@ -1272,8 +1272,10 @@ impl ProfileRuntime {
         // budget) and goal_update (model-owned complete|blocked ONLY,
         // executor-enforced). Session resolved per-call from
         // ToolContext::parent_session_key; profile scope pinned here.
-        // Goals live in the AppUI orchestrator, so the tools exist only
-        // with the `api` feature (like the orchestrator itself).
+        // The orchestrator itself now lives in the un-gated `crate::autonomy`
+        // (so `goal_tool` compiles without `api`), but REGISTRATION stays
+        // `api`-gated: only the serve/AppUI runtime drives goal turns today.
+        // Wiring `octos chat` onto the same engine is a separate change.
         #[cfg(feature = "api")]
         {
             // Peer-agent-based goal: pass the profile's data_dir so
