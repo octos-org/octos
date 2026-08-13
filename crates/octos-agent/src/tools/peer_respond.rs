@@ -8,8 +8,8 @@
 //! human-in-the-loop: `peer_list` surfaces the peer as `awaiting_input` (read
 //! from the process-global pending approval/question stores — the single
 //! authority, so a parked peer stays visible while it remains open), and THIS
-//! tool answers a specific one. (A closed peer that re-parks is the documented
-//! exception — see KNOWN LIMITATION below.)
+//! tool answers a specific one. (A CLOSED peer never parks at all — see
+//! CLOSE-WHILE-PARKED below.)
 //!
 //! The tool carries no IPC knowledge; a host callback (wired during turn
 //! construction in the serve/WS path, right beside `peer_send_input`) locates
@@ -24,16 +24,28 @@
 //!   authorized / already resolved, when the response KIND does not match, or
 //!   when the peer has MULTIPLE pending prompts and no `id` was supplied.
 //!
-//! KNOWN LIMITATION — close-while-parked race (tracked as a follow-up). Closing a
-//! peer cancels its CURRENTLY-parked prompt fail-closed. But `peer_close` does
-//! not abort the peer's in-flight turn, so a peer that PARKS AGAIN after the
-//! close sweep — or reopens under a fresh wire session — can register a new
-//! pending prompt that `peer_list` hides (closed) and `peer_respond` refuses
-//! (closed), leaving it parked until the connection tears down. This is a narrow
-//! adversarial race (closing a peer at the exact instant it is parking); the
-//! common cases — answer a blocked peer, or close a done/idle one — are fully
-//! handled. A robust fix needs cross-session turn-abort keyed on the peer's real
-//! inner task plus `(profile, slug)` gating that also covers raw client sessions.
+//! CLOSE-WHILE-PARKED (#1842, fixed). Closing a peer cancels its
+//! CURRENTLY-parked prompt fail-closed. That alone left a race: `peer_close`
+//! did not abort the peer's in-flight turn, so a peer that PARKED AGAIN after
+//! the close sweep — or reopened under a fresh wire session for the same
+//! `(profile, slug)` — could register a new pending prompt that `peer_list`
+//! hides (closed) and `peer_respond` refuses (closed), leaving it parked until
+//! the connection tore down. Two host-side mechanisms close it:
+//!
+//! - **The peer STOPS on close.** `peer_close` runs the same interrupt routine
+//!   `turn/interrupt` uses against the peer's active turn (`Active` →
+//!   `Interrupting` + the per-turn `interrupt_tx` signal). That is the path the
+//!   turn loop honors, so it aborts the peer's INNER agent task rather than
+//!   detaching it — the peer cannot reach another park point.
+//! - **A closed peer's parks are REFUSED.** Both park points (tool approval and
+//!   `ask_user_question`) gate on the peer's `(profile, slug)` closed state,
+//!   resolved from the turn's RESOLVED runtime profile (so raw client sessions,
+//!   whose session key carries no profile, are covered too) and the peer's
+//!   validated topic, read from the durable `closed` marker. The gate brackets
+//!   the registration — precheck, register, post-check — so a close landing
+//!   inside the check-then-park window is caught by either the post-check or
+//!   the close's own pending sweep. Staging a peer mints a fresh
+//!   `peers/<slug>`, so a restaged peer parks normally again.
 
 use std::sync::Arc;
 

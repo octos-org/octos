@@ -1,12 +1,18 @@
-//! `peer_close` — gracefully retire a running peer you created.
+//! `peer_close` — retire a running peer you created.
 //!
 //! The lifecycle complement to `peer_handoff`: where `peer_handoff` STAGES a
 //! peer and `peer_send_input` STEERS it, `peer_close` RETIRES it. The host
 //! callback marks the peer closed on the durable blackboard (a
 //! `peers/<slug>/closed` marker) and evicts its live wire, so it receives no
-//! further input; `peer_list` / `peer_gather` then report it closed. Closing
-//! is GRACEFUL — the peer finishes any in-flight turn; this does NOT abort a
-//! running turn — and its result files stay readable via `peer_gather`.
+//! further input; `peer_list` / `peer_gather` then report it closed. Whatever
+//! the peer produced before the close stays readable via `peer_gather`.
+//!
+//! Closing STOPS the peer (#1842): the host callback interrupts the peer's
+//! in-flight turn on the same path a user's stop does. That is what makes a
+//! close final — a peer left running after its close could park on an
+//! approval / clarifying question that `peer_list` no longer shows and
+//! `peer_respond` refuses to answer, hanging until the connection tore down.
+//! Close a peer when you want its work to END, not to let it finish.
 //!
 //! Guard rails mirror `peer_send_input`:
 //! - Depth-1: registered only where `peer_handoff` is (never on peer
@@ -32,7 +38,7 @@ use super::{Tool, ToolResult};
 /// confirmation or an error string.
 pub type PeerCloseCallback = Arc<dyn Fn(String) -> Result<String, String> + Send + Sync>;
 
-/// `peer_close` tool. See the module docs for the graceful-retire semantics.
+/// `peer_close` tool. See the module docs for the retire semantics.
 pub struct PeerCloseTool {
     close: PeerCloseCallback,
 }
@@ -61,9 +67,10 @@ impl Tool for PeerCloseTool {
         "Close (retire) a running peer YOU created, identified by its NAME (or \
          slug), as reported by peer_handoff or peer_list. The peer is marked \
          closed and receives no further input; peer_list and peer_gather then \
-         show it as closed. Only the peer's originator may close it. GRACEFUL — \
-         the peer finishes any in-flight turn; this does NOT abort a running \
-         turn. Its result files remain readable via peer_gather."
+         show it as closed. Only the peer's originator may close it. Closing \
+         STOPS the peer: its in-flight turn is interrupted, so close it when \
+         you want its work to end, not to let it finish. Whatever it already \
+         produced remains readable via peer_gather."
     }
 
     fn tags(&self) -> &[&str] {
