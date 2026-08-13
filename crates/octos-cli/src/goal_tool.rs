@@ -27,11 +27,11 @@ use octos_fleet::{
 };
 use serde_json::{Value, json};
 
-use crate::api::agent_orchestrator::{
+use crate::autonomy::agent_orchestrator::{
     AgentOrchestrator, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
     MonitorListRequest, default_agent_orchestrator,
 };
-use crate::api::monitor_runtime::{
+use crate::autonomy::monitor_runtime::{
     MONITOR_DEFAULT_BATCH_MS, MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR, MONITOR_MIN_POLL_INTERVAL_SECS,
     MonitorMode, MonitorSpec,
 };
@@ -1208,7 +1208,7 @@ const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 600;
 /// Assemble the completion evidence the INDEPENDENT verifier judges.
 ///
 /// The verifier grades whether the objective is met by "concrete evidence in
-/// the reply" ([`crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage`]).
+/// the reply" ([`crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage`]).
 /// For a single-agent goal that reply IS the evidence. But in the PEER-GOAL
 /// model the concrete evidence is recorded by goal-scoped peers into the durable
 /// ledger, NOT re-typed into the master's completion reply — so a
@@ -1219,7 +1219,7 @@ const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 600;
 /// evidence lets the verifier judge against what was actually recorded.
 ///
 /// `ledger_findings` are the `{created_by, kind, assertion, ...}` objects from
-/// [`crate::api::agent_orchestrator::AgentOrchestrator::model_goal_ledger_findings`].
+/// [`crate::autonomy::agent_orchestrator::AgentOrchestrator::model_goal_ledger_findings`].
 /// Empty (single-agent goals, or no ledger) returns the reason unchanged —
 /// exact pre-existing behavior.
 fn completion_evidence_with_ledger(reason: &str, ledger_findings: &[Value]) -> String {
@@ -1383,7 +1383,7 @@ impl Tool for GoalUpdateTool {
         // uniform across all four verifier sites — the only trade-off is the
         // TURN cost display no longer counts this one out-of-band call).
         let mut verified_snapshot: Option<
-            crate::api::agent_orchestrator::GoalVerificationSnapshot,
+            crate::autonomy::agent_orchestrator::GoalVerificationSnapshot,
         > = None;
         if status == "complete" {
             let orchestrator = default_agent_orchestrator();
@@ -1417,7 +1417,7 @@ impl Tool for GoalUpdateTool {
                 .unwrap_or_default();
             let evidence = completion_evidence_with_ledger(reason, &ledger_findings);
             let (verdict, usage) =
-                crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage(
+                crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
                     verifier_provider,
                     &snapshot.objective,
                     &evidence,
@@ -1437,7 +1437,7 @@ impl Tool for GoalUpdateTool {
                     output: format!(
                         "goal_update: completion NOT verified — independent verifier returned: {}",
                         match verdict {
-                            crate::api::goal_loop_runtime::GoalCompletionVerdict::NotDone {
+                            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone {
                                 reason,
                             } => reason,
                             _ => "unknown".to_string(),
@@ -2124,7 +2124,7 @@ mod tests {
     /// capturing the exact prompt the verifier receives.
     #[tokio::test]
     async fn goal_update_folds_ledger_findings_into_verifier_evidence() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         let session = SessionKey("ledger-evidence-prof:api:goal-update-ledger".to_owned());
         orchestrator
@@ -2226,7 +2226,7 @@ mod tests {
     /// still be stamped on the ToolResult (#1958).
     #[tokio::test]
     async fn goal_update_routes_verifier_through_configured_lane() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         // Process-global orchestrator: unique key, never cleared (same idiom
         // as the sibling goal_get tests).
@@ -2302,7 +2302,7 @@ mod tests {
     /// the turn's own provider (`ctx.llm_provider`), the pre-#1935 behavior.
     #[tokio::test]
     async fn goal_update_verifier_falls_back_to_turn_provider_when_lane_unconfigured() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         let session = SessionKey("verifier-fallback-prof:api:goal-update-fallback".to_owned());
         orchestrator
@@ -2354,7 +2354,7 @@ mod tests {
     /// active goal). Asserts the GOAL counter, not the ToolResult.
     #[tokio::test]
     async fn goal_update_notdone_refusal_charges_verifier_usage_once() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         let session = SessionKey("verifier-notdone-prof:api:goal-update-notdone".to_owned());
         orchestrator
@@ -2457,7 +2457,7 @@ mod tests {
     /// never see them. Same data_dir gate as `ledger_findings`.
     #[tokio::test]
     async fn goal_get_includes_open_escalations_when_data_dir_set() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         // The tool reads the PROCESS-GLOBAL orchestrator: use a unique
         // session/profile and never clear the shared state (sibling tests own
         // their own keys — same idiom as the ui_protocol continuation tests).
@@ -2548,7 +2548,7 @@ mod tests {
     /// the old path-digest roll-up dropped.
     #[tokio::test]
     async fn goal_get_folds_ledger_digest_when_constructed_with_data_dir() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
 
         let orchestrator = default_agent_orchestrator();
         // Unique wire id: the default orchestrator is process-global.

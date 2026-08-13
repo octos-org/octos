@@ -51,14 +51,11 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "api")]
-#[cfg(feature = "api")]
-use crate::api::agent_orchestrator::{
+use crate::autonomy::agent_orchestrator::{
     default_agent_orchestrator, run_goal_completion_verifier_with_usage,
     upsert_background_task_agent,
 };
-#[cfg(feature = "api")]
-use crate::api::master_continuation_scheduler::{
+use crate::autonomy::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
 };
 use crate::config::QueueMode;
@@ -1744,7 +1741,6 @@ fn forward_task_status_to_actor_inbox(
     // `upsert_background_task_agent` resolves the right profile here; the
     // AppUI/serve bare-key path threads its runtime profile explicitly
     // (see `forward_task_progress_to_channel`).
-    #[cfg(feature = "api")]
     let _ = upsert_background_task_agent(task, None);
 
     let task_json = sanitize_task_for_response(data_dir, task);
@@ -3353,9 +3349,8 @@ impl ActorFactory {
         // Gateway session keys carry the profile (`profile:channel:chat`), so
         // `None` lets the key-derived profile resolve inside the router —
         // matching `forward_task_status_to_actor_inbox`'s `None` call.
-        #[cfg(feature = "api")]
         supervisor.set_on_terminal(move |event| {
-            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
                 event,
                 None,
                 // Gateway: failure recovery stays on the `RecoveryHint` inbox
@@ -3366,7 +3361,7 @@ impl ActorFactory {
                 // collapses against the legacy on_change ChildCompleted via
                 // the step-3 dedupe key). Step 4 retires RecoveryHint and
                 // flips this to `Queue`.
-                crate::api::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
+                crate::autonomy::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
             );
         });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
@@ -4332,7 +4327,6 @@ pub(crate) fn format_failover_push(event: &FailoverEvent) -> String {
     )
 }
 
-#[cfg(feature = "api")]
 fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
     match reason {
         MasterContinuationReason::ChildCompleted => "child_completed",
@@ -4345,7 +4339,7 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
 }
 
 /// Canonicalized (codex HIGH): delegate to the single renderer in
-/// [`crate::api::agent_orchestrator::master_continuation_prompt`] so both
+/// [`crate::autonomy::agent_orchestrator::master_continuation_prompt`] so both
 /// continuation-render paths — the AppUI / WS path and this SessionActor
 /// gateway path — emit byte-identical prompts.
 ///
@@ -4356,9 +4350,8 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
 /// canonical renderer closes by escaping and fencing the objective and
 /// dropping it from the raw metadata. Forwarding eliminates the drift and
 /// prevents it from recurring (the two renderers can no longer diverge).
-#[cfg(feature = "api")]
 fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
-    crate::api::agent_orchestrator::master_continuation_prompt(continuation)
+    crate::autonomy::agent_orchestrator::master_continuation_prompt(continuation)
 }
 
 // ── SessionActor ────────────────────────────────────────────────────────────
@@ -4502,10 +4495,8 @@ struct SessionActor {
 
     /// #1935 — the INDEPENDENT goal-completion verifier lane, threaded from
     /// [`ActorFactory::goal_verifier_llm`]. Read by the goal accountant
-    /// (`maybe_advance_goal_runtime_after_turn`), which is `api`-gated like
-    /// the goal machinery itself — hence the `allow(dead_code)` when the
-    /// crate builds without the `api` feature.
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    /// (`maybe_advance_goal_runtime_after_turn`), which — like the rest of
+    /// the goal machinery in [`crate::autonomy`] — compiles unconditionally.
     goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
 }
 
@@ -4900,7 +4891,6 @@ impl SessionActor {
         }
     }
 
-    #[cfg(feature = "api")]
     fn synthetic_master_continuation_inbound(
         &self,
         continuation: &QueuedMasterContinuation,
@@ -4929,7 +4919,6 @@ impl SessionActor {
         }
     }
 
-    #[cfg(feature = "api")]
     async fn drain_master_continuations(&mut self) -> bool {
         let runtime_state = if self.active_overflow_tasks.load(Ordering::Acquire) > 0 {
             MasterContinuationRuntimeState::busy()
@@ -5092,7 +5081,6 @@ impl SessionActor {
     /// response's input+output tokens — the same per-turn total the AppUI
     /// dispatch path attributes). Passing 0 here previously let the token
     /// budget gate never trip, so a goal recurred past its token budget.
-    #[cfg(feature = "api")]
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
         profile_id: &str,
@@ -5199,15 +5187,10 @@ impl SessionActor {
         // entry idle gate so a goal turn that filled the inbox does not
         // immediately enqueue another goal turn ahead of pending user
         // input.
-        let idle_state = crate::api::goal_loop_runtime::RuntimeIdleState::idle()
+        let idle_state = crate::autonomy::goal_loop_runtime::RuntimeIdleState::idle()
             .with_user_input_pending(!self.inbox.is_empty());
         let _ =
             orchestrator.maybe_enqueue_goal_after_turn(&self.session_key, profile_id, idle_state);
-    }
-
-    #[cfg(not(feature = "api"))]
-    async fn drain_master_continuations(&mut self) -> bool {
-        false
     }
 
     // ── Phase 4: human-approval bridge (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)

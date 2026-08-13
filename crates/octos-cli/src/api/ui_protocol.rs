@@ -83,23 +83,6 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use super::AppState;
-use super::agent_orchestrator::{
-    AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
-    AgentRequest, AgentUpsert, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest,
-    InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
-    LoopListRequest, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
-    MonitorListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
-    default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
-    monitor_invalid_spec_error, parse_agent_output_cursor, run_goal_completion_verifier_with_usage,
-    upsert_background_task_agent, wire_key_from_goal_key,
-};
-#[cfg(test)]
-use super::agent_orchestrator::{
-    AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
-};
-use super::master_continuation_scheduler::{
-    MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
-};
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 #[cfg(test)]
@@ -107,11 +90,6 @@ use super::skill_action_jobs::SkillActionJobStatus;
 use super::skill_action_jobs::{
     SkillActionJobRecord, SkillActionProjectionMetadata, load_skill_action_jobs,
     project_skill_action_job, project_skill_action_jobs, with_skill_action_result,
-};
-use super::specialist_runner::{
-    AppUiSupervisorEventSink, SpecialistArtifactSpec, SupervisedCliSpecialist,
-    SupervisedMcpSpecialist, SupervisedSpecialistSpec, run_supervised_cli_specialist,
-    run_supervised_mcp_specialist,
 };
 use super::ui_protocol_approvals::PendingApprovalStore;
 use super::ui_protocol_audit::{ApprovalsAuditConfig, ApprovalsAuditLog, log_decision_tracing};
@@ -129,6 +107,28 @@ use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
 use super::ui_protocol_task_output;
 use super::ws_slash;
+use crate::autonomy::agent_orchestrator::{
+    AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
+    AgentRequest, AgentUpsert, FleetKeeperSeed, GoalSessionRequest, GoalSetRequest,
+    InProcessAgentOrchestrator, LoopControlKind, LoopControlRequest, LoopCreateRequest,
+    LoopListRequest, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
+    MonitorListRequest, NativeSpecialistAppUiEvent, NativeSpecialistLaunchRequest,
+    default_agent_orchestrator, master_continuation_prompt, master_continuation_reason_name,
+    monitor_invalid_spec_error, parse_agent_output_cursor, run_goal_completion_verifier_with_usage,
+    upsert_background_task_agent, wire_key_from_goal_key,
+};
+#[cfg(test)]
+use crate::autonomy::agent_orchestrator::{
+    AgentArtifactRecord as AgentRuntimeArtifactRecord, clear_default_agent_orchestrator_for_test,
+};
+use crate::autonomy::master_continuation_scheduler::{
+    MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
+};
+use crate::autonomy::specialist_runner::{
+    AppUiSupervisorEventSink, SpecialistArtifactSpec, SupervisedCliSpecialist,
+    SupervisedMcpSpecialist, SupervisedSpecialistSpec, run_supervised_cli_specialist,
+    run_supervised_mcp_specialist,
+};
 use crate::context_manager::{
     CompactContextPolicy, ContextCompactionRecord, ContextManager, ForkPolicy, PromptBuildPolicy,
     PromptFrame, load_or_rebuild_context_manager, persist_context_manager_snapshot,
@@ -1083,11 +1083,11 @@ fn reseed_fleet_keeper_candidates(
 #[cfg(test)]
 mod fleet_keeper_reseed_tests {
     use super::*;
-    use crate::api::agent_orchestrator::{
+    use crate::autonomy::agent_orchestrator::{
         FLEET_KEEPER_EXTERNAL_KIND, FLEET_KEEPER_GROUP, FLEET_KEEPER_META_FLEET_ID,
         FLEET_KEEPER_META_WORKSPACE_HAS_RUNTIME_HINT, FLEET_KEEPER_META_WORKSPACE_ROOT,
     };
-    use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+    use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
 
     #[test]
     fn set_if_absent_is_atomic_and_never_overwrites() {
@@ -10671,11 +10671,11 @@ fn add_autonomy_policy_stamp(policy: &mut Value, features: ConnectionUiFeatures)
     // constants the backend actually enforces.
     object.insert(
         "goal_default_token_budget".into(),
-        json!(super::agent_orchestrator::GOAL_DEFAULT_TOKEN_BUDGET),
+        json!(crate::autonomy::agent_orchestrator::GOAL_DEFAULT_TOKEN_BUDGET),
     );
     object.insert(
         "goal_max_token_budget".into(),
-        json!(super::agent_orchestrator::GOAL_MAX_TOKEN_BUDGET),
+        json!(crate::autonomy::agent_orchestrator::GOAL_MAX_TOKEN_BUDGET),
     );
     object.insert("continuation_min_delay_seconds".into(), json!(30));
     object.insert("continuation_max_per_hour".into(), json!(20));
@@ -14557,7 +14557,7 @@ fn wake_master_and_record_park_escalation(
 #[cfg(test)]
 mod peer_awaiting_wake_tests {
     use super::*;
-    use crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
+    use crate::autonomy::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
 
     /// Stage a peer dir (`<peers_root>/<slug>/` with `brief.md`) and optionally
     /// record its `originator`. Mirrors the `stage_peer` staging contract that
@@ -14585,7 +14585,7 @@ mod peer_awaiting_wake_tests {
     /// same originator — wake + row both land.
     #[test]
     fn closed_peer_park_produces_neither_wake_nor_escalation_row() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let peers_root = data_dir.join("peers");
@@ -15767,28 +15767,11 @@ fn read_and_clear_goal_progress_notes(
 }
 
 /// Stable, collision-resistant filename-safe hash of a session id.
-/// Renders as 16 hex chars (64 bits) from `DefaultHasher` (SipHash-1-3).
 ///
-/// # Caveats
-///
-/// - NOT cryptographic. SipHash's collision resistance is adequate for a
-///   profile-private inbox dir under a single-process trust boundary, but
-///   an adversary who can choose session ids AND access the inbox dir
-///   could force collisions. If that threat model changes, swap to a
-///   cryptographic hash (sha2::Sha256) or a collision-free encoding
-///   (percent-encoding the raw session id).
-/// - `DefaultHasher`'s algorithm is NOT guaranteed stable across Rust
-///   releases. A pending `.notes` file written under release N may become
-///   orphaned (unfindable by release N+1). The wake is best-effort (the
-///   goal ledger is the source of truth), so this is acceptable — but do
-///   NOT rely on this filename for anything durable.
-pub(crate) fn hash_session_for_inbox(session_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    session_id.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+/// Relocated to [`crate::autonomy::hash_session_for_inbox`] so the (no longer
+/// `api`-gated) monitor-notes channel derives its filenames from the SAME
+/// hash; re-exported here so this module's call sites keep working.
+pub(crate) use crate::autonomy::hash_session_for_inbox;
 
 /// Count how many `result-<n>.md` version files exist in the peer directory,
 /// via the fd-anchored, regular-file-only, scan-capped enumerator so swapping
@@ -17462,12 +17445,14 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
             // error, NOT a silent fallback to poll (which would arm a different
             // watcher than the caller asked for).
             let mode = match params.mode.as_deref().map(str::trim) {
-                None | Some("") | Some("poll") => crate::api::monitor_runtime::MonitorMode::Poll {
-                    interval_secs: params
-                        .interval_seconds
-                        .unwrap_or(crate::api::monitor_runtime::MONITOR_MIN_POLL_INTERVAL_SECS),
-                },
-                Some("stream") => crate::api::monitor_runtime::MonitorMode::Stream,
+                None | Some("") | Some("poll") => {
+                    crate::autonomy::monitor_runtime::MonitorMode::Poll {
+                        interval_secs: params.interval_seconds.unwrap_or(
+                            crate::autonomy::monitor_runtime::MONITOR_MIN_POLL_INTERVAL_SECS,
+                        ),
+                    }
+                }
+                Some("stream") => crate::autonomy::monitor_runtime::MonitorMode::Stream,
                 Some(other) => {
                     return Err(monitor_invalid_spec_error(
                         &params.session_id,
@@ -17476,19 +17461,19 @@ fn raw_autonomy_rpc_with_orchestrator_and_ledger(
                     ));
                 }
             };
-            let spec = crate::api::monitor_runtime::MonitorSpec {
+            let spec = crate::autonomy::monitor_runtime::MonitorSpec {
                 name: params.name,
                 argv: params.argv,
                 filter_regex: params.filter_regex,
                 batch_ms: params
                     .batch_ms
-                    .unwrap_or(crate::api::monitor_runtime::MONITOR_DEFAULT_BATCH_MS),
+                    .unwrap_or(crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS),
                 mode,
                 timeout_secs: params.timeout_secs,
                 persistent: params.persistent.unwrap_or(false),
-                max_events_per_hour: params
-                    .max_events_per_hour
-                    .unwrap_or(crate::api::monitor_runtime::MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR),
+                max_events_per_hour: params.max_events_per_hour.unwrap_or(
+                    crate::autonomy::monitor_runtime::MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR,
+                ),
                 goal_id: params.goal_id,
                 cwd: data_dir.clone(),
             };
@@ -21536,7 +21521,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
     let persist_peer_input_prompt = matches!(
         &continuation.reason,
         MasterContinuationReason::External(kind)
-            if kind == crate::api::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
+            if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
     );
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
@@ -21964,9 +21949,12 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // init with its pipe reader gone (it can no longer wake anything).
             {
                 let desired = default_agent_orchestrator().monitor_reconcile_pass();
-                let sink: std::sync::Arc<dyn crate::api::monitor_runtime::MonitorSink> =
-                    std::sync::Arc::new(crate::api::agent_orchestrator::OrchestratorMonitorSink);
-                crate::api::monitor_runtime::monitor_process_runtime().reconcile(desired, sink);
+                let sink: std::sync::Arc<dyn crate::autonomy::monitor_runtime::MonitorSink> =
+                    std::sync::Arc::new(
+                        crate::autonomy::agent_orchestrator::OrchestratorMonitorSink,
+                    );
+                crate::autonomy::monitor_runtime::monitor_process_runtime()
+                    .reconcile(desired, sink);
             }
 
             // #1967 — resolve expired open escalations across every profile's
@@ -31062,13 +31050,13 @@ async fn run_standalone_turn(
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         task_supervisor.set_on_terminal(move |event| {
-            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
                 event,
                 Some(terminal_profile_id.as_str()),
                 // WS / standalone-turn path: the queue IS the only failure
                 // channel here (the legacy `set_on_failure_signal` enqueues
                 // the SAME dedupe key), so route both outcomes.
-                crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+                crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
             );
         });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
@@ -31999,7 +31987,7 @@ async fn run_standalone_turn(
         // bleed into the peer-goal channel. The `External("monitor_fired")`
         // continuation prompt also carries a capped preview in metadata, so
         // the wake is self-contained even when this read races another turn.
-        if let Some(notes) = crate::api::monitor_runtime::read_and_clear_monitor_notes(
+        if let Some(notes) = crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(
             &session_runtime.profile.data_dir,
             &session_id.to_string(),
         ) {
@@ -32078,7 +32066,7 @@ async fn run_standalone_turn(
                      <objective>{}</objective> — {}/{} tokens used. When its success \
                      criteria are demonstrably met, call goal_update(status=\"complete\"); \
                      if permanently blocked, goal_update(status=\"blocked\").",
-                    crate::api::agent_orchestrator::xml_escape_untrusted(&clipped),
+                    crate::autonomy::agent_orchestrator::xml_escape_untrusted(&clipped),
                     snapshot["tokens_used"],
                     snapshot["token_budget"],
                 ),
@@ -36826,20 +36814,20 @@ fn monitor_fired_notification(
     use octos_core::ui_protocol::MonitorFiredEvent;
     match &continuation.reason {
         MasterContinuationReason::External(kind)
-            if kind == crate::api::agent_orchestrator::MONITOR_FIRED_EXTERNAL_KIND => {}
+            if kind == crate::autonomy::agent_orchestrator::MONITOR_FIRED_EXTERNAL_KIND => {}
         _ => return None,
     }
     let monitor_id = continuation
         .metadata
-        .get(crate::api::agent_orchestrator::MONITOR_META_ID)?
+        .get(crate::autonomy::agent_orchestrator::MONITOR_META_ID)?
         .clone();
     let name = continuation
         .metadata
-        .get(crate::api::agent_orchestrator::MONITOR_META_NAME)
+        .get(crate::autonomy::agent_orchestrator::MONITOR_META_NAME)
         .cloned();
     let line_count = continuation
         .metadata
-        .get(crate::api::agent_orchestrator::MONITOR_META_LINE_COUNT)
+        .get(crate::autonomy::agent_orchestrator::MONITOR_META_LINE_COUNT)
         .and_then(|value| value.parse::<u64>().ok());
     let fired_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

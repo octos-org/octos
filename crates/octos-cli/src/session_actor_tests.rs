@@ -2442,8 +2442,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
         setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
     let session_id = test_session_key(dir.path());
 
-    crate::api::agent_orchestrator::default_agent_orchestrator().upsert_agent(
-        crate::api::agent_orchestrator::AgentUpsert {
+    crate::autonomy::agent_orchestrator::default_agent_orchestrator().upsert_agent(
+        crate::autonomy::agent_orchestrator::AgentUpsert {
             agent_id: "child-a".into(),
             parent_agent_id: Some("master".into()),
             session_id: session_id.clone(),
@@ -2525,7 +2525,7 @@ async fn master_continuation_tick_reenters_actor_loop() {
 #[cfg(feature = "api")]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation() {
-    use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
 
     let dir = tempfile::TempDir::new().unwrap();
     // `make_response` carries TokenUsage { input: 50, output: 10 } —
@@ -2620,7 +2620,7 @@ async fn should_charge_goal_real_turn_tokens_when_actor_drains_goal_continuation
 #[cfg(feature = "api")]
 #[test]
 fn session_actor_continuation_prompt_matches_canonical_renderer() {
-    use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
 
     let orchestrator = default_agent_orchestrator();
     let session_id = SessionKey::with_profile("tenant-c", "api", "goalfix-render");
@@ -2666,7 +2666,7 @@ fn session_actor_continuation_prompt_matches_canonical_renderer() {
     );
 
     orchestrator
-        .clear_goal(crate::api::agent_orchestrator::GoalSessionRequest {
+        .clear_goal(crate::autonomy::agent_orchestrator::GoalSessionRequest {
             session_id: session_id.clone(),
             profile_id: "tenant-c".into(),
         })
@@ -2677,13 +2677,13 @@ fn session_actor_continuation_prompt_matches_canonical_renderer() {
 /// `agent_orchestrator::master_continuation_prompt`) must route a fleet-keeper
 /// wake to the fleet-keeper arm, not the generic external fallback. This is the
 /// gateway-path half of the "both renderers" guard (its orchestrator-path twin
-/// lives in `api::fleet_wake`); it also proves the objective is XML-escaped
+/// lives in `autonomy::fleet_wake`); it also proves the objective is XML-escaped
 /// across the delegation.
 #[cfg(feature = "api")]
 #[test]
 fn session_actor_renders_fleet_keeper_prompt() {
-    use crate::api::fleet_wake::{FleetKeeperSnapshot, fleet_keeper_continuation_request};
-    use crate::api::master_continuation_scheduler::MasterContinuationScheduler;
+    use crate::autonomy::fleet_wake::{FleetKeeperSnapshot, fleet_keeper_continuation_request};
+    use crate::autonomy::master_continuation_scheduler::MasterContinuationScheduler;
 
     let snap = FleetKeeperSnapshot {
         objective: "keeper via <gateway>".to_owned(),

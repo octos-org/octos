@@ -2898,7 +2898,7 @@ fn appui_loop_uses_response_content_not_session_history_for_self_paced() {
     // in parallel with the appui_*_loop_*_drains tests that DO
     // share the static would otherwise contaminate their loop
     // counts.
-    use crate::api::agent_orchestrator::InProcessAgentOrchestrator;
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
 
     // `SELF_PACED_DEFAULT_DELAY_SECONDS` is module-private
     // (`agent_orchestrator.rs` line 49: `const ... = 60 * 15`).
@@ -9290,7 +9290,7 @@ async fn ws_turn_supervisor_routes_spawn_only_failure_to_master_continuation_que
     let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
         &session_id,
         &profile_id,
-        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
         1,
     );
     assert_eq!(drained.len(), 1, "exactly one continuation must drain");
@@ -9349,7 +9349,7 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
     // A non-peer session is a no-op (never registered).
     register_peer_wire_session(&state, &SessionKey::with_profile("other", "web", "plain"));
 
-    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
     let orchestrator = default_agent_orchestrator();
     let message = "focus on the auth module next; skip the CSS pass";
     // `call-1` stands in for the LLM `tool_call_id` of the first tool call.
@@ -9401,7 +9401,7 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
     let drained = orchestrator.drain_ready_continuations_for_session(
         &peer_key,
         profile_id,
-        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
         1,
     );
     assert_eq!(
@@ -9425,7 +9425,7 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
     let _ = orchestrator.drain_ready_continuations_for_session(
         &peer_key,
         profile_id,
-        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
         8,
     );
 }
@@ -9866,7 +9866,7 @@ fn peer_continuation_only_drained_by_owning_connection() {
 /// false success ack; a queued/duplicate injection is a success.
 #[test]
 fn peer_send_input_persist_failure_maps_to_error_not_success() {
-    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
     let err = PeerSendInputEnqueueOutcome::PersistFailed
         .into_callback_result("slugz")
         .expect_err("persist failure must be an error, not a success ack");
@@ -9891,7 +9891,7 @@ fn peer_send_input_persist_failure_maps_to_error_not_success() {
 /// closed one.
 #[tokio::test]
 async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
-    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
     let orchestrator = default_agent_orchestrator();
     let profile_id = "test-peer-reconnect-rehome";
     let slug = "reconnect-peer";
@@ -9937,7 +9937,7 @@ async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
     let drained = orchestrator.drain_ready_continuations_for_session(
         &s2,
         profile_id,
-        crate::api::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+        crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
         8,
     );
     assert_eq!(drained.len(), 1);
@@ -10040,7 +10040,9 @@ fn global_drain_skips_obsolete_or_closed_peer_wire() {
 /// under the NEW wire (not the old).
 #[test]
 fn retarget_tombstones_old_durable_record_no_restart_dup() {
-    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    use crate::autonomy::agent_orchestrator::{
+        InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome,
+    };
     let dir = tempfile::tempdir().unwrap();
     let profile_id = "tenant-a";
     let slug = "restart-dup-peer";
@@ -10082,7 +10084,9 @@ fn retarget_tombstones_old_durable_record_no_restart_dup() {
 /// (tombstone) event.
 #[test]
 fn retarget_persists_new_before_tombstoning_old_crash_safe() {
-    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
+    use crate::autonomy::agent_orchestrator::{
+        InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome,
+    };
     let dir = tempfile::tempdir().unwrap();
     let orch = InProcessAgentOrchestrator::default();
     orch.configure_supervisor_store(dir.path()).unwrap();
@@ -10100,7 +10104,7 @@ fn retarget_persists_new_before_tombstoning_old_crash_safe() {
     );
 
     let events = std::fs::read_to_string(
-        crate::api::supervisor_store::SupervisorStore::new(dir.path()).events_path(),
+        crate::autonomy::supervisor_store::SupervisorStore::new(dir.path()).events_path(),
     )
     .unwrap();
     let lines: Vec<&str> = events.lines().collect();
@@ -10127,8 +10131,10 @@ fn retarget_persists_new_before_tombstoning_old_crash_safe() {
 /// redraw. Without this it would only ever re-deliver at a server restart.
 #[test]
 fn reinsert_makes_popped_injection_drainable_again() {
-    use crate::api::agent_orchestrator::{InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome};
-    use crate::api::master_continuation_scheduler::MasterContinuationRuntimeState;
+    use crate::autonomy::agent_orchestrator::{
+        InProcessAgentOrchestrator, PeerSendInputEnqueueOutcome,
+    };
+    use crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState;
     let orch = InProcessAgentOrchestrator::default();
     let profile_id = "test-peer-reinsert";
     let slug = "reinsert-peer";
@@ -14789,26 +14795,26 @@ impl AgentOrchestrator for RecordingOrchestrator {
 
     fn create_monitor(
         &self,
-        request: crate::api::agent_orchestrator::MonitorCreateRequest,
+        request: crate::autonomy::agent_orchestrator::MonitorCreateRequest,
     ) -> Result<Value, RpcError> {
         self.record(format!("create_monitor:{}", request.session_id))
     }
 
     fn list_monitors(
         &self,
-        request: crate::api::agent_orchestrator::MonitorListRequest,
+        request: crate::autonomy::agent_orchestrator::MonitorListRequest,
     ) -> Result<Value, RpcError> {
         self.record(format!("list_monitors:{}", request.profile_id))
     }
 
     fn control_monitor(
         &self,
-        request: crate::api::agent_orchestrator::MonitorControlRequest,
+        request: crate::autonomy::agent_orchestrator::MonitorControlRequest,
     ) -> Result<Value, RpcError> {
         let kind = match request.kind {
-            crate::api::agent_orchestrator::MonitorControlKind::Pause => "pause",
-            crate::api::agent_orchestrator::MonitorControlKind::Resume => "resume",
-            crate::api::agent_orchestrator::MonitorControlKind::Delete => "delete",
+            crate::autonomy::agent_orchestrator::MonitorControlKind::Pause => "pause",
+            crate::autonomy::agent_orchestrator::MonitorControlKind::Resume => "resume",
+            crate::autonomy::agent_orchestrator::MonitorControlKind::Delete => "delete",
         };
         self.record(format!("control_monitor:{kind}:{}", request.monitor_id))
     }
@@ -19399,15 +19405,15 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
     };
 
     // Drive the unified sink twice — idempotent collapse via dedupe key.
-    crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+    crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
-    crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+    crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     assert_eq!(
@@ -19433,7 +19439,7 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
     assert!(matches!(
         drained[0].reason,
         MasterContinuationReason::External(ref kind)
-            if kind == crate::api::agent_orchestrator::SPAWN_ONLY_FAILURE_EXTERNAL_KIND
+            if kind == crate::autonomy::agent_orchestrator::SPAWN_ONLY_FAILURE_EXTERNAL_KIND
     ));
     let prompt = master_continuation_prompt(&drained[0]);
     assert!(
@@ -19473,10 +19479,10 @@ async fn unified_terminal_sink_failure_without_ack_suppresses_recovery() {
         }),
     };
 
-    crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+    crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     assert_eq!(
@@ -19515,15 +19521,15 @@ async fn unified_terminal_sink_success_queues_child_completed_under_profile() {
     };
 
     // Idempotent: two terminal marks collapse to one continuation.
-    crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+    crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
-    crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+    crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
         &event,
         Some(profile_id),
-        crate::api::agent_orchestrator::TerminalFailureRouting::Queue,
+        crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
     );
 
     let drained = default_agent_orchestrator().drain_ready_continuations_for_session(
@@ -23789,7 +23795,7 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
 /// the hint, not the fallback.
 #[test]
 fn self_paced_loop_honours_preamble_hint_when_spawn_only_skipped() {
-    use crate::api::agent_orchestrator::{
+    use crate::autonomy::agent_orchestrator::{
         InProcessAgentOrchestrator, LoopCreateRequest, LoopListRequest,
     };
 
@@ -23863,7 +23869,7 @@ fn self_paced_loop_honours_preamble_hint_when_spawn_only_skipped() {
 
 #[test]
 fn self_paced_loop_reschedules_when_only_assistant_content_is_synth_ack() {
-    use crate::api::agent_orchestrator::{
+    use crate::autonomy::agent_orchestrator::{
         InProcessAgentOrchestrator, LoopCreateRequest, LoopListRequest,
     };
 
@@ -24676,7 +24682,7 @@ async fn real_peer_approval_park_wakes_originator() {
         .iter()
         .find(|c| {
             matches!(&c.reason, MasterContinuationReason::External(k)
-                if k == crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
+                if k == crate::autonomy::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
         })
         .expect("a peer_awaiting_input wake must be queued on the master");
     assert!(
@@ -24803,7 +24809,7 @@ async fn real_peer_question_park_wakes_originator() {
         .iter()
         .find(|c| {
             matches!(&c.reason, MasterContinuationReason::External(k)
-                if k == crate::api::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
+                if k == crate::autonomy::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND)
         })
         .expect("a peer_awaiting_input wake must be queued on the master");
     assert!(
@@ -28446,7 +28452,7 @@ fn peer_list_and_gather_surface_display_name() {
 /// untouched.
 #[test]
 fn peer_close_by_name_cancels_pending_injection_for_right_peer() {
-    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
     let orchestrator = default_agent_orchestrator();
     let profile_id = "test-peer-close-by-name";
     let owner = "test-peer-close-by-name:api:master";
@@ -28874,7 +28880,7 @@ fn peer_key_without_a_profile_is_not_addressable() {
 /// (`cancel_peer_send_input_continuations_for_peer`) the global-drain gate wires.
 #[test]
 fn drain_retires_continuation_for_closed_peer_not_pending() {
-    use crate::api::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
     let orchestrator = default_agent_orchestrator();
     let profile_id = "test-drain-retire-closed";
     let slug = "retire-peer";
