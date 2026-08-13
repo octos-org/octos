@@ -47,6 +47,8 @@ use tracing::warn;
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
 use crate::contracts::UiProtocolContractStores;
 
+pub(crate) mod host;
+
 /// Cap a string at `cap` bytes on a char boundary; returns (text, truncated).
 ///
 /// Not peer-specific, but every remaining caller is (`peer_pending_prompt_summary`,

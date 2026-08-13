@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,7 +16,7 @@ use octos_agent::{
     ToolApprovalRequester, ToolRegistry, UserQuestionOutcome, UserQuestionRequest,
     UserQuestionRequester, read_workspace_policy,
 };
-use octos_core::ui_protocol::UserQuestionAnswer;
+use octos_core::ui_protocol::{PeerStagedEvent, UserQuestionAnswer};
 use octos_core::{AgentId, Message, MessageRole, SessionScope};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
@@ -118,10 +118,24 @@ pub struct ChatCommand {
     /// re-reads the same goal. Off by default — the tool surface is unchanged
     /// unless you ask for it.
     ///
-    /// Peers are NOT part of this: `peer_handoff` and the autonomous
-    /// continuation loop still require `octos serve`.
+    /// Peers are opt-in on top of this — see `--peers`.
     #[arg(long)]
     pub goals: bool,
+
+    /// Enable the PEER tools (`peer_handoff` / `peer_list` / `peer_respond`)
+    /// and host staged peers IN THIS PROCESS.
+    ///
+    /// `peer_handoff` stages a peer under `<data_dir>/peers/<slug>` and chat
+    /// immediately opens a `peer-<slug>` session for it, running its `brief.md`
+    /// as the peer's first turn. A peer that hits a tool approval or an
+    /// `ask_user_question` does NOT prompt this terminal — the terminal belongs
+    /// to you, the master. It PARKS, `peer_list` reports it as
+    /// `awaiting_input`, and you answer it with `peer_respond`.
+    ///
+    /// Requires `--goals`: a peer is a unit of work under a goal, and the
+    /// handoff auto-binds to the session's active goal.
+    #[arg(long, requires = "goals")]
+    pub peers: bool,
 
     /// FULL AUTONOMY ("yolo"): bypass all approvals AND the sandbox — the
     /// agent can edit any file and run any command with network access,
@@ -690,6 +704,37 @@ where
 /// an allow-list profile surface so `filter_by_profile` keeps them.
 const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
 
+/// The peer tools `octos chat --peers` registers, and the exact set added to an
+/// allow-list profile surface.
+///
+/// Deliberately three, not six. `peer_gather` and `peer_close` are read-only /
+/// lifecycle conveniences that would each drag more of the serve-side wiring in
+/// (`peer_close` needs the WS `peer/closed` + `approval/cancelled` emitters);
+/// `peer_send_input` needs a running peer's continuation queue, which chat's
+/// one-shot peer host has no drain for. Handoff → list → respond is the
+/// complete master↔peer loop, and nothing more is claimed.
+const CHAT_PEER_TOOLS: &[&str] = &["peer_handoff", "peer_list", "peer_respond"];
+
+/// Add `wanted` to an ALLOW-LIST profile surface, in place, without duplicates.
+///
+/// Chat's default `coding` profile is an allow list, so REGISTERING a tool is
+/// not enough — `filter_by_profile` drops anything the list does not name and
+/// the model never sees it (observed live in Phase 1: the tool count was
+/// identical with and without `--goals`). A deny list and the pass-through
+/// `Default` mode need no change (none of these names appear in either), and an
+/// EMPTY allow list is already pass-through, so both are left alone.
+fn widen_allow_list(surface: &mut octos_agent::profile::ProfileTools, wanted: &[&str]) {
+    if let octos_agent::profile::ProfileTools::AllowList { tools } = surface {
+        if !tools.is_empty() {
+            for name in wanted {
+                if !tools.iter().any(|entry| entry == name) {
+                    tools.push((*name).to_owned());
+                }
+            }
+        }
+    }
+}
+
 /// Stable goal session key for `octos chat --goals`.
 ///
 /// Chat has no wire session, but the goal tools resolve their session from
@@ -700,6 +745,202 @@ const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
 /// `serve` wire session (`<profile>:local:<name>` / `<profile>:api:<name>`).
 fn chat_goal_session_key(profile_id: &str) -> String {
     format!("{profile_id}:cli:chat")
+}
+
+/// Everything the in-process peer host needs to build and drive a peer agent.
+///
+/// Assembled in `ChatCommand::run` BEFORE the master agent consumes `llm` /
+/// `memory` / `agent_config`; every field is either an `Arc` or `Clone`, so the
+/// host is a cheap sibling of the master rather than a second bootstrap.
+struct ChatPeerHost {
+    rx: tokio::sync::mpsc::UnboundedReceiver<PeerStagedEvent>,
+    llm: Arc<dyn LlmProvider>,
+    memory: Arc<octos_memory::EpisodeStore>,
+    agent_config: AgentConfig,
+    sandbox_config: octos_agent::SandboxConfig,
+    permissions: octos_agent::policy::EffectivePermissions,
+    /// The MASTER's resolved profile. A peer must not see a wider tool surface
+    /// than the session that spawned it, so its registry is narrowed through
+    /// the same envelope (`filter_by_profile`).
+    profile: Arc<octos_agent::profile::ProfileDefinition>,
+    profile_id: String,
+    peers_root: PathBuf,
+    data_dir: PathBuf,
+    shutdown: Arc<AtomicBool>,
+}
+
+/// Drive staged peers, one task per peer, for the lifetime of the chat session.
+///
+/// Detached on purpose: `peer_handoff` returns to the model as soon as staging
+/// succeeds (that is its contract on the serve path too), and the master must
+/// stay responsive while a peer runs — otherwise it could never answer the
+/// peer's parked prompt, which is the entire point of the loop.
+fn spawn_chat_peer_host(mut host: ChatPeerHost) {
+    tokio::spawn(async move {
+        while let Some(event) = host.rx.recv().await {
+            if host.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let slug = event.slug.clone();
+            let cwd = PathBuf::from(&event.cwd);
+            let llm = host.llm.clone();
+            let memory = host.memory.clone();
+            let agent_config = host.agent_config.clone();
+            let sandbox_config = host.sandbox_config.clone();
+            let permissions = host.permissions;
+            let profile = host.profile.clone();
+            let profile_id = host.profile_id.clone();
+            let peers_root = host.peers_root.clone();
+            let data_dir = host.data_dir.clone();
+            tokio::spawn(async move {
+                if let Err(error) = run_chat_peer(
+                    &slug,
+                    &cwd,
+                    llm,
+                    memory,
+                    agent_config,
+                    &sandbox_config,
+                    permissions,
+                    Some(&profile),
+                    &profile_id,
+                    &peers_root,
+                    &data_dir,
+                )
+                .await
+                {
+                    eprintln!("peer '{slug}' failed: {error}");
+                }
+            });
+        }
+    });
+}
+
+/// Run ONE staged peer to completion in this process.
+///
+/// The two things that make it a real peer rather than a sub-agent:
+///
+/// * its session key carries the `peer-<slug>` topic and is published in the
+///   process-global wire registry, so `peer_list` / `peer_respond` can find it;
+/// * its approval + user-question requesters PARK in the shared contract store
+///   instead of touching the console. Only the master talks to the terminal.
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_peer(
+    slug: &str,
+    cwd: &Path,
+    llm: Arc<dyn LlmProvider>,
+    memory: Arc<octos_memory::EpisodeStore>,
+    agent_config: AgentConfig,
+    sandbox_config: &octos_agent::SandboxConfig,
+    permissions: octos_agent::policy::EffectivePermissions,
+    profile: Option<&octos_agent::profile::ProfileDefinition>,
+    profile_id: &str,
+    peers_root: &Path,
+    data_dir: &Path,
+) -> Result<()> {
+    let boot = crate::peers::host::read_peer_boot(peers_root, slug)
+        .ok_or_else(|| eyre::eyre!("peer '{slug}' is not a staged peer directory"))?;
+    let Some(brief) = boot.brief.clone() else {
+        return Err(eyre::eyre!("peer '{slug}' has no brief to run"));
+    };
+
+    // Publish the wire BEFORE the first turn: a peer that parks before it is
+    // registered is invisible to `peer_list` and unanswerable by `peer_respond`.
+    let session = crate::peers::host::register_peer_wire(profile_id, slug);
+
+    // The peer's own tool surface, rooted at ITS cwd (its worktree when the
+    // master asked for one). No peer tools: the depth-1 guard means a peer can
+    // never hand off, list, or respond.
+    let sandbox = octos_agent::create_sandbox(sandbox_config);
+    let mut peer_tools = ToolRegistry::with_builtins_and_permissions(cwd, sandbox, permissions);
+    // Goal tools so a goal-bound peer can read the objective and record its
+    // findings against the MASTER's goal — that is how work gets back.
+    peer_tools.register(
+        crate::goal_tool::GoalGetTool::new(profile_id.to_owned())
+            .with_data_dir(data_dir.to_path_buf()),
+    );
+    peer_tools.register(
+        crate::goal_tool::GoalUpdateTool::new(profile_id.to_owned())
+            .with_data_dir(data_dir.to_path_buf()),
+    );
+    // Narrow through the MASTER's profile envelope, last, exactly as the master
+    // registry does. Without this a `coding`-profile chat would hand its peers
+    // a WIDER tool surface than the session that spawned them. The goal tools
+    // survive because `--peers` requires `--goals`, which already widened the
+    // allow list for them.
+    if let Some(profile) = profile {
+        profile.apply_to_registry(&mut peer_tools);
+    }
+
+    let mut peer_agent = Agent::new(
+        AgentId::new(format!("peer-{slug}")),
+        llm,
+        peer_tools,
+        memory,
+    )
+    .with_config(agent_config)
+    .with_parent_session_key(session.to_string());
+    // Rehydrate the goal binding written by `stage_peer`, exactly as the serve
+    // peer boot does. Without it the peer's `goal_*` calls resolve to its own
+    // (goal-less) session and read empty state.
+    if let Some(goal_id) = boot.goal_id.clone() {
+        peer_agent = peer_agent.with_goal_id(goal_id);
+        if let Some(task_id) = boot.task_id.clone() {
+            peer_agent = peer_agent.with_task_id(task_id);
+        }
+    }
+    if let Some(originator) = boot.originator.clone() {
+        peer_agent = peer_agent.with_originator_session(originator);
+    }
+
+    // A parked peer must be ANNOUNCED — a silent block is indistinguishable
+    // from a hang, and the master has to know to run `peer_list`.
+    let notice: crate::peers::host::PeerParkNotice = Arc::new(|kind, slug, prompt| {
+        println!(
+            "\n{} peer '{}' is awaiting input ({}): {}\n  answer it with peer_respond (peer_list shows the ids)",
+            "⏸".yellow(),
+            slug,
+            kind.as_str(),
+            prompt
+        );
+    });
+    let approval: Arc<dyn ToolApprovalRequester> =
+        Arc::new(crate::peers::host::ParkingApprovalRequester::new(
+            session.clone(),
+            slug.to_owned(),
+            notice.clone(),
+        ));
+    let question: Arc<dyn UserQuestionRequester> = Arc::new(
+        crate::peers::host::ParkingQuestionRequester::new(session.clone(), slug.to_owned(), notice),
+    );
+
+    let outcome = octos_agent::tools::USER_QUESTION_CTX
+        .scope(
+            question,
+            octos_agent::tools::TOOL_APPROVAL_CTX
+                .scope(approval, peer_agent.process_message(&brief, &[], vec![])),
+        )
+        .await;
+
+    // The blackboard is the deliverable: `peer_list` reports `done` only once
+    // `result.md` exists, and `peer_gather` (serve-side) reads it. Write it for
+    // BOTH outcomes — a failed peer that leaves no trace looks like it never
+    // ran. Same fd-anchored atomic writer the serve path uses.
+    let body = match &outcome {
+        Ok(response) => response.content.clone(),
+        Err(error) => format!("peer turn failed: {error}"),
+    };
+    if let Some(dir) = crate::peers::staged_peer_dir(peers_root, slug) {
+        if let Err(error) = crate::peers::peer_io::write_peer_file_atomic(&dir, "result.md", &body)
+        {
+            tracing::warn!(%error, slug, "failed to record peer result");
+        }
+    }
+    println!(
+        "\n{} peer '{}' finished — read it with peer_list",
+        "✓".green(),
+        slug
+    );
+    outcome.map(|_| ())
 }
 
 async fn process_chat_turn(
@@ -1015,16 +1256,16 @@ impl ChatCommand {
         // Deny lists and the pass-through `Default` mode need no change (the
         // goal tools appear in neither), and an EMPTY allow list is already
         // pass-through, so leave that alone too.
+        //
+        // Phase 3 widens the SAME list by exactly the peer tools when `--peers`
+        // is also set. `--peers` requires `--goals` (clap enforces it), so this
+        // never widens a surface the operator did not already opt into.
         if self.goals {
-            if let octos_agent::profile::ProfileTools::AllowList { tools } = &mut profile.tools {
-                if !tools.is_empty() {
-                    for name in CHAT_GOAL_TOOLS {
-                        if !tools.iter().any(|entry| entry == name) {
-                            tools.push((*name).to_owned());
-                        }
-                    }
-                }
+            let mut wanted: Vec<&str> = CHAT_GOAL_TOOLS.to_vec();
+            if self.peers {
+                wanted.extend_from_slice(CHAT_PEER_TOOLS);
             }
+            widen_allow_list(&mut profile.tools, &wanted);
         }
 
         // yolo GAP #3: resolve the effective permissions from the CLI flags
@@ -1283,10 +1524,8 @@ impl ChatCommand {
         // goal (`goal_get` re-reads objective, status, spend, and — when a
         // ledger exists — peer findings written by a `serve`-side run).
         //
-        // NOT included here: peers (`peer_handoff`) and the autonomous
-        // continuation loop. Both need the multi-session host that only `serve`
-        // provides today; a one-shot/REPL chat cannot drive the async
-        // escalate -> wake -> respond cycle.
+        // Phase 3 adds peers on top (`--peers`); the autonomous continuation
+        // loop is still `serve`-only.
         let goal_session_key = if self.goals {
             let profile_id = self
                 .profile
@@ -1318,6 +1557,141 @@ impl ChatCommand {
             // mint a stable one per profile: the SAME key every run is what
             // makes the goal durable across invocations.
             Some(chat_goal_session_key(&profile_id))
+        } else {
+            None
+        };
+
+        // Phase 3 — PEERS in `octos chat` (opt-in via `--peers`, which clap
+        // gates behind `--goals`).
+        //
+        // Three tools, one loop:
+        //   peer_handoff  stages `<data_dir>/peers/<slug>` and hands the staged
+        //                 event to the in-process host below, which opens a
+        //                 `peer-<slug>` session and runs the brief.
+        //   peer_list     joins the on-disk blackboard to the PROCESS-GLOBAL
+        //                 pending-prompt store, so a parked peer shows as
+        //                 `awaiting_input` with the prompt ids.
+        //   peer_respond  resolves that peer's parked oneshot — the peer's own
+        //                 requester is awaiting the very same store entry.
+        //
+        // `contract_stores()` and the peer wire registry are both process-global
+        // `OnceLock`s, which is exactly why this works without `serve`: master
+        // and peer share one registry with no wire between them.
+        let peer_staged_tx = if self.peers {
+            let profile_id = self
+                .profile
+                .clone()
+                .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_owned());
+            let master_session = chat_goal_session_key(&profile_id);
+            // `<data_dir>/peers`, NOT `<profile.data_dir>/peers` as serve uses.
+            // Two reasons: it matches Phase 1's `<data_dir>/supervisor`, and
+            // `peer_respond_resolve` derives the goal-ledger root as
+            // `peers_root.parent()` — which must be the SAME `data_dir` the
+            // goal tools were given, or a peer's escalation resolves into a
+            // ledger nobody reads.
+            //
+            // KNOWN DIVERGENCE: chat peers are therefore NOT scoped per
+            // profile on disk, so `peer_list` in one profile lists peers staged
+            // by another. The wire registry and `peer_respond`'s
+            // originator check ARE profile-scoped, so a cross-profile peer can
+            // be SEEN but never answered or resumed. Acceptable for a
+            // single-user CLI; revisit if chat grows real profile isolation.
+            let peers_root = data_dir.join("peers");
+            if let Err(error) = std::fs::create_dir_all(&peers_root) {
+                return Err(eyre::eyre!(
+                    "--peers needs a writable peers root at {}: {error}",
+                    peers_root.display()
+                ));
+            }
+            let lanes: Vec<String> = config
+                .sub_providers
+                .iter()
+                .map(|sp| sp.key.clone())
+                .collect();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PeerStagedEvent>();
+
+            // The `emit_staged` sink the WS path uses to push `peer/staged` at a
+            // client. Chat has no client: it tells the operator, then hands the
+            // peer to its own host.
+            let staged_tx = tx.clone();
+            let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
+                Arc::new(move |event: PeerStagedEvent| {
+                    println!(
+                        "\n{} peer '{}' staged at {} — running its brief now",
+                        "▸".cyan(),
+                        event.slug,
+                        event.cwd
+                    );
+                    // A closed receiver means the host loop is gone (shutdown).
+                    // The peer stays staged on disk and is still visible to
+                    // `peer_list`; it just will not be driven this run.
+                    if staged_tx.send(event).is_err() {
+                        eprintln!(
+                            "warning: peer host is not running; the peer was staged but not started"
+                        );
+                    }
+                });
+
+            tools.register(octos_agent::PeerHandoffTool::new(
+                crate::peers::build_peer_handoff_callback(
+                    peers_root.clone(),
+                    cwd.clone(),
+                    octos_core::SessionKey(master_session.clone()),
+                    profile_id.clone(),
+                    lanes.clone(),
+                    Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    emit_staged,
+                ),
+            ));
+            tools.register(octos_agent::PeerListTool::new(
+                crate::peers::build_peer_list_callback(
+                    peers_root.clone(),
+                    lanes,
+                    crate::contracts::contract_stores(),
+                    profile_id.clone(),
+                ),
+            ));
+            // `peer_respond` needs an `approval/decided` sink. On the WS path
+            // that publishes the durable wire event plus an audit entry; chat
+            // has no wire, so it prints the decision and writes the SAME audit
+            // log (the audit trail is the part that must not depend on a client
+            // being attached).
+            let respond_peers_root = peers_root.clone();
+            let respond_origin = master_session.clone();
+            let respond_profile = profile_id.clone();
+            let respond_audit_dir = data_dir.clone();
+            let respond: octos_agent::PeerRespondCallback = Arc::new(
+                move |req: octos_agent::PeerRespondRequest| {
+                    let contracts = crate::contracts::contract_stores();
+                    let audit_dir = respond_audit_dir.clone();
+                    let on_decided =
+                        |event: &octos_core::ui_protocol::ApprovalDecidedEvent,
+                         tool_name: Option<&str>| {
+                            println!(
+                                "  {} approval {} {} (tool {})",
+                                "✓".green(),
+                                event.approval_id.0,
+                                event.decision.as_wire_str(),
+                                tool_name.unwrap_or("?")
+                            );
+                            if let Err(error) =
+                                contracts.audit_log(&audit_dir).record(event, tool_name)
+                            {
+                                tracing::warn!(%error, "failed to append peer approval audit entry");
+                            }
+                        };
+                    crate::peers::peer_respond_resolve(
+                        &respond_peers_root,
+                        &respond_origin,
+                        &respond_profile,
+                        &crate::contracts::contract_stores(),
+                        &on_decided,
+                        req,
+                    )
+                },
+            );
+            tools.register(octos_agent::PeerRespondTool::new(respond));
+            Some((tx, rx, profile_id, peers_root))
         } else {
             None
         };
@@ -1519,6 +1893,26 @@ impl ChatCommand {
                 });
             Some(Arc::new(scope))
         };
+
+        // Phase 3 — start the in-process PEER HOST. It owns the receive half of
+        // the staged-peer channel `peer_handoff`'s `emit_staged` feeds, so it
+        // must outlive the master agent's construction below (which moves
+        // `llm` / `memory` / `agent_config`) — hence the clones.
+        if let Some((_tx, rx, peer_profile_id, peers_root)) = peer_staged_tx {
+            spawn_chat_peer_host(ChatPeerHost {
+                rx,
+                llm: llm.clone(),
+                memory: memory.clone(),
+                agent_config: agent_config.clone(),
+                sandbox_config: effective_sandbox_config.clone(),
+                permissions,
+                profile: profile_arc.clone(),
+                profile_id: peer_profile_id,
+                peers_root,
+                data_dir: data_dir.clone(),
+                shutdown: shutdown.clone(),
+            });
+        }
 
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)
@@ -3390,6 +3784,226 @@ mod chat_goal_tests {
             "goal tools must not appear in the default chat tool surface",
         );
         assert!(TestCli::parse_from(["octos-chat", "--goals"]).chat.goals);
+    }
+}
+
+#[cfg(test)]
+mod chat_peer_tests {
+    use super::*;
+    use clap::Parser as _;
+    use octos_agent::profile::ProfileTools;
+
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        chat: ChatCommand,
+    }
+
+    /// `--peers` is opt-in and RIDES on `--goals`. A peer is a unit of work
+    /// under a goal — `peer_handoff` auto-binds to the session's active goal —
+    /// so `--peers` alone would stage peers bound to nothing. clap must reject
+    /// it at parse time rather than letting it half-work at runtime.
+    #[test]
+    fn should_require_goals_when_peers_is_requested() {
+        assert!(
+            !TestCli::parse_from(["octos-chat"]).chat.peers,
+            "peers must be off by default",
+        );
+        assert!(
+            TestCli::try_parse_from(["octos-chat", "--peers"]).is_err(),
+            "--peers without --goals must be a parse error, not a silent no-op",
+        );
+        let both = TestCli::try_parse_from(["octos-chat", "--peers", "--goals"])
+            .expect("--peers --goals is the supported combination");
+        assert!(both.chat.peers && both.chat.goals);
+    }
+
+    /// Registering the peer tools is not enough: chat's default `coding`
+    /// profile is an ALLOW LIST, so `filter_by_profile` drops anything it does
+    /// not name and the model never sees the tools (the exact failure Phase 1
+    /// hit with the goal tools). The widening must admit the peer tools AND
+    /// nothing else.
+    #[test]
+    fn should_keep_peer_tools_when_the_profile_surface_is_an_allow_list() {
+        let mut surface = ProfileTools::AllowList {
+            tools: vec![
+                "group:fs".to_owned(),
+                "group:runtime".to_owned(),
+                "spawn".to_owned(),
+            ],
+        };
+        for name in CHAT_PEER_TOOLS {
+            assert!(
+                !surface.allows(name),
+                "{name} must be filtered out before the widening — otherwise \
+                 this test proves nothing",
+            );
+        }
+        let wanted: Vec<&str> = CHAT_GOAL_TOOLS
+            .iter()
+            .chain(CHAT_PEER_TOOLS.iter())
+            .copied()
+            .collect();
+        widen_allow_list(&mut surface, &wanted);
+        for name in CHAT_GOAL_TOOLS.iter().chain(CHAT_PEER_TOOLS.iter()) {
+            assert!(surface.allows(name), "{name} must survive the filter");
+        }
+        // The carve is exactly three peer tools — the ones chat can actually
+        // honour. Widening for a tool it never registers would advertise a
+        // capability that fails at call time.
+        assert!(!surface.allows("peer_gather"));
+        assert!(!surface.allows("peer_close"));
+        assert!(!surface.allows("peer_send_input"));
+        assert!(!surface.allows("web_search"));
+    }
+
+    /// The widening must be a no-op for surfaces that are already
+    /// pass-through, so `--peers` cannot accidentally NARROW or mutate a deny
+    /// list / empty allow list.
+    #[test]
+    fn should_leave_non_allow_list_surfaces_untouched() {
+        let mut deny = ProfileTools::DenyList {
+            tools: vec!["shell".to_owned()],
+        };
+        widen_allow_list(&mut deny, CHAT_PEER_TOOLS);
+        assert_eq!(
+            deny,
+            ProfileTools::DenyList {
+                tools: vec!["shell".to_owned()]
+            },
+        );
+
+        let mut empty = ProfileTools::AllowList { tools: Vec::new() };
+        widen_allow_list(&mut empty, CHAT_PEER_TOOLS);
+        assert_eq!(
+            empty,
+            ProfileTools::AllowList { tools: Vec::new() },
+            "an empty allow list is already pass-through — widening it would \
+             turn a permissive surface into a three-tool one",
+        );
+    }
+
+    /// A chat-hosted peer's session key must be a CHILD of the master's Phase-1
+    /// goal session, or the two halves of the loop are addressing different
+    /// conversations.
+    #[test]
+    fn should_root_a_hosted_peer_under_the_master_chat_session() {
+        let master = chat_goal_session_key("dev");
+        let peer = crate::peers::host::chat_peer_session_key("dev", "alpha");
+        assert_eq!(peer.base_key(), master);
+        assert_eq!(peer.topic(), Some("peer-alpha"));
+    }
+
+    /// Drive the REAL host entry point over a mock provider.
+    ///
+    /// Everything except the model call is production code: `stage_peer` writes
+    /// the staging, `run_chat_peer` reads the boot context, publishes the wire,
+    /// builds the peer agent, runs `brief.md` as the first turn, and records the
+    /// blackboard result. Three things must hold afterwards, and each has bitten
+    /// this area before:
+    ///   * the peer is REGISTERED (an unregistered peer is invisible to
+    ///     `peer_list` and unanswerable by `peer_respond`);
+    ///   * `result.md` exists (a peer whose work is never recorded reads as
+    ///     "never ran" — octos#1701);
+    ///   * `peer_list` renders it as `done`, which is what the master sees.
+    #[tokio::test]
+    async fn should_run_a_staged_peer_in_process_and_record_its_result() {
+        use async_trait::async_trait;
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmProvider for MockLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("peer deliverable".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+            fn model_id(&self) -> &str {
+                "mock-1"
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        let peers_root = data_dir.join("peers");
+        std::fs::create_dir_all(&peers_root).expect("peers root");
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        // Process-global registries — a unique profile keeps concurrent tests
+        // from resolving each other's peers.
+        let profile = format!("chat-host-{}", uuid::Uuid::now_v7().simple());
+        let master = chat_goal_session_key(&profile);
+
+        let staged = crate::peers::stage_peer(
+            &peers_root,
+            &workspace,
+            "scout",
+            Some("scout"),
+            Some(master.as_str()),
+            "summarize the repo",
+            false,
+            None,
+            None,
+        )
+        .expect("stage");
+
+        let memory = Arc::new(EpisodeStore::open(temp.path()).await.expect("episodes"));
+        run_chat_peer(
+            &staged.slug,
+            &workspace,
+            Arc::new(MockLlm) as Arc<dyn LlmProvider>,
+            memory,
+            AgentConfig::default(),
+            &octos_agent::SandboxConfig::default(),
+            octos_agent::policy::EffectivePermissions::default(),
+            None,
+            &profile,
+            &peers_root,
+            &data_dir,
+        )
+        .await
+        .expect("the peer turn completes");
+
+        assert_eq!(
+            crate::peers::peer_trusted_session(&profile, &staged.slug),
+            Some(crate::peers::host::chat_peer_session_key(
+                &profile,
+                &staged.slug
+            )),
+            "the peer must be reachable through the wire registry — peer_list \
+             and peer_respond derive its trusted session from there",
+        );
+
+        let rows = crate::peers::read_peer_blackboard(&peers_root, None);
+        let row = rows
+            .iter()
+            .find(|row| row.slug == staged.slug)
+            .expect("the staged peer is on the blackboard");
+        assert_eq!(
+            row.result.as_deref(),
+            Some("peer deliverable"),
+            "the peer's turn output must land in result.md or its work is lost",
+        );
+
+        let listing =
+            crate::peers::compose_peer_list_text(&rows, &[], &std::collections::HashMap::new());
+        assert!(
+            listing.contains(&staged.slug) && listing.contains("done"),
+            "peer_list must show the finished peer as done: {listing}",
+        );
     }
 }
 
