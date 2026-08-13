@@ -18148,6 +18148,8 @@ async fn approval_request_closed_ws_keeps_pending_runtime_waiter() {
         ledger: Arc::clone(&ledger),
         contracts: Arc::clone(&contracts),
         state,
+        // Not a `peer-` topic, so the #1842 park gate never resolves.
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         features: ConnectionUiFeatures::default(),
@@ -18236,6 +18238,8 @@ async fn dropped_approval_waiter_cancels_pending_entry() {
         ledger: Arc::clone(&ledger),
         contracts: Arc::clone(&contracts),
         state,
+        // Not a `peer-` topic, so the #1842 park gate never resolves.
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         features: ConnectionUiFeatures::default(),
@@ -24671,6 +24675,7 @@ async fn real_peer_approval_park_wakes_originator() {
         ledger,
         contracts: contracts.clone(),
         state: state.clone(),
+        peers_root: peers_root.clone(),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         features: ConnectionUiFeatures::default(),
@@ -24752,6 +24757,7 @@ async fn real_auto_resolved_approval_does_not_wake() {
         ledger,
         contracts: contracts.clone(),
         state: state.clone(),
+        peers_root: peers_root.clone(),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         features: ConnectionUiFeatures::default(),
@@ -24803,6 +24809,7 @@ async fn real_peer_question_park_wakes_originator() {
         ledger,
         contracts: contracts.clone(),
         state: state.clone(),
+        peers_root: peers_root.clone(),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
     };
@@ -24843,6 +24850,401 @@ async fn real_peer_question_park_wakes_originator() {
         .cancel_pending_for_turn(&session_id, &turn_id, "test-teardown");
     let outcome = handle.await.unwrap();
     assert_eq!(outcome, octos_agent::UserQuestionOutcome::Cancelled);
+}
+
+// ---- #1842 — close-while-parked: a CLOSED peer must not park ----------------
+//
+// Two independent mechanisms, tested separately (the full close-vs-park
+// interleaving is not deterministically drivable through the real requester —
+// there is no await point between its register and its post-check):
+//   (a) `peer_close` ABORTS the peer's in-flight turn through the SAME
+//       interrupt routine `turn/interrupt` uses (state `Active` →
+//       `Interrupting` + a signal on the turn's `interrupt_tx`), which is the
+//       only path `run_standalone_turn` honors — it aborts the INNER
+//       `agent_task`, so the peer definitively stops.
+//   (b) every park point GATES on the peer's `(profile, slug)` closed state,
+//       derived from the RESOLVED runtime profile + the VALIDATED `peer-`
+//       topic, with a precheck → register → post-check bracket.
+
+/// Stage a peer + register a live wire and an ACTIVE turn for it in the
+/// process-global registries — the exact seams `peer_close` resolves through.
+/// Returns the peer's wire session, its turn-state handle, the interrupt
+/// receiver the turn task would observe, and the turn's `JoinHandle`.
+#[allow(clippy::type_complexity)]
+async fn open_peer_with_active_turn(
+    peers_root: &std::path::Path,
+    profile: &str,
+    slug: &str,
+    owner: &str,
+) -> (
+    SessionKey,
+    Arc<TokioMutex<TurnState>>,
+    mpsc::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = peers_root.join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "work").unwrap();
+    std::fs::write(dir.join("originator"), owner).unwrap();
+
+    let peer_session =
+        SessionKey::with_profile_topic(profile, "api", "peer-wire", &format!("peer-{slug}"));
+    peer_wire_registry().register(peer_wire_key(profile, slug), peer_session.clone());
+
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let entry = ActiveTurn {
+        turn_id: TurnId::new(),
+        profile_id: profile.to_owned(),
+        state: turn_state.clone(),
+        interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+        steer: None,
+        abort: handle.abort_handle(),
+    };
+    active_turns_registry()
+        .lock()
+        .await
+        .insert(peer_session.clone(), entry);
+    (peer_session, turn_state, interrupt_rx, handle)
+}
+
+/// #1842(a) — closing a peer must ABORT its in-flight turn, not merely cancel
+/// the prompt it is currently parked on. Without this a still-running closed
+/// peer can PARK AGAIN after the close sweep, invisible to `peer_list` and
+/// refused by `peer_respond`.
+///
+/// The abort must ride the `interrupt_tx` path (state `Active` →
+/// `Interrupting` + channel signal) — the ONLY signal `run_standalone_turn`
+/// honors, and the one that makes it call `agent_task.abort()` on the INNER
+/// task. (A reverted attempt fired the registry's `abort: AbortHandle`, which
+/// targets the OUTER turn wrapper's `JoinHandle` and merely DETACHES the inner
+/// agent task, leaving the parked oneshot's waiter alive.)
+#[tokio::test]
+async fn should_interrupt_the_peers_in_flight_turn_when_peer_close_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let profile = "tenant-1842-abort";
+    let slug = "abort-me";
+    let owner = format!("{profile}:api:master");
+    let (peer_session, turn_state, mut interrupt_rx, handle) =
+        open_peer_with_active_turn(&peers_root, profile, slug, &owner).await;
+
+    let close = build_peer_close_callback(
+        peers_root.clone(),
+        owner.clone(),
+        profile.to_owned(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(|_event: PeerClosedEvent| {}),
+        Arc::new(|_event: ApprovalCancelledEvent| {}),
+    );
+    close(slug.to_owned()).expect("owner closes");
+
+    // The interrupt is dispatched onto the runtime (the close callback is
+    // sync; the turn-state guard is an async mutex), so settle with a bounded
+    // poll rather than a single yield.
+    let mut signalled = false;
+    for _ in 0..200 {
+        if interrupt_rx.try_recv().is_ok() {
+            signalled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        signalled,
+        "peer_close must SIGNAL the peer's in-flight turn on `interrupt_tx` — the \
+         only path run_standalone_turn honors (it aborts the INNER agent task)"
+    );
+    assert!(
+        matches!(&*turn_state.lock().await, TurnState::Interrupting { .. }),
+        "peer_close must transition the peer's active turn Active → Interrupting \
+         through the SAME state-lock routine turn/interrupt uses"
+    );
+
+    active_turns_registry().lock().await.remove(&peer_session);
+    handle.abort();
+}
+
+/// #1842(b) — a park attempt by a CLOSED peer must be REFUSED fail-closed
+/// (never registered), even when the peer's wire session is a RAW client key
+/// (`web-9c1f#peer-edison`) that carries no profile. A reverted attempt derived
+/// the `(profile, slug)` gate by PARSING the `SessionKey`, so exactly these
+/// sessions slipped through; the profile dimension must instead come from the
+/// RESOLVED runtime the turn runs under — here `runtime.data_dir/peers`, the
+/// value the production wiring captures onto the requester.
+#[tokio::test]
+async fn should_refuse_a_peer_park_when_the_peer_is_closed_under_a_raw_client_session() {
+    use octos_agent::ToolApprovalRequester as _;
+    use octos_agent::UserQuestionRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-1842-gate";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    stage_wake_peer(&peers_root, "edison", &master);
+    // CLOSED — the durable marker `peer_list` / `peer_respond` already read.
+    std::fs::write(
+        peers_root.join("edison").join("closed"),
+        format!("{master}\n0\n"),
+    )
+    .unwrap();
+
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    // A raw SPA per-tab handle: `profile_id()` is None, `topic()` is the peer.
+    let session_id = SessionKey("web-9c1f#peer-edison".to_owned());
+    assert_eq!(
+        session_id.profile_id(),
+        None,
+        "a raw client session key carries no profile — that is the bypass"
+    );
+    let turn_id = TurnId::new();
+
+    let requester = UiProtocolApprovalRequester {
+        ws: ws.clone(),
+        ledger: ledger.clone(),
+        contracts: contracts.clone(),
+        state: state.clone(),
+        peers_root: peers_root.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let decision = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        requester.request_approval(octos_agent::ToolApprovalRequest {
+            tool_id: "call-1".to_owned(),
+            tool_name: "shell".to_owned(),
+            title: "Run a shell command".to_owned(),
+            body: "rm -rf ./build-cache".to_owned(),
+            command: Some("rm -rf ./build-cache".to_owned()),
+            cwd: None,
+        }),
+    )
+    .await
+    .expect("a CLOSED peer must never PARK — it must fail closed immediately");
+    assert_eq!(
+        decision,
+        octos_agent::ToolApprovalDecision::Deny,
+        "a refused park fails closed, exactly like the close sweep's cancel"
+    );
+    assert!(
+        contracts
+            .approvals
+            .pending_for_session(&session_id)
+            .is_empty(),
+        "a refused park must leave NO pending entry — peer_list hides it and \
+         peer_respond refuses it, so it would be a permanent invisible park"
+    );
+
+    // Same gate at the QUESTION park point.
+    let questioner = SessionUserQuestionRequester {
+        ws,
+        ledger,
+        contracts: contracts.clone(),
+        state,
+        peers_root: peers_root.clone(),
+        session_id: session_id.clone(),
+        turn_id,
+    };
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        questioner.request_user_question(octos_agent::UserQuestionRequest {
+            questions: Vec::new(),
+            title: "Pick a datastore".to_owned(),
+            body: "Postgres or SQLite?".to_owned(),
+        }),
+    )
+    .await
+    .expect("a CLOSED peer must never PARK on a question either");
+    assert_eq!(outcome, octos_agent::UserQuestionOutcome::Cancelled);
+    assert!(
+        contracts
+            .user_questions
+            .pending_for_session(&session_id)
+            .is_empty(),
+        "a refused question park must leave NO pending entry"
+    );
+}
+
+/// #1842(b) — the POST-check leg of the bracket: a close whose marker lands
+/// AFTER a park already registered (i.e. inside the check-then-park window)
+/// must still be caught — the gate re-READS the durable authority and the park
+/// cancels its own just-registered entry fail-closed. Without it, a park that
+/// registered between the close's marker write and its pending sweep would
+/// survive both.
+#[tokio::test]
+async fn should_cancel_a_registered_peer_park_when_the_close_lands_after_it_registered() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-1842-postcheck";
+    let (_state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let master = format!("{profile}:api:master");
+    stage_wake_peer(&peers_root, "edison", &master);
+
+    let session_id = SessionKey::with_profile_topic(profile, "api", "edison-wire", "peer-edison");
+    let gate = PeerParkGate::for_session(&peers_root, &session_id)
+        .expect("a peer session resolves a park gate");
+    assert!(
+        !peer_park_is_refused(Some(&gate)),
+        "precheck: the peer is still OPEN, so the park proceeds"
+    );
+
+    // The park REGISTERS (exactly what the requester does next)…
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let turn_id = TurnId::new();
+    let mut response_rx = contracts
+        .approvals
+        .request_runtime(ApprovalRequestedEvent::generic(
+            session_id.clone(),
+            approval_id.clone(),
+            turn_id.clone(),
+            "shell",
+            "Run",
+            "body",
+        ));
+    // …and the close lands right here, inside the window.
+    std::fs::write(
+        peers_root.join("edison").join("closed"),
+        format!("{master}\n0\n"),
+    )
+    .unwrap();
+
+    assert!(
+        refuse_registered_approval_park_for_closed_peer(
+            Some(&gate),
+            &contracts,
+            &session_id,
+            &approval_id,
+            &turn_id,
+        ),
+        "post-check: the close that landed after the register must be observed"
+    );
+    assert!(
+        contracts
+            .approvals
+            .pending_for_session(&session_id)
+            .is_empty(),
+        "the park cancels its own entry — nothing is left parked invisibly"
+    );
+    assert!(
+        response_rx.try_recv().is_err(),
+        "the cancelled waiter fails closed (Deny), never hangs"
+    );
+}
+
+/// #1842(b) — the gate is CLEARED by the single `stage_peer` restage
+/// transaction: the reservation mints a FRESH `peers/<slug>` (its `create_dir`
+/// is the atomic claim), so a restaged peer carries no close marker and parks
+/// normally again. Without this a slug would stay poisoned for the life of the
+/// process and `peer/prepare` could restage a peer that can never ask anything.
+#[tokio::test]
+async fn should_allow_a_peer_park_again_when_the_closed_peer_is_restaged() {
+    use octos_agent::ToolApprovalRequester as _;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "tenant-1842-restage";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let peers_root = runtime.data_dir.join("peers");
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let master = format!("{profile}:api:master");
+
+    let staged = stage_peer(
+        &peers_root,
+        &workspace,
+        "Edison",
+        Some("Edison"),
+        Some(master.as_str()),
+        "Brief.",
+        false,
+        None,
+        None,
+    )
+    .expect("stage the peer");
+    assert_eq!(staged.slug, "edison");
+    std::fs::write(
+        peers_root.join("edison").join("closed"),
+        format!("{master}\n0\n"),
+    )
+    .unwrap();
+
+    let session_id = SessionKey::with_profile_topic(profile, "api", "edison-wire", "peer-edison");
+    let gate = PeerParkGate::for_session(&peers_root, &session_id)
+        .expect("a peer session resolves a park gate");
+    assert!(
+        peer_park_is_refused(Some(&gate)),
+        "while CLOSED the peer's parks are refused"
+    );
+
+    // RESTAGE through the single staging transaction (the closed dir is gone —
+    // a named reserve refuses an existing slug, so this is the real flow).
+    std::fs::remove_dir_all(peers_root.join("edison")).unwrap();
+    let restaged = stage_peer(
+        &peers_root,
+        &workspace,
+        "Edison",
+        Some("Edison"),
+        Some(master.as_str()),
+        "Brief.",
+        false,
+        None,
+        None,
+    )
+    .expect("restage the peer");
+    assert_eq!(restaged.slug, "edison", "the same (profile, slug) identity");
+    assert!(
+        !peer_park_is_refused(Some(&gate)),
+        "the restage CLEARS the gate — the peer may park again"
+    );
+
+    // End-to-end through the REAL requester: it parks (registers a pending
+    // entry) instead of failing closed.
+    let (ws_tx, _ws_rx) = mpsc::channel(64);
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let turn_id = TurnId::new();
+    let requester = UiProtocolApprovalRequester {
+        ws: WsConnection::new(ws_tx),
+        ledger: Arc::new(UiProtocolLedger::new(64)),
+        contracts: contracts.clone(),
+        state: state.clone(),
+        peers_root: peers_root.clone(),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let park = tokio::spawn(async move {
+        requester
+            .request_approval(octos_agent::ToolApprovalRequest {
+                tool_id: "call-1".to_owned(),
+                tool_name: "shell".to_owned(),
+                title: "Run a shell command".to_owned(),
+                body: "cargo test".to_owned(),
+                command: Some("cargo test".to_owned()),
+                cwd: None,
+            })
+            .await
+    });
+    let mut parked = false;
+    for _ in 0..200 {
+        if contracts.approvals.pending_for_session(&session_id).len() == 1 {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(parked, "a restaged peer parks normally again");
+    contracts
+        .approvals
+        .cancel_pending_for_turn(&session_id, &turn_id, "test-teardown");
+    assert_eq!(
+        park.await.unwrap(),
+        octos_agent::ToolApprovalDecision::Deny,
+        "teardown cancel still fails closed"
+    );
 }
 
 struct AppuiContinuationLlm {
