@@ -998,6 +998,20 @@ jobs:
         working-directory: e2e
         run: npm ci
 
+      # `npm ci` installs the @playwright/test PACKAGE but NOT the browser
+      # binaries. Several specs in this suite (dashboard/harness/swarm-gate)
+      # launch chrome-headless-shell, so without this step the job only passed
+      # when the runner happened to have a warm ~/Library/Caches/ms-playwright
+      # from an earlier run. Once that cache aged out, every run failed with
+      # `browserType.launch: Executable doesn't exist at
+      # .../chromium_headless_shell-*/chrome-headless-shell` — a green-vs-red
+      # coin flip decided by runner assignment, not by the diff under test.
+      # `install chromium` also fetches the headless shell.
+      - name: Install Playwright browsers
+        if: steps.changes.outputs.run == 'true'
+        working-directory: e2e
+        run: npx playwright install chromium
+
       - name: Run e2e tool regression tests
         if: steps.changes.outputs.run == 'true'
         working-directory: e2e
