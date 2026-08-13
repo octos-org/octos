@@ -7524,7 +7524,12 @@ impl SessionActor {
             crate::stream_reporter::ChannelStreamReporter::new(stream_tx.clone())
                 .with_thread_id(client_message_id.clone()),
         );
-        self.agent.set_reporter(reporter);
+        // Keep our own handle so we can drain the turn's `run_details` (tools +
+        // cost) AFTER the agent finishes and attach it to the final answer
+        // message (as `org.octos.run` metadata) rather than posting a separate
+        // card. The clone handed to the agent is reset to Silent at turn end, but
+        // this Arc keeps the stashed detail alive for us to take.
+        self.agent.set_reporter(reporter.clone());
 
         // Wire adaptive router status callback to forward through the stream channel.
         // This lets failover events inside chat_stream() surface as LlmStatus messages.
@@ -7572,6 +7577,7 @@ impl SessionActor {
                     // bubble.
                     client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
+                    Some(self.user_workspace.clone()),
                 )))
             } else {
                 drop(stream_rx);
@@ -7885,6 +7891,14 @@ impl SessionActor {
             self.responsiveness.set_active(false);
             self.queue_mode = QueueMode::Followup;
         }
+
+        // Drain this turn's run detail (stashed on TaskCompleted) and DROP our
+        // reporter handle NOW: it holds a `stream_tx` clone, so keeping it alive
+        // past here would stop the forwarder's channel from ever closing and
+        // deadlock the `handle.await` below — which would hang the whole session
+        // actor and silence every subsequent turn.
+        let run_detail = reporter.take_run_details();
+        drop(reporter);
 
         // Reset reporter to silent (drops stream_tx → forwarder finishes)
         self.agent
@@ -8274,6 +8288,9 @@ impl SessionActor {
                         display_content
                     };
 
+                    // `run_detail` (tools + cost) was drained above, before the
+                    // reporter handle was dropped; attach it to the answer below.
+
                     // Skip streaming edit when session is inactive — let the
                     // reply go through proxy → pending buffer for later flush.
                     let session_active = self.is_active().await;
@@ -8290,9 +8307,21 @@ impl SessionActor {
                         if let Some(ref sr) = stream_result {
                             if let Some(ref mid) = sr.message_id {
                                 if let Some(ref si) = self.status_indicator {
+                                    // Attach the turn's run detail (tools + cost)
+                                    // to the streamed answer's final edit so the
+                                    // client shows it embedded + expandable.
+                                    let finish_metadata = run_detail
+                                        .as_ref()
+                                        .map(|rd| serde_json::json!({ "org.octos.run": rd }))
+                                        .unwrap_or_else(|| serde_json::json!({}));
                                     let _ = si
                                         .channel()
-                                        .finish_stream(&self.chat_id, mid, &display_content)
+                                        .finish_stream_with_metadata(
+                                            &self.chat_id,
+                                            mid,
+                                            &display_content,
+                                            &finish_metadata,
+                                        )
                                         .await;
                                 }
                                 true
@@ -8317,6 +8346,13 @@ impl SessionActor {
                                     "thread_id".to_string(),
                                     serde_json::Value::String(tid.clone()),
                                 );
+                            }
+                        }
+                        // Embed the turn's run detail on the fresh answer send so
+                        // the client can render its expandable tool section.
+                        if let Some(ref rd) = run_detail {
+                            if let Some(map) = reply_metadata.as_object_mut() {
+                                map.insert("org.octos.run".to_string(), rd.clone());
                             }
                         }
                         let _ = self
@@ -8674,7 +8710,10 @@ impl SessionActor {
             // critical bit that makes overflow stop being a special case —
             // same code path, same events, just a different thread_id.
             let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
-            let overflow_reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
+            // Concrete handle (not `Arc<dyn ProgressReporter>`) so we can drain
+            // the turn's `run_details` after the agent runs and attach it to the
+            // overflow answer, like the primary finalize paths do.
+            let overflow_reporter = Arc::new(
                 crate::stream_reporter::ChannelStreamReporter::new(stream_tx)
                     .with_thread_id(overflow_client_message_id.clone()),
             );
@@ -8703,6 +8742,7 @@ impl SessionActor {
                     // the bubble of whichever turn arrived last.
                     overflow_client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
+                    Some(user_workspace.clone()),
                 )))
             } else {
                 drop(stream_rx);
@@ -8714,7 +8754,8 @@ impl SessionActor {
             // Wave-4 B3.4 — stamp `RouterContext` so the overflow agent's
             // failovers are attributed to this session. The forwarder
             // task filters strictly on `originating_session_id`.
-            let reporter_for_scope = overflow_reporter.clone();
+            let reporter_for_scope: Arc<dyn octos_agent::ProgressReporter> =
+                overflow_reporter.clone();
             let router_ctx_session = session_key.to_string();
             let router_ctx_turn = overflow_client_message_id.clone();
             let result = octos_agent::TASK_REPORTER
@@ -8732,6 +8773,10 @@ impl SessionActor {
                     .await
                 })
                 .await;
+
+            // Drain this overflow turn's run detail (tools + cost) before the
+            // reporter is dropped, to attach it to the answer below.
+            let overflow_run_detail = overflow_reporter.take_run_details();
 
             // Drop the reporter so the stream forwarder sees channel close
             drop(overflow_reporter);
@@ -9044,6 +9089,17 @@ impl SessionActor {
                                 serde_json::Value::String(tid.clone()),
                             );
                         }
+                        // Attach this turn's run detail to the fresh overflow
+                        // answer (embedded + expandable, like the primary paths).
+                        // Skipped when the answer was already streamed: that
+                        // bubble is finalized without a metadata channel and this
+                        // send is empty, so the strip can't ride it — a known
+                        // overflow-streamed limitation, not a silent drop.
+                        if !already_streamed {
+                            if let Some(ref rd) = overflow_run_detail {
+                                metadata.insert("org.octos.run".to_string(), rd.clone());
+                            }
+                        }
                         let _ = out_tx
                             .send(OutboundMessage {
                                 channel: channel.clone(),
@@ -9294,7 +9350,12 @@ impl SessionActor {
             crate::stream_reporter::ChannelStreamReporter::new(stream_tx.clone())
                 .with_thread_id(client_message_id.clone()),
         );
-        self.agent.set_reporter(reporter);
+        // Keep our own handle so we can drain the turn's `run_details` (tools +
+        // cost) AFTER the agent finishes and attach it to the final answer
+        // message (as `org.octos.run` metadata) rather than posting a separate
+        // card. The clone handed to the agent is reset to Silent at turn end, but
+        // this Arc keeps the stashed detail alive for us to take.
+        self.agent.set_reporter(reporter.clone());
 
         // Wire adaptive router status callback for failover notifications
         if let Some(ref router) = self.adaptive_router {
@@ -9338,6 +9399,7 @@ impl SessionActor {
                     // cmid so streaming chunks stamp it on the wire.
                     client_message_id.clone(),
                     Arc::clone(&app_reply_tools),
+                    Some(self.user_workspace.clone()),
                 )))
             } else {
                 drop(stream_rx);
@@ -9424,6 +9486,14 @@ impl SessionActor {
             self.responsiveness.set_active(false);
             self.queue_mode = QueueMode::Followup;
         }
+
+        // Drain this turn's run detail (stashed on TaskCompleted) and DROP our
+        // reporter handle NOW: it holds a `stream_tx` clone, so keeping it alive
+        // past here would stop the forwarder's channel from ever closing and
+        // deadlock the forwarder await below — hanging the session actor and
+        // silencing every subsequent turn.
+        let run_detail = reporter.take_run_details();
+        drop(reporter);
 
         // Reset reporter to silent (drop the stream sender → forwarder will finish)
         self.agent
@@ -9711,6 +9781,9 @@ impl SessionActor {
                         display_content
                     };
 
+                    // `run_detail` (tools + cost) was drained above, before the
+                    // reporter handle was dropped; attach it to the answer below.
+
                     // If stream forwarder already sent a message AND this session
                     // is active, do a final edit. When inactive, skip the edit so
                     // the reply goes through the proxy → pending buffer path.
@@ -9719,9 +9792,21 @@ impl SessionActor {
                         if let Some(ref sr) = stream_result {
                             if let Some(ref mid) = sr.message_id {
                                 if let Some(ref si) = self.status_indicator {
+                                    // Attach the turn's run detail (tools + cost)
+                                    // to the streamed answer's final edit so the
+                                    // client shows it embedded + expandable.
+                                    let finish_metadata = run_detail
+                                        .as_ref()
+                                        .map(|rd| serde_json::json!({ "org.octos.run": rd }))
+                                        .unwrap_or_else(|| serde_json::json!({}));
                                     let _ = si
                                         .channel()
-                                        .finish_stream(&self.chat_id, mid, &display_content)
+                                        .finish_stream_with_metadata(
+                                            &self.chat_id,
+                                            mid,
+                                            &display_content,
+                                            &finish_metadata,
+                                        )
                                         .await;
                                 }
                                 true
@@ -9746,6 +9831,13 @@ impl SessionActor {
                                     "thread_id".to_string(),
                                     serde_json::Value::String(tid.clone()),
                                 );
+                            }
+                        }
+                        // Embed the turn's run detail on the fresh answer send so
+                        // the client can render its expandable tool section.
+                        if let Some(ref rd) = run_detail {
+                            if let Some(map) = reply_metadata.as_object_mut() {
+                                map.insert("org.octos.run".to_string(), rd.clone());
                             }
                         }
                         let _ = self

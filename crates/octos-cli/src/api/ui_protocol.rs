@@ -35417,7 +35417,7 @@ fn harden_progress_emitted_approval(event: &mut ApprovalRequestedEvent) {
     }
 }
 
-fn materialize_file_mutation_diff(
+pub(crate) fn materialize_file_mutation_diff(
     notice: &UiFileMutationNotice,
     workspace_root: Option<&Path>,
 ) -> Option<String> {

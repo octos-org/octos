@@ -809,14 +809,18 @@ impl Agent {
         media: Vec<String>,
         tracker: &TokenTracker,
     ) -> Result<ConversationResponse> {
-        self.process_message_inner(
-            user_content,
-            history,
-            media,
-            TurnAttachmentContext::default(),
-            Some(tracker),
-        )
-        .await
+        let turn_start = Instant::now();
+        let result = self
+            .process_message_inner(
+                user_content,
+                history,
+                media,
+                TurnAttachmentContext::default(),
+                Some(tracker),
+            )
+            .await;
+        self.report_gateway_turn_completed(result.is_ok(), turn_start);
+        result
     }
 
     pub async fn process_message_tracked_with_attachments(
@@ -827,8 +831,33 @@ impl Agent {
         attachments: TurnAttachmentContext,
         tracker: &TokenTracker,
     ) -> Result<ConversationResponse> {
-        self.process_message_inner(user_content, history, media, attachments, Some(tracker))
-            .await
+        let turn_start = Instant::now();
+        let result = self
+            .process_message_inner(user_content, history, media, attachments, Some(tracker))
+            .await;
+        self.report_gateway_turn_completed(result.is_ok(), turn_start);
+        result
+    }
+
+    /// Emit `TaskCompleted` at the end of a gateway turn.
+    ///
+    /// Gateway turns (e.g. Matrix) drive the agent through the `_tracked`
+    /// wrappers, which — unlike [`run_task`] — otherwise never report
+    /// `TaskCompleted`. Emitting it at turn end lets per-turn reporters (the
+    /// Matrix `ChannelStreamReporter`) drain and flush their coalesced app
+    /// cards (`tool_activity` / `run_summary` / `artifact`); without it those
+    /// accumulators are silently discarded when the reporter drops. Only the
+    /// `_tracked` variants are used by the gateway, so this stays scoped to the
+    /// gateway path and does not alter the API / ACP / CLI event streams (which
+    /// use the untracked variants). `iterations` is not surfaced by
+    /// `ConversationResponse` and is unused by that reporter, so 0 is a safe
+    /// placeholder.
+    fn report_gateway_turn_completed(&self, success: bool, turn_start: Instant) {
+        self.reporter().report(ProgressEvent::TaskCompleted {
+            success,
+            iterations: 0,
+            duration: turn_start.elapsed(),
+        });
     }
 
     async fn process_message_inner(

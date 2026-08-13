@@ -145,6 +145,20 @@ pub trait Channel: Send + Sync {
             .await
     }
 
+    /// Finalize a streamed message, carrying platform metadata (e.g. `org.octos.*`
+    /// keys the Matrix channel projects into the replace event's content and
+    /// `m.new_content`). Default: ignores metadata and delegates to
+    /// [`finish_stream`], so channels that can't carry it are unaffected.
+    async fn finish_stream_with_metadata(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+        _metadata: &serde_json::Value,
+    ) -> Result<()> {
+        self.finish_stream(chat_id, message_id, final_content).await
+    }
+
     /// Delete a message by platform message ID.
     async fn delete_message(&self, _chat_id: &str, _message_id: &str) -> Result<()> {
         Ok(())

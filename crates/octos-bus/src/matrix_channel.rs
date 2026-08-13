@@ -45,6 +45,9 @@ const HTML_FORMAT: &str = "org.matrix.custom.html";
 const METADATA_TARGET_PROFILE_ID: &str = "target_profile_id";
 const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
 const CONTENT_APP: &str = "org.octos.app";
+/// Per-turn run detail (tools + token/cost) embedded on the answer message so a
+/// client can render it as an expandable section, instead of a separate card.
+const CONTENT_RUN: &str = "org.octos.run";
 const CONTENT_ACTIONS: &str = "org.octos.actions";
 const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
 const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
@@ -2090,7 +2093,7 @@ impl Channel for MatrixChannel {
     }
 
     async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
-        self.send_replace_event(chat_id, message_id, new_content, true)
+        self.send_replace_event(chat_id, message_id, new_content, true, None)
             .await
     }
 
@@ -2100,7 +2103,42 @@ impl Channel for MatrixChannel {
         message_id: &str,
         final_content: &str,
     ) -> Result<()> {
-        self.send_replace_event(chat_id, message_id, final_content, false)
+        self.send_replace_event(chat_id, message_id, final_content, false, None)
+            .await
+    }
+
+    /// Finalize a streamed message (thread-bound variant).
+    ///
+    /// The stream forwarder ends every stream via `finish_stream_bound`. Without
+    /// this Matrix override it falls through to the default → `edit_message` →
+    /// `send_replace_event(live=TRUE)`, which RE-ARMS the MSC4357 live marker at
+    /// stream end — leaving the client's "generating" spinner spinning until a
+    /// later live=false edit lands (after the turn's disk persistence). Clear the
+    /// marker here so the spinner stops promptly. `thread_id` is unused on Matrix
+    /// (the sender is resolved from `event_senders`).
+    async fn finish_stream_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+        _thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.send_replace_event(chat_id, message_id, final_content, false, None)
+            .await
+    }
+
+    /// Finalize the streamed answer, projecting the turn's `org.octos.run` detail
+    /// (if present in `metadata`) onto the replace event so the answer carries an
+    /// embedded, expandable tool section instead of a separate card message.
+    async fn finish_stream_with_metadata(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        let run = metadata.get(CONTENT_RUN);
+        self.send_replace_event(chat_id, message_id, final_content, false, run)
             .await
     }
 
@@ -2222,6 +2260,9 @@ impl MatrixChannel {
         }
         if let Some(app) = metadata.get(CONTENT_APP) {
             body[CONTENT_APP] = app.clone();
+        }
+        if let Some(run) = metadata.get(CONTENT_RUN) {
+            body[CONTENT_RUN] = run.clone();
         }
         if let Some(actions) = metadata.get(CONTENT_ACTIONS) {
             body[CONTENT_ACTIONS] = actions.clone();
@@ -2436,6 +2477,7 @@ impl MatrixChannel {
         message_id: &str,
         new_content: &str,
         live: bool,
+        run_details: Option<&serde_json::Value>,
     ) -> Result<()> {
         let sender = self
             .event_senders
@@ -2476,6 +2518,14 @@ impl MatrixChannel {
         if live {
             body[LIVE_MARKER] = json!({});
             body["m.new_content"][LIVE_MARKER] = json!({});
+        }
+
+        // Embed the turn's run detail on BOTH the top-level content and
+        // `m.new_content` (the latter is what clients treat as the edited event's
+        // effective content), so the answer carries its expandable tool section.
+        if let Some(run) = run_details {
+            body[CONTENT_RUN] = run.clone();
+            body["m.new_content"][CONTENT_RUN] = run.clone();
         }
 
         let resp = self

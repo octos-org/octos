@@ -622,7 +622,7 @@ fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanR
             arr.iter()
                 .enumerate()
                 .map(|(i, item)| {
-                    let title = ["step", "title", "content", "text"]
+                    let title = ["step", "title", "content", "text", "description"]
                         .iter()
                         .find_map(|k| item.get(*k).and_then(|v| v.as_str()))
                         .unwrap_or_default()
