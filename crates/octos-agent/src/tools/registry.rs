@@ -626,6 +626,16 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
+    /// Return a tool's declared foreground execution budget, when it has
+    /// one. The agent dispatcher uses this before spawning a batch so plugin
+    /// manifest timeouts are not accidentally shortened by the generic
+    /// interactive-tool default.
+    pub fn execution_timeout_secs(&self, name: &str) -> Option<u64> {
+        self.tools
+            .get(name)
+            .and_then(|tool| tool.execution_timeout_secs())
+    }
+
     /// Get tool specifications for the LLM, filtered by provider policy if set.
     /// Results are cached and invalidated when the registry is mutated.
     /// Codex round 2 P2: visibility-aware tool lookup.

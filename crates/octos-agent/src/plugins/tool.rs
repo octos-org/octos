@@ -2378,6 +2378,20 @@ impl Tool for PluginTool {
         }
     }
 
+    fn execution_timeout_secs(&self) -> Option<u64> {
+        // `self.timeout` is the plugin process's own deadline. Give that
+        // inner layer a short window to emit its typed timeout result and
+        // reap the process group before either the registry or the agent's
+        // outer dispatcher applies its last-resort cancellation.
+        const CLEANUP_GRACE_SECS: u64 = 5;
+        Some(
+            self.timeout
+                .as_secs()
+                .max(1)
+                .saturating_add(CLEANUP_GRACE_SECS),
+        )
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         let mut schema = self.tool_def.input_schema.clone();
         // Inject `timeout_secs` so the LLM can request longer timeouts for

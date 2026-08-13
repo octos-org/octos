@@ -159,6 +159,11 @@ const LONG_RUNNING_TOOLS: &[&str] = &[
     "check",
 ];
 
+/// Headroom between a tool's registry-level execution budget and the agent
+/// batch deadline. This lets the inner registry timeout return its typed
+/// result and finish cancellation cleanup before the outer task backstop.
+const DECLARED_TOOL_DISPATCH_GRACE_SECS: u64 = 5;
+
 /// Whether `name` is a genuinely long-running tool (keeps the 1800s default).
 fn is_long_running_tool(name: &str) -> bool {
     LONG_RUNNING_TOOLS.contains(&name)
@@ -187,6 +192,10 @@ fn is_long_running_tool(name: &str) -> bool {
 ///   honour it: clamp to [`MAX_TOOL_TIMEOUT_SECS`] and floor at the batch's
 ///   default (so an explicit request never makes a batch flakier than its
 ///   own baseline). This mirrors the pre-fix `.min(MAX).max(default)`.
+/// - A registered tool can declare a larger foreground budget through
+///   `Tool::execution_timeout_secs`. The batch floor includes the largest
+///   declaration, so a plugin's manifest timeout is not silently replaced by
+///   the generic interactive default merely because its tool name is unknown.
 /// - When the LLM omitted `timeout_secs`, the default depends on the batch:
 ///   a batch containing ANY long-running tool keeps `config_tool_timeout`
 ///   (1800s today); a batch of only fast/interactive tools uses the much
@@ -195,6 +204,7 @@ fn compute_batch_timeout_secs(
     tool_names: &[&str],
     any_human_wait: bool,
     llm_requested: u64,
+    declared_tool_timeout: u64,
     config_tool_timeout: u64,
     interactive_default: u64,
 ) -> Option<u64> {
@@ -202,11 +212,17 @@ fn compute_batch_timeout_secs(
     if any_human_wait {
         return None;
     }
-    let batch_default = if tool_names.iter().any(|n| is_long_running_tool(n)) {
+    let classification_default = if tool_names.iter().any(|n| is_long_running_tool(n)) {
         config_tool_timeout
     } else {
         interactive_default
     };
+    let declared_dispatch_timeout = if declared_tool_timeout > 0 {
+        declared_tool_timeout.saturating_add(DECLARED_TOOL_DISPATCH_GRACE_SECS)
+    } else {
+        0
+    };
+    let batch_default = classification_default.max(declared_dispatch_timeout);
     Some(if llm_requested > 0 {
         llm_requested.min(MAX_TOOL_TIMEOUT_SECS).max(batch_default)
     } else {
@@ -2489,6 +2505,12 @@ impl Agent {
             .tool_calls
             .iter()
             .any(|tc| self.tools.blocks_on_human_input(&tc.name));
+        let declared_tool_timeout = response
+            .tool_calls
+            .iter()
+            .filter_map(|tc| self.tools.execution_timeout_secs(&tc.name))
+            .max()
+            .unwrap_or(0);
 
         // mini5 soak fix: when the LLM omits `timeout_secs`, a batch of only
         // fast/interactive tools (e.g. `glob`, `list_dir`) defaults to the
@@ -2501,6 +2523,7 @@ impl Agent {
             &tool_names,
             any_human_wait,
             llm_requested_timeout,
+            declared_tool_timeout,
             self.config.tool_timeout_secs,
             self.config.default_interactive_tool_timeout_secs,
         );
@@ -2674,16 +2697,20 @@ impl Agent {
                 continue;
             }
 
-            let handle =
+            let mut handle =
                 self.spawn_tool_task(tool_call, explicit_send_file_requested, turn_attachment_ctx);
 
             // `None` (human-wait batch) awaits the handle directly — no finite
             // wrap — so the human-wait call cannot be detached by a ceiling.
             // The `Err(())` arm is unreachable in that case.
             let join_outcome = match tool_timeout {
-                Some(dur) => match tokio::time::timeout(dur, handle).await {
+                Some(dur) => match tokio::time::timeout(dur, &mut handle).await {
                     Ok(joined) => Ok(joined),
-                    Err(_) => Err(()),
+                    Err(_) => {
+                        handle.abort();
+                        let _ = handle.await;
+                        Err(())
+                    }
                 },
                 None => Ok(handle.await),
             };
@@ -2846,8 +2873,10 @@ impl Agent {
 /// EVERY call, discarding the real output of calls (including spawn_only
 /// acks) that had already completed. `timeout_at` polls the inner handle
 /// before the timer, so a handle that completed by the time we reach it
-/// yields its result even at/past the deadline. Timed-out tasks are NOT
-/// aborted — they keep running detached for cleanup, exactly as before.
+/// yields its result even at/past the deadline. A still-pending task is
+/// aborted and awaited before the synthetic timeout result is returned. This
+/// drops the tool future immediately, allowing plugin process kill guards and
+/// other cancellation-safe cleanup to run instead of leaving detached work.
 async fn join_parallel_handles(
     handles: Vec<JoinHandle<ToolCallResult>>,
     calls: &[&octos_core::ToolCall],
@@ -2858,16 +2887,18 @@ async fn join_parallel_handles(
             let deadline = tokio::time::Instant::now() + dur;
             let elapsed_secs = dur.as_secs();
             let mut results: Vec<ToolCallResult> = Vec::with_capacity(calls.len());
-            for (handle, tc) in handles.into_iter().zip(calls.iter()) {
-                match tokio::time::timeout_at(deadline, handle).await {
+            for (mut handle, tc) in handles.into_iter().zip(calls.iter()) {
+                match tokio::time::timeout_at(deadline, &mut handle).await {
                     Ok(Ok(result)) => results.push(result),
                     Ok(Err(e)) => results.push(panic_result(tc, &e.to_string())),
                     Err(_elapsed) => {
+                        handle.abort();
+                        let _ = handle.await;
                         tracing::error!(
                             timeout_secs = elapsed_secs,
                             tool = %tc.name,
                             tool_id = %tc.id,
-                            "tool execution timed out -- spawned task continues running for cleanup"
+                            "tool execution timed out -- spawned task aborted and awaited"
                         );
                         results.push(timed_out_result(tc, elapsed_secs));
                     }
@@ -3234,6 +3265,7 @@ mod tests {
             &["ask_user_question"],
             /* any_human_wait */ true,
             /* llm_requested */ 0,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
@@ -3253,6 +3285,7 @@ mod tests {
             &["ask_user_question"],
             /* any_human_wait */ true,
             /* llm_requested */ 30,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
@@ -3272,6 +3305,7 @@ mod tests {
             &["ask_user_question", "shell"],
             /* any_human_wait */ true,
             /* llm_requested */ 0,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
@@ -3310,10 +3344,24 @@ mod tests {
             &["list_dir", "glob"],
             /* any_human_wait */ false,
             /* llm_requested */ 0,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
         assert_eq!(secs, Some(120));
+    }
+
+    #[test]
+    fn should_honor_registered_plugin_budget_over_interactive_default() {
+        let secs = compute_batch_timeout_secs(
+            &["oll_generate_lesson"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 0,
+            /* declared_tool_timeout */ 305,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, Some(310));
     }
 
     #[test]
@@ -3324,6 +3372,7 @@ mod tests {
             &["glob", "shell"],
             /* any_human_wait */ false,
             /* llm_requested */ 0,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
@@ -3339,6 +3388,7 @@ mod tests {
             &["glob"],
             /* any_human_wait */ false,
             /* llm_requested */ 300,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
@@ -3349,6 +3399,7 @@ mod tests {
             &["glob"],
             /* any_human_wait */ false,
             /* llm_requested */ 99_999,
+            /* declared_tool_timeout */ 0,
             1800,
             120,
         );
@@ -3363,6 +3414,7 @@ mod tests {
             &["glob"],
             /* any_human_wait */ false,
             /* llm_requested */ 5,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
@@ -3377,6 +3429,7 @@ mod tests {
             &["shell"],
             /* any_human_wait */ false,
             /* llm_requested */ 10,
+            /* declared_tool_timeout */ 0,
             /* config_tool_timeout */ 1800,
             /* interactive_default */ 120,
         );
@@ -3474,6 +3527,40 @@ mod tests {
                 success: true,
                 ..Default::default()
             })
+        }
+    }
+
+    struct DropAwareExclusiveTool {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for DropAwareExclusiveTool {
+        fn name(&self) -> &str {
+            "drop_aware_exclusive_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that records cancellation"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            crate::tools::ConcurrencyClass::Exclusive
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            struct DropSignal(Arc<AtomicBool>);
+            impl Drop for DropSignal {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _signal = DropSignal(self.dropped.clone());
+            std::future::pending::<eyre::Result<ToolResult>>().await
         }
     }
 
@@ -3932,6 +4019,74 @@ mod tests {
         assert!(
             success_by_id.contains(&("call_slow".to_string(), false)),
             "timed-out call must report success=false: {success_by_id:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_abort_timed_out_parallel_tool_task() {
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_signal = dropped.clone();
+        let handle = tokio::spawn(async move {
+            let _signal = DropSignal(task_signal);
+            std::future::pending::<super::ToolCallResult>().await
+        });
+        let call = tool_call("call_slow", "slow_tool");
+
+        let results = super::join_parallel_handles(
+            vec![handle],
+            &[&call],
+            Some(std::time::Duration::from_millis(10)),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "timed-out task was detached instead of aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_abort_timed_out_serial_tool_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(DropAwareExclusiveTool {
+            dropped: dropped.clone(),
+        });
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("serial-timeout"), provider, tools, memory)
+            .with_config(AgentConfig {
+                default_interactive_tool_timeout_secs: 1,
+                save_episodes: false,
+                ..Default::default()
+            });
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![tool_call("call_slow", "drop_aware_exclusive_tool")],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, ..) = agent.execute_tools(&response).await.unwrap();
+
+        assert_eq!(
+            messages[0].content,
+            "Tool 'drop_aware_exclusive_tool' timed out after 1 seconds"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "timed-out serial task was detached instead of aborted"
         );
     }
 
