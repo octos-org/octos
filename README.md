@@ -459,7 +459,7 @@ fan-out non-blocking.
 | `--config <path>` | — | explicit flat config file — **wins over** `--profile` |
 | `--cwd <dir>` | current dir | workspace root the agent reads/writes |
 | `--data-dir <dir>` | `$OCTOS_HOME` / `~/.octos` | episodes / memory / sessions store |
-| `--effort <e>` | provider default | `low` \| `medium` \| `high` \| `max` (thinking models; others ignore it) |
+| `--effort <e>` | provider default | `none` \| `low` \| `medium` \| `high` \| `max` (`none` disables reasoning where supported) |
 | `--no-session-persistence` | off | ephemeral run (no episode saved); also **enables parallel agents** on one `--data-dir` |
 | `--max-iterations <n>` | `20` | per-turn tool-call cap |
 | `--no-retry` | off | disable automatic retry on transient LLM errors |

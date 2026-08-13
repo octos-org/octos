@@ -43,8 +43,9 @@ pub struct ModelHints {
     pub merge_system_messages: bool,
 
     /// How this model accepts a reasoning/thinking control on the chat path.
-    /// Translates `ChatConfig::reasoning_effort` into request fields; `None`
-    /// (default) emits nothing, so it is a no-op for non-thinking models.
+    /// Translates `ChatConfig::reasoning_effort` into request fields. The
+    /// default style ignores enabled effort, while an explicit disabled effort
+    /// uses the generic OpenAI-compatible control.
     #[serde(default)]
     pub reasoning_style: ReasoningStyle,
 }
@@ -126,7 +127,8 @@ impl ModelHints {
         // because the same `deepseek-v4` name fronts endpoints that differ
         // (api.deepseek.com accepts it; nvidia/vllm may not), same caveat as
         // `lacks_vision`. `grok` is narrowed to `grok-4` since older Grok
-        // families can reject `reasoning_effort`.
+        // families can reject enabled `reasoning_effort` values. An operator
+        // may still explicitly request `none` for a compatible endpoint.
         let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
             ReasoningStyle::EffortAndThinkingToggle
         } else if m.contains("kimi-k3")
@@ -182,7 +184,8 @@ impl ModelHints {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningStyle {
-    /// No reasoning control emitted on the chat path (default — backward compatible).
+    /// No enabled reasoning control emitted on the chat path. Explicitly disabled
+    /// reasoning uses the generic `reasoning_effort: "none"` control.
     #[default]
     None,
     /// Top-level `reasoning_effort: "low"|"medium"|"high"` — OpenAI chat-completions
@@ -523,21 +526,42 @@ impl OpenAIProvider {
         });
 
         // Translate the provider-agnostic `reasoning_effort` into the chat-path
-        // request fields the model's ReasoningStyle expects. Emitted only when
-        // an effort is configured AND the model declares a non-None style, so
-        // it stays a no-op for models/endpoints that don't accept it.
+        // request fields the model's ReasoningStyle expects. Enabled effort is
+        // emitted only for a declared style. Explicitly disabled reasoning is
+        // also forwarded to generic OpenAI-compatible endpoints because local
+        // servers such as Ollama accept the standard `reasoning_effort: "none"`.
         let (reasoning_effort, thinking): (Option<&str>, Option<serde_json::Value>) =
             match (config.reasoning_effort, self.hints.reasoning_style) {
-                (Some(effort), style) if style != ReasoningStyle::None => {
+                (Some(effort), style) => {
                     use crate::config::ReasoningEffort as RE;
                     let enabled = || serde_json::json!({ "type": "enabled" });
-                    match style {
+                    let disabled = || serde_json::json!({ "type": "disabled" });
+                    match (effort, style) {
+                        // Toggle-based providers disable thinking through their
+                        // native binary control and reject reasoning_effort.
+                        (
+                            RE::Disabled,
+                            ReasoningStyle::ThinkingToggle
+                            | ReasoningStyle::EffortAndThinkingToggle,
+                        ) => (None, Some(disabled())),
+                        // Kimi K3 has no documented off value. Omitting the
+                        // control preserves the provider default.
+                        (
+                            RE::Disabled,
+                            ReasoningStyle::EffortLowHighMax | ReasoningStyle::EffortMaxOnly,
+                        ) => (None, None),
+                        // Standard and generic OpenAI-compatible endpoints use
+                        // reasoning_effort:"none" to disable reasoning.
+                        (RE::Disabled, ReasoningStyle::Effort | ReasoningStyle::None) => {
+                            (Some("none"), None)
+                        }
                         // GLM-4.5+/5.x: binary thinking toggle, NO reasoning_effort.
-                        ReasoningStyle::ThinkingToggle => (None, Some(enabled())),
+                        (_, ReasoningStyle::ThinkingToggle) => (None, Some(enabled())),
                         // Kimi K3: low|high|max (no medium tier → clamp up to high;
                         // Max stays "max", NOT clamped to "high"). Thinking always on.
-                        ReasoningStyle::EffortLowHighMax => {
+                        (_, ReasoningStyle::EffortLowHighMax) => {
                             let e = match effort {
+                                RE::Disabled => unreachable!(),
                                 RE::Low => "low",
                                 RE::Medium | RE::High => "high",
                                 RE::Max => "max",
@@ -545,10 +569,11 @@ impl OpenAIProvider {
                             (Some(e), None)
                         }
                         // Legacy manual-override: everything → "max".
-                        ReasoningStyle::EffortMaxOnly => (Some("max"), None),
+                        (_, ReasoningStyle::EffortMaxOnly) => (Some("max"), None),
                         // DeepSeek V4: reasoning_effort + `thinking` toggle.
-                        ReasoningStyle::EffortAndThinkingToggle => {
+                        (_, ReasoningStyle::EffortAndThinkingToggle) => {
                             let e = match effort {
+                                RE::Disabled => unreachable!(),
                                 RE::Low => "low",
                                 RE::Medium => "medium",
                                 RE::High => "high",
@@ -557,8 +582,9 @@ impl OpenAIProvider {
                             (Some(e), Some(enabled()))
                         }
                         // OpenAI/Grok: low|medium|high, no max tier → clamp to high.
-                        ReasoningStyle::Effort => {
+                        (_, ReasoningStyle::Effort) => {
                             let e = match effort {
+                                RE::Disabled => unreachable!(),
                                 RE::Low => "low",
                                 RE::Medium => "medium",
                                 RE::High => "high",
@@ -566,7 +592,7 @@ impl OpenAIProvider {
                             };
                             (Some(e), None)
                         }
-                        ReasoningStyle::None => (None, None),
+                        (_, ReasoningStyle::None) => (None, None),
                     }
                 }
                 _ => (None, None),
@@ -1585,6 +1611,54 @@ mod tests {
         let v2 = serde_json::to_value(p2.build_request(&msgs, &[], &cfg2, false)).unwrap();
         assert!(v2.get("reasoning_effort").is_none());
         assert!(v2.get("thinking").is_none());
+    }
+
+    #[test]
+    fn should_emit_none_when_reasoning_is_disabled_for_openai_compatible_endpoint() {
+        let effort = serde_json::from_value(serde_json::json!("none"))
+            .expect("none should disable reasoning");
+        let provider =
+            OpenAIProvider::new("key", "qwen3.5:9b").with_base_url("http://localhost:11434/v1");
+        let config = ChatConfig {
+            reasoning_effort: Some(effort),
+            ..Default::default()
+        };
+
+        let request = serde_json::to_value(provider.build_request(
+            &[msg("return JSON")],
+            &[],
+            &config,
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(request["reasoning_effort"], "none");
+        assert!(request.get("thinking").is_none());
+    }
+
+    #[test]
+    fn should_disable_thinking_toggle_when_reasoning_is_disabled() {
+        let effort = serde_json::from_value(serde_json::json!("none"))
+            .expect("none should disable reasoning");
+        let provider = OpenAIProvider::new("key", "glm-5.2");
+        let config = ChatConfig {
+            reasoning_effort: Some(effort),
+            ..Default::default()
+        };
+
+        let request = serde_json::to_value(provider.build_request(
+            &[msg("return JSON")],
+            &[],
+            &config,
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            request["thinking"],
+            serde_json::json!({ "type": "disabled" })
+        );
+        assert!(request.get("reasoning_effort").is_none());
     }
 
     #[test]

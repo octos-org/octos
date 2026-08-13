@@ -137,8 +137,9 @@ pub struct ChatCommand {
     #[arg(long, value_enum)]
     pub ask_for_approval: Option<ChatApprovalMode>,
 
-    /// Reasoning effort for thinking models: `low`, `medium`, `high`, or
-    /// `max` (claude/codex parity). Overrides the config
+    /// Reasoning effort for thinking models: `none`, `low`, `medium`, `high`,
+    /// or `max` (claude/codex parity). `none` disables reasoning where
+    /// supported. Overrides the config
     /// `gateway.reasoning_effort`; non-thinking models ignore it, and
     /// providers without a distinct `max` tier clamp it to `high`.
     #[arg(long, value_enum)]
@@ -237,11 +238,12 @@ pub enum ChatApprovalMode {
 /// `--effort` choices, mirroring claude/codex reasoning-effort tiers. Maps
 /// 1:1 to [`octos_llm::ReasoningEffort`]. For these single-word variants
 /// clap's default `ValueEnum` naming and serde's `kebab-case` agree
-/// (`low`/`medium`/`high`/`max`), so a `config.cli.chat.effort` round-trips
+/// (`none`/`low`/`medium`/`high`/`max`), so a `config.cli.chat.effort` round-trips
 /// losslessly — matching [`ChatSandboxMode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChatEffort {
+    None,
     Low,
     Medium,
     High,
@@ -251,6 +253,7 @@ pub enum ChatEffort {
 impl From<ChatEffort> for octos_llm::ReasoningEffort {
     fn from(effort: ChatEffort) -> Self {
         match effort {
+            ChatEffort::None => octos_llm::ReasoningEffort::Disabled,
             ChatEffort::Low => octos_llm::ReasoningEffort::Low,
             ChatEffort::Medium => octos_llm::ReasoningEffort::Medium,
             ChatEffort::High => octos_llm::ReasoningEffort::High,
@@ -2336,6 +2339,10 @@ mod tests {
     #[test]
     fn should_map_chat_effort_to_reasoning_effort() {
         use octos_llm::ReasoningEffort;
+        assert_eq!(
+            ReasoningEffort::from(ChatEffort::None),
+            ReasoningEffort::Disabled
+        );
         assert_eq!(ReasoningEffort::from(ChatEffort::Low), ReasoningEffort::Low);
         assert_eq!(
             ReasoningEffort::from(ChatEffort::Medium),
@@ -2397,6 +2404,7 @@ mod tests {
 
         // Every effort tier parses (clap's default kebab/lower naming).
         for (arg, want) in [
+            ("none", ChatEffort::None),
             ("low", ChatEffort::Low),
             ("medium", ChatEffort::Medium),
             ("high", ChatEffort::High),
@@ -2411,6 +2419,26 @@ mod tests {
         assert_eq!(bare.effort, None);
         assert!(!bare.no_session_persistence);
         assert_eq!(bare.prompt, None);
+    }
+
+    #[test]
+    fn should_parse_none_when_reasoning_is_disabled() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            chat: ChatCommand,
+        }
+
+        let chat = Wrap::try_parse_from(["prog", "--effort", "none"])
+            .expect("none should be a valid effort")
+            .chat;
+        let effort = octos_llm::ReasoningEffort::from(chat.effort.unwrap());
+        assert_eq!(
+            serde_json::to_value(effort).unwrap(),
+            serde_json::json!("none")
+        );
     }
 
     #[test]
