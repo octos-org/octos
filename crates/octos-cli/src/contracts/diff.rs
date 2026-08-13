@@ -78,7 +78,7 @@ use tracing::{debug, info, warn};
 /// calls return the proposal-time view even if the file on disk has been
 /// rewritten between proposal and approval.
 #[derive(Debug, Clone)]
-pub(super) struct PendingDiffEntry {
+pub(crate) struct PendingDiffEntry {
     preview: DiffPreview,
     /// Raw unified diff captured at proposal time. `None` when the
     /// runtime did not surface a diff at all (e.g. tool emitted no
@@ -98,7 +98,7 @@ impl PendingDiffEntry {
     }
 
     #[cfg(test)]
-    pub(super) fn snapshot(&self) -> Option<&str> {
+    pub(crate) fn snapshot(&self) -> Option<&str> {
         self.snapshot_at_proposal.as_deref()
     }
 }
@@ -125,7 +125,7 @@ struct DiffPreviewDiskRecord {
 // ---------- Configuration ----------
 
 #[derive(Debug, Clone)]
-pub(super) struct DiffPreviewConfig {
+pub(crate) struct DiffPreviewConfig {
     /// Maximum entries retained in RAM per session. Older entries are
     /// dropped from RAM but stay on disk for replay-after-restart.
     pub entries_per_session: usize,
@@ -143,7 +143,7 @@ pub(super) struct DiffPreviewConfig {
 }
 
 impl DiffPreviewConfig {
-    pub(super) fn ephemeral() -> Self {
+    pub(crate) fn ephemeral() -> Self {
         Self {
             entries_per_session: 4096,
             active_session_cap: 1024,
@@ -152,7 +152,7 @@ impl DiffPreviewConfig {
         }
     }
 
-    pub(super) fn durable(data_dir: PathBuf) -> Self {
+    pub(crate) fn durable(data_dir: PathBuf) -> Self {
         Self {
             entries_per_session: 4096,
             active_session_cap: 1024,
@@ -250,7 +250,7 @@ impl StoreInner {
     }
 }
 
-pub(super) struct PendingDiffPreviewStore {
+pub(crate) struct PendingDiffPreviewStore {
     config: DiffPreviewConfig,
     inner: Mutex<StoreInner>,
 }
@@ -262,7 +262,7 @@ impl Default for PendingDiffPreviewStore {
 }
 
 impl PendingDiffPreviewStore {
-    pub(super) fn with_config(config: DiffPreviewConfig) -> Self {
+    pub(crate) fn with_config(config: DiffPreviewConfig) -> Self {
         if let Some(dir) = &config.data_dir {
             let ui_dir = dir.join("ui-protocol");
             if let Err(error) = fs::create_dir_all(&ui_dir) {
@@ -284,7 +284,7 @@ impl PendingDiffPreviewStore {
     ///
     /// Bounded by `config.entries_per_session` per session. A missing
     /// `data_dir` directory is treated as a clean boot (no-op recovery).
-    pub(super) fn recover(config: DiffPreviewConfig) -> RecoveryOutcome {
+    pub(crate) fn recover(config: DiffPreviewConfig) -> RecoveryOutcome {
         let store = Self::with_config(config);
         let Some(dir) = store.config.data_dir.clone() else {
             return RecoveryOutcome {
@@ -538,7 +538,7 @@ impl PendingDiffPreviewStore {
         inner.entries.insert(preview_id, entry);
     }
 
-    pub(super) fn get(
+    pub(crate) fn get(
         &self,
         params: DiffPreviewGetParams,
     ) -> Result<DiffPreviewGetResult, RpcError> {
@@ -559,11 +559,11 @@ impl PendingDiffPreviewStore {
     }
 
     #[allow(dead_code)]
-    pub(super) fn insert(&self, preview: DiffPreview) {
+    pub(crate) fn insert(&self, preview: DiffPreview) {
         self.insert_with_snapshot(preview, None);
     }
 
-    pub(super) fn insert_with_snapshot(
+    pub(crate) fn insert_with_snapshot(
         &self,
         preview: DiffPreview,
         snapshot_at_proposal: Option<String>,
@@ -774,7 +774,7 @@ impl PendingDiffPreviewStore {
         }
     }
 
-    pub(super) fn upsert_file_mutation(
+    pub(crate) fn upsert_file_mutation(
         &self,
         session_id: SessionKey,
         turn_id: &TurnId,
@@ -796,7 +796,7 @@ impl PendingDiffPreviewStore {
     /// Snapshot of the observability counters. Useful for tests and
     /// the `/metrics` endpoint integration.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn metrics(&self) -> DiffPreviewMetrics {
+    pub(crate) fn metrics(&self) -> DiffPreviewMetrics {
         let inner = self.inner.lock().expect("diff preview store poisoned");
         let in_memory_bytes: usize = inner.sessions.values().map(|s| s.in_memory_bytes).sum();
         DiffPreviewMetrics {
@@ -815,7 +815,7 @@ impl PendingDiffPreviewStore {
     /// Intended for periodic operator-visibility, mirroring the
     /// ledger's sweep-tick log.
     #[allow(dead_code)]
-    pub(super) fn log_metrics(&self) {
+    pub(crate) fn log_metrics(&self) {
         let m = self.metrics();
         info!(
             target = "octos::diff_preview",
@@ -830,7 +830,7 @@ impl PendingDiffPreviewStore {
     }
 
     #[cfg(test)]
-    pub(super) fn snapshot_for(&self, preview_id: &PreviewId) -> Option<String> {
+    pub(crate) fn snapshot_for(&self, preview_id: &PreviewId) -> Option<String> {
         self.inner
             .lock()
             .expect("diff preview store poisoned")
@@ -843,24 +843,24 @@ impl PendingDiffPreviewStore {
 /// Outcome of [`PendingDiffPreviewStore::recover`]. The caller wires
 /// `store` into the singleton; the counts are useful for the boot log
 /// line.
-pub(super) struct RecoveryOutcome {
-    pub(super) store: PendingDiffPreviewStore,
-    pub(super) sessions_recovered: usize,
-    pub(super) entries_recovered: usize,
+pub(crate) struct RecoveryOutcome {
+    pub(crate) store: PendingDiffPreviewStore,
+    pub(crate) sessions_recovered: usize,
+    pub(crate) entries_recovered: usize,
 }
 
 /// Snapshot of the diff preview store observability counters.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DiffPreviewMetrics {
-    pub(super) entries_active: usize,
-    pub(super) sessions_active: usize,
-    pub(super) sessions_evicted: u64,
-    pub(super) entries_dropped: u64,
-    pub(super) recovery_entries_loaded: u64,
-    pub(super) recovery_records_skipped: u64,
-    pub(super) bytes_in_memory: usize,
-    pub(super) bytes_on_disk: u64,
+pub(crate) struct DiffPreviewMetrics {
+    pub(crate) entries_active: usize,
+    pub(crate) sessions_active: usize,
+    pub(crate) sessions_evicted: u64,
+    pub(crate) entries_dropped: u64,
+    pub(crate) recovery_entries_loaded: u64,
+    pub(crate) recovery_records_skipped: u64,
+    pub(crate) bytes_in_memory: usize,
+    pub(crate) bytes_on_disk: u64,
 }
 
 // ---------- Helpers ----------
@@ -979,7 +979,7 @@ fn preview_from_file_mutation(
         .map(|files| files.into_iter().map(sanitize_preview_file).collect())
         .unwrap_or_else(|| vec![file_from_mutation_notice(notice)]);
 
-    let safe_path = super::ui_protocol_sanitize::sanitize_display_path(&notice.path);
+    let safe_path = crate::contracts::sanitize::sanitize_display_path(&notice.path);
     DiffPreview {
         session_id,
         preview_id,
@@ -990,7 +990,7 @@ fn preview_from_file_mutation(
 
 fn file_from_mutation_notice(notice: &UiFileMutationNotice) -> DiffPreviewFile {
     DiffPreviewFile {
-        path: super::ui_protocol_sanitize::sanitize_display_path(&notice.path),
+        path: crate::contracts::sanitize::sanitize_display_path(&notice.path),
         old_path: None,
         status: status_from_operation(&notice.operation),
         hunks: Vec::new(),
@@ -998,10 +998,10 @@ fn file_from_mutation_notice(notice: &UiFileMutationNotice) -> DiffPreviewFile {
 }
 
 fn sanitize_preview_file(mut file: DiffPreviewFile) -> DiffPreviewFile {
-    file.path = super::ui_protocol_sanitize::sanitize_display_path(&file.path);
+    file.path = crate::contracts::sanitize::sanitize_display_path(&file.path);
     file.old_path = file
         .old_path
-        .map(|path| super::ui_protocol_sanitize::sanitize_display_path(&path));
+        .map(|path| crate::contracts::sanitize::sanitize_display_path(&path));
     file
 }
 

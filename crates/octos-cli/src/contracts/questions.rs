@@ -1,6 +1,6 @@
 //! Pending structured-user-question store (UPCR-2026-023).
 //!
-//! Mirrors [`super::ui_protocol_approvals::PendingApprovalStore`] for the
+//! Mirrors [`crate::contracts::approvals::PendingApprovalStore`] for the
 //! `ask_user_question` flow: a per-`question_id` map holding the originating
 //! [`UserQuestionRequestedEvent`] and a oneshot `Sender` the
 //! `user_question/respond` handler resolves. The blocked
@@ -20,7 +20,7 @@ use serde_json::json;
 /// Resolution delivered to the waiting `ask_user_question` tool when a client
 /// answers. A *closed* oneshot (sender dropped) means the question was
 /// cancelled (turn interrupt) — the tool treats that as `Cancelled`.
-pub(super) type UserQuestionResolution = Vec<UserQuestionAnswer>;
+pub(crate) type UserQuestionResolution = Vec<UserQuestionAnswer>;
 
 #[derive(Debug)]
 struct QuestionEntry {
@@ -50,25 +50,25 @@ enum QuestionEntryState {
 /// are read by the store tests and by the follow-up wire-emit slice.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(super) struct CancelledQuestion {
-    pub(super) question_id: QuestionId,
-    pub(super) turn_id: TurnId,
+pub(crate) struct CancelledQuestion {
+    pub(crate) question_id: QuestionId,
+    pub(crate) turn_id: TurnId,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct QuestionRespondOutcome {
-    pub(super) result: UserQuestionRespondResult,
+pub(crate) struct QuestionRespondOutcome {
+    pub(crate) result: UserQuestionRespondResult,
 }
 
 #[derive(Default)]
-pub(super) struct PendingQuestionStore {
+pub(crate) struct PendingQuestionStore {
     entries: RwLock<HashMap<QuestionId, QuestionEntry>>,
 }
 
 impl PendingQuestionStore {
     /// Register a runtime-blocking question and return the oneshot the waiting
     /// tool awaits. Mirrors `PendingApprovalStore::request_runtime`.
-    pub(super) fn request_runtime(
+    pub(crate) fn request_runtime(
         &self,
         event: UserQuestionRequestedEvent,
     ) -> tokio::sync::oneshot::Receiver<UserQuestionResolution> {
@@ -90,7 +90,7 @@ impl PendingQuestionStore {
     /// Resolve a pending question with the client's answers. Mirrors
     /// `PendingApprovalStore::respond_with_context`: typed errors on
     /// unknown/stale ids; resolves the waiting tool's oneshot at most once.
-    pub(super) fn respond_with_context(
+    pub(crate) fn respond_with_context(
         &self,
         params: &UserQuestionRespondParams,
     ) -> Result<QuestionRespondOutcome, RpcError> {
@@ -139,7 +139,7 @@ impl PendingQuestionStore {
 
     /// Atomically cancel every still-pending question for the given turn.
     /// Idempotent. Mirrors `PendingApprovalStore::cancel_pending_for_turn`.
-    pub(super) fn cancel_pending_for_turn(
+    pub(crate) fn cancel_pending_for_turn(
         &self,
         session_id: &SessionKey,
         turn_id: &TurnId,
@@ -173,7 +173,7 @@ impl PendingQuestionStore {
 
     /// Cancel a single pending question (e.g. when the requested notification
     /// failed to send). Mirrors `PendingApprovalStore::cancel_pending_approval`.
-    pub(super) fn cancel_pending_question(
+    pub(crate) fn cancel_pending_question(
         &self,
         session_id: &SessionKey,
         question_id: &QuestionId,
@@ -202,7 +202,7 @@ impl PendingQuestionStore {
     /// `PendingApprovalStore::pending_for_session`. Replayed on `session/open`
     /// and `session/hydrate` (gated by `user_question.v1`) so a reconnecting
     /// client re-renders and can still answer a pending question.
-    pub(super) fn pending_for_session(
+    pub(crate) fn pending_for_session(
         &self,
         session_id: &SessionKey,
     ) -> Vec<UserQuestionRequestedEvent> {

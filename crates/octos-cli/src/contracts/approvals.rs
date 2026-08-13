@@ -34,13 +34,13 @@ enum ApprovalEntryState {
 
 /// One cancelled approval surfaced by [`PendingApprovalStore::cancel_pending_for_turn`].
 #[derive(Debug, Clone)]
-pub(super) struct CancelledApproval {
-    pub(super) approval_id: ApprovalId,
-    pub(super) turn_id: TurnId,
+pub(crate) struct CancelledApproval {
+    pub(crate) approval_id: ApprovalId,
+    pub(crate) turn_id: TurnId,
 }
 
 #[derive(Default)]
-pub(super) struct PendingApprovalStore {
+pub(crate) struct PendingApprovalStore {
     entries: RwLock<HashMap<ApprovalId, ApprovalEntry>>,
 }
 
@@ -52,22 +52,22 @@ pub(super) struct PendingApprovalStore {
 /// result. `None` for the legacy `insert_pending` path that never carried
 /// a request.
 #[derive(Debug, Clone)]
-pub(super) struct RespondedApprovalContext {
-    pub(super) tool_name: String,
-    pub(super) turn_id: TurnId,
+pub(crate) struct RespondedApprovalContext {
+    pub(crate) tool_name: String,
+    pub(crate) turn_id: TurnId,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct RespondOutcome {
-    pub(super) result: ApprovalRespondResult,
-    pub(super) context: Option<RespondedApprovalContext>,
+pub(crate) struct RespondOutcome {
+    pub(crate) result: ApprovalRespondResult,
+    pub(crate) context: Option<RespondedApprovalContext>,
 }
 
 impl PendingApprovalStore {
     /// Decide an approval and snapshot the metadata the audit/ledger path
     /// needs. Equivalent to [`Self::respond`] for callers that don't care
     /// about the captured request.
-    pub(super) fn respond_with_context(
+    pub(crate) fn respond_with_context(
         &self,
         params: ApprovalRespondParams,
     ) -> Result<RespondOutcome, RpcError> {
@@ -129,7 +129,7 @@ impl PendingApprovalStore {
     }
 
     #[cfg(test)]
-    pub(super) fn respond(
+    pub(crate) fn respond(
         &self,
         params: ApprovalRespondParams,
     ) -> Result<RespondOutcome, RpcError> {
@@ -149,7 +149,7 @@ impl PendingApprovalStore {
     /// (`decision: "cancelled"` with `reason`) so the audit log mirrors the
     /// durable ledger. Out of scope for FIX-08 — flagged so a follow-up can
     /// pick it up without re-reading the spec.
-    pub(super) fn cancel_pending_for_turn(
+    pub(crate) fn cancel_pending_for_turn(
         &self,
         session_id: &SessionKey,
         turn_id: &TurnId,
@@ -186,7 +186,7 @@ impl PendingApprovalStore {
         cancelled
     }
 
-    pub(super) fn cancel_pending_approval(
+    pub(crate) fn cancel_pending_approval(
         &self,
         session_id: &SessionKey,
         approval_id: &ApprovalId,
@@ -219,7 +219,7 @@ impl PendingApprovalStore {
     }
 
     #[allow(dead_code)]
-    pub(super) fn insert_pending(&self, session_id: SessionKey, approval_id: ApprovalId) {
+    pub(crate) fn insert_pending(&self, session_id: SessionKey, approval_id: ApprovalId) {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
             approval_id,
@@ -233,7 +233,7 @@ impl PendingApprovalStore {
         );
     }
 
-    pub(super) fn request(&self, event: ApprovalRequestedEvent) -> ApprovalRequestedEvent {
+    pub(crate) fn request(&self, event: ApprovalRequestedEvent) -> ApprovalRequestedEvent {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
             event.approval_id.clone(),
@@ -248,7 +248,7 @@ impl PendingApprovalStore {
         event
     }
 
-    pub(super) fn request_runtime(
+    pub(crate) fn request_runtime(
         &self,
         event: ApprovalRequestedEvent,
     ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
@@ -267,7 +267,7 @@ impl PendingApprovalStore {
         rx
     }
 
-    pub(super) fn pending_for_session(
+    pub(crate) fn pending_for_session(
         &self,
         session_id: &SessionKey,
     ) -> Vec<ApprovalRequestedEvent> {
@@ -283,7 +283,7 @@ impl PendingApprovalStore {
     }
 
     #[allow(dead_code)]
-    pub(super) fn remove_pending(&self, session_id: &SessionKey, approval_id: &ApprovalId) -> bool {
+    pub(crate) fn remove_pending(&self, session_id: &SessionKey, approval_id: &ApprovalId) -> bool {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let should_remove = entries.get(approval_id).is_some_and(|entry| {
             entry.session_id == *session_id && matches!(&entry.state, ApprovalEntryState::Pending)
@@ -295,7 +295,7 @@ impl PendingApprovalStore {
     }
 
     #[cfg(test)]
-    pub(super) fn requested_event(
+    pub(crate) fn requested_event(
         &self,
         approval_id: &ApprovalId,
     ) -> Option<ApprovalRequestedEvent> {
@@ -317,7 +317,7 @@ impl PendingApprovalStore {
 /// `outcome.context` is `None` for the legacy `insert_pending` test path
 /// that never carried a request; in that case we synthesize a fresh
 /// `TurnId` so the event still serializes.
-pub(super) fn build_decided_event(
+pub(crate) fn build_decided_event(
     params: &ApprovalRespondParams,
     outcome: &RespondOutcome,
     decided_by: impl Into<String>,

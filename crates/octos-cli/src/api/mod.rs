@@ -35,18 +35,20 @@ pub mod swarm;
 pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
-mod ui_protocol_approvals;
+// Relocated to crate::contracts (Phase 3 of goal-in-chat) so `octos chat
+// --peers` can share the SAME process-global pending-prompt registry the WS
+// path uses without the `api` feature; re-exported here so api-internal paths
+// keep working unchanged.
+pub(crate) use crate::contracts::approvals as ui_protocol_approvals;
 // Relocated to crate::approvals_audit (Phase 4, ROBRIX-PHASE4 ADR) so the
 // gateway approval path can write the same audit log without the `api`
 // feature; re-exported here so api-internal paths keep working.
 pub(crate) use crate::approvals_audit as ui_protocol_audit;
-mod ui_protocol_diff;
 mod ui_protocol_ledger;
 pub(crate) mod ui_protocol_progress;
-mod ui_protocol_questions;
 mod ui_protocol_reasoning_effort;
-mod ui_protocol_sanitize;
-mod ui_protocol_scope;
+pub(crate) use crate::contracts::sanitize as ui_protocol_sanitize;
+pub(crate) use crate::contracts::scope as ui_protocol_scope;
 mod ui_protocol_task_output;
 pub mod usage;
 pub mod user_admin;
