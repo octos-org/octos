@@ -42,7 +42,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.3-rc.2"
+version = "2.0.3-rc.3"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["octos team"]
