@@ -5101,12 +5101,20 @@ impl SessionActor {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
         let tokens_consumed = self.last_turn_total_tokens;
         let orchestrator = default_agent_orchestrator();
-        orchestrator.record_goal_turn(
+        if let Some(snapshot) = orchestrator.record_goal_turn(
             &self.session_key,
             profile_id,
             tokens_consumed,
             elapsed_seconds,
-        );
+        ) {
+            // #1982 — reconcile the durable ledger after a mid-turn completion so
+            // its `tokens_used` reflects the goal's true final cost.
+            orchestrator.reconcile_terminal_goal_ledger(
+                &self.session_key,
+                &snapshot,
+                &self.data_dir,
+            );
+        }
         // Capture the most recent assistant turn's text content to feed
         // the completion-sentinel detector. Reading from the durable
         // session handle keeps the wiring narrow — `process_inbound`

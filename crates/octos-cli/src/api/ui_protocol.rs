@@ -34623,12 +34623,17 @@ async fn run_standalone_turn(
             .map(|start| start.elapsed().as_secs())
             .unwrap_or(0);
         let orchestrator = default_agent_orchestrator();
-        orchestrator.record_goal_turn(
+        if let Some(snapshot) = orchestrator.record_goal_turn(
             goal_key,
             &goal_ctx.profile_id,
             final_tokens_consumed,
             elapsed_seconds,
-        );
+        ) {
+            // #1982 — a goal completed/blocked mid-turn froze its ledger tokens
+            // at the pre-completion total; reconcile the durable record with the
+            // full turn's spend now.
+            orchestrator.reconcile_terminal_goal_ledger(goal_key, &snapshot, &goal_ledger_data_dir);
+        }
         if let Some(reply) = assistant_reply {
             // Loop-engineering completion gate: only spend the INDEPENDENT
             // verifier LLM call when the agent actually CLAIMS completion —
