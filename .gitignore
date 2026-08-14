@@ -173,3 +173,10 @@ tsconfig.tsbuildinfo
 
 # Local audit artifacts (personal, not tracked)
 /audit/
+
+# Agent/dev scratch space — soak runs, driver scripts, issue drafts, captured
+# transcripts. Local only, and large (a single peer-goal soak leaves tens of MB
+# of session ledgers and server logs). Ignored because an accidental
+# `git add -A` here otherwise sweeps hundreds of artifact files — and any
+# workspace dirs the soaks `git init` — into a commit.
+/scratchpad/
