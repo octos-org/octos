@@ -51,7 +51,24 @@ const AUTONOMY_POLICY_ID: &str = "coding-autonomy-v1";
 /// as "the goal stopped counting". Users can override per-goal up to
 /// [`GOAL_MAX_TOKEN_BUDGET`]. `pub(crate)` so the capability advertisement
 /// (`ui_protocol`) reports the real value instead of a drifting literal.
-pub(crate) const GOAL_DEFAULT_TOKEN_BUDGET: u64 = 2_000_000;
+///
+/// Raised 2M -> 100M for PEER FLEETS. A goal that fans out to peers charges
+/// every peer's turns to the MASTER's budget (#1965/#1970), so the old 2M
+/// default was exhausted by a single realistic fleet: a 5-peer deep-review
+/// goal spent 10.65M and flipped to `budget_limited` with all five peers
+/// still doing useful work. Enforcement is at the TURN BOUNDARY (mid-turn
+/// limiting was deliberately dropped), so the overshoot is unbounded within
+/// a turn and a budget only ever acts as a tripwire noticed afterwards —
+/// which made 2M a guard that fired on correct behaviour rather than runaway
+/// behaviour.
+///
+/// TRADE-OFF, stated plainly: this is the ceiling on what an UNSPECIFIED
+/// goal may spend autonomously. At the ~$1/M-token rate observed in soaks,
+/// 100M is on the order of $100 per goal before anything stops it. Set a
+/// smaller explicit `--budget` for anything cost-sensitive; the default now
+/// optimises for "a legitimate fleet finishes" over "an unattended goal
+/// cannot spend much".
+pub(crate) const GOAL_DEFAULT_TOKEN_BUDGET: u64 = 100_000_000;
 /// Hard ceiling on a caller-supplied goal budget — a sanity limit against
 /// typos / overflow, NOT a practical cap (at ~175K tokens/turn this still
 /// allows thousands of continuations). The user owns whatever value they
