@@ -8716,6 +8716,24 @@ impl InProcessAgentOrchestrator {
                 &session_id,
                 &format!("[{name}] {line}"),
             );
+            // #2019 — SECOND consumer: the human. The wake above is untouched
+            // (same continuation, same dedupe key, same ordering); this is a
+            // purely additive, best-effort tap so the user can SEE what the
+            // model was woken by instead of watching a silent session. Routed
+            // on the monitor's OWNING session — never the client's focused one
+            // — and attributed to the monitor. Never fed back into model
+            // context: the model's view is the note above plus the
+            // continuation metadata, exactly as before.
+            crate::autonomy::human_events::emit_background_activity(
+                crate::autonomy::human_events::background_activity(
+                    &session_id,
+                    Some(profile_id.as_str()),
+                    crate::autonomy::human_events::ORIGIN_KIND_MONITOR,
+                    monitor_id,
+                    Some(name.as_str()),
+                    line.clone(),
+                ),
+            );
         }
         MonitorBatchOutcome::Fired { queued }
     }
@@ -25419,6 +25437,136 @@ mod tests {
         assert_eq!(
             orchestrator.handle_monitor_batch(id, &["status: done".into()], 1),
             MonitorBatchOutcome::DedupedUnchanged
+        );
+        assert_eq!(pending_wakes(&orchestrator, &session, "tenant-a"), 1);
+    }
+
+    /// #2019 acceptance — a monitor that fires produces HUMAN-visible,
+    /// origin-attributed lines on the session that OWNS the monitor, and the
+    /// model's wake is untouched.
+    ///
+    /// This asserts ROUTING, not merely emission: two monitors on two
+    /// different sessions fire in an interleaved order, and each event must
+    /// land on ITS OWN session. Activity without a correct routing key renders
+    /// in whichever session happens to be focused (octos-tui#461, #466, #483)
+    /// — the exact bug class this event must not re-ship.
+    #[test]
+    fn should_emit_attributed_human_activity_on_the_owning_session_when_a_monitor_fires() {
+        use crate::autonomy::human_events::{
+            BackgroundActivitySink, ORIGIN_KIND_MONITOR, clear_background_activity_sink,
+            set_background_activity_sink,
+        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let sink: BackgroundActivitySink = std::sync::Arc::new(move |event| {
+            recorder.lock().unwrap().push(event);
+        });
+        set_background_activity_sink(sink);
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_a = SessionKey::new("api", "mon-human-a");
+        let session_b = SessionKey::new("api", "mon-human-b");
+        create_monitor_for_test(
+            &orchestrator,
+            &session_a,
+            "tenant-a",
+            monitor_spec("ci-tail", MonitorMode::Stream),
+            None,
+        );
+        create_monitor_for_test(
+            &orchestrator,
+            &session_b,
+            "tenant-b",
+            monitor_spec("deploy-tail", MonitorMode::Stream),
+            None,
+        );
+        let (id_a, id_b) = ("monitor_01", "monitor_02");
+
+        // Interleave so a "last writer wins" / ambient-session implementation
+        // could not accidentally pass.
+        assert_eq!(
+            orchestrator.handle_monitor_batch(id_a, &["a1".into()], 1),
+            MonitorBatchOutcome::Fired { queued: true }
+        );
+        assert_eq!(
+            orchestrator.handle_monitor_batch(id_b, &["b1".into()], 1),
+            MonitorBatchOutcome::Fired { queued: true }
+        );
+        assert_eq!(
+            orchestrator.handle_monitor_batch(id_a, &["a2".into(), "a3".into()], 2),
+            MonitorBatchOutcome::Fired { queued: true }
+        );
+
+        let events = seen.lock().unwrap().clone();
+        clear_background_activity_sink();
+
+        // One human-visible line per observed event line.
+        assert_eq!(events.len(), 4, "one event per observed line: {events:?}");
+
+        // ROUTING: every event names the session that OWNS its monitor.
+        let a_texts: Vec<&str> = events
+            .iter()
+            .filter(|event| event.session_id == session_a)
+            .map(|event| event.text.as_str())
+            .collect();
+        let b_texts: Vec<&str> = events
+            .iter()
+            .filter(|event| event.session_id == session_b)
+            .map(|event| event.text.as_str())
+            .collect();
+        assert_eq!(a_texts, vec!["a1", "a2", "a3"]);
+        assert_eq!(b_texts, vec!["b1"]);
+        assert!(
+            events.iter().all(|event| !event.session_id.0.is_empty()),
+            "every event carries a routing key"
+        );
+
+        // ATTRIBUTION: an unattributed line reads as the master speaking.
+        for event in &events {
+            assert_eq!(event.origin_kind, ORIGIN_KIND_MONITOR);
+            assert!(!event.origin_id.is_empty());
+            assert!(event.emitted_at_ms > 0);
+            assert!(!event.suppressed);
+        }
+        let a_event = events
+            .iter()
+            .find(|event| event.session_id == session_a)
+            .expect("session A event");
+        assert_eq!(a_event.origin_id, id_a);
+        assert_eq!(a_event.origin_label.as_deref(), Some("ci-tail"));
+        assert_eq!(a_event.profile_id.as_deref(), Some("tenant-a"));
+        let b_event = events
+            .iter()
+            .find(|event| event.session_id == session_b)
+            .expect("session B event");
+        assert_eq!(b_event.origin_id, id_b);
+        assert_eq!(b_event.origin_label.as_deref(), Some("deploy-tail"));
+
+        // WAKE BEHAVIOUR IS UNCHANGED: the human sink is purely additive —
+        // still exactly one master continuation per fired batch, on the
+        // owning session, as before #2019.
+        assert_eq!(pending_wakes(&orchestrator, &session_a, "tenant-a"), 2);
+        assert_eq!(pending_wakes(&orchestrator, &session_b, "tenant-b"), 1);
+    }
+
+    /// #2019 — a producer must never be blocked or failed by the human sink.
+    /// With NO sink installed (the production "queue closed" degradation), the
+    /// monitor's wake path is byte-for-byte the same.
+    #[test]
+    fn should_leave_the_wake_path_intact_when_no_human_sink_is_installed() {
+        crate::autonomy::human_events::clear_background_activity_sink();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-human-nosink");
+        create_monitor_for_test(
+            &orchestrator,
+            &session,
+            "tenant-a",
+            monitor_spec("ci-tail", MonitorMode::Stream),
+            None,
+        );
+        assert_eq!(
+            orchestrator.handle_monitor_batch("monitor_01", &["x".into()], 1),
+            MonitorBatchOutcome::Fired { queued: true }
         );
         assert_eq!(pending_wakes(&orchestrator, &session, "tenant-a"), 1);
     }

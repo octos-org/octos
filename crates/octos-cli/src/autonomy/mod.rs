@@ -14,6 +14,7 @@
 pub(crate) mod agent_orchestrator;
 pub(crate) mod fleet_wake;
 pub(crate) mod goal_loop_runtime;
+pub(crate) mod human_events;
 pub(crate) mod master_continuation_scheduler;
 pub(crate) mod monitor_runtime;
 pub(crate) mod specialist_runner;

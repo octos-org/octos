@@ -623,6 +623,21 @@ Peer staging (#1801 v3, ungated):
   `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
   clients dedup by the already-closed peer for the topic.
 
+Background activity — the human sink (#2019, gate `event.background_activity.v1`):
+
+- `background/activity` — one background event that woke the model, surfaced
+  to the HUMAN. Monitor event lines (#1977) and claimed fleet outbox events
+  already exist, are already durable, and already have producers; their only
+  consumer is the model, so a monitor that fires forty times during a loop is
+  invisible to the user. `params` carry the REQUIRED `session_id` of the
+  session that owns the emitter (the routing key), `origin_kind`
+  (`monitor` | `fleet`), `origin_id`, optional `origin_label`, the observed
+  `text`, `emitted_at_ms`, plus `dropped_count?` / `suppressed` for the
+  per-origin cap's visible drop marker. Durable: a client disconnected
+  mid-loop replays the stream by cursor rather than losing its middle.
+  Purely additive — the model is woken exactly as before, and this stream is
+  never routed back into model context.
+
 ## 7. Command Semantics
 
 ### `session/open`

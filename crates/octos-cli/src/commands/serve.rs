@@ -1491,6 +1491,15 @@ impl ServeCommand {
         // Everything the drain needs (the full AppState) is constructed above.
         crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
 
+        // #2019 — install the HUMAN sink over background events that today
+        // only wake the model (monitor event lines, claimed fleet outbox
+        // events). Spawned here, next to (and before) the global drain, so
+        // both `serve --stdio` and the HTTP serve get it: the producers are
+        // the connection-independent watcher tasks and the outbox consumer,
+        // so the sink must not be per-connection either. Purely additive —
+        // it changes nothing about how or when the model is woken.
+        crate::api::ui_protocol::spawn_background_activity_sink(state.clone());
+
         if self.stdio {
             crate::api::ui_protocol::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");

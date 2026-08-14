@@ -257,6 +257,16 @@ pub const UI_PROTOCOL_FEATURE_USER_QUESTION_V1: &str = "user_question.v1";
 /// turn keeps emitting whole-file `file/attached` audio.
 pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 
+/// #2019 — feature flag for the HUMAN sink over background events that
+/// otherwise only wake the model. Monitor event lines (#1977) and claimed
+/// fleet outbox events already exist, are already durable, and already have
+/// producers — but their sole consumer is the model, so a monitor that fires
+/// forty times during a loop is invisible to the user. When negotiated, the
+/// server additionally pushes `background/activity` notifications carrying the
+/// origin-attributed event text. Purely additive: the model is woken exactly
+/// as before, and this stream is NEVER fed back into model context.
+pub const UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1: &str = "event.background_activity.v1";
+
 /// Feature flag for the model-authored plan/todo checklist. When negotiated,
 /// the server pushes `plan/updated` notifications carrying the agent's current
 /// ordered checklist (the `update_plan` tool's live state), and replays the
@@ -304,6 +314,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
 ];
 
@@ -1261,6 +1272,12 @@ pub mod methods {
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
     /// Session-level whole-job orchestration status notification.
     pub const SESSION_ORCHESTRATION: &str = "session/orchestration";
+    /// #2019 `background/activity` — the HUMAN sink over background events
+    /// that today only wake the model (monitor event lines, claimed fleet
+    /// outbox events). Origin-attributed, durable, capped, and NEVER routed
+    /// back into model context. Gated on
+    /// [`super::UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1`].
+    pub const BACKGROUND_ACTIVITY: &str = "background/activity";
     /// #1801 v3 `peer/staged` — agent-initiated peer staging. The model's
     /// `peer_handoff` tool staged a sovereign peer session server-side
     /// (durable brief + optional fenced worktree); sessions are
@@ -1425,6 +1442,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::CONTEXT_NORMALIZATION_REPORTED,
     methods::PEER_STAGED,
     methods::PEER_CLOSED,
+    methods::BACKGROUND_ACTIVITY,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -6495,6 +6513,59 @@ pub struct PeerClosedEvent {
     pub profile_id: String,
 }
 
+/// #2019 — one background event surfaced to the HUMAN.
+///
+/// Background events (a monitor's filtered stdout line, a claimed fleet outbox
+/// event) already exist and are already durable, but their only consumer is
+/// the model: the sole effect of an event is that the master gets woken, and
+/// whether any of it reaches the transcript depends on whether the model
+/// volunteers it. This is the second consumer — the user — so a monitor that
+/// fires forty times during a self-critic loop is visible rather than a silent
+/// session.
+///
+/// Contract:
+/// - `session_id` is **required** and is the routing key. Activity without one
+///   renders in whichever session happens to be focused (octos-tui#461, #466,
+///   #483) — the exact bug class this event must not re-ship.
+/// - `origin_kind` + `origin_id` (+ optional `origin_label`) attribute the
+///   line. An unattributed monitor/peer line reads as the master speaking.
+/// - The stream is CAPPED per origin. `dropped_count` reports events the cap
+///   suppressed and that this event accounts for; `suppressed` marks the
+///   explicit drop MARKER row (silent truncation reads as "nothing more
+///   happened").
+/// - Durable (ledger-appended) so a client disconnected mid-loop replays the
+///   stream instead of losing its middle.
+/// - This payload is NEVER routed back into model context. It exists so the
+///   human can see what the model was woken by; feeding it back would be a
+///   compaction/cost problem and would make the loop observe itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundActivityEvent {
+    /// REQUIRED routing key — the session whose master this event woke.
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// Emitter class. Open registry; today `"monitor"` or `"fleet"`.
+    pub origin_kind: String,
+    /// Stable id of the emitter within its class (monitor id / fleet id).
+    pub origin_id: String,
+    /// Human label for the emitter (monitor name, peer slug, …). Clients fall
+    /// back to `origin_id` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_label: Option<String>,
+    /// The observed event text (one monitor line, or one fleet event summary).
+    pub text: String,
+    /// Wall-clock emission time, ms since the Unix epoch.
+    pub emitted_at_ms: i64,
+    /// Events this origin's cap suppressed, accounted for by THIS event.
+    /// `None`/`0` when nothing was dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_count: Option<u64>,
+    /// `true` when this row IS the cap's visible drop marker rather than an
+    /// observed event line.
+    #[serde(default)]
+    pub suppressed: bool,
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -6596,6 +6667,9 @@ pub enum UiNotification {
     /// The model's `peer_close` tool tore down a staged peer session; the
     /// client closes the peer pane it opened. See [`PeerClosedEvent`].
     PeerClosed(PeerClosedEvent),
+    /// #2019: a background event that woke the model, surfaced to the HUMAN.
+    /// See [`BackgroundActivityEvent`].
+    BackgroundActivity(BackgroundActivityEvent),
     /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
     /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
     /// per-connection live filter keeps legacy and envelope deliveries
@@ -6674,6 +6748,7 @@ impl UiNotification {
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::PeerStaged(_) => methods::PEER_STAGED,
             Self::PeerClosed(_) => methods::PEER_CLOSED,
+            Self::BackgroundActivity(_) => methods::BACKGROUND_ACTIVITY,
             Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
             Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
@@ -6730,6 +6805,7 @@ impl UiNotification {
             Self::SessionOrchestration(event) => &event.session_id,
             Self::PeerStaged(event) => &event.session_id,
             Self::PeerClosed(event) => &event.session_id,
+            Self::BackgroundActivity(event) => &event.session_id,
             Self::Envelope(event) => &event.session_id,
             Self::EnvelopeV2(event) => &event.session_id,
         }
@@ -6895,6 +6971,9 @@ impl UiNotification {
             // and routing keys off `session_id` (the originating session).
             Self::PeerStaged(params) => serde_json::to_value(params),
             Self::PeerClosed(params) => serde_json::to_value(params),
+            // #2019: routing keys off `session_id` like every other
+            // session-scoped notification; the origin fields are payload.
+            Self::BackgroundActivity(params) => serde_json::to_value(params),
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): the wire
             // shape per spec § 14.1 is the bare `Envelope` fields FLATTENED
             // with the routing keys `session_id` (the bare base key) +
@@ -7046,6 +7125,9 @@ impl UiNotification {
             }
             methods::PEER_STAGED => Ok(Self::PeerStaged(decode_params(method, params)?)),
             methods::PEER_CLOSED => Ok(Self::PeerClosed(decode_params(method, params)?)),
+            methods::BACKGROUND_ACTIVITY => {
+                Ok(Self::BackgroundActivity(decode_params(method, params)?))
+            }
             // UPCR-2026-014 (M9-γ) + feat(envelope-wire-routing): decode
             // the FLATTENED wire frame — bare Envelope keys plus the
             // routing keys `session_id` + `topic`. Backward-compatible:

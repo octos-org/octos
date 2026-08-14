@@ -190,6 +190,32 @@ pub(crate) fn fleet_keeper_continuation_request(
     req
 }
 
+/// #2019 — the human-facing label for a fleet origin: the plan objective when
+/// the snapshot read succeeded, else `None` (the client falls back to the
+/// fleet id). Never a raw verdict reason — the snapshot only carries the
+/// objective, task lines, and ready ids.
+fn snapshot_label(snap: &FleetKeeperSnapshot) -> Option<&str> {
+    let objective = snap.objective.trim();
+    (!objective.is_empty()).then_some(objective)
+}
+
+/// #2019 — the human-facing one-liner for a claimed fleet outbox event. Says
+/// WHAT happened and what is dispatchable now; the model's keeper prompt
+/// (which carries the full task table) is unchanged and unrelated.
+fn fleet_activity_text(kind: FleetEventKind, snap: &FleetKeeperSnapshot) -> String {
+    let what = match kind {
+        FleetEventKind::ChildDone => "a child task finished",
+        FleetEventKind::FleetDrained => "the fleet drained (no runnable work left)",
+        _ => "fleet event",
+    };
+    let ready = snap.ready.trim();
+    if ready.is_empty() {
+        what.to_owned()
+    } else {
+        format!("{what}; ready now: {ready}")
+    }
+}
+
 /// Drain the fleet outbox once: claim up to `max_batch` currently-claimable
 /// events, wake the controller for each `ChildDone` / `FleetDrained`, and ack
 /// **only after the wake is durably committed**.
@@ -258,7 +284,27 @@ where
                         rec.controller_workspace_root.as_deref(),
                         rec.controller_workspace_has_runtime_hint,
                     );
-                    matches!(commit_wake(req), WakeCommit::Durable)
+                    let durable = matches!(commit_wake(req), WakeCommit::Durable);
+                    // #2019 — SECOND consumer: the human. The keeper wake above
+                    // is untouched; this is a purely additive, best-effort tap
+                    // so the user can SEE the fleet event that woke the
+                    // controller. Emitted only once the wake is DURABLE, so a
+                    // redelivered (not-yet-acked) event does not double-report.
+                    // Routed on the CONTROLLER's session — the session that
+                    // owns the keeper — and attributed to the fleet.
+                    if durable {
+                        crate::autonomy::human_events::emit_background_activity(
+                            crate::autonomy::human_events::background_activity(
+                                &rec.controller_session_key,
+                                Some(rec.profile_id.as_str()),
+                                crate::autonomy::human_events::ORIGIN_KIND_FLEET,
+                                &ev.fleet_id,
+                                snapshot_label(&snap),
+                                fleet_activity_text(ev.kind, &snap),
+                            ),
+                        );
+                    }
+                    durable
                 }
                 // A vanished fleet has no wake to persist; ack so the outbox
                 // advances rather than wedging on a missing record.

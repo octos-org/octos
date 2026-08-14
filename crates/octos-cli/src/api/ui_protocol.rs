@@ -51,24 +51,25 @@ use octos_core::ui_protocol::{
     TurnInterruptResult, TurnLifecycleState, TurnSessionResult, TurnStartParams,
     TurnStateGetParams, TurnStateGetResult, TurnTerminalError, TurnTerminalOutcome,
     UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
-    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
-    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
-    hydrate_sections, progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
+    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
+    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
+    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
+    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
+    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -1762,6 +1763,12 @@ struct ConnectionUiFeatures {
     /// replays the latest snapshot on `session/open`. Otherwise the plan rides
     /// out only on the legacy `tool/completed` `structured_metadata` path.
     plan_todos: bool,
+    /// #2019 `event.background_activity.v1`: the HUMAN sink over background
+    /// events that today only wake the model (monitor event lines, claimed
+    /// fleet outbox events). Not negotiated → the connection never receives
+    /// `background/activity`, so a client that cannot render it never sees an
+    /// "unknown notification" (the ui-protocol v2 migration trap).
+    background_activity: bool,
     /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
     /// the client opts in to the historical v1 envelope shape (spec
     /// § 14) for projected events. γ-1 wires capability negotiation
@@ -1860,6 +1867,11 @@ impl ConnectionUiFeatures {
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             plan_todos: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
+            background_activity: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+            ),
             projection_envelope: has_ui_feature(
                 headers,
                 query,
@@ -1933,6 +1945,7 @@ impl ConnectionUiFeatures {
             file_attached: true,
             voice_audio: true,
             plan_todos: true,
+            background_activity: true,
             // Do NOT auto-enable `projection.envelope.v1` for stdio
             // connections. Legacy `turn/completed` is the turn-lifecycle
             // source for clients that do not consume `projection/envelope`
@@ -1990,6 +2003,7 @@ impl ConnectionUiFeatures {
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
             plan_todos: has(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
+            background_activity: has(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1),
             projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             projection_envelope_v2: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
@@ -2060,6 +2074,9 @@ impl ConnectionUiFeatures {
         }
         if self.plan_todos {
             requested.push(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1);
+        }
+        if self.background_activity {
+            requested.push(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1);
         }
         if self.projection_envelope {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
@@ -16932,6 +16949,16 @@ fn live_event_passes_capability_filter(
             return false;
         }
     }
+    // #2019 `event.background_activity.v1` gate. The human sink is a NEW
+    // notification shape; a client that did not negotiate it cannot render it
+    // and would report "unknown UI protocol notification" — the exact
+    // ui-protocol-v2-migration trap this pairing exists to avoid. Applies on
+    // both the live broadcast and reconnect replay (both call this filter).
+    if !features.background_activity {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(_)) = event {
+            return false;
+        }
+    }
     // UPCR-2026-023 `user_question.v1` gate. A client that did not negotiate
     // the structured-question capability never installed a
     // `SessionUserQuestionRequester` and has no `user_question/respond` path,
@@ -19712,6 +19739,69 @@ async fn emit_session_orchestration_updates(
         }
     }
     *last = current;
+}
+
+/// #2019 — bound on the human-sink queue. Producers (`try_send`) never block:
+/// a full queue drops the event, bumps a metric, and logs. Generous enough
+/// that only a genuinely pathological burst reaches it, and the per-origin cap
+/// in `autonomy::human_events` already emits a VISIBLE marker long before.
+const BACKGROUND_ACTIVITY_QUEUE_CAPACITY: usize = 512;
+
+/// #2019 — install the process-global HUMAN sink for background events that
+/// today only wake the model, and spawn its drain task.
+///
+/// Monitor event lines (#1977) and claimed fleet outbox events already exist,
+/// are already durable, and already have producers — with exactly ONE
+/// consumer, the model. This adds the second consumer, the user, WITHOUT
+/// touching how or when the model is woken.
+///
+/// Shape:
+/// - Producers call the sync, non-blocking
+///   [`crate::autonomy::human_events::emit_background_activity`], which caps
+///   per origin and hands the event to the installed sink.
+/// - The sink is a bounded-channel `try_send`. A full queue DROPS and logs; it
+///   must never stall a watcher task or the outbox consumer.
+/// - The drain task appends each event to the durable per-session ledger via
+///   [`send_notification_durable`] over a DETACHED connection, mirroring
+///   `PeerStaged`. The append (ring + disk + `publish_live`) is
+///   connection-independent, so a client disconnected mid-loop replays the
+///   stream by cursor on reconnect instead of losing its middle; connected
+///   clients receive it on their session's live forwarder, which applies their
+///   own `event.background_activity.v1` capability filter.
+///
+/// Nothing here is routed back into model context.
+pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
+    let (tx, mut rx) = mpsc::channel::<octos_core::ui_protocol::BackgroundActivityEvent>(
+        BACKGROUND_ACTIVITY_QUEUE_CAPACITY,
+    );
+    // Best-effort, non-blocking producer side. `try_send` is the whole
+    // contract: a producer must never await, block, or fail on the human sink.
+    crate::autonomy::human_events::set_background_activity_sink(std::sync::Arc::new(
+        move |event: octos_core::ui_protocol::BackgroundActivityEvent| {
+            if let Err(err) = tx.try_send(event) {
+                metrics::counter!("ws.background_activity.drop").increment(1);
+                tracing::debug!(
+                    target: "octos::ui_protocol::ws",
+                    reason = %err,
+                    "background activity dropped: human sink queue full or closed"
+                );
+            }
+        },
+    ));
+    tokio::spawn(async move {
+        // Detached connection: there is no live peer. Outbound frames are
+        // discarded by a drain task (the durable record is the ledger); keep
+        // the receiver alive so sends never backpressure-fail.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
+        tokio::spawn(async move { while writer_rx.recv().await.is_some() {} });
+        let ws = WsConnection::new(writer_tx);
+        let ledger = event_ledger(&state).await;
+        info!("background activity human sink started (#2019)");
+        while let Some(event) = rx.recv().await {
+            let _ =
+                send_notification_durable(&ws, &ledger, UiNotification::BackgroundActivity(event));
+        }
+    });
 }
 
 /// Cadence for the server-level (connection-independent) master-continuation
@@ -36023,6 +36113,10 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // peer/closed likewise carries only teardown facts (slug / topic),
             // not a replay cursor — same authoritative-ledger-cursor rule.
             | UiNotification::PeerClosed(_)
+            // #2019: the human sink carries an origin + text + timestamp, not
+            // a replay cursor; the surrounding ledger event's cursor is what
+            // a reconnecting client resumes from.
+            | UiNotification::BackgroundActivity(_)
             // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
             // `seq` allocated by `ThreadSeqAllocator`, not the per-session
             // `UiCursor` the legacy ledger replay uses. The durable
