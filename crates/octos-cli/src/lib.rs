@@ -36,6 +36,18 @@ pub mod config_watcher;
 pub mod content_catalog;
 #[path = "api/context_manager.rs"]
 pub(crate) mod context_manager;
+// Interactive-contract stores (pending approvals / user questions / diff
+// previews / approval scopes). Deliberately NOT `api`-gated: they are plain
+// in-memory registries over `octos_core::ui_protocol` types with no axum /
+// AppState / WebSocket dependency, and `octos chat --peers` needs the SAME
+// process-global `contract_stores()` the serve WS path uses so a peer's parked
+// oneshot and the master's `peer_respond` meet in one registry.
+//
+// Most of the surface is still reached only from the `api` WS handlers, so an
+// unfeatured build sees it as dead — an artifact of the consumer being absent,
+// not of the code being unreachable (same rationale as `autonomy`).
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod contracts;
 pub mod cron_tool;
 pub mod gateway_dispatcher;
 pub mod goal_tool;
@@ -47,6 +59,13 @@ pub mod memory_refresh;
 pub mod monitor;
 #[cfg(feature = "api")]
 pub mod otp;
+// Peer-agent staging / addressing / parked-prompt plumbing. Deliberately NOT
+// `api`-gated (Phase 3 of goal-in-chat): `octos chat --peers` hosts peers
+// in-process and needs the SAME process-global wire registry + staging layer
+// the serve WS path uses. Everything AppState/WebSocket-shaped stayed in
+// `api::ui_protocol`; see the module doc for the exact split.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod peers;
 pub use octos_services::persona_service;
 #[cfg(feature = "api")]
 pub mod process_manager;

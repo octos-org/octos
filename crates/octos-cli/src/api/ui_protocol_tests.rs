@@ -1,5 +1,9 @@
 use super::*;
+// `UiProtocolContractStores`'s audit writer moved with the contract stores to
+// `crate::approvals_audit`; the parent module no longer imports these two names
+// directly, so name them here.
 use crate::api::coding_tool_contract;
+use crate::approvals_audit::{ApprovalsAuditConfig, ApprovalsAuditLog};
 use crate::user_store::UserRole;
 use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
