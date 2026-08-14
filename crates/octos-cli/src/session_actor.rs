@@ -129,6 +129,23 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
 
+/// #2003 — how often a running turn re-stamps its in-flight marker, gated on
+/// the turn actually producing tokens. Comfortably under
+/// `IN_FLIGHT_STALE_AFTER_MS` (30 min) so a producing turn is never a single
+/// missed beat away from being judged abandoned, while being far too coarse to
+/// matter for contention.
+const IN_FLIGHT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Abort a spawned task when this guard drops, so a helper task cannot outlive
+/// the turn that owns it on ANY exit path (return, error, cancellation).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Bound actor inbox send/ack waits for background terminal delivery.
 const BACKGROUND_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -9348,6 +9365,46 @@ impl SessionActor {
         // (a `None` stamp would leak failovers to every concurrent
         // session on a shared profile-scoped router), so we MUST set it
         // here.
+        // #2003 — keep this session's in-flight marker fresh WHILE the turn is
+        // genuinely producing, so a legitimately long turn is never mistaken
+        // for an abandoned one and un-protected mid-flight.
+        //
+        // The refresh is gated on OBSERVABLE PROGRESS (the shared TokenTracker
+        // advancing), not on the turn merely existing. A plain timer would keep
+        // re-stamping in exactly the case the staleness horizon is for — a turn
+        // wedged forever awaiting something that never resolves — and would
+        // silently revert #2004. A turn that has stopped producing tokens stops
+        // being refreshed and ages out normally.
+        //
+        // `touch_goal_dispatch_in_flight` is a no-op when this session has no
+        // marker (an ordinary interactive turn), so this costs nothing there.
+        // Refresh gated on the turn's own LLM work PRODUCING. The other proof
+        // of life — this session having non-terminal background-task agents,
+        // i.e. a turn blocked awaiting sub-agents, which emits no tokens at all
+        // — is evaluated inside `is_goal_dispatch_in_flight` itself, next to
+        // the marker, because the orchestrator already receives that state via
+        // `upsert_background_task_agent` and needs no plumbing to see it.
+        let in_flight_heartbeat = {
+            let tracker = Arc::clone(&token_tracker);
+            let session_key = self.session_key.clone();
+            tokio::spawn(async move {
+                use std::sync::atomic::Ordering as AtomicOrdering;
+                let mut last = 0_u64;
+                loop {
+                    tokio::time::sleep(IN_FLIGHT_HEARTBEAT_INTERVAL).await;
+                    let seen = u64::from(tracker.input_tokens.load(AtomicOrdering::Relaxed))
+                        + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
+                    if seen > last {
+                        last = seen;
+                        default_agent_orchestrator().touch_goal_dispatch_in_flight(&session_key);
+                    }
+                }
+            })
+        };
+        // Abort on EVERY exit path from the turn below (including error and
+        // cancellation) — the guard drops with the enclosing scope.
+        let _in_flight_heartbeat = AbortOnDrop(in_flight_heartbeat);
+
         let llm_start = Instant::now();
         let result = octos_llm::with_router_context(
             octos_llm::RouterContext {
