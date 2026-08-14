@@ -503,8 +503,16 @@ mod tests {
         if result.output.contains("timed out") {
             eprintln!("skipping formatter assertions: rustfmt exceeded FORMAT_TIMEOUT");
             let on_disk = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
+            // Accept EITHER spelling. A timeout means the tool stopped WAITING
+            // for rustfmt, not that rustfmt stopped running: the process can
+            // still finish and write the formatted file before this read. So
+            // `timed out` does NOT imply the on-disk text is unformatted, and
+            // asserting the unformatted spelling made this test fail whenever
+            // it lost that race (`check-windows` on ce1818258 read
+            // `let x = 2;` here and panicked). What this branch actually needs
+            // to prove is that the EDIT SURVIVED formatting either way.
             assert!(
-                on_disk.contains("let x=2"),
+                on_disk.contains("let x=2") || on_disk.contains("let x = 2"),
                 "the edit must survive even when formatting times out: {on_disk}"
             );
             return;
