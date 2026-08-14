@@ -2404,7 +2404,7 @@ impl InProcessAgentOrchestrator {
         // with the other subsystem's turn, AND its returned guard's drop would
         // clear that turn's marker (codex re-review). Checking first, under
         // the same lock, makes the whole claim generation-safe.
-        if state.in_flight_goal_sessions.contains(session_id) {
+        if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
             return (Vec::new(), None);
         }
         let kept = Self::drain_ready_continuations_locked(
@@ -2417,7 +2417,9 @@ impl InProcessAgentOrchestrator {
         let guard = if kept.is_empty() {
             None
         } else {
-            state.in_flight_goal_sessions.insert(session_id.clone());
+            state
+                .in_flight_goal_sessions
+                .insert(session_id.clone(), now_ms_u64());
             Some(GoalDispatchInFlightGuard {
                 orchestrator: self,
                 session_id: session_id.clone(),
@@ -2618,7 +2620,7 @@ impl InProcessAgentOrchestrator {
                 // cleared by `clear_goal_dispatch_in_flight` from the
                 // post-accountant, so a session leaves the set
                 // exactly when it's safe to re-dispatch.
-                if state.in_flight_goal_sessions.contains(session_id) {
+                if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
                     continue;
                 }
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
@@ -2778,9 +2780,24 @@ impl InProcessAgentOrchestrator {
     /// be re-dispatched in the await gap between turn-terminal
     /// emission and `record_goal_turn`. Idempotent.
     pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+        // #2003 — (re)stamp the marker. A live long-running turn that re-marks
+        // keeps a FRESH timestamp, so the staleness sweep never evicts it.
         self.state()
             .in_flight_goal_sessions
-            .insert(session_id.clone());
+            .insert(session_id.clone(), now_ms_u64());
+    }
+
+    /// #2003 — test hook: age an existing marker so the staleness path can be
+    /// exercised without sleeping.
+    #[cfg(test)]
+    pub(crate) fn force_in_flight_marked_at_for_test(
+        &self,
+        session_id: &SessionKey,
+        marked_at_ms: u64,
+    ) {
+        if let Some(slot) = self.state().in_flight_goal_sessions.get_mut(session_id) {
+            *slot = marked_at_ms;
+        }
     }
 
     /// #1140 codex P2 re-review #3 — clear the in-flight marker.
@@ -2798,7 +2815,7 @@ impl InProcessAgentOrchestrator {
     /// the session actor, closing the cross-subsystem drain race where both
     /// spawn a concurrent turn on the same session (#1529).
     pub(crate) fn is_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> bool {
-        self.state().in_flight_goal_sessions.contains(session_id)
+        in_flight_marker_is_live(&self.state().in_flight_goal_sessions, session_id)
     }
 
     /// #1140 codex P1 re-review #4 — RAII drop-guard for the
@@ -2846,10 +2863,12 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
     ) -> Option<GoalDispatchInFlightGuard> {
         let mut state = self.state();
-        if state.in_flight_goal_sessions.contains(session_id) {
+        if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
             return None;
         }
-        state.in_flight_goal_sessions.insert(session_id.clone());
+        state
+            .in_flight_goal_sessions
+            .insert(session_id.clone(), now_ms_u64());
         Some(GoalDispatchInFlightGuard {
             orchestrator: self,
             session_id: session_id.clone(),
@@ -8155,6 +8174,34 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 }
 
+/// #2003 — how long an in-flight marker may stand before it is treated as
+/// ABANDONED. The marker is released by [`GoalDispatchInFlightGuard::drop`], so
+/// any path that stamps it and never drops the guard would otherwise wedge that
+/// session forever: the in-flight check returns BEFORE draining anything, so a
+/// single stale entry stalls every continuation kind at once (`goal_continue`,
+/// `goal_wrap_up`, `child_completed`, `scatter_join_complete` were all observed
+/// stuck together in the field).
+///
+/// 30 minutes is deliberately far above any real turn: goal turns of 10+
+/// minutes are normal with a large peer fleet, and a LIVE turn re-stamps its
+/// marker via `mark_goal_dispatch_in_flight`, so this can only evict a marker
+/// nothing is maintaining. Self-healing, in the same spirit as #1920's
+/// heartbeat reaper for orphaned background tasks.
+pub(crate) const IN_FLIGHT_STALE_AFTER_MS: u64 = 30 * 60 * 1_000;
+
+/// True when `session_id` has an in-flight marker that is still LIVE (present
+/// and stamped within [`IN_FLIGHT_STALE_AFTER_MS`]). A stale entry reads as not
+/// in flight so the session can be dispatched again; the entry itself is
+/// harmless and is overwritten by the next mark or removed by the next clear.
+fn in_flight_marker_is_live(
+    markers: &std::collections::HashMap<SessionKey, u64>,
+    session_id: &SessionKey,
+) -> bool {
+    markers.get(session_id).is_some_and(|marked_at_ms| {
+        now_ms_u64().saturating_sub(*marked_at_ms) < IN_FLIGHT_STALE_AFTER_MS
+    })
+}
+
 /// #1140 codex P1 re-review #4 — RAII drop-guard returned by
 /// `InProcessAgentOrchestrator::goal_dispatch_in_flight_guard`. On
 /// `Drop` it clears the in-flight marker for the captured session
@@ -8809,7 +8856,13 @@ struct AutonomyRuntimeState {
     /// `clear_goal_dispatch_in_flight`. Independent of (and
     /// complementary to) the `last_continued_at_ms` timestamp, which
     /// remains the authoritative min-delay gate for all other callers.
-    in_flight_goal_sessions: std::collections::HashSet<SessionKey>,
+    /// #2003 — value is the epoch-ms the marker was stamped. A marker older
+    /// than [`IN_FLIGHT_STALE_AFTER_MS`] is treated as ABANDONED and no longer
+    /// excludes the session, so a leaked [`GoalDispatchInFlightGuard`] can no
+    /// longer wedge a session permanently (field report: five continuations of
+    /// four different reason kinds stuck `queued` for 35 minutes, including the
+    /// `goal_wrap_up` that would have explained the stall to the user).
+    in_flight_goal_sessions: std::collections::HashMap<SessionKey, u64>,
     /// #1977 codex round 2 — test-only switch that makes the next monitor wake
     /// persist be treated as FAILED, simulating a crash exactly at the durable
     /// wake write. Per-instance (fresh `InProcessAgentOrchestrator::default()`
@@ -9813,7 +9866,7 @@ fn enqueue_due_goal_continuations(
     // otherwise queue a stale `GoalContinue` despite the in-flight
     // turn. The two guards together ensure the in-flight marker is
     // the authoritative gate on every enqueue path.
-    if state.in_flight_goal_sessions.contains(session_id) {
+    if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
         return 0;
     }
     let Some(goal) = state.goals.get(session_id).cloned() else {
@@ -24493,6 +24546,88 @@ mod tests {
         assert!(
             due_after.iter().any(|(s, _)| s == &session_id),
             "after clearing in-flight, goal must be due again (got {due_after:?})",
+        );
+    }
+
+    /// #2003 — a STALE in-flight marker must not stall a session forever.
+    ///
+    /// Field report: a 5-peer goal fleet finished all its work and the master
+    /// went silent. Five continuations sat `queued` with `started_at_ms: null`
+    /// for 35 minutes — `goal_continue` x2, `goal_wrap_up`, `child_completed`,
+    /// `scatter_join_complete`. Every reason kind stalled together, which is
+    /// the signature of the per-session in-flight gate (it returns BEFORE
+    /// draining anything), not of any per-target filter.
+    ///
+    /// The marker is released by `GoalDispatchInFlightGuard::drop`, so any path
+    /// that sets it and never drops the guard wedges that session permanently.
+    /// The cruelest part of the field case: the `goal_wrap_up` continuation
+    /// that would have TOLD the user the budget was exhausted, and how to
+    /// resume, was itself stuck behind the same marker.
+    ///
+    /// Rather than chase one leak site, the marker self-heals: an entry older
+    /// than `IN_FLIGHT_STALE_AFTER_MS` is treated as abandoned. A real turn
+    /// re-stamps its marker, so a live long-running turn is never evicted.
+    #[test]
+    fn stale_in_flight_marker_stops_wedging_the_session() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-stale-inflight");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "fleet that outlived its marker".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial continuation so the session is "between turns"
+        // (mirrors `in_flight_goal_session_is_excluded_from_due_loop_targets`).
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // Age the timestamp so the min-delay gate PERMITS re-dispatch; the
+        // in-flight marker must then be the only thing deciding.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+
+        // A FRESH marker still excludes the session — the existing race guard
+        // for long-running turns must keep working.
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        assert!(
+            !orchestrator
+                .due_loop_targets(Some("tenant-a"), 8)
+                .iter()
+                .any(|(s, _)| s == &session_id),
+            "a FRESH in-flight marker must still exclude the session",
+        );
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a fresh marker reads as in-flight",
+        );
+
+        // Now age it past the staleness horizon, exactly as an abandoned
+        // marker would (the guard leaked; nothing will ever clear it).
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a marker older than the staleness horizon must not read as in-flight",
+        );
+        assert!(
+            orchestrator
+                .due_loop_targets(Some("tenant-a"), 8)
+                .iter()
+                .any(|(s, _)| s == &session_id),
+            "a session wedged by a STALE marker must become due again — otherwise \
+             a leaked guard silently stalls every continuation kind forever (#2003)",
         );
     }
 
