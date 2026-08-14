@@ -2546,3 +2546,90 @@ pub(crate) fn build_peer_list_callback(
         ))
     })
 }
+
+#[cfg(test)]
+mod peer_task_registry_tests {
+    use super::*;
+
+    /// #1868 Phase 1 — retirement is EXACTLY ONCE.
+    ///
+    /// `emit_closed` can fire more than once for the same peer (a close racing
+    /// a replayed/durable notification). The binding must be consumed by the
+    /// first retirement so a second close cannot mark a task terminal again —
+    /// task ids are recycled, so a late second `mark_completed` could land on
+    /// an unrelated task rather than being a harmless no-op.
+    #[test]
+    fn taking_a_peer_task_binding_is_exactly_once() {
+        let reg = PeerTaskRegistry::default();
+        let key = peer_wire_key("tenant-a", "peer-one");
+        reg.bind(key.clone(), "task-1".to_owned());
+
+        assert_eq!(
+            reg.take(&key).as_deref(),
+            Some("task-1"),
+            "first close retires the task"
+        );
+        assert_eq!(
+            reg.take(&key),
+            None,
+            "second close must find nothing to retire"
+        );
+    }
+
+    /// A re-stage under the same slug rebinds to the NEW task, mirroring
+    /// `PeerWireRegistry::register`'s latest-open-wins. Otherwise the close
+    /// path would retire the dead task and leak the live one, leaving a
+    /// permanently-running row on the master's session.
+    #[test]
+    fn restaging_a_slug_rebinds_to_the_newer_task() {
+        let reg = PeerTaskRegistry::default();
+        let key = peer_wire_key("tenant-a", "peer-one");
+        reg.bind(key.clone(), "task-old".to_owned());
+        reg.bind(key.clone(), "task-new".to_owned());
+
+        assert_eq!(reg.take(&key).as_deref(), Some("task-new"));
+    }
+
+    /// Peers are keyed per PROFILE: the same slug under two profiles is two
+    /// distinct peers, and retiring one must not retire the other.
+    #[test]
+    fn the_same_slug_under_two_profiles_is_two_bindings() {
+        let reg = PeerTaskRegistry::default();
+        let a = peer_wire_key("tenant-a", "reviewer");
+        let b = peer_wire_key("tenant-b", "reviewer");
+        reg.bind(a.clone(), "task-a".to_owned());
+        reg.bind(b.clone(), "task-b".to_owned());
+
+        assert_eq!(reg.take(&a).as_deref(), Some("task-a"));
+        assert_eq!(
+            reg.take(&b).as_deref(),
+            Some("task-b"),
+            "other profile untouched"
+        );
+    }
+
+    /// At capacity a NEW key is dropped rather than evicting a live peer's
+    /// binding — an unsupervised peer is recoverable, silently retiring some
+    /// other peer's task is not. Existing keys still rebind past the cap.
+    #[test]
+    fn a_full_registry_drops_new_keys_but_still_rebinds_existing_ones() {
+        let reg = PeerTaskRegistry::default();
+        for i in 0..PEER_WIRE_REGISTRY_MAX {
+            reg.bind(
+                peer_wire_key("t", &format!("peer-{i}")),
+                format!("task-{i}"),
+            );
+        }
+        let overflow = peer_wire_key("t", "one-too-many");
+        reg.bind(overflow.clone(), "task-overflow".to_owned());
+        assert_eq!(reg.take(&overflow), None, "new key past the cap is dropped");
+
+        let existing = peer_wire_key("t", "peer-0");
+        reg.bind(existing.clone(), "task-rebound".to_owned());
+        assert_eq!(
+            reg.take(&existing).as_deref(),
+            Some("task-rebound"),
+            "an EXISTING key still rebinds at capacity"
+        );
+    }
+}

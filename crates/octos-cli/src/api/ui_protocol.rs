@@ -29377,8 +29377,41 @@ async fn run_standalone_turn(
         if peer_handoff_allowed_for_session(&session_id) {
             let peer_ws = ws.clone();
             let peer_ledger = ledger.clone();
+            // #1868 Phase 1 — enroll the peer as SUPERVISED work. Peers were
+            // never registered with the `TaskSupervisor` (`goal_tool.rs` had
+            // zero supervisor references), so the master's task count never
+            // showed a peer, peers had no cancel token, and the in-flight
+            // liveness rule (#2014) had to read `state.agents` directly rather
+            // than ask the supervisor.
+            //
+            // The task is registered against the MASTER's session, not the
+            // peer's: it represents "this master has a peer working for it",
+            // which is exactly the question liveness asks. Retired in the
+            // `emit_closed` hook below — NOT on turn terminal, because a peer
+            // runs many turns and would otherwise retire after its first.
+            let peer_supervisor = tool_registry.supervisor();
+            let peer_task_profile = session_runtime.profile.profile_id.clone();
             let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
                 Arc::new(move |event: PeerStagedEvent| {
+                    let registry_key = peer_wire_key(&peer_task_profile, &event.slug);
+                    // `register` returns an EMPTY-STRING sentinel when the
+                    // per-session task cap rejects it. Binding that would make
+                    // the close path try to retire a task that never existed.
+                    let task_id = peer_supervisor.register(
+                        "peer_handoff",
+                        &registry_key,
+                        Some(&event.session_id.0),
+                    );
+                    if task_id.is_empty() {
+                        tracing::warn!(
+                            slug = %event.slug,
+                            master = %event.session_id,
+                            "peer task registration rejected by the supervisor cap; \
+                             peer runs UNSUPERVISED (no task row, no cancel token)"
+                        );
+                    } else {
+                        peer_task_registry().bind(registry_key, task_id);
+                    }
                     let _ = send_notification_durable(
                         &peer_ws,
                         &peer_ledger,
@@ -29563,8 +29596,19 @@ async fn run_standalone_turn(
             let close_ledger = ledger.clone();
             // Durable `peer/closed` — mirrors the `peer/staged` emit so a
             // briefly-disconnected client still tears down the peer on replay.
+            let close_supervisor = tool_registry.supervisor();
             let emit_closed: Arc<dyn Fn(PeerClosedEvent) + Send + Sync> =
                 Arc::new(move |event: PeerClosedEvent| {
+                    // #1868 Phase 1 — retire the supervised task bound at
+                    // staging. `take` removes the binding, so a second close is
+                    // a no-op rather than re-marking a terminal task (or, worse,
+                    // a task id later reused). A peer with no binding either
+                    // predates this wiring or was rejected by the task cap.
+                    if let Some(task_id) =
+                        peer_task_registry().take(&peer_wire_key(&event.profile_id, &event.slug))
+                    {
+                        close_supervisor.mark_completed(&task_id, Vec::new());
+                    }
                     let _ = send_notification_durable(
                         &close_ws,
                         &close_ledger,
