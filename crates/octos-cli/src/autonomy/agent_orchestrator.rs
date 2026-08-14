@@ -8333,16 +8333,31 @@ fn in_flight_marker_is_live(
 /// already reaches the orchestrator through `upsert_background_task_agent` —
 /// so we ASK that state rather than infer liveness, and no plumbing is needed.
 ///
-/// Deliberately NOT covered: peers. They are sovereign sessions that are not
-/// registered as supervised tasks, and a master's own turn ENDS after staging
-/// them (holding no marker to protect). Bringing peers under the supervisor is
-/// tracked separately (#1868).
+/// Deliberately EXCLUDED: peers.
+///
+/// #1868 enrolled peers as supervised tasks on their MASTER's session, which
+/// silently invalidated the earlier version of this rule. A peer is not proof
+/// that the master's TURN is alive — it is a sovereign session doing its own
+/// work, and it stays non-terminal from staging until `peer_close`, often for
+/// hours. Counting it here would make a master that wedges WITH PEERS OPEN hold
+/// a marker that can never go stale, disarming #2004's rescue in precisely the
+/// case it exists for (the reported failure was a wedged master with five peers
+/// running). The marker protects the master's own in-flight work; peer liveness
+/// is answered by the fleet gate, not by this predicate.
 fn session_has_live_supervised_work(state: &AutonomyRuntimeState, session_id: &SessionKey) -> bool {
-    state
-        .agents
-        .values()
-        .any(|agent| agent.session_id == *session_id && !is_agent_terminal_status(&agent.status))
+    state.agents.values().any(|agent| {
+        agent.session_id == *session_id
+            && !is_agent_terminal_status(&agent.status)
+            && agent.backend_kind != PEER_HANDOFF_BACKEND_KIND
+    })
 }
+
+/// `backend_kind` stamped on a supervised PEER task, as built by
+/// [`background_task_backend_kind`] from the `peer_handoff` tool name. Peers
+/// are enrolled for observability and cancellation (#1868) but must not count
+/// as liveness for their master's in-flight marker — see
+/// [`session_has_live_supervised_work`].
+pub(crate) const PEER_HANDOFF_BACKEND_KIND: &str = "task_supervisor:peer_handoff";
 
 /// The full in-flight predicate: a marker counts as held while it is either
 /// FRESH or backed by live supervised work. Only a marker that is both stale
@@ -24845,6 +24860,69 @@ mod tests {
     /// session that is genuinely working. `TaskSupervisor` is the lifecycle
     /// authority for that work and its state reaches the orchestrator via
     /// `upsert_background_task_agent`, so we ask it instead of guessing.
+    /// #1868 — an open PEER must NOT keep a wedged master's marker alive.
+    ///
+    /// Peers are enrolled as supervised tasks on their MASTER's session, and
+    /// they stay non-terminal from staging until `peer_close` — often hours.
+    /// If they counted as liveness, a master that wedges with peers open would
+    /// hold a marker that can never age out, disarming #2004's rescue in
+    /// exactly the reported failure (a wedged master with five peers running).
+    #[test]
+    fn an_open_peer_does_not_keep_a_wedged_masters_marker_alive() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-peer-wedge");
+
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+
+        // A staged peer, registered against the MASTER's session by #1868 and
+        // mirrored here through `upsert_background_task_agent`.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "peer-reviewer".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/peer-reviewer".into(),
+            role: "peer".into(),
+            nickname: "reviewer".into(),
+            backend_kind: PEER_HANDOFF_BACKEND_KIND.into(),
+            status: "running".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "an open peer is NOT proof the master's own turn is alive; the aged \
+             marker must still be rescued or a wedged master with peers open can \
+             never be recovered",
+        );
+
+        // A genuine sub-agent on the same session still protects it.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-running".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-running".into(),
+            role: "worker".into(),
+            nickname: "Ada".into(),
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a real sub-agent must still hold the marker",
+        );
+    }
+
     #[test]
     fn stale_marker_is_still_held_while_supervised_children_run() {
         let orchestrator = InProcessAgentOrchestrator::default();
