@@ -139,6 +139,61 @@ pub(crate) fn peer_wire_registry() -> &'static PeerWireRegistry {
     PEER_WIRE_REGISTRY.get_or_init(PeerWireRegistry::default)
 }
 
+/// #1868 Phase 1 — maps a staged peer to the `TaskSupervisor` task enrolled on
+/// its MASTER's session, so the peer's retirement can mark that task terminal.
+///
+/// Peers were never registered with the supervisor at all (`goal_tool.rs` had
+/// zero supervisor references), which is why the master's task count never
+/// showed a peer, why peers had no cancel token, and why the in-flight liveness
+/// rule added in #2014 had to read `state.agents` directly instead of asking
+/// the supervisor. Enrolling them puts all three kinds of supervised work —
+/// sub-agents, background tasks, peers — behind one source of truth.
+///
+/// Keyed by the same `"{profile}:peer:{slug}"` string as [`peer_wire_registry`]
+/// so both registries are addressed identically; the VALUE is the supervisor's
+/// task id. Process-global for the same reason the wire registry is: a peer is
+/// staged on one path and retired on another.
+#[derive(Default)]
+pub(crate) struct PeerTaskRegistry {
+    pub(crate) by_key: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl PeerTaskRegistry {
+    /// Bind `key` to a supervisor task id. A re-stage under the same key
+    /// overwrites, mirroring [`PeerWireRegistry::register`]'s latest-open-wins.
+    pub(crate) fn bind(&self, key: String, task_id: String) {
+        let mut map = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.len() >= PEER_WIRE_REGISTRY_MAX && !map.contains_key(&key) {
+            tracing::warn!(
+                key = %key,
+                cap = PEER_WIRE_REGISTRY_MAX,
+                "peer task registry at capacity; peer will not be supervised"
+            );
+            return;
+        }
+        map.insert(key, task_id);
+    }
+
+    /// Take the task id for `key`, removing the binding. Retirement is
+    /// exactly-once: a second close finds nothing and must NOT re-mark a task
+    /// terminal (the supervisor's terminal guard would reject it anyway, but a
+    /// second `mark_completed` would also race a task id later reused).
+    pub(crate) fn take(&self, key: &str) -> Option<String> {
+        self.by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(key)
+    }
+}
+
+pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
+    static PEER_TASK_REGISTRY: OnceLock<PeerTaskRegistry> = OnceLock::new();
+    PEER_TASK_REGISTRY.get_or_init(PeerTaskRegistry::default)
+}
+
 /// Registry key for a peer session: `"{profile}:peer:{slug}"` (mirrors the
 /// gateway inbox registry's key construction in `session_actor`).
 pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
