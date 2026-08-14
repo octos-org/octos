@@ -37,7 +37,9 @@ impl CronService {
     /// Create a new cron service, loading persisted jobs from disk.
     pub fn new(store_path: impl AsRef<Path>, inbound_tx: mpsc::Sender<InboundMessage>) -> Self {
         let store_path = store_path.as_ref().to_path_buf();
-        let store = load_store(&store_path).unwrap_or_default();
+        // #2005 — never silently start empty on a corrupt store; see
+        // `load_store_or_quarantine`.
+        let store = load_store_or_quarantine(&store_path);
 
         Self {
             store_path,
@@ -644,20 +646,127 @@ pub fn write_cron_json_atomic(store_path: &Path, json: &str) -> Result<()> {
         std::process::id(),
         CRON_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    if let Err(error) = std::fs::write(&tmp_path, json) {
+    // #2005 — fsync the temp file BEFORE the rename, and the directory AFTER.
+    // The rename was already atomic, but not DURABLE: a hard power loss could
+    // leave a zero-length / truncated `cron.json`, which is exactly the input
+    // that used to make the service start with no jobs and then overwrite the
+    // real ones. Mirrors the pattern already used by
+    // `octos-cli::autonomy::supervisor_store` and `octos-memory::memory_store`.
+    if let Err(error) = write_and_sync(&tmp_path, json) {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(eyre::Report::new(error).wrap_err("failed to write cron store temp"));
+        return Err(error.wrap_err("failed to write cron store temp"));
     }
     if let Err(error) = std::fs::rename(&tmp_path, store_path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(eyre::Report::new(error).wrap_err("failed to rename cron store"));
     }
+    if let Some(dir) = store_path.parent() {
+        fsync_dir(dir);
+    }
     Ok(())
+}
+
+/// Write `json` to `path` and fsync the FILE before it is renamed into place.
+fn write_and_sync(path: &Path, json: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(json.as_bytes())?;
+    // `flush()` on a std File is a no-op (no userspace buffer) — `sync_all` is
+    // what actually gets the bytes to stable storage.
+    file.sync_all()?;
+    Ok(())
+}
+
+/// fsync a directory so a rename into it is durable. Best-effort: on non-Unix
+/// std cannot open a directory for syncing, so the rename there is only as
+/// durable as the filesystem makes it (it stays atomic either way).
+fn fsync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
 }
 
 fn load_store(path: &Path) -> Option<CronStore> {
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
+}
+
+/// #2005 — load the cron store, QUARANTINING a corrupt file instead of
+/// silently starting with zero jobs.
+///
+/// The old path was `load_store(..).unwrap_or_default()`, which collapsed
+/// "file absent" (legitimate first run) and "file present but unreadable /
+/// unparseable" into the same empty store — with no error and no log line.
+/// That is silent total loss, because the store is not read-only: the next
+/// `add_job` / `enable_job` persists the empty-plus-one store OVER the real
+/// `cron.json`, destroying every other job permanently.
+///
+/// Absent stays silent (first run is normal). Corrupt is loud AND preserved:
+/// the bytes are renamed aside so a later persist cannot overwrite them, and
+/// the operator can recover the jobs by hand. We still return an empty store
+/// so the service starts — cron being down is bad, but it is recoverable;
+/// losing the definitions is not.
+fn load_store_or_quarantine(path: &Path) -> CronStore {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // First run: no file yet. Legitimate, stay quiet.
+            return CronStore::default();
+        }
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                "cron store is unreadable; quarantining it and starting with NO jobs. \
+                 Existing schedules will not fire until this is resolved.",
+            );
+            quarantine_cron_store(path);
+            return CronStore::default();
+        }
+    };
+    match serde_json::from_str(&data) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                bytes = data.len(),
+                "cron store is corrupt; quarantining it and starting with NO jobs. \
+                 Existing schedules will not fire until this is resolved.",
+            );
+            quarantine_cron_store(path);
+            CronStore::default()
+        }
+    }
+}
+
+/// Move a corrupt cron store aside so the next persist cannot overwrite it.
+/// Best-effort: if the rename fails we have still logged the corruption, and
+/// leaving the file in place is no worse than the pre-#2005 behaviour.
+fn quarantine_cron_store(path: &Path) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let quarantined = path.with_extension(format!("corrupt-{stamp}"));
+    match std::fs::rename(path, &quarantined) {
+        Ok(()) => tracing::error!(
+            quarantined = %quarantined.display(),
+            "corrupt cron store preserved here — recover job definitions from it",
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            %error,
+            "could not quarantine the corrupt cron store",
+        ),
+    }
 }
 
 /// Generate a short 8-char hex ID.
@@ -1362,5 +1471,70 @@ mod tests {
         let path = dir.path().join("bad.json");
         std::fs::write(&path, "not json").unwrap();
         assert!(load_store(&path).is_none());
+    }
+
+    /// #2005 — a corrupt `cron.json` must NEVER be silently swallowed into an
+    /// empty store that the next mutation then overwrites.
+    ///
+    /// Old behaviour: `load_store(..).unwrap_or_default()` turned a truncated
+    /// file into an empty store with no error and no log line; the next
+    /// `add_job` persisted over `cron.json` and every other job was gone for
+    /// good. The load-side property that prevents that is: the original bytes
+    /// must still exist on disk afterwards.
+    #[test]
+    fn corrupt_cron_store_is_quarantined_not_silently_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        // A truncated store — exactly what an unfsynced write + power loss
+        // leaves behind.
+        let corrupt = r#"{"jobs":[{"id":"job-1","name":"nightly buil"#;
+        std::fs::write(&path, corrupt).unwrap();
+
+        let store = load_store_or_quarantine(&path);
+        assert!(
+            store.jobs.is_empty(),
+            "the service still starts (cron down is recoverable; losing the definitions is not)",
+        );
+
+        // THE load-bearing assertion: the operator can still get the jobs back.
+        let preserved: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("corrupt-"))
+            })
+            .collect();
+        assert_eq!(
+            preserved.len(),
+            1,
+            "the corrupt store must be quarantined aside, not discarded (got {preserved:?})",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&preserved[0]).unwrap(),
+            corrupt,
+            "the quarantined copy must be byte-identical so jobs can be recovered",
+        );
+        assert!(
+            !path.exists(),
+            "the corrupt file is moved aside, so a later persist cannot overwrite it in place",
+        );
+    }
+
+    /// A MISSING store is the normal first run — it must stay silent and must
+    /// NOT create a quarantine file.
+    #[test]
+    fn missing_cron_store_is_not_treated_as_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let store = load_store_or_quarantine(&path);
+        assert!(store.jobs.is_empty());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "first run must not leave a quarantine artifact behind",
+        );
     }
 }
