@@ -2404,7 +2404,7 @@ impl InProcessAgentOrchestrator {
         // with the other subsystem's turn, AND its returned guard's drop would
         // clear that turn's marker (codex re-review). Checking first, under
         // the same lock, makes the whole claim generation-safe.
-        if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
+        if in_flight_marker_is_held(&state, session_id) {
             return (Vec::new(), None);
         }
         let kept = Self::drain_ready_continuations_locked(
@@ -2417,12 +2417,18 @@ impl InProcessAgentOrchestrator {
         let guard = if kept.is_empty() {
             None
         } else {
-            state
-                .in_flight_goal_sessions
-                .insert(session_id.clone(), now_ms_u64());
+            let generation = next_in_flight_generation();
+            state.in_flight_goal_sessions.insert(
+                session_id.clone(),
+                InFlightMarker {
+                    generation,
+                    marked_at_ms: now_ms_u64(),
+                },
+            );
             Some(GoalDispatchInFlightGuard {
                 orchestrator: self,
                 session_id: session_id.clone(),
+                generation,
                 disarmed: false,
             })
         };
@@ -2620,7 +2626,7 @@ impl InProcessAgentOrchestrator {
                 // cleared by `clear_goal_dispatch_in_flight` from the
                 // post-accountant, so a session leaves the set
                 // exactly when it's safe to re-dispatch.
-                if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
+                if in_flight_marker_is_held(&state, session_id) {
                     continue;
                 }
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
@@ -2779,12 +2785,43 @@ impl InProcessAgentOrchestrator {
     /// in-flight sessions so a long-running goal turn (> 30s) can't
     /// be re-dispatched in the await gap between turn-terminal
     /// emission and `record_goal_turn`. Idempotent.
-    pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+    pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> u64 {
         // #2003 — (re)stamp the marker. A live long-running turn that re-marks
         // keeps a FRESH timestamp, so the staleness sweep never evicts it.
-        self.state()
-            .in_flight_goal_sessions
-            .insert(session_id.clone(), now_ms_u64());
+        let generation = next_in_flight_generation();
+        self.state().in_flight_goal_sessions.insert(
+            session_id.clone(),
+            InFlightMarker {
+                generation,
+                marked_at_ms: now_ms_u64(),
+            },
+        );
+        generation
+    }
+
+    /// #2003 — refresh an EXISTING in-flight marker to prove the turn holding
+    /// it is still making progress.
+    ///
+    /// The staleness horizon ([`IN_FLIGHT_STALE_AFTER_MS`]) exists so a leaked
+    /// [`GoalDispatchInFlightGuard`] cannot wedge a session forever. But a
+    /// legitimately long turn (a big peer fleet's synthesis turn ran ~13
+    /// minutes; a larger fleet can exceed the horizon) would otherwise have its
+    /// marker age out MID-FLIGHT and stop protecting the session.
+    ///
+    /// Liveness here deliberately means OBSERVABLE PROGRESS, not "the guard
+    /// object still exists". A naive periodic heartbeat tied to the guard's
+    /// existence would keep re-stamping in exactly the case the horizon is for
+    /// — a turn wedged forever awaiting something that never resolves, whose
+    /// future (and therefore guard) is still alive — and would silently revert
+    /// the fix. Driving the refresh from real turn output means a producing
+    /// turn stays protected while a stuck one still ages out and is rescued.
+    ///
+    /// No-op when the session has no marker: this must never CREATE one, or a
+    /// stray progress event could mark an idle session busy.
+    pub(crate) fn touch_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+        if let Some(marker) = self.state().in_flight_goal_sessions.get_mut(session_id) {
+            marker.marked_at_ms = now_ms_u64();
+        }
     }
 
     /// #2003 — test hook: age an existing marker so the staleness path can be
@@ -2795,17 +2832,45 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
         marked_at_ms: u64,
     ) {
-        if let Some(slot) = self.state().in_flight_goal_sessions.get_mut(session_id) {
-            *slot = marked_at_ms;
+        if let Some(marker) = self.state().in_flight_goal_sessions.get_mut(session_id) {
+            marker.marked_at_ms = marked_at_ms;
         }
     }
 
-    /// #1140 codex P2 re-review #3 — clear the in-flight marker.
-    /// Called by the post-turn accountant after `record_goal_turn`
-    /// (and on error/interrupt paths) so subsequent scheduler ticks
-    /// can re-dispatch the goal once the min-delay elapses.
+    /// Unconditional clear — TEST ONLY, to arrange a "no marker" state.
+    ///
+    /// #2003: production code must never take this path. A turn that unwinds
+    /// after being evicted for staleness would wipe whatever marker is present,
+    /// including a NEWER turn's, re-opening the #1529 double-dispatch this
+    /// marker exists to prevent. Production clears go through
+    /// [`Self::clear_goal_dispatch_in_flight_generation`], which only removes a
+    /// marker the caller still owns.
+    #[cfg(test)]
     pub(crate) fn clear_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
         self.state().in_flight_goal_sessions.remove(session_id);
+    }
+
+    /// #2003 — clear the marker ONLY if it is still the incarnation `generation`
+    /// claimed. This is what makes staleness eviction safe: an evicted turn that
+    /// unwinds late must not wipe the marker a NEWER turn now holds, or the
+    /// rescue silently hands the session to two concurrent turns (#1529).
+    ///
+    /// Returns whether it cleared, so callers/tests can assert the identity
+    /// check actually fired.
+    pub(crate) fn clear_goal_dispatch_in_flight_generation(
+        &self,
+        session_id: &SessionKey,
+        generation: u64,
+    ) -> bool {
+        let mut state = self.state();
+        let owned = state
+            .in_flight_goal_sessions
+            .get(session_id)
+            .is_some_and(|marker| marker.generation == generation);
+        if owned {
+            state.in_flight_goal_sessions.remove(session_id);
+        }
+        owned
     }
 
     /// True when a continuation turn for `session_id` is currently in flight
@@ -2815,7 +2880,7 @@ impl InProcessAgentOrchestrator {
     /// the session actor, closing the cross-subsystem drain race where both
     /// spawn a concurrent turn on the same session (#1529).
     pub(crate) fn is_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> bool {
-        in_flight_marker_is_live(&self.state().in_flight_goal_sessions, session_id)
+        in_flight_marker_is_held(&self.state(), session_id)
     }
 
     /// #1140 codex P1 re-review #4 — RAII drop-guard for the
@@ -2829,10 +2894,11 @@ impl InProcessAgentOrchestrator {
         &'static self,
         session_id: SessionKey,
     ) -> GoalDispatchInFlightGuard {
-        self.mark_goal_dispatch_in_flight(&session_id);
+        let generation = self.mark_goal_dispatch_in_flight(&session_id);
         GoalDispatchInFlightGuard {
             orchestrator: self,
             session_id,
+            generation,
             disarmed: false,
         }
     }
@@ -2863,15 +2929,21 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
     ) -> Option<GoalDispatchInFlightGuard> {
         let mut state = self.state();
-        if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
+        if in_flight_marker_is_held(&state, session_id) {
             return None;
         }
-        state
-            .in_flight_goal_sessions
-            .insert(session_id.clone(), now_ms_u64());
+        let generation = next_in_flight_generation();
+        state.in_flight_goal_sessions.insert(
+            session_id.clone(),
+            InFlightMarker {
+                generation,
+                marked_at_ms: now_ms_u64(),
+            },
+        );
         Some(GoalDispatchInFlightGuard {
             orchestrator: self,
             session_id: session_id.clone(),
+            generation,
             disarmed: false,
         })
     }
@@ -8193,13 +8265,75 @@ pub(crate) const IN_FLIGHT_STALE_AFTER_MS: u64 = 30 * 60 * 1_000;
 /// and stamped within [`IN_FLIGHT_STALE_AFTER_MS`]). A stale entry reads as not
 /// in flight so the session can be dispatched again; the entry itself is
 /// harmless and is overwritten by the next mark or removed by the next clear.
+/// #2003 — one incarnation of a session's in-flight marker.
+///
+/// The `generation` is what makes eviction SAFE. Without it, this sequence
+/// silently reintroduces the #1529 double-dispatch the marker exists to stop:
+///
+///   1. turn A claims the marker and wedges (no token progress, no children,
+///      so nothing refreshes it);
+///   2. at the staleness horizon the marker is treated as abandoned and a NEW
+///      turn B claims it — correct, that is the rescue;
+///   3. turn A finally unwinds and its guard's `Drop` clears the marker —
+///      except the marker is now B's, so B is left unprotected and turn C can
+///      start alongside it.
+///
+/// Stamping the incarnation into both the entry and the guard makes step 3 a
+/// no-op for A. Mirrors the identity re-check (`Arc::ptr_eq`) that Codex uses
+/// before nulling its own active-turn slot.
+#[derive(Debug, Clone, Copy)]
+struct InFlightMarker {
+    generation: u64,
+    marked_at_ms: u64,
+}
+
+/// Monotonic source of marker incarnations. Process-global because the marker
+/// map is; wraps only after 2^64 claims.
+static IN_FLIGHT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_in_flight_generation() -> u64 {
+    IN_FLIGHT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn in_flight_marker_is_live(
-    markers: &std::collections::HashMap<SessionKey, u64>,
+    markers: &std::collections::HashMap<SessionKey, InFlightMarker>,
     session_id: &SessionKey,
 ) -> bool {
-    markers.get(session_id).is_some_and(|marked_at_ms| {
-        now_ms_u64().saturating_sub(*marked_at_ms) < IN_FLIGHT_STALE_AFTER_MS
+    markers.get(session_id).is_some_and(|marker| {
+        now_ms_u64().saturating_sub(marker.marked_at_ms) < IN_FLIGHT_STALE_AFTER_MS
     })
+}
+
+/// #2003 — whether a marked session still has SUPERVISED WORK running, i.e.
+/// non-terminal background-task agents.
+///
+/// This is the second proof of life, and it covers a case the token heartbeat
+/// structurally cannot: a turn BLOCKED awaiting its sub-agents emits no tokens
+/// at all, so on token evidence alone it is indistinguishable from a wedged
+/// turn and would lose its marker while legitimately working.
+///
+/// The lifecycle authority for that work is `TaskSupervisor`, and its state
+/// already reaches the orchestrator through `upsert_background_task_agent` —
+/// so we ASK that state rather than infer liveness, and no plumbing is needed.
+///
+/// Deliberately NOT covered: peers. They are sovereign sessions that are not
+/// registered as supervised tasks, and a master's own turn ENDS after staging
+/// them (holding no marker to protect). Bringing peers under the supervisor is
+/// tracked separately (#1868).
+fn session_has_live_supervised_work(state: &AutonomyRuntimeState, session_id: &SessionKey) -> bool {
+    state
+        .agents
+        .values()
+        .any(|agent| agent.session_id == *session_id && !is_agent_terminal_status(&agent.status))
+}
+
+/// The full in-flight predicate: a marker counts as held while it is either
+/// FRESH or backed by live supervised work. Only a marker that is both stale
+/// AND has nothing running is treated as abandoned.
+fn in_flight_marker_is_held(state: &AutonomyRuntimeState, session_id: &SessionKey) -> bool {
+    in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id)
+        || (state.in_flight_goal_sessions.contains_key(session_id)
+            && session_has_live_supervised_work(state, session_id))
 }
 
 /// #1140 codex P1 re-review #4 — RAII drop-guard returned by
@@ -8217,6 +8351,11 @@ fn in_flight_marker_is_live(
 pub(crate) struct GoalDispatchInFlightGuard {
     orchestrator: &'static InProcessAgentOrchestrator,
     session_id: SessionKey,
+    /// #2003 — the marker incarnation THIS guard owns. `Drop` clears only when
+    /// the stored marker still carries it, so a guard whose marker was already
+    /// evicted (staleness) and re-claimed by a NEW turn cannot wipe the new
+    /// owner's marker on its way out.
+    generation: u64,
     disarmed: bool,
 }
 
@@ -8234,8 +8373,12 @@ impl GoalDispatchInFlightGuard {
 impl Drop for GoalDispatchInFlightGuard {
     fn drop(&mut self) {
         if !self.disarmed {
+            // #2003 — identity-checked: if this guard's marker was already
+            // evicted by the staleness rescue and re-claimed by a newer turn,
+            // clearing here would strip the NEW owner's protection and admit a
+            // concurrent continuation. Only the owning incarnation may clear.
             self.orchestrator
-                .clear_goal_dispatch_in_flight(&self.session_id);
+                .clear_goal_dispatch_in_flight_generation(&self.session_id, self.generation);
         }
     }
 }
@@ -8862,7 +9005,7 @@ struct AutonomyRuntimeState {
     /// longer wedge a session permanently (field report: five continuations of
     /// four different reason kinds stuck `queued` for 35 minutes, including the
     /// `goal_wrap_up` that would have explained the stall to the user).
-    in_flight_goal_sessions: std::collections::HashMap<SessionKey, u64>,
+    in_flight_goal_sessions: std::collections::HashMap<SessionKey, InFlightMarker>,
     /// #1977 codex round 2 — test-only switch that makes the next monitor wake
     /// persist be treated as FAILED, simulating a crash exactly at the durable
     /// wake write. Per-instance (fresh `InProcessAgentOrchestrator::default()`
@@ -9866,7 +10009,7 @@ fn enqueue_due_goal_continuations(
     // otherwise queue a stale `GoalContinue` despite the in-flight
     // turn. The two guards together ensure the in-flight marker is
     // the authoritative gate on every enqueue path.
-    if in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id) {
+    if in_flight_marker_is_held(state, session_id) {
         return 0;
     }
     let Some(goal) = state.goals.get(session_id).cloned() else {
@@ -24629,6 +24772,182 @@ mod tests {
             "a session wedged by a STALE marker must become due again — otherwise \
              a leaked guard silently stalls every continuation kind forever (#2003)",
         );
+    }
+
+    /// #2003 follow-up — a LONG but PRODUCING turn must never age out.
+    ///
+    /// The staleness horizon rescues a wedged session, but the original
+    /// justification ("a live turn re-stamps its marker") was FALSE: nothing
+    /// refreshed it, so a turn running past the horizon lost its protection
+    /// mid-flight. `touch_goal_dispatch_in_flight` is that refresh, driven from
+    /// real token production in the actor's turn loop.
+    ///
+    /// Two properties are load-bearing and both are asserted here:
+    ///   1. touching an aged marker restores it (a producing turn stays safe);
+    ///   2. touching a session with NO marker must NOT create one — otherwise a
+    ///      stray progress event could mark an idle session busy forever.
+    #[test]
+    fn touch_refreshes_a_live_turns_marker_but_never_creates_one() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-heartbeat");
+
+        // No marker yet: touching must be a no-op, not a mark.
+        orchestrator.touch_goal_dispatch_in_flight(&session_id);
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "touch must never CREATE a marker — an idle session stays idle",
+        );
+
+        // Mark, then age it past the horizon as an abandoned marker would.
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "precondition: the aged marker reads as stale",
+        );
+
+        // The turn is still producing → refresh → protected again.
+        orchestrator.touch_goal_dispatch_in_flight(&session_id);
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a producing turn must keep its marker live past the staleness \
+             horizon, or a long fleet turn loses its concurrency guard",
+        );
+    }
+
+    /// #2003 follow-up — a turn BLOCKED awaiting its sub-agents must keep its
+    /// marker even though it produces no tokens.
+    ///
+    /// This is the case the token heartbeat structurally cannot see: while the
+    /// parent waits on children it emits nothing, so on token evidence alone it
+    /// is indistinguishable from a wedged turn and would be un-protected once
+    /// the staleness horizon passed — letting a second turn dispatch onto a
+    /// session that is genuinely working. `TaskSupervisor` is the lifecycle
+    /// authority for that work and its state reaches the orchestrator via
+    /// `upsert_background_task_agent`, so we ask it instead of guessing.
+    #[test]
+    fn stale_marker_is_still_held_while_supervised_children_run() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-children");
+
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        // Age it out: on the timestamp alone this session is now dispatchable.
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "precondition: with no children, an aged marker is abandoned",
+        );
+
+        // A child is RUNNING for this session — the parent turn is legitimately
+        // blocked on it, emitting no tokens.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-running".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-running".into(),
+            role: "worker".into(),
+            nickname: "Ada".into(),
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a session with live supervised children must stay protected even \
+             once its marker aged out — otherwise a parent waiting on sub-agents \
+             gets a second concurrent turn dispatched onto it",
+        );
+
+        // Child reaches a terminal state: nothing is running, the aged marker
+        // is abandoned again and the session is rescued as #2004 intends.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-running".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-running".into(),
+            role: "worker".into(),
+            nickname: "Ada".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "once every child is terminal the stale marker must stop holding the \
+             session — the wedge rescue (#2004) still has to work",
+        );
+    }
+
+    /// #2003 — an evicted turn that unwinds LATE must not strip the marker a
+    /// newer turn now holds.
+    ///
+    /// This is the defect the staleness rescue introduced, in three steps:
+    ///   1. turn A claims the marker and wedges (nothing refreshes it);
+    ///   2. at the horizon the marker is judged abandoned and turn B claims it
+    ///      — the rescue working as intended;
+    ///   3. turn A finally unwinds; its guard's `Drop` used to `remove()`
+    ///      unconditionally, wiping *B's* marker and letting turn C start
+    ///      alongside B — precisely the #1529 double-dispatch the marker exists
+    ///      to prevent, reintroduced by the fix for the wedge.
+    ///
+    /// The generation stamp makes step 3 a no-op for A.
+    #[test]
+    fn a_late_unwinding_guard_cannot_clear_a_newer_turns_marker() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-generation");
+
+        // 1. Turn A claims, then wedges.
+        let generation_a = orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+
+        // 2. The rescue fires: the stale marker no longer holds, so a NEW turn
+        //    B claims the session.
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "precondition: A's wedged marker reads as abandoned",
+        );
+        let generation_b = orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        assert_ne!(
+            generation_a, generation_b,
+            "each claim must be a distinct incarnation",
+        );
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "B now holds a fresh marker",
+        );
+
+        // 3. Turn A unwinds LATE. Its clear must be refused.
+        assert!(
+            !orchestrator.clear_goal_dispatch_in_flight_generation(&session_id, generation_a),
+            "the evicted turn must NOT clear a marker it no longer owns",
+        );
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "B must still be protected after A unwinds — otherwise a third turn \
+             dispatches onto a session B is actively running (#1529)",
+        );
+
+        // B's own clear still works, so nothing leaks.
+        assert!(
+            orchestrator.clear_goal_dispatch_in_flight_generation(&session_id, generation_b),
+            "the owning incarnation clears normally",
+        );
+        assert!(!orchestrator.is_goal_dispatch_in_flight(&session_id));
     }
 
     #[test]
