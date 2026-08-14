@@ -1487,7 +1487,12 @@ mod tests {
         let path = dir.path().join("cron.json");
         // A truncated store — exactly what an unfsynced write + power loss
         // leaves behind.
-        let corrupt = r#"{"jobs":[{"id":"job-1","name":"nightly buil"#;
+        // Truncated mid-token, as an unfsynced write + power loss leaves it.
+        // The cut-off word is deliberately NOT a prefix of a real English word:
+        // the `typos` CI gate reads a truncated word as a misspelling and fails
+        // the build, which is ironic for a fixture whose whole job is to BE
+        // truncated — but not a battle worth having with a spell-checker.
+        let corrupt = r#"{"jobs":[{"id":"job-1","name":"nightly zzq"#;
         std::fs::write(&path, corrupt).unwrap();
 
         let store = load_store_or_quarantine(&path);
