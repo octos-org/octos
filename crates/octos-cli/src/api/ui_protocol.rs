@@ -14551,15 +14551,79 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
     if master.is_empty() {
         return;
     }
-    let master_key = SessionKey(master.clone());
+    evaluate_and_enqueue_fleet_synthesis(profile_id, &peers_root, &master, peer_session).await;
+}
 
-    // One lock: sessions with a live (non-terminal) turn. Exclude THIS peer —
-    // its turn is still marked Active at this hook (the terminal transition
-    // runs just after), yet its result is already on the blackboard, so it
-    // counts as DONE, not mid-turn.
+/// #2003 — the MASTER-idle edge.
+///
+/// The fleet gate used to be evaluated ONLY when a peer's turn terminated, and
+/// a `Hold` was discarded with nothing rescheduled. So a fleet whose LAST peer
+/// landed while the master happened to be busy (live turn or pending approval)
+/// was never synthesized: every peer was terminal, so no further peer event
+/// could ever fire, and no other trigger recomputed the decision. That is the
+/// "master just stopped" report — five peers all wrote `result.md` and the
+/// master sat idle forever.
+///
+/// Clearing a wedged in-flight marker (#2004/#2014) does NOT fix it, because
+/// clearing the wedge does not re-run the gate. The lost `Fire` has to be
+/// recomputed, and the master finishing a turn is exactly the edge on which the
+/// input that forced `Hold` (`master_idle == false`) becomes true.
+///
+/// Safe to call on every turn terminal: the decision is pure over
+/// `(peers, stamp_exists, master_idle)` and exactly-once via the
+/// `.synthesized-<master>` stamp, so a redundant evaluation is a no-op.
+async fn maybe_enqueue_peer_fleet_synthesis_for_master(
+    state: &Arc<AppState>,
+    master_session: &SessionKey,
+) {
+    // Peer terminals are already handled by the peer-terminal path above;
+    // this hook is only for a session acting as a MASTER.
+    if peer_slug_and_profile(master_session).is_some() {
+        return;
+    }
+    let Some(profile_id) = master_session.profile_id() else {
+        return;
+    };
+    let Some(runtime) = state.profiles.get(profile_id) else {
+        return;
+    };
+    let peers_root = runtime.data_dir.join("peers");
+    // Cheap early-out so an ordinary session with no fleet does not pay for a
+    // `peers/` scan on every single turn terminal.
+    if !peers_root.is_dir() {
+        return;
+    }
+    evaluate_and_enqueue_fleet_synthesis(
+        profile_id,
+        &peers_root,
+        &master_session.0,
+        master_session,
+    )
+    .await;
+}
+
+/// Shared fleet-readiness evaluation, reached from BOTH the peer-terminal edge
+/// and the master-idle edge. `exclude_session` is the session whose turn is
+/// terminating right now: its turn is still marked Active at this hook (the
+/// terminal transition runs just after), so it must not count against
+/// idle/settled or the gate can never fire on its own edge.
+async fn evaluate_and_enqueue_fleet_synthesis(
+    profile_id: &str,
+    peers_root: &Path,
+    master: &str,
+    exclude_session: &SessionKey,
+) {
+    let master_key = SessionKey(master.to_owned());
+
+    // One lock: sessions with a live (non-terminal) turn. Exclude the session
+    // whose turn is terminating right now — it is still marked Active at this
+    // hook (the terminal transition runs just after). On the peer edge its
+    // result is already on the blackboard, so it counts as DONE, not mid-turn;
+    // on the master edge (#2003) excluding it is what lets `master_idle` become
+    // true on the very edge the master goes idle.
     let active_turns = active_turns_registry();
     let mut running = active_turn_sessions(&active_turns).await;
-    running.remove(peer_session);
+    running.remove(exclude_session);
 
     // Master idle-eligibility, mirroring the drain's gate inputs: no in-flight
     // turn AND no pending approval. (The drain re-checks this before firing.)
@@ -14577,7 +14641,7 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
     // this pass (no fire, no reset) rather than mistake an unreadable dir for a
     // cleared fleet.
     let orchestrator = default_agent_orchestrator();
-    let Some(owned) = collect_owned_peer_results(&peers_root, &master) else {
+    let Some(owned) = collect_owned_peer_results(peers_root, master) else {
         return;
     };
     let mut owned_slugs: Vec<String> = Vec::with_capacity(owned.len());
@@ -14604,7 +14668,7 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
         })
         .collect();
 
-    let stamp_exists = peer_fleet_synthesized_stamp_exists(&peers_root, &master);
+    let stamp_exists = peer_fleet_synthesized_stamp_exists(peers_root, master);
     match evaluate_peer_fleet_synthesis(&peers, stamp_exists, master_idle) {
         FleetSynthesisDecision::Hold => {}
         // Defensive: a peer-terminal eval always includes the just-terminated
@@ -14612,7 +14676,7 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
         // `peer_close`. Handle it anyway so the decision contract is honored —
         // drop the disk marker AND the recent-claim guard together (Bug 1).
         FleetSynthesisDecision::ClearStamp => {
-            remove_peer_fleet_synthesized_stamp(&peers_root, &master);
+            remove_peer_fleet_synthesized_stamp(peers_root, master);
             orchestrator.clear_peer_fleet_synthesis_claim(&master_key);
         }
         FleetSynthesisDecision::Fire => {
@@ -14626,7 +14690,7 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or(0);
             if let Err(err) = crate::memory_consolidate::apply::atomic_write(
-                &peer_fleet_synthesized_stamp_path(&peers_root, &master),
+                &peer_fleet_synthesized_stamp_path(peers_root, master),
                 &now_unix.to_string(),
             ) {
                 tracing::warn!(
@@ -31406,6 +31470,9 @@ async fn run_standalone_turn(
                 // result still counts toward readiness (it does not block) but
                 // does not itself kick off a synthesis.
                 maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
+                // #2003 — also evaluate on the MASTER-idle edge. No-ops for a peer
+                // session (handled just above) and for a session with no fleet.
+                maybe_enqueue_peer_fleet_synthesis_for_master(&state, &session_id).await;
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
@@ -31505,6 +31572,9 @@ async fn run_standalone_turn(
                 // body is part of what the master consolidates). Same fleet
                 // gate as the completed arm; no-op for non-peer sessions.
                 maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
+                // #2003 — also evaluate on the MASTER-idle edge. No-ops for a peer
+                // session (handled just above) and for a session with no fleet.
+                maybe_enqueue_peer_fleet_synthesis_for_master(&state, &session_id).await;
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
                 try_emit_terminal(
                     &turn_state,
@@ -31889,6 +31959,9 @@ async fn run_standalone_turn(
         // point is to not SKIP evaluation on the interrupt path. No-op for
         // non-peer sessions.
         maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
+        // #2003 — also evaluate on the MASTER-idle edge. No-ops for a peer
+        // session (handled just above) and for a session with no fleet.
+        maybe_enqueue_peer_fleet_synthesis_for_master(&state, &session_id).await;
     }
 
     let _ = agent_task.await;

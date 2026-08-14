@@ -9702,6 +9702,69 @@ fn reset_removes_marker_only_when_fleet_fully_cleared() {
     );
 }
 
+/// #2003 — a fleet whose LAST peer lands while the master is BUSY must still
+/// synthesize once the master goes idle.
+///
+/// This is the case that produced "the master just stopped". The gate used to
+/// be evaluated only on a peer's terminal edge, and `Hold` was discarded with
+/// nothing rescheduled — so once every peer was terminal there was no event
+/// left to re-trigger it, and the `Fire` was lost forever. Clearing a wedged
+/// in-flight marker (#2004/#2014) does not help: it does not re-run the gate.
+///
+/// Drives the shared evaluation the way the MASTER edge does, and asserts the
+/// observable effect — the `.synthesized-<master>` stamp — rather than the
+/// decision value, so it fails if the master edge stops being reachable.
+#[tokio::test]
+async fn fleet_that_landed_while_master_was_busy_synthesizes_on_the_master_idle_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-rearm";
+    let master_key = SessionKey(master.to_owned());
+
+    let stage = |slug: &str| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(dir.join("originator"), master).unwrap();
+        // Landed: has a result and no live turn.
+        std::fs::write(dir.join("result.md"), "findings").unwrap();
+    };
+    stage("peer-one");
+    stage("peer-two");
+
+    // The master is BUSY: a live (non-terminal) turn is registered for it.
+    let abort = tokio::spawn(async {}).abort_handle();
+    let busy_turn = test_active_turn(TurnId::new(), abort);
+    active_turns_registry()
+        .lock()
+        .await
+        .insert(master_key.clone(), busy_turn);
+
+    // 1. The PEER edge, with the master busy. This is the moment the last peer
+    //    lands. `master_idle` is false, so the gate Holds — and the old code
+    //    dropped that decision with nothing rescheduled.
+    let landing_peer = SessionKey(format!("{MAIN_PROFILE_ID}:api:peer-two"));
+    evaluate_and_enqueue_fleet_synthesis(MAIN_PROFILE_ID, peers_root, master, &landing_peer).await;
+    assert!(
+        !peer_fleet_synthesized_stamp_exists(peers_root, master),
+        "precondition: a busy master must NOT synthesize on the peer edge"
+    );
+
+    // 2. The MASTER-idle edge (#2003): the master's own turn is the one
+    //    terminating, so it is excluded from the active-turn set — which is
+    //    precisely what flips `master_idle` true and recovers the lost Fire.
+    //    Every peer is already terminal here, so without this edge NOTHING
+    //    would ever re-evaluate the gate and the master would wait forever.
+    evaluate_and_enqueue_fleet_synthesis(MAIN_PROFILE_ID, peers_root, master, &master_key).await;
+    assert!(
+        peer_fleet_synthesized_stamp_exists(peers_root, master),
+        "a complete fleet must synthesize once the master goes idle; without \
+         the re-arm the Fire is lost when the last peer lands on a busy master"
+    );
+
+    active_turns_registry().lock().await.remove(&master_key);
+}
+
 /// Bug 2 (reset edge) — `collect_owned_peer_results` distinguishes a
 /// genuinely-EMPTY readable directory (`Some(vec![])`) from a `peers/` scan
 /// FAILURE (`None`), so a transient read error is never mistaken for a cleared
