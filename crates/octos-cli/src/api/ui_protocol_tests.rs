@@ -10475,6 +10475,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             file_attached: false,
             voice_audio: false,
             plan_todos: false,
+            background_activity: false,
             projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
@@ -10543,6 +10544,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             file_attached: false,
             voice_audio: false,
             plan_todos: false,
+            background_activity: false,
             projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
@@ -10656,6 +10658,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             file_attached: false,
             voice_audio: false,
             plan_todos: false,
+            background_activity: false,
             projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
@@ -10724,6 +10727,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             file_attached: false,
             voice_audio: false,
             plan_todos: false,
+            background_activity: false,
             projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
@@ -10785,6 +10789,7 @@ fn shell_approval_still_emits_risk_field() {
             file_attached: false,
             voice_audio: false,
             plan_todos: false,
+            background_activity: false,
             projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
@@ -10889,6 +10894,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             file_attached: false,
             voice_audio: false,
             plan_todos: false,
+            background_activity: false,
             projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
@@ -12978,6 +12984,130 @@ fn plan_updated_gated_by_plan_todos_capability() {
     assert!(live_event_passes_capability_filter(&event, negotiated));
 }
 
+/// #2019 — build a human-sink event for the tests below.
+fn background_activity_for(
+    session_id: &SessionKey,
+    origin_id: &str,
+    text: &str,
+) -> octos_core::ui_protocol::BackgroundActivityEvent {
+    octos_core::ui_protocol::BackgroundActivityEvent {
+        session_id: session_id.clone(),
+        profile_id: Some("main".into()),
+        origin_kind: "monitor".into(),
+        origin_id: origin_id.into(),
+        origin_label: Some("ci-tail".into()),
+        text: text.into(),
+        emitted_at_ms: 1_760_000_000_000,
+        dropped_count: None,
+        suppressed: false,
+    }
+}
+
+/// #2019 — `background/activity` is a NEW notification shape. A client that
+/// did not negotiate `event.background_activity.v1` cannot render it and would
+/// report "unknown UI protocol notification" — the ui-protocol-v2-migration
+/// trap. Gate it on both the live broadcast and reconnect replay (both routes
+/// call this filter), mirroring the `plan.todos.v1` discipline.
+#[test]
+fn should_gate_background_activity_when_the_capability_was_not_negotiated() {
+    let event = UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(
+        background_activity_for(&SessionKey("local:test".into()), "monitor_01", "boom"),
+    ));
+    assert!(
+        !live_event_passes_capability_filter(&event, ConnectionUiFeatures::default()),
+        "a connection without event.background_activity.v1 must never receive it"
+    );
+    let negotiated = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+    assert!(live_event_passes_capability_filter(&event, negotiated));
+}
+
+/// #2019 acceptance — ten monitor fires land on the OWNING session's durable
+/// stream and are replayable by cursor after a client disconnects mid-run.
+///
+/// Two properties in one test, because they are the same property: the ledger
+/// append is the routing decision AND the disconnect-survival mechanism.
+/// Asserts ROUTING (the sibling session's stream stays empty), not merely that
+/// events were emitted — activity on the wrong stream renders in whichever
+/// session happens to be focused (octos-tui#461, #466, #483).
+#[tokio::test]
+async fn should_replay_background_activity_on_the_owning_session_when_a_client_reconnects() {
+    let (ws, _rx) = ws_connection_for_test(64);
+    let ledger = UiProtocolLedger::new(256);
+    let owner = SessionKey("local:owner".into());
+    let sibling = SessionKey("local:sibling".into());
+
+    // A client connected at the start of the run captures the cursor it would
+    // resume from, then "disconnects" (we simply stop reading the socket).
+    let resume_from = UiCursor {
+        stream: owner.0.clone(),
+        seq: 0,
+    };
+    for i in 0..10 {
+        let _ = send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::BackgroundActivity(background_activity_for(
+                &owner,
+                "monitor_01",
+                &format!("line {i}"),
+            )),
+        );
+    }
+    // One event from a DIFFERENT origin on the SAME session: grouping is a
+    // client concern, so both must be on the one session stream.
+    let _ = send_notification_durable(
+        &ws,
+        &ledger,
+        UiNotification::BackgroundActivity(background_activity_for(
+            &owner,
+            "monitor_02",
+            "other origin",
+        )),
+    );
+
+    let replay = ledger
+        .replay_after(&owner, Some(&resume_from))
+        .expect("reconnecting client replays the owning session");
+    let replayed: Vec<(String, String)> = replay
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(event)) => {
+                Some((event.origin_id.clone(), event.text.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replayed.len(),
+        11,
+        "the whole run replays after a mid-run disconnect, not just its tail"
+    );
+    assert_eq!(replayed[0], ("monitor_01".into(), "line 0".into()));
+    assert_eq!(replayed[9], ("monitor_01".into(), "line 9".into()));
+    assert_eq!(replayed[10], ("monitor_02".into(), "other origin".into()));
+
+    // ROUTING: the sibling session's stream never saw any of it.
+    let sibling_replay = ledger
+        .replay_after(
+            &sibling,
+            Some(&UiCursor {
+                stream: sibling.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap_or_default();
+    assert!(
+        !sibling_replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::BackgroundActivity(_))
+        )),
+        "background activity must never land on a session that did not own the emitter"
+    );
+}
+
 /// #1977 blocker 6 — `monitor/*` notifications are gated by
 /// `coding.monitor_runtime.v1`. A connection that sent a feature header but did
 /// NOT negotiate monitor runtime must never receive a `monitor/updated` (or
@@ -13415,6 +13545,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             file_attached: false,
             voice_audio: false,
             plan_todos: false,
+            background_activity: false,
             projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
