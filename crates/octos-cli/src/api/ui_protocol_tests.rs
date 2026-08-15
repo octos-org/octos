@@ -10096,9 +10096,22 @@ async fn a_second_peer_round_is_not_recorded_as_summarized_unless_a_turn_actuall
     );
 
     // ROUND 2: the master sent a follow-up and the peer delivered again. The
-    // gate re-arms — but round 1's continuation is still pending, so this
-    // enqueue DEDUPES. The mark must therefore stay at 1, leaving the gate
+    // gate re-arms — but a synthesis for this master is already in flight, so
+    // the enqueue DEDUPES. The mark must therefore stay at 1, leaving the gate
     // armed for the next edge instead of recording a synthesis that never ran.
+    //
+    // Establish that precondition EXPLICITLY rather than relying on round 1's
+    // continuation still sitting in the process-global queue: sibling tests
+    // share that queue, and depending on its state made this test flaky in a
+    // full parallel run (the #2029 disease — do not add another instance of
+    // it). A redundant enqueue on the same per-master key is a no-op if one is
+    // already pending, so this is safe either way.
+    default_agent_orchestrator().enqueue_peer_fleet_synthesis_continuation(
+        &master_key,
+        MAIN_PROFILE_ID,
+        &["worker".to_owned()],
+        1,
+    );
     std::fs::write(dir.join("result.md"), "round two").unwrap();
     std::fs::write(dir.join("result-2.md"), "round two").unwrap();
     evaluate_and_enqueue_fleet_synthesis(MAIN_PROFILE_ID, peers_root, master, &master_key).await;
