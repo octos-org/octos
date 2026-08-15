@@ -1129,6 +1129,107 @@ mod peer_io_tests {
     }
 }
 
+/// #2026 — the INPUT half of the exchange must be recorded like the output
+/// half. A multi-round peer kept every `result-<n>.md` but only the ORIGINAL
+/// `brief.md`, so the instructions driving rounds 2..N were unrecoverable.
+#[cfg(test)]
+mod peer_brief_round_tests {
+    use super::*;
+
+    /// Rounds increment across successive instructions, each lands as its own
+    /// `brief-<n>.md`, and `briefs.txt` indexes them — mirroring `turns.txt`.
+    #[test]
+    fn successive_instructions_record_as_numbered_rounds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let peer = dir.path().join("slug");
+        std::fs::create_dir(&peer).unwrap();
+
+        assert_eq!(record_peer_brief(&peer, "round one"), 1);
+        assert_eq!(record_peer_brief(&peer, "round two"), 2);
+        assert_eq!(record_peer_brief(&peer, "round three"), 3);
+
+        let two = std::fs::read_to_string(peer.join("brief-2.md")).unwrap();
+        assert!(
+            two.contains("round two") && two.contains("round: 2"),
+            "each round file carries its body + round header: {two}"
+        );
+        let index = std::fs::read_to_string(peer.join("briefs.txt")).unwrap();
+        assert_eq!(
+            index.lines().count(),
+            3,
+            "briefs.txt indexes every round: {index}"
+        );
+        assert!(
+            index.lines().next().is_some_and(|l| l.starts_with("1 ")),
+            "index lines lead with the round number: {index}"
+        );
+    }
+
+    /// The bare `brief.md` is the staging contract AND the boot prompt, so it
+    /// must never be rewritten by round recording — a rehydrated peer has to
+    /// start from the same assignment it was staged with.
+    #[test]
+    fn recording_rounds_never_rewrites_the_staging_brief() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let peer = dir.path().join("slug");
+        std::fs::create_dir(&peer).unwrap();
+        std::fs::write(peer.join("brief.md"), "ORIGINAL ASSIGNMENT").unwrap();
+
+        record_peer_brief(&peer, "a follow-up that must not clobber it");
+
+        assert_eq!(
+            std::fs::read_to_string(peer.join("brief.md")).unwrap(),
+            "ORIGINAL ASSIGNMENT",
+            "brief.md is the staging contract + boot prompt; rotation must not touch it"
+        );
+    }
+
+    /// Back-compat: a peer staged BEFORE brief versioning has `brief.md` and no
+    /// `brief-<n>.md`. Its bare brief must not be miscounted as a round (the
+    /// prefix is `brief.`, not `brief-`), so the first recorded instruction is
+    /// round 1 rather than round 2.
+    #[test]
+    fn a_legacy_bare_brief_is_not_counted_as_a_round() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let peer = dir.path().join("slug");
+        std::fs::create_dir(&peer).unwrap();
+        std::fs::write(peer.join("brief.md"), "staged before versioning").unwrap();
+        // `briefs.txt` also starts with "brief" but not "brief-" — it must not
+        // inflate the count either.
+        std::fs::write(peer.join("briefs.txt"), "").unwrap();
+
+        assert_eq!(count_peer_brief_versions(&peer), 0);
+        assert_eq!(
+            record_peer_brief(&peer, "first recorded instruction"),
+            1,
+            "a legacy peer's first recorded instruction is round 1"
+        );
+    }
+
+    /// Brief rounds and result versions are independent counters: recording an
+    /// instruction must not renumber results, nor be renumbered by them.
+    #[test]
+    fn brief_rounds_and_result_versions_do_not_interfere() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let peer = dir.path().join("slug");
+        std::fs::create_dir(&peer).unwrap();
+        std::fs::write(peer.join("result-1.md"), "r1").unwrap();
+        std::fs::write(peer.join("result-2.md"), "r2").unwrap();
+
+        assert_eq!(
+            count_peer_brief_versions(&peer),
+            0,
+            "results are not briefs"
+        );
+        assert_eq!(record_peer_brief(&peer, "instruction"), 1);
+        assert_eq!(
+            count_peer_result_versions(&peer),
+            2,
+            "recording a brief must not disturb the result counter"
+        );
+    }
+}
+
 /// `true` when `peers/<slug>/closed` exists — the durable marker written by
 /// `peer_close` retiring a peer. Shared by the continuation-drain freshness
 /// gates and the reconnect-retarget skip so a closed peer is never a live
@@ -1561,6 +1662,10 @@ pub(crate) fn stage_peer(
             "failed to write brief: {err}"
         )));
     }
+    // Record the staging brief as round 1 so the instruction history starts
+    // where the work does. `brief.md` above stays authoritative (staging
+    // contract + boot prompt); this is the audit copy (#2026).
+    record_peer_brief(&peer_dir, brief);
 
     // Store the display NAME so the peer is addressable by it and readers
     // (`read_peer_blackboard` / `resolve_peer_name_to_slug`) can surface it.
@@ -2261,6 +2366,57 @@ pub(crate) fn peer_respond_resolve(
 /// inflate the derived version number (#1824).
 pub(crate) fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
     peer_io::peer_dir_count_prefixed(peer_dir, "result-", peer_io::PEER_DIR_SCAN_CAP) as u32
+}
+
+/// Count how many `brief-<n>.md` instruction files exist in the peer directory
+/// — the INPUT half of what [`count_peer_result_versions`] counts on the output
+/// half, through the same fd-anchored, regular-file-only, scan-capped
+/// enumerator (#1824).
+///
+/// The bare `brief.md` is deliberately NOT counted: its prefix is `brief.`, not
+/// `brief-`. A peer staged before brief versioning existed therefore reads as
+/// ZERO recorded rounds, and its first recorded instruction becomes round 1 —
+/// which is the correct back-compat reading, since its original brief was never
+/// captured as a round.
+pub(crate) fn count_peer_brief_versions(peer_dir: &std::path::Path) -> u32 {
+    peer_io::peer_dir_count_prefixed(peer_dir, "brief-", peer_io::PEER_DIR_SCAN_CAP) as u32
+}
+
+/// Record ONE round of master→peer instruction as `brief-<n>.md`, plus a
+/// `briefs.txt` index line — the mirror of the `result-<n>.md` / `turns.txt`
+/// pair (#435/#1824) for the input half of the exchange.
+///
+/// Closes the asymmetry #2026 documents: a multi-round peer kept every
+/// `result-<n>.md` it produced but only ever the ORIGINAL `brief.md`, so the
+/// instructions that drove rounds 2..N were unrecoverable after the fact
+/// (`peer_send_input` delivers into the running session, which is not
+/// persisted). A live 44-peer fleet had peers with four recorded results and
+/// one recorded brief.
+///
+/// `brief.md` is never rewritten. It is BOTH the staging contract
+/// [`staged_peer_dir`] enforces AND the boot prompt `peers::host` replays, so
+/// rotating it would silently change what a rehydrated peer starts from.
+///
+/// Best-effort by design: a failure is logged and swallowed. Losing the audit
+/// copy must never fail the instruction it is recording — the same posture the
+/// `result-<n>.md` / `turns.txt` writes take.
+pub(crate) fn record_peer_brief(peer_dir: &std::path::Path, body: &str) -> u32 {
+    let round = count_peer_brief_versions(peer_dir) + 1;
+    let updated_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let text = format!("---\nround: {round}\nupdated_unix: {updated_unix}\n---\n\n{body}\n");
+    if let Err(err) = peer_io::write_peer_file_atomic(peer_dir, &format!("brief-{round}.md"), &text)
+    {
+        tracing::warn!(?err, round, "failed to write versioned peer brief");
+    }
+    if let Err(err) =
+        peer_io::append_peer_line(peer_dir, "briefs.txt", &format!("{round} {updated_unix}\n"))
+    {
+        tracing::warn!(?err, round, "failed to append to briefs.txt");
+    }
+    round
 }
 
 /// Parse `turns.txt` into `[(turn_count, outcome, updated_unix)]`.
