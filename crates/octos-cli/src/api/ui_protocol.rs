@@ -14868,33 +14868,58 @@ async fn evaluate_and_enqueue_fleet_synthesis(
             orchestrator.clear_peer_fleet_synthesis_claim(&master_key);
         }
         FleetSynthesisDecision::Fire => {
-            // Advance the per-peer marks FIRST (durably, atomically). If the
-            // write fails, do NOT enqueue: a fire without a persisted mark would
-            // re-fire the same rounds on the next terminal. Concurrent terminals
-            // writing the same marks are safe (same observed rounds, atomic
-            // replace), and the per-master dedupe key collapses the paired
-            // enqueue.
-            if let Err(err) = write_peer_fleet_synthesis_marks(peers_root, master, &fired_marks) {
-                tracing::warn!(
-                    ?err,
-                    "peer fleet synthesis: .synthesized marks write failed; not enqueuing"
-                );
-                return;
-            }
+            // ENQUEUE FIRST, advance the marks only if it actually queued.
+            //
+            // The synthesis continuation's dedupe key is STABLE PER MASTER
+            // (`external/<kind>/<master>`), so a second synthesis lands as a
+            // duplicate whenever the first is still pending or was claimed
+            // inside `RECENT_CLAIM_GUARD_WINDOW`. Advancing the marks before
+            // knowing that would record "round N summarized" for a turn that
+            // never ran, and nothing would ever retry it — the #2024 gate fix
+            // alone would then still lose the second synthesis, silently.
+            //
+            // Holding the marks back makes it self-healing instead: the gate
+            // still reads Fire on the next edge, and the round-1 synthesis
+            // turn's OWN terminal is that edge (the master-idle re-evaluation
+            // added in #2018), by which point the guard window has moved on.
+            //
+            // The inverted order is safe here precisely because the queue is
+            // in-memory: a crash between enqueue and mark-write loses the
+            // continuation too, so re-firing on restart is correct, not double
+            // work. Concurrent terminals are safe as well — the dedupe key
+            // collapses the paired enqueue, and the marks write is an atomic
+            // whole-record replace of the same observed rounds.
             let outcome = orchestrator.enqueue_peer_fleet_synthesis_continuation(
                 &master_key,
                 profile_id,
                 &owned_slugs,
                 peers.len(),
             );
-            if outcome.queued().is_some() {
+            if outcome.queued().is_none() {
                 tracing::debug!(
                     master = %master_key,
                     profile = profile_id,
-                    peers = peers.len(),
-                    "peer fleet complete — enqueued ONE autonomous synthesis turn on master"
+                    "peer fleet synthesis deduped against an in-flight synthesis; \
+                     marks NOT advanced so the next terminal retries"
+                );
+                return;
+            }
+            if let Err(err) = write_peer_fleet_synthesis_marks(peers_root, master, &fired_marks) {
+                // The turn IS queued; only the record failed. Log loudly — the
+                // cost is a repeated synthesis, not a lost one.
+                tracing::warn!(
+                    ?err,
+                    master = %master_key,
+                    "peer fleet synthesis: marks write failed AFTER enqueuing; \
+                     this fleet may synthesize again"
                 );
             }
+            tracing::debug!(
+                master = %master_key,
+                profile = profile_id,
+                peers = peers.len(),
+                "peer fleet complete — enqueued ONE autonomous synthesis turn on master"
+            );
         }
     }
 }

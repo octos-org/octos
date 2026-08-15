@@ -10042,6 +10042,96 @@ async fn fleet_that_landed_while_master_was_busy_synthesizes_on_the_master_idle_
     active_turns_registry().lock().await.remove(&master_key);
 }
 
+/// #2024 END-TO-END — a peer's SECOND round produces a SECOND synthesis, driven
+/// through the real `evaluate_and_enqueue_fleet_synthesis` rather than the pure
+/// decision.
+///
+/// This is the case the pure-function tests cannot reach and that the fix
+/// initially got wrong. The synthesis continuation's dedupe key is stable per
+/// master, so round 2's enqueue lands as a DUPLICATE while round 1's is still
+/// pending. With the marks advanced before the enqueue, round 2 would be
+/// recorded as summarized by a turn that never ran, and nothing would retry —
+/// the gate fix alone would have lost the second synthesis silently while every
+/// unit test passed.
+///
+/// Asserts the marks on disk, because they are what the gate reads next time.
+#[tokio::test]
+async fn a_second_peer_round_is_not_recorded_as_summarized_unless_a_turn_actually_queued() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    // Unique master: the dedupe key and its recent-claim guard are
+    // process-global, so a shared name would collide with sibling tests.
+    let master = "tenant-a:api:master-2024-e2e";
+    let master_key = SessionKey(master.to_owned());
+
+    let dir = peers_root.join("worker");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "brief").unwrap();
+    std::fs::write(dir.join("originator"), master).unwrap();
+
+    // ROUND 1: the peer delivers. Master-idle edge → fires, records round 1.
+    std::fs::write(dir.join("result.md"), "round one").unwrap();
+    std::fs::write(dir.join("result-1.md"), "round one").unwrap();
+    evaluate_and_enqueue_fleet_synthesis(MAIN_PROFILE_ID, peers_root, master, &master_key).await;
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, master),
+            "worker",
+            1
+        ),
+        1,
+        "round 1 queued a synthesis, so it must be recorded as summarized",
+    );
+
+    // Re-evaluating with NOTHING new must not disturb the record.
+    evaluate_and_enqueue_fleet_synthesis(MAIN_PROFILE_ID, peers_root, master, &master_key).await;
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, master),
+            "worker",
+            1
+        ),
+        1,
+        "an evaluation with no new round is a no-op",
+    );
+
+    // ROUND 2: the master sent a follow-up and the peer delivered again. The
+    // gate re-arms — but round 1's continuation is still pending, so this
+    // enqueue DEDUPES. The mark must therefore stay at 1, leaving the gate
+    // armed for the next edge instead of recording a synthesis that never ran.
+    std::fs::write(dir.join("result.md"), "round two").unwrap();
+    std::fs::write(dir.join("result-2.md"), "round two").unwrap();
+    evaluate_and_enqueue_fleet_synthesis(MAIN_PROFILE_ID, peers_root, master, &master_key).await;
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, master),
+            "worker",
+            2
+        ),
+        1,
+        "a deduped enqueue must NOT record round 2 as summarized — otherwise \
+         the second synthesis is lost with nothing left to retry it",
+    );
+
+    // And the gate is still armed: round 2 > recorded 1.
+    let owned = collect_owned_peer_results(peers_root, master).expect("peers dir readable");
+    let marks = read_peer_fleet_synthesis_marks(peers_root, master);
+    let states: Vec<OwnedPeerState> = owned
+        .iter()
+        .map(|peer| OwnedPeerState {
+            has_result: peer.has_result,
+            mid_turn: false,
+            round: peer.round,
+            synthesized_round: synthesized_round_for(&marks, &peer.slug, peer.round),
+        })
+        .collect();
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&states, true, true),
+        FleetSynthesisDecision::Fire,
+        "round 2 stays armed so the next terminal retries the synthesis",
+    );
+}
+
 /// Bug 2 (reset edge) — `collect_owned_peer_results` distinguishes a
 /// genuinely-EMPTY readable directory (`Some(vec![])`) from a `peers/` scan
 /// FAILURE (`None`), so a transient read error is never mistaken for a cleared
