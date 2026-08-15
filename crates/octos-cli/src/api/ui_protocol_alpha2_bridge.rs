@@ -31,7 +31,7 @@ use super::ui_protocol_ledger::UiProtocolLedger;
 /// observe the same event.
 ///
 /// Construction is cheap — `Arc<UiProtocolLedger>` is already
-/// process-singleton (see `ui_protocol::event_ledger`), so wrapping costs
+/// process-singleton (see `ui_protocol_transport::event_ledger`), so wrapping costs
 /// one pointer copy per turn.
 pub(super) struct LedgerToolProgressReporter {
     inner: Arc<dyn ProgressReporter>,

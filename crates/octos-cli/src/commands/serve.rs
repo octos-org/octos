@@ -1489,7 +1489,7 @@ impl ServeCommand {
         // restored goal/loop continuations now drain even while the stdio
         // client is idle or detached, instead of waiting for connection ticks.
         // Everything the drain needs (the full AppState) is constructed above.
-        crate::api::ui_protocol::spawn_global_master_continuation_drain(state.clone());
+        crate::api::ui_protocol_transport::spawn_global_master_continuation_drain(state.clone());
 
         // #2019 — install the HUMAN sink over background events that today
         // only wake the model (monitor event lines, claimed fleet outbox
@@ -1498,10 +1498,10 @@ impl ServeCommand {
         // the connection-independent watcher tasks and the outbox consumer,
         // so the sink must not be per-connection either. Purely additive —
         // it changes nothing about how or when the model is woken.
-        crate::api::ui_protocol::spawn_background_activity_sink(state.clone());
+        crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
 
         if self.stdio {
-            crate::api::ui_protocol::stdio_connection(state).await?;
+            crate::api::ui_protocol_transport::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");
             let _ = process_manager.stop_all().await;
             return Ok(());

@@ -32,7 +32,6 @@ mod smart_home_panel;
 pub(crate) mod solo_auth;
 mod static_files;
 pub mod swarm;
-pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
 // Relocated to crate::contracts (Phase 3 of goal-in-chat) so `octos chat
@@ -40,6 +39,7 @@ mod ui_protocol_alpha9_bridge;
 // path uses without the `api` feature; re-exported here so api-internal paths
 // keep working unchanged.
 pub(crate) use crate::contracts::approvals as ui_protocol_approvals;
+pub(crate) mod ui_protocol_transport;
 // Relocated to crate::approvals_audit (Phase 4, ROBRIX-PHASE4 ADR) so the
 // gateway approval path can write the same audit log without the `api`
 // feature; re-exported here so api-internal paths keep working.

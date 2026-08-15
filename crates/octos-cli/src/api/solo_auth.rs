@@ -39,7 +39,9 @@ use octos_core::ui_protocol::{
 
 use super::AppState;
 use super::auth_handlers::{is_login_ready_email, is_top_level_profile_id};
-use super::ui_protocol::{create_or_get_local_solo_profile, supports_local_solo_profile_create};
+use super::ui_protocol_transport::{
+    create_or_get_local_solo_profile, supports_local_solo_profile_create,
+};
 use crate::user_store::{User, UserRole};
 
 /// `POST /api/auth/solo/create` response: the created/looked-up local

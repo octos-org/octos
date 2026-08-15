@@ -627,13 +627,15 @@ pub async fn auth_status(
         // explicit opt-in (a hosted Local-mode fleet daemon behind Caddy never
         // sets it), so the SPA never offers the no-password path there. See
         // `supports_local_solo_profile_create` / `crate::api::solo_auth`.
-        local_solo_enabled: crate::api::ui_protocol::supports_local_solo_profile_create(&state),
-        solo_profile_exists: if crate::api::ui_protocol::supports_local_solo_profile_create(&state)
-        {
-            Some(crate::api::solo_auth::resolve_solo_user(&state).is_some())
-        } else {
-            None
-        },
+        local_solo_enabled: crate::api::ui_protocol_transport::supports_local_solo_profile_create(
+            &state,
+        ),
+        solo_profile_exists:
+            if crate::api::ui_protocol_transport::supports_local_solo_profile_create(&state) {
+                Some(crate::api::solo_auth::resolve_solo_user(&state).is_some())
+            } else {
+                None
+            },
         scoped_profile,
     }))
 }
@@ -1775,14 +1777,16 @@ pub(crate) async fn synthesize_speech(
         .map_err(|status| SpeechSynthesisError::new(status, "profile unavailable"))?;
     let _synthesis_permit = acquire_speech_synthesis_permit(&profile_id)?;
     consume_speech_synthesis_quota(&profile_id, text.chars().count())?;
-    let runtime =
-        crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id))
-            .ok_or_else(|| {
-                SpeechSynthesisError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "profile runtime unavailable",
-                )
-            })?;
+    let runtime = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+        &state,
+        Some(&profile_id),
+    )
+    .ok_or_else(|| {
+        SpeechSynthesisError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "profile runtime unavailable",
+        )
+    })?;
     let voice = crate::api::voices::resolve_reply_voice(&profile_id, &runtime.voice.default_voice);
     let output_dir = tempfile::tempdir().map_err(|error| {
         tracing::error!(%error, "failed to create speech synthesis temp directory");
@@ -1855,7 +1859,10 @@ pub async fn voice_readiness(
     // runtimes (onboarding, `profile/llm/upsert`) that live outside
     // `state.profiles` — so readiness can't report "not started" while voice
     // turns actually work.
-    let rt = crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id));
+    let rt = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+        &state,
+        Some(&profile_id),
+    );
     let llm = VoiceLeg {
         ready: rt
             .as_ref()
@@ -3006,7 +3013,7 @@ pub async fn delete_my_soul(
 
 // ── Content catalog endpoints ────────────────────────────────────────
 
-// Helper for `ui_protocol::handle_content_list` (M12 Phase D-5).
+// Helper for `ui_protocol_transport::handle_content_list` (M12 Phase D-5).
 // The REST route `GET /api/my/content` was retired in this milestone; the
 // function survives as a private helper that the WS dispatcher calls
 // directly to back the `content/list` RPC method. Downgraded to
@@ -3173,7 +3180,7 @@ pub async fn my_content_body(
     Ok(([(header::CONTENT_TYPE, content_type)], Body::from(data)).into_response())
 }
 
-// Helper for `ui_protocol::handle_content_delete` (M12 Phase D-5).
+// Helper for `ui_protocol_transport::handle_content_delete` (M12 Phase D-5).
 // The REST route `DELETE /api/my/content/{id}` was retired in this
 // milestone; the function survives as a private helper backing the
 // `content/delete` WS RPC method.
@@ -3219,7 +3226,7 @@ pub(super) struct BulkDeleteRequest {
     pub ids: Vec<String>,
 }
 
-// Helper for `ui_protocol::handle_content_bulk_delete` (M12 Phase D-5).
+// Helper for `ui_protocol_transport::handle_content_bulk_delete` (M12 Phase D-5).
 // The REST route `POST /api/my/content/bulk-delete` was retired in this
 // milestone; the function survives as a private helper backing the
 // `content/bulk_delete` WS RPC method.

@@ -27,7 +27,7 @@ use super::session_ingress;
 use super::solo_auth;
 use super::static_files;
 use super::swarm as swarm_api;
-use super::ui_protocol;
+use super::ui_protocol_transport;
 use super::usage;
 use super::user_admin;
 use super::webhook_proxy;
@@ -319,7 +319,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // and site-preview remain REST per the ADR.
     let chat_api = Router::new()
         .route("/api/events/harness", get(events_harness::events_harness))
-        .route("/api/ui-protocol/ws", get(ui_protocol::ws_handler))
+        .route(
+            "/api/ui-protocol/ws",
+            get(ui_protocol_transport::ws_handler),
+        )
         .route(
             "/api/integrations/bilibili/first-video",
             get(bilibili::first_video),
