@@ -29587,6 +29587,18 @@ async fn run_standalone_turn(
                     if peer_is_closed(&send_peers_root, &slug) {
                         return Err(format!("peer '{slug}' is closed and cannot receive input"));
                     }
+                    // Record the instruction as a numbered round (#2026), once,
+                    // BEFORE the path split so BOTH delivery routes (gateway
+                    // in-process inbox and serve continuation queue) capture it.
+                    // `peer_send_input` lands in the peer's RUNNING session,
+                    // which is not persisted, so without this the instruction
+                    // that drove round N is unrecoverable after the fact.
+                    // Anchored on the REAL staged dir so a swapped `<slug>`
+                    // symlink cannot redirect the write; best-effort, so losing
+                    // the audit copy never fails the injection itself.
+                    if let Some(dir) = staged_peer_dir(&send_peers_root, &slug) {
+                        crate::peers::record_peer_brief(&dir, &req.message);
+                    }
                     let key = peer_wire_key(&send_profile_id, &slug);
 
                     // Path 1: gateway in-process inbox (fast, direct).
