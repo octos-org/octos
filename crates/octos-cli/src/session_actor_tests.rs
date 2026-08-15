@@ -2442,13 +2442,31 @@ async fn master_continuation_tick_reenters_actor_loop() {
         setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
     let session_id = test_session_key(dir.path());
 
+    // #2029: the orchestrator's agent registry is process-global and keyed by
+    // `agent_id` ALONE — the session is a field on the record, not part of the
+    // key. Eighteen tests hardcode `child-a`, so a sibling running concurrently
+    // overwrites this record's session_id/status, the tick finds no completed
+    // child for THIS session, and the assertion below fails. It passed under
+    // `--test-threads=1` and under the narrow CI filters, and failed in roughly
+    // one full parallel run in three.
+    //
+    // Uniqueness is unilateral: a unique id cannot be clobbered no matter what
+    // the other seventeen do. Derived from the TempDir name, which is already
+    // what makes `session_id` unique here.
+    let agent_id = format!(
+        "child-a-{}",
+        dir.path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
     crate::autonomy::agent_orchestrator::default_agent_orchestrator().upsert_agent(
         crate::autonomy::agent_orchestrator::AgentUpsert {
-            agent_id: "child-a".into(),
+            agent_id: agent_id.clone(),
             parent_agent_id: Some("master".into()),
             session_id: session_id.clone(),
             task_id: None,
-            path: "master/child-a".into(),
+            path: format!("master/{agent_id}"),
             role: "worker".into(),
             nickname: "Ada".into(),
             backend_kind: "native".into(),
