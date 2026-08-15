@@ -451,6 +451,15 @@ jobs:
       - name: Goal completion verifier ledger evidence (octos-cli)
         run: cargo test -p octos-cli --features api -- completion_evidence goal_update_folds_ledger --nocapture
 
+      # #2019 human sink: the `background/activity` capability gate and the
+      # durable per-session replay both live in the `api`-gated ui_protocol
+      # module, so the unfeatured runs above never compile them — same reason
+      # as the §6 guard. The routing assertion itself is deliberately in
+      # non-gated `crate::autonomy` and DOES run in the unfeatured lib step;
+      # this covers the two halves that cannot.
+      - name: Background activity human sink (octos-cli)
+        run: cargo test -p octos-cli --features api background_activity -- --nocapture
+
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
