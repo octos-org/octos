@@ -88,9 +88,9 @@ If you're running behind a reverse proxy (e.g., Caddy or Nginx), configure it to
 
 Deployment behavior depends on `config.mode`:
 
-- `local` — Standalone machine. `/` redirects to `/admin/`.
-- `tenant` — Default end-user machine setup. Direct installs stay local at `/admin/`; managed registration setup can also configure the machine's public tunnel.
-- `cloud` — Advanced relay-host setup. `/` serves the landing page and `/admin/` remains the admin dashboard.
+- `local` — Standalone machine. `/` redirects to `/app/` (the octos-web app); when the web bundle isn't embedded it falls back to `/admin/`.
+- `tenant` — Default end-user machine setup. Direct installs land on `/app/` the same way; managed registration setup can also configure the machine's public tunnel. `/admin/` remains the admin dashboard.
+- `cloud` — Advanced relay-host setup. `/` serves the landing page, `/app/` serves the octos-web app, and `/admin/` remains the admin dashboard.
 
 `~/.octos/config.json` is the file that `octos serve` reads at startup. Tenant and local installs create it through the normal installers; host installs can now bootstrap it with `scripts/cloud-host-deploy.sh`, which writes `mode: "cloud"` plus the relay settings used by the landing page and frps plugin.
 

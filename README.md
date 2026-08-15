@@ -35,7 +35,7 @@ octos auth login --provider deepseek    # use the provider you chose above
 octos serve --solo
 ```
 
-Now open **http://localhost:50080/app/**, click the local sign-in button, and say hello. That's the whole setup.
+Now open **http://localhost:50080** (it lands on `/app/`), click the local sign-in button, and say hello. That's the whole setup.
 
 Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [self-hosted install options](https://github.com/octos-org/octos-web#self-hosting--deployment):
 
@@ -172,7 +172,7 @@ For a repo-local tenant deploy (builds from source, sets up the same service + t
 What it does:
 
 1. Detects your host triple (mirrors `install.sh`'s platform mapping).
-2. Runs `scripts/build-dashboard.sh` (admin SPA → `/admin/`) and `scripts/build-web-app.sh` (the octos-web submodule → `/app/`) so `rust_embed` bakes both SPAs into the binary. Skip the dashboard build and `/admin/` will 307-loop; skip the web build and `/app/` returns `web_bundle_missing`.
+2. Runs `scripts/build-dashboard.sh` (admin SPA → `/admin/`) and `scripts/build-web-app.sh` (the octos-web submodule → `/app/`) so `rust_embed` bakes both SPAs into the binary. Skip the dashboard build and `/admin/` returns a 503 `admin_bundle_missing` diagnostic; skip the web build and `/app/` returns `web_bundle_missing` (and the root `/` falls back to redirecting to `/admin/`).
 3. Delegates `cargo build --release` to `scripts/milestone-ci.sh release-bundle` (single source of truth for `FEATURES` / `SKILL_CRATES`).
 4. Tars binaries into `scripts/octos-bundle-<TRIPLE>.tar.gz`, which `install.sh` auto-detects via `file://`, skipping the GitHub download.
 5. With `--install`, chains into `install.sh` — copies binaries to `$PREFIX`, rewrites the service plist/unit, reloads the daemon.

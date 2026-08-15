@@ -1746,14 +1746,16 @@ impl ServeCommand {
             .to_string();
 
         tracing::info!(address = %addr, "octos API server starting");
-        tracing::info!(dashboard = %format!("http://{}/admin/", addr), "dashboard available");
+        tracing::info!(app = %format!("http://{}/app/", addr), "web app available");
+        tracing::info!(dashboard = %format!("http://{}/admin/", addr), "admin dashboard available");
         if enabled_count > 0 {
             tracing::info!(count = enabled_count, "gateway profiles auto-started");
         }
 
         println!("{}", "octos API server".cyan().bold());
         println!("{}: http://{}", "Listening".green(), addr);
-        println!("{}: http://{}/admin/", "Dashboard".green(), addr);
+        println!("{}: http://{}/app/", "App".green(), addr);
+        println!("{}: http://{}/admin/", "Admin dashboard".green(), addr);
         if enabled_count > 0 {
             println!(
                 "{}: {} profiles auto-started",
