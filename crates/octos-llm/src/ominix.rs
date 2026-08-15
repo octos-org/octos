@@ -354,10 +354,10 @@ impl VoicesRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// OminixClient — async HTTP client for ominix-api
+// OminixClient — async HTTP client for OMiniX and compatible ASR services
 // ---------------------------------------------------------------------------
 
-/// Async client for ominix-api ASR/TTS endpoints.
+/// Async client for OMiniX TTS endpoints and the shared JSON ASR contract.
 pub struct OminixClient {
     client: Client,
     base_url: String,
@@ -457,12 +457,12 @@ impl OminixClient {
             .timeout(std::time::Duration::from_secs(120))
             .send()
             .await
-            .wrap_err("failed to call ominix-api transcription")?;
+            .wrap_err("failed to call ASR transcription service")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            eyre::bail!("ominix-api transcription failed: {status} - {body}");
+            eyre::bail!("ASR service transcription failed: {status} - {body}");
         }
 
         let json: serde_json::Value = resp
@@ -475,7 +475,7 @@ impl OminixClient {
             .and_then(|v| v.as_str())
             .ok_or_else(|| eyre::eyre!("no text field in transcription response"))?;
 
-        debug!(chars = text.len(), "audio transcribed via ominix-api");
+        debug!(chars = text.len(), "audio transcribed via ASR service");
         Ok(text.to_string())
     }
 
@@ -557,7 +557,7 @@ impl OminixClient {
 
 #[cfg(test)]
 mod tests {
-    use super::tts_endpoint;
+    use super::{OminixClient, tts_endpoint};
 
     #[test]
     fn sovits_is_the_default_endpoint() {
@@ -572,6 +572,40 @@ mod tests {
     #[test]
     fn unknown_engine_falls_back_to_sovits() {
         assert_eq!(tts_endpoint("nonsense"), "/v1/audio/tts/sovits");
+    }
+
+    #[tokio::test]
+    async fn should_name_generic_asr_service_when_transcription_fails() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndown",
+                )
+                .await
+                .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("utterance.wav");
+        std::fs::write(&audio, b"RIFF-test-audio").unwrap();
+        let error = OminixClient::new(&format!("http://{address}"))
+            .transcribe(&audio)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("ASR service transcription failed"),
+            "{error}"
+        );
+        assert!(!error.contains("ominix-api"), "{error}");
     }
 }
 

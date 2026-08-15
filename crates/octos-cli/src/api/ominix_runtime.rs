@@ -297,12 +297,11 @@ pub(crate) async fn runtime_status(client: &reqwest::Client) -> OminixRuntimeSta
     runtime_status_with_config(&config, client).await
 }
 
-/// Whether the on-device ASR model is ready in the probed runtime.
+/// Whether the OMiniX ASR model is ready in the probed runtime.
 ///
-/// ASR is always on-device (there is no cloud ASR route — only TTS has a cloud
-/// option), so the voice pipeline requires this regardless of the chosen TTS
-/// mode. Pure over the probed inputs so it can be unit-tested without a live
-/// runtime.
+/// This is the local fallback check when no dedicated `ASR_API_URL` is
+/// configured. Pure over the probed inputs so it can be unit-tested without a
+/// live runtime.
 pub(crate) fn asr_ready(health_healthy: bool, voice_models: &[OminixVoiceModelStatus]) -> bool {
     health_healthy
         && voice_models
