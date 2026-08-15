@@ -1,7 +1,7 @@
 //! CLI commands for octos.
 
 mod account;
-mod acp;
+pub mod acp;
 mod admin;
 mod auth;
 mod channels;
