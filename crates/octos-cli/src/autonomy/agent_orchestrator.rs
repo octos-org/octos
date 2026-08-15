@@ -25453,9 +25453,13 @@ mod tests {
     #[test]
     fn should_emit_attributed_human_activity_on_the_owning_session_when_a_monitor_fires() {
         use crate::autonomy::human_events::{
-            BackgroundActivitySink, ORIGIN_KIND_MONITOR, clear_background_activity_sink,
-            set_background_activity_sink,
+            BackgroundActivitySink, ORIGIN_KIND_MONITOR, background_activity_test_guard,
+            clear_background_activity_sink, set_background_activity_sink,
         };
+        // The sink is process-global; hold the guard so a sibling case's
+        // teardown cannot wipe the sink this test installs (libtest runs cases
+        // in parallel by default, and CI does NOT pass --test-threads=1).
+        let _guard = background_activity_test_guard();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
         let sink: BackgroundActivitySink = std::sync::Arc::new(move |event| {
@@ -25554,7 +25558,9 @@ mod tests {
     /// monitor's wake path is byte-for-byte the same.
     #[test]
     fn should_leave_the_wake_path_intact_when_no_human_sink_is_installed() {
-        crate::autonomy::human_events::clear_background_activity_sink();
+        // Serialize + reset: "no sink installed" must be true for the whole
+        // body, not just at its first line.
+        let _guard = crate::autonomy::human_events::background_activity_test_guard();
         let orchestrator = InProcessAgentOrchestrator::default();
         let session = SessionKey::new("api", "mon-human-nosink");
         create_monitor_for_test(

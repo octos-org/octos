@@ -80,6 +80,34 @@ pub(crate) fn set_background_activity_sink(sink: BackgroundActivitySink) {
     *slot = Some(sink);
 }
 
+/// Serializes every test that touches the process-global sink or budget map,
+/// and resets both on acquisition.
+///
+/// The sink is deliberately process-global in production (a watcher task deep
+/// in the runtime has no handle to thread down, same rationale as
+/// `default_agent_orchestrator()`), so tests that install or clear it are
+/// mutually destructive: libtest runs them in PARALLEL by default, and one
+/// case's teardown wipes the sink another case just installed. That is a test
+/// harness race, not a production one — a single serve process installs the
+/// sink exactly once at boot — but it makes the routing assertion flap, which
+/// is unacceptable for the one property that has regressed three times
+/// (octos-tui#461 / #466 / #483).
+///
+/// Hold the returned guard for the WHOLE test body. Poison-safe: a failing
+/// test panics while holding it, and the next test must still be able to run
+/// (it resets the state it cares about anyway).
+#[cfg(test)]
+#[must_use = "hold the guard for the whole test body, or the sink races again"]
+pub(crate) fn background_activity_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    let guard = LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_background_activity_sink();
+    guard
+}
+
 /// Remove the sink (and reset the budgets). Test-only: the slot is a `static`
 /// that cannot otherwise be reset between cases.
 #[cfg(test)]
@@ -367,6 +395,7 @@ mod tests {
     /// render in whichever session the client happens to have focused.
     #[test]
     fn should_refuse_to_emit_when_the_session_key_is_empty() {
+        let _guard = background_activity_test_guard();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let recorder = seen.clone();
         set_background_activity_sink(Arc::new(move |event: BackgroundActivityEvent| {
@@ -385,7 +414,9 @@ mod tests {
     /// call is all the producer ever sees.
     #[test]
     fn should_no_op_when_no_sink_is_installed() {
-        clear_background_activity_sink();
+        // The guard both serializes against the sink-installing cases and
+        // resets the sink + budgets, so "no sink" is a fact, not a hope.
+        let _guard = background_activity_test_guard();
         emit_background_activity(event_for("dev:local:tui", "mon-1"));
         // Reaching here without panicking IS the assertion; also prove the
         // budget map was never touched (early-out before the lock).
