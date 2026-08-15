@@ -1394,11 +1394,15 @@ impl UiProtocolLedger {
             .max(1) as u64
     }
 
-    /// Next per-thread v1 sequence, used when a legacy terminal or attachment
-    /// is projected directly into a v2 envelope before its v1 dual-emit is
-    /// appended. Only source rows preceding this event's ledger cursor count;
-    /// otherwise a replay after later writes could assign a different v2 seq.
-    /// This is read-only and does not reserve or mutate sequence state.
+    /// Next per-thread sequence for a wire-projected legacy terminal or
+    /// attachment. A legacy source can be followed by its durable v1 companion,
+    /// but consecutive attachment sources can also arrive without a companion
+    /// between them. Count those projection-only rows after the latest durable
+    /// envelope so they cannot all reuse the same `(thread_id, seq)` identity.
+    ///
+    /// Only rows preceding this source cursor participate, which keeps replay
+    /// deterministic after later writes. This is read-only and does not reserve
+    /// or mutate the authoritative allocator.
     pub(crate) fn projection_v2_next_envelope_seq(
         &self,
         session_id: &SessionKey,
@@ -1410,31 +1414,78 @@ impl UiProtocolLedger {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner
+        let entries = inner
             .sessions
             .get(&storage_id)
             .into_iter()
             .flat_map(|state| state.entries.iter())
-            .filter_map(|entry| {
-                if entry.seq >= before_cursor_seq {
-                    return None;
+            .filter(|entry| entry.seq < before_cursor_seq)
+            .collect::<Vec<_>>();
+
+        let (durable_seq, durable_cursor_seq) = entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
+                    if envelope.envelope.thread_id == thread_id =>
+                {
+                    Some((envelope.envelope.seq, entry.seq))
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                    if envelope.envelope.thread_id == thread_id =>
+                {
+                    Some((envelope.envelope.seq, entry.seq))
+                }
+                _ => None,
+            })
+            .max_by_key(|(envelope_seq, cursor_seq)| (*envelope_seq, *cursor_seq))
+            .unwrap_or((0, 0));
+
+        let has_background_child_before = |cursor_seq: u64| {
+            entries.iter().any(|entry| {
+                if entry.seq >= cursor_seq {
+                    return false;
                 }
                 match &entry.event {
-                    UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
-                        if envelope.envelope.thread_id == thread_id =>
-                    {
-                        Some(envelope.envelope.seq)
+                    UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                        matches!(
+                            &envelope.envelope.payload,
+                            PayloadV2::BackgroundChildCompleted {
+                                parent_turn_id,
+                                ..
+                            } if parent_turn_id == thread_id
+                        )
                     }
-                    UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
-                        if envelope.envelope.thread_id == thread_id =>
-                    {
-                        Some(envelope.envelope.seq)
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(
+                        spawn,
+                    )) => {
+                        spawn.turn_id.as_ref().map(|turn_id| turn_id.0.to_string())
+                            == Some(thread_id.to_owned())
                     }
-                    _ => None,
+                    _ => false,
                 }
             })
-            .max()
-            .unwrap_or(0)
+        };
+
+        let projected_only_count = entries
+            .iter()
+            .filter(|entry| entry.seq > durable_cursor_seq)
+            .filter(|entry| match &entry.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(event)) => {
+                    event.turn_id.0.to_string() == thread_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnError(event)) => {
+                    event.turn_id.0.to_string() == thread_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::FileAttached(event)) => {
+                    event.turn_id.0.to_string() == thread_id
+                        && !has_background_child_before(entry.seq)
+                }
+                _ => false,
+            })
+            .count() as u64;
+
+        durable_seq
+            .saturating_add(projected_only_count)
             .saturating_add(1)
     }
 
