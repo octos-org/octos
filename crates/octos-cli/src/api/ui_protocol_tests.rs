@@ -9474,19 +9474,29 @@ fn peer_send_input_authorized_only_for_recorded_originator() {
     assert!(err3.contains("not a staged peer"), "reason: {err3}");
 }
 
-/// Peer-fleet auto-synthesis fire policy — EXACTLY ONCE per fleet, on the pure
-/// decision. FIRES when every owned peer is done + the master is idle + no
-/// marker yet; HOLDS while any peer is mid-turn (or has queued input), while the
-/// master is busy, when a peer has no result, and — crucially — when the marker
-/// ALREADY EXISTS (no re-fire while any owned peer lives, even if all are done).
-/// A cleared fleet (zero owned peers) yields ClearStamp when a marker exists (so
-/// a fresh fleet can fire), else Hold.
+/// Peer-fleet auto-synthesis fire policy — EXACTLY ONCE PER ROUND, on the pure
+/// decision. FIRES when every owned peer is done + the master is idle + at least
+/// one peer has a round past its recorded mark; HOLDS while any peer is mid-turn
+/// (or has queued input), while the master is busy, when a peer has no result,
+/// and when every peer's delivered round has already been summarized. A cleared
+/// fleet (zero owned peers) yields ClearStamp when a stamp exists (tidy-up), else
+/// Hold.
+///
+/// #2024 changed the exactly-once unit from FLEET to ROUND: the old gate keyed
+/// on stamp existence alone, so a fleet that did more work after being
+/// summarized could never synthesize again until every peer was closed. The
+/// re-arm behaviour is covered by
+/// `a_new_peer_round_re_arms_fleet_synthesis`.
 #[test]
 fn evaluate_peer_fleet_synthesis_fires_once_and_resets_on_clear() {
     use FleetSynthesisDecision::{ClearStamp, Fire, Hold};
+    // A peer on round 1 with nothing summarized yet — the shape every
+    // assertion below except the exactly-once one uses.
     let peer = |has_result: bool, mid_turn: bool| OwnedPeerState {
         has_result,
         mid_turn,
+        round: u32::from(has_result),
+        synthesized_round: 0,
     };
     let done_a = peer(true, false);
     let done_b = peer(true, false);
@@ -9515,11 +9525,18 @@ fn evaluate_peer_fleet_synthesis_fires_once_and_resets_on_clear() {
         Hold,
     );
 
-    // EXACTLY ONCE: the marker already exists → NEVER re-fire while any owned
-    // peer remains, even with MORE peers all done (added-and-completed peers and
-    // newer results do NOT re-synthesize).
+    // EXACTLY ONCE PER ROUND: every peer's delivered round is already recorded
+    // as summarized → HOLD, however many peers, and regardless of the stamp
+    // flag. This is the guarantee the old existence marker provided; #2024 only
+    // changed WHAT is compared, not that a summarized round stays summarized.
+    let summarized = |round: u32| OwnedPeerState {
+        has_result: true,
+        mid_turn: false,
+        round,
+        synthesized_round: round,
+    };
     assert_eq!(
-        evaluate_peer_fleet_synthesis(&[done_a, done_b, peer(true, false)], true, true),
+        evaluate_peer_fleet_synthesis(&[summarized(1), summarized(2), summarized(1)], true, true),
         Hold,
     );
 
@@ -9545,6 +9562,8 @@ fn evaluate_holds_for_resultless_interrupt_and_fires_with_prior_result() {
     let peer = |has_result: bool| OwnedPeerState {
         has_result,
         mid_turn: false,
+        round: u32::from(has_result),
+        synthesized_round: 0,
     };
     let sibling_done = peer(true);
 
@@ -9562,6 +9581,252 @@ fn evaluate_holds_for_resultless_interrupt_and_fires_with_prior_result() {
         Fire,
         "an interrupted peer with a prior result still lets the fleet synthesize",
     );
+}
+
+/// #2024 — a SECOND round of peer work RE-ARMS the gate.
+///
+/// The pre-#2024 stamp was an existence marker: once written it held forever
+/// while any owned peer lived, so a master that put its fleet through another
+/// round never got a second write-up unless every peer was closed first. That
+/// is the stall behind #2024. The stamp now records WHICH round of each peer
+/// was summarized, and a peer that delivers a round past its mark re-arms.
+#[test]
+fn a_new_peer_round_re_arms_fleet_synthesis() {
+    use FleetSynthesisDecision::{Fire, Hold};
+    let peer = |round: u32, synthesized_round: u32| OwnedPeerState {
+        has_result: true,
+        mid_turn: false,
+        round,
+        synthesized_round,
+    };
+
+    // Round 1 delivered, nothing summarized yet → FIRE (unchanged).
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[peer(1, 0)], true, true),
+        Fire
+    );
+
+    // Round 1 delivered AND summarized → HOLD. This is the exactly-once
+    // guarantee the old existence stamp gave, and it is preserved.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[peer(1, 1)], true, true),
+        Hold
+    );
+
+    // THE BUG: the peer did another round. The old gate held here forever;
+    // now the unsummarized round 2 re-arms.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[peer(2, 1)], true, true),
+        Fire
+    );
+
+    // ONE peer with fresh work is enough — the others being caught up does
+    // not suppress it.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[peer(3, 3), peer(2, 1), peer(1, 1)], true, true),
+        Fire,
+    );
+
+    // Whole fleet caught up → HOLD, however many peers.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[peer(3, 3), peer(2, 2), peer(1, 1)], true, true),
+        Hold,
+    );
+
+    // A newly-added peer has no mark at all (synthesized_round 0) → FIRE.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[peer(2, 2), peer(1, 0)], true, true),
+        Fire,
+    );
+
+    // Fresh work still does NOT override the settled/done/idle preconditions:
+    // a busy master, a mid-turn peer, or a resultless peer all still HOLD.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(&[peer(2, 1)], true, false),
+        Hold,
+        "a busy master holds even with an unsummarized round",
+    );
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(
+            &[
+                peer(2, 1),
+                OwnedPeerState {
+                    has_result: true,
+                    mid_turn: true,
+                    round: 1,
+                    synthesized_round: 1,
+                },
+            ],
+            true,
+            true,
+        ),
+        Hold,
+        "a mid-turn sibling holds even with an unsummarized round elsewhere",
+    );
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(
+            &[
+                peer(2, 1),
+                OwnedPeerState {
+                    has_result: false,
+                    mid_turn: false,
+                    round: 0,
+                    synthesized_round: 0,
+                },
+            ],
+            true,
+            true,
+        ),
+        Hold,
+        "a resultless sibling holds even with an unsummarized round elsewhere",
+    );
+}
+
+/// #2024 back-compat — a stamp written before this change is a bare unix
+/// timestamp with no per-peer rounds. It proves the fleet WAS summarized but
+/// not at which rounds, so every currently-owned peer reads as already covered
+/// at its CURRENT round. An upgrade therefore never re-fires a fleet that was
+/// already written up, while a genuinely new round still re-arms.
+#[test]
+fn a_legacy_peer_fleet_stamp_reads_as_every_current_round_summarized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+
+    // Exactly what the old code wrote: seconds-since-epoch, nothing else.
+    std::fs::write(
+        peer_fleet_synthesized_stamp_path(peers_root, master),
+        "1755200000",
+    )
+    .unwrap();
+
+    let marks = read_peer_fleet_synthesis_marks(peers_root, master);
+    assert_eq!(marks, FleetSynthesisMarks::Legacy);
+
+    // A legacy mark covers whatever round the peer is on right now...
+    assert_eq!(synthesized_round_for(&marks, "any-slug", 4), 4);
+    assert_eq!(synthesized_round_for(&marks, "other-slug", 1), 1);
+
+    // ...so the fleet holds on upgrade rather than re-firing.
+    assert_eq!(
+        evaluate_peer_fleet_synthesis(
+            &[OwnedPeerState {
+                has_result: true,
+                mid_turn: false,
+                round: 4,
+                synthesized_round: synthesized_round_for(&marks, "any-slug", 4),
+            }],
+            true,
+            true,
+        ),
+        FleetSynthesisDecision::Hold,
+        "upgrading must not re-synthesize an already-summarized fleet",
+    );
+}
+
+/// #2024 — the stamp round-trips per-peer marks, and an absent stamp reads as
+/// `None` (nothing summarized) rather than as a legacy marker.
+#[test]
+fn peer_fleet_synthesis_marks_round_trip_through_the_stamp_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+
+    // No stamp at all → None, and every peer reads as unsummarized.
+    let absent = read_peer_fleet_synthesis_marks(peers_root, master);
+    assert_eq!(absent, FleetSynthesisMarks::None);
+    assert_eq!(synthesized_round_for(&absent, "whatever", 3), 0);
+
+    write_peer_fleet_synthesis_marks(
+        peers_root,
+        master,
+        &[("alpha".to_owned(), 2), ("beta".to_owned(), 1)],
+    )
+    .expect("stamp write");
+
+    let marks = read_peer_fleet_synthesis_marks(peers_root, master);
+    assert_eq!(synthesized_round_for(&marks, "alpha", 2), 2);
+    assert_eq!(synthesized_round_for(&marks, "beta", 1), 1);
+    // A slug absent from the record is unsummarized — NOT covered-at-current
+    // the way a legacy stamp would be.
+    assert_eq!(synthesized_round_for(&marks, "gamma", 5), 0);
+
+    // Rewriting replaces the record wholesale — a peer dropped from the fleet
+    // does not linger in the stamp.
+    write_peer_fleet_synthesis_marks(peers_root, master, &[("alpha".to_owned(), 3)])
+        .expect("stamp rewrite");
+    let rewritten = read_peer_fleet_synthesis_marks(peers_root, master);
+    assert_eq!(synthesized_round_for(&rewritten, "alpha", 3), 3);
+    assert_eq!(synthesized_round_for(&rewritten, "beta", 1), 0);
+}
+
+/// #2024 — a slug containing whitespace (the field separator) round-trips. The
+/// stamp is keyed by slug, and slugs come from peer directory names, so the
+/// encoding must not be defeated by one.
+#[test]
+fn peer_fleet_synthesis_marks_survive_a_slug_with_a_space() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+
+    write_peer_fleet_synthesis_marks(
+        peers_root,
+        master,
+        &[("two words".to_owned(), 2), ("plain".to_owned(), 1)],
+    )
+    .expect("stamp write");
+
+    let marks = read_peer_fleet_synthesis_marks(peers_root, master);
+    assert_eq!(synthesized_round_for(&marks, "two words", 2), 2);
+    assert_eq!(
+        synthesized_round_for(&marks, "plain", 1),
+        1,
+        "a space in one slug must not corrupt the rest of the record"
+    );
+}
+
+/// #2024 — the round a peer is on is its count of versioned `result-<n>.md`
+/// files, with one back-compat rule: a peer whose result predates versioning
+/// (bare `result.md`, no `result-1.md`) still counts as round 1. Without that
+/// floor such a peer would read as round 0, never exceed its mark, and never
+/// synthesize at all.
+#[test]
+fn peer_result_round_counts_versions_and_floors_a_legacy_result_at_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-1";
+
+    let stage = |slug: &str| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(dir.join("originator"), master).unwrap();
+        dir
+    };
+
+    // No result at all → round 0.
+    stage("pending");
+    // Legacy: bare result.md, no versioned files → floored to round 1.
+    let legacy = stage("legacy");
+    std::fs::write(legacy.join("result.md"), "res").unwrap();
+    // Versioned: three rounds delivered.
+    let versioned = stage("versioned");
+    std::fs::write(versioned.join("result.md"), "res").unwrap();
+    for n in 1..=3 {
+        std::fs::write(versioned.join(format!("result-{n}.md")), "res").unwrap();
+    }
+
+    let owned = collect_owned_peer_results(peers_root, master).expect("peers dir readable");
+    let round_of = |slug: &str| {
+        owned
+            .iter()
+            .find(|peer| peer.slug == slug)
+            .unwrap_or_else(|| panic!("{slug} owned"))
+            .round
+    };
+    assert_eq!(round_of("pending"), 0, "no result → round 0");
+    assert_eq!(round_of("legacy"), 1, "bare result.md floors to round 1");
+    assert_eq!(round_of("versioned"), 3, "three result-<n>.md → round 3");
 }
 
 /// Peer-fleet auto-synthesis — `collect_owned_peer_results` returns exactly the
@@ -9603,32 +9868,43 @@ fn collect_owned_peer_results_filters_by_originator_and_excludes_closed() {
 
     let mut owned = collect_owned_peer_results(peers_root, master).expect("peers dir readable");
     owned.sort();
-    let slugs: Vec<&str> = owned.iter().map(|(slug, _)| slug.as_str()).collect();
+    let slugs: Vec<&str> = owned.iter().map(|peer| peer.slug.as_str()).collect();
     assert_eq!(
         slugs,
         vec!["done-peer", "errored-peer", "pending-peer"],
         "only this master's non-closed peers are owned"
     );
+    let has_result = |slug: &str| {
+        owned
+            .iter()
+            .find(|peer| peer.slug == slug)
+            .unwrap_or_else(|| panic!("{slug} owned"))
+            .has_result
+    };
     assert!(
-        owned.iter().find(|(s, _)| s == "done-peer").unwrap().1,
+        has_result("done-peer"),
         "a written result → has_result true"
     );
     assert!(
-        owned.iter().find(|(s, _)| s == "errored-peer").unwrap().1,
+        has_result("errored-peer"),
         "an errored peer's result.md still counts as present"
     );
     assert!(
-        !owned.iter().find(|(s, _)| s == "pending-peer").unwrap().1,
+        !has_result("pending-peer"),
         "a peer with no result.md → has_result false"
     );
 }
 
-/// Peer-fleet auto-synthesis — the per-master `.synthesized` stamp is an
-/// EXISTENCE marker: create/exists/remove round-trips, distinct masters are
-/// independent (`safe_filename`), removing an absent marker is a no-op, and the
-/// colocated marker file is never mistaken for a staged peer.
+/// Peer-fleet auto-synthesis — the per-master `.synthesized` stamp FILE's
+/// lifecycle: create/exists/remove round-trips, distinct masters are independent
+/// (`safe_filename`), removing an absent stamp is a no-op, and the colocated
+/// stamp file is never mistaken for a staged peer.
+///
+/// This covers the file only. What the stamp SAYS — per-peer summarized rounds
+/// since #2024 — is covered by
+/// `peer_fleet_synthesis_marks_round_trip_through_the_stamp_file`.
 #[test]
-fn peer_fleet_synthesized_stamp_is_an_existence_marker() {
+fn peer_fleet_synthesized_stamp_file_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let peers_root = tmp.path();
     let master_a = "tenant-a:api:master-1";
@@ -9636,7 +9912,8 @@ fn peer_fleet_synthesized_stamp_is_an_existence_marker() {
 
     assert!(!peer_fleet_synthesized_stamp_exists(peers_root, master_a));
 
-    // Create (content is a debug timestamp; only existence gates).
+    // Create. Content is irrelevant here — `..._exists` gates only the
+    // ClearStamp tidy-up, which does not read the record.
     crate::memory_consolidate::apply::atomic_write(
         &peer_fleet_synthesized_stamp_path(peers_root, master_a),
         "1721900000",
@@ -9894,7 +10171,7 @@ fn stage_peer_records_originator_for_ownership_scan() {
     let owned_slugs: Vec<String> = collect_owned_peer_results(&peers_root, master)
         .expect("peers dir readable")
         .into_iter()
-        .map(|(slug, _)| slug)
+        .map(|peer| peer.slug)
         .collect();
     assert_eq!(
         owned_slugs,

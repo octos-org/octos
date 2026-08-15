@@ -14334,6 +14334,21 @@ fn peer_results_ready_note(peers_root: &Path, session_id: &SessionKey) -> Option
     ))
 }
 
+/// One peer of a master's fleet, as read off the blackboard by
+/// [`collect_owned_peer_results`]. A named struct rather than a tuple so the
+/// compiler enumerates every call site when a field is added.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OwnedPeer {
+    slug: String,
+    /// True when this peer has a `result.md` on the blackboard.
+    has_result: bool,
+    /// Which round of work this peer has DELIVERED: its count of versioned
+    /// `result-<n>.md` files, floored at 1 whenever a bare `result.md` exists
+    /// (pre-#435 peers wrote no versioned file and would otherwise read as
+    /// round 0 forever, and so never synthesize). `0` means no result yet.
+    round: u32,
+}
+
 /// Peer-fleet auto-synthesis — one owned peer's readiness inputs for the
 /// [`evaluate_peer_fleet_synthesis`] decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14346,6 +14361,12 @@ struct OwnedPeerState {
     /// run yet. Either BLOCKS synthesis so a stale result isn't synthesized
     /// while a fresher one is (about to be) produced.
     mid_turn: bool,
+    /// Which round of work this peer has DELIVERED — see [`OwnedPeer::round`].
+    round: u32,
+    /// The highest round of this peer the master has ALREADY summarized, read
+    /// from the per-master stamp (#2024). `0` when this peer has never been
+    /// summarized. A peer whose `round` exceeds this has fresh work.
+    synthesized_round: u32,
 }
 
 /// Peer-fleet auto-synthesis — the decision for one evaluation of a master's
@@ -14364,19 +14385,28 @@ enum FleetSynthesisDecision {
 }
 
 /// Peer-fleet auto-synthesis — decide whether a master's peer fleet warrants an
-/// AUTONOMOUS synthesis turn. The `.synthesized` stamp is an EXISTENCE marker:
-/// a fleet fires EXACTLY ONCE and never re-fires while any owned peer lives (a
-/// newer result or an added-and-completed peer must NOT re-synthesize). The
-/// stamp is cleared only when the fleet is fully retired (zero owned peers), so
-/// a genuinely fresh fleet later fires once.
+/// AUTONOMOUS synthesis turn.
+///
+/// #2024: the stamp used to be a bare EXISTENCE marker, so once a fleet had
+/// been summarized it could never synthesize again while any owned peer lived —
+/// a master that put its fleet through a second round of work got no second
+/// write-up unless every peer was closed first. The stamp now records WHICH
+/// round of each peer was summarized, so "exactly once" is per ROUND rather
+/// than per fleet: a peer that delivers work past its recorded mark re-arms the
+/// gate, and a fleet with nothing new still holds.
 ///
 /// Decision:
 /// - zero owned peers → [`ClearStamp`](FleetSynthesisDecision::ClearStamp) when
-///   the marker exists (reset for a future fresh fleet), else `Hold`.
-/// - marker already exists (this fleet was synthesized) → `Hold` — never
-///   re-fire while any owned peer remains.
+///   a stamp exists (tidy-up for a future fresh fleet), else `Hold`.
 /// - master busy, or any owned peer not settled / not done → `Hold`.
-/// - otherwise (≥1 owned peer, idle, all settled + done, no marker) → `Fire`.
+/// - no owned peer has a round past its recorded mark → `Hold` (nothing new to
+///   write up).
+/// - otherwise (≥1 owned peer, idle, all settled + done, ≥1 fresh round)
+///   → `Fire`.
+///
+/// Note the ordering: the settled/done preconditions are checked BEFORE the
+/// freshness test, so one peer's fresh round never fires a synthesis while a
+/// sibling is still mid-turn.
 ///
 /// Pure + input-driven so the whole fire/reset/idle/settled matrix is
 /// unit-testable without the filesystem, the wire registry, or a live turn.
@@ -14385,7 +14415,7 @@ fn evaluate_peer_fleet_synthesis(
     stamp_exists: bool,
     master_idle: bool,
 ) -> FleetSynthesisDecision {
-    // Fleet fully cleared → drop the marker so a fresh fleet can fire once.
+    // Fleet fully cleared → drop the marker so a fresh fleet starts clean.
     // Checked FIRST and independent of idle: a retired fleet resets regardless.
     if peers.is_empty() {
         return if stamp_exists {
@@ -14394,14 +14424,9 @@ fn evaluate_peer_fleet_synthesis(
             FleetSynthesisDecision::Hold
         };
     }
-    // Already synthesized this fleet → EXACTLY ONCE: never re-fire while any
-    // owned peer exists (added peers / newer results do not re-arm).
-    if stamp_exists {
-        return FleetSynthesisDecision::Hold;
-    }
     // Never fire onto a busy master. The continuation drain re-checks
     // idle-eligibility before firing; gating here keeps the decision
-    // self-contained and avoids creating the marker for an unfired wave.
+    // self-contained and avoids advancing the marks for an unfired wave.
     if !master_idle {
         return FleetSynthesisDecision::Hold;
     }
@@ -14411,7 +14436,14 @@ fn evaluate_peer_fleet_synthesis(
             return FleetSynthesisDecision::Hold;
         }
     }
-    FleetSynthesisDecision::Fire
+    // #2024: fire only when there is something NEW to write up. A peer with no
+    // recorded mark reads as `synthesized_round == 0`, so a fresh fleet's first
+    // completed round fires exactly as before.
+    if peers.iter().any(|peer| peer.round > peer.synthesized_round) {
+        FleetSynthesisDecision::Fire
+    } else {
+        FleetSynthesisDecision::Hold
+    }
 }
 
 /// Per-master `.synthesized` stamp path under `peers/`. Keyed by a
@@ -14427,11 +14459,115 @@ fn peer_fleet_synthesized_stamp_path(peers_root: &Path, master: &str) -> PathBuf
     ))
 }
 
-/// True when the per-master `.synthesized` EXISTENCE marker is present. Only
-/// existence gates synthesis; the file's content (a debug timestamp) is never
-/// read.
+/// True when the per-master `.synthesized` stamp file is present, in EITHER
+/// format. Only used for the `ClearStamp` tidy-up decision; the fire decision
+/// reads the marks (see [`read_peer_fleet_synthesis_marks`]).
 fn peer_fleet_synthesized_stamp_exists(peers_root: &Path, master: &str) -> bool {
     peer_fleet_synthesized_stamp_path(peers_root, master).exists()
+}
+
+/// First line of a #2024-format stamp. Its presence is what distinguishes the
+/// new per-round record from the pre-#2024 bare-timestamp existence marker, so
+/// it must never change without a version bump.
+const PEER_FLEET_MARKS_HEADER: &str = "octos-peer-fleet-marks v1";
+
+/// Refuse to parse an implausibly large stamp rather than read it into memory.
+/// A stamp holds one short line per owned peer, and the fleet scan itself is
+/// capped, so anything past this is corruption or a hostile write.
+const PEER_FLEET_MARKS_READ_CAP: u64 = 256 * 1024;
+
+/// What the per-master `.synthesized` stamp says about work already written up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FleetSynthesisMarks {
+    /// No stamp on disk — nothing has been summarized.
+    None,
+    /// A pre-#2024 stamp: a bare unix timestamp with no per-peer rounds. It
+    /// proves the fleet WAS summarized but not at which rounds, so every
+    /// currently-owned peer is read as already covered AT ITS CURRENT ROUND.
+    /// That makes the upgrade silent — an already-summarized fleet does not
+    /// re-fire — while a genuinely new round still re-arms the gate.
+    Legacy,
+    /// Per-slug highest round already summarized.
+    Rounds(HashMap<String, u32>),
+}
+
+/// The highest round of `slug` already summarized, given `marks`.
+///
+/// `current_round` is only consulted for [`FleetSynthesisMarks::Legacy`], where
+/// it IS the answer (see the variant's docs). For `Rounds`, a slug absent from
+/// the record reads as `0` — an unrecorded peer is unsummarized, NOT
+/// covered-at-current — so a peer added after the last synthesis fires.
+fn synthesized_round_for(marks: &FleetSynthesisMarks, slug: &str, current_round: u32) -> u32 {
+    match marks {
+        FleetSynthesisMarks::None => 0,
+        FleetSynthesisMarks::Legacy => current_round,
+        FleetSynthesisMarks::Rounds(rounds) => rounds.get(slug).copied().unwrap_or(0),
+    }
+}
+
+/// Read the per-master stamp. Any unreadable / oversized / header-less file is
+/// treated as [`Legacy`](FleetSynthesisMarks::Legacy) rather than `None`:
+/// fail-closed, because mistaking a real stamp for "nothing summarized" would
+/// re-synthesize a fleet that was already written up.
+fn read_peer_fleet_synthesis_marks(peers_root: &Path, master: &str) -> FleetSynthesisMarks {
+    let path = peer_fleet_synthesized_stamp_path(peers_root, master);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return FleetSynthesisMarks::None;
+    };
+    if !meta.is_file() || meta.len() > PEER_FLEET_MARKS_READ_CAP {
+        return FleetSynthesisMarks::Legacy;
+    }
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return FleetSynthesisMarks::Legacy;
+    };
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) != Some(PEER_FLEET_MARKS_HEADER) {
+        return FleetSynthesisMarks::Legacy;
+    }
+    let mut rounds = HashMap::new();
+    for line in lines {
+        // `<round> <slug>` — round FIRST so a slug containing spaces (peer dir
+        // names are not guaranteed space-free) survives the split intact.
+        let Some((round, slug)) = line.trim_end_matches(['\r', '\n']).split_once(' ') else {
+            continue;
+        };
+        let (Ok(round), false) = (round.parse::<u32>(), slug.is_empty()) else {
+            continue;
+        };
+        // Keep the HIGHEST on a duplicated slug: a lower mark would re-fire
+        // work that was already summarized.
+        rounds
+            .entry(slug.to_owned())
+            .and_modify(|existing: &mut u32| *existing = (*existing).max(round))
+            .or_insert(round);
+    }
+    FleetSynthesisMarks::Rounds(rounds)
+}
+
+/// Write the per-master stamp, replacing any previous record wholesale so a
+/// peer dropped from the fleet does not linger. Atomic — a torn stamp would
+/// read as `Legacy` and silently freeze the gate.
+fn write_peer_fleet_synthesis_marks(
+    peers_root: &Path,
+    master: &str,
+    marks: &[(String, u32)],
+) -> std::io::Result<()> {
+    let mut body = String::with_capacity(PEER_FLEET_MARKS_HEADER.len() + 1 + marks.len() * 24);
+    body.push_str(PEER_FLEET_MARKS_HEADER);
+    body.push('\n');
+    for (slug, round) in marks {
+        // A newline in a slug would forge extra records. Peer slugs come from
+        // directory names via `staged_peer_dir`, so this is belt-and-braces.
+        if slug.is_empty() || slug.contains(['\n', '\r']) {
+            continue;
+        }
+        body.push_str(&format!("{round} {slug}\n"));
+    }
+    crate::memory_consolidate::apply::atomic_write(
+        &peer_fleet_synthesized_stamp_path(peers_root, master),
+        &body,
+    )
+    .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
 /// Remove the per-master `.synthesized` marker (best-effort). Absent is not an
@@ -14488,7 +14624,7 @@ fn reset_peer_fleet_synthesis_if_cleared(peers_root: &Path, master: &str) {
 /// The caller MUST treat `None` as "can't determine this pass" and fail closed
 /// (never reset the marker, never fire), so a transient scan error is never
 /// mistaken for a cleared fleet.
-fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(String, bool)>> {
+fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<OwnedPeer>> {
     let read_dir = std::fs::read_dir(peers_root).ok()?;
     let mut owned = Vec::new();
     for entry in read_dir.flatten() {
@@ -14514,7 +14650,21 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(St
         if originator.trim() != master {
             continue;
         }
-        owned.push((slug, peer_io::peer_regular_file_exists(&dir, "result.md")));
+        let has_result = peer_io::peer_regular_file_exists(&dir, "result.md");
+        // #2024: how many rounds this peer has DELIVERED. Versioned results
+        // (`result-<n>.md`) have existed since #435, but a peer whose result
+        // predates them has only the bare `result.md` — floor it at 1 so it
+        // can still exceed a mark of 0 and synthesize at all.
+        let round = if has_result {
+            crate::peers::count_peer_result_versions(&dir).max(1)
+        } else {
+            0
+        };
+        owned.push(OwnedPeer {
+            slug,
+            has_result,
+            round,
+        });
     }
     Some(owned)
 }
@@ -14529,13 +14679,18 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<(St
 /// pending-continuation sweep surfaces the master even without an active
 /// goal/loop.
 ///
-/// EXACTLY ONCE: the per-master `.synthesized` marker is an existence gate. On
-/// fire the marker is CREATED FIRST (atomically); the continuation is enqueued
-/// ONLY if that write succeeds, so no synthesis fires without a durable marker.
-/// While the marker exists the fleet never re-fires — a newer result or an
-/// added peer does NOT re-synthesize. The marker is cleared only when the fleet
-/// is fully retired (see [`reset_peer_fleet_synthesis_if_cleared`], called from
-/// `peer_close`), letting a later fresh fleet fire once.
+/// EXACTLY ONCE PER ROUND (#2024): the per-master `.synthesized` stamp records
+/// the highest round of each peer already summarized. On fire the marks are
+/// ADVANCED FIRST (atomically); the continuation is enqueued ONLY if that write
+/// succeeds, so no synthesis fires without a durable record. A peer that
+/// delivers a round past its mark — or a peer with no mark at all — re-arms the
+/// gate; a fleet with nothing new holds. The stamp is dropped when the fleet is
+/// fully retired (see [`reset_peer_fleet_synthesis_if_cleared`], called from
+/// `peer_close`), so a later fresh fleet starts from a clean record.
+///
+/// Before #2024 the stamp was a bare existence marker, which made the unit
+/// "once per FLEET": a master that put its peers through a second round got no
+/// second write-up unless every peer was closed first.
 ///
 /// LOOP SAFETY: this fires ONLY on a `peer-<slug>` session's terminal. The
 /// synthesis turn runs on the MASTER session (not a peer), and `peer_gather`
@@ -14661,10 +14816,22 @@ async fn evaluate_and_enqueue_fleet_synthesis(
     let Some(owned) = collect_owned_peer_results(peers_root, master) else {
         return;
     };
+    // #2024: what this master has already written up, per peer. Read ONCE for
+    // the whole fleet so every peer is judged against the same snapshot.
+    let marks = read_peer_fleet_synthesis_marks(peers_root, master);
     let mut owned_slugs: Vec<String> = Vec::with_capacity(owned.len());
+    // The marks to persist if this evaluation fires: each peer AT THE ROUND
+    // this pass observed, so the write can never claim a round the synthesis
+    // did not actually cover.
+    let mut fired_marks: Vec<(String, u32)> = Vec::with_capacity(owned.len());
     let peers: Vec<OwnedPeerState> = owned
         .into_iter()
-        .map(|(slug, has_result)| {
+        .map(|peer| {
+            let OwnedPeer {
+                slug,
+                has_result,
+                round,
+            } = peer;
             // Resolve the wire session ONCE; reuse it for both the active-turn
             // check and the in-flight-injection check.
             let wire_session = peer_wire_registry().resolve(&peer_wire_key(profile_id, &slug));
@@ -14677,10 +14844,14 @@ async fn evaluate_and_enqueue_fleet_synthesis(
             // reads; the recent-claim check closes the pop-vs-snapshot window.
             let inflight_injection =
                 orchestrator.peer_has_inflight_send_input(profile_id, &slug, wire_session.as_ref());
+            let synthesized_round = synthesized_round_for(&marks, &slug, round);
+            fired_marks.push((slug.clone(), round.max(synthesized_round)));
             owned_slugs.push(slug);
             OwnedPeerState {
                 has_result,
                 mid_turn: active_mid_turn || inflight_injection,
+                round,
+                synthesized_round,
             }
         })
         .collect();
@@ -14697,22 +14868,16 @@ async fn evaluate_and_enqueue_fleet_synthesis(
             orchestrator.clear_peer_fleet_synthesis_claim(&master_key);
         }
         FleetSynthesisDecision::Fire => {
-            // Write the `.synthesized` marker FIRST (durably, atomically). If it
-            // fails, do NOT enqueue: no fire without a persisted marker. The
-            // content is a debug timestamp; only existence gates. Concurrent
-            // terminals writing the same marker are safe (idempotent), and the
-            // per-master dedupe key collapses the paired enqueue.
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or(0);
-            if let Err(err) = crate::memory_consolidate::apply::atomic_write(
-                &peer_fleet_synthesized_stamp_path(peers_root, master),
-                &now_unix.to_string(),
-            ) {
+            // Advance the per-peer marks FIRST (durably, atomically). If the
+            // write fails, do NOT enqueue: a fire without a persisted mark would
+            // re-fire the same rounds on the next terminal. Concurrent terminals
+            // writing the same marks are safe (same observed rounds, atomic
+            // replace), and the per-master dedupe key collapses the paired
+            // enqueue.
+            if let Err(err) = write_peer_fleet_synthesis_marks(peers_root, master, &fired_marks) {
                 tracing::warn!(
                     ?err,
-                    "peer fleet synthesis: .synthesized marker write failed; not enqueuing"
+                    "peer fleet synthesis: .synthesized marks write failed; not enqueuing"
                 );
                 return;
             }
