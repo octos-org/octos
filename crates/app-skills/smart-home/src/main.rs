@@ -3,9 +3,12 @@
 //!
 //! Protocol: `./smart_home <tool_name>` with JSON on stdin, JSON on stdout.
 //!
-//! Deliberately does not proxy through the running octos server: like
-//! `account-manager`, this reads the profile JSON directly from
-//! `$OCTOS_HOME/profiles/<id>.json` and talks to the bridge itself,
+//! Bridge config comes from `SMART_HOME_BRIDGE_URL` / `SMART_HOME_BRIDGE_TOKEN`
+//! env vars when set (forwarded by the gateway/serve runtime from the resolved
+//! profile, or exported by hand in `octos chat`), falling back to reading the
+//! profile JSON directly from `$OCTOS_HOME/profiles/<id>.json` (same
+//! convention as the `account-manager` skill). Either way this talks to the
+//! bridge itself rather than proxying through the running octos server,
 //! mirroring the wire contract in
 //! `crates/octos-cli/src/api/smart_home_bridge.rs` (`GET {base}/devices`,
 //! `POST {base}/devices/{id}` form-encoded, Bearer auth, same
@@ -111,10 +114,36 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from))
 }
 
-/// Reads `$OCTOS_HOME/profiles/$OCTOS_PROFILE_ID.json` directly (same
-/// convention as the `account-manager` skill) and resolves the profile's
-/// smart-home bridge config from it.
+/// Resolves the bridge config, in precedence order:
+///
+/// 1. `SMART_HOME_BRIDGE_URL` / `SMART_HOME_BRIDGE_TOKEN` env vars — the
+///    gateway/serve runtime forwards these from the RESOLVED profile
+///    (parent + defaults merged, keychain markers resolved) via
+///    `profile_plugin_env`, and `octos chat` users can export them by hand.
+/// 2. `$OCTOS_HOME/profiles/$OCTOS_PROFILE_ID.json` read directly (same
+///    convention as the `account-manager` skill) — fallback for runtimes
+///    that predate the env forwarding. This path cannot see parent/defaults
+///    inheritance or keychain-stored tokens.
 fn resolve_bridge() -> Result<BridgeConfig, String> {
+    if let Some(config) = resolve_bridge_from_env() {
+        return Ok(config);
+    }
+    resolve_bridge_from_profile()
+}
+
+/// Precedence step 1: runtime-forwarded env vars.
+fn resolve_bridge_from_env() -> Option<BridgeConfig> {
+    let base_url = std::env::var("SMART_HOME_BRIDGE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let token = std::env::var("SMART_HOME_BRIDGE_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
+    Some(BridgeConfig { base_url, token })
+}
+
+/// Precedence step 2: direct profile-JSON read.
+fn resolve_bridge_from_profile() -> Result<BridgeConfig, String> {
     let octos_home = match std::env::var("OCTOS_HOME") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => match home_dir() {
@@ -128,9 +157,9 @@ fn resolve_bridge() -> Result<BridgeConfig, String> {
     let profile_id = match std::env::var("OCTOS_PROFILE_ID") {
         Ok(v) if !v.is_empty() => v,
         _ => {
-            return Err(
-                "OCTOS_PROFILE_ID is not set — this tool must be run from a gateway".to_string(),
-            )
+            return Err("OCTOS_PROFILE_ID is not set — run from a gateway, or set \
+                 SMART_HOME_BRIDGE_URL (and SMART_HOME_BRIDGE_TOKEN) directly"
+                .to_string())
         }
     };
 

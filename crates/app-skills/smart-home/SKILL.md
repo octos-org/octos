@@ -1,7 +1,7 @@
 ---
 name: smart-home
 description: List and control smart-home devices (lights, thermostats, switches, covers, speakers) via the profile's configured bridge. Triggers: smart home, turn on/off, lights, thermostat, dim, brightness, temperature, unlock, devices, 智能家居, 开灯, 关灯, 空调, 窗帘, 灯光, 设备.
-version: 1.0.0
+version: 1.1.0
 author: octos
 always: false
 ---
@@ -13,9 +13,10 @@ profile (e.g. Home Assistant or a compatible gateway). Camera video is not
 available through this skill — it is a UI-only feature in the octos-web
 dashboard.
 
-Requires a bridge to be configured for the profile first (Settings →
-Smart Home). If it isn't configured yet, tools will report that clearly
-instead of failing silently.
+Requires a bridge to be configured for the profile first (dashboard:
+Settings → Smart Home). In `octos chat`, set the `SMART_HOME_BRIDGE_URL`
+(and optionally `SMART_HOME_BRIDGE_TOKEN`) env vars instead. If no bridge
+is configured, tools will report that clearly instead of failing silently.
 
 ## Tools
 

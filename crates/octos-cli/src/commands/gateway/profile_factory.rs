@@ -191,6 +191,19 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
         }
     }
 
+    // Smart-home bridge: forward the RESOLVED bridge config to the
+    // `smart-home` skill as `SMART_HOME_BRIDGE_URL` / `SMART_HOME_BRIDGE_TOKEN`.
+    // Callers pass the runtime-resolved profile (parent + defaults merged) and
+    // `resolved_env_vars` is keychain-aware, so this covers two cases the
+    // skill's own profile-JSON fallback cannot: a sub-account inheriting
+    // `config.smart_home` from its parent, and a `token_env` whose value is a
+    // keychain marker.
+    if let Some(smart_home) = profile.config.smart_home.as_ref() {
+        for (key, value) in smart_home.to_env_vars(&resolved_env_vars) {
+            push_env_once(&mut env, key, value);
+        }
+    }
+
     env
 }
 
@@ -1161,6 +1174,59 @@ mod tests {
         assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
         assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
+    }
+
+    #[test]
+    fn profile_plugin_env_forwards_smart_home_bridge_config_when_configured() {
+        let profile = UserProfile {
+            id: "shenv".to_string(),
+            name: "SHENV".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                smart_home: Some(crate::profiles::SmartHomeConfig {
+                    bridge_url: Some("http://192.168.1.50:8787".to_string()),
+                    token: None,
+                    token_env: Some("SH_BRIDGE_TOKEN".to_string()),
+                }),
+                env_vars: [("SH_BRIDGE_TOKEN".to_string(), "bridge-secret".to_string())].into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(env.contains(&(
+            "SMART_HOME_BRIDGE_URL".to_string(),
+            "http://192.168.1.50:8787".to_string()
+        )));
+        assert!(env.contains(&(
+            "SMART_HOME_BRIDGE_TOKEN".to_string(),
+            "bridge-secret".to_string()
+        )));
+    }
+
+    #[test]
+    fn profile_plugin_env_omits_smart_home_vars_when_not_configured() {
+        let profile = UserProfile {
+            id: "shnone".to_string(),
+            name: "SHNONE".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(!env.iter().any(|(key, _)| key.starts_with("SMART_HOME_")));
     }
 
     #[test]
