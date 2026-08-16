@@ -29739,22 +29739,22 @@ async fn run_standalone_turn(
                 Arc::new(move |event: PeerStagedEvent| {
                     let registry_key = peer_wire_key(&peer_task_profile, &event.slug);
                     // `register` returns an EMPTY-STRING sentinel when the
-                    // per-session task cap rejects it. Binding that would make
-                    // the close path try to retire a task that never existed.
-                    let task_id = peer_supervisor.register(
-                        "peer_handoff",
-                        &registry_key,
-                        Some(&event.session_id.0),
-                    );
-                    if task_id.is_empty() {
+                    // supervisor refuses. Binding that would make the close path
+                    // try to retire a task that never existed. See
+                    // `bind_peer_supervised_task` for the binding contract.
+                    if bind_peer_supervised_task(
+                        &peer_supervisor,
+                        registry_key,
+                        &event.session_id.0,
+                    )
+                    .is_none()
+                    {
                         tracing::warn!(
                             slug = %event.slug,
                             master = %event.session_id,
-                            "peer task registration rejected by the supervisor cap; \
+                            "peer task registration refused by the supervisor; \
                              peer runs UNSUPERVISED (no task row, no cancel token)"
                         );
-                    } else {
-                        peer_task_registry().bind(registry_key, task_id);
                     }
                     let _ = send_notification_durable(
                         &peer_ws,
@@ -29960,11 +29960,7 @@ async fn run_standalone_turn(
                     // a no-op rather than re-marking a terminal task (or, worse,
                     // a task id later reused). A peer with no binding either
                     // predates this wiring or was rejected by the task cap.
-                    if let Some(task_id) =
-                        peer_task_registry().take(&peer_wire_key(&event.profile_id, &event.slug))
-                    {
-                        close_supervisor.mark_completed(&task_id, Vec::new());
-                    }
+                    retire_peer_supervised_task(&close_supervisor, &event.profile_id, &event.slug);
                     let _ = send_notification_durable(
                         &close_ws,
                         &close_ledger,
