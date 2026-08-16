@@ -1646,13 +1646,48 @@ impl SessionContextStatusStore {
 /// All terminal-event emission sites must lock the state, observe `Active` or
 /// `Interrupting`, and atomically transition to `Terminal(_)` before sending.
 /// Any path that sees a `Terminal(_)` state is a no-op (lost the race).
+/// What caused a turn to be interrupted.
+///
+/// The turn runtime reports this to the client on `turn/error`, so it has to
+/// name the ACTUAL cause. `peer_close` deliberately aborts the closed peer's
+/// in-flight turn over the same `interrupt_tx` path `turn/interrupt` uses
+/// (see `interrupt_closed_peer_turn`), and the message was hardcoded to
+/// "interrupted by client" — so a peer whose review was aborted mid-flight
+/// reported an interrupt from a client that had sent nothing, pointing an
+/// investigator at the wrong subsystem. Observed live: a peer three tool calls
+/// into a 550-line review, closed by its master, blamed the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptOrigin {
+    /// `turn/interrupt` from the connected client.
+    Client,
+    /// `peer_close` retired the peer while this turn was still running.
+    PeerClose,
+}
+
+impl InterruptOrigin {
+    /// The `turn/error` message for this origin.
+    fn message(self) -> &'static str {
+        match self {
+            Self::Client => "turn interrupted by client",
+            Self::PeerClose => {
+                "turn interrupted by peer_close — the peer was retired while this \
+                 turn was still running, so its in-flight work was discarded"
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TurnState {
     /// Turn is running normally; eligible for interrupt.
     Active,
     /// Handler captured an interrupt request and is waiting for the task to
-    /// emit the terminal event and signal `ack`.
-    Interrupting { ack: oneshot::Sender<()> },
+    /// emit the terminal event and signal `ack`. `origin` records WHO asked, so
+    /// the terminal event can name the real cause.
+    Interrupting {
+        ack: oneshot::Sender<()>,
+        origin: InterruptOrigin,
+    },
     /// Terminal state — exactly one terminal event has been emitted.
     Terminal(TerminalReason),
 }
@@ -12940,6 +12975,57 @@ mod peer_finding_evidence_tests {
 }
 
 #[cfg(test)]
+mod peer_interrupt_attribution_tests {
+    use super::*;
+
+    /// An interrupt must name its real cause on the wire.
+    ///
+    /// `peer_close` deliberately aborts the closed peer's in-flight turn over
+    /// the same `interrupt_tx` path `turn/interrupt` uses, and the terminal
+    /// message was hardcoded "turn interrupted by client". Observed live: a
+    /// peer three `read_file` calls into a 550-line security review was closed
+    /// by its master and reported an interrupt from a client that had sent
+    /// nothing — which sends an investigator straight at the wrong subsystem.
+    #[test]
+    fn peer_close_and_client_interrupts_report_different_causes() {
+        let client = InterruptOrigin::Client.message();
+        let peer_close = InterruptOrigin::PeerClose.message();
+
+        assert_ne!(
+            client, peer_close,
+            "the two origins must be distinguishable on the wire — one message \
+             for both is what made a peer_close abort look like a client action"
+        );
+        assert!(
+            peer_close.contains("peer_close"),
+            "the peer-close message must NAME peer_close so the reader can find \
+             the cause: {peer_close}"
+        );
+        assert!(
+            !peer_close.contains("by client"),
+            "the peer-close message must not blame the client: {peer_close}"
+        );
+        assert!(
+            client.contains("client"),
+            "a genuine client interrupt still reads as one: {client}"
+        );
+    }
+
+    /// A peer closed while WORKING loses that turn's output — the message says
+    /// so, because the tokens are already spent and the master will have to
+    /// re-dispatch (it re-staged the review as `-v2` in the live run).
+    #[test]
+    fn the_peer_close_message_says_in_flight_work_was_discarded() {
+        let message = InterruptOrigin::PeerClose.message();
+        assert!(
+            message.contains("discarded") || message.contains("still running"),
+            "closing a working peer destroys in-flight work; the terminal event \
+             is the only place a client learns that: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod peer_awaiting_wake_tests {
     use super::*;
     use crate::autonomy::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
@@ -14134,7 +14220,12 @@ fn interrupt_closed_peer_turn(profile_id: &str, slug: &str) {
     let slug = slug.to_owned();
     runtime.spawn(async move {
         let active_turns = active_turns_registry();
-        let outcome = interrupt_active_turn_for_session(&active_turns, &peer_session).await;
+        let outcome = interrupt_active_turn_for_session(
+            &active_turns,
+            &peer_session,
+            InterruptOrigin::PeerClose,
+        )
+        .await;
         tracing::debug!(
             slug = %slug,
             session = %peer_session,
@@ -20497,7 +20588,7 @@ async fn decide_interrupt(
     let state_arc = active.state.clone();
     let interrupt_tx_arc = active.interrupt_tx.clone();
     drop(registry);
-    capture_turn_interrupt(state_arc, interrupt_tx_arc).await
+    capture_turn_interrupt(state_arc, interrupt_tx_arc, InterruptOrigin::Client).await
 }
 
 /// #1842(a) — interrupt WHATEVER turn is currently in flight for `session_id`,
@@ -20512,6 +20603,7 @@ async fn decide_interrupt(
 async fn interrupt_active_turn_for_session(
     active_turns: &SharedActiveTurns,
     session_id: &SessionKey,
+    origin: InterruptOrigin,
 ) -> InterruptOutcome {
     let registry = active_turns.lock().await;
     let Some(active) = registry.get(session_id) else {
@@ -20520,7 +20612,7 @@ async fn interrupt_active_turn_for_session(
     let state_arc = active.state.clone();
     let interrupt_tx_arc = active.interrupt_tx.clone();
     drop(registry);
-    capture_turn_interrupt(state_arc, interrupt_tx_arc).await
+    capture_turn_interrupt(state_arc, interrupt_tx_arc, origin).await
 }
 
 /// The interrupt CAPTURE routine shared by `turn/interrupt` and the #1842(a)
@@ -20531,9 +20623,23 @@ async fn interrupt_active_turn_for_session(
 /// inside `run_standalone_turn` is gated on this same mutex via
 /// `try_emit_terminal`, so the two paths can't both transition `Active` → a
 /// terminal state.
+/// The origin captured when this turn was interrupted.
+///
+/// Read BEFORE `try_emit_terminal`, which takes the same state lock. Defaults
+/// to `Client` for any non-`Interrupting` state: the only callers are on the
+/// interrupt path, so a race that already moved the state is reported as the
+/// common case rather than mislabelled `PeerClose`.
+async fn captured_interrupt_origin(state: &Arc<TokioMutex<TurnState>>) -> InterruptOrigin {
+    match &*state.lock().await {
+        TurnState::Interrupting { origin, .. } => *origin,
+        _ => InterruptOrigin::Client,
+    }
+}
+
 async fn capture_turn_interrupt(
     state_arc: Arc<TokioMutex<TurnState>>,
     interrupt_tx_arc: Arc<TokioMutex<Option<mpsc::Sender<()>>>>,
+    origin: InterruptOrigin,
 ) -> InterruptOutcome {
     let mut state = state_arc.lock().await;
     match &*state {
@@ -20541,7 +20647,10 @@ async fn capture_turn_interrupt(
         TurnState::Interrupting { .. } => InterruptOutcome::AlreadyInterrupting,
         TurnState::Active => {
             let (ack_tx, ack_rx) = oneshot::channel();
-            *state = TurnState::Interrupting { ack: ack_tx };
+            *state = TurnState::Interrupting {
+                ack: ack_tx,
+                origin,
+            };
             drop(state);
             // Best-effort signal — capacity-1 channel; sending fails only if
             // the receiver has already been dropped (turn task is gone). Even
@@ -25995,7 +26104,10 @@ async fn run_m9_fixture_turn(
                 &ledger,
                 &session_id,
                 &turn_id,
-                Some(("interrupted", "turn interrupted by client")),
+                Some((
+                    "interrupted",
+                    captured_interrupt_origin(&turn_state).await.message(),
+                )),
                 None,
             )
             .await;
@@ -32385,7 +32497,10 @@ async fn run_standalone_turn(
             &ledger,
             &session_id,
             &turn_id,
-            Some(("interrupted", "turn interrupted by client")),
+            Some((
+                "interrupted",
+                captured_interrupt_origin(&turn_state).await.message(),
+            )),
             None,
         )
         .await;
@@ -33261,7 +33376,7 @@ async fn transition_to_terminal(
     let mut state = turn_state.lock().await;
     let (reason, ack) = match std::mem::replace(&mut *state, TurnState::Active) {
         TurnState::Active => (expected, None),
-        TurnState::Interrupting { ack } => (TerminalReason::Interrupted, Some(ack)),
+        TurnState::Interrupting { ack, .. } => (TerminalReason::Interrupted, Some(ack)),
         TurnState::Terminal(prior) => {
             *state = TurnState::Terminal(prior);
             return None;

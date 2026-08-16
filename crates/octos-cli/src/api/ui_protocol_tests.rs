@@ -17870,7 +17870,10 @@ async fn interrupt_then_completion_race_emits_one_terminal() {
                 let mut state = s_b.lock().await;
                 if matches!(*state, TurnState::Active) {
                     let (ack_tx, _ack_rx) = oneshot::channel();
-                    *state = TurnState::Interrupting { ack: ack_tx };
+                    *state = TurnState::Interrupting {
+                        ack: ack_tx,
+                        origin: InterruptOrigin::Client,
+                    };
                     true
                 } else {
                     false
