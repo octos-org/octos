@@ -46,6 +46,13 @@
       { "id": "gemini-2.0-flash-001", "input": 0.1, "output": 0.4, "max_output": 8192 }
     ]
   },
+  "vertex": {
+    "env": "VERTEX_SA_JSON",
+    "models": [
+      { "id": "gemini-2.5-flash", "input": 0.15, "output": 2.5, "max_output": 65536 },
+      { "id": "gemini-2.5-pro", "input": 1.25, "output": 10.0, "max_output": 65536 }
+    ]
+  },
   "r9s": {
     "env": "R9S_API_KEY",
     "models": [
