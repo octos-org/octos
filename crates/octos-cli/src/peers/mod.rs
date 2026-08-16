@@ -153,14 +153,27 @@ pub(crate) fn peer_wire_registry() -> &'static PeerWireRegistry {
 /// so both registries are addressed identically; the VALUE is the supervisor's
 /// task id. Process-global for the same reason the wire registry is: a peer is
 /// staged on one path and retired on another.
+/// What the registry holds for one staged peer: the supervisor task id, plus
+/// the liveness lease that keeps the per-turn orphan sweep off it (#2035).
+///
+/// The lease lives HERE, for exactly the peer's supervised lifetime — bound at
+/// staging, dropped by `take` on the close path. Holding it anywhere shorter
+/// (the staging closure, the turn's supervisor) would put it out of scope
+/// while the peer is still working, which is the defect.
+pub(crate) struct PeerTaskBinding {
+    task_id: String,
+    _liveness: octos_agent::TaskLivenessLease,
+}
+
 #[derive(Default)]
 pub(crate) struct PeerTaskRegistry {
-    pub(crate) by_key: std::sync::Mutex<HashMap<String, String>>,
+    pub(crate) by_key: std::sync::Mutex<HashMap<String, PeerTaskBinding>>,
 }
 
 impl PeerTaskRegistry {
-    /// Bind `key` to a supervisor task id. A re-stage under the same key
-    /// overwrites, mirroring [`PeerWireRegistry::register`]'s latest-open-wins.
+    /// Bind `key` to a supervisor task id and take a liveness lease on it. A
+    /// re-stage under the same key overwrites, mirroring
+    /// [`PeerWireRegistry::register`]'s latest-open-wins.
     pub(crate) fn bind(&self, key: String, task_id: String) {
         let mut map = self
             .by_key
@@ -174,24 +187,80 @@ impl PeerTaskRegistry {
             );
             return;
         }
-        map.insert(key, task_id);
+        // A re-stage that resolves to the SAME task id must keep the existing
+        // lease: replacing it would drop the old one AFTER the new insert, and
+        // `Drop` clears the live-set entry unconditionally — briefly unleasing
+        // a task that is still live. Different id ⇒ the old peer is superseded
+        // and its lease should indeed be released.
+        if map.get(&key).is_some_and(|bound| bound.task_id == task_id) {
+            return;
+        }
+        let binding = PeerTaskBinding {
+            _liveness: octos_agent::TaskLivenessLease::new(task_id.clone()),
+            task_id,
+        };
+        map.insert(key, binding);
     }
 
-    /// Take the task id for `key`, removing the binding. Retirement is
-    /// exactly-once: a second close finds nothing and must NOT re-mark a task
-    /// terminal (the supervisor's terminal guard would reject it anyway, but a
-    /// second `mark_completed` would also race a task id later reused).
+    /// Take the task id for `key`, removing the binding and releasing its
+    /// liveness lease. Retirement is exactly-once: a second close finds nothing
+    /// and must NOT re-mark a task terminal (the supervisor's terminal guard
+    /// would reject it anyway, but a second `mark_completed` would also race a
+    /// task id later reused).
     pub(crate) fn take(&self, key: &str) -> Option<String> {
         self.by_key
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(key)
+            .map(|bound| bound.task_id)
     }
 }
 
 pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
     static PEER_TASK_REGISTRY: OnceLock<PeerTaskRegistry> = OnceLock::new();
     PEER_TASK_REGISTRY.get_or_init(PeerTaskRegistry::default)
+}
+
+/// #1868 Phase 1 — bind a staged peer to a supervised task.
+///
+/// The task is registered against the MASTER's session, not the peer's: it
+/// represents "this master has a peer working for it", which is exactly the
+/// question liveness asks.
+///
+/// Returns `None` when the supervisor refuses the registration — `register`
+/// signals that with an EMPTY-STRING sentinel, and binding it would make the
+/// close path try to retire a task that never existed. The peer then runs
+/// UNSUPERVISED (no task row, no cancel token); callers should say so loudly.
+pub(crate) fn bind_peer_supervised_task(
+    supervisor: &octos_agent::TaskSupervisor,
+    registry_key: String,
+    master_session: &str,
+) -> Option<String> {
+    let task_id = supervisor.register("peer_handoff", &registry_key, Some(master_session));
+    if task_id.is_empty() {
+        return None;
+    }
+    peer_task_registry().bind(registry_key, task_id.clone());
+    Some(task_id)
+}
+
+/// #1868 Phase 1 — retire the task bound at staging, on the CLOSE path only.
+///
+/// Deliberately not called on turn terminal: a peer runs many turns and would
+/// otherwise retire after its first, leaving every later turn unsupervised
+/// while the master still believed a peer was working for it.
+///
+/// Retirement is exactly-once — `take` removes the binding, so a second close
+/// finds nothing rather than re-marking a terminal task (or, worse, a task id
+/// later reused). Returns the retired task id.
+pub(crate) fn retire_peer_supervised_task(
+    supervisor: &octos_agent::TaskSupervisor,
+    profile_id: &str,
+    slug: &str,
+) -> Option<String> {
+    let task_id = peer_task_registry().take(&peer_wire_key(profile_id, slug))?;
+    supervisor.mark_completed(&task_id, Vec::new());
+    Some(task_id)
 }
 
 /// Registry key for a peer session: `"{profile}:peer:{slug}"` (mirrors the
@@ -2706,6 +2775,171 @@ pub(crate) fn build_peer_list_callback(
 #[cfg(test)]
 mod peer_task_registry_tests {
     use super::*;
+
+    /// #1868 Phase 1 — staging a peer must REGISTER it with the supervisor,
+    /// keyed to the MASTER's session.
+    ///
+    /// Before this wiring, peers were never registered at all: the master's
+    /// task count never showed a peer, peers had no cancel token, and the
+    /// in-flight liveness rule (#2014) had to read `state.agents` directly
+    /// instead of asking the supervisor. The registry's own bind/take was
+    /// covered; the call site that fills it was not.
+    #[test]
+    fn peer_staging_binds_a_supervised_task_keyed_to_the_master_session() {
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let master = "wiring-a:local:tui";
+        let key = peer_wire_key("wiring-a", "auditor");
+
+        let task_id = bind_peer_supervised_task(&supervisor, key, master)
+            .expect("staging a peer must bind a supervised task");
+
+        assert!(!task_id.is_empty(), "an empty sentinel must never be bound");
+        let active = supervisor.get_active_tasks();
+        assert!(
+            active.iter().any(|task| task.id == task_id),
+            "the bound task must be ACTIVE on the supervisor — that is what \
+             liveness queries; got {active:?}"
+        );
+        assert_eq!(
+            retire_peer_supervised_task(&supervisor, "wiring-a", "auditor").as_deref(),
+            Some(task_id.as_str()),
+            "the binding must be addressable by (profile, slug) on the close path"
+        );
+    }
+
+    /// #2035 — a staged peer must survive the per-turn orphan sweep.
+    ///
+    /// Enrolling a peer is worthless if the next turn immediately un-enrols it.
+    /// The WS turn path builds a fresh `TaskSupervisor` every turn and calls
+    /// `enable_persistence` over the SHARED per-session ledger; its orphan
+    /// sweep reaps every non-terminal row that is not in the process-global
+    /// live-set. A peer row is non-terminal for its whole life (it retires on
+    /// `peer_close`, not on turn terminal) and its worker is a sovereign
+    /// session the CLIENT drives, so nothing arms a `TaskTerminalGuard` for it.
+    ///
+    /// Observed live on mini5 (`80cec9254`): both peers were stamped
+    /// `failed / "orphaned across restart"` six seconds after staging, then ran
+    /// to completion and wrote real findings. `agent/list` showed them dead the
+    /// whole time, and each bogus terminal queued a master continuation.
+    ///
+    /// The pre-existing wiring tests missed this because they build a bare
+    /// supervisor with no persistence, so no sweep ever runs.
+    #[test]
+    fn a_staged_peer_survives_the_per_turn_orphan_sweep() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger = dir.path().join("tasks.jsonl");
+
+        let staging_turn = octos_agent::TaskSupervisor::new();
+        staging_turn.enable_persistence(&ledger).unwrap();
+        let key = peer_wire_key("sweep-a", "auditor");
+        let task_id = bind_peer_supervised_task(&staging_turn, key, "sweep-a:local:tui")
+            .expect("staging must bind");
+
+        // The master takes further turns while the peer works. Each one
+        // rebuilds a supervisor over the same ledger and sweeps.
+        for _ in 0..3 {
+            let next_turn = octos_agent::TaskSupervisor::new();
+            next_turn.enable_persistence(&ledger).unwrap();
+            let row = next_turn.get_task(&task_id).expect("peer row restored");
+            assert_ne!(
+                row.error.as_deref(),
+                Some("orphaned across restart"),
+                "a working peer must not be reaped by the per-turn sweep"
+            );
+        }
+
+        retire_peer_supervised_task(&staging_turn, "sweep-a", "auditor");
+    }
+
+    /// #2035 — retirement must release the liveness lease.
+    ///
+    /// The live-set is process-global and never garbage-collected, so a lease
+    /// that outlives its peer both leaks and, worse, would protect a task id
+    /// from a sweep it should no longer be exempt from.
+    #[test]
+    fn peer_retirement_releases_the_liveness_lease() {
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let key = peer_wire_key("sweep-b", "auditor");
+        let task_id = bind_peer_supervised_task(&supervisor, key, "sweep-b:local:tui")
+            .expect("staging must bind");
+        assert!(
+            octos_agent::task_is_live(&task_id),
+            "a staged peer holds a liveness lease"
+        );
+
+        retire_peer_supervised_task(&supervisor, "sweep-b", "auditor");
+
+        assert!(
+            !octos_agent::task_is_live(&task_id),
+            "closing a peer must release its lease, not leak it"
+        );
+    }
+
+    /// #1868 Phase 1 — the close path retires the task, exactly once.
+    ///
+    /// `emit_closed` can fire more than once for one peer (a close racing a
+    /// replayed durable notification). The second retirement must find nothing
+    /// rather than mark a terminal task again — task ids are recycled, so a
+    /// late second `mark_completed` could land on an unrelated task.
+    #[test]
+    fn peer_close_retires_the_supervised_task_exactly_once() {
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let key = peer_wire_key("wiring-b", "auditor");
+        let task_id = bind_peer_supervised_task(&supervisor, key, "wiring-b:local:tui")
+            .expect("staging must bind");
+
+        assert_eq!(
+            retire_peer_supervised_task(&supervisor, "wiring-b", "auditor").as_deref(),
+            Some(task_id.as_str()),
+            "the first close retires the bound task"
+        );
+        assert_eq!(
+            retire_peer_supervised_task(&supervisor, "wiring-b", "auditor"),
+            None,
+            "a second close must be a no-op, not a second mark_completed"
+        );
+        assert!(
+            !supervisor
+                .get_active_tasks()
+                .iter()
+                .any(|task| task.id == task_id),
+            "the retired task must no longer be active"
+        );
+    }
+
+    /// #1868 Phase 1 — retirement belongs to CLOSE, not to turn terminal.
+    ///
+    /// A peer runs many turns. Retiring on turn terminal would drop the task
+    /// after its first turn, so every later turn would run unsupervised while
+    /// the master still believed a peer was working for it — the master would
+    /// look idle to liveness with a peer mid-turn. This pins the lifetime:
+    /// the task stays active across turns and dies only on close.
+    #[test]
+    fn a_peer_supervised_task_survives_many_turns_and_dies_only_on_close() {
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let key = peer_wire_key("wiring-c", "auditor");
+        let task_id = bind_peer_supervised_task(&supervisor, key, "wiring-c:local:tui")
+            .expect("staging must bind");
+
+        // Three peer turns come and go. None of them touches the binding —
+        // if a future refactor retires on turn terminal, this loop is where it
+        // shows up.
+        for turn in 1..=3 {
+            assert!(
+                supervisor
+                    .get_active_tasks()
+                    .iter()
+                    .any(|task| task.id == task_id),
+                "peer task must still be supervised after turn {turn}"
+            );
+        }
+
+        assert_eq!(
+            retire_peer_supervised_task(&supervisor, "wiring-c", "auditor").as_deref(),
+            Some(task_id.as_str()),
+            "close — and only close — retires the task"
+        );
+    }
 
     /// #1868 Phase 1 — retirement is EXACTLY ONCE.
     ///

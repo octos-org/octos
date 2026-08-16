@@ -188,8 +188,9 @@ pub use swarm::{
 };
 pub use task_supervisor::{
     BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
-    TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState, TaskStatus,
-    TaskSupervisor, TaskTerminalGuard, TerminalEvent, TerminalOutcome, parse_alternatives,
+    TaskCancelToken, TaskLifecycleState, TaskLivenessLease, TaskRelaunchError, TaskRuntimeState,
+    TaskStatus, TaskSupervisor, TaskTerminalGuard, TerminalEvent, TerminalOutcome,
+    parse_alternatives, task_is_live,
 };
 pub use tools::{
     AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,
