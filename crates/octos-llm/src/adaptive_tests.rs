@@ -879,6 +879,7 @@ async fn test_qos_ranking_changes_lane_selection() {
         ModelCatalogEntry {
             provider: "priority-primary/m1".into(),
             model_type: ModelType::Strong,
+            is_family_default: false,
             stability: 1.0,
             tool_avg_ms: 200,
             p95_ms: 300,
@@ -892,6 +893,7 @@ async fn test_qos_ranking_changes_lane_selection() {
         ModelCatalogEntry {
             provider: "quality-fallback/m2".into(),
             model_type: ModelType::Strong,
+            is_family_default: false,
             stability: 1.0,
             tool_avg_ms: 200,
             p95_ms: 300,
@@ -939,6 +941,7 @@ fn seed_catalog_matches_host_tagged_lane_to_bare_catalog_key() {
     router.seed_catalog(&[ModelCatalogEntry {
         provider: "moonshot/kimi-k2.5".into(),
         model_type: ModelType::Strong,
+        is_family_default: false,
         stability: 1.0,
         tool_avg_ms: 200,
         p95_ms: 300,
@@ -968,6 +971,7 @@ fn test_derive_cold_start_catalog_assigns_non_zero_scores() {
             ModelCatalogEntry {
                 provider: "moonshot/kimi-k2.5".into(),
                 model_type: ModelType::Strong,
+                is_family_default: false,
                 stability: 0.93,
                 tool_avg_ms: 1200,
                 p95_ms: 2200,
@@ -981,6 +985,7 @@ fn test_derive_cold_start_catalog_assigns_non_zero_scores() {
             ModelCatalogEntry {
                 provider: "deepseek/deepseek-chat".into(),
                 model_type: ModelType::Fast,
+                is_family_default: false,
                 stability: 1.0,
                 tool_avg_ms: 1400,
                 p95_ms: 2600,

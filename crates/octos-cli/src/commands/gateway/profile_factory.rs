@@ -548,7 +548,7 @@ pub(crate) fn build_synthesis_config(
         .clone()
         .or_else(|| {
             octos_llm::registry::lookup(provider_name)
-                .and_then(|e| e.default_model)
+                .and_then(|e| e.default_model())
                 .map(String::from)
         })
         .unwrap_or_else(|| match provider_name {

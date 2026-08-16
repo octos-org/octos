@@ -16,7 +16,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "moonshot-coding",
     aliases: &["kimi-coding"],
-    default_model: Some("k3"),
     api_key_env: Some("KIMI_CODING_API_KEY"),
     key_env_aliases: &["KIMI_API_KEY", "MOONSHOT_API_KEY"],
     default_base_url: Some("https://api.kimi.com/coding/v1"),
@@ -35,7 +34,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("KIMI_CODING_API_KEY (Kimi coding plan) not set"))?;
-    let model = p.model.unwrap_or_else(|| "k3".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let url = p
         .base_url
         .unwrap_or_else(|| "https://api.kimi.com/coding/v1".into());

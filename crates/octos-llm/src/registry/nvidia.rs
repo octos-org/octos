@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "nvidia",
     aliases: &["nim"],
-    default_model: Some("meta/llama-3.3-70b-instruct"),
     api_key_env: Some("NVIDIA_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://integrate.api.nvidia.com/v1"),
@@ -29,7 +28,13 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
         .ok_or_else(|| eyre::eyre!("NVIDIA_API_KEY not set"))?;
     let model = p
         .model
-        .unwrap_or_else(|| "meta/llama-3.3-70b-instruct".into());
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let url = p
         .base_url
         .unwrap_or_else(|| "https://integrate.api.nvidia.com/v1".into());

@@ -17,7 +17,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "zai-coding",
     aliases: &["z.ai-coding", "glm-coding"],
-    default_model: Some("glm-5.2"),
     api_key_env: Some("ZAI_CODING_API_KEY"),
     key_env_aliases: &["ZAI_API_KEY"],
     default_base_url: Some("https://api.z.ai/api/anthropic"),
@@ -35,7 +34,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("ZAI_CODING_API_KEY (Z.AI GLM coding plan) not set"))?;
-    let model = p.model.unwrap_or_else(|| "glm-5.2".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let url = p
         .base_url
         .unwrap_or_else(|| "https://api.z.ai/api/anthropic".into());

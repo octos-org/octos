@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "anthropic",
     aliases: &[],
-    default_model: Some("claude-sonnet-4-20250514"),
     api_key_env: Some("ANTHROPIC_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://api.anthropic.com"),
@@ -26,7 +25,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("ANTHROPIC_API_KEY not set"))?;
-    let model = p.model.unwrap_or_else(|| "claude-sonnet-4-20250514".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let mut provider = AnthropicProvider::new(&key, &model);
     if let Some(url) = p.base_url {
         provider = provider.with_base_url(&url);

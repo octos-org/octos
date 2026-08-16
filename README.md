@@ -332,7 +332,7 @@ In `--json` mode stdout carries exactly one object (everything else — logs, th
 status line, approval prompts — goes to stderr). On success:
 
 ```json
-{ "text": "…final answer…", "model": "glm-5.2", "input_tokens": 1234, "output_tokens": 567 }
+{ "text": "…final answer…", "model": "glm-5.3", "input_tokens": 1234, "output_tokens": 567 }
 ```
 
 `text` is the final assistant answer; `model` is the model that actually

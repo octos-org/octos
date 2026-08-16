@@ -104,13 +104,25 @@ pub(crate) fn merge_qos_catalog(base: &QosCatalog, overlay: &QosCatalog) -> QosC
                     b.context_window,
                     b.max_output,
                     b.ds_output,
+                    b.is_family_default,
                 )
             });
         let merged = match base_static {
-            Some((model_type, cost_in, cost_out, context_window, max_output, ds_output)) => {
+            Some((
+                model_type,
+                cost_in,
+                cost_out,
+                context_window,
+                max_output,
+                ds_output,
+                is_family_default,
+            )) => {
                 ModelCatalogEntry {
                     provider: entry.provider.clone(),
-                    // Static — canonical base wins (SSOT convergence).
+                    // Static — canonical base wins (SSOT convergence). The
+                    // family-default flag is canonical-only: a live QoS row must
+                    // never be able to elect a different default model.
+                    is_family_default,
                     model_type,
                     cost_in,
                     cost_out,
@@ -515,6 +527,7 @@ mod tests {
                 ModelCatalogEntry {
                     provider: "zai/glm-5-turbo".to_string(),
                     model_type: ModelType::Fast,
+                    is_family_default: false,
                     stability: 0.97,
                     tool_avg_ms: 900,
                     p95_ms: 1500,
@@ -528,6 +541,7 @@ mod tests {
                 ModelCatalogEntry {
                     provider: "dashscope/qwen3.5-plus".to_string(),
                     model_type: ModelType::Strong,
+                    is_family_default: false,
                     stability: 0.92,
                     tool_avg_ms: 1400,
                     p95_ms: 2400,
@@ -561,6 +575,7 @@ mod tests {
         ModelCatalogEntry {
             provider: provider.to_string(),
             model_type: ModelType::Strong,
+            is_family_default: false,
             stability: 1.0,
             tool_avg_ms: 0,
             p95_ms: 0,
@@ -582,20 +597,20 @@ mod tests {
     #[test]
     fn merge_qos_catalog_preserves_base_and_overlays_live() {
         // Base deepseek carries an EVALUATED canonical deep-search quality (>0);
-        // the overlay's is stale, so the canonical value wins. Base glm-5.2 leaves
+        // the overlay's is stale, so the canonical value wins. Base glm-5.3 leaves
         // ds_output at the `0` "not evaluated" sentinel (via `scored_entry`), so an
         // evaluated overlay value there must be PRESERVED, not clobbered by 0.
         let mut base_deepseek = scored_entry("deepseek/deepseek-v4-pro", 0.0, 1_048_576);
         base_deepseek.ds_output = 1500;
         let base = QosCatalog {
             updated_at: "SEED".to_string(),
-            models: vec![scored_entry("zai/glm-5.2", 0.0, 1_000_000), base_deepseek],
+            models: vec![scored_entry("zai/glm-5.3", 0.0, 1_000_000), base_deepseek],
         };
         let mut overlay_deepseek = scored_entry("deepseek/deepseek-v4-pro", 0.87, 999);
         overlay_deepseek.ds_output = 1; // stale seed re-exported by the router
-        // Host-tagged lane whose bare base (`zai/glm-5.2`) is unevaluated (0);
+        // Host-tagged lane whose bare base (`zai/glm-5.3`) is unevaluated (0);
         // this lane carries a real benchmarked ds_output the merge must keep.
-        let mut overlay_glm = scored_entry("zai@api/glm-5.2", 0.9, 111);
+        let mut overlay_glm = scored_entry("zai@api/glm-5.3", 0.9, 111);
         overlay_glm.ds_output = 2222;
         let overlay = QosCatalog {
             updated_at: "2026-07-12T00:00:00Z".to_string(),
@@ -605,7 +620,7 @@ mod tests {
                 // pre-upgrade catalog) — the canonical values must win.
                 overlay_deepseek,
                 // A host-tagged OpenAI-compatible lane whose bare form IS in the
-                // base — it must reconcile with `zai/glm-5.2` (stale ctx wins from
+                // base — it must reconcile with `zai/glm-5.3` (stale ctx wins from
                 // canonical, live score from overlay), not be treated as new.
                 overlay_glm,
                 // … plus a lane not in the base (custom base_url model).
@@ -623,13 +638,13 @@ mod tests {
         let merged = merge_qos_catalog(&base, &overlay);
         // Fresh export timestamp is carried onto the merged catalog.
         assert_eq!(merged.updated_at, "2026-07-12T00:00:00Z");
-        // base-only (zai/glm-5.2) + overlaid (deepseek) + host-tagged
-        // (zai@api/glm-5.2) + overlay-only (stub) + two custom lanes = 6.
+        // base-only (zai/glm-5.3) + overlaid (deepseek) + host-tagged
+        // (zai@api/glm-5.3) + overlay-only (stub) + two custom lanes = 6.
         assert_eq!(merged.models.len(), 6);
         let by = |p: &str| merged.models.iter().find(|m| m.provider == p).unwrap();
         // Base-only entry preserved (researched context window intact).
-        assert_eq!(by("zai/glm-5.2").context_window, 1_000_000);
-        assert_eq!(by("zai/glm-5.2").score, 0.0);
+        assert_eq!(by("zai/glm-5.3").context_window, 1_000_000);
+        assert_eq!(by("zai/glm-5.3").score, 0.0);
         // Overlapping provider: live score wins (DYNAMIC) …
         assert_eq!(by("deepseek/deepseek-v4-pro").score, 0.87);
         // … but the canonical static context window wins over the stale overlay.
@@ -648,16 +663,16 @@ mod tests {
         // Host-tagged lane reconciled with the bare canonical base: canonical
         // static context window, live overlay score.
         assert_eq!(
-            by("zai@api/glm-5.2").context_window,
+            by("zai@api/glm-5.3").context_window,
             1_000_000,
             "host-tagged lane converges to canonical static via key normalization"
         );
-        assert_eq!(by("zai@api/glm-5.2").score, 0.9);
-        // …but the canonical ds_output for glm-5.2 is the `0` "not evaluated"
+        assert_eq!(by("zai@api/glm-5.3").score, 0.9);
+        // …but the canonical ds_output for glm-5.3 is the `0` "not evaluated"
         // sentinel, so the overlay's benchmarked value must be PRESERVED, not
         // erased to 0.
         assert_eq!(
-            by("zai@api/glm-5.2").ds_output,
+            by("zai@api/glm-5.3").ds_output,
             2222,
             "an evaluated overlay ds_output survives when the canonical value is the 0 sentinel"
         );
@@ -680,13 +695,13 @@ mod tests {
     }
 
     /// The compiled-in canonical catalog (the seed floor for fresh installs) is
-    /// well-formed and reflects curation: glm-5.2 + kimi-k2.6 + kimi-k3
+    /// well-formed and reflects curation: glm-5.3 + kimi-k2.6 + kimi-k3
     /// present, deepseek-chat removed.
     #[test]
     fn embedded_qos_catalog_is_curated_ssot() {
         let catalog = embedded_qos_catalog().expect("embedded canonical catalog must parse");
         let has = |p: &str| catalog.models.iter().any(|m| m.provider == p);
-        assert!(has("zai/glm-5.2"), "glm-5.2 present");
+        assert!(has("zai/glm-5.3"), "glm-5.3 present");
         assert!(has("moonshot/kimi-k2.6"), "kimi-k2.6 present");
         assert!(has("moonshot/kimi-k3"), "kimi-k3 present");
         assert!(
@@ -697,7 +712,7 @@ mod tests {
         let glm52 = catalog
             .models
             .iter()
-            .find(|m| m.provider == "zai/glm-5.2")
+            .find(|m| m.provider == "zai/glm-5.3")
             .unwrap();
         assert_eq!(glm52.context_window, 1_000_000);
         // kimi-k3 researched values: 1M window, 131072 (default max
@@ -894,6 +909,7 @@ mod tests {
                 ModelCatalogEntry {
                     provider: stub_key.clone(),
                     model_type: ModelType::Fast,
+                    is_family_default: false,
                     stability: 0.95,
                     tool_avg_ms: 700,
                     p95_ms: 1100,
@@ -907,6 +923,7 @@ mod tests {
                 ModelCatalogEntry {
                     provider: ollama_key.clone(),
                     model_type: ModelType::Strong,
+                    is_family_default: false,
                     stability: 0.88,
                     tool_avg_ms: 1800,
                     p95_ms: 3200,
