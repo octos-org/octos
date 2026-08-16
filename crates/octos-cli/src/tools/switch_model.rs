@@ -165,7 +165,7 @@ impl SwitchModelTool {
             };
 
             let default = entry
-                .default_model
+                .default_model()
                 .map(|m| format!(" (default: {m})"))
                 .unwrap_or_default();
 

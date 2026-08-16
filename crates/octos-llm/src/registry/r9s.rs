@@ -11,7 +11,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "r9s",
     aliases: &["r9s.ai"],
-    default_model: Some("claude-sonnet-4-6"),
     api_key_env: Some("R9S_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://api.r9s.ai/v1"),
@@ -28,7 +27,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("R9S_API_KEY not set"))?;
-    let model = p.model.unwrap_or_else(|| "claude-sonnet-4-6".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let url = p.base_url.unwrap_or_else(|| "https://api.r9s.ai/v1".into());
 
     // Auto-detect protocol: Anthropic Messages API for claude-* models,

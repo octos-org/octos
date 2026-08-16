@@ -3,12 +3,67 @@
 //! Each sub-module exports a `pub const ENTRY: ProviderEntry` and a `create()`
 //! factory.  Adding a new provider = add a file + one line in `ALL`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use eyre::Result;
 
 use crate::openai::ModelHints;
 use crate::provider::LlmProvider;
+
+// ── Family defaults, from the catalog ───────────────────────────────────────
+
+/// The canonical `model_catalog.json`, compiled in — the same SSOT the CLI
+/// serves for onboarding. It is the single place a model NAME is written down;
+/// no provider module hardcodes one.
+const CANONICAL_MODEL_CATALOG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../model_catalog.json"
+));
+
+/// `family -> default model`, built once from the rows flagged `"default": true`.
+///
+/// A family's default used to be a `&'static str` on each `ProviderEntry`, which
+/// meant the same fact lived in two places and drifted: four families (deepseek,
+/// minimax, openrouter, vertex) had hardcoded defaults that no catalog row even
+/// mentioned. Reading it from the catalog makes drift impossible by construction.
+fn family_defaults() -> &'static HashMap<String, String> {
+    static DEFAULTS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let catalog: crate::adaptive::QosCatalog =
+            match serde_json::from_str(CANONICAL_MODEL_CATALOG) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    // The catalog is compiled in, so this is a build-time-shaped
+                    // failure surfacing at runtime. Degrade to "no defaults" rather
+                    // than panicking a live process: every caller already handles
+                    // `None` by demanding an explicit model.
+                    tracing::error!(%error, "canonical model catalog failed to parse; \
+                     provider families will report no default model");
+                    return HashMap::new();
+                }
+            };
+        catalog
+            .models
+            .iter()
+            .filter(|entry| entry.is_family_default)
+            .filter_map(|entry| {
+                // `provider` is `"<family>/<model>"`, and the model half may
+                // itself contain slashes (`openrouter/anthropic/claude-...`),
+                // so split ONCE.
+                let (family, model) = entry.provider.split_once('/')?;
+                Some((family.to_string(), model.to_string()))
+            })
+            .collect()
+    })
+}
+
+/// The catalog-declared default model for a provider family, if it has one.
+///
+/// `None` means the family requires an explicit model.
+pub fn catalog_default_model(family: &str) -> Option<&'static str> {
+    family_defaults().get(family).map(String::as_str)
+}
 
 // ── Provider sub-modules ────────────────────────────────────────────────────
 
@@ -67,8 +122,6 @@ pub struct ProviderEntry {
     pub name: &'static str,
     /// Alternative names that also resolve to this provider.
     pub aliases: &'static [&'static str],
-    /// Default model when none is specified. `None` = must be provided by user.
-    pub default_model: Option<&'static str>,
     /// Environment variable holding the API key. `None` = no key required.
     pub api_key_env: Option<&'static str>,
     /// Additional accepted API-key env var names for this provider, beyond
@@ -92,6 +145,15 @@ pub struct ProviderEntry {
 }
 
 impl ProviderEntry {
+    /// The model this family uses when a profile names none, read from the
+    /// catalog row flagged `"default": true`. `None` = the user must supply one.
+    ///
+    /// Was a `&'static str` const on every entry until the catalog became the
+    /// single place a model name is written down.
+    pub fn default_model(&self) -> Option<&'static str> {
+        catalog_default_model(self.name)
+    }
+
     /// Every API-key env var name this provider accepts: the primary
     /// `api_key_env` plus any declared `key_env_aliases`.
     pub fn key_env_names(&self) -> impl Iterator<Item = &'static str> {
@@ -188,6 +250,84 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// The catalog is the only place a default model is written down, so every
+    /// family that claims one must actually find it there. A family silently
+    /// losing its default would make `octos chat -p <family>` start demanding an
+    /// explicit `--model`.
+    #[test]
+    fn every_family_with_a_default_resolves_it_from_the_catalog() {
+        // Families that must have one, with the value the catalog declares.
+        for (family, expected) in [
+            ("anthropic", "claude-sonnet-4-20250514"),
+            ("deepseek", "deepseek-v4-flash"),
+            ("gemini", "gemini-2.5-flash"),
+            ("minimax", "MiniMax-M3"),
+            ("moonshot-coding", "k3"),
+            ("openai", "gpt-4o"),
+            ("openrouter", "anthropic/claude-sonnet-4-6"),
+            ("vertex", "gemini-2.5-flash"),
+            ("zai", "glm-5-turbo"),
+            ("zai-coding", "glm-5.3"),
+        ] {
+            let entry = lookup(family).unwrap_or_else(|| panic!("{family} registered"));
+            assert_eq!(
+                entry.default_model(),
+                Some(expected),
+                "{family} must resolve its default from the catalog"
+            );
+        }
+    }
+
+    /// A family's default model must be unambiguous: two rows flagged `default`
+    /// under one family would make the resolved value depend on catalog order,
+    /// which is exactly the fragility this replaced.
+    #[test]
+    fn the_catalog_declares_at_most_one_default_per_family() {
+        let catalog: crate::adaptive::QosCatalog =
+            serde_json::from_str(CANONICAL_MODEL_CATALOG).expect("canonical catalog parses");
+
+        let mut by_family: HashMap<&str, Vec<&str>> = HashMap::new();
+        for entry in catalog.models.iter().filter(|e| e.is_family_default) {
+            let (family, _) = entry
+                .provider
+                .split_once('/')
+                .unwrap_or((entry.provider.as_str(), ""));
+            by_family.entry(family).or_default().push(&entry.provider);
+        }
+
+        let duplicated: Vec<_> = by_family.iter().filter(|(_, v)| v.len() > 1).collect();
+        assert!(
+            duplicated.is_empty(),
+            "each family may flag at most one default: {duplicated:?}"
+        );
+        assert!(
+            !by_family.is_empty(),
+            "the catalog must declare family defaults at all"
+        );
+    }
+
+    /// `openrouter` and `nvidia` models carry a slash of their own
+    /// (`anthropic/claude-sonnet-4-6`), so the family split must take the FIRST
+    /// separator only — splitting on the last would yield family `anthropic`
+    /// and silently give OpenRouter no default.
+    #[test]
+    fn a_model_id_containing_a_slash_still_resolves_to_its_family() {
+        assert_eq!(
+            catalog_default_model("openrouter"),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+        assert_eq!(
+            catalog_default_model("nvidia"),
+            Some("meta/llama-3.3-70b-instruct")
+        );
+    }
+
+    /// An unregistered family has no default rather than a wrong one.
+    #[test]
+    fn an_unknown_family_has_no_default() {
+        assert_eq!(catalog_default_model("not-a-provider"), None);
+    }
+
     #[test]
     fn lookup_by_name() {
         assert!(lookup("anthropic").is_some());
@@ -246,7 +386,7 @@ mod tests {
     fn coding_plan_families_resolve_to_coding_endpoints() {
         // Kimi coding plan: OpenAI-compat, api.kimi.com/coding/v1, default k3.
         let mc = lookup("moonshot-coding").expect("moonshot-coding registered");
-        assert_eq!(mc.default_model, Some("k3"));
+        assert_eq!(mc.default_model(), Some("k3"));
         assert_eq!(mc.default_base_url, Some("https://api.kimi.com/coding/v1"));
         assert!(mc.is_known_key_env("KIMI_API_KEY"));
         assert_eq!(

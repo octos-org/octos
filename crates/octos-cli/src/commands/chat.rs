@@ -3612,12 +3612,14 @@ pub fn create_provider_with_api_type(
     // This allows any provider to use the Anthropic Messages API protocol.
     if api_type == Some("anthropic") {
         let key = api_key.ok_or_else(|| eyre::eyre!("API key required for anthropic api_type"))?;
-        let m = model.unwrap_or_else(|| {
-            entry
-                .default_model
-                .unwrap_or("claude-sonnet-4-20250514")
-                .into()
-        });
+        let m = model
+            .or_else(|| entry.default_model().map(str::to_string))
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "{}: no model given and the catalog declares no default for this family",
+                    entry.name
+                )
+            })?;
         let url = base_url.unwrap_or_else(|| {
             entry
                 .default_base_url
@@ -3637,7 +3639,14 @@ pub fn create_provider_with_api_type(
     // This forces the Responses API even for models not auto-detected.
     if api_type == Some("responses") {
         let key = api_key.ok_or_else(|| eyre::eyre!("API key required for responses api_type"))?;
-        let m = model.unwrap_or_else(|| entry.default_model.unwrap_or("gpt-4o").into());
+        let m = model
+            .or_else(|| entry.default_model().map(str::to_string))
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "{}: no model given and the catalog declares no default for this family",
+                    entry.name
+                )
+            })?;
         let mut provider = octos_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m);
         if let Some(url) = base_url {
             provider = provider.with_base_url(&url);

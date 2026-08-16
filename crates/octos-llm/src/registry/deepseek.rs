@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "deepseek",
     aliases: &[],
-    default_model: Some("deepseek-chat"),
     api_key_env: Some("DEEPSEEK_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://api.deepseek.com/v1"),
@@ -26,7 +25,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("DEEPSEEK_API_KEY not set"))?;
-    let model = p.model.unwrap_or_else(|| "deepseek-chat".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let url = p
         .base_url
         .unwrap_or_else(|| "https://api.deepseek.com/v1".into());

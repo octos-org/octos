@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "openrouter",
     aliases: &[],
-    default_model: Some("anthropic/claude-sonnet-4-20250514"),
     api_key_env: Some("OPENROUTER_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://openrouter.ai/api/v1"),
@@ -29,7 +28,13 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
         .ok_or_else(|| eyre::eyre!("OPENROUTER_API_KEY not set"))?;
     let model = p
         .model
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let mut provider = OpenRouterProvider::new(&key, &model);
     if let Some(url) = p.base_url {
         provider = provider.with_base_url(&url);

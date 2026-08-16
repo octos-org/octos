@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "gemini",
     aliases: &["google"],
-    default_model: Some("gemini-2.5-flash"),
     api_key_env: Some("GEMINI_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://generativelanguage.googleapis.com/v1beta"),
@@ -26,7 +25,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("GEMINI_API_KEY not set"))?;
-    let model = p.model.unwrap_or_else(|| "gemini-2.5-flash".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let mut provider = GeminiProvider::new(&key, &model);
     if let Some(url) = p.base_url {
         provider = provider.with_base_url(&url);

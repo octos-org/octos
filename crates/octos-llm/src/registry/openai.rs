@@ -11,7 +11,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "openai",
     aliases: &[],
-    default_model: Some("gpt-4o"),
     api_key_env: Some("OPENAI_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://api.openai.com/v1"),
@@ -27,7 +26,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("OPENAI_API_KEY not set"))?;
-    let model = p.model.unwrap_or_else(|| "gpt-4o".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
 
     // Auto-detect: use Responses API for capable models when talking to OpenAI directly
     // (no custom base_url set, which would indicate a compatible provider).

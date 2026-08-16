@@ -189,7 +189,7 @@
   "zai-coding": {
     "env": "ZAI_CODING_API_KEY",
     "models": [
-      { "id": "glm-5.2", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
+      { "id": "glm-5.3", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
         { "id": "zai-coding", "label": "GLM Coding Plan", "base_url": "https://api.z.ai/api/anthropic", "api_key_env": "ZAI_API_KEY" }
       ] }
     ]
@@ -208,7 +208,7 @@
   "zai": {
     "env": "ZAI_API_KEY",
     "models": [
-      { "id": "glm-5.2", "input": 1.0, "output": 4.0, "max_output": 131072 },
+      { "id": "glm-5.3", "input": 1.0, "output": 4.0, "max_output": 131072 },
       { "id": "glm-5-turbo", "input": 1.0, "output": 0.4, "max_output": 131072 },
       { "id": "glm-5.1", "input": 0.5, "output": 2.0, "max_output": 131072 },
       { "id": "glm-4.7", "input": 0.3, "output": 1.2, "max_output": 8192 },

@@ -21,7 +21,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "vertex",
     aliases: &["vertex-ai", "vertexai"],
-    default_model: Some("gemini-2.5-flash"),
     api_key_env: Some("VERTEX_SA_JSON"),
     key_env_aliases: &[],
     default_base_url: None,
@@ -42,7 +41,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     })?;
     let sa = ServiceAccount::from_json(&json)
         .wrap_err("failed to parse Vertex service-account JSON credential")?;
-    let model = p.model.unwrap_or_else(|| "gemini-2.5-flash".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     // Thread the timeout into both the chat client (`with_http_timeout`) and the
     // OAuth token-exchange client (the `_with_timeout` constructor).
     let mut provider =

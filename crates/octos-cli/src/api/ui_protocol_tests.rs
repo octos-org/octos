@@ -756,7 +756,7 @@ async fn llm_select_promotes_fallback_and_lists_all_models() {
     let state = Arc::new(local_profile_state(dir.path()));
     for (family, model, set_primary) in [
         ("deepseek", "deepseek-v4-pro", true),
-        ("zai", "glm-5.2", false),
+        ("zai", "glm-5.3", false),
     ] {
         let request = RpcRequest::new(
             format!("u-{model}"),
@@ -791,7 +791,7 @@ async fn llm_select_promotes_fallback_and_lists_all_models() {
     assert_eq!(list.len(), 2, "primary + fallback both listed: {models}");
     assert_eq!(list[0]["model"], "deepseek-v4-pro");
     assert_eq!(list[0]["selected"], true);
-    assert_eq!(list[1]["model"], "glm-5.2");
+    assert_eq!(list[1]["model"], "glm-5.3");
     assert_eq!(list[1]["selected"], false);
 
     let request = RpcRequest::new(
@@ -800,7 +800,7 @@ async fn llm_select_promotes_fallback_and_lists_all_models() {
         json!({
             "profile_id": "dev",
             "family_id": "zai",
-            "model_id": "glm-5.2",
+            "model_id": "glm-5.3",
             "route_id": "official",
         }),
     );
@@ -808,7 +808,7 @@ async fn llm_select_promotes_fallback_and_lists_all_models() {
         .await
         .expect("select");
     assert_eq!(result["applied"], true);
-    assert_eq!(result["selected"]["model"], "glm-5.2");
+    assert_eq!(result["selected"]["model"], "glm-5.3");
     assert_eq!(result["selected"]["selected"], true);
 
     let profile = state
@@ -821,7 +821,7 @@ async fn llm_select_promotes_fallback_and_lists_all_models() {
     let llm = profile.config.llm.as_ref().unwrap();
     assert_eq!(
         llm.primary.as_ref().unwrap().model_id.as_deref(),
-        Some("glm-5.2"),
+        Some("glm-5.3"),
         "fallback promoted to primary"
     );
     assert_eq!(llm.fallbacks.len(), 1, "demoted primary kept as fallback");
@@ -833,7 +833,7 @@ async fn llm_select_promotes_fallback_and_lists_all_models() {
     let request = RpcRequest::new(
         "s2".to_string(),
         APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
-        json!({ "profile_id": "dev", "model_id": "glm-5.2" }),
+        json!({ "profile_id": "dev", "model_id": "glm-5.3" }),
     );
     let result = raw_profile_llm_select(&state, &request, None)
         .await
@@ -855,7 +855,7 @@ async fn llm_select_promotes_fallback_and_lists_all_models() {
 /// without persisting: the runtime re-ensure would fail silently (the
 /// live session keeps the old chain while the UI claims the switch), and
 /// the persisted keyless primary bricks the next `session/open` at
-/// bootstrap. Found live: a user selected zai/glm-5.2 with no
+/// bootstrap. Found live: a user selected zai/glm-5.3 with no
 /// ZAI_API_KEY — "Model selected" echoed, the footer snapped back, and
 /// the next launch failed to boot.
 #[tokio::test]
@@ -890,7 +890,7 @@ async fn llm_select_rejects_keyless_models_before_persisting() {
     raw_profile_llm_upsert(&state, &upsert("deepseek-chat", Some("dk"), true), None)
         .await
         .expect("seed keyed primary");
-    raw_profile_llm_upsert(&state, &upsert("glm-5.2", None, false), None)
+    raw_profile_llm_upsert(&state, &upsert("glm-5.3", None, false), None)
         .await
         .expect("seed keyless fallback");
 
@@ -898,7 +898,7 @@ async fn llm_select_rejects_keyless_models_before_persisting() {
         RpcRequest::new(
             id.to_string(),
             APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
-            json!({ "profile_id": "dev", "model_id": "glm-5.2" }),
+            json!({ "profile_id": "dev", "model_id": "glm-5.3" }),
         )
     };
     let error = raw_profile_llm_select(&state, &select("s-keyless"), None)
@@ -911,7 +911,7 @@ async fn llm_select_rejects_keyless_models_before_persisting() {
         "got {error:?}"
     );
     assert!(
-        error.message.contains("OCTOS_TEST_GLM_5_2_KEY"),
+        error.message.contains("OCTOS_TEST_GLM_5_3_KEY"),
         "message must name the missing variable: {}",
         error.message
     );
@@ -938,14 +938,14 @@ async fn llm_select_rejects_keyless_models_before_persisting() {
     );
 
     // Adding the key (the onboarding key step) makes the same select work.
-    raw_profile_llm_upsert(&state, &upsert("glm-5.2", Some("zk"), false), None)
+    raw_profile_llm_upsert(&state, &upsert("glm-5.3", Some("zk"), false), None)
         .await
         .expect("re-save with key");
     let result = raw_profile_llm_select(&state, &select("s-keyed"), None)
         .await
         .expect("keyed select applies");
     assert_eq!(result["applied"], true);
-    assert_eq!(result["selected"]["model"], "glm-5.2");
+    assert_eq!(result["selected"]["model"], "glm-5.3");
     assert_eq!(
         result.get("restart_required"),
         None,
@@ -981,7 +981,7 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
     )
     .await
     .expect("seed primary");
-    raw_profile_llm_upsert(&state, &upsert("fallback", "zai", "glm-5.2", false), None)
+    raw_profile_llm_upsert(&state, &upsert("fallback", "zai", "glm-5.3", false), None)
         .await
         .expect("seed fallback");
 
@@ -1025,7 +1025,7 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
             json!({
                 "profile_id": "job-owner",
                 "family_id": "zai",
-                "model_id": "glm-5.2",
+                "model_id": "glm-5.3",
                 "route_id": "official",
             }),
         ),
@@ -1229,7 +1229,7 @@ async fn llm_select_rejects_unactivatable_api_type_and_unknown_families() {
 async fn llm_upsert_set_primary_demotes_old_primary_instead_of_dropping_it() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
-    for (family, model) in [("deepseek", "deepseek-v4-pro"), ("zai", "glm-5.2")] {
+    for (family, model) in [("deepseek", "deepseek-v4-pro"), ("zai", "glm-5.3")] {
         let request = RpcRequest::new(
             format!("u-{model}"),
             APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
@@ -1258,7 +1258,7 @@ async fn llm_upsert_set_primary_demotes_old_primary_instead_of_dropping_it() {
     let llm = profile.config.llm.as_ref().unwrap();
     assert_eq!(
         llm.primary.as_ref().unwrap().model_id.as_deref(),
-        Some("glm-5.2")
+        Some("glm-5.3")
     );
     assert_eq!(
         llm.fallbacks.len(),
@@ -1306,7 +1306,7 @@ async fn llm_upsert_set_primary_demotes_old_primary_instead_of_dropping_it() {
             .iter()
             .map(|fb| fb.model_id.as_deref())
             .collect::<Vec<_>>(),
-        vec![Some("glm-5.2")],
+        vec![Some("glm-5.3")],
         "round-trip must neither duplicate the promoted model nor drop the demoted one"
     );
 }
@@ -1320,7 +1320,7 @@ async fn llm_upsert_set_primary_demotes_old_primary_instead_of_dropping_it() {
 async fn llm_delete_removes_entries_and_promotes_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
-    for (family, model) in [("deepseek", "deepseek-v4-pro"), ("zai", "glm-5.2")] {
+    for (family, model) in [("deepseek", "deepseek-v4-pro"), ("zai", "glm-5.3")] {
         let request = RpcRequest::new(
             format!("u-{model}"),
             APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
@@ -1365,7 +1365,7 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
     // (b) Delete the PRIMARY -> the fallback is promoted.
     let result = raw_profile_llm_delete(
         &state,
-        &delete("zai", "glm-5.2", "official", "d-primary"),
+        &delete("zai", "glm-5.3", "official", "d-primary"),
         None,
     )
     .expect("delete primary");
@@ -1718,7 +1718,7 @@ async fn llm_select_enforces_scope_and_route_discrimination() {
                 "profile_id": "dev",
                 "selection": {
                     "family_id": "zai",
-                    "model_id": "glm-5.2",
+                    "model_id": "glm-5.3",
                     "route": { "route_id": route },
                 },
                 // Key present so the exact-route select below tests
@@ -1736,7 +1736,7 @@ async fn llm_select_enforces_scope_and_route_discrimination() {
         APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
         json!({
             "profile_id": "dev",
-            "model_id": "glm-5.2",
+            "model_id": "glm-5.3",
             "route_id": "official",
         }),
     );
@@ -1750,7 +1750,7 @@ async fn llm_select_enforces_scope_and_route_discrimination() {
         APPUI_METHOD_PROFILE_LLM_SELECT.to_string(),
         json!({
             "profile_id": "dev",
-            "model_id": "glm-5.2",
+            "model_id": "glm-5.3",
             "route_id": "proxy",
         }),
     );
@@ -1816,7 +1816,7 @@ fn catalog_result_ignores_runtime_qos_not_in_canonical() {
     let zai_models = families["zai"]["models"].as_array().unwrap();
     // Canonical lineup is present …
     assert!(
-        zai_models.iter().any(|model| model["id"] == "glm-5.2"),
+        zai_models.iter().any(|model| model["id"] == "glm-5.3"),
         "canonical zai lineup present: {zai_models:?}"
     );
     // … but the runtime-QoS-only model does NOT leak into onboarding: the
@@ -1852,9 +1852,9 @@ fn catalog_result_sourced_from_registry_and_canonical_catalog() {
 
     // Key-env comes from the registry, not a hand-maintained env map.
     assert_eq!(families["zai"]["env"], "ZAI_API_KEY");
-    // Curation: glm-5.2 + kimi-k2.6 + kimi-k3 present; deepseek-chat removed.
+    // Curation: glm-5.3 + kimi-k2.6 + kimi-k3 present; deepseek-chat removed.
     assert!(
-        ids("zai").contains(&"glm-5.2".to_owned()),
+        ids("zai").contains(&"glm-5.3".to_owned()),
         "{:?}",
         ids("zai")
     );
@@ -1891,7 +1891,7 @@ fn catalog_result_sourced_from_registry_and_canonical_catalog() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["id"] == "glm-5.2")
+        .find(|m| m["id"] == "glm-5.3")
         .unwrap();
     assert_eq!(glm52["context_window"], 1_000_000);
 

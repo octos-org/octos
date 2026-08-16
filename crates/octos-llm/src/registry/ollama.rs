@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "ollama",
     aliases: &[],
-    default_model: Some("llama3.2"),
     api_key_env: None,
     key_env_aliases: &[],
     default_base_url: Some("http://localhost:11434/v1"),
@@ -24,7 +23,15 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
 
 fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let http_timeout = p.http_timeout();
-    let model = p.model.unwrap_or_else(|| "llama3.2".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let url = p
         .base_url
         .unwrap_or_else(|| "http://localhost:11434/v1".into());
