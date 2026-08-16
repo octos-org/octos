@@ -43,6 +43,20 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 const AUTONOMY_POLICY_ID: &str = "coding-autonomy-v1";
+/// #2036 follow-up — how much of a peer's review survives into the durable
+/// ledger row. This is the LAST cap before the DB, so it is the one that
+/// actually binds, whatever the caller already trimmed.
+///
+/// Raising the transport-side cap alone was not enough: a real two-peer review
+/// soak on merged main still produced findings of exactly 500 characters,
+/// because this hard `take(500)` re-truncated them here. The completion
+/// verifier reads these rows (#1990), so a review cut to 500 chars mid-token
+/// is the same unverifiable fragment the original 400-char cut produced.
+///
+/// Sized to match `MAX_PEER_FINDING_RECORD_CHARS` in the transport so the two
+/// stops on the same path agree; the verifier's own prompt stays bounded
+/// separately by `MAX_LEDGER_EVIDENCE_ASSERTION_CHARS` at assembly time.
+const MAX_PEER_FINDING_ASSERTION_CHARS: usize = 4_000;
 /// Default per-goal continuation token budget when the caller does not
 /// specify one. Sized to survive several real turns: each goal turn
 /// charges its FULL token cost (input + output + cache reads/writes), so
@@ -5025,7 +5039,11 @@ impl InProcessAgentOrchestrator {
             lifecycle: "observed".to_owned(),
             confidence: "medium".to_owned(),
             review_state: "unreviewed".to_owned(),
-            assertion: content.chars().take(500).collect(),
+            assertion: octos_core::truncated_utf8(
+                content,
+                MAX_PEER_FINDING_ASSERTION_CHARS,
+                " …[truncated]",
+            ),
             evidence: None,
             config_version: None,
             derived_from: None,
@@ -18600,6 +18618,89 @@ mod tests {
     /// load-bearing case twice over: the path digest's `cost_by_path`
     /// dropped such rows, which is why the digest is computed from direct
     /// SQL aggregates.
+    /// #2036 follow-up — a peer's review must reach the DURABLE row intact.
+    ///
+    /// Found by a real two-peer review soak on merged main, not by a unit test:
+    /// #2036 raised the transport-side cap from 400 to 4000, but this writer
+    /// still applied a hard `take(500)`, so real findings came out at exactly
+    /// 500 characters — cut mid-token and unmarked, which is the same
+    /// unverifiable fragment the 400-char cut produced. Each cap was tested in
+    /// isolation and both looked fine; only the end-to-end path showed that the
+    /// inner one binds.
+    ///
+    /// Drives the production writer and reads back through the same accessor
+    /// the completion verifier uses.
+    #[test]
+    fn a_long_peer_review_reaches_the_ledger_row_intact() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let wire = "tenant-a:api:long-peer-review";
+        let session_id = SessionKey(wire.to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "review two modules".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session_id)
+            .expect("goal_id");
+
+        // The shape that failed live: a multi-finding security review, far
+        // longer than any per-sentence budget but well inside the real one.
+        let mut review = String::from("Security review of ssrf.rs — findings:\n");
+        for i in 0..12 {
+            review.push_str(&format!(
+                "{i}. HIGH — the guard resolves the host before checking it, so a \
+                 DNS entry that flips between a public and a private address \
+                 between the check and the fetch slips through; see the \
+                 resolve/connect gap.\n"
+            ));
+        }
+        review.push_str("END-OF-REVIEW-MARKER");
+        assert!(
+            review.chars().count() > 1_000,
+            "fixture must be far longer than the OLD 500-char cap, or it proves \
+             nothing: {}",
+            review.chars().count()
+        );
+
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "tenant-a",
+                wire,
+                "rev-ssrf",
+                None,
+                &review,
+                1_200,
+            )
+            .expect("finding recorded");
+
+        let findings = orchestrator.model_goal_ledger_findings(data_dir.path(), &goal_id);
+        let stored = findings
+            .first()
+            .and_then(|f| f.get("assertion"))
+            .and_then(|a| a.as_str())
+            .expect("one finding with an assertion");
+
+        assert!(
+            stored.contains("END-OF-REVIEW-MARKER"),
+            "the END of the review must survive — a cap here silently drops the \
+             findings the verifier is asked to judge; stored {} chars",
+            stored.chars().count()
+        );
+        assert!(
+            !stored.contains("…[truncated]"),
+            "an ordinary review must not be abridged at all: {stored}"
+        );
+    }
+
     #[test]
     fn model_goal_ledger_digest_reduces_the_ledger_to_compact_counts() {
         let orchestrator = InProcessAgentOrchestrator::default();
