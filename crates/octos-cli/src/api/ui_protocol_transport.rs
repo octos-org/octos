@@ -176,6 +176,41 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// callers from the actual socket so a slow client cannot wedge unrelated
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
+/// #2036 — how much of a peer's result survives into the DURABLE goal-ledger
+/// finding. Since #1990 that finding is what the completion verifier reads, so
+/// this budget decides whether a multi-peer goal can ever be verified: the
+/// previous 400 was a notification-sized cut that destroyed real audit reports
+/// before the verifier ever saw them. Sized to hold an ordinary multi-finding
+/// peer report whole; the verifier's own input stays bounded by
+/// `MAX_LEDGER_EVIDENCE_ASSERTION_CHARS` at the assembly site.
+const MAX_PEER_FINDING_RECORD_CHARS: usize = 4_000;
+/// The peer-progress WAKE is a notification — the master reads the durable
+/// finding for detail — so it keeps the short budget.
+const MAX_PEER_WAKE_SUMMARY_CHARS: usize = 400;
+// The wake is a pointer to the durable finding, never a copy of it. Widening it
+// past the record budget would paste a whole audit report into a system message
+// on the master's next turn. Enforced at compile time so it cannot drift.
+const _: () = assert!(MAX_PEER_WAKE_SUMMARY_CHARS < MAX_PEER_FINDING_RECORD_CHARS);
+
+/// #2036 — build the DURABLE goal-ledger assertion for a peer's result.
+///
+/// Since #1990 this string is what the completion verifier judges, so it must
+/// not be cut to the size of a notification. At the previous 400-char bare
+/// `take` a real multi-defect peer report lost every finding — one observed
+/// live stopped inside its findings-table header row — and the verifier
+/// rejected completion on exactly that basis until the goal was abandoned as
+/// `blocked`.
+///
+/// Two properties matter and neither held before: the budget is large enough
+/// for an ordinary peer report to arrive whole, and when it does bite the
+/// abridgement is MARKED — an unmarked mid-token cut reads to a verifier as
+/// corrupt evidence rather than as an abridged report. The verifier's own
+/// input stays bounded independently, by `MAX_LEDGER_EVIDENCE_ASSERTION_CHARS`
+/// at the assembly site in `goal_tool`.
+fn peer_finding_assertion(outcome: &str, body: &str) -> String {
+    let content = octos_core::truncated_utf8(body, MAX_PEER_FINDING_RECORD_CHARS, " …[truncated]");
+    format!("[{outcome}] {content}")
+}
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
 /// Reason recorded when a pending APPROVAL entry is cancelled because the
 /// approval-requesting tool's waiting future was dropped (turn interrupt/abort,
@@ -12838,6 +12873,73 @@ fn wake_master_and_record_park_escalation(
 }
 
 #[cfg(test)]
+mod peer_finding_evidence_tests {
+    use super::*;
+
+    /// #2036 — an ordinary peer report reaches the ledger WHOLE.
+    ///
+    /// The durable finding is the completion verifier's evidence, so anything
+    /// the recorder drops here is lost to verification permanently. Live, a
+    /// four-defect audit was cut at 400 chars inside its findings-table header
+    /// row; the verifier could see none of the defects and refused completion
+    /// until the goal was abandoned as `blocked`.
+    #[test]
+    fn a_multi_defect_peer_report_is_recorded_whole() {
+        let mut body = String::from("Audit of auth.py — 4 defects found:\n");
+        for i in 0..4 {
+            body.push_str(&format!(
+                "| CRITICAL | defect number {i} with a full explanation of the \
+                 failure mode and the remediation that follows from it |\n"
+            ));
+        }
+        body.push_str("Totals: 4 defects.");
+        assert!(
+            body.chars().count() > 400,
+            "the fixture must exceed the OLD budget or it proves nothing"
+        );
+
+        let assertion = peer_finding_assertion("completed", &body);
+
+        assert!(
+            assertion.starts_with("[completed] "),
+            "the outcome prefix is preserved: {assertion}"
+        );
+        assert!(
+            assertion.contains("defect number 0") && assertion.contains("defect number 3"),
+            "every defect must survive, first to last: {assertion}"
+        );
+        assert!(
+            assertion.contains("Totals: 4 defects."),
+            "the report's own summary must survive: {assertion}"
+        );
+        assert!(
+            !assertion.contains("…[truncated]"),
+            "an ordinary report must not be abridged at all: {assertion}"
+        );
+    }
+
+    /// The bound still exists — a runaway peer cannot write an unbounded row —
+    /// but when it bites it says so, so a verifier reads "abridged" rather than
+    /// "corrupt".
+    #[test]
+    fn an_oversized_peer_report_is_bounded_and_marked() {
+        let body = "Z".repeat(MAX_PEER_FINDING_RECORD_CHARS * 4);
+
+        let assertion = peer_finding_assertion("completed", &body);
+
+        assert!(
+            assertion.chars().count() < MAX_PEER_FINDING_RECORD_CHARS + 100,
+            "the row stays bounded: {} chars",
+            assertion.chars().count()
+        );
+        assert!(
+            assertion.contains("…[truncated]"),
+            "abridgement must be marked: {assertion}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod peer_awaiting_wake_tests {
     use super::*;
     use crate::autonomy::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
@@ -13421,7 +13523,7 @@ fn write_peer_result_if_peer_session(
             // The returned `goal_still_active` is the POST-charge status:
             // it gates the goal-progress wake below so a budget-crossing
             // peer cannot queue one more uncharged master turn past the cap.
-            let content_summary: String = body.chars().take(400).collect();
+            let content_summary = peer_finding_assertion(outcome_str, body);
             let goal_still_active = match default_agent_orchestrator()
                 .model_goal_record_peer_finding(
                     &runtime.data_dir,
@@ -13430,7 +13532,7 @@ fn write_peer_result_if_peer_session(
                     &originator,
                     slug,
                     task_id,
-                    &format!("[{outcome_str}] {content_summary}"),
+                    &content_summary,
                     tokens_consumed,
                 ) {
                 Err(err) => {
@@ -13489,7 +13591,12 @@ fn write_peer_result_if_peer_session(
                 // session. This is the same mechanism used for peer parking /
                 // approval wakes — it surfaces as a system message on the
                 // master's next turn.
-                let content_summary: String = body.chars().take(400).collect();
+                // The WAKE is a notification, not evidence — the master reads
+                // the durable finding for detail — so a short bound is right
+                // here. Marked all the same, so the master can tell a complete
+                // short report from an abridged long one.
+                let content_summary =
+                    octos_core::truncated_utf8(body, MAX_PEER_WAKE_SUMMARY_CHARS, " …[truncated]");
                 if let Err(err) = enqueue_goal_progress_wake(
                     &runtime.data_dir,
                     &originator,
