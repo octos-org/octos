@@ -1203,7 +1203,12 @@ impl GoalUpdateTool {
 /// Max ledger findings folded into the completion evidence, and the per-finding
 /// assertion budget, so a large ledger cannot blow the verifier's input context.
 const MAX_LEDGER_EVIDENCE_FINDINGS: usize = 24;
-const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 600;
+/// #2036 — raised from 600. A peer-recorded finding is a whole report, not one
+/// sentence, and at 600 the verifier was shown a fragment of every multi-defect
+/// audit and rejected completion on exactly that basis. Worst case is still
+/// bounded: 24 × 2000 ≈ 48K chars of evidence, and abridgement stays explicitly
+/// marked so the verifier can tell "abridged" from "corrupt".
+const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 2_000;
 
 /// Assemble the completion evidence the INDEPENDENT verifier judges.
 ///
@@ -2106,13 +2111,89 @@ mod tests {
 
     #[test]
     fn completion_evidence_truncates_a_giant_assertion() {
-        let big = "Z".repeat(5000);
+        let big = "Z".repeat(50_000);
         let findings = vec![json!({"created_by":"peer:x","kind":"observation","assertion":big})];
         let evidence = completion_evidence_with_ledger("done", &findings);
         assert!(
-            evidence.len() < 2000,
+            evidence.len() < MAX_LEDGER_EVIDENCE_ASSERTION_CHARS + 500,
             "a giant assertion is bounded: len={}",
             evidence.len()
+        );
+        assert!(
+            evidence.contains("…[truncated]"),
+            "abridgement must be MARKED, so the verifier reads it as abridged \
+             rather than as corrupt evidence: {evidence}"
+        );
+    }
+
+    /// #2036 — a peer's multi-finding report must reach the verifier WHOLE.
+    ///
+    /// This is the shape that failed live: two peers audited a file each and
+    /// reported a table of defects. At the old 600-char budget the verifier saw
+    /// the first row and a cut-off second, and rejected completion six times on
+    /// exactly that basis ("only ~2 of the 7 claimed findings are actually
+    /// verifiable") until the master gave up and marked the goal `blocked` —
+    /// even though every finding was real and correctly recorded.
+    #[test]
+    fn completion_evidence_keeps_a_realistic_peer_report_intact() {
+        let mut report = String::from("[completed] Audit of auth.py — 4 defects found:\n");
+        for (severity, defect, remediation) in [
+            (
+                "CRITICAL",
+                "hardcoded live admin token in source (line 3): ADMIN_TOKEN is a \
+                 real credential committed to the repository and readable by \
+                 anyone with source access",
+                "rotate the token immediately and load it from the environment",
+            ),
+            (
+                "CRITICAL",
+                "check_pin off-by-one (lines 8-11): the loop bound is \
+                 len(expected) - 1, so the final digit is never compared and \
+                 \"123X\" authenticates against \"1234\" for any X",
+                "iterate the full range and compare with a constant-time helper",
+            ),
+            (
+                "HIGH",
+                "no length check (lines 6-11): a short entry raises IndexError \
+                 out of the comparison loop, and a longer-than-expected entry is \
+                 silently accepted because only the shared prefix is examined",
+                "reject a mismatched length before comparing",
+            ),
+            (
+                "MEDIUM",
+                "non-constant-time comparison (lines 9-10, 15): both the PIN loop \
+                 and the token equality short-circuit on first mismatch, leaking \
+                 the shared prefix length through timing",
+                "use hmac.compare_digest for both",
+            ),
+        ] {
+            report.push_str(&format!("| {severity} | {defect} | fix: {remediation} |\n"));
+        }
+        report.push_str("Totals: 2 critical, 1 high, 1 medium.");
+        assert!(
+            report.chars().count() > 600,
+            "the fixture must exceed the OLD budget or it proves nothing"
+        );
+
+        let findings =
+            vec![json!({"created_by":"peer:aud-auth","kind":"observation","assertion":report})];
+        let evidence = completion_evidence_with_ledger("both peers reported", &findings);
+
+        assert!(
+            evidence.contains("hardcoded live admin token"),
+            "the first defect must survive: {evidence}"
+        );
+        assert!(
+            evidence.contains("hmac.compare_digest"),
+            "the LAST defect must survive too — truncation used to drop it: {evidence}"
+        );
+        assert!(
+            evidence.contains("Totals: 2 critical"),
+            "the report's own summary must survive: {evidence}"
+        );
+        assert!(
+            !evidence.contains("…[truncated]"),
+            "an ordinary peer report must not be abridged at all: {evidence}"
         );
     }
 
