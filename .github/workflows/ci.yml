@@ -1034,6 +1034,18 @@ jobs:
 
       - name: Start octos serve
         run: |
+          # #2031 — the suite asserts the AGENT's shell tool can reach Homebrew
+          # binaries (`ffmpeg version N`, and `/opt/homebrew/bin` present on
+          # PATH). The agent inherits its environment from THIS process, so the
+          # install step passing proves only that the RUNNER has ffmpeg — not
+          # that serve, and therefore the agent, can see it. Set the prefix
+          # explicitly rather than trusting the image's default PATH.
+          export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+          # Recorded so a future failure shows what serve actually inherited,
+          # instead of leaving the next reader to infer it from a green install
+          # step — which is exactly how this stayed misdiagnosed.
+          echo "serve PATH: $PATH"
+          command -v ffmpeg || echo "WARNING: ffmpeg not on serve's PATH"
           OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 &
           # Wait for server to be ready
           for i in $(seq 1 30); do
