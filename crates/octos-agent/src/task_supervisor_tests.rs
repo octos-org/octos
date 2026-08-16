@@ -3962,6 +3962,89 @@ async fn foreground_armed_guard_survives_sweep_before_worker_polls() {
     );
 }
 
+// ── issue #2035: liveness for CLIENT-DRIVEN work (peers) ──────────────
+
+/// Reproduction of #2035. A `peer_handoff` row is the shape the sweep was
+/// never designed for: it is non-terminal for the peer's whole life (it is
+/// retired on `peer_close`, not on turn terminal) and its worker is a
+/// sovereign session the CLIENT drives, so no `TaskTerminalGuard` is ever
+/// armed for it. The next turn's `enable_persistence` therefore reaps a peer
+/// that is perfectly healthy — observed live on mini5, where both peers were
+/// stamped `failed` six seconds after staging and then ran to completion.
+#[test]
+fn a_client_driven_task_with_no_lease_is_reaped_by_the_next_sweep() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let staging_turn = TaskSupervisor::new();
+    staging_turn.enable_persistence(&ledger_path).unwrap();
+    let peer = staging_turn.register("peer_handoff", "profile:peer:auditor", Some("api:master"));
+
+    // The very next turn rebuilds a fresh supervisor over the SAME ledger.
+    let next_turn = TaskSupervisor::new();
+    next_turn.enable_persistence(&ledger_path).unwrap();
+
+    assert_eq!(
+        next_turn.get_task(&peer).expect("peer row restored").error,
+        Some("orphaned across restart".to_string()),
+        "documents the #2035 defect: without a lease the peer is reaped",
+    );
+}
+
+/// The fix. A liveness lease marks the task live for as long as the CLIENT's
+/// work is in flight, so the per-turn sweep skips it — the same exemption a
+/// detached tokio worker gets from `TaskTerminalGuard`, minus the terminal
+/// side effect (a peer is retired by `peer_close`, not by a worker future).
+#[test]
+fn a_liveness_lease_keeps_a_client_driven_task_out_of_the_sweep() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let staging_turn = TaskSupervisor::new();
+    staging_turn.enable_persistence(&ledger_path).unwrap();
+    let peer = staging_turn.register("peer_handoff", "profile:peer:auditor", Some("api:master"));
+    let _lease = TaskLivenessLease::new(peer.clone());
+
+    // Several turns pass while the peer works; every one of them sweeps.
+    for _ in 0..3 {
+        let turn = TaskSupervisor::new();
+        turn.enable_persistence(&ledger_path).unwrap();
+        assert_ne!(
+            turn.get_task(&peer).expect("peer row restored").error,
+            Some("orphaned across restart".to_string()),
+            "a leased peer must survive every per-turn sweep",
+        );
+    }
+}
+
+/// The lease must not defeat the sweep's real purpose. Membership is
+/// process-global and starts empty in a new process, so a peer left behind by
+/// a genuine cross-process restart is still reaped — modelled here by dropping
+/// the lease (what process death does to the whole set) and sweeping again.
+#[test]
+fn dropping_the_liveness_lease_makes_the_task_reapable_again() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let staging_turn = TaskSupervisor::new();
+    staging_turn.enable_persistence(&ledger_path).unwrap();
+    let peer = staging_turn.register("peer_handoff", "profile:peer:auditor", Some("api:master"));
+
+    {
+        let _lease = TaskLivenessLease::new(peer.clone());
+        assert!(is_task_live(&peer), "lease marks the task live");
+    }
+    assert!(!is_task_live(&peer), "drop clears the live-set entry");
+
+    let after_restart = TaskSupervisor::new();
+    after_restart.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        after_restart.get_task(&peer).expect("peer row").error,
+        Some("orphaned across restart".to_string()),
+        "an unleased peer row is still a genuine orphan",
+    );
+}
+
 // ── issue #1920: heartbeat-based in-flight orphan reaper ──────────────
 
 /// A live worker whose heartbeat (`updated_at`) has been silent for longer

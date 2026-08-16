@@ -3689,6 +3689,62 @@ impl Drop for TaskTerminalGuard {
     }
 }
 
+/// Whether `task_id` currently holds a liveness claim in this process — either
+/// a detached worker's [`TaskTerminalGuard`] or a [`TaskLivenessLease`].
+///
+/// This is what the orphan sweep consults, so it is also the honest way for a
+/// caller outside this crate to assert that it has (or has released) liveness
+/// for work it owns.
+pub fn task_is_live(task_id: &str) -> bool {
+    is_task_live(task_id)
+}
+
+/// A liveness lease for work that is genuinely in flight but is NOT driven by
+/// a detached `tokio` worker in this process — a peer session the CLIENT
+/// boots and drives being the motivating case (#2035).
+///
+/// The orphan sweep in [`TaskSupervisor::enable_persistence`] reaps every
+/// non-terminal row that is absent from the process-global live-set, on the
+/// premise that "non-terminal ⇒ no live worker". [`TaskTerminalGuard`] is what
+/// makes that premise true for detached workers, but it is the wrong tool
+/// here: it holds an `Arc<TaskSupervisor>` (which would pin a per-turn
+/// supervisor for the whole life of the peer and defeat the `Weak`-based
+/// pruning in `SessionTaskQueryStore`), and its `Drop` fires a terminal
+/// transition — whereas a peer is retired by `peer_close`, not by a worker
+/// future ending.
+///
+/// So this type carries the liveness half alone: mark on construction, clear
+/// on `Drop`, no supervisor reference and no terminal side effect. Hold it for
+/// exactly as long as the client-driven work is live.
+///
+/// It does not weaken the sweep. Membership is process-global and starts EMPTY
+/// in a new process, so a row left behind by a genuine cross-process restart
+/// has no lease and is still correctly reaped.
+pub struct TaskLivenessLease {
+    task_id: String,
+}
+
+impl TaskLivenessLease {
+    /// Mark `task_id` live until the returned lease is dropped. Idempotent —
+    /// re-leasing an already-live id is a no-op insert.
+    pub fn new(task_id: impl Into<String>) -> Self {
+        let task_id = task_id.into();
+        mark_task_live(&task_id);
+        Self { task_id }
+    }
+
+    /// The task this lease keeps live.
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+}
+
+impl Drop for TaskLivenessLease {
+    fn drop(&mut self) {
+        clear_task_live(&self.task_id);
+    }
+}
+
 #[cfg(test)]
 #[path = "task_supervisor_tests.rs"]
 mod tests;
