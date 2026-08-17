@@ -1133,6 +1133,26 @@ impl ServeCommand {
             }
         }
 
+        // #2033 — the PEER-fleet half of boot-resume. The peer-fleet synthesis
+        // gate is edge-triggered (a peer turn terminal / a master turn
+        // terminal), which is sound inside a process but leaves a restart with
+        // no edge at all: a synthesis that was owed when the previous process
+        // exited is recovered only by the next unrelated turn — never, on a
+        // fleet whose master is idle and whose peers are done. Recompute it here
+        // for every profile, bounded to fleets whose delivered round is past
+        // their recorded mark. Enqueue-only; the global continuation drain
+        // spawned below turns it into a turn under the usual gates.
+        //
+        // Peers live under the PROFILE data dir (not the serve `data_dir`), so
+        // this walks the profile runtimes rather than a single root.
+        for (profile_id, rt) in &profile_runtimes {
+            crate::api::ui_protocol_transport::enqueue_boot_owed_peer_fleet_synthesis(
+                profile_id,
+                &rt.data_dir.join("peers"),
+            )
+            .await;
+        }
+
         let session_cache = Arc::new(
             crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
                 // Per-project session storage (opt-in, default off). When set,

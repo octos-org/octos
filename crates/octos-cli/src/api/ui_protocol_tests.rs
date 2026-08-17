@@ -10145,6 +10145,151 @@ async fn a_second_peer_round_is_not_recorded_as_summarized_unless_a_turn_actuall
     );
 }
 
+/// #2033 — a synthesis that was OWED when the process died must be evaluated at
+/// BOOT, not left waiting for the next unrelated turn.
+///
+/// The gate is EDGE-triggered: `evaluate_and_enqueue_fleet_synthesis` is reached
+/// from exactly two edges, a PEER turn terminal and a MASTER turn terminal.
+/// Normally that is enough — a deduped enqueue deliberately leaves the marks
+/// behind (#2024) and the in-flight synthesis continuation's OWN terminal is the
+/// retry edge. What has no edge at all is a process restart: if the owed round's
+/// retry edge was still in the future when the process died, nothing on the new
+/// process ever recomputes the gate.
+///
+/// Observed live (mini5 soak): a peer's round-2 terminal landed while a round-1
+/// synthesis was in flight, so the enqueue deduped and the marks stayed at
+/// `1 auditor`; the serve was then killed before that continuation reached its
+/// terminal. On restart the master session was opened and sat for 220s with the
+/// marks still at round 1 — one trivial master turn advanced them in 3s. The
+/// peer's last round is only ever written up if the user happens to type again.
+///
+/// Reconstructs exactly that on-disk state — peer delivered round 2, marks
+/// recorded at round 1, nothing in flight — and asserts the BOOT sweep fires it
+/// with NO turn edge whatsoever. The already-current fleet in the same
+/// `peers/` root must NOT be evaluated: the sweep is bounded to owed fleets.
+#[tokio::test]
+async fn boot_sweep_synthesizes_a_peer_fleet_round_left_owed_when_the_process_died() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    // Unique masters/slugs: the continuation dedupe key, its recent-claim
+    // guard, and the peer wire registry are all process-global, so shared names
+    // would collide with sibling tests in a parallel run (#2029).
+    let owed_master = "tenant-a:api:master-2033-owed";
+    let current_master = "tenant-a:api:master-2033-current";
+
+    let stage = |slug: &str, master: &str, rounds: u32| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "brief").unwrap();
+        std::fs::write(dir.join("originator"), master).unwrap();
+        std::fs::write(dir.join("result.md"), "findings").unwrap();
+        for round in 1..=rounds {
+            std::fs::write(dir.join(format!("result-{round}.md")), "findings").unwrap();
+        }
+    };
+    // OWED: delivered round 2, only round 1 recorded as summarized.
+    stage("auditor-2033", owed_master, 2);
+    write_peer_fleet_synthesis_marks(peers_root, owed_master, &[("auditor-2033".to_owned(), 1)])
+        .unwrap();
+    // CURRENT: delivered round 1, round 1 already summarized. Nothing owed.
+    stage("scribe-2033", current_master, 1);
+    write_peer_fleet_synthesis_marks(peers_root, current_master, &[("scribe-2033".to_owned(), 1)])
+        .unwrap();
+
+    // Precondition: the owed fleet's record is genuinely behind its delivery.
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, owed_master),
+            "auditor-2033",
+            2
+        ),
+        1,
+        "precondition: the round-2 delivery is recorded as summarized only through round 1",
+    );
+
+    // The BOOT sweep — no peer terminal, no master terminal, no client.
+    let evaluated = enqueue_boot_owed_peer_fleet_synthesis(MAIN_PROFILE_ID, peers_root).await;
+
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, owed_master),
+            "auditor-2033",
+            2
+        ),
+        2,
+        "boot must enqueue the owed synthesis and advance the marks; without a \
+         boot-time evaluation the round waits for an unrelated turn, forever on \
+         a quiet fleet",
+    );
+    assert_eq!(
+        evaluated, 1,
+        "exactly the OWED fleet is evaluated; a fleet with nothing new must not \
+         be re-evaluated (the sweep is bounded to owed fleets, not a full scan)",
+    );
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, current_master),
+            "scribe-2033",
+            1
+        ),
+        1,
+        "an already-summarized fleet is untouched by the boot sweep",
+    );
+}
+
+/// #2033 — the boot sweep only decides WHICH fleets to look at; whether one
+/// fires stays with the shared gate.
+///
+/// "Owed" (a delivered round past the recorded mark) is a strictly weaker
+/// condition than "ready": it says nothing about the other peers in the fleet.
+/// A sweep that wrote the marks itself — or that treated owed as fire — would
+/// summarize a fleet mid-flight and, because the marks advance, never write up
+/// the sibling's work at all. Here one peer is owed at round 2 while a sibling
+/// has not delivered anything, so the fleet must be selected and then HELD.
+#[tokio::test]
+async fn boot_sweep_selects_an_owed_peer_fleet_but_leaves_the_fire_decision_to_the_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path();
+    let master = "tenant-a:api:master-2033-unfinished";
+
+    // Owed: delivered round 2, recorded at round 1.
+    let delivered = peers_root.join("auditor-2033-unfinished");
+    std::fs::create_dir_all(&delivered).unwrap();
+    std::fs::write(delivered.join("brief.md"), "brief").unwrap();
+    std::fs::write(delivered.join("originator"), master).unwrap();
+    std::fs::write(delivered.join("result.md"), "findings").unwrap();
+    std::fs::write(delivered.join("result-1.md"), "findings").unwrap();
+    std::fs::write(delivered.join("result-2.md"), "findings").unwrap();
+    // Sibling in the SAME fleet with no result at all — the fleet is not done.
+    let pending = peers_root.join("scribe-2033-unfinished");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("brief.md"), "brief").unwrap();
+    std::fs::write(pending.join("originator"), master).unwrap();
+    write_peer_fleet_synthesis_marks(
+        peers_root,
+        master,
+        &[("auditor-2033-unfinished".to_owned(), 1)],
+    )
+    .unwrap();
+
+    let evaluated = enqueue_boot_owed_peer_fleet_synthesis(MAIN_PROFILE_ID, peers_root).await;
+
+    assert_eq!(
+        evaluated, 1,
+        "the fleet IS owed, so the sweep must hand it to the gate",
+    );
+    assert_eq!(
+        synthesized_round_for(
+            &read_peer_fleet_synthesis_marks(peers_root, master),
+            "auditor-2033-unfinished",
+            2
+        ),
+        1,
+        "the gate holds an unfinished fleet, so the boot sweep must not advance \
+         the marks — advancing them here would lose the sibling's round entirely",
+    );
+}
+
 /// Bug 2 (reset edge) — `collect_owned_peer_results` distinguishes a
 /// genuinely-EMPTY readable directory (`Some(vec![])`) from a `peers/` scan
 /// FAILURE (`None`), so a transient read error is never mistaken for a cleared
