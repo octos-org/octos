@@ -164,6 +164,12 @@ const LONG_RUNNING_TOOLS: &[&str] = &[
 /// result and finish cancellation cleanup before the outer task backstop.
 const DECLARED_TOOL_DISPATCH_GRACE_SECS: u64 = 5;
 
+/// Maximum time the dispatcher waits for an aborted Tokio task to acknowledge
+/// cancellation. A future that is executing blocking synchronous code cannot
+/// observe `abort()` until it yields, so awaiting it without another deadline
+/// would turn a timeout into an indefinite wait.
+const TOOL_ABORT_JOIN_GRACE_SECS: u64 = 1;
+
 /// Whether `name` is a genuinely long-running tool (keeps the 1800s default).
 fn is_long_running_tool(name: &str) -> bool {
     LONG_RUNNING_TOOLS.contains(&name)
@@ -218,7 +224,9 @@ fn compute_batch_timeout_secs(
         interactive_default
     };
     let declared_dispatch_timeout = if declared_tool_timeout > 0 {
-        declared_tool_timeout.saturating_add(DECLARED_TOOL_DISPATCH_GRACE_SECS)
+        declared_tool_timeout
+            .saturating_add(DECLARED_TOOL_DISPATCH_GRACE_SECS)
+            .min(MAX_TOOL_TIMEOUT_SECS)
     } else {
         0
     };
@@ -2707,8 +2715,18 @@ impl Agent {
                 Some(dur) => match tokio::time::timeout(dur, &mut handle).await {
                     Ok(joined) => Ok(joined),
                     Err(_) => {
-                        handle.abort();
-                        let _ = handle.await;
+                        if !abort_and_join_with_grace(
+                            &mut handle,
+                            Duration::from_secs(TOOL_ABORT_JOIN_GRACE_SECS),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                tool = %tool_call.name,
+                                tool_id = %tool_call.id,
+                                "aborted tool task did not stop within cleanup grace"
+                            );
+                        }
                         Err(())
                     }
                 },
@@ -2874,9 +2892,15 @@ impl Agent {
 /// acks) that had already completed. `timeout_at` polls the inner handle
 /// before the timer, so a handle that completed by the time we reach it
 /// yields its result even at/past the deadline. A still-pending task is
-/// aborted and awaited before the synthetic timeout result is returned. This
-/// drops the tool future immediately, allowing plugin process kill guards and
-/// other cancellation-safe cleanup to run instead of leaving detached work.
+/// aborted and awaited for a bounded cleanup grace before the synthetic
+/// timeout result is returned. Cancellation-safe futures stop immediately;
+/// blocking synchronous code cannot wedge the dispatcher while acknowledging
+/// the abort later, once it yields.
+async fn abort_and_join_with_grace<T>(handle: &mut JoinHandle<T>, grace: Duration) -> bool {
+    handle.abort();
+    tokio::time::timeout(grace, handle).await.is_ok()
+}
+
 async fn join_parallel_handles(
     handles: Vec<JoinHandle<ToolCallResult>>,
     calls: &[&octos_core::ToolCall],
@@ -2892,13 +2916,17 @@ async fn join_parallel_handles(
                     Ok(Ok(result)) => results.push(result),
                     Ok(Err(e)) => results.push(panic_result(tc, &e.to_string())),
                     Err(_elapsed) => {
-                        handle.abort();
-                        let _ = handle.await;
+                        let stopped = abort_and_join_with_grace(
+                            &mut handle,
+                            Duration::from_secs(TOOL_ABORT_JOIN_GRACE_SECS),
+                        )
+                        .await;
                         tracing::error!(
                             timeout_secs = elapsed_secs,
                             tool = %tc.name,
                             tool_id = %tc.id,
-                            "tool execution timed out -- spawned task aborted and awaited"
+                            stopped_within_grace = stopped,
+                            "tool execution timed out -- abort requested with bounded cleanup wait"
                         );
                         results.push(timed_out_result(tc, elapsed_secs));
                     }
@@ -3354,7 +3382,7 @@ mod tests {
     #[test]
     fn should_honor_registered_plugin_budget_over_interactive_default() {
         let secs = compute_batch_timeout_secs(
-            &["oll_generate_lesson"],
+            &["lesson_generate"],
             /* any_human_wait */ false,
             /* llm_requested */ 0,
             /* declared_tool_timeout */ 305,
@@ -3362,6 +3390,19 @@ mod tests {
             /* interactive_default */ 120,
         );
         assert_eq!(secs, Some(310));
+    }
+
+    #[test]
+    fn should_clamp_registered_plugin_budget_to_dispatch_maximum() {
+        let secs = compute_batch_timeout_secs(
+            &["lesson_generate"],
+            /* any_human_wait */ false,
+            /* llm_requested */ 0,
+            /* declared_tool_timeout */ MAX_TOOL_TIMEOUT_SECS + 300,
+            /* config_tool_timeout */ 1800,
+            /* interactive_default */ 120,
+        );
+        assert_eq!(secs, Some(MAX_TOOL_TIMEOUT_SECS));
     }
 
     #[test]
@@ -4050,6 +4091,29 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "timed-out task was detached instead of aborted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_not_wait_forever_for_blocking_task_after_abort() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let mut handle = tokio::spawn(async move {
+            entered_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("task should enter blocking code");
+
+        let started = std::time::Instant::now();
+        let joined =
+            super::abort_and_join_with_grace(&mut handle, std::time::Duration::from_millis(10))
+                .await;
+
+        assert!(!joined, "blocking task cannot acknowledge abort in time");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "dispatcher waited for blocking code after abort",
         );
     }
 
