@@ -155,17 +155,22 @@ const NATIVE_SPECIALIST_ARTIFACT_CONTENT_MAX_BYTES: usize = 256 * 1024;
 
 /// #1324 follow-up — kind label for the `External(_)` master continuation
 /// reason used to re-inject a `SpawnOnlyFailureSignal` as a synthetic
-/// recovery turn on the WS / standalone-turn path. The gateway path drives
-/// recovery through `ActorMessage::RecoveryHint` directly into the actor
-/// inbox; on the WS path the closest equivalent is the global master
-/// continuation queue (drained on the connection's tick).
+/// recovery turn.
+///
+/// #2020 (Gap-1 step 4): this is now the ONLY failure re-entry transport.
+/// Both runtime modes enqueue here — the WS / standalone-turn path (drained
+/// on the connection's tick and by the connection-independent global drain)
+/// and the gateway path (drained by
+/// `SessionActor::drain_master_continuations`). The gateway's former
+/// `ActorMessage::RecoveryHint` inbox — a SECOND, parallel re-entry channel
+/// — is retired.
 pub(crate) const SPAWN_ONLY_FAILURE_EXTERNAL_KIND: &str = "spawn_only_failure";
-const SPAWN_ONLY_FAILURE_META_TASK_ID: &str = "task_id";
-const SPAWN_ONLY_FAILURE_META_TOOL_NAME: &str = "tool_name";
+pub(crate) const SPAWN_ONLY_FAILURE_META_TASK_ID: &str = "task_id";
+pub(crate) const SPAWN_ONLY_FAILURE_META_TOOL_NAME: &str = "tool_name";
 const SPAWN_ONLY_FAILURE_META_ERROR_MESSAGE: &str = "error_message";
 const SPAWN_ONLY_FAILURE_META_TOOL_INPUT: &str = "tool_input";
 const SPAWN_ONLY_FAILURE_META_ALTERNATIVES: &str = "suggested_alternatives";
-const SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID: &str = "originating_client_message_id";
+pub(crate) const SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID: &str = "originating_client_message_id";
 /// Synthetic "group" id stamped onto spawn_only failure continuations so
 /// the `External` enqueue path passes the scheduler's required field.
 /// Distinct from `coding-autonomy` (loops/goals) so operators can filter
@@ -922,31 +927,6 @@ pub(crate) fn upsert_background_task_agent(
     Some((session_id, agent))
 }
 
-/// Gap-1 unification: how a runtime mode wants the unified terminal sink to
-/// route the FAILURE outcome.
-///
-/// Success always routes through the queue (`ChildCompleted`); the question
-/// is only whether the failure outcome also enqueues a recovery
-/// continuation HERE, or stays on the mode's legacy failure delivery during
-/// the strangler migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TerminalFailureRouting {
-    /// Route the failure outcome through the queue
-    /// (`External("spawn_only_failure")`). Used by the WS / standalone-turn
-    /// path, whose only failure channel IS the queue (the legacy
-    /// `set_on_failure_signal` enqueues the SAME dedupe key, so the two
-    /// collapse to one continuation).
-    Queue,
-    /// Skip the failure outcome — the mode still drives failure recovery
-    /// through its OWN channel (the gateway `ActorMessage::RecoveryHint`
-    /// inbox, which carries the consecutive-recovery cap + per-task claim +
-    /// exhaustion banner the queue drain does not yet replicate). Routing
-    /// failure here too would DOUBLE-deliver across the two distinct
-    /// channels (no shared dedupe key between the inbox and the queue).
-    /// Retiring `RecoveryHint` (Gap-1 step 4) flips this to `Queue`.
-    LegacyChannel,
-}
-
 /// Gap-1 unification: the SINGLE sink that routes terminal background
 /// transitions through the master continuation queue. Wired via
 /// `TaskSupervisor::set_on_terminal` in every runtime mode (gateway, WS,
@@ -959,8 +939,7 @@ pub(crate) enum TerminalFailureRouting {
 ///   exactly the success path the legacy `on_change` callback already
 ///   drives — the explicit `child/...` dedupe key (step 3) keeps the
 ///   strangler double-delivery collapsed to one continuation.
-/// - **Failure** (`TerminalOutcome::Failed`) → when `failure_routing` is
-///   [`TerminalFailureRouting::Queue`], enqueue an
+/// - **Failure** (`TerminalOutcome::Failed`) → enqueue an
 ///   `External("spawn_only_failure")` recovery continuation under the SAME
 ///   profile-resolving rule (killing `_main` stranding for failures by
 ///   construction). The synth-ack gate moves to PROMPT SELECTION here: a
@@ -968,12 +947,16 @@ pub(crate) enum TerminalFailureRouting {
 ///   short-circuit) is SUPPRESSED — matching the documented skip cases —
 ///   while the recovery body is rendered only when the LLM was previously
 ///   told the work started. The failure dedupe key
-///   (`external/<kind>/<session>/<task_id>`) is shared with the legacy WS
-///   `enqueue_spawn_only_failure_continuation`, so double-delivery on the WS
-///   path collapses to one continuation. The gateway passes
-///   [`TerminalFailureRouting::LegacyChannel`] so its `RecoveryHint` inbox
-///   (which owns the runaway-recovery caps) remains the single failure
-///   channel until step 4 retires it.
+///   (`external/<kind>/<session>/<task_id>`) is shared with
+///   [`InProcessAgentOrchestrator::enqueue_spawn_only_failure_continuation`],
+///   which the deferred synth-ack stash still fires through `on_failure`, so
+///   the two producers collapse to one continuation.
+///
+/// #2020 (Gap-1 step 4): failure now routes here for EVERY runtime mode.
+/// The gateway used to opt out (its `ActorMessage::RecoveryHint` inbox was a
+/// second, parallel re-entry channel that owned the recovery caps); that
+/// inbox is retired and the caps moved onto the queue drain, so there is one
+/// re-entry path for both outcomes.
 ///
 /// `runtime_profile_id` is the turn's resolved profile (mirrors the
 /// `active_profile_id.or(routed_profile_id)` resolution the call sites use);
@@ -982,7 +965,6 @@ pub(crate) enum TerminalFailureRouting {
 pub(crate) fn route_terminal_event_to_continuation_queue(
     event: &octos_agent::TerminalEvent,
     runtime_profile_id: Option<&str>,
-    failure_routing: TerminalFailureRouting,
 ) {
     match &event.outcome {
         octos_agent::TerminalOutcome::Completed => {
@@ -990,13 +972,6 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
             // transition enqueues the autonomous ChildCompleted re-entry
             // under the resolved profile.
             let _ = upsert_background_task_agent(&event.task, runtime_profile_id);
-        }
-        octos_agent::TerminalOutcome::Failed(_)
-            if failure_routing == TerminalFailureRouting::LegacyChannel =>
-        {
-            // The mode drives failure recovery through its own channel
-            // (gateway RecoveryHint inbox). Routing it here too would
-            // double-deliver across two channels with no shared dedupe key.
         }
         octos_agent::TerminalOutcome::Failed(signal) => {
             // Synth-ack-as-prompt-selection: only the ack-emitted failures
@@ -3356,19 +3331,25 @@ impl InProcessAgentOrchestrator {
     /// PR #1324 follow-up — enqueue a synthetic recovery continuation for a
     /// failed `spawn_only` task.
     ///
-    /// The gateway path drives recovery through
-    /// [`ActorMessage::RecoveryHint`] directly into the session actor's
-    /// inbox (see `session_actor.rs::SessionActor::spawn` for the wiring).
-    /// The WS / `run_standalone_turn` path has no equivalent inbox: the
-    /// per-turn registry's `TaskSupervisor` outlives the turn (background
-    /// tokio::spawn tasks may fail AFTER the turn terminates), and the
-    /// WS connection itself may have closed before the failure surfaces.
-    /// The closest survivor is the in-process master continuation queue
-    /// (drained on every `appui_continuation_tick`), so we enqueue an
-    /// `External("spawn_only_failure")` request carrying the recovery
-    /// fields in metadata. `master_continuation_prompt` recognises the
-    /// kind and renders the same `[system-internal] Your previous ...`
-    /// body that `build_recovery_prompt` produces on the gateway path.
+    /// The per-turn registry's `TaskSupervisor` outlives the turn (background
+    /// tokio::spawn tasks may fail AFTER the turn terminates), and on the WS
+    /// path the connection itself may have closed before the failure
+    /// surfaces. The survivor in every runtime mode is the in-process master
+    /// continuation queue, so we enqueue an
+    /// `External("spawn_only_failure")` request carrying the recovery fields
+    /// in metadata. `master_continuation_prompt` recognises the kind and
+    /// renders the `[system-internal] Your previous ...` body via the shared
+    /// [`crate::session_actor::build_recovery_prompt_body`] formatter.
+    ///
+    /// #2020: BOTH runtime modes now call this. It is reached two ways —
+    /// directly from `on_failure` (which is what re-delivers a
+    /// *fail-before-ack* failure once the deferred synth-ack stash drains,
+    /// the case the unified `on_terminal` sink prompt-suppresses because the
+    /// ack had not been recorded when its event was built), and from
+    /// [`route_terminal_event_to_continuation_queue`] for an already-acked
+    /// failure. Both carry the SAME dedupe key, so the pair collapses to one
+    /// continuation; the scheduler's recently-claimed guard closes the drain
+    /// race between them.
     ///
     /// The dedupe key is keyed on `task_id` so repeated `mark_failed`
     /// calls (live + cascade-fail, idempotent re-marks) collapse onto a
@@ -12074,53 +12055,85 @@ pub(crate) fn render_fleet_keeper_prompt(continuation: &QueuedMasterContinuation
 }
 
 /// PR #1324 follow-up — render the spawn_only post-spawn failure recovery
-/// prompt from a queued continuation's metadata. Mirrors the
-/// `build_recovery_prompt` helper in `session_actor.rs` that the gateway
-/// path uses on the `ActorMessage::RecoveryHint` inbox, so the LLM sees
-/// the same `[system-internal] Your previous ...` body regardless of
-/// which path delivered the recovery turn.
+/// prompt from a queued continuation's metadata.
+///
+/// #2020: delegates to [`crate::session_actor::build_recovery_prompt_body`],
+/// the single formatter for this body. It used to carry its own copy of the
+/// format string "mirroring" `build_recovery_prompt` on the retired
+/// `RecoveryHint` inbox — two renderers that had to be kept in sync by hand.
+/// With the inbox gone there is one delivery path, so there is one renderer.
 fn render_spawn_only_failure_recovery_prompt(continuation: &QueuedMasterContinuation) -> String {
-    let tool_name = continuation
-        .metadata
-        .get(SPAWN_ONLY_FAILURE_META_TOOL_NAME)
-        .map(String::as_str)
-        .unwrap_or("unknown");
-    let error_message = continuation
-        .metadata
-        .get(SPAWN_ONLY_FAILURE_META_ERROR_MESSAGE)
-        .map(String::as_str)
-        .unwrap_or("");
-    let input_block = continuation
-        .metadata
-        .get(SPAWN_ONLY_FAILURE_META_TOOL_INPUT)
-        .map(|input| format!("\nOriginal input: {input}"))
-        .unwrap_or_default();
-    let alternatives_block = continuation
+    let alternatives = continuation
         .metadata
         .get(SPAWN_ONLY_FAILURE_META_ALTERNATIVES)
         .map(|joined| {
-            let list = joined
+            joined
                 .split('\u{001f}')
                 .filter(|alt| !alt.is_empty())
-                .map(|alt| format!("- {alt}"))
                 .collect::<Vec<_>>()
-                .join("\n");
-            if list.is_empty() {
-                String::new()
-            } else {
-                format!("\nDetected alternatives:\n{list}\n")
-            }
         })
         .unwrap_or_default();
-    format!(
-        "[system-internal] Your previous `{tool}` call failed.\n\
-         Error: {err}{input}{alts}\n\
-         Respond to the user with a path forward — offer the alternatives, or try the safest one yourself if appropriate. Do not just report failure.",
-        tool = tool_name,
-        err = error_message,
-        input = input_block,
-        alts = alternatives_block,
+    crate::session_actor::build_recovery_prompt_body(
+        continuation
+            .metadata
+            .get(SPAWN_ONLY_FAILURE_META_TOOL_NAME)
+            .map(String::as_str)
+            .unwrap_or("unknown"),
+        continuation
+            .metadata
+            .get(SPAWN_ONLY_FAILURE_META_ERROR_MESSAGE)
+            .map(String::as_str)
+            .unwrap_or(""),
+        continuation
+            .metadata
+            .get(SPAWN_ONLY_FAILURE_META_TOOL_INPUT)
+            .map(String::as_str),
+        &alternatives,
     )
+}
+
+/// #2020 — the recovery-policy fields a drain needs off a queued
+/// `External("spawn_only_failure")` continuation, so the metadata key names
+/// stay owned by this module.
+///
+/// Returns `None` for any other continuation reason, which is the drain's
+/// signal that the recovery gate (per-task claim + consecutive cap +
+/// exhaustion banner) does not apply to it.
+pub(crate) struct SpawnOnlyFailureRecoveryFields<'a> {
+    pub(crate) task_id: &'a str,
+    pub(crate) tool_name: &'a str,
+    pub(crate) originating_client_message_id: Option<&'a str>,
+}
+
+pub(crate) fn spawn_only_failure_recovery_fields(
+    continuation: &QueuedMasterContinuation,
+) -> Option<SpawnOnlyFailureRecoveryFields<'_>> {
+    match &continuation.reason {
+        MasterContinuationReason::External(kind) if kind == SPAWN_ONLY_FAILURE_EXTERNAL_KIND => {
+            Some(SpawnOnlyFailureRecoveryFields {
+                // A continuation with no `task_id` metadata (legacy persisted
+                // row) still gets a claim slot — keyed on the dedupe key,
+                // which is task-scoped by construction — so the cap and the
+                // claim can never be bypassed by a missing field.
+                task_id: continuation
+                    .metadata
+                    .get(SPAWN_ONLY_FAILURE_META_TASK_ID)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| continuation.dedupe_key.as_str()),
+                tool_name: continuation
+                    .metadata
+                    .get(SPAWN_ONLY_FAILURE_META_TOOL_NAME)
+                    .map(String::as_str)
+                    .unwrap_or("unknown"),
+                originating_client_message_id: continuation
+                    .metadata
+                    .get(SPAWN_ONLY_FAILURE_META_ORIGINATING_CMID)
+                    .map(String::as_str)
+                    .filter(|cmid| !cmid.is_empty()),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn master_continuation_reason_wire_name(reason: &MasterContinuationReason) -> String {
@@ -16698,15 +16711,21 @@ mod tests {
         );
     }
 
-    /// Gap-1 step 2/4 boundary: the gateway wires the unified sink with
-    /// `TerminalFailureRouting::LegacyChannel` so failure recovery stays on
-    /// the `RecoveryHint` inbox (which owns the runaway-recovery caps).
-    /// Routing failure through the queue here too would DOUBLE-deliver
-    /// across two channels with no shared dedupe key. This pins that a
-    /// failure event under `LegacyChannel` enqueues NOTHING, while the same
-    /// event under `Queue` (WS path) enqueues exactly one recovery.
+    /// Gap-1 step 4 (#2020): the unified sink routes the FAILURE outcome
+    /// through the queue for EVERY runtime mode. The gateway used to opt out
+    /// (`TerminalFailureRouting::LegacyChannel`) because its
+    /// `ActorMessage::RecoveryHint` inbox was a second, parallel re-entry
+    /// channel that owned the runaway-recovery caps; with the inbox retired
+    /// and the caps moved onto the queue drain, the opt-out is gone.
+    ///
+    /// This pins the post-flip contract: a gateway-shaped failure (no
+    /// threaded runtime profile — the profile resolves off the session key)
+    /// and a WS-shaped failure (explicit runtime profile) each enqueue
+    /// EXACTLY ONE recovery continuation, under the profile the turn ran as.
+    /// A regression to zero would silently drop failure recovery on the
+    /// gateway; a regression to two would double-deliver.
     #[test]
-    fn legacy_channel_failure_routing_does_not_double_enqueue() {
+    fn failure_routing_enqueues_exactly_one_recovery_for_every_runtime_mode() {
         let session_legacy = SessionKey::with_profile("tenant-legacy", "api", "fail-legacy");
         let session_queue = SessionKey::with_profile("tenant-queue", "api", "fail-queue");
         let now = Utc::now();
@@ -16759,30 +16778,32 @@ mod tests {
             }
         };
 
-        // Gateway: LegacyChannel — failure must NOT reach the queue.
+        // Gateway shape: no threaded runtime profile — the profile resolves
+        // off the (profile-bearing) session key inside the router. Pre-#2020
+        // this enqueued NOTHING, because failure stayed on the RecoveryHint
+        // inbox.
         route_terminal_event_to_continuation_queue(
             &make_event(&session_legacy, "task-legacy"),
-            Some("tenant-legacy"),
-            TerminalFailureRouting::LegacyChannel,
+            None,
         );
         assert_eq!(
             default_agent_orchestrator()
                 .pending_continuation_count_for_session_for_test(&session_legacy, "tenant-legacy"),
-            0,
-            "LegacyChannel failure routing must not enqueue (recovery stays on RecoveryHint)",
+            1,
+            "gateway failure routing must enqueue exactly one recovery continuation \
+             under the key-derived profile",
         );
 
-        // WS: Queue — same shaped failure enqueues exactly one recovery.
+        // WS shape: explicit runtime profile — same single enqueue.
         route_terminal_event_to_continuation_queue(
             &make_event(&session_queue, "task-queue"),
             Some("tenant-queue"),
-            TerminalFailureRouting::Queue,
         );
         assert_eq!(
             default_agent_orchestrator()
                 .pending_continuation_count_for_session_for_test(&session_queue, "tenant-queue"),
             1,
-            "Queue failure routing must enqueue exactly one recovery continuation",
+            "WS failure routing must enqueue exactly one recovery continuation",
         );
     }
 
@@ -17299,11 +17320,7 @@ mod tests {
         // 3. Unified `on_terminal` WS enqueue (route_terminal_event...Queue) —
         //    same transition, microseconds later. Must be collapsed by the
         //    recently-claimed guard, NOT produce a second recovery.
-        route_terminal_event_to_continuation_queue(
-            &event,
-            Some(profile),
-            TerminalFailureRouting::Queue,
-        );
+        route_terminal_event_to_continuation_queue(&event, Some(profile));
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
             0,
@@ -17377,11 +17394,7 @@ mod tests {
 
         // 1. Unified `notify_terminal` fires first on the failed transition but
         //    PROMPT-SUPPRESSES (ack never emitted at fire time) → enqueues nothing.
-        route_terminal_event_to_continuation_queue(
-            &unified_event,
-            Some(profile),
-            TerminalFailureRouting::Queue,
-        );
+        route_terminal_event_to_continuation_queue(&unified_event, Some(profile));
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
             0,

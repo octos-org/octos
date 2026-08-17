@@ -29487,17 +29487,19 @@ async fn run_standalone_turn(
         // post-spawn failure signal BEFORE `enable_persistence` so the
         // orphan-task sweep at `task_supervisor.rs:1164-1166` —
         // which can `mark_failed` resurrected tasks — does NOT
-        // silently drop the recovery turn. The gateway path drives
-        // recovery through `ActorMessage::RecoveryHint` directly into
-        // the session actor's inbox; the WS turn handler has no
-        // actor, so we re-inject the failure into the global master
-        // continuation queue (drained on every
+        // silently drop the recovery turn. We re-inject the failure
+        // into the global master continuation queue (drained on every
         // `appui_continuation_tick`). `default_agent_orchestrator()`
         // is a process-wide singleton, so the callback survives both
         // the per-turn `tool_registry` drop AND a closed WS
         // connection — on next subscribe, the queued
         // `External("spawn_only_failure")` continuation fires and
         // `master_continuation_prompt` renders the recovery body.
+        //
+        // #2020: the gateway now enqueues onto this same queue from its own
+        // `set_on_failure_signal` (it used to own a separate
+        // `ActorMessage::RecoveryHint` inbox), so both runtime modes
+        // re-enter through one transport.
         //
         // The per-connection drain filter
         // (`maybe_spawn_appui_master_continuation_runner`) takes
@@ -29586,11 +29588,12 @@ async fn run_standalone_turn(
         // (ChildCompleted) AND failure (recovery) re-entry through ONE
         // profile-resolving call into the master continuation queue. Runs
         // alongside the legacy `set_on_change` (success) and
-        // `set_on_failure_signal` (failure) wiring during the strangler
-        // migration — shared dedupe keys collapse the double delivery to one
-        // continuation. The threaded `terminal_profile_id` (mirrors
-        // `change_profile_id` / `failure_profile_id`) kills the `_main`
-        // failure-stranding by construction.
+        // `set_on_failure_signal` (failure, which still owns the deferred
+        // fail-before-ack re-emit) wiring — shared dedupe keys collapse the
+        // double delivery to one continuation. The threaded
+        // `terminal_profile_id` (mirrors `change_profile_id` /
+        // `failure_profile_id`) kills the `_main` failure-stranding by
+        // construction.
         let terminal_profile_id = active_profile_id
             .clone()
             .or_else(|| routed_profile_id.clone())
@@ -29599,10 +29602,6 @@ async fn run_standalone_turn(
             crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
                 event,
                 Some(terminal_profile_id.as_str()),
-                // WS / standalone-turn path: the queue IS the only failure
-                // channel here (the legacy `set_on_failure_signal` enqueues
-                // the SAME dedupe key), so route both outcomes.
-                crate::autonomy::agent_orchestrator::TerminalFailureRouting::Queue,
             );
         });
         if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {

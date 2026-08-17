@@ -196,6 +196,11 @@ const DEFAULT_CONTEXT_COMPACT_KEEP_ITEMS: usize = 16;
 /// distinct task failures (LLM retries the same broken approach with new
 /// tool_call_ids and they all fail). Reset to 0 on a user-initiated turn.
 ///
+/// #2020: both caps are applied by
+/// [`SessionActor::admit_spawn_only_failure_recovery`] on the continuation
+/// queue drain — the single re-entry path — rather than by the retired
+/// `ActorMessage::RecoveryHint` handler.
+///
 /// Default 2 = the LLM gets up to two corrective rounds before the actor
 /// gives up and emits a final UI banner ("Background failure could not be
 /// recovered after N attempts"). Higher values risk runaway loops on
@@ -1000,7 +1005,31 @@ fn inbound_bool_metadata(inbound: &InboundMessage, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// #2020 — a drained `External("spawn_only_failure")` continuation is
+/// stamped `_recovery_turn` by
+/// [`SessionActor::synthetic_master_continuation_inbound`].
+fn inbound_is_recovery_turn(inbound: &InboundMessage) -> bool {
+    inbound_bool_metadata(inbound, "_recovery_turn")
+}
+
+/// Inbounds the runtime synthesised for itself, whose prompt is a directive
+/// rather than a turn the user took — so no durable user row and no session
+/// summary derived from it.
+///
+/// #2020 — a spawn_only-failure RECOVERY continuation is deliberately
+/// excluded. Unlike a goal/loop/child continuation it is not a bare
+/// directive: the recovery prompt is the only record of WHY the assistant
+/// suddenly re-engaged, and the M8.9 "Design A" constraint requires the model
+/// to see it on its next turn. The retired `ActorMessage::RecoveryHint`
+/// inbound carried no `_master_continuation` marker and so persisted by
+/// default; without this exclusion, moving recovery onto the continuation
+/// queue would have silently stopped persisting it — the turn would still
+/// run, but the transcript would show an assistant reply with no visible
+/// cause and the next turn would lose the failure context entirely.
 fn runtime_internal_inbound(inbound: &InboundMessage) -> bool {
+    if inbound_is_recovery_turn(inbound) {
+        return false;
+    }
     inbound_is_master_continuation(inbound) || inbound_is_approval_continuation(inbound)
 }
 
@@ -2130,35 +2159,45 @@ async fn dispatch_background_result_to_actor(
     }
 }
 
-/// Build the synthetic `[system-internal]` recovery prompt that the
-/// session actor enqueues when a `spawn_only` task transitions to
-/// `Failed` (M8.9). The prompt frames the failure for the LLM and asks
-/// it to offer a path forward — alternatives parsed from the error, or
-/// a safer fallback the model can attempt itself.
-pub(crate) fn build_recovery_prompt(signal: &octos_agent::SpawnOnlyFailureSignal) -> String {
-    let alternatives_block = if signal.suggested_alternatives.is_empty() {
+/// Build the synthetic `[system-internal]` recovery prompt body for a
+/// `spawn_only` task that transitioned to `Failed` (M8.9). The prompt
+/// frames the failure for the LLM and asks it to offer a path forward —
+/// alternatives parsed from the error, or a safer fallback the model can
+/// attempt itself.
+///
+/// #2020: the SINGLE formatter for this body. There used to be two — this
+/// one, fed a live `SpawnOnlyFailureSignal` on the `ActorMessage::
+/// RecoveryHint` inbox, and a hand-synchronised copy of the same format
+/// string in `agent_orchestrator::render_spawn_only_failure_recovery_prompt`
+/// fed a queued continuation's metadata. The duplicate existed only because
+/// the two re-entry paths rendered independently. With the inbox retired
+/// there is one delivery path, so the signal is flattened into metadata by
+/// `enqueue_spawn_only_failure_continuation` and rendered here, once.
+pub(crate) fn build_recovery_prompt_body(
+    tool_name: &str,
+    error_message: &str,
+    tool_input_json: Option<&str>,
+    suggested_alternatives: &[&str],
+) -> String {
+    let alternatives_block = if suggested_alternatives.is_empty() {
         String::new()
     } else {
-        let list = signal
-            .suggested_alternatives
+        let list = suggested_alternatives
             .iter()
             .map(|alt| format!("- {alt}"))
             .collect::<Vec<_>>()
             .join("\n");
         format!("\nDetected alternatives:\n{list}\n")
     };
-    let input_block = if signal.tool_input.is_null() {
-        String::new()
-    } else {
-        let pretty = serde_json::to_string(&signal.tool_input).unwrap_or_else(|_| "{}".into());
-        format!("\nOriginal input: {pretty}")
-    };
+    let input_block = tool_input_json
+        .map(|input| format!("\nOriginal input: {input}"))
+        .unwrap_or_default();
     format!(
         "[system-internal] Your previous `{tool}` call failed.\n\
          Error: {err}{input}{alts}\n\
          Respond to the user with a path forward — offer the alternatives, or try the safest one yourself if appropriate. Do not just report failure.",
-        tool = signal.tool_name,
-        err = signal.error_message,
+        tool = tool_name,
+        err = error_message,
         input = input_block,
         alts = alternatives_block,
     )
@@ -2443,25 +2482,6 @@ pub enum ActorMessage {
     /// A pending human-approval request reached its expiry deadline
     /// (Phase 4, docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md).
     ApprovalExpired { request_id: String },
-    /// Synthetic recovery turn enqueued by the spawn_only failure-signal
-    /// callback (M8.9). Drives the LLM to re-engage on a failed background
-    /// task with the actionable error and (optionally parsed) alternatives.
-    RecoveryHint {
-        /// Task ID that triggered the recovery (used for de-duplication).
-        task_id: String,
-        /// Tool that failed — surfaced verbatim in the synthetic prompt.
-        tool_name: String,
-        /// Best-effort prompt body. Already framed as `[system-internal]` so
-        /// the LLM treats it as runtime guidance, not a user turn.
-        prompt: String,
-        /// Issue #738 fix: the originating user turn's `client_message_id`,
-        /// captured when the spawn_only task was registered. Stamped onto
-        /// the synthetic recovery `InboundMessage`'s metadata so
-        /// `process_inbound` reuses it as the cmid for the recovery turn
-        /// instead of minting a fresh server UUIDv7. `None` for legacy
-        /// callers / tests that pre-date the fix.
-        originating_client_message_id: Option<String>,
-    },
     /// Cancel the current operation.
     Cancel,
 }
@@ -3328,21 +3348,49 @@ impl ActorFactory {
         // reorder both this gateway path and the WS `run_standalone_turn`
         // path to wire the callbacks first so every terminal path —
         // orphan-sweep, live `mark_failed`/`mark_completed`, cascade-fail —
-        // reaches the recovery inbox and the SSE/WS task-status consumers.
-        let recovery_tx = tx.clone();
+        // reaches the recovery queue and the SSE/WS task-status consumers.
+        //
+        // #2020 — this used to push `ActorMessage::RecoveryHint` onto the
+        // actor inbox: a SECOND re-entry channel running in parallel with the
+        // continuation queue. It now enqueues onto the queue, exactly like the
+        // WS path, so failure and success re-enter through one transport.
+        //
+        // The callback is still wired (rather than deleted in favour of the
+        // unified `on_terminal` sink alone) because `on_failure` is the ONLY
+        // delivery for a fail-BEFORE-ack failure: `notify_terminal` samples
+        // `synth_ack_emitted = false` at `mark_failed` time and the consumer
+        // prompt-suppresses it, while the supervisor's two-phase stash
+        // re-emits the deferred signal here once `mark_synth_ack_emitted`
+        // lands. Both producers share the `external/<kind>/<session>/<task>`
+        // dedupe key, so an acked failure (where both fire) still yields
+        // exactly one continuation.
+        let failure_session_key = session_key.clone();
+        let failure_profile_id = session_key
+            .profile_id()
+            .unwrap_or(MAIN_PROFILE_ID)
+            .to_owned();
         supervisor.set_on_failure_signal(move |signal| {
-            let prompt = build_recovery_prompt(signal);
-            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
-                task_id: signal.task_id.clone(),
-                tool_name: signal.tool_name.clone(),
-                prompt,
-                // Issue #738 fix: forward the originating user turn's
-                // cmid into the recovery hint so the synthetic
-                // InboundMessage stamps `client_message_id` into its
-                // metadata and `process_inbound` reuses it instead of
-                // minting an orphan UUIDv7.
-                originating_client_message_id: signal.originating_client_message_id.clone(),
-            });
+            let outcome = crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                .enqueue_spawn_only_failure_continuation(
+                    &failure_session_key,
+                    &failure_profile_id,
+                    signal,
+                );
+            if outcome.is_duplicate() {
+                debug!(
+                    session = %failure_session_key,
+                    task_id = %signal.task_id,
+                    tool = %signal.tool_name,
+                    "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+                );
+            } else {
+                info!(
+                    session = %failure_session_key,
+                    task_id = %signal.task_id,
+                    tool = %signal.tool_name,
+                    "spawn_only failure recovery continuation queued (gateway path)"
+                );
+            }
         });
         // Wire supervisor on_change callback to push task status via SSE,
         // ALSO before `enable_persistence` (see the combined ordering note
@@ -3359,26 +3407,15 @@ impl ActorFactory {
         // `enable_persistence` (see the combined ordering note above). Routes
         // BOTH success (ChildCompleted) AND failure (recovery) re-entry
         // through ONE profile-resolving call into the master continuation
-        // queue. Runs alongside the legacy gateway wiring (the `on_change` →
-        // `upsert_background_task_agent` success path and the
-        // `set_on_failure_signal` → `RecoveryHint` failure path) during the
-        // strangler migration; shared dedupe keys collapse double delivery.
-        // Gateway session keys carry the profile (`profile:channel:chat`), so
-        // `None` lets the key-derived profile resolve inside the router —
-        // matching `forward_task_status_to_actor_inbox`'s `None` call.
+        // queue. Runs alongside the legacy `on_change` →
+        // `upsert_background_task_agent` success path; shared dedupe keys
+        // collapse double delivery. Gateway session keys carry the profile
+        // (`profile:channel:chat`), so `None` lets the key-derived profile
+        // resolve inside the router — matching
+        // `forward_task_status_to_actor_inbox`'s `None` call.
         supervisor.set_on_terminal(move |event| {
             crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
-                event,
-                None,
-                // Gateway: failure recovery stays on the `RecoveryHint` inbox
-                // (which owns the consecutive-recovery cap + per-task claim +
-                // exhaustion banner). Routing failure through the queue too
-                // would double-deliver across two distinct channels. Only the
-                // SUCCESS outcome routes through the queue here (and it
-                // collapses against the legacy on_change ChildCompleted via
-                // the step-3 dedupe key). Step 4 retires RecoveryHint and
-                // flips this to `Queue`.
-                crate::autonomy::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
+                event, None,
             );
         });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
@@ -4486,8 +4523,9 @@ struct SessionActor {
     /// Counter of CONSECUTIVE recovery turns the actor has dispatched in
     /// response to spawn_only post-spawn failures (PR
     /// feat/spawn-only-failure-feedback-loop). Reset to 0 on a
-    /// user-initiated turn; incremented every time a `RecoveryHint` drives
-    /// an inbound. When the counter reaches
+    /// user-initiated turn; incremented every time a drained
+    /// `External("spawn_only_failure")` continuation drives an inbound (see
+    /// [`Self::admit_spawn_only_failure_recovery`]). When the counter reaches
     /// [`MAX_CONSECUTIVE_RECOVERY_TURNS`] the actor emits a final UI
     /// banner instead of dispatching another recovery so the loop cannot
     /// run away on pathological LLM retries with new tool_call_ids.
@@ -4737,6 +4775,76 @@ impl SessionActor {
         true
     }
 
+    /// #2020 — the runaway-recovery gate, applied to a drained continuation
+    /// before it is dispatched as a turn.
+    ///
+    /// This is the policy the retired `ActorMessage::RecoveryHint` handler
+    /// owned, moved onto the queue drain so it guards the SINGLE re-entry
+    /// path instead of one of two. Returns `true` when the continuation may
+    /// proceed. Non-recovery continuations (goal, loop, child, peer …) are
+    /// always admitted — the gate is scoped to
+    /// `External("spawn_only_failure")`.
+    ///
+    /// Three rejections, all preserved verbatim from the inbox handler:
+    ///
+    /// 1. **Per-task claim** — one recovery per task id, so a recovery turn
+    ///    that itself fails cannot ignite a runaway loop. The queue's
+    ///    task-scoped dedupe key collapses repeated `mark_failed` calls while
+    ///    a continuation is still pending, but says nothing once it has been
+    ///    drained; this claim is what survives the drain.
+    /// 2. **Consecutive-recovery cap** — bounds the chain of DISTINCT failing
+    ///    tasks (the LLM retrying its broken approach under new
+    ///    tool_call_ids), which no per-task key can catch. Reset on a
+    ///    user-initiated turn by `process_inbound`.
+    /// 3. **Exhaustion banner** — when the cap trips the user is TOLD. A
+    ///    silent stop is indistinguishable from the task having succeeded.
+    async fn admit_spawn_only_failure_recovery(
+        &mut self,
+        continuation: &QueuedMasterContinuation,
+    ) -> bool {
+        let Some(fields) =
+            crate::autonomy::agent_orchestrator::spawn_only_failure_recovery_fields(continuation)
+        else {
+            return true;
+        };
+        let task_id = fields.task_id.to_owned();
+        let tool_name = fields.tool_name.to_owned();
+        if !self.claim_recovery_slot(&task_id) {
+            debug!(
+                session = %self.session_key,
+                task_id,
+                tool_name,
+                "skipping duplicate spawn_only failure recovery continuation"
+            );
+            return false;
+        }
+        if !self.try_begin_recovery_turn() {
+            let max = self.max_consecutive_recovery_turns();
+            warn!(
+                session = %self.session_key,
+                task_id,
+                tool_name,
+                max,
+                "consecutive recovery cap exceeded — emitting final banner instead of dispatching another LLM turn"
+            );
+            let banner = format!(
+                "Background failure could not be recovered after {max} attempts. The last failure was on `{tool_name}`. Please review the error and try a different approach.",
+            );
+            self.deliver_background_notification(banner, Vec::new(), None)
+                .await;
+            return false;
+        }
+        debug!(
+            session = %self.session_key,
+            task_id,
+            tool_name,
+            originating_client_message_id =
+                fields.originating_client_message_id.unwrap_or("<none>"),
+            "dispatching synthetic recovery turn from the continuation queue"
+        );
+        true
+    }
+
     /// Reset the consecutive-recovery counter to 0. Called when a
     /// user-initiated inbound is about to be processed — once the user
     /// re-engages we no longer count the prior chain as "consecutive".
@@ -4835,47 +4943,7 @@ impl SessionActor {
         frame.messages
     }
 
-    /// Build a synthetic `InboundMessage` carrying the recovery prompt so
-    /// the existing inbound pipeline (history persistence, agent loop)
-    /// runs unchanged.
-    ///
-    /// Issue #738 fix: when `originating_client_message_id` is supplied,
-    /// stamp it into `metadata.client_message_id` so `process_inbound`'s
-    /// `inbound_client_message_id` helper reads it back and the recovery
-    /// turn inherits the originating user turn's thread_id instead of
-    /// `process_inbound` minting a fresh server UUIDv7. The eventual
-    /// successful retry's deliverables (e.g. `_report.md`) then land
-    /// under the original SPA bubble rather than an orphan thread_id.
-    fn synthetic_recovery_inbound(
-        &self,
-        prompt: String,
-        originating_client_message_id: Option<String>,
-    ) -> InboundMessage {
-        let mut metadata = serde_json::Map::new();
-        metadata.insert("_recovery_turn".to_string(), serde_json::json!(true));
-        if let Some(cmid) = originating_client_message_id {
-            if !cmid.is_empty() {
-                metadata.insert(
-                    "client_message_id".to_string(),
-                    serde_json::Value::String(cmid),
-                );
-            }
-        }
-        InboundMessage {
-            channel: self.channel.clone(),
-            sender_id: "octos-runtime".to_string(),
-            chat_id: self.chat_id.clone(),
-            content: prompt,
-            timestamp: chrono::Utc::now(),
-            media: vec![],
-            metadata: serde_json::Value::Object(metadata),
-            message_id: None,
-            origin: octos_core::MessageOrigin::Synthetic,
-        }
-    }
-
-    /// Synthetic `InboundMessage` for the completion-review turn — the
-    /// success-path sibling of [`Self::synthetic_recovery_inbound`]. Stamped
+    /// Synthetic `InboundMessage` for the completion-review turn. Stamped
     /// `_completion_review` so `process_inbound` does NOT reset the
     /// consecutive-auto-turn cap (the review is server-driven, not user
     /// re-engagement); the optional originating id threads the review under
@@ -4922,6 +4990,33 @@ impl SessionActor {
             "continuation_reason".to_string(),
             serde_json::json!(master_continuation_reason_name(&continuation.reason)),
         );
+        // #2020 — a spawn_only failure recovery continuation IS the recovery
+        // turn that `ActorMessage::RecoveryHint` used to build, so it must
+        // carry the same two markers the retired inbox stamped:
+        //
+        //  * `_recovery_turn` — load-bearing in TWO places. It tells
+        //    `process_inbound` not to reset the consecutive-recovery counter
+        //    (which `_master_continuation` would also do), and it tells
+        //    `runtime_internal_inbound` this prompt IS durable user history —
+        //    which `_master_continuation` alone would suppress, silently
+        //    dropping the recovery prompt from the transcript.
+        //  * `client_message_id` (#738) — the originating user turn's cmid,
+        //    threaded through the continuation's metadata by
+        //    `enqueue_spawn_only_failure_continuation`. Without it
+        //    `process_inbound` mints a fresh server UUIDv7 and the eventual
+        //    successful retry's deliverables land under an orphan thread_id
+        //    with no DOM bubble in the SPA.
+        if let Some(fields) =
+            crate::autonomy::agent_orchestrator::spawn_only_failure_recovery_fields(continuation)
+        {
+            metadata.insert("_recovery_turn".to_string(), serde_json::json!(true));
+            if let Some(cmid) = fields.originating_client_message_id {
+                metadata.insert(
+                    "client_message_id".to_string(),
+                    serde_json::Value::String(cmid.to_owned()),
+                );
+            }
+        }
 
         InboundMessage {
             channel: self.channel.clone(),
@@ -4975,6 +5070,19 @@ impl SessionActor {
                 reason = master_continuation_reason_name(&continuation.reason),
                 "draining queued master continuation into session actor"
             );
+            // #2020 — runaway-recovery policy, applied on the ONE re-entry
+            // path. A rejected continuation is marked completed (not
+            // re-queued) so the queue does not redeliver it forever.
+            // Deliberately NO matching `mark_continuation_started`: no turn
+            // ran, so the ledger records a resolution with an explicit
+            // suppression reason rather than a phantom start.
+            if !self.admit_spawn_only_failure_recovery(&continuation).await {
+                default_agent_orchestrator().mark_continuation_completed(
+                    &continuation,
+                    Some("suppressed_by_recovery_policy".to_owned()),
+                );
+                continue;
+            }
             // #1131 — `GoalWrapUp` is the final goal turn under
             // budget exhaustion. Treat it as a goal turn for runtime
             // accounting so per-turn elapsed time is still recorded;
@@ -5768,7 +5876,7 @@ impl SessionActor {
                             // hit, since a missed review is harmless.
                             //
                             // SUCCESS ONLY (codex P2): a FAILED spawn_only task already
-                            // drives the dedicated RecoveryHint path AND emits a failure
+                            // drives the queued recovery continuation AND emits a failure
                             // BackgroundResult — reviewing that would (a) summarize a
                             // failure the recovery turn is already handling and (b) burn
                             // a shared recovery-cap slot a real recovery needs.
@@ -5831,77 +5939,6 @@ impl SessionActor {
                                     "_task_status": task_json
                                 }),
                             }).await;
-                        }
-                        Some(ActorMessage::RecoveryHint {
-                            task_id,
-                            tool_name,
-                            prompt,
-                            originating_client_message_id,
-                        }) => {
-                            idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
-                            // Cap recovery at one attempt per task to avoid
-                            // runaway loops if the recovery turn itself
-                            // fails. Subsequent failures from the same task
-                            // ID are silently dropped here.
-                            if !self.claim_recovery_slot(&task_id) {
-                                debug!(
-                                    session = %self.session_key,
-                                    task_id,
-                                    tool_name,
-                                    "skipping duplicate recovery hint"
-                                );
-                                continue;
-                            }
-                            // Consecutive-recovery cap
-                            // (feat/spawn-only-failure-feedback-loop): a
-                            // distinct, second-or-later task failing AGAIN
-                            // (the LLM retried its broken approach with a
-                            // new tool_call_id) is still bounded by
-                            // MAX_CONSECUTIVE_RECOVERY_TURNS. Above the
-                            // cap, emit a final user-visible banner via
-                            // the same persisted-notification path the
-                            // background-result consumer uses, then bail
-                            // out instead of dispatching another LLM
-                            // turn. The counter resets on every user-
-                            // initiated turn (see `process_inbound`).
-                            if !self.try_begin_recovery_turn() {
-                                let max = self.max_consecutive_recovery_turns();
-                                warn!(
-                                    session = %self.session_key,
-                                    task_id,
-                                    tool_name,
-                                    max,
-                                    "consecutive recovery cap exceeded — emitting final banner instead of dispatching another LLM turn"
-                                );
-                                let banner = format!(
-                                    "Background failure could not be recovered after {max} attempts. The last failure was on `{tool_name}`. Please review the error and try a different approach.",
-                                );
-                                self.deliver_background_notification(banner, Vec::new(), None)
-                                    .await;
-                                continue;
-                            }
-                            debug!(
-                                session = %self.session_key,
-                                task_id,
-                                tool_name,
-                                originating_client_message_id =
-                                    originating_client_message_id.as_deref().unwrap_or("<none>"),
-                                "enqueueing synthetic recovery turn"
-                            );
-                            let synthetic = self.synthetic_recovery_inbound(
-                                prompt,
-                                originating_client_message_id,
-                            );
-                            let final_attachment_media = self
-                                .copy_media_to_workspace(Vec::new());
-                            self.process_inbound(
-                                synthetic,
-                                Vec::new(),
-                                final_attachment_media,
-                                None,
-                            )
-                            .await;
-                            let _ = self.drain_master_continuations().await;
                         }
                         Some(ActorMessage::Cancel) => {
                             idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
@@ -6643,21 +6680,6 @@ impl SessionActor {
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
                         }
-                        Ok(ActorMessage::RecoveryHint {
-                            task_id, tool_name, ..
-                        }) => {
-                            // Drain context: a turn is already running. The
-                            // claim guarantees we won't try to recover this
-                            // task again later. Trace and drop — the LLM
-                            // will see the failure via TaskStatusChanged.
-                            debug!(
-                                session = %self.session_key,
-                                task_id,
-                                tool_name,
-                                "dropping recovery hint received during drain"
-                            );
-                            self.claim_recovery_slot(&task_id);
-                        }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                             break;
@@ -6736,21 +6758,6 @@ impl SessionActor {
                         }
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
-                        }
-                        Ok(ActorMessage::RecoveryHint {
-                            task_id, tool_name, ..
-                        }) => {
-                            // Drain context: a turn is already running. The
-                            // claim guarantees we won't try to recover this
-                            // task again later. Trace and drop — the LLM
-                            // will see the failure via TaskStatusChanged.
-                            debug!(
-                                session = %self.session_key,
-                                task_id,
-                                tool_name,
-                                "dropping recovery hint received during drain"
-                            );
-                            self.claim_recovery_slot(&task_id);
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -7786,20 +7793,6 @@ impl SessionActor {
                                     "_task_status": task_json
                                 }),
                             }).await;
-                        }
-                        Some(ActorMessage::RecoveryHint { task_id, tool_name, .. }) => {
-                            // Speculative-overflow context: the primary
-                            // turn is already running. Reserve the slot
-                            // (so we don't try again later) and drop the
-                            // hint — the failure will be visible via
-                            // TaskStatusChanged.
-                            debug!(
-                                session = %self.session_key,
-                                task_id,
-                                tool_name,
-                                "dropping recovery hint during speculative overflow"
-                            );
-                            self.claim_recovery_slot(&task_id);
                         }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -9136,15 +9129,11 @@ impl SessionActor {
         // break the "recovery chain" — once the user re-engages we no
         // longer count the prior auto-recoveries against the cap. Master
         // continuations are server-driven and don't represent user
-        // re-engagement, so they're excluded too. The recovery hint
-        // path stamps `_recovery_turn = true` in metadata via
-        // `synthetic_recovery_inbound`; any inbound without that flag
-        // counts as user-initiated for this reset.
-        let is_recovery_turn = inbound
-            .metadata
-            .get("_recovery_turn")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // re-engagement, so they're excluded too. The recovery path stamps
+        // `_recovery_turn = true` in metadata via
+        // `synthetic_master_continuation_inbound`; any inbound without that
+        // flag counts as user-initiated for this reset.
+        let is_recovery_turn = inbound_is_recovery_turn(&inbound);
         // A completion-review turn (event-driven background acknowledgment) is
         // server-driven too — it must NOT reset the consecutive-auto-turn cap,
         // otherwise a review that spawns more background work could review its

@@ -6672,20 +6672,16 @@ async fn should_return_immediately_when_assistant_already_landed() {
     assert_eq!(snapshot.len(), 2);
 }
 
-// ── M8.9: Runtime failure recovery ─────────────────────────────────────
+// ── M8.9: Runtime failure recovery ─────────────────────────────────
 
 #[test]
 fn recovery_prompt_includes_tool_name_and_error() {
-    let signal = octos_agent::SpawnOnlyFailureSignal {
-        task_id: "task-1".into(),
-        tool_name: "fm_tts".into(),
-        tool_input: serde_json::json!({"voice": "yangmi"}),
-        error_message: "voice 'yangmi' not registered".into(),
-        suggested_alternatives: vec![],
-        parent_session_key: Some("api:test".into()),
-        originating_client_message_id: None,
-    };
-    let prompt = build_recovery_prompt(&signal);
+    let prompt = build_recovery_prompt_body(
+        "fm_tts",
+        "voice 'yangmi' not registered",
+        Some(r#"{"voice":"yangmi"}"#),
+        &[],
+    );
     assert!(prompt.starts_with("[system-internal]"));
     assert!(prompt.contains("fm_tts"));
     assert!(prompt.contains("voice 'yangmi' not registered"));
@@ -6694,16 +6690,12 @@ fn recovery_prompt_includes_tool_name_and_error() {
 
 #[test]
 fn recovery_prompt_includes_alternatives_block_when_present() {
-    let signal = octos_agent::SpawnOnlyFailureSignal {
-        task_id: "task-2".into(),
-        tool_name: "fm_tts".into(),
-        tool_input: serde_json::Value::Null,
-        error_message: "voice missing".into(),
-        suggested_alternatives: vec!["vivian".into(), "serena".into(), "longxiang".into()],
-        parent_session_key: None,
-        originating_client_message_id: None,
-    };
-    let prompt = build_recovery_prompt(&signal);
+    let prompt = build_recovery_prompt_body(
+        "fm_tts",
+        "voice missing",
+        None,
+        &["vivian", "serena", "longxiang"],
+    );
     assert!(prompt.contains("Detected alternatives"));
     assert!(prompt.contains("- vivian"));
     assert!(prompt.contains("- serena"));
@@ -6712,40 +6704,68 @@ fn recovery_prompt_includes_alternatives_block_when_present() {
 
 #[test]
 fn recovery_prompt_omits_alternatives_block_when_empty() {
-    let signal = octos_agent::SpawnOnlyFailureSignal {
-        task_id: "task-3".into(),
-        tool_name: "fm_tts".into(),
-        tool_input: serde_json::Value::Null,
-        error_message: "internal error".into(),
-        suggested_alternatives: vec![],
-        parent_session_key: None,
-        originating_client_message_id: None,
-    };
-    let prompt = build_recovery_prompt(&signal);
+    let prompt = build_recovery_prompt_body("fm_tts", "internal error", None, &[]);
     assert!(!prompt.contains("Detected alternatives"));
+    assert!(!prompt.contains("Original input"));
 }
 
 #[test]
 fn recovery_prompt_includes_tool_input_when_set() {
-    let signal = octos_agent::SpawnOnlyFailureSignal {
-        task_id: "task-4".into(),
-        tool_name: "fm_tts".into(),
-        tool_input: serde_json::json!({"voice": "yangmi", "text": "hello"}),
-        error_message: "voice missing".into(),
-        suggested_alternatives: vec![],
-        parent_session_key: None,
-        originating_client_message_id: None,
-    };
-    let prompt = build_recovery_prompt(&signal);
+    let prompt = build_recovery_prompt_body(
+        "fm_tts",
+        "voice missing",
+        Some(r#"{"text":"hello","voice":"yangmi"}"#),
+        &[],
+    );
     assert!(prompt.contains("Original input"));
     assert!(prompt.contains("yangmi"));
 }
 
+/// #2020 — enqueue a spawn_only failure recovery continuation onto the ONE
+/// re-entry path (the master continuation queue) for `session_key`, the way
+/// production does from `set_on_failure_signal` / the unified terminal sink.
+fn enqueue_recovery_continuation(
+    session_key: &SessionKey,
+    signal: &octos_agent::SpawnOnlyFailureSignal,
+) {
+    default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
+        session_key,
+        session_key.profile_id().unwrap_or(MAIN_PROFILE_ID),
+        signal,
+    );
+}
+
+fn recovery_signal(
+    task_id: &str,
+    tool_name: &str,
+    error: &str,
+) -> octos_agent::SpawnOnlyFailureSignal {
+    octos_agent::SpawnOnlyFailureSignal {
+        task_id: task_id.into(),
+        tool_name: tool_name.into(),
+        tool_input: serde_json::json!({"voice": "yangmi"}),
+        error_message: error.into(),
+        suggested_alternatives: vec![],
+        parent_session_key: None,
+        originating_client_message_id: None,
+    }
+}
+
+/// A queued recovery continuation is drained on the actor's continuation
+/// tick (2s), so recovery-turn assertions need more headroom than an
+/// inbox-delivered message did.
+const RECOVERY_DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+
 #[tokio::test]
 async fn should_enqueue_synthetic_recovery_turn_with_error_message() {
-    // End-to-end: a RecoveryHint pushed onto the inbox should drive a
-    // primary turn whose user/system content includes the recovery
-    // prompt, so the LLM (mock here) sees and responds to it.
+    // End-to-end: a queued spawn_only-failure continuation drives a primary
+    // turn whose user/system content includes the recovery prompt, so the
+    // LLM (mock here) sees and responds to it.
+    //
+    // #2020: this used to push `ActorMessage::RecoveryHint` onto the actor
+    // inbox — a second re-entry channel alongside the continuation queue.
+    // The inbox is retired; the queue is the single path, and the rendered
+    // body is unchanged (same `build_recovery_prompt_body` formatter).
     let dir = tempfile::TempDir::new().unwrap();
     let agent_llm = Arc::new(DelayedMockProvider::new(
         "agent",
@@ -6757,31 +6777,29 @@ async fn should_enqueue_synthetic_recovery_turn_with_error_message() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm.clone(), QueueMode::Followup, None, false, &dir).await;
 
-    let prompt = build_recovery_prompt(&octos_agent::SpawnOnlyFailureSignal {
-        task_id: "task-rh-1".into(),
-        tool_name: "fm_tts".into(),
-        tool_input: serde_json::json!({"voice": "yangmi"}),
-        error_message: "voice 'yangmi' not registered. available: vivian, serena.".into(),
-        suggested_alternatives: vec!["vivian".into(), "serena".into()],
-        parent_session_key: Some("cli:test".into()),
-        originating_client_message_id: None,
-    });
-    tx.send(ActorMessage::RecoveryHint {
-        task_id: "task-rh-1".into(),
-        tool_name: "fm_tts".into(),
-        prompt,
-        originating_client_message_id: None,
-    })
-    .await
-    .unwrap();
+    enqueue_recovery_continuation(
+        &test_session_key(dir.path()),
+        &octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-rh-1".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::json!({"voice": "yangmi"}),
+            error_message: "voice 'yangmi' not registered. available: vivian, serena.".into(),
+            suggested_alternatives: vec!["vivian".into(), "serena".into()],
+            parent_session_key: Some("cli:test".into()),
+            originating_client_message_id: None,
+        },
+    );
 
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         if !msg.content.is_empty() {
             responses.push(msg.content);
         }
-        if !responses.is_empty() {
+        if responses
+            .iter()
+            .any(|c| c.contains("acknowledging recovery"))
+        {
             break;
         }
     }
@@ -6904,9 +6922,12 @@ async fn background_result_does_not_auto_review_when_gate_disabled() {
 
 #[tokio::test]
 async fn should_not_enqueue_second_recovery_for_same_task_id() {
-    // Two RecoveryHints for the same task_id — only the first should
-    // produce a recovery turn. The second is silently dropped via the
-    // recovered_tasks claim slot.
+    // Two terminal failure reports for the SAME task must produce exactly
+    // ONE recovery turn. #2020 moved the per-task claim from the retired
+    // `RecoveryHint` handler onto the queue drain
+    // (`admit_spawn_only_failure_recovery`), so this pins the property
+    // end-to-end through the one re-entry path rather than through the
+    // inbox that used to own it.
     let dir = tempfile::TempDir::new().unwrap();
     let agent_llm = Arc::new(DelayedMockProvider::new(
         "agent",
@@ -6918,45 +6939,132 @@ async fn should_not_enqueue_second_recovery_for_same_task_id() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    let prompt1 = "[system-internal] first recovery prompt".to_string();
-    let prompt2 = "[system-internal] second recovery prompt".to_string();
-    tx.send(ActorMessage::RecoveryHint {
-        task_id: "task-dup".into(),
-        tool_name: "fm_tts".into(),
-        prompt: prompt1,
-        originating_client_message_id: None,
-    })
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    tx.send(ActorMessage::RecoveryHint {
-        task_id: "task-dup".into(),
-        tool_name: "fm_tts".into(),
-        prompt: prompt2,
-        originating_client_message_id: None,
-    })
-    .await
-    .unwrap();
+    let session_key = test_session_key(dir.path());
+    let signal = recovery_signal("task-dup", "fm_tts", "first failure report");
+    enqueue_recovery_continuation(&session_key, &signal);
+    // A second report of the same task — the queue's task-scoped dedupe key
+    // collapses it while the first is pending, and the actor's per-task
+    // claim collapses it after the first has been drained.
+    enqueue_recovery_continuation(&session_key, &signal);
 
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         if !msg.content.is_empty() {
             responses.push(msg.content);
         }
+        if responses.iter().any(|c| c.contains("second recovery")) {
+            break;
+        }
     }
-    // Only the first recovery should have driven an LLM turn.
-    let first_seen = responses.iter().any(|c| c.contains("first recovery"));
-    let second_seen = responses.iter().any(|c| c.contains("second recovery"));
     assert!(
-        first_seen,
-        "first recovery should have run: {:?}",
-        responses
+        responses.iter().any(|c| c.contains("first recovery")),
+        "first recovery should have run: {responses:?}",
     );
     assert!(
-        !second_seen,
-        "second recovery should have been suppressed: {:?}",
+        !responses.iter().any(|c| c.contains("second recovery")),
+        "second recovery should have been suppressed: {responses:?}",
+    );
+
+    // Exactly one recovery prompt in durable history — the decisive check,
+    // since a suppressed turn must leave no transcript trace either.
+    let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
+    let session = session_handle.session();
+    let recovery_prompts = session
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User && m.content.contains("[system-internal]"))
+        .count();
+    assert_eq!(
+        recovery_prompts, 1,
+        "one terminal transition must yield one recovery turn: {:?}",
+        session.messages
+    );
+
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+}
+
+/// #2020 RED-shaped guard for the highest-risk regression the migration
+/// could introduce: the consecutive-recovery cap must still BITE, and must
+/// still tell the user when it does.
+///
+/// The cap bounds a chain of DISTINCT failing tasks (the LLM retrying its
+/// broken approach under fresh tool_call_ids) — something no per-task dedupe
+/// key can catch, which is precisely why moving the policy had to move this
+/// with it. Above the cap the actor must emit the exhaustion banner instead
+/// of dispatching another LLM turn: stopping silently is indistinguishable
+/// from the task having succeeded.
+#[tokio::test]
+async fn consecutive_recovery_cap_trips_and_emits_banner_instead_of_a_turn() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_llm = Arc::new(DelayedMockProvider::new(
+        "agent",
+        vec![
+            (Duration::from_millis(50), make_response("recovery-turn-1")),
+            (Duration::from_millis(50), make_response("recovery-turn-2")),
+            (Duration::from_millis(50), make_response("recovery-turn-3")),
+        ],
+    ));
+    let (tx, mut rx, handle, _session_mgr) =
+        setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+    // MAX_CONSECUTIVE_RECOVERY_TURNS distinct tasks are admitted; the next
+    // one must trip the cap. Enqueued up-front — the drain takes one per
+    // tick, so they are processed in order.
+    let session_key = test_session_key(dir.path());
+    let over_cap = MAX_CONSECUTIVE_RECOVERY_TURNS + 1;
+    for index in 0..over_cap {
+        enqueue_recovery_continuation(
+            &session_key,
+            &recovery_signal(
+                &format!("task-cap-{index}"),
+                "mofa_slides",
+                "Gemini API: 429 quota exceeded",
+            ),
+        );
+    }
+
+    let mut responses = Vec::new();
+    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
+    while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if !msg.content.is_empty() {
+            responses.push(msg.content);
+        }
+        if responses
+            .iter()
+            .any(|c| c.contains("could not be recovered after"))
+        {
+            break;
+        }
+    }
+
+    assert!(
         responses
+            .iter()
+            .any(|c| c.contains("could not be recovered after")),
+        "cap exhaustion must emit the user-visible banner, got: {responses:?}",
+    );
+    assert!(
+        responses
+            .iter()
+            .any(|c| c.contains("could not be recovered after") && c.contains("mofa_slides")),
+        "the banner must name the tool that last failed: {responses:?}",
+    );
+
+    // The cap BITES: only MAX_CONSECUTIVE_RECOVERY_TURNS recovery prompts
+    // reach the transcript, no matter how many failures were queued.
+    let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
+    let session = session_handle.session();
+    let recovery_prompts = session
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User && m.content.contains("[system-internal]"))
+        .count();
+    assert_eq!(
+        recovery_prompts as u32, MAX_CONSECUTIVE_RECOVERY_TURNS,
+        "recovery turns must be bounded by the cap: {:?}",
+        session.messages
     );
 
     drop(tx);
@@ -6964,12 +7072,10 @@ async fn should_not_enqueue_second_recovery_for_same_task_id() {
 }
 
 #[tokio::test]
-async fn supervisor_failure_signal_generates_recovery_actor_message_end_to_end() {
-    // Full integration: install the failure-signal callback we set up
-    // in spawn(), trigger mark_failed, and assert the actor enqueues
-    // and processes a RecoveryHint.
-    use octos_agent::TaskSupervisor;
-
+async fn supervisor_failure_signal_generates_recovery_continuation_end_to_end() {
+    // Full integration: install the failure-signal callback the gateway
+    // wires in `spawn()`, trigger mark_failed, and assert the actor drains
+    // the resulting continuation and runs the recovery turn.
     let dir = tempfile::TempDir::new().unwrap();
     let agent_llm = Arc::new(DelayedMockProvider::new(
         "agent",
@@ -6978,23 +7084,12 @@ async fn supervisor_failure_signal_generates_recovery_actor_message_end_to_end()
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    // Mirror the spawn() wiring: a TaskSupervisor whose failure signal
-    // dispatches a RecoveryHint into the actor inbox.
-    let supervisor = TaskSupervisor::new();
-    let recovery_tx = tx.clone();
-    supervisor.set_on_failure_signal(move |signal| {
-        let prompt = build_recovery_prompt(signal);
-        let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
-            task_id: signal.task_id.clone(),
-            tool_name: signal.tool_name.clone(),
-            prompt,
-            originating_client_message_id: signal.originating_client_message_id.clone(),
-        });
-    });
+    let session_key = test_session_key(dir.path());
+    let supervisor = wire_supervisor_to_continuation_queue(&session_key);
     let task_id = supervisor.register_with_input(
         "fm_tts",
         "call-int-1",
-        Some(test_session_key(dir.path()).to_string().as_str()),
+        Some(session_key.to_string().as_str()),
         Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
     );
     // Synth-ack gate (feat/spawn-only-failure-feedback-loop): mark
@@ -7008,7 +7103,7 @@ async fn supervisor_failure_signal_generates_recovery_actor_message_end_to_end()
     );
 
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         if !msg.content.is_empty() {
             responses.push(msg.content);
@@ -7043,17 +7138,19 @@ async fn supervisor_failure_signal_generates_recovery_actor_message_end_to_end()
 
 #[tokio::test]
 async fn recovery_turn_preserves_originating_client_message_id_from_failure_signal() {
-    // Issue #738 RED test: when the supervisor emits a
-    // `SpawnOnlyFailureSignal` with `originating_client_message_id`,
-    // the synthetic recovery turn the actor enqueues MUST persist a
-    // user message whose `client_message_id` matches the originating
-    // turn's cmid. Pre-fix, `synthetic_recovery_inbound` stamped only
-    // `_recovery_turn = true` into the InboundMessage metadata, so
-    // `inbound_client_message_id` returned None and `process_inbound`
-    // minted a fresh server UUIDv7 — leaving the eventual successful
-    // retry's deliverables stranded under an orphan thread_id with no
-    // DOM bubble in the SPA.
-    use octos_agent::TaskSupervisor;
+    // Issue #738: when the supervisor emits a `SpawnOnlyFailureSignal` with
+    // `originating_client_message_id`, the synthetic recovery turn MUST
+    // persist a user message whose `client_message_id` matches the
+    // originating turn's cmid. Pre-#738 the recovery inbound stamped no
+    // cmid, so `process_inbound` minted a fresh server UUIDv7 — leaving the
+    // eventual successful retry's deliverables stranded under an orphan
+    // thread_id with no DOM bubble in the SPA.
+    //
+    // #2020 re-homes this: the cmid now travels as continuation metadata
+    // (`originating_client_message_id`) and is stamped back onto the inbound
+    // by `synthetic_master_continuation_inbound`. Dropping that thread on
+    // the way to the queue would silently reintroduce #738, so this test
+    // guards the migrated path, not the retired one.
     const ORIGINATING_CMID: &str = "45756a8f-1234-4abc-8def-cafebabe0001";
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -7067,21 +7164,8 @@ async fn recovery_turn_preserves_originating_client_message_id_from_failure_sign
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    // Mirror the production wiring: the failure-signal callback
-    // forwards `signal.originating_client_message_id` onto
-    // `ActorMessage::RecoveryHint` so the actor's
-    // `synthetic_recovery_inbound` builder can stamp it into metadata.
-    let supervisor = TaskSupervisor::new();
-    let recovery_tx = tx.clone();
-    supervisor.set_on_failure_signal(move |signal| {
-        let prompt = build_recovery_prompt(signal);
-        let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
-            task_id: signal.task_id.clone(),
-            tool_name: signal.tool_name.clone(),
-            prompt,
-            originating_client_message_id: signal.originating_client_message_id.clone(),
-        });
-    });
+    let session_key = test_session_key(dir.path());
+    let supervisor = wire_supervisor_to_continuation_queue(&session_key);
 
     // Register the failed task with the originating user turn's
     // cmid. The supervisor must thread it through to the failure
@@ -7089,7 +7173,7 @@ async fn recovery_turn_preserves_originating_client_message_id_from_failure_sign
     let task_id = supervisor.register_with_input_and_cmid(
         "deep_research",
         "call-738",
-        Some(test_session_key(dir.path()).to_string().as_str()),
+        Some(session_key.to_string().as_str()),
         Some(serde_json::json!({"query": "rust news"})),
         Some(ORIGINATING_CMID.to_string()),
     );
@@ -7097,7 +7181,7 @@ async fn recovery_turn_preserves_originating_client_message_id_from_failure_sign
     supervisor.mark_failed(&task_id, "MiniMax 429 rate limited".into());
 
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         if !msg.content.is_empty() {
             responses.push(msg.content);
@@ -7113,9 +7197,7 @@ async fn recovery_turn_preserves_originating_client_message_id_from_failure_sign
 
     // The decisive assertion: the persisted user message for the
     // recovery turn must carry the originating cmid, NOT a freshly
-    // minted server UUIDv7. Pre-fix this was None or a fresh UUID
-    // because synthetic_recovery_inbound only stamped
-    // `_recovery_turn` and `process_inbound` had nothing to read.
+    // minted server UUIDv7.
     let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
     let session = session_handle.session();
     let recovery_msg = session
@@ -7912,23 +7994,18 @@ async fn router_failover_filters_to_originating_session() {
 // `task_supervisor::tests`; these are end-to-end against the running
 // actor.
 
-/// Wire a TaskSupervisor to the actor's RecoveryHint inbox exactly the
-/// way `SessionActor::spawn` does in production. Returns the
-/// supervisor so tests can drive `mark_synth_ack_emitted` +
-/// `mark_failed`.
-fn wire_supervisor_to_actor_inbox(
-    tx: &mpsc::Sender<ActorMessage>,
+/// Wire a TaskSupervisor to the master continuation queue exactly the way
+/// `SessionActor::spawn` does in production (#2020 — the gateway's
+/// `set_on_failure_signal` used to push `ActorMessage::RecoveryHint` onto
+/// the actor inbox instead). Returns the supervisor so tests can drive
+/// `mark_synth_ack_emitted` + `mark_failed`.
+fn wire_supervisor_to_continuation_queue(
+    session_key: &SessionKey,
 ) -> Arc<octos_agent::TaskSupervisor> {
     let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
-    let recovery_tx = tx.clone();
+    let failure_session_key = session_key.clone();
     supervisor.set_on_failure_signal(move |signal| {
-        let prompt = build_recovery_prompt(signal);
-        let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
-            task_id: signal.task_id.clone(),
-            tool_name: signal.tool_name.clone(),
-            prompt,
-            originating_client_message_id: signal.originating_client_message_id.clone(),
-        });
+        enqueue_recovery_continuation(&failure_session_key, signal);
     });
     supervisor
 }
@@ -7948,7 +8025,7 @@ async fn background_failure_with_synth_ack_triggers_recovery_turn() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    let supervisor = wire_supervisor_to_actor_inbox(&tx);
+    let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
     let task_id = supervisor.register_with_input(
         "mofa_slides",
         "call-spawn-fb-1",
@@ -7960,7 +8037,7 @@ async fn background_failure_with_synth_ack_triggers_recovery_turn() {
     supervisor.mark_failed(&task_id, "Gemini API: 429 quota exceeded".to_string());
 
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + RECOVERY_DRAIN_DEADLINE;
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         if !msg.content.is_empty() {
             responses.push(msg.content);
@@ -8013,7 +8090,7 @@ async fn background_failure_without_synth_ack_no_op() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    let supervisor = wire_supervisor_to_actor_inbox(&tx);
+    let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
     let task_id = supervisor.register_with_input(
         "mofa_slides",
         "call-spawn-fb-2",
@@ -8025,8 +8102,10 @@ async fn background_failure_without_synth_ack_no_op() {
     supervisor.mark_running(&task_id);
     supervisor.mark_failed(&task_id, "plugin crash".to_string());
 
-    // Give the inbox a window to deliver a hypothetical RecoveryHint.
-    let push = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+    // #2020: recovery now arrives on the continuation queue, drained on the
+    // actor's 2s tick — so the negative window must span at least one full
+    // tick, or the test would pass simply by not having looked yet.
+    let push = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
     assert!(
         push.is_err()
             || push
@@ -8068,7 +8147,7 @@ async fn background_success_path_unchanged() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    let supervisor = wire_supervisor_to_actor_inbox(&tx);
+    let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
     let task_id = supervisor.register(
         "mofa_slides",
         "call-spawn-fb-3",
@@ -8114,7 +8193,7 @@ async fn background_failure_dedup_on_repeated_payloads() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    let supervisor = wire_supervisor_to_actor_inbox(&tx);
+    let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
     let task_id = supervisor.register(
         "mofa_slides",
         "call-spawn-fb-4",
@@ -8171,7 +8250,7 @@ async fn background_failure_recovery_capped_at_max_retries() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    let supervisor = wire_supervisor_to_actor_inbox(&tx);
+    let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
 
     // Drain `rx`, accumulating every non-empty message into `seen`, until
     // one containing `needle` arrives. Deterministic sequencing: each
@@ -8279,7 +8358,7 @@ async fn user_turn_resets_consecutive_recovery_counter() {
     let (tx, mut rx, handle, _session_mgr) =
         setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
 
-    let supervisor = wire_supervisor_to_actor_inbox(&tx);
+    let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
     let task_id = supervisor.register(
         "mofa_slides",
         "call-reset-1",
