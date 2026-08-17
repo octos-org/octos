@@ -34,7 +34,9 @@ impl AssetStore for EmbeddedAssets {
 /// The React SPA uses `basename="/admin"`, so all UI paths must start with `/admin/`.
 /// The swarm-app SPA uses `basename="/swarm"` and is served from the parallel
 /// `/swarm/` mount for the M7.6 PM+supervisor orchestrator. Non-matching
-/// paths are redirected to `/admin/` so that React Router can handle them.
+/// paths are redirected to the default UI — `/app/` (octos-web) when its
+/// bundle is embedded, `/admin/` otherwise — so that React Router can
+/// handle them.
 ///
 /// If a `/swarm/*` path is requested but the swarm-app bundle wasn't
 /// embedded at build time (i.e. `static/swarm/index.html` is missing),
@@ -69,16 +71,19 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
             .into_response();
     }
 
-    // Root "/" → serve landing page only in cloud mode,
-    // otherwise redirect to /admin/ (or 503 when the admin bundle is
-    // missing — see Bug 2 below).
+    // Root "/" → serve landing page only in cloud mode, otherwise
+    // redirect to the default UI: /app/ (octos-web) when its bundle is
+    // embedded, /admin/ as fallback (or 503 when no bundle is present —
+    // see Bug 2 below). The README quickstart onboards users through
+    // /app/'s one-step local sign-in; landing them on the admin
+    // dashboard's token login was the top onboarding complaint.
     if path.is_empty() {
         if matches!(state.deployment_mode, crate::config::DeploymentMode::Cloud) {
             if let Some(data) = assets.get("landing.html") {
                 return serve_file("landing.html", &data);
             }
         }
-        return redirect_to_admin_or_503(assets);
+        return redirect_to_default_ui_or_503(assets);
     }
 
     // Serve exact embedded asset (e.g. admin/assets/index-xxx.js or
@@ -193,9 +198,27 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
         return admin_bundle_missing_response();
     }
 
-    // Catch-all: redirect to /admin/ so non-API UI paths land on the
-    // dashboard. Must also guard on `admin/index.html` — otherwise the
-    // redirect target itself 307s and the browser loops.
+    // Catch-all: redirect stray non-API UI paths to the default UI
+    // (same /app/-first preference as the root branch). Must guard on
+    // the target bundle's index.html — otherwise the redirect target
+    // itself 307s and the browser loops.
+    redirect_to_default_ui_or_503(assets)
+}
+
+/// Redirect to the default UI: prefer the octos-web app (`/app/`) when its
+/// bundle is embedded, fall back to the admin dashboard otherwise. The
+/// fallback keeps binaries built without `scripts/build-web-app.sh` (older
+/// checkouts, dashboard-only builds) on the previous `/admin/` behavior,
+/// including all of its missing-bundle 503 diagnostics.
+fn redirect_to_default_ui_or_503<A: AssetStore>(assets: &A) -> Response {
+    if assets.get("web/index.html").is_some() {
+        return (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(header::LOCATION, "/app/")],
+            "",
+        )
+            .into_response();
+    }
     redirect_to_admin_or_503(assets)
 }
 
@@ -676,5 +699,84 @@ mod tests {
         let assets = StubAssets::with(&[("admin/index.html", b"<html/>")]);
         let html = b"<html/>";
         assert!(admin_index_missing_assets(&assets, html).is_none());
+    }
+
+    /// Default-entry: when the octos-web bundle is embedded, root `/`
+    /// (local deployment mode) must redirect to `/app/` — the README
+    /// quickstart sends new users there, and the admin dashboard's
+    /// token login is the wrong first screen for onboarding.
+    #[tokio::test]
+    async fn should_redirect_root_to_app_when_web_bundle_present() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[
+            ("web/index.html", b"<html>app</html>"),
+            ("admin/index.html", b"<html>admin</html>"),
+        ]);
+        let resp = serve_with(&assets, &state, "/").await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(location, "/app/");
+    }
+
+    /// Default-entry fallback: a binary built without the octos-web
+    /// bundle (older checkouts, `--skip-web` style builds) must keep
+    /// the previous behavior — root redirects to `/admin/`.
+    #[tokio::test]
+    async fn should_redirect_root_to_admin_when_web_bundle_missing() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[("admin/index.html", b"<html>admin</html>")]);
+        let resp = serve_with(&assets, &state, "/").await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(location, "/admin/");
+    }
+
+    /// Default-entry: stray non-API UI paths (the catch-all branch)
+    /// follow the same preference — `/app/` when the web bundle is
+    /// embedded, `/admin/` otherwise (covered by the sibling tests
+    /// above that stub only the admin bundle).
+    #[tokio::test]
+    async fn should_redirect_catch_all_to_app_when_web_bundle_present() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[
+            ("web/index.html", b"<html>app</html>"),
+            ("admin/index.html", b"<html>admin</html>"),
+        ]);
+        let resp = serve_with(&assets, &state, "/some-stray-path").await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(location, "/app/");
+    }
+
+    /// The default-entry change must not shadow the admin SPA: with
+    /// both bundles embedded, `/admin/*` still serves the admin
+    /// dashboard's index.html.
+    #[tokio::test]
+    async fn should_still_serve_admin_spa_when_web_bundle_present() {
+        let state = AppState::empty_for_tests();
+        let assets = StubAssets::with(&[
+            ("web/index.html", b"<html>app</html>"),
+            ("admin/index.html", b"<html>admin</html>"),
+        ]);
+        let resp = serve_with(&assets, &state, "/admin/users").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/html"));
     }
 }

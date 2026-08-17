@@ -869,6 +869,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "context/normalization_reported",
             "peer/staged",
             "peer/closed",
+            "background/activity",
         ]
     );
     assert_eq!(
@@ -1083,7 +1084,8 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "context/compaction_started",
                 "context/normalization_reported",
                 "peer/staged",
-                "peer/closed"
+                "peer/closed",
+                "background/activity"
             ],
             "supported_features": [
                 "approval.typed.v1",
@@ -1110,6 +1112,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "user_question.v1",
                 "event.voice_audio.v1",
                 "plan.todos.v1",
+                "event.background_activity.v1",
                 "smart_home.v1"
             ]
         })
@@ -3037,6 +3040,83 @@ fn peer_staged_notification_roundtrips_and_keeps_peer_topic() {
     .into_rpc_notification()
     .expect("serialize plain peer/staged");
     assert!(plain.params.get("worktree_branch").is_none());
+}
+
+/// #2019 — `background/activity` is the HUMAN sink over events that today
+/// only wake the model. The routing key is the session that OWNS the emitter,
+/// and it must survive the wire boundary intact: an event that loses (or never
+/// carries) `session_id` renders in whichever session happens to be focused
+/// (octos-tui#461/#466/#483). Attribution and the visible drop marker must
+/// survive too.
+#[test]
+fn should_route_on_owning_session_when_background_activity_crosses_the_wire() {
+    let owner = SessionKey("dev:local:tui#coding".into());
+    let other = SessionKey("dev:local:tui#review".into());
+    let event = BackgroundActivityEvent {
+        session_id: owner.clone(),
+        profile_id: Some("dev".into()),
+        origin_kind: "monitor".into(),
+        origin_id: "mon-7".into(),
+        origin_label: Some("ci-tail".into()),
+        text: "ERROR bus test flaked".into(),
+        emitted_at_ms: 1_760_000_000_000,
+        dropped_count: None,
+        suppressed: false,
+    };
+    let notification = UiNotification::BackgroundActivity(event.clone());
+
+    assert_eq!(notification.method(), methods::BACKGROUND_ACTIVITY);
+    assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::BACKGROUND_ACTIVITY));
+    assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1));
+
+    let rpc = notification
+        .clone()
+        .into_rpc_notification()
+        .expect("serialize background/activity");
+    assert_eq!(rpc.method, methods::BACKGROUND_ACTIVITY);
+    // ROUTING, not merely emission: the wire frame names the OWNING session,
+    // never the sibling a client might happen to have focused.
+    assert_eq!(rpc.params["session_id"], owner.0);
+    assert_ne!(rpc.params["session_id"], other.0);
+    // Attribution rides along — an unattributed line reads as the master.
+    assert_eq!(rpc.params["origin_kind"], "monitor");
+    assert_eq!(rpc.params["origin_id"], "mon-7");
+    assert_eq!(rpc.params["origin_label"], "ci-tail");
+
+    let decoded = UiNotification::from_rpc_notification(rpc).expect("decode background/activity");
+    assert_eq!(decoded, notification);
+    assert_eq!(decoded.session_id(), &owner);
+    assert_eq!(decoded.topic(), Some("coding"));
+}
+
+/// #2019 — the cap's drop marker must be explicitly representable on the wire:
+/// silent truncation reads as "nothing more happened".
+#[test]
+fn should_carry_a_visible_drop_marker_when_background_activity_is_capped() {
+    let marker = UiNotification::BackgroundActivity(BackgroundActivityEvent {
+        session_id: SessionKey("dev:local:tui".into()),
+        profile_id: None,
+        origin_kind: "monitor".into(),
+        origin_id: "mon-7".into(),
+        origin_label: None,
+        text: "further events from this monitor suppressed".into(),
+        emitted_at_ms: 1_760_000_000_001,
+        dropped_count: Some(9),
+        suppressed: true,
+    });
+    let rpc = marker
+        .clone()
+        .into_rpc_notification()
+        .expect("serialize drop marker");
+    assert_eq!(rpc.params["suppressed"], true);
+    assert_eq!(rpc.params["dropped_count"], 9);
+    // Absent optionals stay off the wire.
+    assert!(rpc.params.get("origin_label").is_none());
+    assert!(rpc.params.get("profile_id").is_none());
+    assert_eq!(
+        UiNotification::from_rpc_notification(rpc).expect("decode drop marker"),
+        marker
+    );
 }
 
 /// `peer/closed` round-trips through the wire boundary with the originating

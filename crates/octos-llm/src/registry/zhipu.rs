@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "zhipu",
     aliases: &["glm"],
-    default_model: Some("glm-4-plus"),
     api_key_env: Some("ZHIPU_API_KEY"),
     key_env_aliases: &[],
     default_base_url: Some("https://open.bigmodel.cn/api/paas/v4"),
@@ -26,7 +25,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let key = p
         .api_key
         .ok_or_else(|| eyre::eyre!("ZHIPU_API_KEY not set"))?;
-    let model = p.model.unwrap_or_else(|| "glm-4-plus".into());
+    let model = p
+        .model
+        .or_else(|| ENTRY.default_model().map(str::to_string))
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{}: no model given and the catalog declares no default for this family",
+                ENTRY.name
+            )
+        })?;
     let url = p
         .base_url
         .unwrap_or_else(|| "https://open.bigmodel.cn/api/paas/v4".into());

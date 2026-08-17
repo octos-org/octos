@@ -523,8 +523,12 @@ impl ProcessManager {
             }
         }
 
-        // Inject smart-home bridge config as env vars for the smart-home
-        // plugin skill, same gap-bridging as the email block above.
+        // Inject smart-home bridge config as env vars, same gap-bridging as
+        // the email block above. The smart-home skill resolves
+        // SMART_HOME_BRIDGE_URL/TOKEN first (before its profile-JSON
+        // fallback); the gateway's own `profile_plugin_env` also forwards
+        // these per-profile, so this process-level injection matters for
+        // spawn paths that bypass that template.
         if let Some(ref smart_home) = profile.config.smart_home {
             for (key, value) in smart_home.to_env_vars(&profile.config.env_vars) {
                 if !profile.config.env_vars.contains_key(&key) {

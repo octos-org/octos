@@ -144,6 +144,46 @@ pub(crate) fn discover_ominix_url() -> Option<String> {
         })
 }
 
+/// Resolve the ASR endpoint independently from OminiX. `ASR_API_URL` is an
+/// explicit Octos/OMiniX JSON batch-transcription override at
+/// `/v1/audio/transcriptions`; without it, ASR continues to use OminiX for
+/// backward compatibility.
+pub(crate) fn discover_asr_url() -> Option<String> {
+    discover_asr_route().into_url()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AsrRoute {
+    External(String),
+    Ominix(Option<String>),
+}
+
+impl AsrRoute {
+    fn into_url(self) -> Option<String> {
+        match self {
+            Self::External(url) => Some(url),
+            Self::Ominix(url) => url,
+        }
+    }
+}
+
+pub(crate) fn discover_asr_route() -> AsrRoute {
+    resolve_asr_route(std::env::var("ASR_API_URL").ok(), discover_ominix_url)
+}
+
+fn resolve_asr_route<F>(explicit: Option<String>, discover_ominix: F) -> AsrRoute
+where
+    F: FnOnce() -> Option<String>,
+{
+    let explicit = explicit
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+    match explicit {
+        Some(url) => AsrRoute::External(url),
+        None => AsrRoute::Ominix(discover_ominix()),
+    }
+}
+
 /// Append the standard per-profile runtime env vars onto a plugin-env
 /// vector. Mirrors the gateway path's call site at
 /// `gateway_runtime.rs:435` so the `serve` plugin loader can spawn
@@ -342,6 +382,61 @@ mod tests {
 
         let dirs = build_account_plugin_dirs(&data_dir);
         assert_eq!(dirs, vec![skills_dir]);
+    }
+
+    #[test]
+    fn should_prefer_explicit_asr_url_over_ominix_fallback() {
+        assert_eq!(
+            resolve_asr_route(Some(" http://127.0.0.1:8093/ ".to_string()), || Some(
+                "http://127.0.0.1:8081".to_string()
+            ),)
+            .into_url()
+            .as_deref(),
+            Some("http://127.0.0.1:8093")
+        );
+    }
+
+    #[test]
+    fn should_fall_back_to_ominix_when_asr_url_is_blank_or_missing() {
+        let fallback = Some("http://127.0.0.1:8081".to_string());
+        assert_eq!(
+            resolve_asr_route(Some("  ".to_string()), || fallback.clone()).into_url(),
+            fallback
+        );
+        assert_eq!(
+            resolve_asr_route(None, || fallback.clone()).into_url(),
+            fallback
+        );
+    }
+
+    #[test]
+    fn should_classify_explicit_asr_url_as_external_route() {
+        assert_eq!(
+            resolve_asr_route(Some(" http://127.0.0.1:8093/ ".to_string()), || Some(
+                "http://127.0.0.1:8081".to_string()
+            ),),
+            AsrRoute::External("http://127.0.0.1:8093".to_string())
+        );
+    }
+
+    #[test]
+    fn should_not_discover_ominix_when_dedicated_asr_url_is_set() {
+        let route = resolve_asr_route(Some("http://127.0.0.1:8093".to_string()), || {
+            panic!("OMiniX discovery must be lazy when ASR_API_URL is set")
+        });
+
+        assert_eq!(
+            route,
+            AsrRoute::External("http://127.0.0.1:8093".to_string())
+        );
+    }
+
+    #[test]
+    fn should_classify_missing_asr_url_as_ominix_route() {
+        assert_eq!(
+            resolve_asr_route(None, || Some("http://127.0.0.1:8081".to_string())),
+            AsrRoute::Ominix(Some("http://127.0.0.1:8081".to_string()))
+        );
     }
 
     #[test]

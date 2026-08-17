@@ -1297,6 +1297,11 @@ pub enum ChannelCredentials {
         port: u16,
         #[serde(default)]
         allowed_senders: Vec<String>,
+        /// Appservice-mode: outside a true 1:1 DM, bots only reply when
+        /// explicitly addressed. Safe-by-default; set to `false` to let bots
+        /// answer every message.
+        #[serde(default = "crate::config::default_true")]
+        mention_only: bool,
         /// Channel mode: "appservice" (default) or "user" (regular account login).
         #[serde(default)]
         mode: String,
@@ -1790,6 +1795,11 @@ impl ProfileStore {
                     &mut new_email.feishu_app_secret,
                     &old_email.feishu_app_secret,
                 );
+            }
+            if let (Some(new_smart_home), Some(old_smart_home)) =
+                (&mut profile.config.smart_home, &existing.config.smart_home)
+            {
+                restore_masked_optional_secret(&mut new_smart_home.token, &old_smart_home.token);
             }
         }
         self.save(profile)
@@ -2946,6 +2956,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             user_prefix,
             port,
             allowed_senders,
+            mention_only,
             mode,
             user_id,
             access_token,
@@ -2991,6 +3002,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 settings["sender_localpart"] = serde_json::json!(sender_localpart);
                 settings["user_prefix"] = serde_json::json!(user_prefix);
                 settings["port"] = serde_json::json!(port);
+                settings["mention_only"] = serde_json::json!(mention_only);
             }
             serde_json::json!({
                 "type": "matrix",
@@ -4282,6 +4294,7 @@ mod tests {
                         user_prefix: "octos_".into(),
                         port: 8009,
                         allowed_senders: Vec::new(),
+                        mention_only: true,
                         mode: "user".into(),
                         user_id: "@bot:example.org".into(),
                         access_token: "syt_access_token_secret".into(),
@@ -4481,6 +4494,67 @@ mod tests {
         );
     }
 
+    /// Build a profile whose `config.smart_home` carries a literal token.
+    fn smart_home_secret_profile(id: &str) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: "Smart Home Secrets".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                smart_home: Some(SmartHomeConfig {
+                    bridge_url: Some("http://192.168.1.50:8787".into()),
+                    token: Some("real-bridge-token".into()),
+                    token_env: None,
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_masked_smart_home_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        store.save(&smart_home_secret_profile("sh-merge")).unwrap();
+
+        // A client GETs the masked profile and PUTs it straight back — the
+        // settings page does exactly this for every unrelated config save.
+        let mut round_tripped = mask_secrets(&store.get("sh-merge").unwrap().unwrap());
+        store.save_with_merge(&mut round_tripped).unwrap();
+
+        let loaded = store.get("sh-merge").unwrap().unwrap();
+        let smart_home = loaded
+            .config
+            .smart_home
+            .expect("smart_home settings survive the merge");
+        assert_eq!(smart_home.token.as_deref(), Some("real-bridge-token"));
+        assert_eq!(
+            smart_home.bridge_url.as_deref(),
+            Some("http://192.168.1.50:8787")
+        );
+    }
+
+    #[test]
+    fn test_save_with_merge_allows_changing_smart_home_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        store.save(&smart_home_secret_profile("sh-change")).unwrap();
+
+        // A genuinely new value is NOT a display artifact, so it must land.
+        let mut updated = smart_home_secret_profile("sh-change");
+        updated.config.smart_home.as_mut().unwrap().token = Some("rotated-bridge-token".into());
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("sh-change").unwrap().unwrap();
+        let smart_home = loaded.config.smart_home.unwrap();
+        assert_eq!(smart_home.token.as_deref(), Some("rotated-bridge-token"));
+    }
+
     #[test]
     fn test_save_with_merge_allows_changing_email_secrets() {
         let dir = tempfile::tempdir().unwrap();
@@ -4530,6 +4604,7 @@ mod tests {
                         user_prefix: "octos_".into(),
                         port: 8009,
                         allowed_senders: Vec::new(),
+                        mention_only: true,
                         mode: "user".into(),
                         user_id: "@bot:old.example.org".into(),
                         access_token: "syt_real_access_token".into(),
@@ -4621,6 +4696,7 @@ mod tests {
                     user_prefix: "octos_".into(),
                     port: 8009,
                     allowed_senders: Vec::new(),
+                    mention_only: true,
                     mode: "user".into(),
                     user_id: "@bot:example.org".into(),
                     access_token: "syt_old_access_token".into(),
@@ -4679,6 +4755,7 @@ mod tests {
             user_prefix: "octos_".into(),
             port: 8009,
             allowed_senders: Vec::new(),
+            mention_only: true,
             mode: "user".into(),
             user_id: user_id.into(),
             access_token: token.into(),
@@ -5752,6 +5829,39 @@ mod tests {
         assert!(settings.get("as_token").is_none());
         assert!(settings.get("hs_token").is_none());
         assert!(settings.get("port").is_none());
+    }
+
+    #[test]
+    fn test_matrix_appservice_channel_to_entry_carries_mention_only() {
+        // The documented opt-out (`mention_only: false`) must survive the
+        // profiles → ChannelEntry conversion; otherwise a matrix channel
+        // configured through this path silently reverts to the default.
+        let channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "homeserver": "http://localhost:6167",
+            "as_token": "as",
+            "hs_token": "hs",
+            "server_name": "localhost",
+            "mention_only": false,
+        }))
+        .unwrap();
+
+        let entry = channel_to_entry(&channel);
+        assert_eq!(entry["settings"]["mention_only"], false);
+
+        // Omitted → safe default `true`, and the entry says so explicitly.
+        let default_channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "homeserver": "http://localhost:6167",
+            "as_token": "as",
+            "hs_token": "hs",
+            "server_name": "localhost",
+        }))
+        .unwrap();
+        assert_eq!(
+            channel_to_entry(&default_channel)["settings"]["mention_only"],
+            true
+        );
     }
 
     #[test]

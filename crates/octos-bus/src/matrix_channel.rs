@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -31,6 +32,10 @@ use crate::markdown_html::markdown_to_matrix_html;
 // ── Matrix event type constants ──────────────────────────────────────────────
 
 const CHANNEL_NAME: &str = "matrix";
+/// How long a room's human-member count is cached before it is re-queried from
+/// the homeserver. Keeps the mention-only gate off the hot path for repeated
+/// messages in the same room without letting membership go stale for long.
+const DM_MEMBER_CACHE_TTL: Duration = Duration::from_secs(60);
 const EVENT_ROOM_MESSAGE: &str = "m.room.message";
 const EVENT_ROOM_MEMBER: &str = "m.room.member";
 const MSGTYPE_TEXT: &str = "m.text";
@@ -51,6 +56,10 @@ const CONTENT_APPROVAL_REQUEST: &str = "org.octos.approval_request";
 const CONTENT_APPROVAL_RESPONSE: &str = "org.octos.approval_response";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
+/// Marker set by capable clients (Robrix) on messages the user explicitly
+/// addressed to the room rather than to a bot. Such messages go through the
+/// mention gate even when `mention_only` is disabled.
+const CONTENT_EXPLICIT_ROOM: &str = "org.octos.explicit_room";
 const CONTENT_BROADCAST_TARGETS: &str = "org.octos.broadcast_targets";
 #[cfg(not(test))]
 const MAX_EVENT_SENDER_CACHE: usize = 2048;
@@ -125,6 +134,10 @@ pub enum BotVisibility {
 pub struct BotRouter {
     routes: Arc<RwLock<HashMap<String, BotEntry>>>, // matrix_user_id -> metadata
     room_bots: Arc<RwLock<HashMap<String, HashSet<String>>>>, // room_id -> profile_ids
+    /// True when an existing room-map file could not be read or parsed at
+    /// startup. The mention gate treats a poisoned map as "composition
+    /// unknown" and fails closed, rather than silently acting on an empty map.
+    room_map_poisoned: bool,
     persist_path: Option<PathBuf>,
     room_persist_path: Option<PathBuf>,
     update_lock: Arc<Mutex<()>>,
@@ -141,13 +154,14 @@ impl BotRouter {
             .as_deref()
             .and_then(|p| p.parent())
             .map(|dir| dir.join("matrix-bot-room-map.json"));
-        let room_bots = room_persist_path
+        let (room_bots, room_map_poisoned) = room_persist_path
             .as_deref()
             .map(Self::load_rooms)
             .unwrap_or_default();
         Self {
             routes: Arc::new(RwLock::new(routes)),
             room_bots: Arc::new(RwLock::new(room_bots)),
+            room_map_poisoned,
             persist_path,
             room_persist_path,
             update_lock: Arc::new(Mutex::new(())),
@@ -271,6 +285,58 @@ impl BotRouter {
         }
     }
 
+    /// Number of managed bots mapped to `room_id` in the room map.
+    ///
+    /// The homeserver's `joined_members` response may omit appservice virtual
+    /// users entirely (Palpo does), so the mention gate cannot count bots from
+    /// membership alone — this map is the appservice's own authority on which
+    /// of its bots are in the room.
+    pub async fn bot_count_for_room(&self, room_id: &str) -> usize {
+        let room_bots = self.room_bots.read().await;
+        room_bots.get(room_id).map_or(0, |profiles| profiles.len())
+    }
+
+    /// Managed-bot composition of `room_id` from the appservice's own room
+    /// map, split into child bots and the BotFather profile so it can be
+    /// unioned with a membership-derived count (which sees BotFather but may
+    /// not see homeserver-hidden child virtual users).
+    ///
+    /// A mapped profile whose Matrix user ID equals `bot_user_id` is the
+    /// BotFather profile; a profile with no known reverse route is counted as
+    /// a child bot (over-counting fails safe: it can only demand a mention,
+    /// never grant a DM exemption). Returns `None` when the room map failed
+    /// to load at startup, so the caller fails closed.
+    pub async fn room_bot_composition(
+        &self,
+        room_id: &str,
+        bot_user_id: &str,
+    ) -> Option<RoomBotComposition> {
+        if self.room_map_poisoned {
+            return None;
+        }
+        let mut composition = RoomBotComposition {
+            child_bots: 0,
+            botfather_mapped: false,
+        };
+        let room_bots = self.room_bots.read().await;
+        let Some(profiles) = room_bots.get(room_id) else {
+            return Some(composition);
+        };
+        let routes = self.routes.read().await;
+        for profile_id in profiles {
+            let matrix_user_id = routes
+                .iter()
+                .find(|(_, entry)| entry.profile_id == *profile_id)
+                .map(|(matrix_user_id, _)| matrix_user_id.as_str());
+            if matrix_user_id == Some(bot_user_id) {
+                composition.botfather_mapped = true;
+            } else {
+                composition.child_bots += 1;
+            }
+        }
+        Some(composition)
+    }
+
     /// Record that a bot (by profile_id) is in a room.
     /// Called when a bot virtual user is invited to and joins a room.
     pub async fn add_room_bot(&self, room_id: &str, profile_id: &str) -> Result<()> {
@@ -331,9 +397,14 @@ impl BotRouter {
             *routes = new_routes;
         }
         if let Some(ref path) = self.room_persist_path {
-            let new_rooms = Self::load_rooms(path);
-            let mut room_bots = self.room_bots.write().await;
-            *room_bots = new_rooms;
+            // A reload that fails to parse keeps the previous in-memory map
+            // rather than clobbering it with an empty one; the startup
+            // `room_map_poisoned` flag is not revisited here.
+            let (new_rooms, poisoned) = Self::load_rooms(path);
+            if !poisoned {
+                let mut room_bots = self.room_bots.write().await;
+                *room_bots = new_rooms;
+            }
         }
         Ok(())
     }
@@ -407,22 +478,40 @@ impl BotRouter {
     }
 
     /// Load room-bot mappings from a JSON file.
-    fn load_rooms(path: &std::path::Path) -> HashMap<String, HashSet<String>> {
+    /// Load the room map from disk. The boolean is the "poisoned" flag: a
+    /// missing file is a legitimate first run (empty map, not poisoned), but
+    /// an existing file that cannot be read or parsed must not silently
+    /// become an empty map — the mention gate would then see zero bots in
+    /// every room and treat multi-bot rooms as DMs.
+    fn load_rooms(path: &std::path::Path) -> (HashMap<String, HashSet<String>>, bool) {
         match std::fs::read_to_string(path) {
-            Ok(data) => {
-                let map: HashMap<String, Vec<String>> =
-                    serde_json::from_str(&data).unwrap_or_default();
-                map.into_iter()
-                    .map(|(k, v)| (k, v.into_iter().collect()))
-                    .collect()
+            Ok(data) => match serde_json::from_str::<HashMap<String, Vec<String>>>(&data) {
+                Ok(map) => (
+                    map.into_iter()
+                        .map(|(k, v)| (k, v.into_iter().collect()))
+                        .collect(),
+                    false,
+                ),
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to parse matrix room map; failing closed");
+                    (HashMap::new(), true)
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), false),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to read matrix room map; failing closed");
+                (HashMap::new(), true)
             }
-            Err(_) => HashMap::new(),
         }
     }
 }
 
+// `/` is deliberately NOT a user-id char: it is not valid in an MXID, and in a
+// standard matrix.to pill (`https://matrix.to/#/@bot:server`) the MXID is
+// immediately preceded by `/` — treating `/` as part of a user ID would make
+// the left-boundary check reject exactly that pill form.
 fn is_matrix_user_id_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | '/' | ':' | '@')
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '=' | '-' | ':' | '@')
 }
 
 fn contains_exact_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
@@ -504,6 +593,251 @@ async fn route_by_matrix_mention(
     None
 }
 
+/// Whether `content`/`body_text` explicitly mention `user_id` via a structured
+/// `m.mentions.user_ids` entry, a matrix.to pill in `formatted_body`, or a
+/// plain-text MXID mention. Used to treat a direct mention of the appservice's
+/// own bot user as "addressed" even when it is not a registered child-bot route.
+fn mentions_user(content: &Value, body_text: &str, user_id: &str) -> bool {
+    if let Some(user_ids) = content
+        .get("m.mentions")
+        .and_then(|v| v.get("user_ids"))
+        .and_then(|v| v.as_array())
+        && user_ids
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|candidate| candidate == user_id)
+    {
+        return true;
+    }
+
+    if contains_exact_matrix_user_id_mention(body_text, user_id) {
+        return true;
+    }
+
+    let formatted_body = content
+        .get("formatted_body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    !formatted_body.is_empty() && contains_exact_matrix_user_id_mention(formatted_body, user_id)
+}
+
+/// Final member breakdown of a room, as seen by the mention gate.
+///
+/// `humans` are joined users that are neither the appservice bot nor managed
+/// virtual users. `managed_bots` are all managed responders — child bots plus
+/// the appservice's own BotFather user: BotFather answers unrouted messages
+/// itself (admin mode), so it counts as a potential responder too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RoomMemberCounts {
+    humans: usize,
+    managed_bots: usize,
+}
+
+impl RoomMemberCounts {
+    /// Sentinel for "membership unknown": fails every `<= 1` check closed.
+    const UNKNOWN: Self = Self {
+        humans: usize::MAX,
+        managed_bots: usize::MAX,
+    };
+
+    /// A true 1:1 DM: at most one human talking to at most one managed bot.
+    fn is_direct_chat(self) -> bool {
+        self.humans <= 1 && self.managed_bots <= 1
+    }
+}
+
+/// Member breakdown derived from the homeserver's `joined_members` response.
+///
+/// Kept separate from [`RoomMemberCounts`] because this source sees BotFather
+/// (when the homeserver reports it) but may not see managed child virtual
+/// users at all — Palpo omits appservice virtual users from `joined_members`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MembershipCounts {
+    humans: usize,
+    /// Managed child (virtual) bot users visible in the membership list.
+    child_bots: usize,
+    /// Whether the appservice's own BotFather user appears as joined.
+    botfather_joined: bool,
+}
+
+/// Managed-bot composition of a room from the appservice's room map
+/// (see [`BotRouter::room_bot_composition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomBotComposition {
+    pub child_bots: usize,
+    pub botfather_mapped: bool,
+}
+
+/// Union the two bot-count sources into the gate's final member breakdown.
+///
+/// The sources see different bots, so a plain `max` of totals undercounts:
+/// membership sees BotFather but may miss homeserver-hidden child users,
+/// while the room map sees bound child bots. A room of one human plus a
+/// BotFather and one hidden child would look like "1 bot" to each source
+/// individually, yet has two potential responders. Child bots are maxed
+/// across sources (same population, different visibility) and BotFather is
+/// added separately when either source saw it. `None` from either source
+/// means that source could not be determined — fail closed.
+fn merge_room_bot_sources(
+    membership: Option<MembershipCounts>,
+    mapped: Option<RoomBotComposition>,
+) -> RoomMemberCounts {
+    let (Some(membership), Some(mapped)) = (membership, mapped) else {
+        return RoomMemberCounts::UNKNOWN;
+    };
+    let child_bots = membership.child_bots.max(mapped.child_bots);
+    let botfather_present = membership.botfather_joined || mapped.botfather_mapped;
+    RoomMemberCounts {
+        humans: membership.humans,
+        managed_bots: child_bots.saturating_add(usize::from(botfather_present)),
+    }
+}
+
+/// Decide whether an inbound room message should reach the agent.
+///
+/// Pure decision function for the mention-only gate:
+/// - `gated == false` → always dispatch (legacy behaviour).
+/// - the bot was explicitly `addressed` → always dispatch.
+/// - otherwise dispatch only in a true 1:1 DM: at most one human AND at most
+///   one managed child bot. A room with several bots requires a mention even
+///   when a single human is present, so bound and merely-invited bots do not
+///   all answer every message. [`RoomMemberCounts::UNKNOWN`] is used by
+///   callers to signal "membership unknown", which fails closed.
+fn should_dispatch_message(gated: bool, addressed: bool, members: RoomMemberCounts) -> bool {
+    if !gated || addressed {
+        return true;
+    }
+    members.is_direct_chat()
+}
+
+/// Break down the members in a homeserver `joined_members` response into
+/// humans, visible child bots, and BotFather (see [`MembershipCounts`]).
+/// Returns `None` when the response has no `joined` object, so the caller
+/// can fail closed.
+fn count_room_members(
+    joined_members: &Value,
+    bot_user_id: &str,
+    server_suffix: &str,
+    user_prefix: &str,
+) -> Option<MembershipCounts> {
+    let members = joined_members
+        .get("joined")
+        .and_then(|value| value.as_object())?;
+
+    let mut counts = MembershipCounts {
+        humans: 0,
+        child_bots: 0,
+        botfather_joined: false,
+    };
+    for user_id in members.keys() {
+        if user_id == bot_user_id {
+            counts.botfather_joined = true;
+        } else if is_managed_user(user_id, bot_user_id, server_suffix, user_prefix) {
+            counts.child_bots += 1;
+        } else {
+            counts.humans += 1;
+        }
+    }
+    Some(counts)
+}
+
+/// Invalidate the cached membership for `room_id` and bump the cache
+/// generation so any in-flight fetch that started before this invalidation
+/// cannot reinsert its (now stale) result afterward.
+async fn invalidate_room_member_cache(state: &AppserviceState, room_id: &str) {
+    if !room_id.is_empty() {
+        state
+            .dm_member_cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.dm_member_cache.write().await.remove(room_id);
+    }
+}
+
+/// Return the membership breakdown of `room_id`, consulting a short-TTL cache
+/// first and otherwise querying the homeserver. Returns `None` when the
+/// membership cannot be determined (so the caller can fail closed).
+async fn room_member_counts(
+    state: &AppserviceState,
+    room_id: &str,
+    as_user_id: &str,
+    server_suffix: &str,
+) -> Option<MembershipCounts> {
+    {
+        let cache = state.dm_member_cache.read().await;
+        if let Some((counts, fetched_at)) = cache.get(room_id) {
+            if fetched_at.elapsed() < DM_MEMBER_CACHE_TTL {
+                return Some(*counts);
+            }
+        }
+    }
+
+    let generation_before_fetch = state
+        .dm_member_cache_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let counts = fetch_room_member_counts(state, room_id, as_user_id, server_suffix).await?;
+    let mut cache = state.dm_member_cache.write().await;
+    // Age-based eviction on write keeps the cache bounded: entries are
+    // otherwise only removed by membership events for their own room.
+    cache.retain(|_, (_, fetched_at)| fetched_at.elapsed() < DM_MEMBER_CACHE_TTL);
+    // A membership event may have invalidated this room while the fetch was
+    // in flight; inserting the pre-event snapshot would resurrect stale
+    // counts for a full TTL. Serve the fresh value but do not cache it.
+    if state
+        .dm_member_cache_generation
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == generation_before_fetch
+    {
+        cache.insert(room_id.to_string(), (counts, Instant::now()));
+    }
+    Some(counts)
+}
+
+/// Query the homeserver for the joined members of `room_id`, asserting the
+/// appservice identity `as_user_id` (which must be joined to the room), and
+/// return the member breakdown. Returns `None` on any failure.
+async fn fetch_room_member_counts(
+    state: &AppserviceState,
+    room_id: &str,
+    as_user_id: &str,
+    server_suffix: &str,
+) -> Option<MembershipCounts> {
+    let url = format!(
+        "{}/_matrix/client/v3/rooms/{}/joined_members?user_id={}",
+        state.homeserver,
+        percent_encode_path(room_id),
+        percent_encode_path(as_user_id),
+    );
+    let resp = match state
+        .http
+        .get(&url)
+        .bearer_auth(&state.as_token)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(room_id, error = %e, "failed to query room membership for mention gate");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(
+            room_id,
+            status = resp.status().as_u16(),
+            "room membership query returned non-success for mention gate"
+        );
+        return None;
+    }
+    let body: Value = match resp.json().await {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(room_id, error = %e, "failed to parse room membership for mention gate");
+            return None;
+        }
+    };
+    count_room_members(&body, &state.bot_user_id, server_suffix, &state.user_prefix)
+}
+
 /// Shared state for the appservice HTTP handlers.
 #[derive(Clone)]
 struct AppserviceState {
@@ -521,6 +855,18 @@ struct AppserviceState {
     bot_manager: Option<Arc<dyn BotManager>>,
     /// Directory for downloaded media files (inbound images, files, audio, video).
     media_dir: PathBuf,
+    /// When set, the bot only replies in a multi-participant room if it was
+    /// explicitly addressed (mention / pill / explicit target). A 1:1 DM (the
+    /// bot plus a single human) still replies to every message. Safe-by-default.
+    mention_only: bool,
+    /// Cached human-member counts per room (`room_id -> (count, fetched_at)`),
+    /// used by the mention-only gate to avoid a homeserver round-trip on every
+    /// message. Entries expire after [`DM_MEMBER_CACHE_TTL`].
+    dm_member_cache: Arc<RwLock<HashMap<String, (MembershipCounts, Instant)>>>,
+    /// Monotonic generation counter for `dm_member_cache`: bumped on every
+    /// membership-event invalidation so an in-flight fetch that predates the
+    /// event cannot reinsert stale counts (see `room_member_counts`).
+    dm_member_cache_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn error_json_response(
@@ -570,6 +916,13 @@ pub struct MatrixChannel {
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
     /// Directory for downloaded media files (inbound images, files, audio, video).
     media_dir: PathBuf,
+    /// Mention-only gating (see [`AppserviceState::mention_only`]). Defaults to
+    /// `true`; override via [`MatrixChannel::with_mention_only`].
+    mention_only: bool,
+    /// Shared room human-member-count cache backing the mention-only gate.
+    dm_member_cache: Arc<RwLock<HashMap<String, (MembershipCounts, Instant)>>>,
+    /// Generation counter paired with `dm_member_cache` (see `AppserviceState`).
+    dm_member_cache_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MatrixChannel {
@@ -605,12 +958,26 @@ impl MatrixChannel {
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
             media_dir: std::env::temp_dir().join("octos-matrix-media"),
+            mention_only: true,
+            dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
+            dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Set the directory for downloaded media files.
     pub fn with_media_dir(mut self, media_dir: PathBuf) -> Self {
         self.media_dir = media_dir;
+        self
+    }
+
+    /// Configure mention-only gating for multi-participant rooms.
+    ///
+    /// When `true` (the default), the bot only replies in a room with more than
+    /// one human participant if it was explicitly addressed; a 1:1 DM still
+    /// replies to every message. When `false`, the bot replies to every routed
+    /// message as before.
+    pub fn with_mention_only(mut self, mention_only: bool) -> Self {
+        self.mention_only = mention_only;
         self
     }
 
@@ -1078,6 +1445,9 @@ async fn handle_transaction(
 
         // Handle m.room.member invite events — auto-join rooms we're invited to
         if event_type == EVENT_ROOM_MEMBER {
+            let member_room_id = event.get("room_id").and_then(|v| v.as_str()).unwrap_or("");
+            invalidate_room_member_cache(&state, member_room_id).await;
+
             if let Some(membership) = event
                 .get("content")
                 .and_then(|c| c.get("membership"))
@@ -1315,14 +1685,28 @@ async fn handle_transaction(
         if let Some(approval_response) = content.get(CONTENT_APPROVAL_RESPONSE) {
             metadata[CONTENT_APPROVAL_RESPONSE] = approval_response.clone();
         }
+        // Whether the bot was explicitly addressed: an explicit `target_user_id`
+        // from a capable client, an `m.mentions` entry, a matrix.to pill, or a
+        // plain-text MXID mention. Routing by room mapping alone (the DM /
+        // single-bot fallback) does NOT count as being addressed.
+        let mut addressed = false;
         if let Some(profile_id) = route_by_explicit_target(&state.bot_router, content).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
+            addressed = true;
         } else if let Some(profile_id) =
             route_by_matrix_mention(&state.bot_router, content, body_text).await
         {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
+            addressed = true;
         } else if let Some(profile_id) = state.bot_router.route_by_room(room_id).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
+        }
+
+        // A direct mention of the appservice's own bot user (e.g. BotFather)
+        // also counts as being addressed, even though it is not a registered
+        // child-bot route.
+        if !addressed && mentions_user(content, body_text, &state.bot_user_id) {
+            addressed = true;
         }
 
         if let Some(profile_id) = metadata
@@ -1340,15 +1724,29 @@ async fn handle_transaction(
         {
             if let Some(entry) = state.bot_router.get_entry(target_user_id).await {
                 if entry.visibility == BotVisibility::Private && sender != entry.owner {
-                    if let Err(e) = send_text_to_room_as(
-                        &state,
-                        room_id,
-                        "This is a private bot. Only its owner can chat with it.",
-                        target_user_id,
-                    )
-                    .await
-                    {
-                        warn!(error = %e, room_id, target_user_id, "failed to send private bot message rejection");
+                    // Only reply with the rejection when the sender explicitly
+                    // addressed the bot. Room-mapping routing alone can target
+                    // a private bot with any unaddressed group chatter, and
+                    // answering that would both spam the room and reveal the
+                    // private bot's existence — exactly the unmentioned noise
+                    // the mention gate suppresses. Unaddressed messages are
+                    // dropped silently either way.
+                    if addressed {
+                        if let Err(e) = send_text_to_room_as(
+                            &state,
+                            room_id,
+                            "This is a private bot. Only its owner can chat with it.",
+                            target_user_id,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, room_id, target_user_id, "failed to send private bot message rejection");
+                        }
+                    } else {
+                        debug!(
+                            room_id,
+                            sender, target_user_id, "unaddressed message to private bot ignored"
+                        );
                     }
                     continue;
                 }
@@ -1380,6 +1778,48 @@ async fn handle_transaction(
                 warn!(error = %e, room_id, "failed to send slash command response");
             }
             continue;
+        }
+
+        // Mention-only gate (safe-by-default): outside a true 1:1 DM, only
+        // respond when the bot was explicitly addressed. A 1:1 DM means at
+        // most one human AND at most one managed child bot — a single human
+        // sharing a room with several bots must still mention one of them,
+        // otherwise every bot in the room would answer each message.
+        // Messages carrying the client-side `org.octos.explicit_room` marker
+        // ("the user addressed the room, not a bot") go through the same gate
+        // even when `mention_only` is disabled. Humans are counted from live
+        // room membership (cached); bots are additionally counted from the
+        // appservice's own room map, because the homeserver may hide virtual
+        // users from `joined_members` (Palpo does). If membership cannot be
+        // determined, fail closed and require a mention. Runs after
+        // slash-command handling so admin commands are never gated.
+        let explicit_room = content
+            .get(CONTENT_EXPLICIT_ROOM)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if (state.mention_only || explicit_room) && !addressed {
+            let as_user_id = metadata
+                .get(METADATA_TARGET_MATRIX_USER_ID)
+                .and_then(|value| value.as_str())
+                .unwrap_or(state.bot_user_id.as_str())
+                .to_string();
+            let membership = room_member_counts(&state, room_id, &as_user_id, &server_suffix).await;
+            let mapped = state
+                .bot_router
+                .room_bot_composition(room_id, state.bot_user_id.as_str())
+                .await;
+            let members = merge_room_bot_sources(membership, mapped);
+            if !should_dispatch_message(true, false, members) {
+                debug!(
+                    room_id,
+                    sender,
+                    explicit_room,
+                    membership = ?membership,
+                    mapped = ?mapped,
+                    "Matrix message ignored; mention required outside 1:1 DM"
+                );
+                continue;
+            }
         }
 
         // For media messages with an empty body, provide a descriptive placeholder.
@@ -1944,6 +2384,9 @@ impl Channel for MatrixChannel {
             bot_router: self.bot_router.clone(),
             bot_manager: self.bot_manager.get().cloned(),
             media_dir: self.media_dir.clone(),
+            mention_only: self.mention_only,
+            dm_member_cache: self.dm_member_cache.clone(),
+            dm_member_cache_generation: self.dm_member_cache_generation.clone(),
         };
 
         let app = Router::new()

@@ -1531,13 +1531,17 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
 
 ## 13. 平台技能 (ASR/TTS)
 
-平台技能是服务器级别的技能，需要在 Apple Silicon 上运行 OminiX 后端。它们提供设备端语音转录和合成 — 无需云端 API。
+平台技能是服务器级别的语音工具。语音转录可通过 `ASR_API_URL` 使用独立的批量
+ASR 服务；未配置时保持原有 OminiX 回退。预设音色合成和模型管理仍由 Apple
+Silicon 上的 OminiX 提供。
 
 ### 13.1 前提条件
 
-- Apple Silicon Mac（M1/M2/M3/M4）
-- OminiX API 服务器运行中（通过 `octos serve` 管理）
-- 已下载模型：`Qwen3-ASR-1.7B-8bit`、`Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
+- 使用 OminiX ASR 或本地 TTS 时需要 Apple Silicon Mac
+- ASR：配置了 `ASR_API_URL` 的兼容服务，或者运行 OminiX API 并下载
+  `Qwen3-ASR-1.7B-8bit`
+- 本地 TTS：运行 OminiX API 并下载
+  `Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
 
 ### 13.2 通过仪表盘管理 OminiX
 
@@ -1568,6 +1572,19 @@ curl http://localhost:50080/api/admin/platform-skills/ominix-api/logs?lines=100
 ### 13.3 语音转录 (`voice_transcribe`)
 
 将音频文件转录为文本。
+
+在启动 `octos serve` 或 `octos gateway` 前，把 `ASR_API_URL` 设置为服务基址，
+即可让 AppUI 语音轮、Gateway 语音消息和 `voice_transcribe` 工具统一走独立 ASR：
+
+```bash
+ASR_API_URL=http://127.0.0.1:8091 octos serve --port 50080
+```
+
+服务必须接受 `POST /v1/audio/transcriptions`，JSON 请求字段为 `file`（base64
+音频）、可选的 `language` 和 `response_format`，并返回包含字符串 `text` 的
+JSON。成功但为空的 `text` 会被视为“未检测到人声”，不会发送给智能体。
+Octos 会通过 `GET /health` 检查 readiness；没有该路由的服务可返回 `404` 或
+`405`。如果 `ASR_API_URL` 未设置或为空，Octos 会继续使用 OminiX ASR。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -2099,6 +2116,7 @@ chmod +x .octos/skills/translator/main
 | `LARK_APP_SECRET` | 飞书邮件应用密钥 |
 | `LARK_FROM_ADDRESS` | 飞书邮件发件人地址 |
 | **语音** | |
+| `ASR_API_URL` | 独立批量 ASR 服务基址；设置后转录不再走 OMiniX |
 | `OMINIX_API_URL` | OminiX ASR/TTS API 地址 |
 | **系统** | |
 | `RUST_LOG` | 日志级别（error/warn/info/debug/trace） |
@@ -2301,6 +2319,7 @@ client = "https://your.server.name"
         "sender_localpart": "octosbot",
         "user_prefix": "octosbot_",
         "port": 8009,
+        "mention_only": true,
         "allowed_senders": ["@alice:your.server.name"]
       }
     ],
@@ -2324,6 +2343,7 @@ Matrix 频道字段说明：
 | `user_prefix` | 此应用服务管理的桥接用户 ID 前缀。 |
 | `port` | Octos 监听来自 Palpo 的应用服务事件的端口。 |
 | `allowed_senders` | 允许与机器人对话的 Matrix 用户 ID。空数组 = 允许所有人。 |
+| `mention_only` | 可选，默认 `true`。在真正的 1:1 私聊之外，机器人只在被显式寻址时才回复（`m.mentions` 条目、MXID pill/提及、或客户端指定的 target）。真正的 1:1 私聊——1 个人类 + 该应用服务在此房间仅管理 1 个机器人（以应用服务自己的房间映射为准）——始终回复。多机器人房间即使只有 1 个人类也要求提及，避免所有机器人同时应答。设为 `false` 则在所有房间回复每条消息（带 `org.octos.explicit_room` 标记的消息仍走门控）。 |
 
 #### 5. Docker Compose
 

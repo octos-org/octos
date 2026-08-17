@@ -335,7 +335,8 @@ Sub-agent multi-model routing. Routes different sub-agent tasks to different pro
 
 ### OminixClient (`ominix.rs`)
 
-Client for local ASR/TTS via Ominix runtime.
+Client for OminiX TTS and the shared JSON batch-ASR contract. Voice input uses
+`ASR_API_URL` when configured and otherwise falls back to OminiX.
 
 ### Token Estimation
 
@@ -611,7 +612,7 @@ Triggered when estimated tokens exceed 80% of context window / 1.2 safety margin
 | `smart-home` | `smart_home` | List/control smart-home devices via profile bridge |
 | `skill-evolve` | `skill-evolve` | Patch-management for skill SKILL.md drift |
 
-`PLATFORM_SKILLS` adds one more entry — `voice` — bootstrapped once by `octos serve` at admin-bot startup, shared across all gateway profiles, only installed when its OminiX-API backend is reachable. Voice cloning is **not** part of the platform voice skill — it is handled by the separate `mofa-fm` skill (`fm_tts`).
+`PLATFORM_SKILLS` adds one more entry — `voice` — bootstrapped once by `octos serve` at admin-bot startup and shared across all gateway profiles. Its ASR leg uses `ASR_API_URL` when configured or OminiX otherwise; TTS and model-management operations remain on OminiX. Voice cloning is **not** part of the platform voice skill — it is handled by the separate `mofa-fm` skill (`fm_tts`).
 
 The other workspace `app-skills/*` crates (`harness-starter-{audio,coding,generic,report}`, `wechat-bridge`) are **not** in `BUNDLED_APP_SKILLS`. They build as part of `cargo build --workspace` but are not auto-installed by the gateway; harness-starters are templates new skill authors copy, and `wechat-bridge` is a WebSocket transport helper rather than a tool-providing skill.
 
@@ -1573,8 +1574,9 @@ crates/
 │                    Workspace-only (not bundled):
 │                      harness-starter-{audio, coding, generic, report},
 │                      wechat-bridge)
-└── platform-skills/voice/   (preset-voice TTS + ASR via OminiX-API.
-                              Cloning lives in mofa-fm / fm_tts, not here.)
+└── platform-skills/voice/   (batch ASR via ASR_API_URL or OminiX fallback;
+                              preset-voice TTS via OminiX. Cloning lives in
+                              mofa-fm / fm_tts, not here.)
 ```
 
 ---

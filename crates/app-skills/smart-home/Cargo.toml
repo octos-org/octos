@@ -1,6 +1,6 @@
 [package]
 name = "smart-home"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Standalone smart-home skill: list and control devices via the profile's configured bridge"
 authors = ["octos"]
@@ -13,6 +13,9 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [package.metadata.release]
 release = false

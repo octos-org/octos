@@ -29,7 +29,7 @@ use octos_core::ui_protocol::{ApprovalDecision, ApprovalScopeEntry, TurnId, appr
 /// documentation, not a missed naming mistake.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum ApprovalScopeKind {
+pub(crate) enum ApprovalScopeKind {
     /// `approve_once` / `request` — never recorded; one-shot only.
     ApproveOnce,
     /// `approve_for_turn` / `turn` — auto-resolves within the same `turn_id`.
@@ -47,7 +47,7 @@ impl ApprovalScopeKind {
     /// unknown string becomes `ApproveOnce` rather than an error, so a forward-
     /// compatible client can keep sending its own scope strings without
     /// breaking the server.
-    pub(super) fn from_scope_str(scope: &str) -> Self {
+    pub(crate) fn from_scope_str(scope: &str) -> Self {
         match scope {
             // Default / "request" / "approve_once" — never recorded.
             approval_scopes::REQUEST | "approve_once" | "once" => Self::ApproveOnce,
@@ -60,7 +60,7 @@ impl ApprovalScopeKind {
 
     /// Canonical wire string used in the auto-resolved notification. Always
     /// the spec's short alias (`request`/`turn`/`session`/`tool`).
-    pub(super) fn as_wire_str(self) -> &'static str {
+    pub(crate) fn as_wire_str(self) -> &'static str {
         match self {
             Self::ApproveOnce => approval_scopes::REQUEST,
             Self::ApproveForTurn => approval_scopes::TURN,
@@ -71,7 +71,7 @@ impl ApprovalScopeKind {
 
     /// Whether this scope kind should be recorded in the policy table.
     /// `ApproveOnce` is one-shot — no entry is needed.
-    pub(super) fn is_recordable(self) -> bool {
+    pub(crate) fn is_recordable(self) -> bool {
         !matches!(self, Self::ApproveOnce)
     }
 }
@@ -81,7 +81,7 @@ impl ApprovalScopeKind {
 /// `Tool(name)` for `approve_for_tool`, `Turn(id)` for `approve_for_turn`,
 /// and `Session` for `approve_for_session` (the whole session, no extra key).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) enum MatchKey {
+pub(crate) enum MatchKey {
     Session,
     Turn(TurnId),
     Tool(String),
@@ -123,7 +123,7 @@ struct SessionScopes {
 /// session-level `Mutex` is taken for reads/writes inside a single session,
 /// avoiding a global write-lock for every approval-request lookup.
 #[derive(Debug, Default)]
-pub(super) struct ScopePolicy {
+pub(crate) struct ScopePolicy {
     sessions: RwLock<HashMap<SessionKey, Mutex<SessionScopes>>>,
 }
 
@@ -134,7 +134,7 @@ impl ScopePolicy {
     ///
     /// Returns `true` if the scope was actually recorded (recordable kind),
     /// `false` if the scope is one-shot and there is nothing to do.
-    pub(super) fn record(
+    pub(crate) fn record(
         &self,
         session_id: &SessionKey,
         scope_kind: ApprovalScopeKind,
@@ -189,7 +189,7 @@ impl ScopePolicy {
     /// Earliest hit wins; any matching `Deny` short-circuits exactly the
     /// same way an `Approve` does — symmetry is intentional, the spec says
     /// `deny_*` analogs auto-deny.
-    pub(super) fn lookup(
+    pub(crate) fn lookup(
         &self,
         session_id: &SessionKey,
         tool_name: &str,
@@ -233,14 +233,14 @@ impl ScopePolicy {
     /// surface so the future `session/close` handler can call it without
     /// further refactoring.
     #[allow(dead_code)]
-    pub(super) fn evict_session(&self, session_id: &SessionKey) {
+    pub(crate) fn evict_session(&self, session_id: &SessionKey) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions.remove(session_id);
     }
 
     /// Drops every `ApproveForTurn` entry for `(session_id, turn_id)`. Other
     /// scope kinds (`session`, `tool`) are unaffected — they outlive the turn.
-    pub(super) fn evict_turn(&self, session_id: &SessionKey, turn_id: &TurnId) {
+    pub(crate) fn evict_turn(&self, session_id: &SessionKey, turn_id: &TurnId) {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         let Some(session) = sessions.get(session_id) else {
             return;
@@ -257,7 +257,7 @@ impl ScopePolicy {
     /// Snapshot of every recorded scope for a session — wire-shaped so the
     /// `approval/scopes/list` handler can return it directly. Sorted for
     /// deterministic output.
-    pub(super) fn list_for_session(&self, session_id: &SessionKey) -> Vec<ApprovalScopeEntry> {
+    pub(crate) fn list_for_session(&self, session_id: &SessionKey) -> Vec<ApprovalScopeEntry> {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         let Some(session) = sessions.get(session_id) else {
             return Vec::new();
@@ -286,7 +286,7 @@ impl ScopePolicy {
 
     /// Test-only: number of stored entries for a session.
     #[cfg(test)]
-    pub(super) fn entry_count(&self, session_id: &SessionKey) -> usize {
+    pub(crate) fn entry_count(&self, session_id: &SessionKey) -> usize {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions
             .get(session_id)
@@ -304,15 +304,15 @@ impl ScopePolicy {
 /// Result of a successful `lookup` — what the auto-resolved notification
 /// needs to know to render itself, plus the canonical scope wire string.
 #[derive(Debug, Clone)]
-pub(super) struct ScopeHit {
+pub(crate) struct ScopeHit {
     #[allow(dead_code)]
-    pub(super) scope_kind: ApprovalScopeKind,
-    pub(super) decision: ApprovalDecision,
-    pub(super) scope_match: String,
+    pub(crate) scope_kind: ApprovalScopeKind,
+    pub(crate) decision: ApprovalDecision,
+    pub(crate) scope_match: String,
 }
 
 impl ScopeHit {
-    pub(super) fn scope_wire(&self) -> &'static str {
+    pub(crate) fn scope_wire(&self) -> &'static str {
         self.scope_kind.as_wire_str()
     }
 }
@@ -320,7 +320,7 @@ impl ScopeHit {
 /// Decide which `MatchKey` corresponds to a given scope kind given the
 /// approval that was just decided. Centralising this keeps the `respond`
 /// site small.
-pub(super) fn match_key_for(
+pub(crate) fn match_key_for(
     scope_kind: ApprovalScopeKind,
     tool_name: &str,
     turn_id: &TurnId,

@@ -35,7 +35,7 @@ octos auth login --provider deepseek    # use the provider you chose above
 octos serve --solo
 ```
 
-Now open **http://localhost:50080/app/**, click the local sign-in button, and say hello. That's the whole setup.
+Now open **http://localhost:50080** (it lands on `/app/`), click the local sign-in button, and say hello. That's the whole setup.
 
 Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [self-hosted install options](https://github.com/octos-org/octos-web#self-hosting--deployment):
 
@@ -96,7 +96,7 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Autonomy — goals & loops**: `/goal <objective>` keeps the agent working across turns via checkpointed continuations (under a token budget); `/loop` runs a task on a fixed interval or self-paced. The agent keeps going between your messages — see [Autonomy: goals & loops](#autonomy-goals--loops).
 - **Session time-travel**: `session/rollback` RPC with resume/rewind checkpoint pickers in both clients; every session can be rolled back to any prior user turn.
 - **Live reasoning**: streams the model's thinking as it happens, with per-session `/thinking` effort control.
-- **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, and an OMiniX runtime provider for local ASR/TTS.
+- **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, dedicated batch-ASR routing via `ASR_API_URL`, and an OMiniX fallback for local ASR/TTS.
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
 - **Sandbox isolation**: bwrap + Landlock/seccomp + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 
@@ -172,7 +172,7 @@ For a repo-local tenant deploy (builds from source, sets up the same service + t
 What it does:
 
 1. Detects your host triple (mirrors `install.sh`'s platform mapping).
-2. Runs `scripts/build-dashboard.sh` (admin SPA → `/admin/`) and `scripts/build-web-app.sh` (the octos-web submodule → `/app/`) so `rust_embed` bakes both SPAs into the binary. Skip the dashboard build and `/admin/` will 307-loop; skip the web build and `/app/` returns `web_bundle_missing`.
+2. Runs `scripts/build-dashboard.sh` (admin SPA → `/admin/`) and `scripts/build-web-app.sh` (the octos-web submodule → `/app/`) so `rust_embed` bakes both SPAs into the binary. Skip the dashboard build and `/admin/` returns a 503 `admin_bundle_missing` diagnostic; skip the web build and `/app/` returns `web_bundle_missing` (and the root `/` falls back to redirecting to `/admin/`).
 3. Delegates `cargo build --release` to `scripts/milestone-ci.sh release-bundle` (single source of truth for `FEATURES` / `SKILL_CRATES`).
 4. Tars binaries into `scripts/octos-bundle-<TRIPLE>.tar.gz`, which `install.sh` auto-detects via `file://`, skipping the GitHub download.
 5. With `--install`, chains into `install.sh` — copies binaries to `$PREFIX`, rewrites the service plist/unit, reloads the daemon.
@@ -332,7 +332,7 @@ In `--json` mode stdout carries exactly one object (everything else — logs, th
 status line, approval prompts — goes to stderr). On success:
 
 ```json
-{ "text": "…final answer…", "model": "glm-5.2", "input_tokens": 1234, "output_tokens": 567 }
+{ "text": "…final answer…", "model": "glm-5.3", "input_tokens": 1234, "output_tokens": 567 }
 ```
 
 `text` is the final assistant answer; `model` is the model that actually

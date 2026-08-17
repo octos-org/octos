@@ -40,6 +40,13 @@ pub(super) const MATRIX_MISSING_TOKENS_ERROR: &str =
     "matrix channel requires settings.as_token and settings.hs_token";
 #[cfg(feature = "matrix")]
 pub(super) const MATRIX_BOT_USER_ID_ENV_KEY: &str = "OCTOS_MATRIX_BOT_USER_ID";
+/// Appservice mention-only gating. When `true` (the default), a bot in a
+/// multi-participant room only replies when explicitly addressed; a 1:1 DM
+/// still replies to everything.
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_MENTION_ONLY: &str = "mention_only";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_MENTION_ONLY_CAMEL: &str = "mentionOnly";
 
 // ── User-mode (Matrix account login) settings ────────────────────────────────
 #[cfg(feature = "matrix")]
@@ -97,6 +104,7 @@ pub(super) struct MatrixChannelSettings {
     pub(super) user_prefix: String,
     pub(super) port: u16,
     pub(super) allowed_senders: Vec<String>,
+    pub(super) mention_only: bool,
 }
 
 #[cfg(feature = "matrix")]
@@ -119,6 +127,15 @@ impl MatrixChannelSettings {
             None => MATRIX_DEFAULT_PORT,
         };
 
+        // Safe-by-default: gate replies behind an explicit mention in
+        // multi-participant rooms unless the operator opts out.
+        let mention_only = entry
+            .settings
+            .get(MATRIX_SETTING_MENTION_ONLY)
+            .or_else(|| entry.settings.get(MATRIX_SETTING_MENTION_ONLY_CAMEL))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         Ok(Self {
             homeserver,
             as_token,
@@ -140,6 +157,7 @@ impl MatrixChannelSettings {
             ),
             port,
             allowed_senders: entry.allowed_senders.clone(),
+            mention_only,
         })
     }
 
@@ -161,6 +179,7 @@ impl MatrixChannelSettings {
             )
             .with_admin_allowed_senders(self.allowed_senders.clone())
             .with_media_dir(data_dir.join("media"))
+            .with_mention_only(self.mention_only)
             .with_bot_router(data_dir),
         )
     }

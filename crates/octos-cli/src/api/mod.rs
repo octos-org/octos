@@ -10,21 +10,16 @@
 pub mod admin;
 pub mod admin_audit;
 pub mod admin_setup;
-pub(crate) mod agent_orchestrator;
 pub mod auth_handlers;
 mod bilibili;
 pub(crate) mod coding_tool_contract;
 mod cron_panel;
 mod events;
 mod events_harness;
-pub(crate) mod fleet_wake;
 mod frps_plugin;
-pub(crate) mod goal_loop_runtime;
 mod handlers;
-pub(crate) mod master_continuation_scheduler;
 mod memory_panel;
 pub mod metrics;
-pub(crate) mod monitor_runtime;
 pub(crate) mod ominix_runtime;
 pub mod preview;
 pub mod preview_tokens;
@@ -35,25 +30,25 @@ pub(crate) mod skill_action_jobs;
 mod smart_home_bridge;
 mod smart_home_panel;
 pub(crate) mod solo_auth;
-pub(crate) mod specialist_runner;
 mod static_files;
-pub(crate) mod supervisor_store;
 pub mod swarm;
-pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
-mod ui_protocol_approvals;
+// Relocated to crate::contracts (Phase 3 of goal-in-chat) so `octos chat
+// --peers` can share the SAME process-global pending-prompt registry the WS
+// path uses without the `api` feature; re-exported here so api-internal paths
+// keep working unchanged.
+pub(crate) use crate::contracts::approvals as ui_protocol_approvals;
+pub(crate) mod ui_protocol_transport;
 // Relocated to crate::approvals_audit (Phase 4, ROBRIX-PHASE4 ADR) so the
 // gateway approval path can write the same audit log without the `api`
 // feature; re-exported here so api-internal paths keep working.
 pub(crate) use crate::approvals_audit as ui_protocol_audit;
-mod ui_protocol_diff;
 mod ui_protocol_ledger;
 pub(crate) mod ui_protocol_progress;
-mod ui_protocol_questions;
 mod ui_protocol_reasoning_effort;
-mod ui_protocol_sanitize;
-mod ui_protocol_scope;
+pub(crate) use crate::contracts::sanitize as ui_protocol_sanitize;
+pub(crate) use crate::contracts::scope as ui_protocol_scope;
 mod ui_protocol_task_output;
 pub mod usage;
 pub mod user_admin;

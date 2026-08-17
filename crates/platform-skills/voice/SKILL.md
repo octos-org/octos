@@ -1,16 +1,20 @@
 ---
 name: voice
-description: OminiX ASR (speech-to-text), preset-voice TTS with emotion/speed control, and model management via Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm. Triggers: voice, transcribe audio, text to speech, speak this, read aloud, model management, download model, 语音识别, 语音合成, 模型管理.
-version: 1.1.2
+description: Batch ASR (via dedicated ASR_API_URL or OminiX fallback), preset-voice TTS with emotion/speed control, and model management via Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm. Triggers: voice, transcribe audio, text to speech, speak this, read aloud, model management, download model, 语音识别, 语音合成, 模型管理.
+version: 1.2.0
 author: octos
 always: true
 ---
 
-# OminiX ASR / TTS / Model Management
+# Batch ASR / OminiX TTS / Model Management
 
-On-device speech-to-text and preset-voice text-to-speech with emotion control
-plus model lifecycle management, backed by Qwen3 ASR/TTS models running on the
-local ominix-api server (Apple Silicon).
+Speech-to-text uses `ASR_API_URL` when configured (the Octos/OMiniX JSON +
+base64 batch-transcription contract at `POST /v1/audio/transcriptions`, such as
+the local Whisper or Nemotron adapter); otherwise it falls back to Qwen3 ASR
+through local OminiX. Preset-voice text-to-speech with emotion control and model
+lifecycle management remain backed by local OminiX (Apple Silicon).
+
+An empty ASR result is a successful no-speech rejection, not an error.
 
 ## Boundary — when NOT to use this skill
 

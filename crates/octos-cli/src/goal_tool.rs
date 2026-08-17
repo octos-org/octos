@@ -27,11 +27,11 @@ use octos_fleet::{
 };
 use serde_json::{Value, json};
 
-use crate::api::agent_orchestrator::{
+use crate::autonomy::agent_orchestrator::{
     AgentOrchestrator, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
     MonitorListRequest, default_agent_orchestrator,
 };
-use crate::api::monitor_runtime::{
+use crate::autonomy::monitor_runtime::{
     MONITOR_DEFAULT_BATCH_MS, MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR, MONITOR_MIN_POLL_INTERVAL_SECS,
     MonitorMode, MonitorSpec,
 };
@@ -1203,12 +1203,17 @@ impl GoalUpdateTool {
 /// Max ledger findings folded into the completion evidence, and the per-finding
 /// assertion budget, so a large ledger cannot blow the verifier's input context.
 const MAX_LEDGER_EVIDENCE_FINDINGS: usize = 24;
-const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 600;
+/// #2036 — raised from 600. A peer-recorded finding is a whole report, not one
+/// sentence, and at 600 the verifier was shown a fragment of every multi-defect
+/// audit and rejected completion on exactly that basis. Worst case is still
+/// bounded: 24 × 2000 ≈ 48K chars of evidence, and abridgement stays explicitly
+/// marked so the verifier can tell "abridged" from "corrupt".
+const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 2_000;
 
 /// Assemble the completion evidence the INDEPENDENT verifier judges.
 ///
 /// The verifier grades whether the objective is met by "concrete evidence in
-/// the reply" ([`crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage`]).
+/// the reply" ([`crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage`]).
 /// For a single-agent goal that reply IS the evidence. But in the PEER-GOAL
 /// model the concrete evidence is recorded by goal-scoped peers into the durable
 /// ledger, NOT re-typed into the master's completion reply — so a
@@ -1219,7 +1224,7 @@ const MAX_LEDGER_EVIDENCE_ASSERTION_CHARS: usize = 600;
 /// evidence lets the verifier judge against what was actually recorded.
 ///
 /// `ledger_findings` are the `{created_by, kind, assertion, ...}` objects from
-/// [`crate::api::agent_orchestrator::AgentOrchestrator::model_goal_ledger_findings`].
+/// [`crate::autonomy::agent_orchestrator::AgentOrchestrator::model_goal_ledger_findings`].
 /// Empty (single-agent goals, or no ledger) returns the reason unchanged —
 /// exact pre-existing behavior.
 fn completion_evidence_with_ledger(reason: &str, ledger_findings: &[Value]) -> String {
@@ -1383,7 +1388,7 @@ impl Tool for GoalUpdateTool {
         // uniform across all four verifier sites — the only trade-off is the
         // TURN cost display no longer counts this one out-of-band call).
         let mut verified_snapshot: Option<
-            crate::api::agent_orchestrator::GoalVerificationSnapshot,
+            crate::autonomy::agent_orchestrator::GoalVerificationSnapshot,
         > = None;
         if status == "complete" {
             let orchestrator = default_agent_orchestrator();
@@ -1417,7 +1422,7 @@ impl Tool for GoalUpdateTool {
                 .unwrap_or_default();
             let evidence = completion_evidence_with_ledger(reason, &ledger_findings);
             let (verdict, usage) =
-                crate::api::agent_orchestrator::run_goal_completion_verifier_with_usage(
+                crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
                     verifier_provider,
                     &snapshot.objective,
                     &evidence,
@@ -1437,7 +1442,7 @@ impl Tool for GoalUpdateTool {
                     output: format!(
                         "goal_update: completion NOT verified — independent verifier returned: {}",
                         match verdict {
-                            crate::api::goal_loop_runtime::GoalCompletionVerdict::NotDone {
+                            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone {
                                 reason,
                             } => reason,
                             _ => "unknown".to_string(),
@@ -2106,13 +2111,89 @@ mod tests {
 
     #[test]
     fn completion_evidence_truncates_a_giant_assertion() {
-        let big = "Z".repeat(5000);
+        let big = "Z".repeat(50_000);
         let findings = vec![json!({"created_by":"peer:x","kind":"observation","assertion":big})];
         let evidence = completion_evidence_with_ledger("done", &findings);
         assert!(
-            evidence.len() < 2000,
+            evidence.len() < MAX_LEDGER_EVIDENCE_ASSERTION_CHARS + 500,
             "a giant assertion is bounded: len={}",
             evidence.len()
+        );
+        assert!(
+            evidence.contains("…[truncated]"),
+            "abridgement must be MARKED, so the verifier reads it as abridged \
+             rather than as corrupt evidence: {evidence}"
+        );
+    }
+
+    /// #2036 — a peer's multi-finding report must reach the verifier WHOLE.
+    ///
+    /// This is the shape that failed live: two peers audited a file each and
+    /// reported a table of defects. At the old 600-char budget the verifier saw
+    /// the first row and a cut-off second, and rejected completion six times on
+    /// exactly that basis ("only ~2 of the 7 claimed findings are actually
+    /// verifiable") until the master gave up and marked the goal `blocked` —
+    /// even though every finding was real and correctly recorded.
+    #[test]
+    fn completion_evidence_keeps_a_realistic_peer_report_intact() {
+        let mut report = String::from("[completed] Audit of auth.py — 4 defects found:\n");
+        for (severity, defect, remediation) in [
+            (
+                "CRITICAL",
+                "hardcoded live admin token in source (line 3): ADMIN_TOKEN is a \
+                 real credential committed to the repository and readable by \
+                 anyone with source access",
+                "rotate the token immediately and load it from the environment",
+            ),
+            (
+                "CRITICAL",
+                "check_pin off-by-one (lines 8-11): the loop bound is \
+                 len(expected) - 1, so the final digit is never compared and \
+                 \"123X\" authenticates against \"1234\" for any X",
+                "iterate the full range and compare with a constant-time helper",
+            ),
+            (
+                "HIGH",
+                "no length check (lines 6-11): a short entry raises IndexError \
+                 out of the comparison loop, and a longer-than-expected entry is \
+                 silently accepted because only the shared prefix is examined",
+                "reject a mismatched length before comparing",
+            ),
+            (
+                "MEDIUM",
+                "non-constant-time comparison (lines 9-10, 15): both the PIN loop \
+                 and the token equality short-circuit on first mismatch, leaking \
+                 the shared prefix length through timing",
+                "use hmac.compare_digest for both",
+            ),
+        ] {
+            report.push_str(&format!("| {severity} | {defect} | fix: {remediation} |\n"));
+        }
+        report.push_str("Totals: 2 critical, 1 high, 1 medium.");
+        assert!(
+            report.chars().count() > 600,
+            "the fixture must exceed the OLD budget or it proves nothing"
+        );
+
+        let findings =
+            vec![json!({"created_by":"peer:aud-auth","kind":"observation","assertion":report})];
+        let evidence = completion_evidence_with_ledger("both peers reported", &findings);
+
+        assert!(
+            evidence.contains("hardcoded live admin token"),
+            "the first defect must survive: {evidence}"
+        );
+        assert!(
+            evidence.contains("hmac.compare_digest"),
+            "the LAST defect must survive too — truncation used to drop it: {evidence}"
+        );
+        assert!(
+            evidence.contains("Totals: 2 critical"),
+            "the report's own summary must survive: {evidence}"
+        );
+        assert!(
+            !evidence.contains("…[truncated]"),
+            "an ordinary peer report must not be abridged at all: {evidence}"
         );
     }
 
@@ -2124,7 +2205,7 @@ mod tests {
     /// capturing the exact prompt the verifier receives.
     #[tokio::test]
     async fn goal_update_folds_ledger_findings_into_verifier_evidence() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         let session = SessionKey("ledger-evidence-prof:api:goal-update-ledger".to_owned());
         orchestrator
@@ -2226,7 +2307,7 @@ mod tests {
     /// still be stamped on the ToolResult (#1958).
     #[tokio::test]
     async fn goal_update_routes_verifier_through_configured_lane() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         // Process-global orchestrator: unique key, never cleared (same idiom
         // as the sibling goal_get tests).
@@ -2302,7 +2383,7 @@ mod tests {
     /// the turn's own provider (`ctx.llm_provider`), the pre-#1935 behavior.
     #[tokio::test]
     async fn goal_update_verifier_falls_back_to_turn_provider_when_lane_unconfigured() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         let session = SessionKey("verifier-fallback-prof:api:goal-update-fallback".to_owned());
         orchestrator
@@ -2354,7 +2435,7 @@ mod tests {
     /// active goal). Asserts the GOAL counter, not the ToolResult.
     #[tokio::test]
     async fn goal_update_notdone_refusal_charges_verifier_usage_once() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         let orchestrator = default_agent_orchestrator();
         let session = SessionKey("verifier-notdone-prof:api:goal-update-notdone".to_owned());
         orchestrator
@@ -2457,7 +2538,7 @@ mod tests {
     /// never see them. Same data_dir gate as `ledger_findings`.
     #[tokio::test]
     async fn goal_get_includes_open_escalations_when_data_dir_set() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
         // The tool reads the PROCESS-GLOBAL orchestrator: use a unique
         // session/profile and never clear the shared state (sibling tests own
         // their own keys — same idiom as the ui_protocol continuation tests).
@@ -2548,7 +2629,7 @@ mod tests {
     /// the old path-digest roll-up dropped.
     #[tokio::test]
     async fn goal_get_folds_ledger_digest_when_constructed_with_data_dir() {
-        use crate::api::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator, GoalSetRequest};
 
         let orchestrator = default_agent_orchestrator();
         // Unique wire id: the default orchestrator is process-global.

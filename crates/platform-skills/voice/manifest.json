@@ -1,14 +1,14 @@
 {
   "name": "voice",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "author": "octos",
-  "description": "OminiX voice skill: ASR, preset-voice TTS with emotion/speed control, and model management via local Qwen3 models on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm instead.",
+  "description": "Batch ASR via ASR_API_URL or OminiX fallback, preset-voice TTS with emotion/speed control, and OminiX model management on Apple Silicon. For voice cloning and custom voice profiles, use mofa-fm instead.",
   "timeout_secs": 600,
   "requires_network": true,
   "tools": [
     {
       "name": "voice_transcribe",
-      "description": "Transcribe an audio file to text using Qwen3-ASR (POST /v1/audio/asr/qwen3). Supports WAV, OGG, MP3, FLAC, M4A. Use this when you receive a voice message or need to extract text from audio. Returns the transcribed text.",
+      "description": "Transcribe an audio file to text. By default uses Qwen3-ASR through OminiX; when ASR_API_URL is set, sends the Octos/OMiniX JSON + base64 contract to POST /v1/audio/transcriptions (for example a local Whisper or Nemotron adapter). Supports WAV, OGG, MP3, FLAC, M4A. Empty text is a successful no-speech rejection.",
       "input_schema": {
         "type": "object",
         "properties": {

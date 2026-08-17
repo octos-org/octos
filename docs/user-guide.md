@@ -88,9 +88,9 @@ If you're running behind a reverse proxy (e.g., Caddy or Nginx), configure it to
 
 Deployment behavior depends on `config.mode`:
 
-- `local` — Standalone machine. `/` redirects to `/admin/`.
-- `tenant` — Default end-user machine setup. Direct installs stay local at `/admin/`; managed registration setup can also configure the machine's public tunnel.
-- `cloud` — Advanced relay-host setup. `/` serves the landing page and `/admin/` remains the admin dashboard.
+- `local` — Standalone machine. `/` redirects to `/app/` (the octos-web app); when the web bundle isn't embedded it falls back to `/admin/`.
+- `tenant` — Default end-user machine setup. Direct installs land on `/app/` the same way; managed registration setup can also configure the machine's public tunnel. `/admin/` remains the admin dashboard.
+- `cloud` — Advanced relay-host setup. `/` serves the landing page, `/app/` serves the octos-web app, and `/admin/` remains the admin dashboard.
 
 `~/.octos/config.json` is the file that `octos serve` reads at startup. Tenant and local installs create it through the normal installers; host installs can now bootstrap it with `scripts/cloud-host-deploy.sh`, which writes `mode: "cloud"` plus the relay settings used by the landing page and frps plugin.
 
@@ -1610,13 +1610,18 @@ These are intended as templates — the `SKILL.md` for each says "Replace with a
 
 ## 13. Platform Skills (ASR/TTS)
 
-Platform skills are server-level skills that require the OminiX backend running on Apple Silicon. They provide on-device voice transcription and synthesis — no cloud APIs needed.
+Platform skills are server-level voice tools. Transcription can use a dedicated
+batch-ASR service through `ASR_API_URL`, with OMiniX as the backward-compatible
+fallback. Preset-voice synthesis and model management continue to use OMiniX on
+Apple Silicon.
 
 ### 13.1 Prerequisites
 
-- Apple Silicon Mac (M1/M2/M3/M4)
-- OminiX API server running (managed via `octos serve`)
-- Models downloaded: `Qwen3-ASR-1.7B-8bit`, `Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
+- Apple Silicon Mac when using OMiniX-backed ASR or local TTS
+- For ASR, either a compatible service configured with `ASR_API_URL`, or an
+  OMiniX API server with `Qwen3-ASR-1.7B-8bit`
+- For local TTS, an OMiniX API server with
+  `Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit`
 
 ### 13.2 Managing OminiX via Dashboard
 
@@ -1647,6 +1652,21 @@ curl http://localhost:50080/api/admin/platform-skills/ominix-api/logs?lines=100
 ### 13.3 Voice Transcription (`voice_transcribe`)
 
 Transcribes audio files to text.
+
+Set `ASR_API_URL` to the service base URL before starting `octos serve` or
+`octos gateway` to route AppUI voice turns, gateway voice messages, and the
+`voice_transcribe` tool to a dedicated ASR service:
+
+```bash
+ASR_API_URL=http://127.0.0.1:8091 octos serve --port 50080
+```
+
+The service must accept `POST /v1/audio/transcriptions` with JSON fields
+`file` (base64 audio), optional `language`, and `response_format`. It must
+return JSON containing a string `text` field. A successful empty `text` is
+treated as a no-speech rejection. Octos probes `GET /health` for readiness;
+services without that route may return `404` or `405`. If `ASR_API_URL` is
+unset or blank, Octos uses the existing OMiniX ASR route.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -2186,6 +2206,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | `LARK_APP_SECRET` | Feishu mail app secret |
 | `LARK_FROM_ADDRESS` | Feishu mail from address |
 | **Voice** | |
+| `ASR_API_URL` | Dedicated batch-ASR service base URL; overrides OMiniX for transcription |
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
@@ -2392,6 +2413,7 @@ Create `config/botfather.json` with a Matrix channel that uses the same tokens:
         "sender_localpart": "octosbot",
         "user_prefix": "octosbot_",
         "port": 8009,
+        "mention_only": true,
         "allowed_senders": ["@alice:your.server.name"]
       }
     ],
@@ -2415,6 +2437,7 @@ Matrix channel fields:
 | `user_prefix` | Prefix for bridged user IDs managed by this appservice. |
 | `port` | Port Octos listens on for appservice events from Palpo. |
 | `allowed_senders` | Matrix user IDs that may talk to the bot. Empty array = allow all. |
+| `mention_only` | Optional, default `true`. Outside a true 1:1 DM, a bot only replies when explicitly addressed (an `m.mentions` entry, an MXID pill/mention, or a client-supplied target). A true 1:1 DM — a single human plus a single managed bot in the room, counted from the appservice's own room map — always replies. Rooms with multiple managed bots require a mention even when only one human is present, so bots don't all answer every message. Set to `false` to make the bot reply to every message in every room (messages carrying `org.octos.explicit_room` are still gated). |
 
 #### 5. Docker Compose
 

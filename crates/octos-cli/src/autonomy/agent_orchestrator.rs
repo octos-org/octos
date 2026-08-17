@@ -43,6 +43,20 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 const AUTONOMY_POLICY_ID: &str = "coding-autonomy-v1";
+/// #2036 follow-up — how much of a peer's review survives into the durable
+/// ledger row. This is the LAST cap before the DB, so it is the one that
+/// actually binds, whatever the caller already trimmed.
+///
+/// Raising the transport-side cap alone was not enough: a real two-peer review
+/// soak on merged main still produced findings of exactly 500 characters,
+/// because this hard `take(500)` re-truncated them here. The completion
+/// verifier reads these rows (#1990), so a review cut to 500 chars mid-token
+/// is the same unverifiable fragment the original 400-char cut produced.
+///
+/// Sized to match `MAX_PEER_FINDING_RECORD_CHARS` in the transport so the two
+/// stops on the same path agree; the verifier's own prompt stays bounded
+/// separately by `MAX_LEDGER_EVIDENCE_ASSERTION_CHARS` at assembly time.
+const MAX_PEER_FINDING_ASSERTION_CHARS: usize = 4_000;
 /// Default per-goal continuation token budget when the caller does not
 /// specify one. Sized to survive several real turns: each goal turn
 /// charges its FULL token cost (input + output + cache reads/writes), so
@@ -51,7 +65,24 @@ const AUTONOMY_POLICY_ID: &str = "coding-autonomy-v1";
 /// as "the goal stopped counting". Users can override per-goal up to
 /// [`GOAL_MAX_TOKEN_BUDGET`]. `pub(crate)` so the capability advertisement
 /// (`ui_protocol`) reports the real value instead of a drifting literal.
-pub(crate) const GOAL_DEFAULT_TOKEN_BUDGET: u64 = 2_000_000;
+///
+/// Raised 2M -> 100M for PEER FLEETS. A goal that fans out to peers charges
+/// every peer's turns to the MASTER's budget (#1965/#1970), so the old 2M
+/// default was exhausted by a single realistic fleet: a 5-peer deep-review
+/// goal spent 10.65M and flipped to `budget_limited` with all five peers
+/// still doing useful work. Enforcement is at the TURN BOUNDARY (mid-turn
+/// limiting was deliberately dropped), so the overshoot is unbounded within
+/// a turn and a budget only ever acts as a tripwire noticed afterwards —
+/// which made 2M a guard that fired on correct behaviour rather than runaway
+/// behaviour.
+///
+/// TRADE-OFF, stated plainly: this is the ceiling on what an UNSPECIFIED
+/// goal may spend autonomously. At the ~$1/M-token rate observed in soaks,
+/// 100M is on the order of $100 per goal before anything stops it. Set a
+/// smaller explicit `--budget` for anything cost-sensitive; the default now
+/// optimises for "a legitimate fleet finishes" over "an unattended goal
+/// cannot spend much".
+pub(crate) const GOAL_DEFAULT_TOKEN_BUDGET: u64 = 100_000_000;
 /// Hard ceiling on a caller-supplied goal budget — a sanity limit against
 /// typos / overflow, NOT a practical cap (at ~175K tokens/turn this still
 /// allows thousands of continuations). The user owns whatever value they
@@ -181,7 +212,7 @@ pub(crate) const PEER_FLEET_SYNTHESIS_META_SLUGS: &str = "peer_fleet_slugs";
 const PEER_FLEET_SYNTHESIS_GROUP: &str = "peer-fleet-synthesis";
 
 /// Fleet-keeper WAKE (#1857 PR 4a) — kind label for the `External(_)` master
-/// continuation the fleet outbox consumer (`api::fleet_wake`) enqueues on a
+/// continuation the fleet outbox consumer (`autonomy::fleet_wake`) enqueues on a
 /// fleet's controller session when a `ChildDone` / `FleetDrained` event lands.
 /// It directs the keeper to advance the durable plan by one bounded step. Flows
 /// through the same hardened `External` drain path as the peer wakes; the drain
@@ -262,7 +293,7 @@ pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input"
 pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 
 /// #1977 Monitor WAKE — kind label for the `External(_)` master continuation a
-/// [`crate::api::monitor_runtime`] watcher enqueues when its filtered probe
+/// [`crate::autonomy::monitor_runtime`] watcher enqueues when its filtered probe
 /// output changes (poll) or a stream batch lands. Rides the SAME hardened
 /// `External` drain path (idle-gated, deduped, rate-disciplined) as the peer
 /// wakes — no new scheduler. The matched lines are staged for prompt injection
@@ -472,7 +503,7 @@ pub(crate) struct LoopControlRequest {
 pub(crate) struct MonitorCreateRequest {
     pub(crate) session_id: SessionKey,
     pub(crate) profile_id: String,
-    pub(crate) spec: crate::api::monitor_runtime::MonitorSpec,
+    pub(crate) spec: crate::autonomy::monitor_runtime::MonitorSpec,
     pub(crate) data_dir: Option<std::path::PathBuf>,
 }
 
@@ -1366,7 +1397,7 @@ impl InProcessAgentOrchestrator {
 
     /// #1857 PR 4a — install the durable fleet-kernel store (opened async at
     /// serve boot). Mirrors `configure_supervisor_store`; the fleet outbox
-    /// consumer (`api::fleet_wake`) drives its drain against this orchestrator.
+    /// consumer (`autonomy::fleet_wake`) drives its drain against this orchestrator.
     pub(crate) fn set_fleet_store(&self, store: FleetKernelStore) {
         let mut state = self.state();
         state.fleet_store = Some(store);
@@ -1418,7 +1449,7 @@ impl InProcessAgentOrchestrator {
 
     /// #1857 PR 4a — drain the fleet outbox once against this orchestrator's
     /// continuation scheduler. Thin wrapper over the singleton-free core
-    /// [`crate::api::fleet_wake::drain_fleet_outbox_once`]: it supplies a
+    /// [`crate::autonomy::fleet_wake::drain_fleet_outbox_once`]: it supplies a
     /// `commit_wake` closure that takes the `StdMutex` guard **only** for the
     /// synchronous enqueue + durable persist, so the core's async store I/O
     /// never runs under the guard.
@@ -2404,7 +2435,7 @@ impl InProcessAgentOrchestrator {
         // with the other subsystem's turn, AND its returned guard's drop would
         // clear that turn's marker (codex re-review). Checking first, under
         // the same lock, makes the whole claim generation-safe.
-        if state.in_flight_goal_sessions.contains(session_id) {
+        if in_flight_marker_is_held(&state, session_id) {
             return (Vec::new(), None);
         }
         let kept = Self::drain_ready_continuations_locked(
@@ -2417,10 +2448,18 @@ impl InProcessAgentOrchestrator {
         let guard = if kept.is_empty() {
             None
         } else {
-            state.in_flight_goal_sessions.insert(session_id.clone());
+            let generation = next_in_flight_generation();
+            state.in_flight_goal_sessions.insert(
+                session_id.clone(),
+                InFlightMarker {
+                    generation,
+                    marked_at_ms: now_ms_u64(),
+                },
+            );
             Some(GoalDispatchInFlightGuard {
                 orchestrator: self,
                 session_id: session_id.clone(),
+                generation,
                 disarmed: false,
             })
         };
@@ -2618,7 +2657,7 @@ impl InProcessAgentOrchestrator {
                 // cleared by `clear_goal_dispatch_in_flight` from the
                 // post-accountant, so a session leaves the set
                 // exactly when it's safe to re-dispatch.
-                if state.in_flight_goal_sessions.contains(session_id) {
+                if in_flight_marker_is_held(&state, session_id) {
                     continue;
                 }
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
@@ -2777,18 +2816,92 @@ impl InProcessAgentOrchestrator {
     /// in-flight sessions so a long-running goal turn (> 30s) can't
     /// be re-dispatched in the await gap between turn-terminal
     /// emission and `record_goal_turn`. Idempotent.
-    pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
-        self.state()
-            .in_flight_goal_sessions
-            .insert(session_id.clone());
+    pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> u64 {
+        // #2003 — (re)stamp the marker. A live long-running turn that re-marks
+        // keeps a FRESH timestamp, so the staleness sweep never evicts it.
+        let generation = next_in_flight_generation();
+        self.state().in_flight_goal_sessions.insert(
+            session_id.clone(),
+            InFlightMarker {
+                generation,
+                marked_at_ms: now_ms_u64(),
+            },
+        );
+        generation
     }
 
-    /// #1140 codex P2 re-review #3 — clear the in-flight marker.
-    /// Called by the post-turn accountant after `record_goal_turn`
-    /// (and on error/interrupt paths) so subsequent scheduler ticks
-    /// can re-dispatch the goal once the min-delay elapses.
+    /// #2003 — refresh an EXISTING in-flight marker to prove the turn holding
+    /// it is still making progress.
+    ///
+    /// The staleness horizon ([`IN_FLIGHT_STALE_AFTER_MS`]) exists so a leaked
+    /// [`GoalDispatchInFlightGuard`] cannot wedge a session forever. But a
+    /// legitimately long turn (a big peer fleet's synthesis turn ran ~13
+    /// minutes; a larger fleet can exceed the horizon) would otherwise have its
+    /// marker age out MID-FLIGHT and stop protecting the session.
+    ///
+    /// Liveness here deliberately means OBSERVABLE PROGRESS, not "the guard
+    /// object still exists". A naive periodic heartbeat tied to the guard's
+    /// existence would keep re-stamping in exactly the case the horizon is for
+    /// — a turn wedged forever awaiting something that never resolves, whose
+    /// future (and therefore guard) is still alive — and would silently revert
+    /// the fix. Driving the refresh from real turn output means a producing
+    /// turn stays protected while a stuck one still ages out and is rescued.
+    ///
+    /// No-op when the session has no marker: this must never CREATE one, or a
+    /// stray progress event could mark an idle session busy.
+    pub(crate) fn touch_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+        if let Some(marker) = self.state().in_flight_goal_sessions.get_mut(session_id) {
+            marker.marked_at_ms = now_ms_u64();
+        }
+    }
+
+    /// #2003 — test hook: age an existing marker so the staleness path can be
+    /// exercised without sleeping.
+    #[cfg(test)]
+    pub(crate) fn force_in_flight_marked_at_for_test(
+        &self,
+        session_id: &SessionKey,
+        marked_at_ms: u64,
+    ) {
+        if let Some(marker) = self.state().in_flight_goal_sessions.get_mut(session_id) {
+            marker.marked_at_ms = marked_at_ms;
+        }
+    }
+
+    /// Unconditional clear — TEST ONLY, to arrange a "no marker" state.
+    ///
+    /// #2003: production code must never take this path. A turn that unwinds
+    /// after being evicted for staleness would wipe whatever marker is present,
+    /// including a NEWER turn's, re-opening the #1529 double-dispatch this
+    /// marker exists to prevent. Production clears go through
+    /// [`Self::clear_goal_dispatch_in_flight_generation`], which only removes a
+    /// marker the caller still owns.
+    #[cfg(test)]
     pub(crate) fn clear_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
         self.state().in_flight_goal_sessions.remove(session_id);
+    }
+
+    /// #2003 — clear the marker ONLY if it is still the incarnation `generation`
+    /// claimed. This is what makes staleness eviction safe: an evicted turn that
+    /// unwinds late must not wipe the marker a NEWER turn now holds, or the
+    /// rescue silently hands the session to two concurrent turns (#1529).
+    ///
+    /// Returns whether it cleared, so callers/tests can assert the identity
+    /// check actually fired.
+    pub(crate) fn clear_goal_dispatch_in_flight_generation(
+        &self,
+        session_id: &SessionKey,
+        generation: u64,
+    ) -> bool {
+        let mut state = self.state();
+        let owned = state
+            .in_flight_goal_sessions
+            .get(session_id)
+            .is_some_and(|marker| marker.generation == generation);
+        if owned {
+            state.in_flight_goal_sessions.remove(session_id);
+        }
+        owned
     }
 
     /// True when a continuation turn for `session_id` is currently in flight
@@ -2798,7 +2911,7 @@ impl InProcessAgentOrchestrator {
     /// the session actor, closing the cross-subsystem drain race where both
     /// spawn a concurrent turn on the same session (#1529).
     pub(crate) fn is_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> bool {
-        self.state().in_flight_goal_sessions.contains(session_id)
+        in_flight_marker_is_held(&self.state(), session_id)
     }
 
     /// #1140 codex P1 re-review #4 — RAII drop-guard for the
@@ -2812,10 +2925,11 @@ impl InProcessAgentOrchestrator {
         &'static self,
         session_id: SessionKey,
     ) -> GoalDispatchInFlightGuard {
-        self.mark_goal_dispatch_in_flight(&session_id);
+        let generation = self.mark_goal_dispatch_in_flight(&session_id);
         GoalDispatchInFlightGuard {
             orchestrator: self,
             session_id,
+            generation,
             disarmed: false,
         }
     }
@@ -2846,13 +2960,21 @@ impl InProcessAgentOrchestrator {
         session_id: &SessionKey,
     ) -> Option<GoalDispatchInFlightGuard> {
         let mut state = self.state();
-        if state.in_flight_goal_sessions.contains(session_id) {
+        if in_flight_marker_is_held(&state, session_id) {
             return None;
         }
-        state.in_flight_goal_sessions.insert(session_id.clone());
+        let generation = next_in_flight_generation();
+        state.in_flight_goal_sessions.insert(
+            session_id.clone(),
+            InFlightMarker {
+                generation,
+                marked_at_ms: now_ms_u64(),
+            },
+        );
         Some(GoalDispatchInFlightGuard {
             orchestrator: self,
             session_id: session_id.clone(),
+            generation,
             disarmed: false,
         })
     }
@@ -4917,7 +5039,11 @@ impl InProcessAgentOrchestrator {
             lifecycle: "observed".to_owned(),
             confidence: "medium".to_owned(),
             review_state: "unreviewed".to_owned(),
-            assertion: content.chars().take(500).collect(),
+            assertion: octos_core::truncated_utf8(
+                content,
+                MAX_PEER_FINDING_ASSERTION_CHARS,
+                " …[truncated]",
+            ),
             evidence: None,
             config_version: None,
             derived_from: None,
@@ -8019,7 +8145,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         } else {
             let timeout_secs = spec
                 .timeout_secs
-                .unwrap_or(crate::api::monitor_runtime::MONITOR_DEFAULT_TIMEOUT_SECS);
+                .unwrap_or(crate::autonomy::monitor_runtime::MONITOR_DEFAULT_TIMEOUT_SECS);
             i64::try_from(timeout_secs)
                 .ok()
                 .and_then(|secs| secs.checked_mul(1_000))
@@ -8155,6 +8281,111 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 }
 
+/// #2003 — how long an in-flight marker may stand before it is treated as
+/// ABANDONED. The marker is released by [`GoalDispatchInFlightGuard::drop`], so
+/// any path that stamps it and never drops the guard would otherwise wedge that
+/// session forever: the in-flight check returns BEFORE draining anything, so a
+/// single stale entry stalls every continuation kind at once (`goal_continue`,
+/// `goal_wrap_up`, `child_completed`, `scatter_join_complete` were all observed
+/// stuck together in the field).
+///
+/// 30 minutes is deliberately far above any real turn: goal turns of 10+
+/// minutes are normal with a large peer fleet, and a LIVE turn re-stamps its
+/// marker via `mark_goal_dispatch_in_flight`, so this can only evict a marker
+/// nothing is maintaining. Self-healing, in the same spirit as #1920's
+/// heartbeat reaper for orphaned background tasks.
+pub(crate) const IN_FLIGHT_STALE_AFTER_MS: u64 = 30 * 60 * 1_000;
+
+/// True when `session_id` has an in-flight marker that is still LIVE (present
+/// and stamped within [`IN_FLIGHT_STALE_AFTER_MS`]). A stale entry reads as not
+/// in flight so the session can be dispatched again; the entry itself is
+/// harmless and is overwritten by the next mark or removed by the next clear.
+/// #2003 — one incarnation of a session's in-flight marker.
+///
+/// The `generation` is what makes eviction SAFE. Without it, this sequence
+/// silently reintroduces the #1529 double-dispatch the marker exists to stop:
+///
+///   1. turn A claims the marker and wedges (no token progress, no children,
+///      so nothing refreshes it);
+///   2. at the staleness horizon the marker is treated as abandoned and a NEW
+///      turn B claims it — correct, that is the rescue;
+///   3. turn A finally unwinds and its guard's `Drop` clears the marker —
+///      except the marker is now B's, so B is left unprotected and turn C can
+///      start alongside it.
+///
+/// Stamping the incarnation into both the entry and the guard makes step 3 a
+/// no-op for A. Mirrors the identity re-check (`Arc::ptr_eq`) that Codex uses
+/// before nulling its own active-turn slot.
+#[derive(Debug, Clone, Copy)]
+struct InFlightMarker {
+    generation: u64,
+    marked_at_ms: u64,
+}
+
+/// Monotonic source of marker incarnations. Process-global because the marker
+/// map is; wraps only after 2^64 claims.
+static IN_FLIGHT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_in_flight_generation() -> u64 {
+    IN_FLIGHT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn in_flight_marker_is_live(
+    markers: &std::collections::HashMap<SessionKey, InFlightMarker>,
+    session_id: &SessionKey,
+) -> bool {
+    markers.get(session_id).is_some_and(|marker| {
+        now_ms_u64().saturating_sub(marker.marked_at_ms) < IN_FLIGHT_STALE_AFTER_MS
+    })
+}
+
+/// #2003 — whether a marked session still has SUPERVISED WORK running, i.e.
+/// non-terminal background-task agents.
+///
+/// This is the second proof of life, and it covers a case the token heartbeat
+/// structurally cannot: a turn BLOCKED awaiting its sub-agents emits no tokens
+/// at all, so on token evidence alone it is indistinguishable from a wedged
+/// turn and would lose its marker while legitimately working.
+///
+/// The lifecycle authority for that work is `TaskSupervisor`, and its state
+/// already reaches the orchestrator through `upsert_background_task_agent` —
+/// so we ASK that state rather than infer liveness, and no plumbing is needed.
+///
+/// Deliberately EXCLUDED: peers.
+///
+/// #1868 enrolled peers as supervised tasks on their MASTER's session, which
+/// silently invalidated the earlier version of this rule. A peer is not proof
+/// that the master's TURN is alive — it is a sovereign session doing its own
+/// work, and it stays non-terminal from staging until `peer_close`, often for
+/// hours. Counting it here would make a master that wedges WITH PEERS OPEN hold
+/// a marker that can never go stale, disarming #2004's rescue in precisely the
+/// case it exists for (the reported failure was a wedged master with five peers
+/// running). The marker protects the master's own in-flight work; peer liveness
+/// is answered by the fleet gate, not by this predicate.
+fn session_has_live_supervised_work(state: &AutonomyRuntimeState, session_id: &SessionKey) -> bool {
+    state.agents.values().any(|agent| {
+        agent.session_id == *session_id
+            && !is_agent_terminal_status(&agent.status)
+            && agent.backend_kind != PEER_HANDOFF_BACKEND_KIND
+    })
+}
+
+/// `backend_kind` stamped on a supervised PEER task, as built by
+/// [`background_task_backend_kind`] from the `peer_handoff` tool name. Peers
+/// are enrolled for observability and cancellation (#1868) but must not count
+/// as liveness for their master's in-flight marker — see
+/// [`session_has_live_supervised_work`].
+pub(crate) const PEER_HANDOFF_BACKEND_KIND: &str = "task_supervisor:peer_handoff";
+
+/// The full in-flight predicate: a marker counts as held while it is either
+/// FRESH or backed by live supervised work. Only a marker that is both stale
+/// AND has nothing running is treated as abandoned.
+fn in_flight_marker_is_held(state: &AutonomyRuntimeState, session_id: &SessionKey) -> bool {
+    in_flight_marker_is_live(&state.in_flight_goal_sessions, session_id)
+        || (state.in_flight_goal_sessions.contains_key(session_id)
+            && session_has_live_supervised_work(state, session_id))
+}
+
 /// #1140 codex P1 re-review #4 — RAII drop-guard returned by
 /// `InProcessAgentOrchestrator::goal_dispatch_in_flight_guard`. On
 /// `Drop` it clears the in-flight marker for the captured session
@@ -8170,6 +8401,11 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
 pub(crate) struct GoalDispatchInFlightGuard {
     orchestrator: &'static InProcessAgentOrchestrator,
     session_id: SessionKey,
+    /// #2003 — the marker incarnation THIS guard owns. `Drop` clears only when
+    /// the stored marker still carries it, so a guard whose marker was already
+    /// evicted (staleness) and re-claimed by a NEW turn cannot wipe the new
+    /// owner's marker on its way out.
+    generation: u64,
     disarmed: bool,
 }
 
@@ -8187,8 +8423,12 @@ impl GoalDispatchInFlightGuard {
 impl Drop for GoalDispatchInFlightGuard {
     fn drop(&mut self) {
         if !self.disarmed {
+            // #2003 — identity-checked: if this guard's marker was already
+            // evicted by the staleness rescue and re-claimed by a newer turn,
+            // clearing here would strip the NEW owner's protection and admit a
+            // concurrent continuation. Only the owning incarnation may clear.
             self.orchestrator
-                .clear_goal_dispatch_in_flight(&self.session_id);
+                .clear_goal_dispatch_in_flight_generation(&self.session_id, self.generation);
         }
     }
 }
@@ -8494,6 +8734,24 @@ impl InProcessAgentOrchestrator {
                 &session_id,
                 &format!("[{name}] {line}"),
             );
+            // #2019 — SECOND consumer: the human. The wake above is untouched
+            // (same continuation, same dedupe key, same ordering); this is a
+            // purely additive, best-effort tap so the user can SEE what the
+            // model was woken by instead of watching a silent session. Routed
+            // on the monitor's OWNING session — never the client's focused one
+            // — and attributed to the monitor. Never fed back into model
+            // context: the model's view is the note above plus the
+            // continuation metadata, exactly as before.
+            crate::autonomy::human_events::emit_background_activity(
+                crate::autonomy::human_events::background_activity(
+                    &session_id,
+                    Some(profile_id.as_str()),
+                    crate::autonomy::human_events::ORIGIN_KIND_MONITOR,
+                    monitor_id,
+                    Some(name.as_str()),
+                    line.clone(),
+                ),
+            );
         }
         MonitorBatchOutcome::Fired { queued }
     }
@@ -8501,7 +8759,7 @@ impl InProcessAgentOrchestrator {
     /// #1977 — expiry + desired-watcher-set pass, run by the global drain
     /// every tick. Expires overdue non-persistent monitors (durable note,
     /// terminal persist) and returns the watch configs for every ACTIVE
-    /// monitor — [`crate::api::monitor_runtime::MonitorProcessRuntime::reconcile`]
+    /// monitor — [`crate::autonomy::monitor_runtime::MonitorProcessRuntime::reconcile`]
     /// converges the live watcher set onto it. Because the pass is pure
     /// convergence, running it at boot IS the re-arm (loops' boot re-arm
     /// precedent) and running it after a watcher death IS the self-heal.
@@ -8747,14 +9005,14 @@ struct AutonomyRuntimeState {
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
     /// #1977 — durable monitor records (specs + wake accounting). The live
-    /// watcher PROCESSES live in [`crate::api::monitor_runtime`]'s global
+    /// watcher PROCESSES live in [`crate::autonomy::monitor_runtime`]'s global
     /// registry; the global drain reconciles that registry against the
     /// `status == "active"` subset of this map every tick.
     monitors: HashMap<String, AutonomyMonitorRecord>,
     continuations: MasterContinuationScheduler,
     supervisor_store: Option<SupervisorStore>,
     /// #1857 PR 4a — durable fleet-kernel store, opened at serve boot beside
-    /// `supervisor_store`. The fleet outbox consumer (`api::fleet_wake`) drains
+    /// `supervisor_store`. The fleet outbox consumer (`autonomy::fleet_wake`) drains
     /// it against `continuations`. `None` until `set_fleet_store` (never wired
     /// on the chat/gateway boot paths, which have no fleet kernel).
     fleet_store: Option<FleetKernelStore>,
@@ -8809,7 +9067,13 @@ struct AutonomyRuntimeState {
     /// `clear_goal_dispatch_in_flight`. Independent of (and
     /// complementary to) the `last_continued_at_ms` timestamp, which
     /// remains the authoritative min-delay gate for all other callers.
-    in_flight_goal_sessions: std::collections::HashSet<SessionKey>,
+    /// #2003 — value is the epoch-ms the marker was stamped. A marker older
+    /// than [`IN_FLIGHT_STALE_AFTER_MS`] is treated as ABANDONED and no longer
+    /// excludes the session, so a leaked [`GoalDispatchInFlightGuard`] can no
+    /// longer wedge a session permanently (field report: five continuations of
+    /// four different reason kinds stuck `queued` for 35 minutes, including the
+    /// `goal_wrap_up` that would have explained the stall to the user).
+    in_flight_goal_sessions: std::collections::HashMap<SessionKey, InFlightMarker>,
     /// #1977 codex round 2 — test-only switch that makes the next monitor wake
     /// persist be treated as FAILED, simulating a crash exactly at the durable
     /// wake write. Per-instance (fresh `InProcessAgentOrchestrator::default()`
@@ -9467,7 +9731,7 @@ fn autonomy_error(
 
 /// #1977 blocker 6 — the typed `monitor_invalid_spec` RPC error for the raw
 /// dispatch layer (e.g. an unknown `mode`), matching the shape `create_monitor`
-/// produces when [`crate::api::monitor_runtime::MonitorSpec::validate`] fails.
+/// produces when [`crate::autonomy::monitor_runtime::MonitorSpec::validate`] fails.
 pub(crate) fn monitor_invalid_spec_error(
     session_id: &SessionKey,
     profile_id: &str,
@@ -9813,7 +10077,7 @@ fn enqueue_due_goal_continuations(
     // otherwise queue a stale `GoalContinue` despite the in-flight
     // turn. The two guards together ensure the in-flight marker is
     // the authoritative gate on every enqueue path.
-    if state.in_flight_goal_sessions.contains(session_id) {
+    if in_flight_marker_is_held(state, session_id) {
         return 0;
     }
     let Some(goal) = state.goals.get(session_id).cloned() else {
@@ -10773,12 +11037,12 @@ fn restore_monitor_from_group(state: &mut AutonomyRuntimeState, group: &Supervis
         interval_seconds: supervisor_metadata_u64(&group.metadata, "interval_seconds"),
         batch_ms: supervisor_metadata_u64(&group.metadata, "batch_ms")
             .unwrap_or(u64::from(
-                crate::api::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
             ))
             .min(u64::from(u32::MAX)) as u32,
         max_events_per_hour: supervisor_metadata_u64(&group.metadata, "max_events_per_hour")
             .unwrap_or(u64::from(
-                crate::api::monitor_runtime::MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR,
+                crate::autonomy::monitor_runtime::MONITOR_DEFAULT_MAX_EVENTS_PER_HOUR,
             ))
             .min(u64::from(u32::MAX)) as u32,
         persistent: supervisor_metadata_bool(&group.metadata, "persistent").unwrap_or(false),
@@ -18354,6 +18618,89 @@ mod tests {
     /// load-bearing case twice over: the path digest's `cost_by_path`
     /// dropped such rows, which is why the digest is computed from direct
     /// SQL aggregates.
+    /// #2036 follow-up — a peer's review must reach the DURABLE row intact.
+    ///
+    /// Found by a real two-peer review soak on merged main, not by a unit test:
+    /// #2036 raised the transport-side cap from 400 to 4000, but this writer
+    /// still applied a hard `take(500)`, so real findings came out at exactly
+    /// 500 characters — cut mid-token and unmarked, which is the same
+    /// unverifiable fragment the 400-char cut produced. Each cap was tested in
+    /// isolation and both looked fine; only the end-to-end path showed that the
+    /// inner one binds.
+    ///
+    /// Drives the production writer and reads back through the same accessor
+    /// the completion verifier uses.
+    #[test]
+    fn a_long_peer_review_reaches_the_ledger_row_intact() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let wire = "tenant-a:api:long-peer-review";
+        let session_id = SessionKey(wire.to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "review two modules".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let goal_id = orchestrator
+            .goal_id_for_session(&session_id)
+            .expect("goal_id");
+
+        // The shape that failed live: a multi-finding security review, far
+        // longer than any per-sentence budget but well inside the real one.
+        let mut review = String::from("Security review of ssrf.rs — findings:\n");
+        for i in 0..12 {
+            review.push_str(&format!(
+                "{i}. HIGH — the guard resolves the host before checking it, so a \
+                 DNS entry that flips between a public and a private address \
+                 between the check and the fetch slips through; see the \
+                 resolve/connect gap.\n"
+            ));
+        }
+        review.push_str("END-OF-REVIEW-MARKER");
+        assert!(
+            review.chars().count() > 1_000,
+            "fixture must be far longer than the OLD 500-char cap, or it proves \
+             nothing: {}",
+            review.chars().count()
+        );
+
+        orchestrator
+            .model_goal_record_peer_finding(
+                data_dir.path(),
+                &goal_id,
+                "tenant-a",
+                wire,
+                "rev-ssrf",
+                None,
+                &review,
+                1_200,
+            )
+            .expect("finding recorded");
+
+        let findings = orchestrator.model_goal_ledger_findings(data_dir.path(), &goal_id);
+        let stored = findings
+            .first()
+            .and_then(|f| f.get("assertion"))
+            .and_then(|a| a.as_str())
+            .expect("one finding with an assertion");
+
+        assert!(
+            stored.contains("END-OF-REVIEW-MARKER"),
+            "the END of the review must survive — a cap here silently drops the \
+             findings the verifier is asked to judge; stored {} chars",
+            stored.chars().count()
+        );
+        assert!(
+            !stored.contains("…[truncated]"),
+            "an ordinary review must not be abridged at all: {stored}"
+        );
+    }
+
     #[test]
     fn model_goal_ledger_digest_reduces_the_ledger_to_compact_counts() {
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -21311,7 +21658,7 @@ mod tests {
     /// pause intent.
     #[test]
     fn due_loop_targets_pending_sweep_filters_paused_goal_continuations() {
-        use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+        use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey::with_profile("tenant-a", "api", "paused-goal-stale");
         orchestrator
@@ -21436,7 +21783,7 @@ mod tests {
     /// pre-#1131 code emitted on budget exhaustion.
     #[test]
     fn legacy_goal_continue_with_wrap_up_metadata_promotes_to_wrap_up() {
-        use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+        use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
 
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey::with_profile("tenant-a", "api", "legacy-wrap-up");
@@ -24496,6 +24843,327 @@ mod tests {
         );
     }
 
+    /// #2003 — a STALE in-flight marker must not stall a session forever.
+    ///
+    /// Field report: a 5-peer goal fleet finished all its work and the master
+    /// went silent. Five continuations sat `queued` with `started_at_ms: null`
+    /// for 35 minutes — `goal_continue` x2, `goal_wrap_up`, `child_completed`,
+    /// `scatter_join_complete`. Every reason kind stalled together, which is
+    /// the signature of the per-session in-flight gate (it returns BEFORE
+    /// draining anything), not of any per-target filter.
+    ///
+    /// The marker is released by `GoalDispatchInFlightGuard::drop`, so any path
+    /// that sets it and never drops the guard wedges that session permanently.
+    /// The cruelest part of the field case: the `goal_wrap_up` continuation
+    /// that would have TOLD the user the budget was exhausted, and how to
+    /// resume, was itself stuck behind the same marker.
+    ///
+    /// Rather than chase one leak site, the marker self-heals: an entry older
+    /// than `IN_FLIGHT_STALE_AFTER_MS` is treated as abandoned. A real turn
+    /// re-stamps its marker, so a live long-running turn is never evicted.
+    #[test]
+    fn stale_in_flight_marker_stops_wedging_the_session() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-stale-inflight");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "fleet that outlived its marker".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial continuation so the session is "between turns"
+        // (mirrors `in_flight_goal_session_is_excluded_from_due_loop_targets`).
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // Age the timestamp so the min-delay gate PERMITS re-dispatch; the
+        // in-flight marker must then be the only thing deciding.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+
+        // A FRESH marker still excludes the session — the existing race guard
+        // for long-running turns must keep working.
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        assert!(
+            !orchestrator
+                .due_loop_targets(Some("tenant-a"), 8)
+                .iter()
+                .any(|(s, _)| s == &session_id),
+            "a FRESH in-flight marker must still exclude the session",
+        );
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a fresh marker reads as in-flight",
+        );
+
+        // Now age it past the staleness horizon, exactly as an abandoned
+        // marker would (the guard leaked; nothing will ever clear it).
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a marker older than the staleness horizon must not read as in-flight",
+        );
+        assert!(
+            orchestrator
+                .due_loop_targets(Some("tenant-a"), 8)
+                .iter()
+                .any(|(s, _)| s == &session_id),
+            "a session wedged by a STALE marker must become due again — otherwise \
+             a leaked guard silently stalls every continuation kind forever (#2003)",
+        );
+    }
+
+    /// #2003 follow-up — a LONG but PRODUCING turn must never age out.
+    ///
+    /// The staleness horizon rescues a wedged session, but the original
+    /// justification ("a live turn re-stamps its marker") was FALSE: nothing
+    /// refreshed it, so a turn running past the horizon lost its protection
+    /// mid-flight. `touch_goal_dispatch_in_flight` is that refresh, driven from
+    /// real token production in the actor's turn loop.
+    ///
+    /// Two properties are load-bearing and both are asserted here:
+    ///   1. touching an aged marker restores it (a producing turn stays safe);
+    ///   2. touching a session with NO marker must NOT create one — otherwise a
+    ///      stray progress event could mark an idle session busy forever.
+    #[test]
+    fn touch_refreshes_a_live_turns_marker_but_never_creates_one() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-heartbeat");
+
+        // No marker yet: touching must be a no-op, not a mark.
+        orchestrator.touch_goal_dispatch_in_flight(&session_id);
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "touch must never CREATE a marker — an idle session stays idle",
+        );
+
+        // Mark, then age it past the horizon as an abandoned marker would.
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "precondition: the aged marker reads as stale",
+        );
+
+        // The turn is still producing → refresh → protected again.
+        orchestrator.touch_goal_dispatch_in_flight(&session_id);
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a producing turn must keep its marker live past the staleness \
+             horizon, or a long fleet turn loses its concurrency guard",
+        );
+    }
+
+    /// #2003 follow-up — a turn BLOCKED awaiting its sub-agents must keep its
+    /// marker even though it produces no tokens.
+    ///
+    /// This is the case the token heartbeat structurally cannot see: while the
+    /// parent waits on children it emits nothing, so on token evidence alone it
+    /// is indistinguishable from a wedged turn and would be un-protected once
+    /// the staleness horizon passed — letting a second turn dispatch onto a
+    /// session that is genuinely working. `TaskSupervisor` is the lifecycle
+    /// authority for that work and its state reaches the orchestrator via
+    /// `upsert_background_task_agent`, so we ask it instead of guessing.
+    /// #1868 — an open PEER must NOT keep a wedged master's marker alive.
+    ///
+    /// Peers are enrolled as supervised tasks on their MASTER's session, and
+    /// they stay non-terminal from staging until `peer_close` — often hours.
+    /// If they counted as liveness, a master that wedges with peers open would
+    /// hold a marker that can never age out, disarming #2004's rescue in
+    /// exactly the reported failure (a wedged master with five peers running).
+    #[test]
+    fn an_open_peer_does_not_keep_a_wedged_masters_marker_alive() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-peer-wedge");
+
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+
+        // A staged peer, registered against the MASTER's session by #1868 and
+        // mirrored here through `upsert_background_task_agent`.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "peer-reviewer".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/peer-reviewer".into(),
+            role: "peer".into(),
+            nickname: "reviewer".into(),
+            backend_kind: PEER_HANDOFF_BACKEND_KIND.into(),
+            status: "running".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "an open peer is NOT proof the master's own turn is alive; the aged \
+             marker must still be rescued or a wedged master with peers open can \
+             never be recovered",
+        );
+
+        // A genuine sub-agent on the same session still protects it.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-running".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-running".into(),
+            role: "worker".into(),
+            nickname: "Ada".into(),
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a real sub-agent must still hold the marker",
+        );
+    }
+
+    #[test]
+    fn stale_marker_is_still_held_while_supervised_children_run() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-children");
+
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        // Age it out: on the timestamp alone this session is now dispatchable.
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "precondition: with no children, an aged marker is abandoned",
+        );
+
+        // A child is RUNNING for this session — the parent turn is legitimately
+        // blocked on it, emitting no tokens.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-running".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-running".into(),
+            role: "worker".into(),
+            nickname: "Ada".into(),
+            backend_kind: "native".into(),
+            status: "running".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "a session with live supervised children must stay protected even \
+             once its marker aged out — otherwise a parent waiting on sub-agents \
+             gets a second concurrent turn dispatched onto it",
+        );
+
+        // Child reaches a terminal state: nothing is running, the aged marker
+        // is abandoned again and the session is rescued as #2004 intends.
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "child-running".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "master/child-running".into(),
+            role: "worker".into(),
+            nickname: "Ada".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: None,
+            cwd: None,
+            profile_id: "tenant-a".into(),
+        });
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "once every child is terminal the stale marker must stop holding the \
+             session — the wedge rescue (#2004) still has to work",
+        );
+    }
+
+    /// #2003 — an evicted turn that unwinds LATE must not strip the marker a
+    /// newer turn now holds.
+    ///
+    /// This is the defect the staleness rescue introduced, in three steps:
+    ///   1. turn A claims the marker and wedges (nothing refreshes it);
+    ///   2. at the horizon the marker is judged abandoned and turn B claims it
+    ///      — the rescue working as intended;
+    ///   3. turn A finally unwinds; its guard's `Drop` used to `remove()`
+    ///      unconditionally, wiping *B's* marker and letting turn C start
+    ///      alongside B — precisely the #1529 double-dispatch the marker exists
+    ///      to prevent, reintroduced by the fix for the wedge.
+    ///
+    /// The generation stamp makes step 3 a no-op for A.
+    #[test]
+    fn a_late_unwinding_guard_cannot_clear_a_newer_turns_marker() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-generation");
+
+        // 1. Turn A claims, then wedges.
+        let generation_a = orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        orchestrator.force_in_flight_marked_at_for_test(
+            &session_id,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1_000),
+        );
+
+        // 2. The rescue fires: the stale marker no longer holds, so a NEW turn
+        //    B claims the session.
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "precondition: A's wedged marker reads as abandoned",
+        );
+        let generation_b = orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        assert_ne!(
+            generation_a, generation_b,
+            "each claim must be a distinct incarnation",
+        );
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "B now holds a fresh marker",
+        );
+
+        // 3. Turn A unwinds LATE. Its clear must be refused.
+        assert!(
+            !orchestrator.clear_goal_dispatch_in_flight_generation(&session_id, generation_a),
+            "the evicted turn must NOT clear a marker it no longer owns",
+        );
+        assert!(
+            orchestrator.is_goal_dispatch_in_flight(&session_id),
+            "B must still be protected after A unwinds — otherwise a third turn \
+             dispatches onto a session B is actively running (#1529)",
+        );
+
+        // B's own clear still works, so nothing leaks.
+        assert!(
+            orchestrator.clear_goal_dispatch_in_flight_generation(&session_id, generation_b),
+            "the owning incarnation clears normally",
+        );
+        assert!(!orchestrator.is_goal_dispatch_in_flight(&session_id));
+    }
+
     #[test]
     fn is_goal_dispatch_in_flight_reflects_mark_and_clear() {
         // P2 (tri-repo #1529): the accessor the AppUI serve tick reads to skip
@@ -24764,12 +25432,15 @@ mod tests {
 
     // ---- #1977 MonitorRuntime: orchestrator-seam acceptance tests ---------
 
-    fn monitor_spec(name: &str, mode: MonitorMode) -> crate::api::monitor_runtime::MonitorSpec {
-        crate::api::monitor_runtime::MonitorSpec {
+    fn monitor_spec(
+        name: &str,
+        mode: MonitorMode,
+    ) -> crate::autonomy::monitor_runtime::MonitorSpec {
+        crate::autonomy::monitor_runtime::MonitorSpec {
             name: name.to_owned(),
             argv: vec!["sh".into(), "-c".into(), "true".into()],
             filter_regex: None,
-            batch_ms: crate::api::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+            batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
             mode,
             timeout_secs: None,
             persistent: false,
@@ -24783,7 +25454,7 @@ mod tests {
         orchestrator: &InProcessAgentOrchestrator,
         session: &SessionKey,
         profile: &str,
-        spec: crate::api::monitor_runtime::MonitorSpec,
+        spec: crate::autonomy::monitor_runtime::MonitorSpec,
         data_dir: Option<std::path::PathBuf>,
     ) -> String {
         let value = orchestrator
@@ -24871,6 +25542,142 @@ mod tests {
         assert_eq!(pending_wakes(&orchestrator, &session, "tenant-a"), 1);
     }
 
+    /// #2019 acceptance — a monitor that fires produces HUMAN-visible,
+    /// origin-attributed lines on the session that OWNS the monitor, and the
+    /// model's wake is untouched.
+    ///
+    /// This asserts ROUTING, not merely emission: two monitors on two
+    /// different sessions fire in an interleaved order, and each event must
+    /// land on ITS OWN session. Activity without a correct routing key renders
+    /// in whichever session happens to be focused (octos-tui#461, #466, #483)
+    /// — the exact bug class this event must not re-ship.
+    #[test]
+    fn should_emit_attributed_human_activity_on_the_owning_session_when_a_monitor_fires() {
+        use crate::autonomy::human_events::{
+            BackgroundActivitySink, ORIGIN_KIND_MONITOR, background_activity_test_guard,
+            clear_background_activity_sink, set_background_activity_sink,
+        };
+        // The sink is process-global; hold the guard so a sibling case's
+        // teardown cannot wipe the sink this test installs (libtest runs cases
+        // in parallel by default, and CI does NOT pass --test-threads=1).
+        let _guard = background_activity_test_guard();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let sink: BackgroundActivitySink = std::sync::Arc::new(move |event| {
+            recorder.lock().unwrap().push(event);
+        });
+        set_background_activity_sink(sink);
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_a = SessionKey::new("api", "mon-human-a");
+        let session_b = SessionKey::new("api", "mon-human-b");
+        create_monitor_for_test(
+            &orchestrator,
+            &session_a,
+            "tenant-a",
+            monitor_spec("ci-tail", MonitorMode::Stream),
+            None,
+        );
+        create_monitor_for_test(
+            &orchestrator,
+            &session_b,
+            "tenant-b",
+            monitor_spec("deploy-tail", MonitorMode::Stream),
+            None,
+        );
+        let (id_a, id_b) = ("monitor_01", "monitor_02");
+
+        // Interleave so a "last writer wins" / ambient-session implementation
+        // could not accidentally pass.
+        assert_eq!(
+            orchestrator.handle_monitor_batch(id_a, &["a1".into()], 1),
+            MonitorBatchOutcome::Fired { queued: true }
+        );
+        assert_eq!(
+            orchestrator.handle_monitor_batch(id_b, &["b1".into()], 1),
+            MonitorBatchOutcome::Fired { queued: true }
+        );
+        assert_eq!(
+            orchestrator.handle_monitor_batch(id_a, &["a2".into(), "a3".into()], 2),
+            MonitorBatchOutcome::Fired { queued: true }
+        );
+
+        let events = seen.lock().unwrap().clone();
+        clear_background_activity_sink();
+
+        // One human-visible line per observed event line.
+        assert_eq!(events.len(), 4, "one event per observed line: {events:?}");
+
+        // ROUTING: every event names the session that OWNS its monitor.
+        let a_texts: Vec<&str> = events
+            .iter()
+            .filter(|event| event.session_id == session_a)
+            .map(|event| event.text.as_str())
+            .collect();
+        let b_texts: Vec<&str> = events
+            .iter()
+            .filter(|event| event.session_id == session_b)
+            .map(|event| event.text.as_str())
+            .collect();
+        assert_eq!(a_texts, vec!["a1", "a2", "a3"]);
+        assert_eq!(b_texts, vec!["b1"]);
+        assert!(
+            events.iter().all(|event| !event.session_id.0.is_empty()),
+            "every event carries a routing key"
+        );
+
+        // ATTRIBUTION: an unattributed line reads as the master speaking.
+        for event in &events {
+            assert_eq!(event.origin_kind, ORIGIN_KIND_MONITOR);
+            assert!(!event.origin_id.is_empty());
+            assert!(event.emitted_at_ms > 0);
+            assert!(!event.suppressed);
+        }
+        let a_event = events
+            .iter()
+            .find(|event| event.session_id == session_a)
+            .expect("session A event");
+        assert_eq!(a_event.origin_id, id_a);
+        assert_eq!(a_event.origin_label.as_deref(), Some("ci-tail"));
+        assert_eq!(a_event.profile_id.as_deref(), Some("tenant-a"));
+        let b_event = events
+            .iter()
+            .find(|event| event.session_id == session_b)
+            .expect("session B event");
+        assert_eq!(b_event.origin_id, id_b);
+        assert_eq!(b_event.origin_label.as_deref(), Some("deploy-tail"));
+
+        // WAKE BEHAVIOUR IS UNCHANGED: the human sink is purely additive —
+        // still exactly one master continuation per fired batch, on the
+        // owning session, as before #2019.
+        assert_eq!(pending_wakes(&orchestrator, &session_a, "tenant-a"), 2);
+        assert_eq!(pending_wakes(&orchestrator, &session_b, "tenant-b"), 1);
+    }
+
+    /// #2019 — a producer must never be blocked or failed by the human sink.
+    /// With NO sink installed (the production "queue closed" degradation), the
+    /// monitor's wake path is byte-for-byte the same.
+    #[test]
+    fn should_leave_the_wake_path_intact_when_no_human_sink_is_installed() {
+        // Serialize + reset: "no sink installed" must be true for the whole
+        // body, not just at its first line.
+        let _guard = crate::autonomy::human_events::background_activity_test_guard();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-human-nosink");
+        create_monitor_for_test(
+            &orchestrator,
+            &session,
+            "tenant-a",
+            monitor_spec("ci-tail", MonitorMode::Stream),
+            None,
+        );
+        assert_eq!(
+            orchestrator.handle_monitor_batch("monitor_01", &["x".into()], 1),
+            MonitorBatchOutcome::Fired { queued: true }
+        );
+        assert_eq!(pending_wakes(&orchestrator, &session, "tenant-a"), 1);
+    }
+
     /// Acceptance: a flood (many lines fast) is batched, capped, and
     /// auto-pauses the monitor with a durable note — never 1000 wakes.
     #[test]
@@ -24922,7 +25729,7 @@ mod tests {
 
         // The pause left a DURABLE note (no silent caps).
         let notes =
-            crate::api::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
+            crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
                 .expect("a durable flood note was staged");
         assert!(
             notes.contains("AUTO-PAUSED"),
@@ -25437,7 +26244,7 @@ mod tests {
         let (status, _) = orchestrator.monitor_status_for_test("monitor_01").unwrap();
         assert_eq!(status, "expired");
         let notes =
-            crate::api::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
+            crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(dir.path(), &session.0)
                 .expect("expiry note");
         assert!(
             notes.contains("EXPIRED"),

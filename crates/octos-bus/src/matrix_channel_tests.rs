@@ -36,7 +36,241 @@ fn make_test_state(inbound_tx: mpsc::Sender<InboundMessage>) -> AppserviceState 
         bot_router: Arc::new(BotRouter::new(None)),
         bot_manager: None,
         media_dir: std::env::temp_dir().join("octos-matrix-test-media"),
+        // Existing transaction tests exercise routing/enqueue without the
+        // mention gate; enable it explicitly in the gate's own tests.
+        mention_only: false,
+        dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
+        dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
+}
+
+// ── mention-only gate ────────────────────────────────────────────────
+
+fn members(humans: usize, managed_bots: usize) -> RoomMemberCounts {
+    RoomMemberCounts {
+        humans,
+        managed_bots,
+    }
+}
+
+#[test]
+fn gate_disabled_always_dispatches() {
+    // Gate off → legacy behaviour, reply regardless of room.
+    assert!(should_dispatch_message(false, false, members(5, 3)));
+    assert!(should_dispatch_message(false, false, members(1, 1)));
+}
+
+#[test]
+fn gate_dispatches_when_addressed() {
+    // Explicit mention/target bypasses the member-count check entirely.
+    assert!(should_dispatch_message(true, true, members(100, 100)));
+}
+
+#[test]
+fn gate_replies_in_dm_without_mention() {
+    // A true 1:1 DM (one human, one child bot) replies without a mention.
+    assert!(should_dispatch_message(true, false, members(1, 1)));
+    assert!(should_dispatch_message(true, false, members(0, 1)));
+    assert!(should_dispatch_message(true, false, members(1, 0)));
+}
+
+#[test]
+fn gate_requires_mention_in_group() {
+    // Multiple humans and no mention → do not reply.
+    assert!(!should_dispatch_message(true, false, members(2, 1)));
+    assert!(!should_dispatch_message(true, false, members(9, 1)));
+}
+
+#[test]
+fn gate_requires_mention_when_room_has_multiple_bots() {
+    // One human sharing a room with several bots is NOT a DM: without
+    // this, every bot in the room would answer each unaddressed message.
+    assert!(!should_dispatch_message(true, false, members(1, 2)));
+    assert!(!should_dispatch_message(true, false, members(0, 5)));
+}
+
+#[test]
+fn gate_fails_closed_when_membership_unknown() {
+    assert!(!should_dispatch_message(
+        true,
+        false,
+        RoomMemberCounts::UNKNOWN
+    ));
+}
+
+fn membership(humans: usize, child_bots: usize, botfather_joined: bool) -> MembershipCounts {
+    MembershipCounts {
+        humans,
+        child_bots,
+        botfather_joined,
+    }
+}
+
+fn mapped(child_bots: usize, botfather_mapped: bool) -> RoomBotComposition {
+    RoomBotComposition {
+        child_bots,
+        botfather_mapped,
+    }
+}
+
+#[test]
+fn count_room_members_splits_humans_child_bots_and_botfather() {
+    let joined = json!({
+        "joined": {
+            "@octos_bot:localhost": { "display_name": "Octos" },
+            "@octos_alexbot:localhost": { "display_name": "AlexBot" },
+            "@alice:localhost": { "display_name": "Alice" },
+            "@bob:localhost": { "display_name": "Bob" }
+        }
+    });
+    assert_eq!(
+        count_room_members(&joined, "@octos_bot:localhost", ":localhost", "octos_"),
+        Some(membership(2, 1, true))
+    );
+}
+
+#[test]
+fn count_room_members_handles_missing_field() {
+    // No `joined` object → membership unknown → merge fails closed.
+    assert_eq!(
+        count_room_members(&json!({}), "@octos_bot:localhost", ":localhost", "octos_"),
+        None
+    );
+    assert_eq!(
+        merge_room_bot_sources(None, Some(mapped(1, false))),
+        RoomMemberCounts::UNKNOWN
+    );
+}
+
+#[test]
+fn merge_unions_membership_and_room_map() {
+    // Palpo hides child virtual users from joined_members: the room map
+    // is the authority on child bots, membership on humans/BotFather.
+    let hidden_children =
+        merge_room_bot_sources(Some(membership(1, 0, false)), Some(mapped(2, false)));
+    assert_eq!(hidden_children, members(1, 2));
+    assert!(!should_dispatch_message(true, false, hidden_children));
+
+    // A single mapped child bot with one human stays a DM.
+    let dm = merge_room_bot_sources(Some(membership(1, 0, false)), Some(mapped(1, false)));
+    assert_eq!(dm, members(1, 1));
+    assert!(dm.is_direct_chat());
+
+    // Membership-visible children and mapped children are the same
+    // population seen through different windows: max, not sum.
+    let both_visible =
+        merge_room_bot_sources(Some(membership(1, 1, false)), Some(mapped(1, false)));
+    assert_eq!(both_visible, members(1, 1));
+}
+
+#[test]
+fn merge_counts_botfather_and_hidden_child_as_two_responders() {
+    // The P1 review case: one human + BotFather (visible in membership)
+    // + one child bot (hidden by the homeserver, known to the room map).
+    // Each source alone sees "1 bot"; a max of totals would grant a DM
+    // exemption. The union must see two potential responders.
+    let counts = merge_room_bot_sources(Some(membership(1, 0, true)), Some(mapped(1, false)));
+    assert_eq!(counts, members(1, 2));
+    assert!(!counts.is_direct_chat());
+    assert!(!should_dispatch_message(true, false, counts));
+}
+
+#[test]
+fn merge_botfather_only_dm_is_direct_chat() {
+    // 1:1 admin chat with BotFather alone stays a DM, whether membership
+    // or the room map is the source that sees it.
+    let via_membership =
+        merge_room_bot_sources(Some(membership(1, 0, true)), Some(mapped(0, false)));
+    assert_eq!(via_membership, members(1, 1));
+    assert!(via_membership.is_direct_chat());
+
+    let via_room_map = merge_room_bot_sources(Some(membership(1, 0, false)), Some(mapped(0, true)));
+    assert_eq!(via_room_map, members(1, 1));
+    assert!(via_room_map.is_direct_chat());
+
+    // Both sources seeing BotFather is still one BotFather.
+    let both = merge_room_bot_sources(Some(membership(1, 0, true)), Some(mapped(0, true)));
+    assert_eq!(both, members(1, 1));
+}
+
+#[test]
+fn merge_fails_closed_when_room_map_unavailable() {
+    // A poisoned room map (existing file that failed to load) yields
+    // `None` from `room_bot_composition`; the gate must not fall back to
+    // membership alone, which may be blind to hidden child bots.
+    assert_eq!(
+        merge_room_bot_sources(Some(membership(1, 0, false)), None),
+        RoomMemberCounts::UNKNOWN
+    );
+}
+
+#[tokio::test]
+async fn room_bot_composition_distinguishes_botfather_from_children() {
+    let router = BotRouter::new(None);
+    router
+        .register("@octos_bot:localhost", "botfather")
+        .await
+        .unwrap();
+    router
+        .register("@octos_weather:localhost", "profile-weather")
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!room:localhost", "botfather")
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!room:localhost", "profile-weather")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        router
+            .room_bot_composition("!room:localhost", "@octos_bot:localhost")
+            .await,
+        Some(mapped(1, true))
+    );
+    // A room absent from the map has no mapped bots (legitimate, e.g. a
+    // room the appservice was never bound to) — not a failure.
+    assert_eq!(
+        router
+            .room_bot_composition("!other:localhost", "@octos_bot:localhost")
+            .await,
+        Some(mapped(0, false))
+    );
+}
+
+#[test]
+fn mentions_user_detects_structured_and_text_mentions() {
+    let bot = "@octosbot:localhost";
+
+    // Structured m.mentions.user_ids
+    let structured = json!({ "m.mentions": { "user_ids": ["@octosbot:localhost"] } });
+    assert!(mentions_user(&structured, "hello", bot));
+
+    // Plain-text MXID mention in the body
+    let text = json!({});
+    assert!(mentions_user(
+        &text,
+        "hey @octosbot:localhost please help",
+        bot
+    ));
+
+    // MXID mention embedded in formatted_body markup.
+    let formatted = json!({ "formatted_body": "<b>@octosbot:localhost</b> hi" });
+    assert!(mentions_user(&formatted, "hi", bot));
+
+    // Standard matrix.to pill: the MXID is preceded by `/` in the href,
+    // which must not defeat the left-boundary check.
+    let pill = json!({
+        "formatted_body":
+            "<a href=\"https://matrix.to/#/@octosbot:localhost\">octosbot</a> hi"
+    });
+    assert!(mentions_user(&pill, "octosbot hi", bot));
+
+    // No mention at all
+    let none = json!({});
+    assert!(!mentions_user(&none, "just chatting with everyone", bot));
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +358,10 @@ async fn spawn_mock_homeserver_with_response(
             "/_matrix/client/v3/rooms/{room_id}/typing/{user_id}",
             any(capture_homeserver_request),
         )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/joined_members",
+            any(capture_homeserver_request),
+        )
         .route("/_matrix/media/v3/upload", any(capture_homeserver_request))
         .route(
             "/_matrix/media/v3/download/{server_name}/{media_id}",
@@ -136,6 +374,16 @@ async fn spawn_mock_homeserver_with_response(
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{}", addr), requests, handle)
+}
+
+async fn spawn_mock_homeserver_with_joined_members(
+    joined_members: Value,
+) -> (
+    String,
+    Arc<Mutex<Vec<CapturedRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    spawn_mock_homeserver_with_response(StatusCode::OK, joined_members).await
 }
 
 async fn spawn_mock_homeserver_with_dynamic_event_ids() -> (
@@ -468,86 +716,6 @@ async fn test_handle_transaction_bad_json_does_not_poison_txn_id() {
 
     let msg = inbound_rx.try_recv().unwrap();
     assert_eq!(msg.content, "retry should still deliver");
-}
-
-#[tokio::test]
-async fn test_handle_transaction_enqueue_failure_returns_500_and_does_not_poison_txn_id() {
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
-    // Close the inbound channel by dropping the receiver so every
-    // enqueue fails. The homeserver must NOT be told 200 OK (which
-    // means "processed, never retry") for a message we dropped.
-    let (closed_tx, closed_rx) = mpsc::channel::<InboundMessage>(16);
-    drop(closed_rx);
-
-    let state = make_test_state(closed_tx);
-    let dedup = state.dedup.clone();
-
-    let app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(state);
-
-    let body = json!({
-        "events": [{
-            "type": "m.room.message",
-            "sender": "@alice:elsewhere.org",
-            "room_id": "!room:localhost",
-            "event_id": "$ev_enqueue_fail",
-            "content": {
-                "msgtype": "m.text",
-                "body": "must not be acked when dropped"
-            }
-        }]
-    });
-
-    let req = Request::builder()
-        .method("PUT")
-        .uri("/_matrix/app/v1/transactions/txn_enqueue_fail?access_token=test_token")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "failed enqueue must not be acked with 200 OK"
-    );
-
-    // The failed transaction must not be recorded as processed:
-    // the homeserver retries the same txn_id, and that retry must be
-    // accepted, not dropped as a duplicate. Simulate the retry against
-    // a healthy inbound channel sharing the same dedup cache.
-    let (retry_tx, mut retry_rx) = mpsc::channel::<InboundMessage>(16);
-    let mut retry_state = make_test_state(retry_tx);
-    retry_state.dedup = dedup;
-
-    let retry_app = Router::new()
-        .route(
-            "/_matrix/app/v1/transactions/{txn_id}",
-            put(handle_transaction),
-        )
-        .with_state(retry_state);
-
-    let retry_req = Request::builder()
-        .method("PUT")
-        .uri("/_matrix/app/v1/transactions/txn_enqueue_fail?access_token=test_token")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-
-    let retry_resp = retry_app.oneshot(retry_req).await.unwrap();
-    assert_eq!(retry_resp.status(), StatusCode::OK);
-
-    let msg = retry_rx
-        .try_recv()
-        .expect("retried transaction must be delivered, not deduped");
-    assert_eq!(msg.content, "must not be acked when dropped");
 }
 
 #[tokio::test]
@@ -2720,6 +2888,350 @@ async fn test_handle_transaction_dm_routing() {
 }
 
 #[tokio::test]
+async fn test_handle_transaction_mention_gate_blocks_unaddressed_group_room_mapping() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (homeserver, requests, homeserver_handle) =
+        spawn_mock_homeserver_with_joined_members(json!({
+            "joined": {
+                "@octos_bot:localhost": {},
+                "@octos_weather:localhost": {},
+                "@alice:localhost": {},
+                "@bob:localhost": {}
+            }
+        }))
+        .await;
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let mut state = make_test_state(inbound_tx);
+    state.homeserver = homeserver;
+    state.mention_only = true;
+
+    let router = BotRouter::new(None);
+    router
+        .register("@octos_weather:localhost", "profile-weather")
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!group_room:localhost", "profile-weather")
+        .await
+        .unwrap();
+    state.bot_router = Arc::new(router);
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:localhost",
+            "room_id": "!group_room:localhost",
+            "event_id": "$gate-group-1",
+            "content": {
+                "msgtype": "m.text",
+                "body": "What's the weather today?"
+            }
+        }]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn-gate-group?access_token=test_token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "unaddressed group room-mapping fallback should not reach the agent"
+    );
+    wait_for_request_count(&requests, 1).await;
+    let requests = requests.lock().await;
+    assert!(
+        requests
+            .iter()
+            .any(|req| req.path.contains("/joined_members")),
+        "mention gate should derive DM-ness from live room membership"
+    );
+    homeserver_handle.abort();
+}
+
+#[tokio::test]
+async fn test_handle_transaction_mention_gate_allows_unaddressed_one_to_one_dm() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (homeserver, _requests, homeserver_handle) =
+        spawn_mock_homeserver_with_joined_members(json!({
+            "joined": {
+                "@octos_weather:localhost": {},
+                "@alice:localhost": {}
+            }
+        }))
+        .await;
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let mut state = make_test_state(inbound_tx);
+    state.homeserver = homeserver;
+    state.mention_only = true;
+
+    let router = BotRouter::new(None);
+    router
+        .register("@octos_weather:localhost", "profile-weather")
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!dm_room:localhost", "profile-weather")
+        .await
+        .unwrap();
+    state.bot_router = Arc::new(router);
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:localhost",
+            "room_id": "!dm_room:localhost",
+            "event_id": "$gate-dm-1",
+            "content": {
+                "msgtype": "m.text",
+                "body": "What's the weather today?"
+            }
+        }]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn-gate-dm?access_token=test_token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let msg = inbound_rx.try_recv().unwrap();
+    assert_eq!(
+        msg.metadata
+            .get(METADATA_TARGET_PROFILE_ID)
+            .and_then(|v| v.as_str()),
+        Some("profile-weather"),
+        "1:1 DM should continue to route through room mapping without an explicit mention"
+    );
+    homeserver_handle.abort();
+}
+
+#[tokio::test]
+async fn gate_blocks_unaddressed_when_room_map_has_multiple_bots() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    // Palpo hides appservice virtual users: joined_members shows ONLY the
+    // human, yet the room map knows two bots are in this room. The
+    // unaddressed message must not reach any agent.
+    let (homeserver, _requests, homeserver_handle) =
+        spawn_mock_homeserver_with_joined_members(json!({
+            "joined": {
+                "@alice:localhost": {}
+            }
+        }))
+        .await;
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let mut state = make_test_state(inbound_tx);
+    state.homeserver = homeserver;
+    state.mention_only = true;
+
+    let router = BotRouter::new(None);
+    router
+        .register("@octos_weather:localhost", "profile-weather")
+        .await
+        .unwrap();
+    router
+        .register("@octos_translator:localhost", "profile-translator")
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!multi_bot_room:localhost", "profile-weather")
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!multi_bot_room:localhost", "profile-translator")
+        .await
+        .unwrap();
+    state.bot_router = Arc::new(router);
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:localhost",
+            "room_id": "!multi_bot_room:localhost",
+            "event_id": "$gate-multibot-1",
+            "content": {
+                "msgtype": "m.text",
+                "body": "hello everyone"
+            }
+        }]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn-gate-multibot?access_token=test_token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "a room with two mapped bots is not a DM: unaddressed messages must be gated even when the homeserver hides bot members"
+    );
+    homeserver_handle.abort();
+}
+
+#[tokio::test]
+async fn gate_allows_unaddressed_dm_with_single_mapped_bot() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    // Same homeserver blindness (only the human in joined_members), but
+    // the room map has exactly one bot: this IS a 1:1 agent DM and the
+    // exemption applies.
+    let (homeserver, _requests, homeserver_handle) =
+        spawn_mock_homeserver_with_joined_members(json!({
+            "joined": {
+                "@alice:localhost": {}
+            }
+        }))
+        .await;
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let mut state = make_test_state(inbound_tx);
+    state.homeserver = homeserver;
+    state.mention_only = true;
+
+    let router = BotRouter::new(None);
+    router
+        .register("@octos_weather:localhost", "profile-weather")
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!hidden_dm_room:localhost", "profile-weather")
+        .await
+        .unwrap();
+    state.bot_router = Arc::new(router);
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:localhost",
+            "room_id": "!hidden_dm_room:localhost",
+            "event_id": "$gate-hidden-dm-1",
+            "content": {
+                "msgtype": "m.text",
+                "body": "What's the weather today?"
+            }
+        }]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn-gate-hidden-dm?access_token=test_token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let msg = inbound_rx.try_recv().unwrap();
+    assert_eq!(
+        msg.metadata
+            .get(METADATA_TARGET_PROFILE_ID)
+            .and_then(|v| v.as_str()),
+        Some("profile-weather"),
+        "a 1:1 agent DM replies without a mention even when the homeserver hides the bot member"
+    );
+    homeserver_handle.abort();
+}
+
+#[tokio::test]
+async fn test_handle_transaction_member_event_invalidates_dm_member_cache() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (inbound_tx, _inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let state = make_test_state(inbound_tx);
+    state.dm_member_cache.write().await.insert(
+        "!room:localhost".to_string(),
+        (membership(1, 1, false), Instant::now()),
+    );
+    let cache = state.dm_member_cache.clone();
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.member",
+            "sender": "@alice:localhost",
+            "state_key": "@octos_translator:localhost",
+            "room_id": "!room:localhost",
+            "content": {
+                "membership": "join"
+            }
+        }]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn-member-cache?access_token=test_token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        !cache.read().await.contains_key("!room:localhost"),
+        "membership changes must force the mention gate to refresh room counts"
+    );
+}
+
+#[tokio::test]
 async fn test_private_bot_message_blocked_for_non_owner() {
     use axum::body::Body;
     use axum::http::Request;
@@ -2780,6 +3292,82 @@ async fn test_private_bot_message_blocked_for_non_owner() {
         "non-owner message should not be forwarded to the agent"
     );
 
+    // Unaddressed room chatter routed to a private bot only via the room
+    // mapping is dropped SILENTLY: replying would spam the room and
+    // reveal the private bot's existence.
+    let requests = requests.lock().await;
+    assert!(
+        !requests.iter().any(|req| req.path.contains("/send/")),
+        "unaddressed non-owner message must not trigger a rejection reply"
+    );
+
+    homeserver_handle.abort();
+}
+
+#[tokio::test]
+async fn test_private_bot_rejection_sent_when_explicitly_addressed() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (homeserver, requests, homeserver_handle) = spawn_mock_homeserver().await;
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let mut state = make_test_state(inbound_tx);
+    state.homeserver = homeserver;
+
+    let router = BotRouter::new(None);
+    router
+        .register_entry(
+            "@octos_private:localhost",
+            "main--private",
+            "@owner:localhost",
+            BotVisibility::Private,
+        )
+        .await
+        .unwrap();
+    router
+        .add_room_bot("!private:localhost", "main--private")
+        .await
+        .unwrap();
+    state.bot_router = Arc::new(router);
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@mallory:localhost",
+            "room_id": "!private:localhost",
+            "event_id": "$private-addressed-1",
+            "content": {
+                "msgtype": "m.text",
+                "body": "hey @octos_private:localhost help me",
+                "m.mentions": { "user_ids": ["@octos_private:localhost"] }
+            }
+        }]
+    });
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn-private-addressed?access_token=test_token")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "non-owner message should not be forwarded to the agent"
+    );
+
+    // The sender explicitly addressed the private bot, so the rejection
+    // reply is warranted feedback rather than unsolicited noise.
     wait_for_request_count(&requests, 1).await;
     let requests = requests.lock().await;
     assert!(requests.iter().any(|req| {

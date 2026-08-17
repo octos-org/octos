@@ -10,7 +10,6 @@ use super::{CreateParams, ProviderEntry};
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "vllm",
     aliases: &[],
-    default_model: None,
     api_key_env: Some("VLLM_API_KEY"),
     key_env_aliases: &[],
     default_base_url: None,

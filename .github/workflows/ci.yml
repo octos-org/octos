@@ -451,6 +451,29 @@ jobs:
       - name: Goal completion verifier ledger evidence (octos-cli)
         run: cargo test -p octos-cli --features api -- completion_evidence goal_update_folds_ledger --nocapture
 
+      # #2019 human sink: the `background/activity` capability gate and the
+      # durable per-session replay both live in the `api`-gated ui_protocol
+      # module, so the unfeatured runs above never compile them — same reason
+      # as the §6 guard. The routing assertion itself is deliberately in
+      # non-gated `crate::autonomy` and DOES run in the unfeatured lib step;
+      # this covers the two halves that cannot.
+      - name: Background activity human sink (octos-cli)
+        run: cargo test -p octos-cli --features api background_activity -- --nocapture
+
+      # The smart_home/* WS methods are `api`-gated too, so the unfeatured
+      # integration run above compiles this file to zero tests. Run it
+      # explicitly: it is the only end-to-end coverage of the WS dispatch →
+      # bridge-config resolution → real HTTP bridge path.
+      - name: Smart-home WS e2e (octos-cli)
+        run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
+
+      # SKILL_CRATES only get `cargo build`ed by the bundle jobs — their
+      # tests never ran in CI. smart-home is the one with a real test
+      # suite (unit + binary-contract e2e against a mock bridge), so run
+      # it here where the build cache is already warm.
+      - name: Smart-home skill tests
+        run: cargo test -p smart-home
+
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
@@ -931,13 +954,18 @@ jobs:
           path: octos-bundle-x86_64-pc-windows-msvc.zip
           retention-days: 7
 
-  e2e-tool-regression:
-    runs-on: macos-14
-    needs: [check, test-octos-agent, test-octos-cli]
-    # Run on pushes to main and on every PR. The file-level detection below is
-    # the only filter — PR-title keyword matching used to gate this job, so a
-    # PR that changed tools without saying so in the title skipped e2e entirely.
+  # Change detection lives in its OWN job so that "nothing relevant changed"
+  # surfaces as a SKIPPED e2e check rather than a green one. Previously the
+  # filter set a step-level flag and every step carried
+  # `if: steps.changes.outputs.run == 'true'` — a job whose steps all skip
+  # still concludes SUCCESS, so `e2e-tool-regression: SUCCESS` was
+  # indistinguishable from "the suite ran and passed". It had not actually
+  # executed in any of the last 14 CI runs (#2015).
+  e2e-changes:
+    runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    outputs:
+      run: ${{ steps.changes.outputs.run }}
     steps:
       # fetch-depth: 0 is load-bearing: the diff below needs HEAD~1 (push) and
       # the PR base sha (pull_request). The default depth-1 checkout has
@@ -946,14 +974,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
 
       - name: Check for relevant changes
         id: changes
@@ -966,22 +986,53 @@ jobs:
           fi
           echo "Changed files:"
           echo "$FILES"
-          if echo "$FILES" | grep -qE '(activate_tools|sandbox|shell\.rs|tools/mod|session_actor|exec_env)'; then
+          # `.github/workflows/ci.yml` is in the list so that changes to THIS
+          # job are self-testing. Without it a PR that repairs the e2e gate
+          # cannot observe its own repair — the gate skips itself.
+          if echo "$FILES" | grep -qE '(activate_tools|sandbox|shell\.rs|tools/mod|session_actor|exec_env|\.github/workflows/ci\.yml)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+  e2e-tool-regression:
+    runs-on: macos-14
+    needs: [check, test-octos-agent, test-octos-cli, e2e-changes]
+    # Run on pushes to main and on every PR whose diff touches the paths in
+    # `e2e-changes`. PR-title keyword matching used to gate this job, so a PR
+    # that changed tools without saying so in the title skipped e2e entirely.
+    if: github.event_name != 'schedule' && needs.e2e-changes.outputs.run == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      # MUST precede the cargo build: the admin SPA is embedded into the
+      # binary at COMPILE time via `rust_embed::Embed` (api/static_files.rs),
+      # not read from disk at runtime, so building it afterwards has no
+      # effect. `crates/octos-cli/static/admin/` is gitignored by the
+      # ephemeral-bundle policy and `scripts/build-dashboard.sh` runs in the
+      # separate `dashboard` job, whose filesystem this job never sees.
+      # Without this, `/admin/login` answers 503 (static_files.rs:169), the
+      # setup-wizard readiness probe never gets its 2xx, and the whole suite
+      # fails on a six-minute timeout that has nothing to do with the diff
+      # under test (#2015).
+      - name: Build dashboard bundle (embedded at compile time)
+        run: ./scripts/build-dashboard.sh
+
       - name: Build octos with all features
-        if: steps.changes.outputs.run == 'true'
         run: cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 
       - name: Install Homebrew ffmpeg (macOS)
-        if: steps.changes.outputs.run == 'true'
         run: brew install ffmpeg
 
       - name: Start octos serve
-        if: steps.changes.outputs.run == 'true'
         run: |
           OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 &
           # Wait for server to be ready
@@ -994,12 +1045,23 @@ jobs:
           done
 
       - name: Install e2e deps
-        if: steps.changes.outputs.run == 'true'
         working-directory: e2e
         run: npm ci
 
+      # `npm ci` installs the @playwright/test PACKAGE but NOT the browser
+      # binaries. Several specs in this suite (dashboard/harness/swarm-gate)
+      # launch chrome-headless-shell, so without this step the job only passed
+      # when the runner happened to have a warm ~/Library/Caches/ms-playwright
+      # from an earlier run. Once that cache aged out, every run failed with
+      # `browserType.launch: Executable doesn't exist at
+      # .../chromium_headless_shell-*/chrome-headless-shell` — a green-vs-red
+      # coin flip decided by runner assignment, not by the diff under test.
+      # `install chromium` also fetches the headless shell.
+      - name: Install Playwright browsers
+        working-directory: e2e
+        run: npx playwright install chromium
+
       - name: Run e2e tool regression tests
-        if: steps.changes.outputs.run == 'true'
         working-directory: e2e
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line
 

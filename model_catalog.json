@@ -95,6 +95,7 @@
     {
       "provider": "anthropic/claude-sonnet-4-20250514",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -147,6 +148,7 @@
     {
       "provider": "dashscope/qwen-max",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -251,6 +253,7 @@
     {
       "provider": "deepseek/deepseek-v4-flash",
       "type": "fast",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -314,6 +317,7 @@
     {
       "provider": "gemini/gemini-2.5-flash",
       "type": "fast",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -390,6 +394,33 @@
       "max_output": 65536
     },
     {
+      "provider": "vertex/gemini-2.5-flash",
+      "type": "fast",
+      "default": true,
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.15,
+      "cost_out": 2.5,
+      "context_window": 1048576,
+      "max_output": 65536
+    },
+    {
+      "provider": "vertex/gemini-2.5-pro",
+      "type": "fast",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 1.25,
+      "cost_out": 10.0,
+      "context_window": 1048576,
+      "max_output": 65536
+    },
+    {
       "provider": "groq/gemma2-9b-it",
       "type": "strong",
       "stability": 1.0,
@@ -418,6 +449,7 @@
     {
       "provider": "groq/llama-3.3-70b-versatile",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -547,6 +579,7 @@
     {
       "provider": "minimax/MiniMax-M3",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -560,6 +593,7 @@
     {
       "provider": "moonshot/kimi-k2.5",
       "type": "fast",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -650,6 +684,7 @@
     {
       "provider": "nvidia/meta/llama-3.3-70b-instruct",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -806,6 +841,7 @@
     {
       "provider": "ollama/llama3.2",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -897,6 +933,7 @@
     {
       "provider": "openai/gpt-4o",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -1079,6 +1116,7 @@
     {
       "provider": "openrouter/anthropic/claude-sonnet-4-6",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -1560,6 +1598,7 @@
     {
       "provider": "r9s/claude-sonnet-4-6",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -1872,6 +1911,7 @@
     {
       "provider": "zai/glm-5-turbo",
       "type": "fast",
+      "default": true,
       "cost_in": 1.0,
       "cost_out": 0.4,
       "context_window": 200000,
@@ -1896,7 +1936,7 @@
       "max_output": 131072
     },
     {
-      "provider": "zai/glm-5.2",
+      "provider": "zai/glm-5.3",
       "type": "strong",
       "cost_in": 1.0,
       "cost_out": 4.0,
@@ -1963,6 +2003,7 @@
     {
       "provider": "zhipu/glm-4-plus",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -1989,6 +2030,7 @@
     {
       "provider": "moonshot-coding/k3",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
@@ -2029,8 +2071,9 @@
       ]
     },
     {
-      "provider": "zai-coding/glm-5.2",
+      "provider": "zai-coding/glm-5.3",
       "type": "strong",
+      "default": true,
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,

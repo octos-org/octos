@@ -425,6 +425,10 @@ impl std::fmt::Display for ModelType {
 
 /// Unified model catalog entry — single source of truth for model metadata + live QoS.
 ///
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Static fields (type, cost, ds_output) are loaded from `model_catalog.json`.
 /// Dynamic fields (stability, tool_avg_ms, p95_ms, score) are updated by the QoS scanner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +438,14 @@ pub struct ModelCatalogEntry {
     /// Model capability type.
     #[serde(rename = "type")]
     pub model_type: ModelType,
+    /// Whether this row is its provider family's default model — the model a
+    /// family resolves to when a profile names no model. Exactly one row per
+    /// family carries it; `registry::catalog_default_model` reads it.
+    ///
+    /// Skipped when false so the per-profile catalogs that `qos_catalog`
+    /// rewrites do not sprout `"default": false` on all 150-odd rows.
+    #[serde(default, rename = "default", skip_serializing_if = "is_false")]
+    pub is_family_default: bool,
     /// Tool call stability (0.0 to 1.0). Updated by QoS scanner.
     pub stability: f64,
     /// Average tool call latency in ms. Updated by QoS scanner.
@@ -1542,6 +1554,10 @@ impl AdaptiveRouter {
                 ModelCatalogEntry {
                     provider: format!("{}/{}", s.provider.provider_name(), s.provider.model_id()),
                     model_type: ModelType::from_u8(s.model_type.load(Ordering::Relaxed)),
+                    // A live QoS row describes observed behaviour, never which
+                    // model a family defaults to — that fact belongs only to
+                    // the canonical catalog.
+                    is_family_default: false,
                     stability,
                     tool_avg_ms,
                     p95_ms,

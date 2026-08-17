@@ -627,13 +627,15 @@ pub async fn auth_status(
         // explicit opt-in (a hosted Local-mode fleet daemon behind Caddy never
         // sets it), so the SPA never offers the no-password path there. See
         // `supports_local_solo_profile_create` / `crate::api::solo_auth`.
-        local_solo_enabled: crate::api::ui_protocol::supports_local_solo_profile_create(&state),
-        solo_profile_exists: if crate::api::ui_protocol::supports_local_solo_profile_create(&state)
-        {
-            Some(crate::api::solo_auth::resolve_solo_user(&state).is_some())
-        } else {
-            None
-        },
+        local_solo_enabled: crate::api::ui_protocol_transport::supports_local_solo_profile_create(
+            &state,
+        ),
+        solo_profile_exists:
+            if crate::api::ui_protocol_transport::supports_local_solo_profile_create(&state) {
+                Some(crate::api::solo_auth::resolve_solo_user(&state).is_some())
+            } else {
+                None
+            },
         scoped_profile,
     }))
 }
@@ -1508,6 +1510,15 @@ pub struct VoiceLeg {
     pub detail: String,
 }
 
+/// Readiness of the ASR leg, including which route the host resolves to.
+#[derive(Serialize)]
+pub struct VoiceAsrLeg {
+    pub ready: bool,
+    /// Effective route: `"external"` (`ASR_API_URL`) or `"ominix"`.
+    pub mode: String,
+    pub detail: String,
+}
+
 /// Readiness of the TTS leg, including which route the profile resolves to.
 #[derive(Serialize)]
 pub struct VoiceTtsLeg {
@@ -1522,9 +1533,62 @@ pub struct VoiceTtsLeg {
 pub struct VoiceReadiness {
     /// All legs ready → a voice turn can complete end to end.
     pub ready: bool,
-    pub asr: VoiceLeg,
+    pub asr: VoiceAsrLeg,
     pub llm: VoiceLeg,
     pub tts: VoiceTtsLeg,
+}
+
+async fn external_asr_readiness(client: &reqwest::Client, base_url: &str) -> VoiceAsrLeg {
+    let response = client
+        .get(format!("{}/health", base_url.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await;
+
+    match response {
+        Ok(response) if response.status().is_success() => VoiceAsrLeg {
+            ready: true,
+            mode: "external".into(),
+            detail: "External ASR ready".into(),
+        },
+        Ok(response)
+            if matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ) =>
+        {
+            VoiceAsrLeg {
+                ready: true,
+                mode: "external".into(),
+                detail: "External ASR configured (health endpoint not provided)".into(),
+            }
+        }
+        Ok(response) => VoiceAsrLeg {
+            ready: false,
+            mode: "external".into(),
+            detail: format!(
+                "External ASR health check returned HTTP {}",
+                response.status()
+            ),
+        },
+        Err(error) => VoiceAsrLeg {
+            ready: false,
+            mode: "external".into(),
+            detail: if error.is_timeout() {
+                "External ASR health check timed out".into()
+            } else {
+                "External ASR is unreachable".into()
+            },
+        },
+    }
+}
+
+fn voice_readiness_needs_ominix(
+    asr_route: &crate::skills_scope::AsrRoute,
+    tts_route: crate::api::voice_turn::TtsRoute,
+) -> bool {
+    matches!(asr_route, crate::skills_scope::AsrRoute::Ominix(_))
+        || tts_route == crate::api::voice_turn::TtsRoute::Local
 }
 
 const MAX_SPEECH_SYNTHESIS_CHARS: usize = 4_000;
@@ -1713,14 +1777,16 @@ pub(crate) async fn synthesize_speech(
         .map_err(|status| SpeechSynthesisError::new(status, "profile unavailable"))?;
     let _synthesis_permit = acquire_speech_synthesis_permit(&profile_id)?;
     consume_speech_synthesis_quota(&profile_id, text.chars().count())?;
-    let runtime =
-        crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id))
-            .ok_or_else(|| {
-                SpeechSynthesisError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "profile runtime unavailable",
-                )
-            })?;
+    let runtime = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+        &state,
+        Some(&profile_id),
+    )
+    .ok_or_else(|| {
+        SpeechSynthesisError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "profile runtime unavailable",
+        )
+    })?;
     let voice = crate::api::voices::resolve_reply_voice(&profile_id, &runtime.voice.default_voice);
     let output_dir = tempfile::tempdir().map_err(|error| {
         tracing::error!(%error, "failed to create speech synthesis temp directory");
@@ -1764,8 +1830,8 @@ pub(crate) async fn synthesize_speech(
 /// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
 ///
 /// Confirms the whole pipeline can run under THIS profile's current config:
-/// - **ASR**: on-device model ready. Always required — there is no cloud ASR
-///   route (only TTS has a cloud option), so ASR is on-device in every mode.
+/// - **ASR**: `ASR_API_URL` health when explicitly configured; otherwise the
+///   OMiniX ASR model.
 /// - **LLM**: the profile's provider chain is constructed (running runtime with
 ///   a named provider).
 /// - **TTS**: the *chosen* route is actually usable — cloud credentials resolve
@@ -1786,21 +1852,6 @@ pub async fn voice_readiness(
     let profile = resolve_my_profile(&identity, ps, &state, &headers)?;
     let profile_id = profile.id.clone();
 
-    // ── ASR leg (always on-device) ──
-    let runtime = crate::api::ominix_runtime::runtime_status(&state.http_client).await;
-    let health_healthy = runtime.health.healthy;
-    let asr_ok = crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
-    let asr = VoiceLeg {
-        ready: asr_ok,
-        detail: if asr_ok {
-            "On-device ASR ready".into()
-        } else if !health_healthy {
-            "Voice engine unavailable".into()
-        } else {
-            "On-device ASR model not ready".into()
-        },
-    };
-
     // ── LLM leg ──
     // The provider chain is built at bootstrap; a running runtime with a named
     // provider means the LLM is wired for this tenant. Resolve via the same
@@ -1808,7 +1859,10 @@ pub async fn voice_readiness(
     // runtimes (onboarding, `profile/llm/upsert`) that live outside
     // `state.profiles` — so readiness can't report "not started" while voice
     // turns actually work.
-    let rt = crate::api::ui_protocol::resolve_session_profile_runtime(&state, Some(&profile_id));
+    let rt = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+        &state,
+        Some(&profile_id),
+    );
     let llm = VoiceLeg {
         ready: rt
             .as_ref()
@@ -1827,7 +1881,42 @@ pub async fn voice_readiness(
         .map(|r| (r.voice.tts_provider.clone(), r.voice.cloud.clone()))
         .unwrap_or_else(|| ("auto".to_string(), None));
     let cloud_configured = crate::api::voice_turn::cloud_tts_configured(cloud.as_ref());
-    let tts = match crate::api::voice_turn::classify_tts_route(&provider, cloud_configured) {
+    let tts_route = crate::api::voice_turn::classify_tts_route(&provider, cloud_configured);
+    let asr_route = crate::skills_scope::discover_asr_route();
+    let ominix_runtime = if voice_readiness_needs_ominix(&asr_route, tts_route) {
+        Some(crate::api::ominix_runtime::runtime_status(&state.http_client).await)
+    } else {
+        None
+    };
+
+    // ── ASR leg (route-aware) ──
+    let asr = match &asr_route {
+        crate::skills_scope::AsrRoute::External(url) => {
+            external_asr_readiness(&state.http_client, url).await
+        }
+        crate::skills_scope::AsrRoute::Ominix(_) => {
+            let runtime = ominix_runtime
+                .as_ref()
+                .expect("OMiniX ASR route requires an OMiniX runtime probe");
+            let health_healthy = runtime.health.healthy;
+            let ready =
+                crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
+            VoiceAsrLeg {
+                ready,
+                mode: "ominix".into(),
+                detail: if ready {
+                    "OMiniX ASR ready".into()
+                } else if !health_healthy {
+                    "OMiniX voice engine unavailable".into()
+                } else {
+                    "OMiniX ASR model not ready".into()
+                },
+            }
+        }
+    };
+
+    // ── TTS leg (route-aware) ──
+    let tts = match tts_route {
         crate::api::voice_turn::TtsRoute::Cloud => VoiceTtsLeg {
             ready: cloud_configured,
             mode: "cloud".into(),
@@ -1838,6 +1927,10 @@ pub async fn voice_readiness(
             },
         },
         crate::api::voice_turn::TtsRoute::Local => {
+            let runtime = ominix_runtime
+                .as_ref()
+                .expect("local TTS route requires an OMiniX runtime probe");
+            let health_healthy = runtime.health.healthy;
             // The on-device leg needs the TTS MODEL itself: a ready ASR plus
             // a present voice with a missing GPT-SoVITS model would report
             // ready here and then fail inside `synthesize_reply`.
@@ -2920,7 +3013,7 @@ pub async fn delete_my_soul(
 
 // ── Content catalog endpoints ────────────────────────────────────────
 
-// Helper for `ui_protocol::handle_content_list` (M12 Phase D-5).
+// Helper for `ui_protocol_transport::handle_content_list` (M12 Phase D-5).
 // The REST route `GET /api/my/content` was retired in this milestone; the
 // function survives as a private helper that the WS dispatcher calls
 // directly to back the `content/list` RPC method. Downgraded to
@@ -3087,7 +3180,7 @@ pub async fn my_content_body(
     Ok(([(header::CONTENT_TYPE, content_type)], Body::from(data)).into_response())
 }
 
-// Helper for `ui_protocol::handle_content_delete` (M12 Phase D-5).
+// Helper for `ui_protocol_transport::handle_content_delete` (M12 Phase D-5).
 // The REST route `DELETE /api/my/content/{id}` was retired in this
 // milestone; the function survives as a private helper backing the
 // `content/delete` WS RPC method.
@@ -3133,7 +3226,7 @@ pub(super) struct BulkDeleteRequest {
     pub ids: Vec<String>,
 }
 
-// Helper for `ui_protocol::handle_content_bulk_delete` (M12 Phase D-5).
+// Helper for `ui_protocol_transport::handle_content_bulk_delete` (M12 Phase D-5).
 // The REST route `POST /api/my/content/bulk-delete` was retired in this
 // milestone; the function survives as a private helper backing the
 // `content/bulk_delete` WS RPC method.
@@ -4236,6 +4329,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_require_ominix_only_for_local_voice_legs() {
+        use crate::api::voice_turn::TtsRoute;
+        use crate::skills_scope::AsrRoute;
+
+        let external = AsrRoute::External("http://127.0.0.1:8093".to_string());
+        let ominix = AsrRoute::Ominix(Some("http://127.0.0.1:8081".to_string()));
+
+        assert!(!voice_readiness_needs_ominix(&external, TtsRoute::Cloud));
+        assert!(voice_readiness_needs_ominix(&external, TtsRoute::Local));
+        assert!(voice_readiness_needs_ominix(&ominix, TtsRoute::Cloud));
+        assert!(voice_readiness_needs_ominix(&ominix, TtsRoute::Local));
+    }
+
+    async fn external_asr_health_server(status: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..read]).starts_with("GET /health "),
+                "readiness must probe the external ASR health path"
+            );
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn should_accept_external_asr_when_health_check_succeeds() {
+        let url = external_asr_health_server("200 OK").await;
+        let leg = external_asr_readiness(&reqwest::Client::new(), &url).await;
+
+        assert!(leg.ready);
+        assert_eq!(leg.mode, "external");
+        assert_eq!(leg.detail, "External ASR ready");
+    }
+
+    #[tokio::test]
+    async fn should_accept_external_asr_when_health_endpoint_is_not_implemented() {
+        let url = external_asr_health_server("404 Not Found").await;
+        let leg = external_asr_readiness(&reqwest::Client::new(), &url).await;
+
+        assert!(leg.ready);
+        assert_eq!(leg.mode, "external");
+        assert!(leg.detail.contains("health endpoint not provided"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_external_asr_when_health_endpoint_reports_unavailable() {
+        let url = external_asr_health_server("503 Service Unavailable").await;
+        let leg = external_asr_readiness(&reqwest::Client::new(), &url).await;
+
+        assert!(!leg.ready);
+        assert_eq!(leg.mode, "external");
+        assert!(leg.detail.contains("HTTP 503"));
+    }
+
+    #[test]
     fn speech_synthesis_rejects_blank_and_oversized_text() {
         assert_eq!(
             validate_synthesis_text("  ").unwrap_err().status,
@@ -4915,6 +5073,7 @@ mod tests {
             user_prefix: "octos_".into(),
             port: 8009,
             allowed_senders: Vec::new(),
+            mention_only: true,
             mode: "user".into(),
             user_id: "@bot:example.org".into(),
             access_token: "syt_token".into(),
@@ -4947,6 +5106,7 @@ mod tests {
             user_prefix: "octos_".into(),
             port: 8009,
             allowed_senders: Vec::new(),
+            mention_only: true,
             mode: "user".into(),
             user_id: "@old:example.org".into(),
             access_token: "old_token".into(),
@@ -4990,6 +5150,7 @@ mod tests {
             user_prefix: "octos_".into(),
             port: 8009,
             allowed_senders: Vec::new(),
+            mention_only: true,
             mode: "user".into(),
             user_id: "@bot:example.org".into(),
             access_token: "syt_real_access_token".into(),
@@ -5035,6 +5196,7 @@ mod tests {
             user_prefix: "octos_".into(),
             port: 8009,
             allowed_senders: Vec::new(),
+            mention_only: true,
             mode: "user".into(),
             user_id: "@bot:example.org".into(),
             access_token: "syt_real_access_token".into(),

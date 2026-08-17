@@ -51,14 +51,11 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "api")]
-#[cfg(feature = "api")]
-use crate::api::agent_orchestrator::{
+use crate::autonomy::agent_orchestrator::{
     default_agent_orchestrator, run_goal_completion_verifier_with_usage,
     upsert_background_task_agent,
 };
-#[cfg(feature = "api")]
-use crate::api::master_continuation_scheduler::{
+use crate::autonomy::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
 };
 use crate::config::QueueMode;
@@ -131,6 +128,23 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
+
+/// #2003 — how often a running turn re-stamps its in-flight marker, gated on
+/// the turn actually producing tokens. Comfortably under
+/// `IN_FLIGHT_STALE_AFTER_MS` (30 min) so a producing turn is never a single
+/// missed beat away from being judged abandoned, while being far too coarse to
+/// matter for contention.
+const IN_FLIGHT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Abort a spawned task when this guard drops, so a helper task cannot outlive
+/// the turn that owns it on ANY exit path (return, error, cancellation).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Bound actor inbox send/ack waits for background terminal delivery.
 const BACKGROUND_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -355,7 +369,7 @@ fn context_manager_status_value(manager: &ContextManager) -> serde_json::Value {
 
 fn publish_context_manager_status(session_key: &SessionKey, manager: &ContextManager) {
     #[cfg(feature = "api")]
-    crate::api::ui_protocol::update_session_context_status(
+    crate::api::ui_protocol_transport::update_session_context_status(
         session_key,
         context_manager_status_value(manager),
     );
@@ -539,7 +553,7 @@ fn record_prompt_messages_not_covered_by_context(
             continue;
         }
         // Mirror of the same exemption in
-        // `api::ui_protocol::record_prompt_messages_not_covered_by_context`:
+        // `api::ui_protocol_transport::record_prompt_messages_not_covered_by_context`:
         // skip System messages. The agent's runtime System prompt is
         // re-composed on every turn and prepended fresh to
         // `messages[0]`; recording it here makes the manager stack one
@@ -719,7 +733,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
 
         // Capture runtime System once per turn at TurnStart, reuse on
         // every Iteration. See the AppUI analogue in
-        // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+        // `api::ui_protocol_transport::AppUiPromptContextBridge::prepare_prompt`
         // for the duplication concern that motivates the cache.
         if request.phase == PromptContextPhase::TurnStart {
             scratch.runtime_system = messages
@@ -743,7 +757,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             // multi-System payloads produced here would reach the
             // provider unmerged. Anthropic in particular rejects them
             // outright. See the AppUI analogue in
-            // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // `api::ui_protocol_transport::AppUiPromptContextBridge::prepare_prompt`
             // for the rationale.
             match messages.first_mut() {
                 Some(first) if first.role == MessageRole::System => {
@@ -1744,7 +1758,6 @@ fn forward_task_status_to_actor_inbox(
     // `upsert_background_task_agent` resolves the right profile here; the
     // AppUI/serve bare-key path threads its runtime profile explicitly
     // (see `forward_task_progress_to_channel`).
-    #[cfg(feature = "api")]
     let _ = upsert_background_task_agent(task, None);
 
     let task_json = sanitize_task_for_response(data_dir, task);
@@ -3353,9 +3366,8 @@ impl ActorFactory {
         // Gateway session keys carry the profile (`profile:channel:chat`), so
         // `None` lets the key-derived profile resolve inside the router —
         // matching `forward_task_status_to_actor_inbox`'s `None` call.
-        #[cfg(feature = "api")]
         supervisor.set_on_terminal(move |event| {
-            crate::api::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
                 event,
                 None,
                 // Gateway: failure recovery stays on the `RecoveryHint` inbox
@@ -3366,7 +3378,7 @@ impl ActorFactory {
                 // collapses against the legacy on_change ChildCompleted via
                 // the step-3 dedupe key). Step 4 retires RecoveryHint and
                 // flips this to `Queue`.
-                crate::api::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
+                crate::autonomy::agent_orchestrator::TerminalFailureRouting::LegacyChannel,
             );
         });
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
@@ -4332,7 +4344,6 @@ pub(crate) fn format_failover_push(event: &FailoverEvent) -> String {
     )
 }
 
-#[cfg(feature = "api")]
 fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
     match reason {
         MasterContinuationReason::ChildCompleted => "child_completed",
@@ -4345,7 +4356,7 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
 }
 
 /// Canonicalized (codex HIGH): delegate to the single renderer in
-/// [`crate::api::agent_orchestrator::master_continuation_prompt`] so both
+/// [`crate::autonomy::agent_orchestrator::master_continuation_prompt`] so both
 /// continuation-render paths — the AppUI / WS path and this SessionActor
 /// gateway path — emit byte-identical prompts.
 ///
@@ -4356,9 +4367,8 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
 /// canonical renderer closes by escaping and fencing the objective and
 /// dropping it from the raw metadata. Forwarding eliminates the drift and
 /// prevents it from recurring (the two renderers can no longer diverge).
-#[cfg(feature = "api")]
 fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
-    crate::api::agent_orchestrator::master_continuation_prompt(continuation)
+    crate::autonomy::agent_orchestrator::master_continuation_prompt(continuation)
 }
 
 // ── SessionActor ────────────────────────────────────────────────────────────
@@ -4502,10 +4512,8 @@ struct SessionActor {
 
     /// #1935 — the INDEPENDENT goal-completion verifier lane, threaded from
     /// [`ActorFactory::goal_verifier_llm`]. Read by the goal accountant
-    /// (`maybe_advance_goal_runtime_after_turn`), which is `api`-gated like
-    /// the goal machinery itself — hence the `allow(dead_code)` when the
-    /// crate builds without the `api` feature.
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    /// (`maybe_advance_goal_runtime_after_turn`), which — like the rest of
+    /// the goal machinery in [`crate::autonomy`] — compiles unconditionally.
     goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
 }
 
@@ -4900,7 +4908,6 @@ impl SessionActor {
         }
     }
 
-    #[cfg(feature = "api")]
     fn synthetic_master_continuation_inbound(
         &self,
         continuation: &QueuedMasterContinuation,
@@ -4929,7 +4936,6 @@ impl SessionActor {
         }
     }
 
-    #[cfg(feature = "api")]
     async fn drain_master_continuations(&mut self) -> bool {
         let runtime_state = if self.active_overflow_tasks.load(Ordering::Acquire) > 0 {
             MasterContinuationRuntimeState::busy()
@@ -5092,7 +5098,6 @@ impl SessionActor {
     /// response's input+output tokens — the same per-turn total the AppUI
     /// dispatch path attributes). Passing 0 here previously let the token
     /// budget gate never trip, so a goal recurred past its token budget.
-    #[cfg(feature = "api")]
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
         profile_id: &str,
@@ -5199,15 +5204,10 @@ impl SessionActor {
         // entry idle gate so a goal turn that filled the inbox does not
         // immediately enqueue another goal turn ahead of pending user
         // input.
-        let idle_state = crate::api::goal_loop_runtime::RuntimeIdleState::idle()
+        let idle_state = crate::autonomy::goal_loop_runtime::RuntimeIdleState::idle()
             .with_user_input_pending(!self.inbox.is_empty());
         let _ =
             orchestrator.maybe_enqueue_goal_after_turn(&self.session_key, profile_id, idle_state);
-    }
-
-    #[cfg(not(feature = "api"))]
-    async fn drain_master_continuations(&mut self) -> bool {
-        false
     }
 
     // ── Phase 4: human-approval bridge (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
@@ -7648,7 +7648,7 @@ impl SessionActor {
                             &history_for_agent,
                             media,
                             attachments,
-                            &tracker,
+                            std::sync::Arc::clone(&tracker),
                         ),
                     ),
                 ),
@@ -9365,6 +9365,46 @@ impl SessionActor {
         // (a `None` stamp would leak failovers to every concurrent
         // session on a shared profile-scoped router), so we MUST set it
         // here.
+        // #2003 — keep this session's in-flight marker fresh WHILE the turn is
+        // genuinely producing, so a legitimately long turn is never mistaken
+        // for an abandoned one and un-protected mid-flight.
+        //
+        // The refresh is gated on OBSERVABLE PROGRESS (the shared TokenTracker
+        // advancing), not on the turn merely existing. A plain timer would keep
+        // re-stamping in exactly the case the staleness horizon is for — a turn
+        // wedged forever awaiting something that never resolves — and would
+        // silently revert #2004. A turn that has stopped producing tokens stops
+        // being refreshed and ages out normally.
+        //
+        // `touch_goal_dispatch_in_flight` is a no-op when this session has no
+        // marker (an ordinary interactive turn), so this costs nothing there.
+        // Refresh gated on the turn's own LLM work PRODUCING. The other proof
+        // of life — this session having non-terminal background-task agents,
+        // i.e. a turn blocked awaiting sub-agents, which emits no tokens at all
+        // — is evaluated inside `is_goal_dispatch_in_flight` itself, next to
+        // the marker, because the orchestrator already receives that state via
+        // `upsert_background_task_agent` and needs no plumbing to see it.
+        let in_flight_heartbeat = {
+            let tracker = Arc::clone(&token_tracker);
+            let session_key = self.session_key.clone();
+            tokio::spawn(async move {
+                use std::sync::atomic::Ordering as AtomicOrdering;
+                let mut last = 0_u64;
+                loop {
+                    tokio::time::sleep(IN_FLIGHT_HEARTBEAT_INTERVAL).await;
+                    let seen = u64::from(tracker.input_tokens.load(AtomicOrdering::Relaxed))
+                        + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
+                    if seen > last {
+                        last = seen;
+                        default_agent_orchestrator().touch_goal_dispatch_in_flight(&session_key);
+                    }
+                }
+            })
+        };
+        // Abort on EVERY exit path from the turn below (including error and
+        // cancellation) — the guard drops with the enclosing scope.
+        let _in_flight_heartbeat = AbortOnDrop(in_flight_heartbeat);
+
         let llm_start = Instant::now();
         let result = octos_llm::with_router_context(
             octos_llm::RouterContext {
@@ -9382,7 +9422,7 @@ impl SessionActor {
                         attachment_prompt,
                         Self::inbound_live_video(&inbound),
                     ),
-                    &token_tracker,
+                    std::sync::Arc::clone(&token_tracker),
                 ),
             ),
         )

@@ -23,7 +23,7 @@
 //!   buffered unboundedly), the regex filter, the stream batch window,
 //!   process-group reaping, and the watcher task lifecycle
 //!   (arm / disarm / reconcile).
-//! - The ORCHESTRATOR ([`crate::api::agent_orchestrator`]) owns the
+//! - The ORCHESTRATOR ([`crate::autonomy::agent_orchestrator`]) owns the
 //!   DURABLE side through the [`MonitorSink`] seam: poll change-dedupe
 //!   (persisted `last_emit_hash`), the per-hour flood accountant +
 //!   auto-pause, supervisor-store persistence, the continuation enqueue,
@@ -379,7 +379,7 @@ fn monitor_notes_paths(
     data_dir: &std::path::Path,
     session_id: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
-    let safe_session = crate::api::ui_protocol::hash_session_for_inbox(session_id);
+    let safe_session = crate::autonomy::hash_session_for_inbox(session_id);
     let inbox = data_dir.join("inbox");
     (
         inbox.join(format!("{safe_session}.monitor-notes")),
