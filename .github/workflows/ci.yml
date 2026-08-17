@@ -1032,21 +1032,26 @@ jobs:
       - name: Install Homebrew ffmpeg (macOS)
         run: brew install ffmpeg
 
+      # #2031 — the four ffmpeg/PATH specs in `tool-use-regression.spec.ts`
+      # drive `POST /api/admin/shell`, and that route is registered ONLY when
+      # `allow_admin_shell` is true (api/router.rs). It defaults to false and
+      # nothing in CI ever set it, so every one of those requests answered
+      # 404 `{"error":"not_found"}`. `res.json()` on that body has no
+      # `exit_code` field, which is why the failures read
+      # `expect(result.exit_code).toBe(0) // Received: undefined` — an absent
+      # route, not a missing binary and not a PATH problem.
+      #
+      # This is a full-RCE endpoint, so it is enabled here and nowhere else:
+      # an ephemeral runner, bound to loopback, behind an admin token. Do not
+      # copy this config to anything long-lived.
+      - name: Write CI serve config (enables the admin shell endpoint)
+        run: |
+          echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
+
       - name: Start octos serve
         run: |
-          # #2031 — the suite asserts the AGENT's shell tool can reach Homebrew
-          # binaries (`ffmpeg version N`, and `/opt/homebrew/bin` present on
-          # PATH). The agent inherits its environment from THIS process, so the
-          # install step passing proves only that the RUNNER has ffmpeg — not
-          # that serve, and therefore the agent, can see it. Set the prefix
-          # explicitly rather than trusting the image's default PATH.
-          export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-          # Recorded so a future failure shows what serve actually inherited,
-          # instead of leaving the next reader to infer it from a green install
-          # step — which is exactly how this stayed misdiagnosed.
-          echo "serve PATH: $PATH"
-          command -v ffmpeg || echo "WARNING: ffmpeg not on serve's PATH"
-          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 &
+          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
+            --config /tmp/octos-ci-serve.json &
           # Wait for server to be ready
           for i in $(seq 1 30); do
             if curl -sf http://localhost:3000/api/status -H "Authorization: Bearer ci-test-token" > /dev/null 2>&1; then
@@ -1055,6 +1060,23 @@ jobs:
             fi
             sleep 1
           done
+
+      # Fail loudly at the precondition rather than inside four assertions that
+      # each report it as `undefined`. If this step ever 404s again, the config
+      # above stopped taking effect — that is a different bug from ffmpeg being
+      # absent, and the two were conflated for long enough to be worth naming.
+      - name: Verify the admin shell endpoint is live
+        run: |
+          body=$(curl -s -w '\n%{http_code}' -X POST http://localhost:3000/api/admin/shell \
+            -H "Authorization: Bearer ci-test-token" \
+            -H 'Content-Type: application/json' \
+            -d '{"command":"command -v ffmpeg"}')
+          code=$(echo "$body" | tail -1)
+          echo "$body" | sed '$d'
+          if [ "$code" != "200" ]; then
+            echo "::error::/api/admin/shell answered HTTP $code — expected 200."
+            exit 1
+          fi
 
       - name: Install e2e deps
         working-directory: e2e
@@ -1132,14 +1154,16 @@ jobs:
       - name: Install Homebrew ffmpeg (macOS)
         run: brew install ffmpeg
 
+      # Same `allow_admin_shell` config as the required job (#2031) — this job
+      # runs the full tree, which includes the admin-shell specs.
+      - name: Write CI serve config (enables the admin shell endpoint)
+        run: |
+          echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
+
       - name: Start octos serve
         run: |
-          # Same environment fix as the required job (#2031): the agent inherits
-          # its PATH from serve, so the install step alone is not enough.
-          export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-          echo "serve PATH: $PATH"
-          command -v ffmpeg || echo "WARNING: ffmpeg not on serve's PATH"
-          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 &
+          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
+            --config /tmp/octos-ci-serve.json &
           for i in $(seq 1 30); do
             if curl -sf http://localhost:3000/api/status -H "Authorization: Bearer ci-test-token" > /dev/null 2>&1; then
               echo "Server ready after ${i}s"
