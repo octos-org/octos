@@ -443,6 +443,15 @@ jobs:
       - name: Peer staging + worktree fencing (octos-cli)
         run: cargo test -p octos-cli --features api peer
 
+      # `commands::serve::tests` matched NONE of the filters on this list, so
+      # its guards had not executed in CI since #1728 — long enough for
+      # `global_drain_spawns_before_the_stdio_early_return` to go red on main
+      # unnoticed (its source-scan needle carried the pre-rename module path).
+      # A filter that matches nothing reports `ok`, so absent coverage is
+      # indistinguishable from passing coverage; see #2029 for the general fix.
+      - name: serve wiring guards (octos-cli)
+        run: cargo test -p octos-cli --features api commands::serve::tests
+
       # The goal-completion verifier's ledger-evidence fold lives in the
       # `api`-gated goal_tool module, so the unfeatured runs above never compile
       # it. Guards the peer-goal convergence fix (#1989): a genuinely-complete
