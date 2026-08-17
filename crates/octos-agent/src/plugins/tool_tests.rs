@@ -3077,6 +3077,49 @@ async fn plugin_uses_scope_workspace_when_present() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
+async fn plugin_exposes_session_workspace_separately_from_output_work_dir() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let skill_output = workspace.path().join("skill-output");
+    std::fs::create_dir_all(&skill_output).expect("skill output");
+
+    let bin_dir = tempfile::tempdir().expect("bin dir");
+    let script_path = bin_dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nprintf '{\"output\":\"%s|%s\",\"success\":true}' \"$OCTOS_WORK_DIR\" \"$OCTOS_SESSION_WORKSPACE\"\n",
+    );
+
+    let tool = PluginTool::new(
+        "plug".into(),
+        make_tool_def("session_roots", "echo session roots"),
+        script_path,
+    )
+    .with_work_dir(skill_output.clone())
+    .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let ctx = ctx_with_scope(solo_scope_at(workspace.path()));
+    let result = crate::tools::TOOL_CTX
+        .scope(ctx, tool.execute(&json!({})))
+        .await
+        .expect("execute should succeed");
+
+    assert!(result.success);
+    let (actual_output, actual_workspace) = result
+        .output
+        .trim()
+        .split_once('|')
+        .expect("plugin should echo both roots");
+    assert_eq!(
+        std::fs::canonicalize(actual_output).unwrap(),
+        std::fs::canonicalize(skill_output).unwrap(),
+    );
+    assert_eq!(
+        std::fs::canonicalize(actual_workspace).unwrap(),
+        std::fs::canonicalize(workspace.path()).unwrap(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
 async fn high_risk_plugin_approval_cwd_reflects_scope_workspace() {
     // Codex P3 pin (Phase 2-B): the approval prompt's `cwd` field
     // must reflect the directory the plugin will ACTUALLY run in,

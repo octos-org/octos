@@ -2716,6 +2716,19 @@ impl Tool for PluginTool {
             cmd.env("OCTOS_WORK_DIR", dir);
         }
 
+        // The plugin output directory and the session workspace are different
+        // roots in a normal session (`<workspace>/skill-output` versus
+        // `<workspace>`). Inputs materialized by the host are relative to the
+        // latter, so expose it explicitly instead of making plugins infer it
+        // by walking to the parent of `OCTOS_WORK_DIR`.
+        if let Some(workspace) = ctx
+            .as_ref()
+            .and_then(|ctx| ctx.session_scope.as_deref())
+            .map(SessionScope::workspace)
+        {
+            cmd.env("OCTOS_SESSION_WORKSPACE", workspace);
+        }
+
         // Codex round-3 BLOCKER fix (PR #1186 review): when
         // `prepare_effective_args` -> `rewrite_workspace_file_args` ->
         // `resolve_plugin_input_path` rejects a path with `..`
