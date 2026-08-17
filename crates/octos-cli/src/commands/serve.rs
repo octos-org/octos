@@ -1994,13 +1994,25 @@ mod tests {
             "spawn_global_master_continuation_drain{}",
             "(state.clone());"
         );
-        let stdio_needle = format!("ui_protocol::stdio_connection{}", "(state)");
+        // Anchor on the CALL, not on the module path that reaches it. The
+        // original needle was `ui_protocol::stdio_connection(state)`; #1728
+        // renamed the module to `ui_protocol_transport`, so the needle stopped
+        // matching, `find` returned `None`, and this guard has been failing
+        // ever since — unnoticed, because CI's api-feature steps are a list of
+        // hand-written name filters and `commands::serve::tests::*` matches
+        // none of them (#2029). Dropping the module prefix makes the anchor
+        // survive a rename while still pinning the one call that matters.
+        let stdio_needle = format!("::stdio_connection{}", "(state)");
         let spawn_at = src
             .find(&spawn_needle)
             .expect("the global drain spawn call must exist in serve.rs");
-        let stdio_at = src
-            .find(&stdio_needle)
-            .expect("the stdio connection call must exist in serve.rs");
+        let stdio_at = src.find(&stdio_needle).unwrap_or_else(|| {
+            panic!(
+                "the stdio connection call must exist in serve.rs — if it was \
+                 renamed, update `stdio_needle` rather than deleting this guard: \
+                 it is the only thing pinning the drain BEFORE the early return"
+            )
+        });
         assert!(
             spawn_at < stdio_at,
             "the global master-continuation drain must be spawned BEFORE the stdio \

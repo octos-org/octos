@@ -7,13 +7,20 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::time::{Duration, SystemTime};
 
-/// codex DO-NOT-SHIP TOCTOU window: the WS spawn_only-failure recovery fires
-/// the legacy `on_failure` enqueue and the unified `on_terminal` enqueue
-/// SEQUENTIALLY inside one `mark_failed` (microseconds apart). Both carry the
-/// identical `external/spawn_only_failure/<session>/<task>` dedupe key. If the
-/// AppUI continuation tick drains the first enqueue before the second runs,
-/// the key has already left `pending_by_key` so the existing dedupe misses and
-/// one terminal transition would produce TWO recovery turns.
+/// codex DO-NOT-SHIP TOCTOU window: spawn_only-failure recovery fires the
+/// `on_failure` enqueue and the unified `on_terminal` enqueue SEQUENTIALLY
+/// inside one `mark_failed` (microseconds apart). Both carry the identical
+/// `external/spawn_only_failure/<session>/<task>` dedupe key. If the
+/// continuation tick drains the first enqueue before the second runs, the key
+/// has already left `pending_by_key` so the existing dedupe misses and one
+/// terminal transition would produce TWO recovery turns.
+///
+/// #2020 widened the blast radius rather than closing it: retiring the
+/// gateway's `ActorMessage::RecoveryHint` inbox put the GATEWAY on this same
+/// two-producer queue, so this guard is now load-bearing for both runtime
+/// modes, not just the WS path it was written for. `on_failure` cannot simply
+/// be deleted in favour of `on_terminal` alone — it is the ONLY delivery for a
+/// fail-before-ack failure, which `on_terminal` prompt-suppresses.
 ///
 /// The recently-claimed guard records the moment an `External` continuation is
 /// claimed (drained/popped) and rejects a re-enqueue of the SAME key inside
@@ -1192,15 +1199,20 @@ mod tests {
         assert!(scheduler.is_empty());
     }
 
-    /// codex DO-NOT-SHIP TOCTOU: the WS spawn_only-failure recovery fires
-    /// the legacy `on_failure` enqueue and the unified `on_terminal` enqueue
+    /// codex DO-NOT-SHIP TOCTOU: spawn_only-failure recovery fires the
+    /// `on_failure` enqueue and the unified `on_terminal` enqueue
     /// SEQUENTIALLY (not atomically) inside one `mark_failed`. Both use the
     /// IDENTICAL `external/spawn_only_failure/<session>/<task>` dedupe key.
-    /// If the AppUI continuation tick DRAINS the first enqueue before the
+    /// If the continuation tick DRAINS the first enqueue before the
     /// second one runs, the pending-map dedupe misses (the key already left
     /// `pending_by_key`) and ONE terminal transition produces TWO recovery
     /// turns. The recently-claimed guard rejects the re-enqueue of a key that
     /// was claimed moments ago within the same transition window.
+    ///
+    /// #2020 note: this property is unchanged by retiring the gateway's
+    /// `RecoveryHint` inbox — that migration puts the gateway on this SAME
+    /// two-producer queue, so the interleaving pinned below now describes
+    /// both runtime modes.
     #[test]
     fn recent_claim_guard_collapses_drain_between_two_spawn_only_failure_enqueues() {
         let mut scheduler = MasterContinuationScheduler::new();
