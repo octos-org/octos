@@ -14827,44 +14827,83 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<Own
     let mut owned = Vec::new();
     for entry in read_dir.flatten() {
         let slug = entry.file_name().to_string_lossy().into_owned();
-        // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
-        // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
-        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+        let Some((originator, peer)) = read_owned_peer_entry(peers_root, slug) else {
             continue;
         };
-        // Retired peer: neither blocks nor keeps the fleet alive.
-        if peer_io::peer_regular_file_exists(&dir, "closed") {
+        // Originator gate — only peers THIS master staged.
+        if originator != master {
             continue;
         }
-        // Originator gate — only peers THIS master staged. After the atomic
-        // owner-before-brief write in `stage_peer`, a visible (brief.md) member
-        // always has a readable originator, so a member of THIS master is never
-        // silently dropped from the ownership scan.
-        let Some(originator) =
-            peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
-        else {
-            continue;
-        };
-        if originator.trim() != master {
-            continue;
-        }
-        let has_result = peer_io::peer_regular_file_exists(&dir, "result.md");
-        // #2024: how many rounds this peer has DELIVERED. Versioned results
-        // (`result-<n>.md`) have existed since #435, but a peer whose result
-        // predates them has only the bare `result.md` — floor it at 1 so it
-        // can still exceed a mark of 0 and synthesize at all.
-        let round = if has_result {
-            crate::peers::count_peer_result_versions(&dir).max(1)
-        } else {
-            0
-        };
-        owned.push(OwnedPeer {
+        owned.push(peer);
+    }
+    Some(owned)
+}
+
+/// Read ONE `peers/<slug>` entry as `(originating master, fleet inputs)`, or
+/// `None` when it is not a live owned peer.
+///
+/// Single definition of "owned", shared by the per-master scan
+/// ([`collect_owned_peer_results`]) and the boot-time all-fleets scan
+/// ([`collect_peer_fleets_by_master`]) so the two can never disagree about
+/// which peers a fleet has — a divergence would let the boot sweep judge a
+/// fleet against a different membership than the turn-terminal edges do.
+fn read_owned_peer_entry(peers_root: &Path, slug: String) -> Option<(String, OwnedPeer)> {
+    // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
+    // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
+    let dir = staged_peer_dir(peers_root, &slug)?;
+    // Retired peer: neither blocks nor keeps the fleet alive.
+    if peer_io::peer_regular_file_exists(&dir, "closed") {
+        return None;
+    }
+    // After the atomic owner-before-brief write in `stage_peer`, a visible
+    // (brief.md) member always has a readable originator, so a member of a
+    // master's fleet is never silently dropped from the ownership scan.
+    let originator =
+        peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)?;
+    let has_result = peer_io::peer_regular_file_exists(&dir, "result.md");
+    // #2024: how many rounds this peer has DELIVERED. Versioned results
+    // (`result-<n>.md`) have existed since #435, but a peer whose result
+    // predates them has only the bare `result.md` — floor it at 1 so it
+    // can still exceed a mark of 0 and synthesize at all.
+    let round = if has_result {
+        crate::peers::count_peer_result_versions(&dir).max(1)
+    } else {
+        0
+    };
+    Some((
+        originator.trim().to_owned(),
+        OwnedPeer {
             slug,
             has_result,
             round,
-        });
+        },
+    ))
+}
+
+/// Every live peer under `peers_root`, grouped by the master that staged it.
+///
+/// The inverse of [`collect_owned_peer_results`], which needs the master up
+/// front. The boot sweep (#2033) has no master to start from — nothing is
+/// terminating, there is no session in hand — so it discovers the fleets from
+/// the directory itself, in ONE scan rather than one scan per candidate master.
+///
+/// Same fail-closed contract: `None` when `peers/` cannot be READ, so a
+/// transient scan error is never mistaken for "no fleets".
+fn collect_peer_fleets_by_master(peers_root: &Path) -> Option<HashMap<String, Vec<OwnedPeer>>> {
+    let read_dir = std::fs::read_dir(peers_root).ok()?;
+    let mut fleets: HashMap<String, Vec<OwnedPeer>> = HashMap::new();
+    for entry in read_dir.flatten() {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let Some((originator, peer)) = read_owned_peer_entry(peers_root, slug) else {
+            continue;
+        };
+        // An empty originator names no master; it can never be evaluated.
+        if originator.is_empty() {
+            continue;
+        }
+        fleets.entry(originator).or_default().push(peer);
     }
-    Some(owned)
+    Some(fleets)
 }
 
 /// Peer-fleet auto-synthesis hook. Called at a PEER session's turn terminal
@@ -15120,6 +15159,110 @@ async fn evaluate_and_enqueue_fleet_synthesis(
             );
         }
     }
+}
+
+/// True when `master`'s fleet has a peer whose DELIVERED round is past what the
+/// stamp records as summarized — i.e. a synthesis is OWED for this fleet.
+///
+/// Deliberately the freshness half of [`evaluate_peer_fleet_synthesis`] and
+/// nothing else: it is a cheap pre-filter, not a second gate. Idle/settled/done
+/// are re-decided by the real evaluation, which is the only thing allowed to
+/// fire. A [`Legacy`](FleetSynthesisMarks::Legacy) record reads every peer as
+/// covered at its current round, so an unparseable stamp is never owed — the
+/// same fail-closed posture the gate takes.
+fn peer_fleet_synthesis_is_owed(marks: &FleetSynthesisMarks, peers: &[OwnedPeer]) -> bool {
+    peers
+        .iter()
+        .any(|peer| peer.round > synthesized_round_for(marks, &peer.slug, peer.round))
+}
+
+/// The `exclude_session` the BOOT sweep passes to the shared evaluation.
+///
+/// Every other caller is a session whose turn is terminating right now and so
+/// must not count against idle/settled. At boot NOTHING is terminating, so
+/// nothing may be excluded. A session key is always `<profile>:<channel>:<id>`,
+/// so the empty key can never name a real session and removing it from the
+/// live-turn set is a guaranteed no-op — which is exactly the intent.
+fn boot_sweep_exclude_session() -> SessionKey {
+    SessionKey(String::new())
+}
+
+/// #2033 — BOOT-TIME evaluation of owed peer-fleet synthesis, for one profile.
+/// Returns how many fleets were evaluated (i.e. how many were owed).
+///
+/// The synthesis gate is EDGE-triggered: [`evaluate_and_enqueue_fleet_synthesis`]
+/// is reached from exactly two edges, a PEER turn terminal and a MASTER turn
+/// terminal. That is sound *within* a process — a deduped enqueue deliberately
+/// holds the marks back (#2024) and the in-flight continuation's own terminal is
+/// the guaranteed retry edge. A process restart is what has no edge at all: when
+/// the owed round's retry edge was still in the future at the moment the process
+/// died, the new process has nothing that recomputes the gate.
+///
+/// Observed live (mini5 soak, #2033): a peer's round-2 terminal landed while a
+/// round-1 synthesis was in flight, so the enqueue deduped and the marks stayed
+/// at round 1; the serve was killed before that continuation reached terminal.
+/// After the restart the master session sat for 220s with the round still
+/// unsynthesized, and one trivial master turn advanced it in 3s. The peer's last
+/// round of work is written up only if the user happens to type again — on a
+/// quiet fleet, never.
+///
+/// This is the missing boot edge, and it is the boot-resume precedent already
+/// applied to restart-stranded fleet-kernel fleets
+/// ([`crate::autonomy::fleet_wake::enqueue_fleet_boot_resume_wakes`]) and to
+/// persisted monitors: recompute at startup what only an event would otherwise
+/// recompute.
+///
+/// BOUNDED, not a poll. One `peers/` scan per profile at startup, then the real
+/// evaluation ONLY for fleets whose delivered round is past their recorded mark.
+/// Fleets with nothing new pay a mark read and no more, and the turn-terminal
+/// edges are untouched — no tick, no re-arm-on-dedupe, no per-tick scan.
+///
+/// Enqueue-only: the continuation is drained by the same
+/// `spawn_global_master_continuation_drain` / per-connection tick as any other,
+/// under the same workspace-known gate. So a master session that has not been
+/// opened this process run defers until it is — which is the observed case
+/// (the user opens the master, then waits), and it fires on the next drain tick
+/// instead of never.
+pub(crate) async fn enqueue_boot_owed_peer_fleet_synthesis(
+    profile_id: &str,
+    peers_root: &Path,
+) -> usize {
+    // Cheap early-out: a profile that has never staged a peer has no fleets.
+    if !peers_root.is_dir() {
+        return 0;
+    }
+    // FAIL-CLOSED, as everywhere else on this path: an unreadable `peers/` is
+    // "can't determine", not "no fleets".
+    let Some(fleets) = collect_peer_fleets_by_master(peers_root) else {
+        tracing::warn!(
+            profile = profile_id,
+            peers_root = %peers_root.display(),
+            "boot peer-fleet synthesis sweep: peers/ unreadable; skipping this profile"
+        );
+        return 0;
+    };
+    let exclude = boot_sweep_exclude_session();
+    let mut evaluated = 0usize;
+    for (master, peers) in fleets {
+        let marks = read_peer_fleet_synthesis_marks(peers_root, &master);
+        if !peer_fleet_synthesis_is_owed(&marks, &peers) {
+            continue;
+        }
+        evaluated += 1;
+        // Hand off to the SAME evaluation the two turn-terminal edges use — it
+        // re-reads the fleet, re-checks master-idle/settled, and owns the
+        // exactly-once marks write. The boot sweep only decides WHO to look at.
+        evaluate_and_enqueue_fleet_synthesis(profile_id, peers_root, &master, &exclude).await;
+    }
+    if evaluated > 0 {
+        tracing::info!(
+            profile = profile_id,
+            fleets = evaluated,
+            "boot peer-fleet synthesis sweep: re-evaluated fleets whose last round was \
+             left unsynthesized when the previous process exited"
+        );
+    }
+    evaluated
 }
 
 /// Serializes profile `sub_providers` read-modify-write across concurrent
