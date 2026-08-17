@@ -1646,13 +1646,48 @@ impl SessionContextStatusStore {
 /// All terminal-event emission sites must lock the state, observe `Active` or
 /// `Interrupting`, and atomically transition to `Terminal(_)` before sending.
 /// Any path that sees a `Terminal(_)` state is a no-op (lost the race).
+/// What caused a turn to be interrupted.
+///
+/// The turn runtime reports this to the client on `turn/error`, so it has to
+/// name the ACTUAL cause. `peer_close` deliberately aborts the closed peer's
+/// in-flight turn over the same `interrupt_tx` path `turn/interrupt` uses
+/// (see `interrupt_closed_peer_turn`), and the message was hardcoded to
+/// "interrupted by client" — so a peer whose review was aborted mid-flight
+/// reported an interrupt from a client that had sent nothing, pointing an
+/// investigator at the wrong subsystem. Observed live: a peer three tool calls
+/// into a 550-line review, closed by its master, blamed the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptOrigin {
+    /// `turn/interrupt` from the connected client.
+    Client,
+    /// `peer_close` retired the peer while this turn was still running.
+    PeerClose,
+}
+
+impl InterruptOrigin {
+    /// The `turn/error` message for this origin.
+    fn message(self) -> &'static str {
+        match self {
+            Self::Client => "turn interrupted by client",
+            Self::PeerClose => {
+                "turn interrupted by peer_close — the peer was retired while this \
+                 turn was still running, so its in-flight work was discarded"
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TurnState {
     /// Turn is running normally; eligible for interrupt.
     Active,
     /// Handler captured an interrupt request and is waiting for the task to
-    /// emit the terminal event and signal `ack`.
-    Interrupting { ack: oneshot::Sender<()> },
+    /// emit the terminal event and signal `ack`. `origin` records WHO asked, so
+    /// the terminal event can name the real cause.
+    Interrupting {
+        ack: oneshot::Sender<()>,
+        origin: InterruptOrigin,
+    },
     /// Terminal state — exactly one terminal event has been emitted.
     Terminal(TerminalReason),
 }
@@ -12940,6 +12975,57 @@ mod peer_finding_evidence_tests {
 }
 
 #[cfg(test)]
+mod peer_interrupt_attribution_tests {
+    use super::*;
+
+    /// An interrupt must name its real cause on the wire.
+    ///
+    /// `peer_close` deliberately aborts the closed peer's in-flight turn over
+    /// the same `interrupt_tx` path `turn/interrupt` uses, and the terminal
+    /// message was hardcoded "turn interrupted by client". Observed live: a
+    /// peer three `read_file` calls into a 550-line security review was closed
+    /// by its master and reported an interrupt from a client that had sent
+    /// nothing — which sends an investigator straight at the wrong subsystem.
+    #[test]
+    fn peer_close_and_client_interrupts_report_different_causes() {
+        let client = InterruptOrigin::Client.message();
+        let peer_close = InterruptOrigin::PeerClose.message();
+
+        assert_ne!(
+            client, peer_close,
+            "the two origins must be distinguishable on the wire — one message \
+             for both is what made a peer_close abort look like a client action"
+        );
+        assert!(
+            peer_close.contains("peer_close"),
+            "the peer-close message must NAME peer_close so the reader can find \
+             the cause: {peer_close}"
+        );
+        assert!(
+            !peer_close.contains("by client"),
+            "the peer-close message must not blame the client: {peer_close}"
+        );
+        assert!(
+            client.contains("client"),
+            "a genuine client interrupt still reads as one: {client}"
+        );
+    }
+
+    /// A peer closed while WORKING loses that turn's output — the message says
+    /// so, because the tokens are already spent and the master will have to
+    /// re-dispatch (it re-staged the review as `-v2` in the live run).
+    #[test]
+    fn the_peer_close_message_says_in_flight_work_was_discarded() {
+        let message = InterruptOrigin::PeerClose.message();
+        assert!(
+            message.contains("discarded") || message.contains("still running"),
+            "closing a working peer destroys in-flight work; the terminal event \
+             is the only place a client learns that: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod peer_awaiting_wake_tests {
     use super::*;
     use crate::autonomy::agent_orchestrator::PEER_AWAITING_INPUT_EXTERNAL_KIND;
@@ -14134,7 +14220,12 @@ fn interrupt_closed_peer_turn(profile_id: &str, slug: &str) {
     let slug = slug.to_owned();
     runtime.spawn(async move {
         let active_turns = active_turns_registry();
-        let outcome = interrupt_active_turn_for_session(&active_turns, &peer_session).await;
+        let outcome = interrupt_active_turn_for_session(
+            &active_turns,
+            &peer_session,
+            InterruptOrigin::PeerClose,
+        )
+        .await;
         tracing::debug!(
             slug = %slug,
             session = %peer_session,
@@ -14736,44 +14827,83 @@ fn collect_owned_peer_results(peers_root: &Path, master: &str) -> Option<Vec<Own
     let mut owned = Vec::new();
     for entry in read_dir.flatten() {
         let slug = entry.file_name().to_string_lossy().into_owned();
-        // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
-        // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
-        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+        let Some((originator, peer)) = read_owned_peer_entry(peers_root, slug) else {
             continue;
         };
-        // Retired peer: neither blocks nor keeps the fleet alive.
-        if peer_io::peer_regular_file_exists(&dir, "closed") {
+        // Originator gate — only peers THIS master staged.
+        if originator != master {
             continue;
         }
-        // Originator gate — only peers THIS master staged. After the atomic
-        // owner-before-brief write in `stage_peer`, a visible (brief.md) member
-        // always has a readable originator, so a member of THIS master is never
-        // silently dropped from the ownership scan.
-        let Some(originator) =
-            peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
-        else {
-            continue;
-        };
-        if originator.trim() != master {
-            continue;
-        }
-        let has_result = peer_io::peer_regular_file_exists(&dir, "result.md");
-        // #2024: how many rounds this peer has DELIVERED. Versioned results
-        // (`result-<n>.md`) have existed since #435, but a peer whose result
-        // predates them has only the bare `result.md` — floor it at 1 so it
-        // can still exceed a mark of 0 and synthesize at all.
-        let round = if has_result {
-            crate::peers::count_peer_result_versions(&dir).max(1)
-        } else {
-            0
-        };
-        owned.push(OwnedPeer {
+        owned.push(peer);
+    }
+    Some(owned)
+}
+
+/// Read ONE `peers/<slug>` entry as `(originating master, fleet inputs)`, or
+/// `None` when it is not a live owned peer.
+///
+/// Single definition of "owned", shared by the per-master scan
+/// ([`collect_owned_peer_results`]) and the boot-time all-fleets scan
+/// ([`collect_peer_fleets_by_master`]) so the two can never disagree about
+/// which peers a fleet has — a divergence would let the boot sweep judge a
+/// fleet against a different membership than the turn-terminal edges do.
+fn read_owned_peer_entry(peers_root: &Path, slug: String) -> Option<(String, OwnedPeer)> {
+    // Route through `staged_peer_dir`: a symlinked / unsafe slug is never
+    // followed, and the `.synthesized-*` stamp files (not dirs) are skipped.
+    let dir = staged_peer_dir(peers_root, &slug)?;
+    // Retired peer: neither blocks nor keeps the fleet alive.
+    if peer_io::peer_regular_file_exists(&dir, "closed") {
+        return None;
+    }
+    // After the atomic owner-before-brief write in `stage_peer`, a visible
+    // (brief.md) member always has a readable originator, so a member of a
+    // master's fleet is never silently dropped from the ownership scan.
+    let originator =
+        peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)?;
+    let has_result = peer_io::peer_regular_file_exists(&dir, "result.md");
+    // #2024: how many rounds this peer has DELIVERED. Versioned results
+    // (`result-<n>.md`) have existed since #435, but a peer whose result
+    // predates them has only the bare `result.md` — floor it at 1 so it
+    // can still exceed a mark of 0 and synthesize at all.
+    let round = if has_result {
+        crate::peers::count_peer_result_versions(&dir).max(1)
+    } else {
+        0
+    };
+    Some((
+        originator.trim().to_owned(),
+        OwnedPeer {
             slug,
             has_result,
             round,
-        });
+        },
+    ))
+}
+
+/// Every live peer under `peers_root`, grouped by the master that staged it.
+///
+/// The inverse of [`collect_owned_peer_results`], which needs the master up
+/// front. The boot sweep (#2033) has no master to start from — nothing is
+/// terminating, there is no session in hand — so it discovers the fleets from
+/// the directory itself, in ONE scan rather than one scan per candidate master.
+///
+/// Same fail-closed contract: `None` when `peers/` cannot be READ, so a
+/// transient scan error is never mistaken for "no fleets".
+fn collect_peer_fleets_by_master(peers_root: &Path) -> Option<HashMap<String, Vec<OwnedPeer>>> {
+    let read_dir = std::fs::read_dir(peers_root).ok()?;
+    let mut fleets: HashMap<String, Vec<OwnedPeer>> = HashMap::new();
+    for entry in read_dir.flatten() {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let Some((originator, peer)) = read_owned_peer_entry(peers_root, slug) else {
+            continue;
+        };
+        // An empty originator names no master; it can never be evaluated.
+        if originator.is_empty() {
+            continue;
+        }
+        fleets.entry(originator).or_default().push(peer);
     }
-    Some(owned)
+    Some(fleets)
 }
 
 /// Peer-fleet auto-synthesis hook. Called at a PEER session's turn terminal
@@ -15029,6 +15159,110 @@ async fn evaluate_and_enqueue_fleet_synthesis(
             );
         }
     }
+}
+
+/// True when `master`'s fleet has a peer whose DELIVERED round is past what the
+/// stamp records as summarized — i.e. a synthesis is OWED for this fleet.
+///
+/// Deliberately the freshness half of [`evaluate_peer_fleet_synthesis`] and
+/// nothing else: it is a cheap pre-filter, not a second gate. Idle/settled/done
+/// are re-decided by the real evaluation, which is the only thing allowed to
+/// fire. A [`Legacy`](FleetSynthesisMarks::Legacy) record reads every peer as
+/// covered at its current round, so an unparseable stamp is never owed — the
+/// same fail-closed posture the gate takes.
+fn peer_fleet_synthesis_is_owed(marks: &FleetSynthesisMarks, peers: &[OwnedPeer]) -> bool {
+    peers
+        .iter()
+        .any(|peer| peer.round > synthesized_round_for(marks, &peer.slug, peer.round))
+}
+
+/// The `exclude_session` the BOOT sweep passes to the shared evaluation.
+///
+/// Every other caller is a session whose turn is terminating right now and so
+/// must not count against idle/settled. At boot NOTHING is terminating, so
+/// nothing may be excluded. A session key is always `<profile>:<channel>:<id>`,
+/// so the empty key can never name a real session and removing it from the
+/// live-turn set is a guaranteed no-op — which is exactly the intent.
+fn boot_sweep_exclude_session() -> SessionKey {
+    SessionKey(String::new())
+}
+
+/// #2033 — BOOT-TIME evaluation of owed peer-fleet synthesis, for one profile.
+/// Returns how many fleets were evaluated (i.e. how many were owed).
+///
+/// The synthesis gate is EDGE-triggered: [`evaluate_and_enqueue_fleet_synthesis`]
+/// is reached from exactly two edges, a PEER turn terminal and a MASTER turn
+/// terminal. That is sound *within* a process — a deduped enqueue deliberately
+/// holds the marks back (#2024) and the in-flight continuation's own terminal is
+/// the guaranteed retry edge. A process restart is what has no edge at all: when
+/// the owed round's retry edge was still in the future at the moment the process
+/// died, the new process has nothing that recomputes the gate.
+///
+/// Observed live (mini5 soak, #2033): a peer's round-2 terminal landed while a
+/// round-1 synthesis was in flight, so the enqueue deduped and the marks stayed
+/// at round 1; the serve was killed before that continuation reached terminal.
+/// After the restart the master session sat for 220s with the round still
+/// unsynthesized, and one trivial master turn advanced it in 3s. The peer's last
+/// round of work is written up only if the user happens to type again — on a
+/// quiet fleet, never.
+///
+/// This is the missing boot edge, and it is the boot-resume precedent already
+/// applied to restart-stranded fleet-kernel fleets
+/// ([`crate::autonomy::fleet_wake::enqueue_fleet_boot_resume_wakes`]) and to
+/// persisted monitors: recompute at startup what only an event would otherwise
+/// recompute.
+///
+/// BOUNDED, not a poll. One `peers/` scan per profile at startup, then the real
+/// evaluation ONLY for fleets whose delivered round is past their recorded mark.
+/// Fleets with nothing new pay a mark read and no more, and the turn-terminal
+/// edges are untouched — no tick, no re-arm-on-dedupe, no per-tick scan.
+///
+/// Enqueue-only: the continuation is drained by the same
+/// `spawn_global_master_continuation_drain` / per-connection tick as any other,
+/// under the same workspace-known gate. So a master session that has not been
+/// opened this process run defers until it is — which is the observed case
+/// (the user opens the master, then waits), and it fires on the next drain tick
+/// instead of never.
+pub(crate) async fn enqueue_boot_owed_peer_fleet_synthesis(
+    profile_id: &str,
+    peers_root: &Path,
+) -> usize {
+    // Cheap early-out: a profile that has never staged a peer has no fleets.
+    if !peers_root.is_dir() {
+        return 0;
+    }
+    // FAIL-CLOSED, as everywhere else on this path: an unreadable `peers/` is
+    // "can't determine", not "no fleets".
+    let Some(fleets) = collect_peer_fleets_by_master(peers_root) else {
+        tracing::warn!(
+            profile = profile_id,
+            peers_root = %peers_root.display(),
+            "boot peer-fleet synthesis sweep: peers/ unreadable; skipping this profile"
+        );
+        return 0;
+    };
+    let exclude = boot_sweep_exclude_session();
+    let mut evaluated = 0usize;
+    for (master, peers) in fleets {
+        let marks = read_peer_fleet_synthesis_marks(peers_root, &master);
+        if !peer_fleet_synthesis_is_owed(&marks, &peers) {
+            continue;
+        }
+        evaluated += 1;
+        // Hand off to the SAME evaluation the two turn-terminal edges use — it
+        // re-reads the fleet, re-checks master-idle/settled, and owns the
+        // exactly-once marks write. The boot sweep only decides WHO to look at.
+        evaluate_and_enqueue_fleet_synthesis(profile_id, peers_root, &master, &exclude).await;
+    }
+    if evaluated > 0 {
+        tracing::info!(
+            profile = profile_id,
+            fleets = evaluated,
+            "boot peer-fleet synthesis sweep: re-evaluated fleets whose last round was \
+             left unsynthesized when the previous process exited"
+        );
+    }
+    evaluated
 }
 
 /// Serializes profile `sub_providers` read-modify-write across concurrent
@@ -20497,7 +20731,7 @@ async fn decide_interrupt(
     let state_arc = active.state.clone();
     let interrupt_tx_arc = active.interrupt_tx.clone();
     drop(registry);
-    capture_turn_interrupt(state_arc, interrupt_tx_arc).await
+    capture_turn_interrupt(state_arc, interrupt_tx_arc, InterruptOrigin::Client).await
 }
 
 /// #1842(a) — interrupt WHATEVER turn is currently in flight for `session_id`,
@@ -20512,6 +20746,7 @@ async fn decide_interrupt(
 async fn interrupt_active_turn_for_session(
     active_turns: &SharedActiveTurns,
     session_id: &SessionKey,
+    origin: InterruptOrigin,
 ) -> InterruptOutcome {
     let registry = active_turns.lock().await;
     let Some(active) = registry.get(session_id) else {
@@ -20520,7 +20755,7 @@ async fn interrupt_active_turn_for_session(
     let state_arc = active.state.clone();
     let interrupt_tx_arc = active.interrupt_tx.clone();
     drop(registry);
-    capture_turn_interrupt(state_arc, interrupt_tx_arc).await
+    capture_turn_interrupt(state_arc, interrupt_tx_arc, origin).await
 }
 
 /// The interrupt CAPTURE routine shared by `turn/interrupt` and the #1842(a)
@@ -20531,9 +20766,23 @@ async fn interrupt_active_turn_for_session(
 /// inside `run_standalone_turn` is gated on this same mutex via
 /// `try_emit_terminal`, so the two paths can't both transition `Active` → a
 /// terminal state.
+/// The origin captured when this turn was interrupted.
+///
+/// Read BEFORE `try_emit_terminal`, which takes the same state lock. Defaults
+/// to `Client` for any non-`Interrupting` state: the only callers are on the
+/// interrupt path, so a race that already moved the state is reported as the
+/// common case rather than mislabelled `PeerClose`.
+async fn captured_interrupt_origin(state: &Arc<TokioMutex<TurnState>>) -> InterruptOrigin {
+    match &*state.lock().await {
+        TurnState::Interrupting { origin, .. } => *origin,
+        _ => InterruptOrigin::Client,
+    }
+}
+
 async fn capture_turn_interrupt(
     state_arc: Arc<TokioMutex<TurnState>>,
     interrupt_tx_arc: Arc<TokioMutex<Option<mpsc::Sender<()>>>>,
+    origin: InterruptOrigin,
 ) -> InterruptOutcome {
     let mut state = state_arc.lock().await;
     match &*state {
@@ -20541,7 +20790,10 @@ async fn capture_turn_interrupt(
         TurnState::Interrupting { .. } => InterruptOutcome::AlreadyInterrupting,
         TurnState::Active => {
             let (ack_tx, ack_rx) = oneshot::channel();
-            *state = TurnState::Interrupting { ack: ack_tx };
+            *state = TurnState::Interrupting {
+                ack: ack_tx,
+                origin,
+            };
             drop(state);
             // Best-effort signal — capacity-1 channel; sending fails only if
             // the receiver has already been dropped (turn task is gone). Even
@@ -25995,7 +26247,10 @@ async fn run_m9_fixture_turn(
                 &ledger,
                 &session_id,
                 &turn_id,
-                Some(("interrupted", "turn interrupted by client")),
+                Some((
+                    "interrupted",
+                    captured_interrupt_origin(&turn_state).await.message(),
+                )),
                 None,
             )
             .await;
@@ -32385,7 +32640,10 @@ async fn run_standalone_turn(
             &ledger,
             &session_id,
             &turn_id,
-            Some(("interrupted", "turn interrupted by client")),
+            Some((
+                "interrupted",
+                captured_interrupt_origin(&turn_state).await.message(),
+            )),
             None,
         )
         .await;
@@ -33261,7 +33519,7 @@ async fn transition_to_terminal(
     let mut state = turn_state.lock().await;
     let (reason, ack) = match std::mem::replace(&mut *state, TurnState::Active) {
         TurnState::Active => (expected, None),
-        TurnState::Interrupting { ack } => (TerminalReason::Interrupted, Some(ack)),
+        TurnState::Interrupting { ack, .. } => (TerminalReason::Interrupted, Some(ack)),
         TurnState::Terminal(prior) => {
             *state = TurnState::Terminal(prior);
             return None;
