@@ -2305,7 +2305,7 @@ async fn run_task_with_m8_9_recovery(
 
 /// Build the synthetic `[system-internal]` instruction the spawn-task
 /// recovery wrapper sends after a first-pass failure. The shape mirrors
-/// `session_actor::build_recovery_prompt` but operates on the
+/// `session_actor::build_recovery_prompt_body` but operates on the
 /// pre-LLM task description (we don't have a tool_input here).
 fn build_spawn_recovery_prompt(task_desc: &str, error_message: &str) -> String {
     format!(
