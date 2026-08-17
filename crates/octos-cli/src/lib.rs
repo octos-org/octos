@@ -25,6 +25,9 @@ pub mod auth;
 // full `dead_code` enforcement.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod autonomy;
+/// task-sysinfo-proc-stat-fd-budget: the one place the metrics `sysinfo::System`
+/// is constructed (handle cache off, no startup process snapshot).
+pub(crate) mod sysinfo_budget;
 pub use octos_services::cli_agent_adapter;
 pub mod commands;
 pub use octos_services::compaction;

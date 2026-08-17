@@ -1851,7 +1851,9 @@ pub async fn system_metrics(
     let include_procs = params.get("procs").map(|v| v == "1").unwrap_or(false);
 
     let mut sys = state.sysinfo.lock().await;
-    sys.refresh_all();
+    // task-sysinfo-proc-stat-fd-budget: refresh only what this endpoint
+    // renders; processes (without per-thread tasks) only when asked for.
+    crate::sysinfo_budget::refresh_metrics(&mut sys, include_procs);
 
     // CPU info
     let cpu_count = sys.cpus().len();
