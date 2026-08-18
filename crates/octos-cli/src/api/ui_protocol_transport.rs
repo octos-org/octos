@@ -19981,6 +19981,10 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 // enqueued under; the post-turn accountant must charge THAT
                 // record, not the plain wire id.
                 goal_session_key: SessionKey(continuation.session_id.as_str().to_owned()),
+                bound_goal_id: continuation
+                    .goal_id
+                    .as_ref()
+                    .map(|goal_id| goal_id.as_str().to_owned()),
             })
         }
         _ => None,
@@ -20024,15 +20028,63 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // or returns through an early terminal path. The Drop becomes
         // the single canonical clear-point (codex P2 re-review #5).
         //
-        // GoalWrapUp doesn't go through this guard because the
-        // goal is already `budget_limited` — `due_loop_targets`'s
-        // goal sweep already excludes non-active goals, and the
-        // pending-queue sweep handles wrap-up via #1141's path.
+        // #2066 round 2 (codex R2 — the round-1 root defect): the claim is
+        // now an ATOMIC TRY-claim, not the unconditional mark. The old
+        // `goal_dispatch_in_flight_guard` INSERTED over whatever marker
+        // existed — so a `/goal clear` that claimed the slot (or another
+        // dispatcher's live turn) in the gap between this path's pre-drain
+        // check and this spawned task was silently overwritten, and the turn
+        // launched from state being destroyed with its charge landing
+        // nowhere (the clear saw the slot free, so no settle tombstone was
+        // parked). Now: (1) try-claim — if the slot is held, the launch
+        // ABORTS without emitting anything; (2) after claiming, RE-CHECK
+        // that the goal record still exists and is the same incarnation the
+        // continuation was enqueued for — a clear that already claimed,
+        // stamped and released leaves the goal gone, and launching the
+        // drained prompt anyway would run a turn for a deleted goal. Both
+        // aborts stamp the internal turn slot Terminal (no wire event was
+        // emitted for this turn yet — the client never saw it) so the
+        // session's `active_turns` slot frees for the next dispatch, and
+        // mark the continuation completed so a restart never replays it.
         let _in_flight_guard = if let Some(ref ctx) = goal_context_for_appui {
             let session_key = SessionKey(continuation.session_id.as_str().to_owned());
+            let Some(guard) = default_agent_orchestrator().try_claim_goal_in_flight(&session_key)
+            else {
+                info!(
+                    session = %params.session_id,
+                    continuation_id = continuation.id.as_u64(),
+                    "goal dispatch slot already claimed (another turn or a clear \
+                     in progress); aborting this launch"
+                );
+                *turn_state_for_task.lock().await = TurnState::Terminal(TerminalReason::Completed);
+                default_agent_orchestrator().mark_continuation_completed(
+                    &continuation,
+                    Some("dispatch_slot_claimed_launch_aborted".to_owned()),
+                );
+                return;
+            };
+            if !default_agent_orchestrator().goal_dispatch_target_matches(
+                &session_key,
+                &ctx.profile_id,
+                ctx.bound_goal_id.as_deref(),
+            ) {
+                info!(
+                    session = %params.session_id,
+                    continuation_id = continuation.id.as_u64(),
+                    "goal was cleared/replaced between drain and claim; \
+                     aborting this launch"
+                );
+                *turn_state_for_task.lock().await = TurnState::Terminal(TerminalReason::Completed);
+                default_agent_orchestrator().mark_continuation_completed(
+                    &continuation,
+                    Some("goal_removed_before_launch".to_owned()),
+                );
+                // The claim guard drops here, releasing the slot.
+                return;
+            }
             default_agent_orchestrator()
                 .record_goal_dispatch_timestamp_only(&session_key, &ctx.profile_id);
-            Some(default_agent_orchestrator().goal_dispatch_in_flight_guard(session_key))
+            Some(guard)
         } else {
             None
         };
@@ -28601,6 +28653,14 @@ struct GoalContinuationContext {
     /// A goal turn would charge nothing (the wire key finds no scoped goal) and
     /// recur forever without ever hitting its budget.
     goal_session_key: SessionKey,
+    /// #2066 round 2 (codex R1c/R2) — the goal identity this continuation was
+    /// enqueued under (`QueuedMasterContinuation::goal_id`). Used twice: the
+    /// post-claim dispatch recheck refuses to launch when the live goal is no
+    /// longer this incarnation, and the post-turn accountant charges
+    /// goal-id-bound so a mid-turn clear(+recreate) settles the cleared
+    /// goal's tombstone instead of the replacement. `None` for legacy
+    /// persisted continuations without a stamped goal id.
+    bound_goal_id: Option<String>,
 }
 
 /// #1134 — pick the LAST non-empty assistant row after `pre` from a
@@ -33465,6 +33525,10 @@ async fn run_standalone_turn(
         if let Some(snapshot) = orchestrator.record_goal_turn(
             goal_key,
             &goal_ctx.profile_id,
+            // #2066 round 2 (codex R1c) — goal-id-bound charge: a mid-turn
+            // clear(+recreate) settles the cleared goal's tombstone, never
+            // the replacement goal.
+            goal_ctx.bound_goal_id.as_deref(),
             final_tokens_consumed,
             elapsed_seconds,
         ) {
