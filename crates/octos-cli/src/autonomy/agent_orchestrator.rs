@@ -786,17 +786,28 @@ const PROVISIONAL_CORRECTION_RETENTION: std::time::Duration =
 /// #2055 review round 3 — bounded retry budget for a settle whose ledger
 /// write failed (BUSY exhaustion, transient I/O). Cancellation emits exactly
 /// one change event, so without a retry a transient failure left the row
-/// `running` forever; five attempts with capped exponential backoff cover
+/// `running` forever; five attempts with exponential backoff cover
 /// multi-second contention without unbounded queues.
 const GOAL_TASK_SETTLE_ATTEMPTS: u32 = 5;
 
-/// Capped exponential backoff for the settle retry chain: 100ms, 200ms,
-/// 400ms, 800ms — capped at 2s.
+/// Exponential backoff for the settle retry chain. With
+/// [`GOAL_TASK_SETTLE_ATTEMPTS`] = 5 the reachable waits are 100ms, 200ms,
+/// 400ms, and 800ms (a failure at attempt N schedules attempt N+1 after
+/// `backoff(N)`; attempt 4's failure exhausts the budget, so the 2s cap
+/// below is reached only if the attempt budget is ever raised).
 fn goal_task_settle_backoff(attempt: u32) -> std::time::Duration {
     let base = std::time::Duration::from_millis(100);
     let capped = base.saturating_mul(1u32 << attempt.min(4));
     capped.min(std::time::Duration::from_secs(2))
 }
+
+/// #2055 review round 4 — settle blocking-core entries, visible to the
+/// contention tests so they can assert that the retry chain actually fired
+/// (the counter is process-global across parallel tests, so assertions are
+/// on DELTAS with `>=`).
+#[cfg(test)]
+pub(crate) static GOAL_TASK_SETTLE_ATTEMPT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// #2055/#2054 — everything the ledger I/O for one task's row needs, captured
 /// at registration-stash time so BOTH the offloaded row creation and any
@@ -811,11 +822,19 @@ struct GoalTaskLedgerBinding {
     assigned_peer: Option<String>,
     profile_data_dir: PathBuf,
     /// `None` while the task is live (or its settle is still retrying);
-    /// stamped when a provisional-failed settle SUCCEEDS and the binding is
-    /// retained purely as the correction window — the purge deadline
-    /// ([`PROVISIONAL_CORRECTION_RETENTION`]) applies only to that state, so
-    /// a legitimately long-running task can never be purged mid-flight.
+    /// stamped ONCE when a provisional-failed settle first SUCCEEDS and the
+    /// binding is retained purely as the correction window — the purge
+    /// deadline ([`PROVISIONAL_CORRECTION_RETENTION`]) applies only to that
+    /// state, so a legitimately long-running task can never be purged
+    /// mid-flight, and a redelivery no-op never refreshes the clock.
     retained_since: Option<std::time::Instant>,
+    /// #2055 review round 4 — chain-staleness fence. A settle chain captures
+    /// the generation it was started under and re-checks presence AND
+    /// generation immediately before EVERY write attempt; a re-registration
+    /// re-stashes with a bumped generation, and removal (success or purge)
+    /// deletes the entry, so a stale chain dies at its next check instead of
+    /// writing after its sleep.
+    generation: u64,
 }
 
 impl GoalTaskLedgerBinding {
@@ -5749,21 +5768,31 @@ impl InProcessAgentOrchestrator {
         // is the agent id. Every other kind has no peer identity.
         let assigned_peer = (task.tool_name == "native_agent" && !task.tool_call_id.is_empty())
             .then(|| task.tool_call_id.clone());
-        let binding = GoalTaskLedgerBinding {
+        let mut binding = GoalTaskLedgerBinding {
             goal_row,
             title: task.tool_name.clone(),
             assigned_peer,
             profile_data_dir: profile_data_dir.to_path_buf(),
             retained_since: None,
+            generation: 0,
         };
         // Stash BEFORE the offload so a terminal racing in can already
         // resolve the binding; the settle write sequence converges with the
-        // creation in either order.
-        self.shared
-            .goal_task_ledger_bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(task.id.clone(), binding.clone());
+        // creation in either order. A re-stash over an existing entry bumps
+        // the generation so any settle chain started under the old entry
+        // dies at its next pre-write check.
+        {
+            let mut bindings = self
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            binding.generation = bindings
+                .get(&task.id)
+                .map(|existing| existing.generation + 1)
+                .unwrap_or(0);
+            bindings.insert(task.id.clone(), binding.clone());
+        }
         let task_id = task.id.clone();
         offload_goal_ledger_io(move || {
             Self::record_goal_task_row_blocking(&binding, &task_id);
@@ -5831,10 +5860,10 @@ impl InProcessAgentOrchestrator {
     /// - the sink's once-per-task dedupe swallows the owner's correcting
     ///   completion after an observer-provisional failure
     ///   (task_supervisor.rs:2527); the change feed delivers it, and the
-    ///   ledger's one admitted terminal→terminal transition
-    ///   (`failed → complete`) receives it.
-    /// - the feed's multi-fire redelivery is absorbed by the ledger's
-    ///   first-terminal-wins idempotency.
+    ///   ledger's authority-ranked writer admits it over the provisional
+    ///   verdict.
+    /// - the feed's multi-fire redelivery is absorbed by the ranked
+    ///   writer's first-wins-within-a-rank idempotency.
     ///
     /// Emits NO continuation, event, notification, or wake — this writes
     /// ledger cells and nothing else (`completed → sink → ChildCompleted →
@@ -5850,17 +5879,28 @@ impl InProcessAgentOrchestrator {
     /// it.
     ///
     /// Fidelity note: cancellation settles as `"failed"` — the ledger keeps
-    /// the #2054 status vocabulary (`TerminalOutcome` collapses the two the
-    /// same way upstream).
+    /// the #2054 status vocabulary; the two are distinguishable only through
+    /// the persisted authority rank.
+    ///
+    /// Round 4 ordering note: the binding is fetched BEFORE the retention
+    /// purge runs — a live task finishing after the correction deadline must
+    /// not self-drop the very binding its own settle is about to use.
     pub(crate) fn settle_goal_task_row_from_change(&self, task: &octos_agent::BackgroundTask) {
-        let (status, remove_on_success) = match task.status {
-            octos_agent::TaskStatus::Completed => ("complete", true),
-            octos_agent::TaskStatus::Cancelled => ("failed", true),
-            octos_agent::TaskStatus::Failed => ("failed", !task.failed_by_observer),
+        let (authority, remove_on_success) = match task.status {
+            octos_agent::TaskStatus::Completed => {
+                (octos_fleet::TaskSettleAuthority::Completion, true)
+            }
+            octos_agent::TaskStatus::Cancelled => {
+                (octos_fleet::TaskSettleAuthority::FinalFailure, true)
+            }
+            octos_agent::TaskStatus::Failed if task.failed_by_observer => {
+                (octos_fleet::TaskSettleAuthority::ProvisionalFailure, false)
+            }
+            octos_agent::TaskStatus::Failed => {
+                (octos_fleet::TaskSettleAuthority::FinalFailure, true)
+            }
             octos_agent::TaskStatus::Spawned | octos_agent::TaskStatus::Running => return,
         };
-        // Round 3 — opportunistic retention purge on every map touch.
-        self.purge_expired_goal_task_bindings();
         let binding = self
             .shared
             .goal_task_ledger_bindings
@@ -5868,46 +5908,75 @@ impl InProcessAgentOrchestrator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&task.id)
             .cloned();
+        // Opportunistic retention purge AFTER the fetch (see doc note).
+        self.purge_expired_goal_task_bindings();
         let Some(binding) = binding else {
             return;
         };
         let this = self.clone();
         let task_id = task.id.clone();
         offload_goal_ledger_io(move || {
-            this.settle_goal_task_row_blocking(&binding, &task_id, status, remove_on_success, 0);
+            this.settle_goal_task_row_blocking(&binding, &task_id, authority, remove_on_success, 0);
         });
     }
 
-    /// #2054 (review round 2, retry in round 3) — the blocking half of the
-    /// change-feed settle. SELF-SUFFICIENT: seeds the FK-parent goals row
-    /// and the task row (as `running`) if the creation offload has not
-    /// landed yet, then applies the provenance-carrying
-    /// [`octos_fleet::GoalLedger::update_task_status_with_provenance`] —
-    /// creation-then-settle and settle-then-creation converge on the same
-    /// terminal row, and an observer-provisional failure stamps
-    /// `correctable = 1` so the owner's later completion is admitted. An
-    /// `Ok(false)` from the guarded update is a normal no-op (the row
-    /// already carries this terminal).
+    /// #2054 — the blocking half of the change-feed settle. SELF-SUFFICIENT:
+    /// seeds the FK-parent goals row and the task row (as `running`) if the
+    /// creation offload has not landed yet, then applies the
+    /// authority-ranked [`octos_fleet::GoalLedger::settle_task_status`] —
+    /// creation-then-settle and settle-then-creation converge, and the
+    /// persisted rank makes the outcome independent of write delivery order
+    /// (see [`octos_fleet::TaskSettleAuthority`]). An `Ok(false)` from the
+    /// ranked write is a normal no-op (redelivery or an outranked write).
     ///
-    /// Round 3 — bounded retry: `open_with_busy_retry` covers only the OPEN,
+    /// Staleness fence (round 4): before EVERY write attempt — the first and
+    /// each retry re-entry — the chain re-checks that the binding is still
+    /// present under the generation it captured; otherwise it dies. This
+    /// stops redundant work and duplicate chains (removal or a
+    /// re-registration bump kills survivors at their next check), not
+    /// corruption: the ranked write itself is order-safe, and a
+    /// completion-correction arriving after a purge would be a semantically
+    /// legitimate late correction that simply no longer has a binding to
+    /// route it.
+    ///
+    /// Bounded retry (round 3): `open_with_busy_retry` covers only the OPEN,
     /// a write can still exhaust the busy handler, and cancellation emits
     /// exactly ONE change event — so a transiently-failed settle would
     /// otherwise leave the row `running` forever. On failure the SAME settle
-    /// is re-scheduled through an async `tokio::time::sleep` backoff and a
-    /// fresh `spawn_blocking` (never a sleep parked on the blocking pool;
-    /// without a runtime the bounded chain runs inline on the caller's
-    /// non-executor thread). At most [`GOAL_TASK_SETTLE_ATTEMPTS`] attempts,
-    /// deduplicated by the binding entry: a retry re-arms only while the
-    /// binding is still present, and a concurrent success removes it, which
-    /// cancels the chain naturally.
+    /// re-arms through an async `tokio::time::sleep` backoff and a fresh
+    /// `spawn_blocking`. The retry chain itself parks no sleeps on the
+    /// blocking pool (the backoff rides the executor timer; without a
+    /// runtime the bounded chain runs inline on the caller's non-executor
+    /// thread) — `open_with_busy_retry`'s own 50ms inter-attempt sleeps DO
+    /// run on the blocking pool, by design: that is where sleeping is
+    /// allowed. At most [`GOAL_TASK_SETTLE_ATTEMPTS`] attempts.
     fn settle_goal_task_row_blocking(
         &self,
         binding: &GoalTaskLedgerBinding,
         task_id: &str,
-        status: &str,
+        authority: octos_fleet::TaskSettleAuthority,
         remove_on_success: bool,
         attempt: u32,
     ) {
+        #[cfg(test)]
+        GOAL_TASK_SETTLE_ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Staleness fence — see the doc comment.
+        {
+            let bindings = self
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if bindings.get(task_id).map(|entry| entry.generation) != Some(binding.generation) {
+                tracing::debug!(
+                    task_id,
+                    goal_id = %binding.goal_row.goal_id,
+                    attempt,
+                    "goal task-row settle chain is stale (binding removed or re-stashed); dying"
+                );
+                return;
+            }
+        }
         let ledger_dir = Self::goal_ledger_dir(&binding.profile_data_dir);
         let now = now_ms_u64();
         let seed_row = octos_fleet::Task {
@@ -5920,17 +5989,13 @@ impl InProcessAgentOrchestrator {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        // Round 3 — provenance: `remove_on_success == false` is exactly the
-        // observer-provisional failure (see the status match above), the one
-        // verdict the owner may still correct; everything else is final.
-        let correctable = !remove_on_success;
         let written = std::fs::create_dir_all(&ledger_dir)
             .map_err(|error| eyre::eyre!("ledger dir unavailable: {error}"))
             .and_then(|()| octos_fleet::GoalLedger::open_with_busy_retry(binding.ledger_path()))
             .and_then(|ledger| {
                 ledger.create_goal_if_absent(&binding.goal_row)?;
                 ledger.create_task_if_absent(&seed_row)?;
-                ledger.update_task_status_with_provenance(task_id, status, correctable, now)
+                ledger.settle_task_status(task_id, authority, now)
             });
         match written {
             Ok(moved) => {
@@ -5943,14 +6008,17 @@ impl InProcessAgentOrchestrator {
                     bindings.remove(task_id);
                 } else if let Some(entry) = bindings.get_mut(task_id) {
                     // Provisional failure settled: the binding stays purely
-                    // as the correction window, now on the purge clock.
-                    entry.retained_since = Some(std::time::Instant::now());
+                    // as the correction window. Stamp the purge clock ONCE —
+                    // a redelivery no-op must not extend retention.
+                    entry
+                        .retained_since
+                        .get_or_insert_with(std::time::Instant::now);
                 }
                 drop(bindings);
                 tracing::debug!(
                     task_id,
                     goal_id = %binding.goal_row.goal_id,
-                    status,
+                    authority = ?authority,
                     moved,
                     remove_on_success,
                     attempt,
@@ -5959,27 +6027,21 @@ impl InProcessAgentOrchestrator {
             }
             Err(error) => {
                 let next_attempt = attempt + 1;
-                let binding_present = self
-                    .shared
-                    .goal_task_ledger_bindings
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .contains_key(task_id);
-                if next_attempt >= GOAL_TASK_SETTLE_ATTEMPTS || !binding_present {
+                if next_attempt >= GOAL_TASK_SETTLE_ATTEMPTS {
                     tracing::debug!(
                         task_id,
                         goal_id = %binding.goal_row.goal_id,
-                        status,
+                        authority = ?authority,
                         attempt,
                         %error,
-                        "goal task-row terminal settle failed; retry budget exhausted or binding gone"
+                        "goal task-row terminal settle failed; retry budget exhausted"
                     );
                     return;
                 }
                 tracing::debug!(
                     task_id,
                     goal_id = %binding.goal_row.goal_id,
-                    status,
+                    authority = ?authority,
                     attempt,
                     %error,
                     "goal task-row terminal settle failed; re-scheduling"
@@ -5987,7 +6049,6 @@ impl InProcessAgentOrchestrator {
                 let this = self.clone();
                 let binding = binding.clone();
                 let task_id = task_id.to_owned();
-                let status = status.to_owned();
                 let backoff = goal_task_settle_backoff(attempt);
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle) => {
@@ -5998,7 +6059,7 @@ impl InProcessAgentOrchestrator {
                                 this.settle_goal_task_row_blocking(
                                     &binding,
                                     &task_id,
-                                    &status,
+                                    authority,
                                     remove_on_success,
                                     next_attempt,
                                 );
@@ -6012,7 +6073,7 @@ impl InProcessAgentOrchestrator {
                         this.settle_goal_task_row_blocking(
                             &binding,
                             &task_id,
-                            &status,
+                            authority,
                             remove_on_success,
                             next_attempt,
                         );
@@ -6022,19 +6083,26 @@ impl InProcessAgentOrchestrator {
         }
     }
 
-    /// #2055 review round 3 — drop correction windows older than
-    /// [`PROVISIONAL_CORRECTION_RETENTION`]. Only entries whose settle
-    /// RETAINED them (`retained_since` stamped) are eligible — a live
-    /// task's binding carries `None` and is never purged, however long the
-    /// task runs. Called opportunistically from every registration and
-    /// settle map touch; no background sweeper.
+    /// #2055 review round 3 (liveness consult in round 4) — drop correction
+    /// windows older than [`PROVISIONAL_CORRECTION_RETENTION`], but NEVER a
+    /// live task's: eligibility requires BOTH an expired `retained_since`
+    /// stamp AND the process-global worker liveness
+    /// ([`octos_agent::task_is_live`]) reporting the worker gone — a
+    /// still-running provisionally-failed worker keeps its correction
+    /// window however long it runs. A binding with no stamp (task live or
+    /// settle still retrying) is never eligible at all. Called
+    /// opportunistically from registration and settle map touches; no
+    /// background sweeper.
     fn purge_expired_goal_task_bindings(&self) {
         self.shared
             .goal_task_ledger_bindings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|_, binding| match binding.retained_since {
-                Some(retained_since) => retained_since.elapsed() < PROVISIONAL_CORRECTION_RETENTION,
+            .retain(|task_id, binding| match binding.retained_since {
+                Some(retained_since) => {
+                    retained_since.elapsed() < PROVISIONAL_CORRECTION_RETENTION
+                        || octos_agent::task_is_live(task_id)
+                }
                 None => true,
             });
     }
@@ -17761,6 +17829,42 @@ mod tests {
         );
     }
 
+    /// Build a binding AND stash it in the orchestrator's map (the settle
+    /// core's staleness fence requires a present, generation-matched entry),
+    /// for tests that drive the private blocking cores directly.
+    fn stashed_test_binding(
+        orchestrator: &InProcessAgentOrchestrator,
+        data_dir: &std::path::Path,
+        goal_id: &str,
+        task_id: &str,
+    ) -> GoalTaskLedgerBinding {
+        let binding = GoalTaskLedgerBinding {
+            goal_row: octos_fleet::Goal {
+                goal_id: goal_id.to_string(),
+                objective: "converge".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            title: "web_probe".to_string(),
+            assigned_peer: None,
+            profile_data_dir: data_dir.to_path_buf(),
+            retained_since: None,
+            generation: 0,
+        };
+        orchestrator
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap()
+            .insert(task_id.to_string(), binding.clone());
+        binding
+    }
+
     /// #2055 review round 2 (Additional-3): with the I/O offloaded, nothing
     /// orders the creation write against the settle write. This test
     /// DELIBERATELY invokes the two PRIVATE blocking cores directly (review
@@ -17773,27 +17877,17 @@ mod tests {
     fn settle_before_create_ordering_converges() {
         let dir = tempfile::TempDir::new().unwrap();
         let orchestrator = InProcessAgentOrchestrator::default();
-        let binding = GoalTaskLedgerBinding {
-            goal_row: octos_fleet::Goal {
-                goal_id: "goal-order".to_string(),
-                objective: "converge".to_string(),
-                status: "active".to_string(),
-                tokens_used: 0,
-                token_budget: 1_000,
-                continuations_used: 0,
-                revision: 0,
-                created_at_ms: 1,
-                updated_at_ms: 1,
-            },
-            title: "web_probe".to_string(),
-            assigned_peer: None,
-            profile_data_dir: dir.path().to_path_buf(),
-            retained_since: None,
-        };
+        let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-order", "task-order");
 
         // Settle lands FIRST (fresh ledger file — the settle is
         // self-sufficient and seeds goal + task rows itself).
-        orchestrator.settle_goal_task_row_blocking(&binding, "task-order", "complete", true, 0);
+        orchestrator.settle_goal_task_row_blocking(
+            &binding,
+            "task-order",
+            octos_fleet::TaskSettleAuthority::Completion,
+            true,
+            0,
+        );
         // The creation offload arrives LATE and must not resurrect it.
         InProcessAgentOrchestrator::record_goal_task_row_blocking(&binding, "task-order");
 
@@ -17805,6 +17899,164 @@ mod tests {
         assert_eq!(
             row.status, "complete",
             "a late creation write preserves the settled terminal"
+        );
+    }
+
+    /// #2055 review round 4 (P1 terminal authority): every delivery order of
+    /// P = provisional failure, C = completion, D = final failure converges
+    /// through the REAL blocking cores — all six D-present orders end
+    /// `failed`; P/C alone end `complete` either way. `remove_on_success`
+    /// is passed as `false` throughout so the binding survives between
+    /// writes and the test isolates pure write-order convergence: in
+    /// production a D event after a final settle removed the binding cannot
+    /// be EMITTED by the owning supervisor at all (its terminal guard), and
+    /// cross-supervisor scrambles are #2060's problem — the ranked writer
+    /// below is what makes any of them harmless.
+    #[test]
+    fn every_authority_order_converges_through_the_blocking_cores() {
+        use octos_fleet::TaskSettleAuthority::{Completion, FinalFailure, ProvisionalFailure};
+        let three_event_orders: [[octos_fleet::TaskSettleAuthority; 3]; 6] = [
+            [ProvisionalFailure, Completion, FinalFailure],
+            [ProvisionalFailure, FinalFailure, Completion],
+            [Completion, ProvisionalFailure, FinalFailure],
+            [Completion, FinalFailure, ProvisionalFailure],
+            [FinalFailure, ProvisionalFailure, Completion],
+            [FinalFailure, Completion, ProvisionalFailure],
+        ];
+        for (index, order) in three_event_orders.iter().enumerate() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let task_id = format!("task-order-{index}");
+            let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-order", &task_id);
+            for authority in order {
+                orchestrator
+                    .settle_goal_task_row_blocking(&binding, &task_id, *authority, false, 0);
+            }
+            let ledger = octos_fleet::GoalLedger::open(binding.ledger_path()).expect("open ledger");
+            let row = ledger.get_task(&task_id).expect("read").expect("row");
+            assert_eq!(
+                row.status, "failed",
+                "order #{index} {order:?} contains a final failure and must end failed"
+            );
+        }
+        for (index, order) in [
+            [ProvisionalFailure, Completion],
+            [Completion, ProvisionalFailure],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = tempfile::TempDir::new().unwrap();
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let task_id = format!("task-nod-{index}");
+            let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-order", &task_id);
+            for authority in order {
+                orchestrator
+                    .settle_goal_task_row_blocking(&binding, &task_id, *authority, false, 0);
+            }
+            let ledger = octos_fleet::GoalLedger::open(binding.ledger_path()).expect("open ledger");
+            let row = ledger.get_task(&task_id).expect("read").expect("row");
+            assert_eq!(
+                row.status, "complete",
+                "{order:?} has no final failure and must end complete"
+            );
+        }
+    }
+
+    /// #2055 review round 4 (retry-chain lifecycle): a settle chain captures
+    /// its binding generation and re-checks presence + generation before
+    /// EVERY write attempt — a re-stash under a bumped generation kills the
+    /// stale chain even though an entry EXISTS under the same task id, so a
+    /// presence-only check cannot pass this test.
+    #[test]
+    fn stale_settle_chain_dies_on_generation_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-gen", "task-gen-stale");
+
+        // Re-stash with a bumped generation — the captured `binding`
+        // (generation 0) is now stale.
+        {
+            let mut bindings = orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            let entry = bindings.get_mut("task-gen-stale").expect("entry");
+            entry.generation += 1;
+        }
+
+        orchestrator.settle_goal_task_row_blocking(
+            &binding,
+            "task-gen-stale",
+            octos_fleet::TaskSettleAuthority::FinalFailure,
+            true,
+            0,
+        );
+
+        // The stale chain died BEFORE any write: no ledger file, no row.
+        assert!(
+            octos_fleet::GoalLedger::open(binding.ledger_path())
+                .ok()
+                .and_then(|ledger| ledger.get_task("task-gen-stale").ok().flatten())
+                .is_none(),
+            "a generation-stale chain must not write"
+        );
+        // And the current-generation entry is untouched.
+        assert!(
+            orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap()
+                .contains_key("task-gen-stale")
+        );
+    }
+
+    /// #2055 review round 4 (purge vs liveness): an expired correction
+    /// window is purged ONLY when the process-global worker liveness agrees
+    /// the worker is gone — a still-live provisionally-failed task keeps
+    /// its binding past the deadline.
+    #[test]
+    fn retention_purge_spares_live_workers_past_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-purge-live";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-purge-live");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id = supervisor.register("web_probe", "call-purge-alive", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        // Arm the process-global liveness for this worker (the guard is what
+        // real workers hold for their whole critical section).
+        let live_guard =
+            octos_agent::TaskTerminalGuard::new(Arc::clone(&supervisor), task_id.clone());
+        supervisor.mark_failed_observed(&task_id, "flaky".to_string());
+
+        // Backdate the correction window past the deadline.
+        {
+            let mut bindings = default_agent_orchestrator()
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            let entry = bindings.get_mut(&task_id).expect("retained entry");
+            entry.retained_since = std::time::Instant::now()
+                .checked_sub(PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1));
+        }
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "a LIVE worker's expired correction window must survive the purge"
+        );
+
+        // Once the worker is genuinely gone, the expired window purges.
+        drop(live_guard);
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the same expired window purges once the worker liveness clears"
         );
     }
 
@@ -17860,16 +18112,70 @@ mod tests {
         );
     }
 
-    /// #2055 review round 2 (H9), tightened in round 3 (R9-c/d): inside a
-    /// tokio runtime the observer callbacks only stash and spawn — the
-    /// SQLite I/O lands on the blocking pool. Proven under CONTENTION on a
-    /// SINGLE-worker runtime: while a real write transaction holds the
-    /// ledger, (1) the register call returns promptly, (2) a heartbeat task
-    /// keeps beating through the entire hold (inline I/O would starve the
-    /// only worker on the busy handler), and (3) the offloaded write lands
-    /// once the lock releases. All test-side ledger reads go through
-    /// `spawn_blocking` — the test must not itself commit the pattern this
-    /// PR removes.
+    /// Poll a ledger row's status from the blocking pool (test-side reads
+    /// must not commit the runtime-thread SQLite pattern this PR removes).
+    async fn poll_row_status(
+        ledger_path: &std::path::Path,
+        task_id: &str,
+        want: &str,
+        deadline: std::time::Duration,
+    ) -> Option<String> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            let path = ledger_path.to_path_buf();
+            let id = task_id.to_owned();
+            let found = tokio::task::spawn_blocking(move || {
+                octos_fleet::GoalLedger::open(&path)
+                    .ok()
+                    .and_then(|ledger| ledger.get_task(&id).ok().flatten())
+                    .map(|row| row.status)
+            })
+            .await
+            .unwrap();
+            if found.as_deref() == Some(want) {
+                return found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    /// Hold `BEGIN IMMEDIATE` on the ledger from the blocking pool. The
+    /// returned oneshot resolves AFTER the transaction actually began (the
+    /// lock-acquired handshake), and the returned sender releases it — no
+    /// fixed sleeps anywhere, so scheduler delays cannot invert the test's
+    /// phases.
+    fn hold_ledger_write_lock(
+        ledger_path: &std::path::Path,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let path = ledger_path.to_path_buf();
+        let holder = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            let _ = held_tx.send(());
+            // Held until the test says otherwise (or it dropped the sender).
+            let _ = release_rx.recv();
+            conn.execute_batch("COMMIT;").unwrap();
+        });
+        (held_rx, release_tx, holder)
+    }
+
+    /// #2055 review round 2 (H9), tightened in rounds 3-4: inside a tokio
+    /// runtime the observer callbacks only stash and spawn — the SQLite I/O
+    /// lands on the blocking pool. Proven under handshaked CONTENTION on a
+    /// SINGLE-worker runtime: with a real write transaction verifiably held,
+    /// (1) the register call returns promptly, (2) a verifiably-started
+    /// heartbeat keeps beating through a two-second window (inline I/O
+    /// would park the only worker on the busy handler and starve it), and
+    /// (3) the task's row genuinely lands — the post-release completion
+    /// settles it through the self-sufficient settle path, so no assertion
+    /// depends on the lock releasing before any internal busy budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn offloaded_registration_stays_off_the_executor_under_contention() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -17881,9 +18187,7 @@ mod tests {
             .expect("goal id");
         let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
 
-        // Materialize the ledger file, then take a REAL write transaction on
-        // it from the blocking pool so the registration's offloaded write
-        // must wait on the busy handler.
+        // Materialize the ledger file so the holder has something to lock.
         {
             let path = ledger_path.clone();
             tokio::task::spawn_blocking(move || {
@@ -17893,16 +18197,11 @@ mod tests {
             .await
             .unwrap();
         }
-        let contention_path = ledger_path.clone();
-        let contention = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open(&contention_path).unwrap();
-            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
-            // Hold the write lock briefly — shorter than the 1s busy
-            // budget, so the blocked write completes right after release.
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            conn.execute_batch("COMMIT;").unwrap();
-        });
+        let (held, release, holder) = hold_ledger_write_lock(&ledger_path);
+        held.await.expect("lock-acquired handshake");
 
+        // Heartbeat with a started-handshake: the measured window opens only
+        // after the first beat has demonstrably run.
         let heartbeat = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let heartbeat_task = {
             let heartbeat = heartbeat.clone();
@@ -17913,6 +18212,9 @@ mod tests {
                 }
             })
         };
+        while heartbeat.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         let supervisor = octos_agent::TaskSupervisor::new();
         wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
@@ -17921,48 +18223,55 @@ mod tests {
             supervisor.register("web_probe", "call-rows-offload", Some(&wire.to_string()));
         let register_elapsed = register_started.elapsed();
         assert!(
-            register_elapsed < std::time::Duration::from_millis(250),
-            "registration must return promptly under ledger contention \
+            register_elapsed < std::time::Duration::from_millis(1_500),
+            "registration must return promptly under held ledger contention \
              (took {register_elapsed:?} — inline I/O would ride the busy handler)"
         );
 
         // The single worker must keep serving the heartbeat while the
-        // offloaded write waits out the held lock on the blocking pool.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let beats = heartbeat.load(std::sync::atomic::Ordering::SeqCst);
+        // offloaded write busy-waits on the blocking pool behind the held
+        // lock. Two full seconds, wide tolerance (nominal ~200 beats).
+        let beats_before = heartbeat.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let beats = heartbeat.load(std::sync::atomic::Ordering::SeqCst) - beats_before;
         assert!(
-            beats >= 20,
+            beats >= 40,
             "the executor worker must keep beating under contention; got {beats} beats"
         );
         heartbeat_task.abort();
-        contention.await.unwrap();
+        release.send(()).expect("release the held lock");
+        holder.await.unwrap();
 
-        let mut row = None;
-        for _ in 0..200 {
-            let path = ledger_path.clone();
-            let id = task_id.clone();
-            let found = tokio::task::spawn_blocking(move || {
-                octos_fleet::GoalLedger::open(&path)
-                    .ok()
-                    .and_then(|ledger| ledger.get_task(&id).ok().flatten())
-            })
-            .await
-            .unwrap();
-            if found.is_some() {
-                row = found;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let row = row.expect("the offloaded creation write landed after the lock released");
-        assert_eq!(row.status, "running");
+        // The row genuinely lands: the completion settle is self-sufficient
+        // (it seeds the row if the contended creation write lost its busy
+        // window), so this holds regardless of how long the lock was held.
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+        let status = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "complete",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(
+            status.as_deref(),
+            Some("complete"),
+            "the registered task's row must land in the ledger"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the settled completion releases the binding"
+        );
     }
 
-    /// #2055 review round 3 (bounded settle retry): a settle whose write
-    /// fails against held contention re-arms itself with backoff and
-    /// converges once the lock releases — cancellation emits exactly one
-    /// change event, so without the retry this row would stay `running`
-    /// forever.
+    /// #2055 review rounds 3-4 (bounded settle retry): with the lock
+    /// verifiably held past the first attempt's busy budget, the settle
+    /// re-arms — the release is triggered by the ATTEMPT COUNTER observing a
+    /// retry entry, not by a fixed sleep, so scheduler delays cannot invert
+    /// the phases — and the chain converges the row once the lock releases.
+    /// Cancellation emits exactly one change event, so without the retry
+    /// this row would stay `running` forever.
     #[tokio::test(flavor = "multi_thread")]
     async fn contended_settle_retries_until_the_row_converges() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -17980,62 +18289,58 @@ mod tests {
 
         // Wait for the registration write to land so the contention below
         // targets the settle, not the creation.
-        for _ in 0..200 {
-            let path = ledger_path.clone();
-            let id = task_id.clone();
-            let found = tokio::task::spawn_blocking(move || {
-                octos_fleet::GoalLedger::open(&path)
-                    .ok()
-                    .and_then(|ledger| ledger.get_task(&id).ok().flatten())
-            })
-            .await
-            .unwrap();
-            if found.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let created = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "running",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(created.as_deref(), Some("running"), "creation landed");
 
-        // Hold a real write transaction PAST the settle's first busy budget
-        // (1s per lock acquisition on the retry-profile connection), so the
-        // first settle attempt genuinely fails and only the retry chain can
-        // converge the row.
-        let contention_path = ledger_path.clone();
-        let contention = tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open(&contention_path).unwrap();
-            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(2_500));
-            conn.execute_batch("COMMIT;").unwrap();
-        });
-        // Give the lock holder a beat to actually acquire it.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let attempts_before =
+            GOAL_TASK_SETTLE_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let (held, release, holder) = hold_ledger_write_lock(&ledger_path);
+        held.await.expect("lock-acquired handshake");
 
         supervisor.mark_running(&task_id);
         supervisor.mark_completed(&task_id, vec![]);
-        contention.await.unwrap();
 
-        let mut status = None;
-        for _ in 0..600 {
-            let path = ledger_path.clone();
-            let id = task_id.clone();
-            let found = tokio::task::spawn_blocking(move || {
-                octos_fleet::GoalLedger::open(&path)
-                    .ok()
-                    .and_then(|ledger| ledger.get_task(&id).ok().flatten())
-                    .map(|row| row.status)
-            })
-            .await
-            .unwrap();
-            if found.as_deref() == Some("complete") {
-                status = found;
+        // Hold until the counter proves a RETRY attempt entered (first
+        // attempt + at least one re-arm), then release. Counter is global
+        // across parallel tests, so the check is on the delta with `>=`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let attempts = GOAL_TASK_SETTLE_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+            if attempts >= attempts_before + 2 {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no settle retry entered within the deadline (attempts delta {})",
+                attempts - attempts_before
+            );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+        release.send(()).expect("release the held lock");
+        holder.await.unwrap();
+
+        let status = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "complete",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
         assert_eq!(
             status.as_deref(),
             Some("complete"),
             "the settle retry chain must converge the row after the lock releases"
+        );
+        assert!(
+            GOAL_TASK_SETTLE_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+                >= attempts_before + 2,
+            "at least one outer retry fired"
         );
         assert!(
             !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),

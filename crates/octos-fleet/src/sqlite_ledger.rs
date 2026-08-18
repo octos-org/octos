@@ -44,6 +44,56 @@ pub struct Task {
     pub updated_at_ms: u64,
 }
 
+/// #2055 review round 4 — the terminal authority of a task-settle write.
+/// Ranked to make the settled outcome ORDER-INDEPENDENT across scrambled
+/// write delivery (offloaded/retried writes give no ordering guarantee):
+/// a write lands iff its rank is strictly greater than the row's stored
+/// rank, first-wins within equal rank. The ledger status is DERIVED from
+/// the authority, so an illegal status/authority pairing is
+/// unrepresentable.
+///
+/// The ranking mirrors the authority model `TaskSupervisor` enforces
+/// internally (task_supervisor.rs:2575): an observer-provisional failure is
+/// the weakest verdict (the owner's completion corrects it), and a final
+/// failure — owner-reported failure or cancellation — refuses a later
+/// completion. Rank 2 beating rank 1 additionally makes the D-present
+/// orderings converge on `failed` even when the completion write was
+/// DELIVERED first; within one supervisor a final failure after a
+/// completion cannot be emitted at all (the supervisor's terminal guard
+/// refuses it), and whether a STALE supervisor copy's cancel should outrank
+/// the true owner's completion is cross-supervisor truth — #2060's problem,
+/// not this rule's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSettleAuthority {
+    /// An OBSERVER classified a mid-run signal as fatal without watching
+    /// the worker stop; the owner may still correct it. Lands `failed`.
+    ProvisionalFailure,
+    /// The owner watched its worker actually finish. Lands `complete`.
+    Completion,
+    /// Owner-reported failure or cancellation. Lands `failed`.
+    FinalFailure,
+}
+
+impl TaskSettleAuthority {
+    /// The persisted rank (`tasks.authority`); `-1` in the column means no
+    /// terminal verdict has been recorded yet.
+    pub fn rank(self) -> i64 {
+        match self {
+            TaskSettleAuthority::ProvisionalFailure => 0,
+            TaskSettleAuthority::Completion => 1,
+            TaskSettleAuthority::FinalFailure => 2,
+        }
+    }
+
+    /// The ledger status this authority writes.
+    pub fn ledger_status(self) -> &'static str {
+        match self {
+            TaskSettleAuthority::ProvisionalFailure | TaskSettleAuthority::FinalFailure => "failed",
+            TaskSettleAuthority::Completion => "complete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     /// Monotonic row ID (SQLite rowid, assigned on insert, never changes).
@@ -174,7 +224,20 @@ impl GoalLedger {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            match Self::open_inner(path, Some(std::time::Duration::from_secs(1))) {
+            // #2055 review round 4 — the `authority` schema migration runs
+            // HERE, inside the attempt (never in the common `open`, which
+            // executes on tokio workers): this profile is only ever called
+            // from blocking contexts, and a migration ALTER that loses a
+            // lock race is retried exactly like a contended open.
+            let attempt_result = Self::open_inner(path, Some(std::time::Duration::from_secs(1)))
+                .and_then(|ledger| {
+                    {
+                        let conn = ledger.conn.lock().unwrap();
+                        Self::migrate_tasks_authority_column(&conn)?;
+                    }
+                    Ok(ledger)
+                });
+            match attempt_result {
                 Ok(ledger) => return Ok(ledger),
                 Err(err) if error_is_lock_contention(&err) && attempt + 1 < ATTEMPTS => {
                     last_err = Some(err);
@@ -235,12 +298,13 @@ impl GoalLedger {
                 assigned_peer TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
-                -- #2055 review round 3: provenance mark for the ONE admitted
-                -- terminal-to-terminal transition. 1 = this `failed` row is an
-                -- OBSERVER-provisional verdict the owner may still correct to
-                -- `complete` (task_supervisor.rs:2527); 0 = final (owner
-                -- failure, cancellation, or any non-failed status).
-                correctable INTEGER NOT NULL DEFAULT 0,
+                -- #2055 review round 4: persisted TERMINAL AUTHORITY rank.
+                -- -1 = no terminal verdict recorded; 0 = observer-provisional
+                -- failure; 1 = completion; 2 = final failure (owner failure /
+                -- cancellation). A settle write lands iff its rank is
+                -- STRICTLY greater than the stored rank, making the outcome
+                -- order-independent across scrambled write delivery.
+                authority INTEGER NOT NULL DEFAULT -1,
                 FOREIGN KEY (goal_id) REFERENCES goals(goal_id)
             );
 
@@ -307,16 +371,56 @@ impl GoalLedger {
             CREATE INDEX IF NOT EXISTS idx_decisions_goal ON decisions(goal_id, decided_at_ms);
             ",
         )?;
-        // #2055 review round 3 — best-effort migration for a tasks table
-        // created before `correctable` existed (`CREATE TABLE IF NOT EXISTS`
-        // never alters an existing table). The duplicate-column error on an
-        // already-migrated database is expected and swallowed; any other
-        // failure is also non-fatal here because the first statement that
-        // actually touches the column surfaces it loudly.
-        let _ = conn.execute(
-            "ALTER TABLE tasks ADD COLUMN correctable INTEGER NOT NULL DEFAULT 0",
+        // #2055 review round 4: NO column migration here. `create_tables`
+        // runs inside the COMMON `open`, which executes on tokio workers
+        // (`goal_get` and every inline reader), and migration DDL is exactly
+        // the synchronous work this PR keeps off the executor. The
+        // `authority` migration lives in [`Self::open_with_busy_retry`],
+        // which is only ever called from blocking contexts — and every code
+        // path that references the column opens through it. Plain-`open`
+        // readers reference only pre-migration columns by name.
+        Ok(())
+    }
+
+    /// #2055 review round 4 — bring an existing `tasks` table onto the
+    /// `authority` schema. Three steps, each with an explicit error policy
+    /// (SQLite reports both expected failures as generic `SQLITE_ERROR`, so
+    /// the message text is the only discriminator — documented rusqlite
+    /// behavior for DDL):
+    ///
+    /// 1. Add the column (fresh default `-1`, identical to the
+    ///    `CREATE TABLE` shape). A duplicate-column error means the table is
+    ///    already migrated — swallowed; every OTHER error propagates.
+    /// 2. Only when step 1 actually added the column: stamp every
+    ///    pre-existing terminal row as FINAL (`authority = 2`) — a legacy
+    ///    `failed` row must NOT become correctable, and a legacy `complete`
+    ///    row is equally settled history. Rows the round-4 code writes carry
+    ///    their real rank from the start, and this backfill can never touch
+    ///    them because it runs only in the same breath as the column
+    ///    creation.
+    /// 3. Drop the short-lived round-3 `correctable` column if present
+    ///    (this branch never shipped; the column exists only on databases
+    ///    created from it). A missing column is swallowed; other errors
+    ///    propagate.
+    fn migrate_tasks_authority_column(conn: &Connection) -> Result<()> {
+        match conn.execute(
+            "ALTER TABLE tasks ADD COLUMN authority INTEGER NOT NULL DEFAULT -1",
             [],
-        );
+        ) {
+            Ok(_) => {
+                conn.execute(
+                    "UPDATE tasks SET authority = 2 WHERE status IN ('complete', 'failed')",
+                    [],
+                )?;
+            }
+            Err(error) if error.to_string().contains("duplicate column name") => {}
+            Err(error) => return Err(error.into()),
+        }
+        match conn.execute("ALTER TABLE tasks DROP COLUMN correctable", []) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("no such column") => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 
@@ -622,71 +726,82 @@ impl GoalLedger {
     /// fire-and-forget. Encoding the rule in the `WHERE` clause makes
     /// redelivery and out-of-order delivery both harmless in one statement:
     ///
-    /// - absent row            → 0 rows → `false`
-    /// - `running` → terminal  → 1 row  → `true`
-    /// - terminal → same       → guard excludes → `false` (redelivery)
-    /// - terminal → `running`  → guard excludes → `false` (late refresh)
-    /// - correctable `failed` → `complete` → 1 row → `true` (correction)
-    /// - any other terminal → terminal → guard excludes → `false`
+    /// - absent row                   → 0 rows → `false`
+    /// - no verdict (`-1`) → any rank → 1 row  → `true`
+    /// - equal rank redelivery        → guard excludes → `false` (first wins)
+    /// - lower rank after higher      → guard excludes → `false`
+    /// - higher rank after lower      → 1 row  → `true`
+    /// - non-terminal refresh after any verdict → guard excludes → `false`
     ///
-    /// #2055 review round 3 — the ONE admitted terminal→terminal transition
-    /// is PROVENANCE-GATED: `failed → complete` requires the row to carry
-    /// `correctable = 1`, which only
-    /// [`Self::update_task_status_with_provenance`] can stamp and only for a
-    /// `failed` write. That mirrors the supervisor's authority model —
-    /// `TaskSupervisor::mark_completed` overrides exactly an
-    /// OBSERVER-derived provisional failure (task_supervisor.rs:2527) — and
-    /// keeps every FINAL `failed` row (owner failure, cancellation) closed:
-    /// blanket failed→complete admission would let a genuinely-cancelled
-    /// row be flipped by a racing completion from another supervisor copy
-    /// (#2060). The correction clears the mark; `complete` is immutable;
-    /// `updated_at_ms` records the latest admitted write and cannot regress
-    /// to a straggler.
+    /// #2055 review round 4 — terminal writes route through
+    /// [`Self::settle_task_status`]'s authority-rank rule (see
+    /// [`TaskSettleAuthority`]); this string-status compatibility form maps
+    /// `"complete"` → `Completion` and `"failed"` → `FinalFailure`
+    /// (owner-final — the historical semantics of this API), and treats any
+    /// other status as a non-terminal refresh admitted only while the row
+    /// carries no terminal verdict.
+    ///
+    /// Requires the migrated schema: every statement here references the
+    /// `authority` column, so production callers reach this only through
+    /// connections opened by [`Self::open_with_busy_retry`] (which runs the
+    /// migration) or on databases created by the current schema batch.
     ///
     /// Fidelity note: cancellation is collapsed into failure upstream
     /// (`TerminalOutcome` has no `Cancelled`; the change-feed settle maps
-    /// `TaskStatus::Cancelled` to `"failed"` too), so a cancelled task lands
-    /// here as `"failed"` and the two are indistinguishable in the ledger —
-    /// distinguishable only through the provenance mark.
-    ///
-    /// This plain form writes owner-final provenance (`correctable = 0`).
+    /// `TaskStatus::Cancelled` to `FinalFailure` too), so a cancelled task
+    /// lands here as `"failed"` and the two are indistinguishable in the
+    /// ledger — distinguishable only through the authority rank.
     pub fn update_task_status(
         &self,
         task_id: &str,
         new_status: &str,
         updated_at_ms: u64,
     ) -> Result<bool> {
-        self.update_task_status_with_provenance(task_id, new_status, false, updated_at_ms)
+        match new_status {
+            "complete" => {
+                self.settle_task_status(task_id, TaskSettleAuthority::Completion, updated_at_ms)
+            }
+            "failed" => {
+                self.settle_task_status(task_id, TaskSettleAuthority::FinalFailure, updated_at_ms)
+            }
+            _ => {
+                let conn = self.conn.lock().unwrap();
+                let changed = conn.execute(
+                    "UPDATE tasks SET status = ?1, updated_at_ms = ?2
+                     WHERE task_id = ?3 AND authority < 0",
+                    params![new_status, updated_at_ms, task_id],
+                )?;
+                Ok(changed > 0)
+            }
+        }
     }
 
-    /// #2055 review round 3 — [`Self::update_task_status`] with explicit
-    /// correction provenance. `correctable = true` is meaningful only for a
-    /// `"failed"` write (the observer-provisional verdict); it is clamped to
-    /// `0` for every other status, so a completion can never re-open a row.
+    /// #2055 review round 4 — the ONE terminal admission rule: the write
+    /// lands iff its authority rank is STRICTLY greater than the row's
+    /// stored rank (first-wins within equal rank), and both the status and
+    /// the stored rank come from the [`TaskSettleAuthority`] itself, so an
+    /// illegal status/authority pairing cannot be expressed. `Ok(false)` is
+    /// a normal no-op (absent row, redelivery, or an outranked write).
     ///
-    /// Besides the correction itself, a correctable `failed` row also admits
-    /// an owner-final `failed` DOWNGRADE (`correctable 1 → 0`, status
-    /// unchanged): when the owner re-marks an observer-failed task, the
-    /// supervisor clears the provisional stamp, and the row must follow —
-    /// otherwise the correction window would stay open forever on a failure
-    /// the owner already confirmed. A provisional redelivery (`1 → 1`) stays
-    /// a no-op.
-    pub fn update_task_status_with_provenance(
+    /// Order-independence this buys (P = provisional failure, C =
+    /// completion, D = final failure): every delivery order containing a D
+    /// ends `failed`; P and C alone end `complete` in either order.
+    pub fn settle_task_status(
         &self,
         task_id: &str,
-        new_status: &str,
-        correctable: bool,
+        authority: TaskSettleAuthority,
         updated_at_ms: u64,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let stamp_correctable = i64::from(correctable && new_status == "failed");
         let changed = conn.execute(
-            "UPDATE tasks SET status = ?1, updated_at_ms = ?2, correctable = ?4
-             WHERE task_id = ?3
-               AND (status NOT IN ('complete', 'failed')
-                    OR (status = 'failed' AND correctable = 1 AND ?1 = 'complete')
-                    OR (status = 'failed' AND correctable = 1 AND ?1 = 'failed' AND ?4 = 0))",
-            params![new_status, updated_at_ms, task_id, stamp_correctable],
+            "UPDATE tasks SET status = ?1, updated_at_ms = ?2, authority = ?4
+             WHERE task_id = ?3 AND ?4 > authority",
+            params![
+                authority.ledger_status(),
+                updated_at_ms,
+                task_id,
+                authority.rank()
+            ],
         )?;
         Ok(changed > 0)
     }
@@ -3210,14 +3325,13 @@ mod digest_integration_tests {
                 "a terminal task refuses the late non-terminal write {late:?}"
             );
         }
-        // #2055 review round 3 — `complete` after an OWNER-reported `failed`
-        // is refused again: the correction admission is provenance-gated on
-        // the `correctable` column, and the plain writer stamps
-        // `correctable = 0` (owner-final). Only a row written through
-        // `update_task_status_with_provenance(.., correctable = true, ..)` —
-        // the observer-provisional case — admits the later completion.
-        // Blanket failed→complete admission would let a genuinely-cancelled
-        // row (cancellation also lands as `failed`) be flipped by a racing
+        // #2055 review round 4 — `complete` after an OWNER-reported `failed`
+        // is refused: the plain writer maps `"failed"` to `FinalFailure`
+        // (rank 2), which outranks `Completion` (rank 1). Only an
+        // observer-provisional failure (rank 0, written through
+        // `settle_task_status`) admits the later completion. Blanket
+        // failed→complete admission would let a genuinely-cancelled row
+        // (cancellation also lands as `failed`) be flipped by a racing
         // completion from another supervisor copy (#2060).
         assert!(!ledger.update_task_status("t1", "complete", 4_000).unwrap());
 
@@ -3226,58 +3340,68 @@ mod digest_integration_tests {
         assert_eq!(task.updated_at_ms, 2_000);
     }
 
-    /// #2055 review round 3 — the provenance-gated correction in full: an
-    /// observer-provisional failure (written with `correctable = true`)
-    /// admits exactly the owner's later `complete`
-    /// (task_supervisor.rs:2527's correction semantics); the correction
-    /// clears the provenance mark, and from there the row is immutable
-    /// (a straggler `failed` redelivery cannot undo the correction).
+    /// #2055 review round 4 — the authority-gated correction: an
+    /// observer-provisional failure (rank 0) admits exactly the owner's
+    /// later completion (rank 1, task_supervisor.rs:2527's correction
+    /// semantics); afterwards the row refuses provisional redeliveries,
+    /// non-terminal refreshes, and completion redeliveries — only a FINAL
+    /// failure (rank 2) can still land, which is the deliberate
+    /// order-independence rule verified exhaustively below.
     #[test]
-    fn should_allow_failed_to_complete_only_with_correctable_provenance() {
+    fn should_allow_failed_to_complete_only_with_provisional_authority() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
         seed_goal_with_task(&ledger, "g1", "t1", "running");
 
         assert!(
             ledger
-                .update_task_status_with_provenance("t1", "failed", true, 2_000)
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_000)
                 .unwrap(),
-            "the provisional failure lands with correctable provenance"
+            "the provisional failure lands at rank 0"
         );
         assert!(
             ledger.update_task_status("t1", "complete", 3_000).unwrap(),
-            "failed → complete is admitted for a correctable row"
+            "failed → complete is admitted over a provisional verdict"
         );
-        for late in ["failed", "running", "pending", "complete"] {
+        assert!(
+            !ledger
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 4_000)
+                .unwrap(),
+            "a straggler provisional write cannot undo the correction"
+        );
+        assert!(
+            !ledger.update_task_status("t1", "complete", 4_000).unwrap(),
+            "a completion redelivery is a no-op (first wins within a rank)"
+        );
+        for late in ["running", "pending"] {
             assert!(
                 !ledger.update_task_status("t1", late, 4_000).unwrap(),
-                "complete refuses every subsequent write ({late:?})"
+                "a settled row refuses the non-terminal refresh {late:?}"
             );
         }
 
         let task = ledger.get_task("t1").unwrap().unwrap();
         assert_eq!(task.status, "complete");
         assert_eq!(task.updated_at_ms, 3_000);
-        // The correction cleared the provenance mark (defense in depth —
-        // `complete` is immutable regardless). Same-module test, so the raw
+        // The stored rank is the completion's. Same-module test, so the raw
         // column read is fine.
-        let correctable: i64 = ledger
+        let authority: i64 = ledger
             .conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT correctable FROM tasks WHERE task_id = 't1'",
+                "SELECT authority FROM tasks WHERE task_id = 't1'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(correctable, 0, "the correction clears correctable");
+        assert_eq!(authority, 1);
     }
 
-    /// #2055 review round 3 — the owner's authoritative re-failure closes
-    /// the correction window: a correctable `failed` row admits the
-    /// owner-final `failed` downgrade (provenance cleared), after which the
-    /// completion is refused like any other final failure.
+    /// #2055 review round 4 — the owner's authoritative re-failure closes
+    /// the correction window: rank 2 lands over the provisional rank 0,
+    /// after which the completion (rank 1) is refused. A provisional
+    /// redelivery in between is a no-op, not a retention refresh.
     #[test]
     fn should_close_correction_window_when_owner_confirms_the_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -3286,19 +3410,19 @@ mod digest_integration_tests {
 
         assert!(
             ledger
-                .update_task_status_with_provenance("t1", "failed", true, 2_000)
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_000)
                 .unwrap()
         );
         // A provisional redelivery is a no-op, not a churn write.
         assert!(
             !ledger
-                .update_task_status_with_provenance("t1", "failed", true, 2_500)
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_500)
                 .unwrap()
         );
-        // The owner's confirming failure downgrades the provenance mark.
+        // The owner's confirming failure outranks the provisional verdict.
         assert!(
             ledger.update_task_status("t1", "failed", 3_000).unwrap(),
-            "the owner-final downgrade of a correctable row is admitted"
+            "the owner-final failure is admitted over the provisional rank"
         );
         assert!(
             !ledger.update_task_status("t1", "complete", 4_000).unwrap(),
@@ -3310,14 +3434,64 @@ mod digest_integration_tests {
         assert_eq!(task.updated_at_ms, 3_000);
     }
 
-    /// #2055 review round 3 — the `correctable` column arrives via a
-    /// best-effort `ALTER TABLE` for databases created before the column
-    /// existed; the provenance-gated correction works on such a ledger.
+    /// #2055 review round 4 — the load-bearing order-independence matrix:
+    /// with P = provisional failure, C = completion, D = final failure,
+    /// EVERY delivery order containing a D ends `failed`, and P/C alone end
+    /// `complete` in either order. The write layer alone guarantees this —
+    /// no delivery-order assumptions anywhere above it.
     #[test]
-    fn should_migrate_tasks_table_missing_the_correctable_column() {
+    fn should_converge_every_authority_delivery_order() {
+        use TaskSettleAuthority::{Completion, FinalFailure, ProvisionalFailure};
+        let three_event_orders: [[TaskSettleAuthority; 3]; 6] = [
+            [ProvisionalFailure, Completion, FinalFailure],
+            [ProvisionalFailure, FinalFailure, Completion],
+            [Completion, ProvisionalFailure, FinalFailure],
+            [Completion, FinalFailure, ProvisionalFailure],
+            [FinalFailure, ProvisionalFailure, Completion],
+            [FinalFailure, Completion, ProvisionalFailure],
+        ];
+        for (index, order) in three_event_orders.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+            seed_goal_with_task(&ledger, "g1", "t1", "running");
+            for authority in order {
+                let _ = ledger.settle_task_status("t1", *authority, 2_000).unwrap();
+            }
+            let task = ledger.get_task("t1").unwrap().unwrap();
+            assert_eq!(
+                task.status, "failed",
+                "order #{index} {order:?} contains a final failure and must end failed"
+            );
+        }
+        for order in [
+            [ProvisionalFailure, Completion],
+            [Completion, ProvisionalFailure],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+            seed_goal_with_task(&ledger, "g1", "t1", "running");
+            for authority in order {
+                let _ = ledger.settle_task_status("t1", authority, 2_000).unwrap();
+            }
+            let task = ledger.get_task("t1").unwrap().unwrap();
+            assert_eq!(
+                task.status, "complete",
+                "{order:?} has no final failure and must end complete"
+            );
+        }
+    }
+
+    /// #2055 review round 4 — the `authority` column arrives via the
+    /// migration in `open_with_busy_retry` (never the common `open`, which
+    /// runs on tokio workers). Pre-existing terminal rows are stamped FINAL
+    /// — a legacy `failed` row must NOT become correctable — while legacy
+    /// non-terminal rows settle exactly like fresh ones.
+    #[test]
+    fn should_migrate_tasks_table_missing_the_authority_column() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.db");
-        // A pre-round-3 database shape: tasks table WITHOUT `correctable`.
+        // A pre-#2055 database shape: tasks table with neither `authority`
+        // nor the short-lived round-3 `correctable`.
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -3335,23 +3509,168 @@ mod digest_integration_tests {
                      created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
                      FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
                  INSERT INTO goals VALUES ('g1', 'ship', 'active', 0, 1000, 0, 0, 1, 1);
-                 INSERT INTO tasks VALUES ('t1', 'g1', '', '', 'running', NULL, 1, 1);",
+                 INSERT INTO tasks VALUES ('legacy-failed', 'g1', '', '', 'failed', NULL, 1, 1);
+                 INSERT INTO tasks VALUES ('legacy-live', 'g1', '', '', 'running', NULL, 1, 1);",
             )
             .unwrap();
         }
 
-        let ledger = GoalLedger::open(&path).unwrap();
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        assert!(
+            !ledger
+                .update_task_status("legacy-failed", "complete", 2_000)
+                .unwrap(),
+            "a legacy failed row is stamped FINAL by the migration backfill \
+             and must not become correctable"
+        );
+        assert_eq!(
+            ledger.get_task("legacy-failed").unwrap().unwrap().status,
+            "failed"
+        );
+        // A legacy live row settles exactly like a fresh one.
         assert!(
             ledger
-                .update_task_status_with_provenance("t1", "failed", true, 2_000)
-                .unwrap(),
-            "the migrated column accepts the provenance write"
+                .settle_task_status(
+                    "legacy-live",
+                    TaskSettleAuthority::ProvisionalFailure,
+                    2_000
+                )
+                .unwrap()
         );
         assert!(
-            ledger.update_task_status("t1", "complete", 3_000).unwrap(),
-            "the correction works on a migrated ledger"
+            ledger
+                .update_task_status("legacy-live", "complete", 3_000)
+                .unwrap(),
+            "the provisional-then-correction flow works on a migrated ledger"
         );
-        assert_eq!(ledger.get_task("t1").unwrap().unwrap().status, "complete");
+    }
+
+    /// #2055 review round 4 — a database created from the short-lived
+    /// round-3 shape (with `correctable`) migrates too: the column is
+    /// dropped and its terminal rows are stamped FINAL alongside the
+    /// `authority` addition.
+    #[test]
+    fn should_migrate_round3_correctable_column_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                     title TEXT NOT NULL, detail TEXT NOT NULL,
+                     status TEXT NOT NULL, assigned_peer TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     correctable INTEGER NOT NULL DEFAULT 0,
+                     FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
+                 INSERT INTO goals VALUES ('g1', 'ship', 'active', 0, 1000, 0, 0, 1, 1);
+                 INSERT INTO tasks VALUES ('t1', 'g1', '', '', 'failed', NULL, 1, 1, 1);",
+            )
+            .unwrap();
+        }
+
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        let correctable_exists: i64 = ledger
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'correctable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(correctable_exists, 0, "the round-3 column is dropped");
+        assert!(
+            !ledger.update_task_status("t1", "complete", 2_000).unwrap(),
+            "the round-3 terminal row is stamped FINAL, not carried over as correctable"
+        );
+    }
+
+    /// #2055 review round 4 — the migration swallows exactly the
+    /// duplicate-column error; every other failure propagates. Forced here
+    /// by presenting a connection whose `tasks` table does not exist.
+    #[test]
+    fn should_propagate_non_duplicate_migration_failures() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // No `tasks` table at all: the ALTER fails with "no such table",
+        // which is NOT the ignorable duplicate-column case.
+        let error = GoalLedger::migrate_tasks_authority_column(&conn)
+            .expect_err("a non-duplicate migration failure must propagate");
+        assert!(
+            error.to_string().contains("no such table"),
+            "unexpected error: {error}"
+        );
+        // And on an already-migrated table the helper is a clean no-op.
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                 task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                 title TEXT NOT NULL, detail TEXT NOT NULL,
+                 status TEXT NOT NULL, assigned_peer TEXT,
+                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                 authority INTEGER NOT NULL DEFAULT -1);",
+        )
+        .unwrap();
+        GoalLedger::migrate_tasks_authority_column(&conn)
+            .expect("an already-migrated table is a no-op");
+    }
+
+    /// #2055 review round 4 — fresh-schema and migrated-schema databases
+    /// behave identically under the same write sequence.
+    #[test]
+    fn should_behave_identically_on_fresh_and_migrated_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fresh: created by the current schema batch.
+        let fresh = GoalLedger::open_with_busy_retry(dir.path().join("fresh.db")).unwrap();
+        // Migrated: created without the column, then opened through the
+        // migrating profile.
+        let migrated_path = dir.path().join("migrated.db");
+        {
+            let conn = rusqlite::Connection::open(&migrated_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                     title TEXT NOT NULL, detail TEXT NOT NULL,
+                     status TEXT NOT NULL, assigned_peer TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     FOREIGN KEY (goal_id) REFERENCES goals(goal_id));",
+            )
+            .unwrap();
+        }
+        let migrated = GoalLedger::open_with_busy_retry(&migrated_path).unwrap();
+
+        for ledger in [&fresh, &migrated] {
+            seed_goal_with_task(ledger, "g1", "t1", "running");
+            assert!(
+                ledger
+                    .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_000)
+                    .unwrap()
+            );
+            assert!(ledger.update_task_status("t1", "complete", 3_000).unwrap());
+            assert!(
+                ledger
+                    .settle_task_status("t1", TaskSettleAuthority::FinalFailure, 4_000)
+                    .unwrap(),
+                "a final failure outranks the completion on both shapes"
+            );
+            let task = ledger.get_task("t1").unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            assert_eq!(task.updated_at_ms, 4_000);
+        }
     }
 
     /// #2055 review round 3 — goal-scoped task listing (used by effect

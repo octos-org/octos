@@ -60,7 +60,7 @@ pub use records::{
     PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
 };
 pub use sqlite_ledger::{
-    Decision, Escalation, Finding, Goal, GoalLedger, Task, digest_from_ledger,
+    Decision, Escalation, Finding, Goal, GoalLedger, Task, TaskSettleAuthority, digest_from_ledger,
 };
 pub use store::{
     AckOutcome, CompleteOutcome, DenyEscalationOutcome, FleetKernelStore, FleetSnapshot,
