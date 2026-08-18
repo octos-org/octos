@@ -19826,27 +19826,33 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
-    // Cross-subsystem occupancy (#1529): a session actor draining a
-    // continuation turn for this session marks it in-flight but has no entry
-    // in this connection's `active_turns` map. Without this check the serve
-    // tick would drain + spawn a SECOND concurrent turn on the same session
-    // while the actor's turn runs. The actor clears the marker (RAII guard)
-    // when its turn ends, so the next tick re-dispatches normally.
-    if default_agent_orchestrator().is_goal_dispatch_in_flight(&goal_storage_key) {
-        return false;
-    }
-
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
             .approvals
             .pending_for_session(&session_id)
             .is_empty(),
     );
-    let Some(continuation) = default_agent_orchestrator()
-        .drain_ready_continuations_for_session(&goal_storage_key, &profile_id, runtime_state, 1)
-        .into_iter()
-        .next()
-    else {
+    // #2066 round 3 (codex fix 2) — ATOMIC drain-and-claim, the same
+    // primitive the session actor uses: the in-flight claim and the pop
+    // happen under ONE state lock, so this path can never pop a one-shot it
+    // does not own. The round-2 shape (separate occupancy check → pop →
+    // claim inside the spawned task) could pop an item, lose the claim race
+    // to another dispatcher, and complete the popped item UNEXECUTED — for a
+    // latched GoalWrapUp that meant permanently dropping the wrap-up
+    // (`wrap_up_emitted` never re-mints on a budget_limited goal). A held
+    // marker now drains NOTHING here (cross-subsystem occupancy, #1529,
+    // subsumed: the claim check is inside the same lock as the pop), and the
+    // returned guard travels into the spawned turn, released on every exit.
+    let (mut drained, claim_guard) = default_agent_orchestrator()
+        .drain_and_claim_ready_continuation_for_session(
+            &goal_storage_key,
+            &profile_id,
+            runtime_state,
+            1,
+        );
+    let Some(continuation) = drained.pop() else {
+        // Nothing owned: nothing was popped, nothing to complete. The guard
+        // (if any) drops here and releases immediately.
         return false;
     };
 
@@ -20016,53 +20022,30 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // post-turn `record_goal_turn` call below (which runs with
         // real token usage).
         //
-        // #1140 codex P2 re-review #3: mark the goal session as
-        // in-flight so `due_loop_targets`'s goal sweep + the
-        // `enqueue_due_goal_continuations` enqueue path both skip
-        // it until the post-turn accountant clears it. The
-        // timestamp alone isn't enough for goal turns > 30s.
+        // #1140 codex P2 re-review #3/#4: the in-flight claim keeps
+        // `due_loop_targets`'s goal sweep + the enqueue paths off this
+        // session until the post-turn accountant finishes, and the RAII
+        // guard clears it on every exit (abort, early terminal, panic).
         //
-        // #1140 codex P1 re-review #4: use the RAII drop-guard shape
-        // so the marker is cleared even if the spawned turn task is
-        // aborted (e.g. `abort_connection_turns` on connection close)
-        // or returns through an early terminal path. The Drop becomes
-        // the single canonical clear-point (codex P2 re-review #5).
+        // #2066 round 3 (codex fix 2) — the claim is no longer taken here:
+        // it was taken ATOMICALLY WITH THE POP by
+        // `drain_and_claim_ready_continuation_for_session` and travels into
+        // this task. Claim-failure therefore pops nothing and completes
+        // nothing (the round-2 try-claim-in-task shape popped first and
+        // completed the item UNEXECUTED on claim failure — permanently
+        // dropping a latched GoalWrapUp). Held for EVERY continuation
+        // reason, matching the session actor's claim semantics.
         //
-        // #2066 round 2 (codex R2 — the round-1 root defect): the claim is
-        // now an ATOMIC TRY-claim, not the unconditional mark. The old
-        // `goal_dispatch_in_flight_guard` INSERTED over whatever marker
-        // existed — so a `/goal clear` that claimed the slot (or another
-        // dispatcher's live turn) in the gap between this path's pre-drain
-        // check and this spawned task was silently overwritten, and the turn
-        // launched from state being destroyed with its charge landing
-        // nowhere (the clear saw the slot free, so no settle tombstone was
-        // parked). Now: (1) try-claim — if the slot is held, the launch
-        // ABORTS without emitting anything; (2) after claiming, RE-CHECK
-        // that the goal record still exists and is the same incarnation the
-        // continuation was enqueued for — a clear that already claimed,
-        // stamped and released leaves the goal gone, and launching the
-        // drained prompt anyway would run a turn for a deleted goal. Both
-        // aborts stamp the internal turn slot Terminal (no wire event was
-        // emitted for this turn yet — the client never saw it) so the
-        // session's `active_turns` slot frees for the next dispatch, and
-        // mark the continuation completed so a restart never replays it.
-        let _in_flight_guard = if let Some(ref ctx) = goal_context_for_appui {
+        // The post-claim goal RECHECK stays: with the claim held, a
+        // gone/mismatched goal is genuinely cleared/replaced (not a racing
+        // dispatcher), so completing the popped item is correct — launching
+        // the drained prompt would run a turn for a deleted goal. The abort
+        // stamps the internal turn slot Terminal (no wire event was emitted
+        // for this turn yet — the client never saw it) so the session's
+        // `active_turns` slot frees for the next dispatch.
+        let _in_flight_guard = claim_guard;
+        if let Some(ref ctx) = goal_context_for_appui {
             let session_key = SessionKey(continuation.session_id.as_str().to_owned());
-            let Some(guard) = default_agent_orchestrator().try_claim_goal_in_flight(&session_key)
-            else {
-                info!(
-                    session = %params.session_id,
-                    continuation_id = continuation.id.as_u64(),
-                    "goal dispatch slot already claimed (another turn or a clear \
-                     in progress); aborting this launch"
-                );
-                *turn_state_for_task.lock().await = TurnState::Terminal(TerminalReason::Completed);
-                default_agent_orchestrator().mark_continuation_completed(
-                    &continuation,
-                    Some("dispatch_slot_claimed_launch_aborted".to_owned()),
-                );
-                return;
-            };
             if !default_agent_orchestrator().goal_dispatch_target_matches(
                 &session_key,
                 &ctx.profile_id,
@@ -20071,8 +20054,8 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 info!(
                     session = %params.session_id,
                     continuation_id = continuation.id.as_u64(),
-                    "goal was cleared/replaced between drain and claim; \
-                     aborting this launch"
+                    "goal was cleared/replaced between drain and launch; \
+                     aborting this turn"
                 );
                 *turn_state_for_task.lock().await = TurnState::Terminal(TerminalReason::Completed);
                 default_agent_orchestrator().mark_continuation_completed(
@@ -20084,10 +20067,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             }
             default_agent_orchestrator()
                 .record_goal_dispatch_timestamp_only(&session_key, &ctx.profile_id);
-            Some(guard)
-        } else {
-            None
-        };
+        }
         // #436 P1 #2 — for a peer_send_input injection, track whether the turn
         // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
         // failed `TurnStarted`) is NOT marked completed and stays durable for

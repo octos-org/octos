@@ -2782,9 +2782,46 @@ impl InProcessAgentOrchestrator {
             if drained.is_empty() {
                 break;
             }
-            for item in drained {
+            for mut item in drained {
                 if pending_continuation_is_schedulable(&*state, &item) {
-                    kept.push(item);
+                    // #2066 round 3 (codex fix 3) — bind-at-drain for legacy
+                    // UNBOUND goal continuations. A persisted `goal_id: None`
+                    // item passed every identity gate as a WILDCARD (the
+                    // schedulability check binds identity only for `Some`,
+                    // the dispatch recheck treats `None` as match-any, and
+                    // `record_goal_turn`'s live path charges unbound), so a
+                    // legacy item enqueued for a since-cleared goal would
+                    // launch against — and charge — a create-after-clear
+                    // REPLACEMENT. Resolve the binding here, under the same
+                    // lock as the pop: the live goal takes the binding ONLY
+                    // if it already existed when the item was enqueued
+                    // (goal.created_at_ms <= the item's creation time);
+                    // otherwise the item predates the live goal — it belongs
+                    // to a cleared predecessor — and is completed as stale
+                    // without launching or charging anything.
+                    match bind_unbound_goal_continuation_at_drain(state, session_id, &mut item) {
+                        UnboundGoalBinding::Keep => kept.push(item),
+                        UnboundGoalBinding::Stale => {
+                            if let Some(store) = state.supervisor_store.as_ref() {
+                                let _ = store.record_continuation_completed(
+                                    item.group_id.as_str(),
+                                    item.dedupe_key.as_str(),
+                                    now_ms_u64(),
+                                    Some(
+                                        "discarded:unbound_goal_continuation_stale (#2066)".into(),
+                                    ),
+                                );
+                            }
+                            tracing::debug!(
+                                session_key = %session_id.0,
+                                profile_id = %profile_id,
+                                reason = ?item.reason,
+                                continuation_id = ?item.id,
+                                "dropping legacy unbound goal continuation at drain: \
+                                 the live goal postdates it (#2066 round 3)"
+                            );
+                        }
+                    }
                 } else {
                     // #1159 codex P2 follow-up: only TOMBSTONE drops whose
                     // owning entity is genuinely gone (goal cleared and
@@ -5093,8 +5130,13 @@ impl InProcessAgentOrchestrator {
                 updated_at_ms: base_snapshot.updated_at_ms.max(0) as u64,
             };
             let _ = ledger.create_goal_if_absent(&base);
+            // #2066 round 3 (codex fix 1) — the settle MAX-folds the frozen
+            // clear-time base before adding its delta, so a settle that
+            // lands ahead of the clear stamp already carries the pre-clear
+            // lag and a later stamp MAX-merges to the identical total.
             match ledger.settle_cleared_goal_cost_delta(
                 &base_snapshot.goal_id,
+                base_snapshot.tokens_used,
                 tokens_delta,
                 now_ms_u64(),
             ) {
@@ -5111,6 +5153,91 @@ impl InProcessAgentOrchestrator {
                     "post-clear settle: delta write failed (best-effort; charge dropped)"),
             }
         });
+    }
+
+    /// #2066 round 3 (codex fix 1) — the CLEAR path's durable stamp, replacing
+    /// its round-1/2 use of the generic [`Self::sync_transition_to_ledger_blocking`]
+    /// (whose all-or-nothing guarded upsert is exactly what made stamp-vs-settle
+    /// order-dependent: a same-millisecond stamp landing after the settle
+    /// overwrote the settled delta; a newer-timestamp settle made a later
+    /// stamp reject and lose the entire pre-clear lag). The dedicated writer
+    /// ([`octos_fleet::GoalLedger::stamp_goal_cleared`]) MAX-merges counters
+    /// per column and CASEs status, so it commutes with the settle deltas in
+    /// every arrival order. The audit decision is gated on the STORED status
+    /// (a `complete` row keeps `complete` and gets no `cleared` decision —
+    /// the same honest-audit gate the generic sync applied). Best-effort like
+    /// every ledger stamp; the other transitions keep the generic sync
+    /// unchanged.
+    fn stamp_goal_cleared_blocking(
+        &self,
+        profile_data_dir: &std::path::Path,
+        snapshot: &AutonomyGoalRecord,
+        decided_by: &SessionKey,
+    ) {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        if std::fs::create_dir_all(&ledger_dir).is_err() {
+            return;
+        }
+        let ledger_path = ledger_dir.join(format!(
+            "{}.db",
+            sanitize_filename_for_ledger(&snapshot.goal_id)
+        ));
+        let ledger = match octos_fleet::GoalLedger::open(&ledger_path) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(%error, ledger = %ledger_path.display(),
+                    "goal-ledger open failed; clear stamp skipped (best-effort)");
+                return;
+            }
+        };
+        let row = octos_fleet::Goal {
+            goal_id: snapshot.goal_id.clone(),
+            objective: snapshot.objective.clone(),
+            status: "cleared".to_owned(),
+            tokens_used: snapshot.tokens_used,
+            token_budget: snapshot.token_budget,
+            continuations_used: snapshot.continuations_used,
+            revision: 0,
+            created_at_ms: snapshot.created_at_ms.max(0) as u64,
+            updated_at_ms: snapshot.updated_at_ms.max(0) as u64,
+        };
+        let stored = match ledger.stamp_goal_cleared(&row) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(%error, goal_id = %snapshot.goal_id,
+                    "goal-ledger clear stamp failed (best-effort)");
+                return;
+            }
+        };
+        if stored != "cleared" {
+            // `complete` outranks `cleared`; the counters still merged, and
+            // the audit trail must not claim a status the row refused.
+            tracing::warn!(
+                goal_id = %snapshot.goal_id,
+                stored_status = %stored,
+                "goal ledger clear stamp: the row kept its terminal status; \
+                 no cleared decision appended"
+            );
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let decision = octos_fleet::Decision {
+            decision_id: format!("dec-{}-{}", snapshot.goal_id, uuid::Uuid::now_v7()),
+            goal_id: snapshot.goal_id.clone(),
+            task_id: None,
+            question: "transition goal to `cleared`".to_owned(),
+            options_considered: None,
+            choice: "cleared".to_owned(),
+            rationale: "goal cleared by user".to_owned(),
+            based_on_findings: None,
+            based_on_rev: 0,
+            decided_at_ms: now_ms,
+            decided_by: decided_by.to_string(),
+        };
+        let _ = ledger.append_decision(&decision);
     }
 
     /// #2066 round 2 (codex R2) — the post-claim dispatch recheck: after a
@@ -5263,15 +5390,10 @@ impl InProcessAgentOrchestrator {
                 // SYNC caller (the clear RPC arm): blocking core, plain open
                 // profile — same inline best-effort class as the pre-existing
                 // finding/escalation writers (#1865 keeps the bounded retry
-                // exclusive to the spawn_blocking facade).
-                self.sync_transition_to_ledger_blocking(
-                    data_dir,
-                    &snapshot,
-                    "goal cleared by user",
-                    &request.session_id,
-                    true,
-                    false,
-                );
+                // exclusive to the spawn_blocking facade). #2066 round 3 —
+                // the clear uses its dedicated MAX-merge stamp writer, which
+                // commutes with the tombstone settle deltas in every order.
+                self.stamp_goal_cleared_blocking(data_dir, &snapshot, &request.session_id);
             }
         }
         // #2064(a)/#2066 round 2 (codex R4) — release the clear's own claim
@@ -9387,6 +9509,65 @@ fn in_flight_marker_is_live(
     })
 }
 
+/// #2066 round 3 (codex fix 3) — outcome of resolving a legacy UNBOUND
+/// (`goal_id: None`) goal continuation against the session's live goal at
+/// drain time. See the call site in `drain_ready_continuations_locked`.
+enum UnboundGoalBinding {
+    /// Item is not a goal continuation, already bound, or was bound here to
+    /// the live goal (which provably existed when the item was enqueued).
+    Keep,
+    /// The live goal POSTDATES the item (a create-after-clear replacement),
+    /// belongs to another profile, or the item's timestamp is
+    /// unrepresentable — the item belongs to a cleared predecessor and must
+    /// be completed without launching or charging.
+    Stale,
+}
+
+/// #2066 round 3 (codex fix 3) — bind-at-drain: stamp a legacy unbound goal
+/// continuation with the live goal's id IFF that goal already existed when
+/// the continuation was enqueued (`goal.created_at_ms <= item.created_at`,
+/// `<=` because `set_goal` enqueues in the same `now_ms()` tick it creates
+/// the record). Downstream everything then sees `Some` and the wildcard
+/// paths never fire. Item creation time (`created_at`, preserved across
+/// reinsert) is the comparison anchor, not `enqueued_at`.
+fn bind_unbound_goal_continuation_at_drain(
+    state: &AutonomyRuntimeState,
+    session_id: &SessionKey,
+    item: &mut QueuedMasterContinuation,
+) -> UnboundGoalBinding {
+    if !matches!(
+        item.reason,
+        MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp
+    ) {
+        return UnboundGoalBinding::Keep;
+    }
+    if item.goal_id.is_some() {
+        return UnboundGoalBinding::Keep;
+    }
+    // Schedulability already required a live goal for goal reasons; a miss
+    // here (racing removal) is conservatively stale.
+    let Some(goal) = state.goals.get(session_id) else {
+        return UnboundGoalBinding::Stale;
+    };
+    if goal.profile_id != item.profile_id.as_str() {
+        return UnboundGoalBinding::Stale;
+    }
+    let item_created_ms = item
+        .created_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
+    match item_created_ms {
+        Some(created_ms) if goal.created_at_ms <= created_ms => {
+            item.goal_id = Some(
+                crate::autonomy::master_continuation_scheduler::GoalId::from(goal.goal_id.as_str()),
+            );
+            UnboundGoalBinding::Keep
+        }
+        _ => UnboundGoalBinding::Stale,
+    }
+}
+
 /// #2064(b) — upper bound on parked [`ClearedGoalTombstone`]s. A tombstone
 /// stays parked after settling (the turn charge AND its verifier charge must
 /// both land) and is replaced by the next clear on its key, so the cap only
@@ -9430,20 +9611,44 @@ struct ClearedGoalTombstone {
 /// Opportunistic: called on the map's own touch points (park + accrue), so a
 /// quiet orchestrator retains at most [`MAX_CLEARED_GOAL_TOMBSTONES`] inert
 /// entries and an active one self-cleans.
+///
+/// #2066 round 3 (codex fix 4) — expiry alone is NOT sufficient: the
+/// in-flight marker is REFRESHED by real turn output
+/// (`touch_goal_dispatch_in_flight`) and kept live by nonterminal supervised
+/// work, so a legitimately long (>30min) turn can outlive the tombstone's
+/// parked_at horizon and would then lose its charge. Purge eligibility is
+/// therefore expired AND the session's marker is no longer held — the same
+/// liveness consult the marker's own staleness rescue uses
+/// ([`in_flight_marker_is_held`] covers both the fresh-stamp and
+/// supervised-work halves). Once the marker is gone, no legitimate late
+/// charge for that turn can arrive.
 fn purge_stale_cleared_goal_tombstones(state: &mut AutonomyRuntimeState) {
     let now = now_ms_u64();
-    state.cleared_goal_tombstones.retain(|key, tombstone| {
-        let live = now.saturating_sub(tombstone.parked_at_ms) < CLEARED_GOAL_TOMBSTONE_TTL_MS;
-        if !live {
+    let expired: Vec<SessionKey> = state
+        .cleared_goal_tombstones
+        .iter()
+        .filter(|(_, tombstone)| {
+            now.saturating_sub(tombstone.parked_at_ms) >= CLEARED_GOAL_TOMBSTONE_TTL_MS
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in expired {
+        if in_flight_marker_is_held(state, &key) {
+            // The turn that justified parking is still provably alive
+            // (refreshed marker or live supervised work) — its charge may
+            // still arrive; keep the tombstone.
+            continue;
+        }
+        if let Some(dropped) = state.cleared_goal_tombstones.remove(&key) {
             tracing::debug!(
                 session = %key,
-                goal_id = %tombstone.snapshot.goal_id,
-                settled_tokens = tombstone.settled_tokens,
-                "cleared-goal tombstone aged past the settle horizon; dropping it"
+                goal_id = %dropped.snapshot.goal_id,
+                settled_tokens = dropped.settled_tokens,
+                "cleared-goal tombstone aged past the settle horizon with no \
+                 live in-flight marker; dropping it"
             );
         }
-        live
-    });
+    }
 }
 
 /// #2064(a) — the clear path's half of the dispatcher serialization: claim
@@ -22735,41 +22940,349 @@ mod tests {
         assert!(!orchestrator.goal_dispatch_target_matches(&key, "tenant-b", Some(&new_goal_id)));
     }
 
-    /// #2066 round 2 (codex R2/R7) — source guard for the AppUI dispatch
-    /// wiring: the spawned continuation task must claim ATOMICALLY
-    /// (`try_claim_goal_in_flight`) and re-check the goal
-    /// (`goal_dispatch_target_matches`) before launching — never the
-    /// unconditional `goal_dispatch_in_flight_guard`, which overwrites a
-    /// clear's (or another dispatcher's) claim. Scans the spawn region of
-    /// `ui_protocol_transport.rs` so reverting the wiring fails even though
-    /// that module is feature-gated out of this build (mutation check 1).
+    /// #2066 round 2 (codex R2/R7) + round 3 (codex fix 2) — source guard for
+    /// the AppUI dispatch wiring: the continuation runner must pop and claim
+    /// ATOMICALLY (`drain_and_claim_ready_continuation_for_session`, the same
+    /// primitive the session actor uses — claim-failure pops nothing, so no
+    /// one-shot can be completed unexecuted), never the non-atomic pop
+    /// (`drain_ready_continuations_for_session`) nor an unconditional mark;
+    /// and it must re-check the goal (`goal_dispatch_target_matches`) before
+    /// launching. Scans `ui_protocol_transport.rs` so reverting the wiring
+    /// fails even though that module is feature-gated out of this build
+    /// (mutation checks 1 and 2 of the respective rounds).
     #[test]
     fn appui_continuation_spawn_should_use_atomic_try_claim_source_guard() {
         let transport = include_str!("../api/ui_protocol_transport.rs");
-        let spawn_marker = "draining queued master continuation into AppUI turn runtime";
+        let fn_marker = "async fn maybe_spawn_appui_master_continuation_runner";
         let start = transport
-            .find(spawn_marker)
-            .expect("the AppUI continuation spawn log line exists");
+            .find(fn_marker)
+            .expect("the AppUI continuation runner exists");
         let end = transport[start..]
             .find("run_standalone_turn(")
             .map(|offset| start + offset)
-            .expect("the spawn region ends at the turn launch");
-        let spawn_region = &transport[start..end];
+            .expect("the runner region ends at the turn launch");
+        let runner_region = &transport[start..end];
         assert!(
-            spawn_region.contains("try_claim_goal_in_flight"),
-            "the continuation spawn must claim the dispatch slot atomically \
-             (try-claim), not mark unconditionally"
+            runner_region.contains("drain_and_claim_ready_continuation_for_session"),
+            "the continuation runner must pop-and-claim under ONE lock \
+             (atomic drain-and-claim), so a failed claim pops nothing"
         );
         assert!(
-            spawn_region.contains("goal_dispatch_target_matches"),
-            "the continuation spawn must re-check the goal after claiming, \
+            !runner_region.contains("drain_ready_continuations_for_session("),
+            "the non-atomic pop must not return to the continuation runner \
+             (pop-before-claim completes unexecuted one-shots on claim failure)"
+        );
+        assert!(
+            runner_region.contains("goal_dispatch_target_matches"),
+            "the continuation runner must re-check the goal after claiming, \
              before launching"
         );
         assert!(
-            !spawn_region.contains("goal_dispatch_in_flight_guard("),
+            !runner_region.contains("goal_dispatch_in_flight_guard(")
+                && !runner_region.contains("mark_goal_dispatch_in_flight"),
             "the unconditional marker overwrite must not return to the \
-             continuation spawn path (it silently steals a clear's claim)"
+             continuation runner (it silently steals a clear's claim)"
         );
+    }
+
+    /// #2066 round 3 (codex fix 2) — two dispatchers, DIFFERENT pending
+    /// reasons: while one dispatcher's atomic drain-and-claim holds the
+    /// slot, the other pops NOTHING (and therefore completes nothing); after
+    /// release it drains the remaining item. Both one-shots execute exactly
+    /// once — the round-2 shape completed the loser's popped item
+    /// unexecuted, permanently dropping a latched GoalWrapUp.
+    #[test]
+    fn concurrent_dispatchers_should_never_complete_an_unexecuted_one_shot() {
+        use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
+        // drain_and_claim takes &'static self (guards borrow the
+        // orchestrator); leak a test-local instance instead of sharing the
+        // process singleton with parallel tests.
+        let orchestrator: &'static InProcessAgentOrchestrator =
+            Box::leak(Box::new(InProcessAgentOrchestrator::default()));
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-two-dispatchers");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "two dispatchers".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        // A second pending one-shot with a DIFFERENT reason (codex's loss
+        // case pairs a goal item with a ChildCompleted).
+        {
+            let mut state = orchestrator.state();
+            let request = MasterContinuationRequest::new(
+                "coding-autonomy-child",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::ChildCompleted,
+                SystemTime::now(),
+            );
+            let _ = enqueue_and_persist_continuation(&mut state, request);
+        }
+        let pending_before =
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a");
+        assert_eq!(pending_before, 2, "goal continuation + child completion");
+
+        // Dispatcher 1 pops-and-claims one item.
+        let (first, guard1) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(first.len(), 1);
+        let guard1 = guard1.expect("claim taken with the pop");
+
+        // Dispatcher 2 races in while the slot is held: it must pop NOTHING
+        // — the second one-shot stays pending, nothing is completed.
+        let (second, guard2) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            second.is_empty() && guard2.is_none(),
+            "a held slot must drain nothing (pop-before-claim is the bug)"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            1,
+            "the un-owned one-shot must still be pending, not completed-unexecuted"
+        );
+
+        // Dispatcher 1's turn ends; dispatcher 2 now drains the second item.
+        drop(guard1);
+        let (third, guard3) = orchestrator.drain_and_claim_ready_continuation_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(third.len(), 1);
+        assert!(guard3.is_some());
+        assert_ne!(
+            std::mem::discriminant(&first[0].reason),
+            std::mem::discriminant(&third[0].reason),
+            "both one-shots executed exactly once, each by one dispatcher"
+        );
+    }
+
+    /// #2066 round 3 (codex fix 3) — legacy UNBOUND (`goal_id: None`)
+    /// continuations must not wildcard onto a create-after-clear
+    /// replacement. Negative: an unbound item enqueued for a since-cleared
+    /// goal is completed STALE at drain (never launched, replacement never
+    /// charged). Positive: an unbound item drained under its original
+    /// still-live goal binds to it at drain and charges it.
+    #[test]
+    fn unbound_goal_continuation_should_bind_at_drain_or_die_stale() {
+        use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-unbound-legacy");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "old goal".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        // Drain the initial bound continuation out of the way.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // A LEGACY persisted item: no goal_id stamped. Legacy items are by
+        // definition OLD (restored from a pre-restart queue), so model that:
+        // the item's creation time predates a same-tick clear+recreate. A
+        // goal created in the SAME millisecond as the item still binds
+        // (`<=` — set_goal's own tick), which only the replacement case
+        // below must not hit.
+        let enqueue_unbound = |orchestrator: &InProcessAgentOrchestrator| {
+            let mut state = orchestrator.state();
+            let request = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now() - std::time::Duration::from_secs(1),
+            );
+            let _ = enqueue_and_persist_continuation(&mut state, request);
+        };
+        // The original goal clearly predates the legacy item.
+        {
+            let mut state = orchestrator.state();
+            let key = orchestrator.scoped_goal_key(&session_id);
+            state
+                .goals
+                .get_mut(&key)
+                .expect("goal exists")
+                .created_at_ms -= 5_000;
+        }
+
+        // POSITIVE: the original goal is still live → the drain BINDS the
+        // item to it (downstream sees Some, the wildcard paths never fire).
+        enqueue_unbound(&orchestrator);
+        let old_goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let bound: Vec<_> = drained
+            .iter()
+            .filter(|c| matches!(c.reason, MasterContinuationReason::GoalContinue))
+            .collect();
+        // The drain's own due-scan may enqueue a fresh (already-bound)
+        // continuation alongside; the property under test is that NOTHING
+        // comes out unbound and everything is bound to the live goal.
+        assert!(!bound.is_empty());
+        assert!(
+            bound
+                .iter()
+                .all(|c| c.goal_id.as_ref().map(|goal_id| goal_id.as_str())
+                    == Some(old_goal_id.as_str())),
+            "an unbound item drained under its original live goal binds to it \
+             (and nothing drains unbound): {drained:?}"
+        );
+
+        // NEGATIVE: enqueue unbound → clear → create a REPLACEMENT → drain.
+        enqueue_unbound(&orchestrator);
+        orchestrator
+            .clear_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("clear");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "replacement".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set replacement");
+        // Both the legacy unbound item AND the replacement's own initial
+        // continuation are queued now (distinct dedupe keys); drain
+        // everything and inspect which survived.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let new_goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        let goal_items: Vec<_> = drained
+            .iter()
+            .filter(|c| matches!(c.reason, MasterContinuationReason::GoalContinue))
+            .collect();
+        assert_eq!(
+            goal_items.len(),
+            1,
+            "the legacy unbound item must be completed STALE at drain — only \
+             the replacement's own continuation may come out: {drained:?}"
+        );
+        assert_eq!(
+            goal_items[0]
+                .goal_id
+                .as_ref()
+                .map(|goal_id| goal_id.as_str()),
+            Some(new_goal_id.as_str()),
+            "the surviving item is the replacement's own, bound to it"
+        );
+        // And the replacement was never charged by anything stale.
+        let (new_tokens, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("replacement exists");
+        assert_eq!(new_tokens, 0);
+    }
+
+    /// #2066 round 3 (codex fix 4) — tombstone TTL consults marker liveness:
+    /// a tombstone past its horizon SURVIVES while the session's in-flight
+    /// marker is still held (a legitimately long turn may still charge), and
+    /// is purged once the marker is gone.
+    #[test]
+    fn expired_tombstone_should_survive_while_the_dispatch_marker_is_held() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-ttl-liveness");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "very long turn".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        let key = orchestrator.scoped_goal_key(&session_id);
+        let dispatcher_generation = orchestrator.mark_goal_dispatch_in_flight(&key);
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(data_dir.path()),
+            )
+            .expect("clear");
+        // Age the tombstone past its horizon while the marker stays FRESH
+        // (the turn keeps proving progress via the touch/refresh path).
+        {
+            let mut state = orchestrator.state();
+            state
+                .cleared_goal_tombstones
+                .get_mut(&key)
+                .expect("tombstone parked")
+                .parked_at_ms = now_ms_u64().saturating_sub(CLEARED_GOAL_TOMBSTONE_TTL_MS + 1);
+            purge_stale_cleared_goal_tombstones(&mut state);
+            assert!(
+                state.cleared_goal_tombstones.contains_key(&key),
+                "an expired tombstone must SURVIVE while the marker is held \
+                 (the >30min turn can still charge)"
+            );
+        }
+        // The long turn's charge still settles.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 5_000, 7)
+                .is_none()
+        );
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        assert_eq!(
+            ledger
+                .get_goal(&goal_id)
+                .expect("query")
+                .expect("row")
+                .tokens_used,
+            5_000,
+        );
+        // Marker released (turn over) → the expired tombstone purges on the
+        // next touch.
+        assert!(orchestrator.clear_goal_dispatch_in_flight_generation(&key, dispatcher_generation));
+        {
+            let mut state = orchestrator.state();
+            purge_stale_cleared_goal_tombstones(&mut state);
+            assert!(
+                !state.cleared_goal_tombstones.contains_key(&key),
+                "with the marker gone, the expired tombstone purges"
+            );
+        }
     }
 
     /// Codex LOW (zero-budget consistency): a `token_budget` of 0 is not a

@@ -1516,14 +1516,66 @@ impl GoalLedger {
         Ok(stored_status)
     }
 
-    /// #2066 round 2 (codex R6) — COUNTERS-ONLY additive settle for a
-    /// post-clear turn charge. `tokens_used` grows by a DELTA (never an
-    /// absolute), the status is stamped `cleared` unless the row is the
-    /// stronger `complete` terminal, and `updated_at_ms` only ever moves
-    /// forward. Additive deltas commute with each other and with the clear's
-    /// status stamp by arithmetic, so the settled total is identical in every
-    /// arrival order — the property the snapshot-upsert settle could not give
-    /// (its monotonic absolute clauses made the outcome order-dependent).
+    /// #2066 round 3 (codex fix 1) — the CLEAR STAMP: per-column MAX-merge on
+    /// counters, CASE on status, insert-if-absent. This writer deliberately
+    /// drops the row-level all-or-nothing guard of [`Self::upsert_goal`] —
+    /// that reject-whole-row shape is exactly what made the round-2 mixed
+    /// model order-dependent (a same-millisecond stamp landing after the
+    /// settle OVERWROTE the settled delta; a newer-timestamp settle made a
+    /// later stamp reject and lose the entire pre-clear lag). With both the
+    /// stamp and the settle MAX-merging on `tokens_used`, order-independence
+    /// is arithmetic: for row lag `L`, frozen clear-time base `B`, late
+    /// delta `D` — stamp→settle = `MAX(L,B)+D = B+D`; settle→stamp =
+    /// `MAX(MAX(L,B)+D, B) = B+D` (deltas are positive); every interleaving
+    /// of further deltas commutes the same way.
+    ///
+    /// Status: `cleared` unless the row is the stronger `complete` terminal
+    /// (clearing an already-complete goal keeps the row `complete`).
+    /// `objective`/`token_budget` take the clear-time values — the clear is
+    /// this row's single stamp writer, and the settle never touches them.
+    ///
+    /// Returns the STORED status so the caller can gate its audit decision
+    /// on what actually landed (`cleared` ⇒ append; `complete` ⇒ skip).
+    pub fn stamp_goal_cleared(&self, goal: &Goal) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 'cleared', ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(goal_id) DO UPDATE SET
+                 objective = excluded.objective,
+                 status = CASE WHEN goals.status = 'complete' THEN goals.status ELSE 'cleared' END,
+                 tokens_used = MAX(goals.tokens_used, excluded.tokens_used),
+                 token_budget = excluded.token_budget,
+                 continuations_used = MAX(goals.continuations_used, excluded.continuations_used),
+                 updated_at_ms = MAX(goals.updated_at_ms, excluded.updated_at_ms)",
+            params![
+                goal.goal_id,
+                goal.objective,
+                goal.tokens_used,
+                goal.token_budget,
+                goal.continuations_used,
+                goal.revision,
+                goal.created_at_ms,
+                goal.updated_at_ms,
+            ],
+        )?;
+        let stored: String = conn.query_row(
+            "SELECT status FROM goals WHERE goal_id = ?1",
+            params![goal.goal_id],
+            |row| row.get(0),
+        )?;
+        Ok(stored)
+    }
+
+    /// #2066 round 2 (codex R6) / round 3 (codex fix 1 + 5) — GENUINELY
+    /// counters-only settle for a post-clear turn charge: `tokens_used`
+    /// MAX-merges the frozen clear-time base and adds the charge's DELTA,
+    /// `updated_at_ms` only ever moves forward, and STATUS is never touched
+    /// (round 3 removed the round-2 `cleared` CASE — the stamp owns the
+    /// status dimension, and a settle must never stamp a row it races). The
+    /// MAX-fold of the base is what makes settle-first converge: a stamp
+    /// arriving later MAX-merges to the same total (see
+    /// [`Self::stamp_goal_cleared`] for the arithmetic).
     ///
     /// Idempotency assumption: per-charge SINGLE DELIVERY — each in-process
     /// accountant charge settles exactly once (one offload per charge); this
@@ -1534,16 +1586,16 @@ impl GoalLedger {
     pub fn settle_cleared_goal_cost_delta(
         &self,
         goal_id: &str,
+        frozen_base_tokens: u64,
         tokens_delta: u64,
         updated_at_ms: u64,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "UPDATE goals SET tokens_used = tokens_used + ?1,
-                 status = CASE WHEN status = 'complete' THEN status ELSE 'cleared' END,
-                 updated_at_ms = MAX(updated_at_ms, ?2)
-             WHERE goal_id = ?3",
-            params![tokens_delta, updated_at_ms, goal_id],
+            "UPDATE goals SET tokens_used = MAX(tokens_used, ?1) + ?2,
+                 updated_at_ms = MAX(updated_at_ms, ?3)
+             WHERE goal_id = ?4",
+            params![frozen_base_tokens, tokens_delta, updated_at_ms, goal_id],
         )?;
         Ok(changed > 0)
     }
@@ -2256,7 +2308,7 @@ mod tests {
         // The counters-only settle still lands on the cleared tombstone.
         assert!(
             ledger
-                .settle_cleared_goal_cost_delta("g1", 4_000, 6000)
+                .settle_cleared_goal_cost_delta("g1", 500, 4_000, 6000)
                 .unwrap()
         );
         let row = ledger.get_goal("g1").unwrap().unwrap();
@@ -2319,67 +2371,55 @@ mod tests {
         assert_eq!(ledger.count_decisions("g1").unwrap(), 1);
     }
 
-    /// #2066 round 2 (codex R6) — the clear's status stamp and the settle's
-    /// counters delta are SEPARATE write dimensions, so the final row is
-    /// identical in both arrival orders. Order A replicates the production
-    /// clear-stamp-first path (guarded upsert admits); order B replicates the
-    /// race (delta lands first, then the sync's upsert is refused and its
-    /// ordering-gated CAS retry declines) — both converge on the same row.
+    /// #2066 round 3 (codex fix 1) — THE order-independence pin, with the
+    /// adversarial fixture the round-2 test masked (it seeded ledger == base):
+    /// row lag `L=0` STRICTLY BELOW the frozen clear-time base `B=100`, late
+    /// delta `D=10`, and ALL writers stamping the SAME millisecond (the tie
+    /// that let the round-2 guarded upsert overwrite a settled delta). Every
+    /// order must land exactly `B + ΣD` with status `cleared`:
+    /// stamp→delta = `MAX(0,100)+10`; delta→stamp = `MAX(MAX(0,100)+10,100)`;
+    /// delta-only then a late stamp retry converges the same way.
     #[test]
     fn should_settle_identical_rows_for_clear_stamp_and_delta_in_both_orders() {
+        // Frozen clear-time snapshot: B=100 (the ledger row lags at L=0
+        // because ordinary nonterminal turns deliberately never sync it).
         let clear_snapshot = Goal {
             goal_id: "g1".to_string(),
             objective: "both orders".to_string(),
             status: "cleared".to_string(),
-            tokens_used: 500,
+            tokens_used: 100,
             token_budget: 100_000,
             continuations_used: 0,
             revision: 0,
             created_at_ms: 1000,
-            updated_at_ms: 2000, // clear time
+            updated_at_ms: 2000, // clear time == charge time (same-ms tie)
         };
-        // Replicates `sync_transition_to_ledger_blocking`: guarded upsert,
-        // then the ordering-gated status-CAS retry on rejection.
         let stamp_cleared = |ledger: &GoalLedger| {
-            let admitted = ledger.upsert_goal(&clear_snapshot).unwrap();
-            if !admitted {
-                if let Some(current) = ledger.get_goal("g1").unwrap() {
-                    let retry_admissible = clear_snapshot.updated_at_ms >= current.updated_at_ms
-                        && current.status != "complete"
-                        && current.status != clear_snapshot.status;
-                    if retry_admissible {
-                        let _ = ledger
-                            .cas_goal_status(
-                                "g1",
-                                &clear_snapshot.status,
-                                &current.status,
-                                current.updated_at_ms,
-                                clear_snapshot.updated_at_ms,
-                            )
-                            .unwrap();
-                    }
-                }
-            }
+            let stored = ledger.stamp_goal_cleared(&clear_snapshot).unwrap();
+            assert_eq!(stored, "cleared");
         };
-        let settle = |ledger: &GoalLedger| {
-            // The production settle: create-if-absent (base), then the delta.
+        let settle = |ledger: &GoalLedger, delta: u64| {
+            // The production settle: create-if-absent (frozen base), then the
+            // MAX-merged delta — same-millisecond timestamp as the stamp.
             assert!(ledger.create_goal_if_absent(&clear_snapshot).is_ok());
             assert!(
                 ledger
-                    .settle_cleared_goal_cost_delta("g1", 4_000, 3000)
+                    .settle_cleared_goal_cost_delta("g1", 100, delta, 2000)
                     .unwrap()
             );
         };
 
-        // Order A: stamp, then settle.
-        let (_dir_a, ledger_a) = ledger_with_goal(500, 100_000, "active");
+        // Order A: stamp, then delta.
+        let (_dir_a, ledger_a) = ledger_with_goal(0, 100_000, "active");
         stamp_cleared(&ledger_a);
-        settle(&ledger_a);
+        settle(&ledger_a, 10);
         let row_a = ledger_a.get_goal("g1").unwrap().unwrap();
 
-        // Order B: settle, then stamp.
-        let (_dir_b, ledger_b) = ledger_with_goal(500, 100_000, "active");
-        settle(&ledger_b);
+        // Order B: delta first, then the SAME-MILLISECOND stamp (the round-2
+        // loss case: the all-or-nothing upsert admitted and overwrote 110
+        // back to 100; the MAX-merge stamp must not).
+        let (_dir_b, ledger_b) = ledger_with_goal(0, 100_000, "active");
+        settle(&ledger_b, 10);
         stamp_cleared(&ledger_b);
         let row_b = ledger_b.get_goal("g1").unwrap().unwrap();
 
@@ -2390,22 +2430,46 @@ mod tests {
             "the settled row must be identical in both arrival orders"
         );
         assert_eq!(
-            row_b.tokens_used, 4_500,
-            "base 500 + delta 4000, never lost"
+            row_b.tokens_used, 110,
+            "B(100) + D(10): neither the late delta nor the pre-clear lag may be lost"
         );
+
+        // Multi-delta interleaving: delta, delta, stamp — still B + ΣD.
+        let (_dir_c, ledger_c) = ledger_with_goal(0, 100_000, "active");
+        settle(&ledger_c, 10);
+        settle(&ledger_c, 5);
+        stamp_cleared(&ledger_c);
+        assert_eq!(
+            ledger_c.get_goal("g1").unwrap().unwrap().tokens_used,
+            115,
+            "B(100) + D1(10) + D2(5) in every interleaving"
+        );
+
+        // Fix 5 pin: the settle is GENUINELY counters-only — before the stamp
+        // lands, a settled row keeps whatever status it had (the stamp owns
+        // the status dimension).
+        let (_dir_d, ledger_d) = ledger_with_goal(0, 100_000, "active");
+        settle(&ledger_d, 10);
+        assert_eq!(
+            ledger_d.get_goal("g1").unwrap().unwrap().status,
+            "active",
+            "a settle racing ahead of the stamp must not flip status"
+        );
+        stamp_cleared(&ledger_d);
+        assert_eq!(ledger_d.get_goal("g1").unwrap().unwrap().status, "cleared");
     }
 
     /// #2066 round 2 (codex R6) — the settle sequence on a goal whose ledger
     /// row does not exist yet: the delta alone matches nothing; the caller's
-    /// create-if-absent + delta sequence creates the cleared tombstone and
-    /// lands the charge.
+    /// create-if-absent + delta sequence creates the cleared tombstone (the
+    /// frozen base INSERT carries status `cleared`) and lands the charge.
     #[test]
     fn should_create_the_cleared_row_when_settling_without_one() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
         assert!(
             !ledger
-                .settle_cleared_goal_cost_delta("g1", 4_000, 3000)
+                .settle_cleared_goal_cost_delta("g1", 500, 4_000, 3000)
                 .unwrap(),
             "a bare delta on a missing row changes nothing"
         );
@@ -2426,11 +2490,36 @@ mod tests {
         );
         assert!(
             ledger
-                .settle_cleared_goal_cost_delta("g1", 4_000, 3000)
+                .settle_cleared_goal_cost_delta("g1", 500, 4_000, 3000)
                 .unwrap()
         );
         let row = ledger.get_goal("g1").unwrap().unwrap();
         assert_eq!((row.status.as_str(), row.tokens_used), ("cleared", 4_500));
+    }
+
+    /// #2066 round 3 (codex fix 1) — the stamp keeps `complete` (terminal
+    /// parity) while still MAX-merging counters, and reports the stored
+    /// status so the caller's decision gate can skip the audit row.
+    #[test]
+    fn should_keep_complete_when_stamping_cleared_over_a_complete_row() {
+        let (_dir, ledger) = ledger_with_goal(500, 100_000, "complete");
+        let stored = ledger
+            .stamp_goal_cleared(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "clear a finished goal".to_string(),
+                status: "cleared".to_string(),
+                tokens_used: 700,
+                token_budget: 100_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+        assert_eq!(stored, "complete", "complete is the stronger terminal");
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.tokens_used, 700, "counters still MAX-merge");
     }
 
     #[test]
