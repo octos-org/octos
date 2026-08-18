@@ -41,7 +41,36 @@ use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
 /// Hard wall-clock limit for a single formatter run. The child is killed when
 /// the limit elapses (`kill_on_drop` — dropping the wait future SIGKILLs).
+///
+/// #2053 — the budget is platform-scaled because it bounds a *hung* formatter,
+/// not a slow one, and "slow" means something very different on Windows. A
+/// cold `rustfmt` there pays for process creation plus on-access AV scanning of
+/// the binary and its inputs, and routinely exceeds five seconds on CI: the
+/// same test (`edit_file::should_return_formatted_content_when_format_after_edit_enabled`)
+/// tripped this limit five times across four unrelated PRs in one day, twice
+/// consecutively on the same PR, always with
+///
+/// ```text
+/// Note: post-edit formatting with rustfmt timed out after 5s and was killed;
+///       the edit itself was applied unchanged.
+/// ```
+///
+/// This is not only a CI artifact. The timeout is a real code path: when it
+/// fires, the edit lands unformatted and the user is merely told so. A budget
+/// that a healthy formatter cannot meet therefore degrades Windows users'
+/// output silently and at random, which is a worse failure than waiting a few
+/// more seconds for the answer they asked for. Raising the ceiling does not
+/// weaken the guarantee it exists for — a genuinely hung formatter is still
+/// killed, just later.
+///
+/// Unix keeps 5s, where rustfmt returns in well under a second.
+#[cfg(not(windows))]
 pub const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Windows counterpart of [`FORMAT_TIMEOUT`] — see that constant for why the
+/// budget differs by platform.
+#[cfg(windows)]
+pub const FORMAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Byte cap for the formatted-content echo appended to the tool output.
 /// Larger files are truncated at a UTF-8 boundary with a marker; the LLM can
