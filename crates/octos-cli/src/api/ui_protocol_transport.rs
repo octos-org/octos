@@ -81,7 +81,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use super::AppState;
 use super::metrics::MetricsReporter;
@@ -19577,8 +19577,11 @@ async fn handle_turn_start_with_accept(
 /// Outcome of the `turn/steer` registry decision (computed under the
 /// active-turns registry lock — see [`handle_turn_steer`]).
 enum TurnSteerDecision {
-    /// Input pushed into the ACTIVE turn's pending buffer.
-    Steered(TurnId),
+    /// Input pushed into the ACTIVE turn's pending buffer. `interrupting`
+    /// records that the turn was already winding down at acceptance
+    /// (task-turn-interrupt-steer-correlation-logs) — such input is likely
+    /// to be returned as `turn/steer_dropped` rather than drained.
+    Steered { turn_id: TurnId, interrupting: bool },
     /// `expected_turn_id` was present and does not name the active turn
     /// (codex `ExpectedTurnMismatch`). Carries the actual active id for the
     /// error message.
@@ -19654,6 +19657,10 @@ async fn handle_turn_steer(
                 // in between the settlement and the terminal frame.
                 let state = existing.state.lock().await;
                 let terminal = matches!(*state, TurnState::Terminal(_));
+                // task-turn-interrupt-steer-correlation-logs: input accepted
+                // while the turn is already winding down is the case that
+                // ends up returned as turn/steer_dropped.
+                let interrupting = matches!(*state, TurnState::Interrupting { .. });
                 if terminal {
                     TurnSteerDecision::NoActiveTurn
                 } else if params
@@ -19669,7 +19676,10 @@ async fn handle_turn_steer(
                             // the accept below can never name a turn that a
                             // concurrent admission already replaced.
                             buffer.push(prompt.clone());
-                            TurnSteerDecision::Steered(existing.turn_id.clone())
+                            TurnSteerDecision::Steered {
+                                turn_id: existing.turn_id.clone(),
+                                interrupting,
+                            }
                         }
                         None => TurnSteerDecision::NotSteerable,
                     }
@@ -19680,12 +19690,11 @@ async fn handle_turn_steer(
     };
 
     match decision {
-        TurnSteerDecision::Steered(turn_id) => {
-            info!(
-                session = %params.session_id.0,
-                turn = %turn_id.0,
-                "turn/steer accepted into the active turn's pending-input buffer"
-            );
+        TurnSteerDecision::Steered {
+            turn_id,
+            interrupting,
+        } => {
+            crate::turn_trace::log_steer_accepted(&params.session_id, &turn_id, interrupting);
             let _ = send_rpc_result(ws, id, json!({ "turn_id": turn_id, "steered": true }));
         }
         TurnSteerDecision::Mismatch(active_turn_id) => {
@@ -20656,7 +20665,20 @@ async fn handle_turn_interrupt(
     id: String,
     params: TurnInterruptParams,
 ) {
+    // task-turn-interrupt-steer-correlation-logs: make the interrupt's
+    // receipt, decision and ack reconstructible from the log alone.
+    crate::turn_trace::log_interrupt_received(&params.session_id, &params.turn_id);
     let outcome = decide_interrupt(active_turns, &params).await;
+    let outcome_label: String = match &outcome {
+        InterruptOutcome::Unknown => "unknown".into(),
+        InterruptOutcome::Mismatch => "mismatch".into(),
+        InterruptOutcome::AlreadyTerminal(reason) => {
+            format!("already_terminal:{}", reason.as_str())
+        }
+        InterruptOutcome::AlreadyInterrupting => "already_interrupting".into(),
+        InterruptOutcome::Captured { .. } => "captured".into(),
+    };
+    crate::turn_trace::log_interrupt_outcome(&params.session_id, &params.turn_id, &outcome_label);
     match outcome {
         InterruptOutcome::Unknown => {
             let _ = send_rpc_error(ws, Some(id), unknown_turn_error(&params.turn_id));
@@ -20694,6 +20716,15 @@ async fn handle_turn_interrupt(
             // outer turn future here — that would race with the terminal
             // emission and could lose the wire-side event.
             let result = tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, ack_rx).await;
+            crate::turn_trace::log_interrupt_ack(
+                &params.session_id,
+                &params.turn_id,
+                if matches!(result, Ok(Ok(()))) {
+                    "interrupted"
+                } else {
+                    "ack_timed_out"
+                },
+            );
             let payload = match result {
                 Ok(Ok(())) => TurnInterruptResult::interrupted_ok(),
                 Ok(Err(_)) => {
@@ -31268,6 +31299,11 @@ async fn run_standalone_turn(
     // task future is dropped.
     let token_tracker = std::sync::Arc::new(octos_agent::TokenTracker::new());
     let token_tracker_task = std::sync::Arc::clone(&token_tracker);
+    // task-turn-interrupt-steer-correlation-logs: every agent-side log line
+    // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
+    // `session`/`turn` from this span (postfix `.instrument` keeps the block
+    // itself untouched).
+    let turn_span = crate::turn_trace::turn_span(&session_id, &turn_id);
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -31983,7 +32019,7 @@ async fn run_standalone_turn(
                 let _ = progress_tx_for_result.send(error.to_string()).await;
             }
         }
-    });
+    }.instrument(turn_span));
     let _abort_guard = AbortOnDrop {
         abort: agent_task.abort_handle(),
     };
