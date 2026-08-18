@@ -2642,6 +2642,15 @@ impl InProcessAgentOrchestrator {
         Ok(autonomy_agent_json(&agent))
     }
 
+    /// #2066 round 3 (codex fix 2) — TEST ONLY: the non-atomic pop lost its
+    /// last production caller when the AppUI runner moved to
+    /// [`Self::drain_and_claim_ready_continuation_for_session`]. Popping
+    /// without claiming is exactly the pop-before-claim hazard fix 2 removed
+    /// (a dispatcher that pops and then loses the claim race completes the
+    /// popped one-shot unexecuted), so no production path may use this; the
+    /// AppUI source guard additionally forbids it at the runner site. Tests
+    /// keep it as a convenient queue-inspection harness.
+    #[cfg(test)]
     pub(crate) fn drain_ready_continuations_for_session(
         &self,
         session_id: &SessionKey,
@@ -3204,11 +3213,12 @@ impl InProcessAgentOrchestrator {
     }
 
     /// True when a continuation turn for `session_id` is currently in flight
-    /// (the in-flight marker is set). The due-scan already excludes such
-    /// sessions; this accessor lets a SECOND dispatch surface — the AppUI
-    /// serve tick — also skip a session whose continuation turn is running in
-    /// the session actor, closing the cross-subsystem drain race where both
-    /// spawn a concurrent turn on the same session (#1529).
+    /// (the in-flight marker is set). #2066 round 3 — TEST ONLY: the AppUI
+    /// serve tick's separate occupancy pre-check (#1529) was subsumed by the
+    /// atomic [`Self::drain_and_claim_ready_continuation_for_session`], which
+    /// performs the same check under the same lock as the pop; a standalone
+    /// read is inherently TOCTOU and no production path should decide on it.
+    #[cfg(test)]
     pub(crate) fn is_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> bool {
         in_flight_marker_is_held(&self.state(), session_id)
     }
