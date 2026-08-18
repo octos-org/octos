@@ -227,13 +227,13 @@ impl GoalLedger {
             // #2055 review round 4 — the `authority` schema migration runs
             // HERE, inside the attempt (never in the common `open`, which
             // executes on tokio workers): this profile is only ever called
-            // from blocking contexts, and a migration ALTER that loses a
-            // lock race is retried exactly like a contended open.
+            // from blocking contexts, and a migration transaction that loses
+            // a lock race is retried exactly like a contended open.
             let attempt_result = Self::open_inner(path, Some(std::time::Duration::from_secs(1)))
                 .and_then(|ledger| {
                     {
-                        let conn = ledger.conn.lock().unwrap();
-                        Self::migrate_tasks_authority_column(&conn)?;
+                        let mut conn = ledger.conn.lock().unwrap();
+                        Self::migrate_tasks_authority_column(&mut conn)?;
                     }
                     Ok(ledger)
                 });
@@ -382,45 +382,69 @@ impl GoalLedger {
         Ok(())
     }
 
-    /// #2055 review round 4 — bring an existing `tasks` table onto the
-    /// `authority` schema. Three steps, each with an explicit error policy
-    /// (SQLite reports both expected failures as generic `SQLITE_ERROR`, so
-    /// the message text is the only discriminator — documented rusqlite
-    /// behavior for DDL):
+    /// Whether the `tasks` table currently carries `column` — schema
+    /// inspection via `pragma_table_info`, which never references the column
+    /// itself and returns an empty set for a missing table, so it is safe on
+    /// every schema generation.
+    fn tasks_has_column(conn: &Connection, column: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// #2055 review round 5 — bring an existing `tasks` table onto the
+    /// `authority` schema, ATOMICALLY. All steps run inside ONE
+    /// `BEGIN IMMEDIATE` transaction and are decided by SCHEMA INSPECTION
+    /// (`pragma_table_info`), never by error-message substrings:
     ///
-    /// 1. Add the column (fresh default `-1`, identical to the
-    ///    `CREATE TABLE` shape). A duplicate-column error means the table is
-    ///    already migrated — swallowed; every OTHER error propagates.
-    /// 2. Only when step 1 actually added the column: stamp every
-    ///    pre-existing terminal row as FINAL (`authority = 2`) — a legacy
-    ///    `failed` row must NOT become correctable, and a legacy `complete`
-    ///    row is equally settled history. Rows the round-4 code writes carry
-    ///    their real rank from the start, and this backfill can never touch
-    ///    them because it runs only in the same breath as the column
-    ///    creation.
-    /// 3. Drop the short-lived round-3 `correctable` column if present
-    ///    (this branch never shipped; the column exists only on databases
-    ///    created from it). A missing column is swallowed; other errors
-    ///    propagate.
-    fn migrate_tasks_authority_column(conn: &Connection) -> Result<()> {
-        match conn.execute(
-            "ALTER TABLE tasks ADD COLUMN authority INTEGER NOT NULL DEFAULT -1",
-            [],
-        ) {
-            Ok(_) => {
-                conn.execute(
-                    "UPDATE tasks SET authority = 2 WHERE status IN ('complete', 'failed')",
-                    [],
-                )?;
-            }
-            Err(error) if error.to_string().contains("duplicate column name") => {}
-            Err(error) => return Err(error.into()),
+    /// - the previous statement-by-statement shape could commit the
+    ///   ALTER-ADD and then fail before the backfill; every later opener
+    ///   then saw the column present, skipped the backfill forever, and
+    ///   legacy terminal rows sat at authority `-1` (correctable).
+    /// - the `"no such column"` substring also matched REAL failures (a
+    ///   dependent index on the dropped column reports
+    ///   `error in index … no such column`), silently eating them.
+    ///
+    /// Steps, inside the transaction: (1) when `authority` is absent, add
+    /// it (default `-1`, identical to the `CREATE TABLE` shape) and stamp
+    /// every pre-existing terminal row FINAL (`authority = 2`) — a legacy
+    /// `failed` row must NOT become correctable, and the backfill can never
+    /// touch rows the current code writes because it runs only in the same
+    /// transaction as the column creation; (2) when the short-lived round-3
+    /// `correctable` column is present, drop it. Any statement failure
+    /// rolls the WHOLE migration back (the `Transaction` drop path), so no
+    /// partial schema state can persist; any error propagates to the caller
+    /// (`open_with_busy_retry`'s attempt loop, which retries the
+    /// lock-contention class and surfaces the rest).
+    ///
+    /// The pre-transaction fast path skips the write lock entirely on a
+    /// fully-migrated database; the checks are REPEATED inside the
+    /// transaction because two blocking-context openers can race the fast
+    /// path, and only the in-transaction view is serialized.
+    fn migrate_tasks_authority_column(conn: &mut Connection) -> Result<()> {
+        if Self::tasks_has_column(conn, "authority")?
+            && !Self::tasks_has_column(conn, "correctable")?
+        {
+            return Ok(());
         }
-        match conn.execute("ALTER TABLE tasks DROP COLUMN correctable", []) {
-            Ok(_) => {}
-            Err(error) if error.to_string().contains("no such column") => {}
-            Err(error) => return Err(error.into()),
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !Self::tasks_has_column(&tx, "authority")? {
+            tx.execute(
+                "ALTER TABLE tasks ADD COLUMN authority INTEGER NOT NULL DEFAULT -1",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET authority = 2 WHERE status IN ('complete', 'failed')",
+                [],
+            )?;
         }
+        if Self::tasks_has_column(&tx, "correctable")? {
+            tx.execute("ALTER TABLE tasks DROP COLUMN correctable", [])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -633,23 +657,63 @@ impl GoalLedger {
         Ok(rows.next().transpose()?)
     }
 
+    /// #2055 review round 5 — the authority rank a freshly CREATED row
+    /// starts at, derived from the status it is created with: a terminal
+    /// status written at creation is an owner-recorded fact, so `complete`
+    /// starts at the completion rank and `failed` at the FINAL-failure rank
+    /// (an observer-provisional failure is only ever expressible through
+    /// [`Self::settle_task_status`], never at creation). Without this, a
+    /// terminal creation sat at `-1` and the nonterminal-refresh guard
+    /// admitted a plain `running` write over a valid terminal row.
+    fn creation_authority_for_status(status: &str) -> i64 {
+        match status {
+            "complete" => TaskSettleAuthority::Completion.rank(),
+            "failed" => TaskSettleAuthority::FinalFailure.rank(),
+            _ => -1,
+        }
+    }
+
     /// Create a new task.
+    ///
+    /// Round 5: the initial `authority` is derived from `task.status` (see
+    /// [`Self::creation_authority_for_status`]) when the column exists; on a
+    /// not-yet-migrated legacy database (reachable through the plain
+    /// [`Self::open`], which deliberately runs no migration) the statement
+    /// falls back to the legacy shape and never references the column.
     pub fn create_task(&self, task: &Task) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                task.task_id,
-                task.goal_id,
-                task.title,
-                task.detail,
-                task.status,
-                task.assigned_peer,
-                task.created_at_ms,
-                task.updated_at_ms,
-            ],
-        )?;
+        if Self::tasks_has_column(&conn, "authority")? {
+            conn.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms, authority)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                    Self::creation_authority_for_status(&task.status),
+                ],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -664,23 +728,46 @@ impl GoalLedger {
     /// [`Self::update_task_status`]), title, and timestamps — rather than
     /// error or overwrite. Returns `Ok(true)` when a row was inserted,
     /// `Ok(false)` for the preserve-existing no-op.
+    ///
+    /// Round 5: the initial `authority` is derived from `task.status` (see
+    /// [`Self::creation_authority_for_status`]) when the column exists; the
+    /// legacy fallback mirrors [`Self::create_task`].
     pub fn create_task_if_absent(&self, task: &Task) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let inserted = conn.execute(
-            "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(task_id) DO NOTHING",
-            params![
-                task.task_id,
-                task.goal_id,
-                task.title,
-                task.detail,
-                task.status,
-                task.assigned_peer,
-                task.created_at_ms,
-                task.updated_at_ms,
-            ],
-        )?;
+        let inserted = if Self::tasks_has_column(&conn, "authority")? {
+            conn.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms, authority)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(task_id) DO NOTHING",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                    Self::creation_authority_for_status(&task.status),
+                ],
+            )?
+        } else {
+            conn.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(task_id) DO NOTHING",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                ],
+            )?
+        };
         Ok(inserted > 0)
     }
 
@@ -3594,21 +3681,23 @@ mod digest_integration_tests {
         );
     }
 
-    /// #2055 review round 4 — the migration swallows exactly the
-    /// duplicate-column error; every other failure propagates. Forced here
-    /// by presenting a connection whose `tasks` table does not exist.
+    /// #2055 review round 4/5 — a migration failure propagates; nothing is
+    /// swallowed by error-message matching (steps are decided by schema
+    /// inspection). Forced here by presenting a connection whose `tasks`
+    /// table does not exist.
     #[test]
     fn should_propagate_non_duplicate_migration_failures() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        // No `tasks` table at all: the ALTER fails with "no such table",
-        // which is NOT the ignorable duplicate-column case.
-        let error = GoalLedger::migrate_tasks_authority_column(&conn)
-            .expect_err("a non-duplicate migration failure must propagate");
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        // No `tasks` table at all: the inspection reports the column absent
+        // and the in-transaction ALTER fails with "no such table".
+        let error = GoalLedger::migrate_tasks_authority_column(&mut conn)
+            .expect_err("a migration failure must propagate");
         assert!(
             error.to_string().contains("no such table"),
             "unexpected error: {error}"
         );
-        // And on an already-migrated table the helper is a clean no-op.
+        // And on an already-migrated table the helper is a clean no-op that
+        // takes no write transaction at all (fast path).
         conn.execute_batch(
             "CREATE TABLE tasks (
                  task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
@@ -3618,8 +3707,213 @@ mod digest_integration_tests {
                  authority INTEGER NOT NULL DEFAULT -1);",
         )
         .unwrap();
-        GoalLedger::migrate_tasks_authority_column(&conn)
+        GoalLedger::migrate_tasks_authority_column(&mut conn)
             .expect("an already-migrated table is a no-op");
+    }
+
+    /// The raw pre-#2055 schema (no `authority`, no `correctable`), used by
+    /// the atomicity fixtures below.
+    fn create_legacy_schema(conn: &rusqlite::Connection, extra: &str) {
+        conn.execute_batch(&format!(
+            "CREATE TABLE goals (
+                 goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                 status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                 token_budget INTEGER NOT NULL,
+                 continuations_used INTEGER NOT NULL DEFAULT 0,
+                 revision INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+             CREATE TABLE tasks (
+                 task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                 title TEXT NOT NULL, detail TEXT NOT NULL,
+                 status TEXT NOT NULL, assigned_peer TEXT,
+                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL{extra},
+                 FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
+             INSERT INTO goals VALUES ('g1', 'ship', 'active', 0, 1000, 0, 0, 1, 1);
+             INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+             VALUES ('legacy-failed', 'g1', '', '', 'failed', NULL, 1, 1);",
+        ))
+        .unwrap();
+    }
+
+    /// #2055 review round 5 (migration atomicity) — a failure AFTER the
+    /// ALTER-ADD rolls the WHOLE migration back: the pre-migration shape is
+    /// restored, so the next opener re-runs everything instead of seeing
+    /// the column present and skipping the terminal backfill forever. The
+    /// mid-migration failure is forced with an aborting trigger on the
+    /// backfill's UPDATE — a real table, a real partial-failure point.
+    #[test]
+    fn should_roll_back_whole_migration_when_a_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            create_legacy_schema(&conn, "");
+            conn.execute_batch(
+                "CREATE TRIGGER abort_backfill BEFORE UPDATE ON tasks
+                 BEGIN SELECT RAISE(ABORT, 'backfill aborted by test trigger'); END;",
+            )
+            .unwrap();
+        }
+
+        let error = GoalLedger::open_with_busy_retry(&path)
+            .err()
+            .expect("the aborted backfill must fail the open");
+        assert!(
+            error.to_string().contains("backfill aborted"),
+            "unexpected error: {error}"
+        );
+        // Partial state must NOT persist: the ALTER-ADD was rolled back
+        // together with the failed backfill.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let authority_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'authority'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            authority_present, 0,
+            "a failed migration must leave the pre-migration shape intact"
+        );
+
+        // With the trigger gone, the SAME database migrates cleanly and the
+        // legacy terminal row is FINAL — the backfill was not lost.
+        conn.execute_batch("DROP TRIGGER abort_backfill;").unwrap();
+        drop(conn);
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        assert!(
+            !ledger
+                .update_task_status("legacy-failed", "complete", 2_000)
+                .unwrap(),
+            "the re-run migration stamps the legacy terminal row FINAL"
+        );
+    }
+
+    /// #2055 review round 5 — a second opener after a completed migration is
+    /// a clean no-op (the fast path sees the migrated shape and takes no
+    /// write transaction).
+    #[test]
+    fn should_treat_second_open_after_migration_as_clean_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            create_legacy_schema(&conn, "");
+        }
+        let first = GoalLedger::open_with_busy_retry(&path).expect("first open migrates");
+        drop(first);
+        let second = GoalLedger::open_with_busy_retry(&path).expect("second open is a no-op");
+        assert!(
+            !second
+                .update_task_status("legacy-failed", "complete", 2_000)
+                .unwrap(),
+            "the migrated FINAL stamp survives the second open"
+        );
+    }
+
+    /// #2055 review round 5 — a dependent index on the round-3 column makes
+    /// the DROP fail LOUDLY (the old substring match ate exactly this error),
+    /// and the failure rolls back the whole migration.
+    #[test]
+    fn should_propagate_drop_failure_when_an_index_depends_on_the_old_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            create_legacy_schema(&conn, ", correctable INTEGER NOT NULL DEFAULT 0");
+            conn.execute_batch("CREATE INDEX idx_tasks_correctable ON tasks(correctable);")
+                .unwrap();
+        }
+
+        let error = GoalLedger::open_with_busy_retry(&path)
+            .err()
+            .expect("a dependent index must fail the column drop loudly");
+        assert!(
+            error.to_string().contains("index"),
+            "unexpected error: {error}"
+        );
+        // The whole migration rolled back: `correctable` is still there and
+        // `authority` never landed.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count_columns = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count_columns("correctable"), 1);
+        assert_eq!(count_columns("authority"), 0);
+    }
+
+    /// #2055 review round 5 (terminal-creation authority) — a row CREATED
+    /// with a terminal status starts at the matching authority rank, so the
+    /// nonterminal-refresh guard cannot let a plain `running` write
+    /// overwrite it (the reproduced `failed/-1 → running/-1` hole).
+    #[test]
+    fn should_refuse_running_refresh_on_freshly_created_terminal_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "ship".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        let terminal_task = |id: &str, status: &str| Task {
+            task_id: id.to_string(),
+            goal_id: "g1".to_string(),
+            title: String::new(),
+            detail: String::new(),
+            status: status.to_string(),
+            assigned_peer: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        ledger
+            .create_task_if_absent(&terminal_task("t-failed", "failed"))
+            .unwrap();
+        ledger
+            .create_task(&terminal_task("t-complete", "complete"))
+            .unwrap();
+
+        for late in ["running", "pending"] {
+            assert!(
+                !ledger.update_task_status("t-failed", late, 2_000).unwrap(),
+                "a created terminal row refuses the nonterminal refresh {late:?}"
+            );
+        }
+        assert_eq!(
+            ledger.get_task("t-failed").unwrap().unwrap().status,
+            "failed"
+        );
+        // Rank consistency: a created `failed` is FINAL (refuses completion),
+        // a created `complete` sits at the completion rank (a final failure
+        // still outranks it, per the order-independence rule).
+        assert!(
+            !ledger
+                .update_task_status("t-failed", "complete", 2_000)
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .update_task_status("t-complete", "running", 2_000)
+                .unwrap()
+        );
+        assert!(
+            ledger
+                .settle_task_status("t-complete", TaskSettleAuthority::FinalFailure, 2_000)
+                .unwrap()
+        );
     }
 
     /// #2055 review round 4 — fresh-schema and migrated-schema databases

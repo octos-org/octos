@@ -801,13 +801,27 @@ fn goal_task_settle_backoff(attempt: u32) -> std::time::Duration {
     capped.min(std::time::Duration::from_secs(2))
 }
 
-/// #2055 review round 4 — settle blocking-core entries, visible to the
-/// contention tests so they can assert that the retry chain actually fired
-/// (the counter is process-global across parallel tests, so assertions are
-/// on DELTAS with `>=`).
+/// #2055 review round 5 — settle blocking-core entries, keyed PER TASK so a
+/// contention test's release gate observes exactly ITS chain's attempts:
+/// the earlier process-global counter could be satisfied by parallel tests'
+/// attempts before this task's retry ever entered (a false pass).
 #[cfg(test)]
-pub(crate) static GOAL_TASK_SETTLE_ATTEMPT_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+fn goal_task_settle_attempt_counts() -> &'static StdMutex<HashMap<String, u64>> {
+    static COUNTS: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// #2055 review round 5 — how many settle blocking-core attempts have
+/// entered for exactly `task_id`.
+#[cfg(test)]
+pub(crate) fn goal_task_settle_attempts_for(task_id: &str) -> u64 {
+    goal_task_settle_attempt_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(task_id)
+        .copied()
+        .unwrap_or(0)
+}
 
 /// #2055/#2054 — everything the ledger I/O for one task's row needs, captured
 /// at registration-stash time so BOTH the offloaded row creation and any
@@ -835,6 +849,15 @@ struct GoalTaskLedgerBinding {
     /// deletes the entry, so a stale chain dies at its next check instead of
     /// writing after its sleep.
     generation: u64,
+    /// #2055 review round 5 — settle flights currently holding this entry:
+    /// incremented under the map lock at the moment settle work is enqueued,
+    /// decremented (generation-matched) when the chain ends in success or
+    /// budget exhaustion. The purge NEVER drops an entry with a flight in
+    /// progress, however expired — the staleness fence would otherwise kill
+    /// a queued/backing-off correction whose window expired mid-flight
+    /// (`TaskTerminalGuard` clears liveness BEFORE the final transition, so
+    /// liveness alone cannot protect it).
+    in_flight: u32,
 }
 
 impl GoalTaskLedgerBinding {
@@ -5775,6 +5798,7 @@ impl InProcessAgentOrchestrator {
             profile_data_dir: profile_data_dir.to_path_buf(),
             retained_since: None,
             generation: 0,
+            in_flight: 0,
         };
         // Stash BEFORE the offload so a terminal racing in can already
         // resolve the binding; the settle write sequence converges with the
@@ -5882,9 +5906,12 @@ impl InProcessAgentOrchestrator {
     /// the #2054 status vocabulary; the two are distinguishable only through
     /// the persisted authority rank.
     ///
-    /// Round 4 ordering note: the binding is fetched BEFORE the retention
-    /// purge runs — a live task finishing after the correction deadline must
-    /// not self-drop the very binding its own settle is about to use.
+    /// Round 5 ordering note: the flight mark is taken ATOMICALLY with the
+    /// binding fetch, BEFORE the retention purge runs — an expired
+    /// correction whose settle is being enqueued right now must not be
+    /// purged out from under its own chain (`TaskTerminalGuard` clears
+    /// liveness before the final transition, so the liveness consult alone
+    /// cannot protect it).
     pub(crate) fn settle_goal_task_row_from_change(&self, task: &octos_agent::BackgroundTask) {
         let (authority, remove_on_success) = match task.status {
             octos_agent::TaskStatus::Completed => {
@@ -5901,14 +5928,22 @@ impl InProcessAgentOrchestrator {
             }
             octos_agent::TaskStatus::Spawned | octos_agent::TaskStatus::Running => return,
         };
-        let binding = self
-            .shared
-            .goal_task_ledger_bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&task.id)
-            .cloned();
-        // Opportunistic retention purge AFTER the fetch (see doc note).
+        // Fetch + flight-mark under ONE lock acquisition.
+        let binding = {
+            let mut bindings = self
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match bindings.get_mut(&task.id) {
+                Some(entry) => {
+                    entry.in_flight += 1;
+                    Some(entry.clone())
+                }
+                None => None,
+            }
+        };
+        // Opportunistic retention purge AFTER the flight mark (see doc note).
         self.purge_expired_goal_task_bindings();
         let Some(binding) = binding else {
             return;
@@ -5918,6 +5953,22 @@ impl InProcessAgentOrchestrator {
         offload_goal_ledger_io(move || {
             this.settle_goal_task_row_blocking(&binding, &task_id, authority, remove_on_success, 0);
         });
+    }
+
+    /// #2055 review round 5 — release one settle flight on `task_id`,
+    /// generation-matched: a re-stashed entry (bumped generation) starts its
+    /// own flight accounting, and a stale chain's release must not touch it.
+    fn release_goal_task_settle_flight(&self, task_id: &str, generation: u64) {
+        let mut bindings = self
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = bindings.get_mut(task_id)
+            && entry.generation == generation
+        {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+        }
     }
 
     /// #2054 — the blocking half of the change-feed settle. SELF-SUFFICIENT:
@@ -5959,7 +6010,13 @@ impl InProcessAgentOrchestrator {
         attempt: u32,
     ) {
         #[cfg(test)]
-        GOAL_TASK_SETTLE_ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            *goal_task_settle_attempt_counts()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(task_id.to_owned())
+                .or_insert(0) += 1;
+        }
         // Staleness fence — see the doc comment.
         {
             let bindings = self
@@ -6004,15 +6061,26 @@ impl InProcessAgentOrchestrator {
                     .goal_task_ledger_bindings
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if remove_on_success {
-                    bindings.remove(task_id);
-                } else if let Some(entry) = bindings.get_mut(task_id) {
-                    // Provisional failure settled: the binding stays purely
-                    // as the correction window. Stamp the purge clock ONCE —
-                    // a redelivery no-op must not extend retention.
-                    entry
-                        .retained_since
-                        .get_or_insert_with(std::time::Instant::now);
+                // Every map mutation below is generation-gated (round 5): a
+                // re-stash between this chain's fence and its success means
+                // the entry — and its flight accounting — belongs to the new
+                // incarnation, which this chain must not touch.
+                match bindings.get_mut(task_id) {
+                    Some(entry) if entry.generation == binding.generation => {
+                        if remove_on_success {
+                            bindings.remove(task_id);
+                        } else {
+                            // Provisional failure settled: the binding stays
+                            // purely as the correction window. Stamp the
+                            // purge clock ONCE — a redelivery no-op must not
+                            // extend retention — and release this flight.
+                            entry
+                                .retained_since
+                                .get_or_insert_with(std::time::Instant::now);
+                            entry.in_flight = entry.in_flight.saturating_sub(1);
+                        }
+                    }
+                    _ => {}
                 }
                 drop(bindings);
                 tracing::debug!(
@@ -6028,6 +6096,7 @@ impl InProcessAgentOrchestrator {
             Err(error) => {
                 let next_attempt = attempt + 1;
                 if next_attempt >= GOAL_TASK_SETTLE_ATTEMPTS {
+                    self.release_goal_task_settle_flight(task_id, binding.generation);
                     tracing::debug!(
                         task_id,
                         goal_id = %binding.goal_row.goal_id,
@@ -6098,12 +6167,21 @@ impl InProcessAgentOrchestrator {
             .goal_task_ledger_bindings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|task_id, binding| match binding.retained_since {
-                Some(retained_since) => {
-                    retained_since.elapsed() < PROVISIONAL_CORRECTION_RETENTION
-                        || octos_agent::task_is_live(task_id)
+            .retain(|task_id, binding| {
+                // Round 5 — an entry with a settle flight in progress is
+                // NEVER purged, however expired: dropping it would make the
+                // chain's staleness fence kill a queued/backing-off
+                // correction (right fence, wrong victim).
+                if binding.in_flight > 0 {
+                    return true;
                 }
-                None => true,
+                match binding.retained_since {
+                    Some(retained_since) => {
+                        retained_since.elapsed() < PROVISIONAL_CORRECTION_RETENTION
+                            || octos_agent::task_is_live(task_id)
+                    }
+                    None => true,
+                }
             });
     }
 
@@ -17855,6 +17933,7 @@ mod tests {
             profile_data_dir: data_dir.to_path_buf(),
             retained_since: None,
             generation: 0,
+            in_flight: 0,
         };
         orchestrator
             .shared
@@ -18298,27 +18377,26 @@ mod tests {
         .await;
         assert_eq!(created.as_deref(), Some("running"), "creation landed");
 
-        let attempts_before =
-            GOAL_TASK_SETTLE_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         let (held, release, holder) = hold_ledger_write_lock(&ledger_path);
         held.await.expect("lock-acquired handshake");
 
         supervisor.mark_running(&task_id);
         supervisor.mark_completed(&task_id, vec![]);
 
-        // Hold until the counter proves a RETRY attempt entered (first
-        // attempt + at least one re-arm), then release. Counter is global
-        // across parallel tests, so the check is on the delta with `>=`.
+        // Hold until THIS task's per-task attempt count proves a RETRY
+        // entered (first attempt + at least one re-arm), then release. The
+        // round-5 counter is keyed by task id, so parallel tests' attempts
+        // cannot satisfy this gate (the earlier global delta could release
+        // before this task's retry ever entered — a false pass).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let attempts = GOAL_TASK_SETTLE_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-            if attempts >= attempts_before + 2 {
+            let attempts = goal_task_settle_attempts_for(&task_id);
+            if attempts >= 2 {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "no settle retry entered within the deadline (attempts delta {})",
-                attempts - attempts_before
+                "no settle retry entered within the deadline (this task's attempts: {attempts})"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -18338,13 +18416,154 @@ mod tests {
             "the settle retry chain must converge the row after the lock releases"
         );
         assert!(
-            GOAL_TASK_SETTLE_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::SeqCst)
-                >= attempts_before + 2,
-            "at least one outer retry fired"
+            goal_task_settle_attempts_for(&task_id) >= 2,
+            "at least one outer retry fired for exactly this task"
         );
         assert!(
             !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
             "the converged settle releases the binding"
+        );
+    }
+
+    /// #2055 review round 5 (retry-proof isolation): the attempt counter is
+    /// keyed per task — attempts recorded for one task are invisible to
+    /// another task's gate, so a parallel test can never satisfy this
+    /// test's release condition.
+    #[test]
+    fn settle_attempt_counter_is_scoped_per_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let binding =
+            stashed_test_binding(&orchestrator, dir.path(), "goal-scoped", "task-scoped-a");
+        assert_eq!(goal_task_settle_attempts_for("task-scoped-b"), 0);
+
+        orchestrator.settle_goal_task_row_blocking(
+            &binding,
+            "task-scoped-a",
+            octos_fleet::TaskSettleAuthority::Completion,
+            false,
+            0,
+        );
+
+        assert!(
+            goal_task_settle_attempts_for("task-scoped-a") >= 1,
+            "the driven task's attempts are recorded under its own key"
+        );
+        assert_eq!(
+            goal_task_settle_attempts_for("task-scoped-b"),
+            0,
+            "another task's gate observes NONE of them"
+        );
+    }
+
+    /// #2055 review round 5 (purge vs in-flight correction): an expired,
+    /// liveness-cleared correction whose settle is queued/backing off must
+    /// NOT be purged out from under its own chain — the write fence would
+    /// kill it permanently. The flight mark protects it; the entry is then
+    /// removed by the SETTLE, not the purge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_spares_in_flight_correction_and_the_settle_lands_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-inflight";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-inflight");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id = supervisor.register(
+            "review_worker",
+            "call-rows-inflight",
+            Some(&wire.to_string()),
+        );
+        supervisor.mark_running(&task_id);
+
+        // Provisional failure settles and retains the correction window.
+        supervisor.mark_failed_observed(&task_id, "flaky verdict".to_string());
+        let failed = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "failed",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(failed.as_deref(), Some("failed"));
+        // Wait for the provisional chain to fully finish (flight released),
+        // then force expiry. No liveness guard is armed for this task, so
+        // only the in-flight mark can protect the correction below.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                {
+                    let mut bindings = default_agent_orchestrator()
+                        .shared
+                        .goal_task_ledger_bindings
+                        .lock()
+                        .unwrap();
+                    if let Some(entry) = bindings.get_mut(&task_id)
+                        && entry.in_flight == 0
+                        && entry.retained_since.is_some()
+                    {
+                        entry.retained_since = std::time::Instant::now().checked_sub(
+                            PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1),
+                        );
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "provisional settle did not retain the binding in time"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        let attempts_after_provisional = goal_task_settle_attempts_for(&task_id);
+
+        // Hold the ledger, fire the owner's correction, and wait until its
+        // chain has verifiably ENTERED (scoped attempt counter) — it is now
+        // queued/backing off against the held lock.
+        let (held, release, holder) = hold_ledger_write_lock(&ledger_path);
+        held.await.expect("lock-acquired handshake");
+        supervisor.mark_completed(&task_id, vec![]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while goal_task_settle_attempts_for(&task_id) <= attempts_after_provisional {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the correction chain never entered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Purge NOW: expired + liveness-cleared, but a flight is in
+        // progress — the entry must survive.
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the purge must spare the in-flight correction's binding"
+        );
+
+        release.send(()).expect("release the held lock");
+        holder.await.unwrap();
+
+        // The correction lands, and the SETTLE removes the entry.
+        let status = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "complete",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(
+            status.as_deref(),
+            Some("complete"),
+            "the spared correction must still land"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the entry is removed by the settle, not the purge"
         );
     }
 
