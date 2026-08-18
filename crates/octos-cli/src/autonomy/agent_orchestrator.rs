@@ -3163,6 +3163,38 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// #2066 round 5 (codex fix 1) — GENERATION-MATCHED marker refresh: a
+    /// heartbeat may only refresh the marker incarnation its OWN turn
+    /// claimed. The key-only [`Self::touch_goal_dispatch_in_flight`] let a
+    /// stale turn A — evicted at the staleness horizon and replaced by turn
+    /// B on the same scoped key — refresh B's marker whenever A resumed
+    /// producing, keeping a wedged replacement protected indefinitely (the
+    /// same A/B incarnation hazard the claim guard's generation exists for,
+    /// #2003). No-ops with a debug log when the held marker's generation
+    /// differs from the caller's; never creates a marker.
+    pub(crate) fn touch_goal_dispatch_in_flight_generation(
+        &self,
+        session_id: &SessionKey,
+        generation: u64,
+    ) {
+        let mut state = self.state();
+        match state.in_flight_goal_sessions.get_mut(session_id) {
+            Some(marker) if marker.generation == generation => {
+                marker.marked_at_ms = now_ms_u64();
+            }
+            Some(marker) => {
+                tracing::debug!(
+                    session = %session_id,
+                    held_generation = marker.generation,
+                    caller_generation = generation,
+                    "in-flight refresh skipped: the marker belongs to a different \
+                     turn incarnation"
+                );
+            }
+            None => {}
+        }
+    }
+
     /// #2003 — test hook: age an existing marker so the staleness path can be
     /// exercised without sleeping.
     #[cfg(test)]
@@ -9901,6 +9933,13 @@ impl GoalDispatchInFlightGuard {
     pub(crate) fn disarm(mut self) {
         self.disarmed = true;
     }
+
+    /// #2066 round 5 (codex fix 1) — the marker incarnation this guard owns,
+    /// for generation-matched refreshes
+    /// ([`InProcessAgentOrchestrator::touch_goal_dispatch_in_flight_generation`]).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl Drop for GoalDispatchInFlightGuard {
@@ -12452,8 +12491,21 @@ fn master_continuation_request_from_persisted(
     // rebound to a post-clear replacement. `created_at` has no other
     // behavioral consumer (the scheduler orders by priority/sequence, dedupe
     // is key-based), so restoring the truthful time needs no second field.
-    let restored_created_at =
-        SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(continuation.queued_at_ms);
+    // #2066 round 5 (codex fix 2) — CHECKED addition: `+` on SystemTime
+    // panics on overflow, and a parseable extreme `queued_at_ms` overflows
+    // narrower SystemTime representations (Windows). Clamp to UNIX_EPOCH —
+    // conservatively ANCIENT, so the bind-at-drain predicate classifies the
+    // item stale (the safe direction: drop, never misattribute).
+    let restored_created_at = SystemTime::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_millis(continuation.queued_at_ms))
+        .unwrap_or_else(|| {
+            tracing::debug!(
+                queued_at_ms = continuation.queued_at_ms,
+                "restored continuation timestamp overflows SystemTime; clamping \
+                 to UNIX_EPOCH (item will classify stale)"
+            );
+            SystemTime::UNIX_EPOCH
+        });
     let mut request = MasterContinuationRequest::new(
         continuation.group_id.clone(),
         session_id.to_owned(),
@@ -23325,14 +23377,24 @@ mod tests {
         assert_eq!(new_tokens, 0, "the replacement is never charged");
     }
 
-    /// #2066 round 4 (codex fix 1b) — the same-millisecond tie: a replacement
-    /// goal minted in the exact millisecond the unbound item was created must
-    /// NOT steal it (strict `<`; on a tie the item dies stale — dropping a
-    /// charge beats misattributing it).
+    /// #2066 round 4 (codex fix 1b) / round 5 (codex fix 3) — the
+    /// same-millisecond tie: a replacement goal minted in the exact
+    /// millisecond the unbound item was created must NOT steal it (strict
+    /// `<`; on a tie the item dies stale — dropping a charge beats
+    /// misattributing it). Round 5 rewrote the assertions to pin the
+    /// OUTCOME, not the key shape: the tie item never drains (by its own
+    /// dedupe key), the pending queue empties without a launch, the
+    /// replacement is never charged, and the durable completion carries the
+    /// STALE reason — so a `<`→`<=` mutation (the item binds and drains)
+    /// fails this test.
     #[test]
     fn same_millisecond_replacement_should_not_steal_an_unbound_continuation() {
         use crate::autonomy::master_continuation_scheduler::MasterContinuationRequest;
         let orchestrator = InProcessAgentOrchestrator::default();
+        let store_dir = tempfile::TempDir::new().unwrap();
+        orchestrator
+            .configure_supervisor_store(store_dir.path())
+            .expect("supervisor store");
         let session_id = SessionKey::with_profile("tenant-a", "api", "goal-tie-unbound");
         orchestrator
             .set_goal(GoalSetRequest {
@@ -23351,7 +23413,8 @@ mod tests {
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        // An unbound item created in EXACTLY the goal's creation millisecond.
+        // An unbound item created in EXACTLY the goal's creation millisecond,
+        // with a KNOWN dedupe key so the outcome is identifiable.
         let goal_created_ms = {
             let state = orchestrator.state();
             let key = orchestrator.scoped_goal_key(&session_id);
@@ -23366,7 +23429,8 @@ mod tests {
                 MasterContinuationReason::GoalContinue,
                 SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_millis(goal_created_ms.max(0) as u64),
-            );
+            )
+            .with_dedupe_key("tie-unbound-1");
             let _ = enqueue_and_persist_continuation(&mut state, request);
         }
         let drained = orchestrator.drain_ready_continuations_for_session(
@@ -23375,21 +23439,138 @@ mod tests {
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        assert!(
-            drained
-                .iter()
-                .filter(|c| matches!(c.reason, MasterContinuationReason::GoalContinue))
-                .all(|c| c.goal_id.is_some()),
-            "nothing drains unbound: {drained:?}"
-        );
-        // The tie item itself died stale — it is not among the drained items
-        // as a bound-to-this-goal charge carrier with its dedupe key.
+        // OUTCOME 1: the tie item itself never drains — no launch can happen.
         assert!(
             !drained
                 .iter()
-                .any(|c| c.dedupe_key.as_str().contains("legacy") || c.goal_id.is_none()),
-            "the same-millisecond item must die stale, not be stolen: {drained:?}"
+                .any(|c| c.dedupe_key.as_str() == "tie-unbound-1"),
+            "the same-millisecond item must die stale, not drain: {drained:?}"
         );
+        // OUTCOME 2: the queue emptied — the item was consumed (completed),
+        // not left pending.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            0,
+            "the stale item is completed, not stranded"
+        );
+        // OUTCOME 3: the replacement goal was never charged.
+        let (new_tokens, new_continuations, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!((new_tokens, new_continuations), (0, 0));
+        // OUTCOME 4: the durable completion carries the STALE reason — the
+        // item died on the stale path, it was not executed.
+        let store = SupervisorStore::new(store_dir.path());
+        let persisted = store.load_state().expect("reload supervisor state");
+        let record = persisted
+            .continuations
+            .values()
+            .find(|record| record.continuation_id == "tie-unbound-1")
+            .expect("the tie item's durable record exists");
+        assert_eq!(record.status, ContinuationStatus::Completed);
+        assert!(
+            record
+                .result
+                .as_deref()
+                .is_some_and(|result| result.contains("unbound_goal_continuation_stale")),
+            "the completion must be the STALE path, not an execution: {:?}",
+            record.result
+        );
+    }
+
+    /// #2066 round 5 (codex fix 1) — the heartbeat refresh is
+    /// GENERATION-MATCHED: a stale predecessor turn (evicted at the horizon
+    /// and replaced on the same key) that resumes producing must NOT refresh
+    /// the replacement's marker; only the marker's own incarnation may.
+    /// Removing the generation match fails this test (round-5 mutation 1).
+    #[test]
+    fn heartbeat_touch_should_refresh_only_its_own_marker_generation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let key = SessionKey::with_profile("tenant-a", "api", "goal-heartbeat-generation");
+        // Turn A claims, wedges, and is evicted-then-replaced by turn B.
+        let generation_a = orchestrator.mark_goal_dispatch_in_flight(&key);
+        let generation_b = orchestrator.mark_goal_dispatch_in_flight(&key);
+        assert_ne!(generation_a, generation_b);
+        // B's marker ages past the horizon (B is now the one wedged).
+        orchestrator.force_in_flight_marked_at_for_test(
+            &key,
+            now_ms_u64().saturating_sub(IN_FLIGHT_STALE_AFTER_MS + 1),
+        );
+        assert!(!orchestrator.is_goal_dispatch_in_flight(&key));
+        // A resumes producing and its late heartbeat fires with A's
+        // generation: it must NOT revive B's marker.
+        orchestrator.touch_goal_dispatch_in_flight_generation(&key, generation_a);
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&key),
+            "a stale predecessor's heartbeat must not keep the replacement's \
+             marker alive"
+        );
+        // B's own heartbeat refreshes it.
+        orchestrator.touch_goal_dispatch_in_flight_generation(&key, generation_b);
+        assert!(orchestrator.is_goal_dispatch_in_flight(&key));
+        assert!(orchestrator.clear_goal_dispatch_in_flight_generation(&key, generation_b));
+    }
+
+    /// #2066 round 5 (codex fix 2) — an extreme durable `queued_at_ms`
+    /// restores WITHOUT panicking (checked SystemTime addition; overflow
+    /// clamps to UNIX_EPOCH) and classifies STALE at drain in either
+    /// direction (clamped-ancient, or unrepresentable-as-ms on platforms
+    /// whose SystemTime can hold it).
+    #[test]
+    fn extreme_restored_timestamp_should_not_panic_and_dies_stale() {
+        use crate::autonomy::supervisor_store::{ContinuationStatus, PendingContinuationRecord};
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-extreme-ts");
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("session_id".to_owned(), json!(session_id.to_string()));
+        metadata.insert("profile_id".to_owned(), json!("tenant-a"));
+        metadata.insert("reason".to_owned(), json!("goal_continue"));
+        metadata.insert("dedupe_key".to_owned(), json!("extreme-ts-1"));
+        let record = PendingContinuationRecord {
+            group_id: "coding-autonomy-goal".to_owned(),
+            continuation_id: "extreme-ts-1".to_owned(),
+            child_id: None,
+            prompt: None,
+            status: ContinuationStatus::Queued,
+            queued_at_ms: u64::MAX,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: None,
+            attempt: 1,
+            metadata,
+        };
+        let request =
+            master_continuation_request_from_persisted(&record).expect("restores without panic");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "live goal".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        {
+            let mut state = orchestrator.state();
+            let _ = state.continuations.enqueue(request);
+        }
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !drained
+                .iter()
+                .any(|c| c.dedupe_key.as_str() == "extreme-ts-1"),
+            "an extreme-timestamp unbound item dies stale: {drained:?}"
+        );
+        let (tokens, _, _) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens, 0);
     }
 
     /// #2066 round 4 (codex fix 2) — the AppUI heartbeat's semantics at the
@@ -23481,11 +23662,12 @@ mod tests {
             .expect("the standalone turn runner exists");
         let turn_region = &transport[start..];
         assert!(
-            turn_region.contains("touch_goal_dispatch_in_flight"),
+            turn_region.contains("touch_goal_dispatch_in_flight_generation"),
             "the AppUI standalone turn must refresh the goal dispatch marker \
-             on token progress (the session actor's #2003 heartbeat twin) — \
-             without it a >30min goal turn loses its tombstone and a clear \
-             can claim the slot mid-turn"
+             on token progress, GENERATION-MATCHED (#2066 round 5) — without \
+             the refresh a >30min goal turn loses its tombstone and a clear \
+             can claim the slot mid-turn; without the generation match a \
+             stale predecessor could keep a replacement's marker alive"
         );
     }
 

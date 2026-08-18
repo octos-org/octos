@@ -19997,6 +19997,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
                     .goal_id
                     .as_ref()
                     .map(|goal_id| goal_id.as_str().to_owned()),
+                claim_generation: claim_guard.as_ref().map(|guard| guard.generation()),
             })
         }
         _ => None,
@@ -28647,6 +28648,11 @@ struct GoalContinuationContext {
     /// goal's tombstone instead of the replacement. `None` for legacy
     /// persisted continuations without a stamped goal id.
     bound_goal_id: Option<String>,
+    /// #2066 round 5 (codex fix 1) — the marker incarnation the atomic
+    /// drain-and-claim took for THIS turn. The in-flight heartbeat refreshes
+    /// generation-matched so a stale predecessor turn resuming production
+    /// can never keep a replacement turn's marker alive.
+    claim_generation: Option<u64>,
 }
 
 /// #1134 — pick the LAST non-empty assistant row after `pre` from a
@@ -31442,9 +31448,14 @@ async fn run_standalone_turn(
     // the shared TokenTracker has ADVANCED since the last tick, so a wedged
     // turn stops being refreshed and ages out normally (#2003's contract).
     // Touches the SCOPED goal store key — the key the drain claimed the
-    // marker under — not the wire session id. Aborted on every exit with the
-    // turn (AbortOnDrop).
-    let _in_flight_heartbeat = goal_context.as_ref().map(|ctx| {
+    // marker under — not the wire session id. #2066 round 5 (codex fix 1):
+    // GENERATION-MATCHED — the refresh names the marker incarnation THIS
+    // turn's drain-and-claim took, so a stale predecessor that resumes
+    // producing after eviction can never keep a replacement turn's marker
+    // alive (no generation ⇒ no claim was taken ⇒ no heartbeat). Aborted on
+    // every exit with the turn (AbortOnDrop).
+    let _in_flight_heartbeat = goal_context.as_ref().and_then(|ctx| {
+        let claim_generation = ctx.claim_generation?;
         let tracker = std::sync::Arc::clone(&token_tracker);
         let marker_key = ctx.goal_session_key.clone();
         let heartbeat = tokio::spawn(async move {
@@ -31456,13 +31467,14 @@ async fn run_standalone_turn(
                     + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
                 if seen > last {
                     last = seen;
-                    default_agent_orchestrator().touch_goal_dispatch_in_flight(&marker_key);
+                    default_agent_orchestrator()
+                        .touch_goal_dispatch_in_flight_generation(&marker_key, claim_generation);
                 }
             }
         });
-        AbortOnDrop {
+        Some(AbortOnDrop {
             abort: heartbeat.abort_handle(),
-        }
+        })
     });
     // task-turn-interrupt-steer-correlation-logs: every agent-side log line
     // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
