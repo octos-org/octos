@@ -3293,7 +3293,27 @@ impl InProcessAgentOrchestrator {
         let now = now_ms();
         let now_system = SystemTime::now();
         let mut state = self.state();
-        let goal = state.goals.get_mut(session_id)?;
+        let Some(goal) = state.goals.get_mut(session_id) else {
+            // #2064(b) — same settle for the autonomous accountant: the
+            // continuation turn that was already running when the user
+            // cleared lands its spend on the cleared row. No goal-identity
+            // binding on this path (mirrors its live lookup); profile
+            // isolation still applies inside the accrual. Returns None —
+            // `cleared` is not the complete/blocked reconcile family.
+            let settle = accrue_cleared_goal_tombstone_charge(
+                &mut state,
+                session_id,
+                profile_id,
+                None,
+                tokens_consumed,
+                elapsed_seconds,
+            );
+            drop(state);
+            if let Some((snapshot, ledger_data_dir)) = settle {
+                self.offload_cleared_goal_settle(snapshot, ledger_data_dir, session_id.clone());
+            }
+            return None;
+        };
         if goal.profile_id != profile_id {
             return None;
         }
@@ -3471,7 +3491,27 @@ impl InProcessAgentOrchestrator {
         let now = now_ms();
         let now_system = SystemTime::now();
         let mut state = self.state();
-        let goal = state.goals.get_mut(&key)?;
+        let Some(goal) = state.goals.get_mut(&key) else {
+            // #2064(b) — the goal may have been CLEARED while this turn was
+            // in flight: settle the charge into the parked tombstone
+            // (profile-checked, bound to the goal_id this turn captured at
+            // start) so the cleared row's recorded cost stays true.
+            // Deliberately NO wire event, NO wrap-up, NO continuation — the
+            // goal is gone for the client and terminal for scheduling.
+            let settle = accrue_cleared_goal_tombstone_charge(
+                &mut state,
+                &key,
+                profile_id,
+                Some(expected_goal_id),
+                tokens_consumed,
+                elapsed_seconds,
+            );
+            drop(state);
+            if let Some((snapshot, ledger_data_dir)) = settle {
+                self.offload_cleared_goal_settle(snapshot, ledger_data_dir, key.clone());
+            }
+            return None;
+        };
         // Profile isolation: never charge or leak a goal owned by a
         // different profile on the same (possibly unprofiled/shared)
         // session key. Mirrors `record_goal_turn`.
@@ -4983,6 +5023,40 @@ impl InProcessAgentOrchestrator {
         let _ = ledger.append_decision(&decision);
     }
 
+    /// #2064(b) — durably settle a late (post-clear) turn charge into the
+    /// cleared goals-row. Counters-only by construction: `status_changed ==
+    /// false` routes the guarded `upsert_goal` (which admits the higher
+    /// tokens + newer stamp on the `cleared` row) and appends NO decision —
+    /// the clear already wrote its one audit row. Runs through
+    /// [`offload_goal_ledger_io`] so the accountants (which fire on tokio
+    /// worker threads) never do ledger I/O inline; without a runtime the
+    /// settle runs synchronously (plain-thread/test callers).
+    ///
+    /// Arrival order against the clear's own stamp is free: if the settle
+    /// lands second its snapshot carries a newer stamp and higher tokens
+    /// (admitted); if the clear's stamp lands second its LOWER counters are
+    /// rejected by the monotonic clause and its status-CAS retry is
+    /// ordering-gated off — either order converges on
+    /// `cleared` + true totals.
+    fn offload_cleared_goal_settle(
+        &self,
+        snapshot: AutonomyGoalRecord,
+        ledger_data_dir: std::path::PathBuf,
+        decided_by: SessionKey,
+    ) {
+        let this = self.clone();
+        offload_goal_ledger_io(move || {
+            this.sync_transition_to_ledger_blocking(
+                &ledger_data_dir,
+                &snapshot,
+                "post-clear in-flight turn charge settled",
+                &decided_by,
+                false,
+                false,
+            );
+        });
+    }
+
     /// #1973 fix B — the shared body behind both `clear_goal` trait entry
     /// points. On top of the original remove + `persist_goal_cleared`, a clear
     /// now also:
@@ -5014,7 +5088,7 @@ impl InProcessAgentOrchestrator {
         // #1666 residue — clear the cwd-scoped goal for this wire session id so
         // `goal_clear` in folder B never removes folder A's goal.
         let key = self.scoped_goal_key(&request.session_id);
-        let (removed, generation, fleet_store) = {
+        let (removed, generation, fleet_store, clear_claim) = {
             let mut state = self.state();
             let removed = match state.goals.get(&key) {
                 Some(goal) if goal.profile_id == request.profile_id => state.goals.remove(&key),
@@ -5030,8 +5104,27 @@ impl InProcessAgentOrchestrator {
                 }
                 None => None,
             };
-            if removed.is_some() {
+            let mut clear_claim = None;
+            if let Some(goal) = removed.as_ref() {
                 persist_goal_cleared(&state, &key, &request.profile_id);
+                // #2064(a) — serialize with the continuation dispatcher,
+                // under the SAME lock that removed the record: claim the
+                // dispatch marker when it is free (released after the
+                // durable stamp below, generation-keyed), so a dispatcher
+                // racing this clear cannot claim-and-launch from the state
+                // being destroyed. When a turn is already IN FLIGHT the
+                // marker is left untouched (stealing it would strip the
+                // running turn's #1529 protection); the clear stamps
+                // `cleared` immediately and parks the settle tombstone
+                // instead, so the turn's charge lands on the cleared row
+                // (#2064(b)). No tombstone without a ledger dir — there is
+                // no durable row to settle into.
+                clear_claim = claim_clear_dispatch_slot(&mut state, &key);
+                if clear_claim.is_none() {
+                    if let Some(data_dir) = ledger_data_dir {
+                        park_cleared_goal_tombstone(&mut state, &key, goal, data_dir);
+                    }
+                }
             }
             // #1959 — stamp the same monotonic generation as
             // `SessionGoalUpdated` so the client can order a clear against a
@@ -5040,7 +5133,7 @@ impl InProcessAgentOrchestrator {
             // `update.generation < clear.generation`.
             let generation = next_goal_event_generation(&mut state);
             let fleet_store = state.fleet_store.clone();
-            (removed, generation, fleet_store)
+            (removed, generation, fleet_store, clear_claim)
         };
         let cleared = removed.is_some();
         if let Some(goal) = removed {
@@ -5093,6 +5186,14 @@ impl InProcessAgentOrchestrator {
                     false,
                 );
             }
+        }
+        if let Some(claim_generation) = clear_claim {
+            // #2064(a) — release the clear's own claim now that the durable
+            // stamp landed. Generation-keyed: this can never wipe a marker a
+            // newer turn claimed in the meantime. An unwind between claim and
+            // release would leak the marker; the #2003 staleness horizon
+            // rescues the session after `IN_FLIGHT_STALE_AFTER_MS`.
+            self.clear_goal_dispatch_in_flight_generation(&key, claim_generation);
         }
         Ok(json!({
             "session_id": request.session_id,
@@ -9181,6 +9282,139 @@ fn in_flight_marker_is_live(
     })
 }
 
+/// #2064(b) — upper bound on parked [`ClearedGoalTombstone`]s. A tombstone
+/// stays parked after settling (the turn charge AND its verifier charge must
+/// both land) and is replaced by the next clear on its key, so the cap only
+/// matters when cleared-mid-turn turns keep dying without charging.
+/// Oldest-parked is evicted first — dropping one merely restores the pre-fix
+/// behavior for that turn (its late charge lands nowhere).
+const MAX_CLEARED_GOAL_TOMBSTONES: usize = 16;
+
+/// #2064(b) — the settle context for a goal cleared while its dispatched turn
+/// was still in flight. See the field doc on
+/// `AutonomyRuntimeState::cleared_goal_tombstones`.
+#[derive(Debug, Clone)]
+struct ClearedGoalTombstone {
+    /// The removed record with `status == "cleared"`; the accountants accrue
+    /// the late charge into `tokens_used`/`time_used_seconds` here before the
+    /// durable settle.
+    snapshot: AutonomyGoalRecord,
+    /// The profile data dir the clear RPC resolved — the settle writes the
+    /// same `<data_dir>/goal-ledgers/<goal_id>.db` row the clear stamped.
+    ledger_data_dir: std::path::PathBuf,
+    parked_at_ms: u64,
+}
+
+/// #2064(a) — the clear path's half of the dispatcher serialization: claim
+/// the SAME in-flight marker the continuation dispatcher holds, under the
+/// same state lock that removes the goal record.
+///
+/// - Marker free → claim it (fresh generation, returned for the
+///   generation-keyed release). While the clear holds the claim, a racing
+///   dispatcher's `try_claim_goal_in_flight` / due-scan sees the session as
+///   busy and cannot claim-and-launch from the state being destroyed; by the
+///   time the claim frees, the goal is gone and nothing is schedulable
+///   (`pending_continuation_is_schedulable` refuses absent goals).
+/// - Marker held (a turn is in flight) → `None`, and the marker is NOT
+///   touched: stealing it would strip the running turn's #1529 protection.
+///   The caller stamps `cleared` immediately and parks a tombstone instead
+///   (stamp-and-accept-late-charge; deferring the stamp until the claim
+///   frees would leave the durable row claiming `active` through a crash —
+///   the exact lie #1973 fix B exists to prevent).
+///
+/// The claim STAYS a lock — folding it into goal status would reopen the
+/// #1529 double-dispatch (established by the #2059-era review).
+fn claim_clear_dispatch_slot(state: &mut AutonomyRuntimeState, key: &SessionKey) -> Option<u64> {
+    if in_flight_marker_is_held(state, key) {
+        return None;
+    }
+    let generation = next_in_flight_generation();
+    state.in_flight_goal_sessions.insert(
+        key.clone(),
+        InFlightMarker {
+            generation,
+            marked_at_ms: now_ms_u64(),
+        },
+    );
+    Some(generation)
+}
+
+/// #2064(b) — park the settle context for the in-flight turn of a goal that
+/// was just cleared. Bounded (see [`MAX_CLEARED_GOAL_TOMBSTONES`]); a newer
+/// clear on the same key replaces the older tombstone (whose turn's late
+/// charge then lands nowhere — exactly the pre-fix behavior for that turn).
+fn park_cleared_goal_tombstone(
+    state: &mut AutonomyRuntimeState,
+    key: &SessionKey,
+    goal: &AutonomyGoalRecord,
+    ledger_data_dir: &Path,
+) {
+    if state.cleared_goal_tombstones.len() >= MAX_CLEARED_GOAL_TOMBSTONES
+        && !state.cleared_goal_tombstones.contains_key(key)
+    {
+        if let Some(oldest) = state
+            .cleared_goal_tombstones
+            .iter()
+            .min_by_key(|(_, tombstone)| tombstone.parked_at_ms)
+            .map(|(key, _)| key.clone())
+        {
+            state.cleared_goal_tombstones.remove(&oldest);
+        }
+    }
+    let mut snapshot = goal.clone();
+    snapshot.status = "cleared".to_owned();
+    snapshot.updated_at_ms = now_ms();
+    state.cleared_goal_tombstones.insert(
+        key.clone(),
+        ClearedGoalTombstone {
+            snapshot,
+            ledger_data_dir: ledger_data_dir.to_path_buf(),
+            parked_at_ms: now_ms_u64(),
+        },
+    );
+}
+
+/// #2064(b) — accrue a turn-end charge into the key's parked tombstone (if
+/// any) and hand back the updated snapshot + ledger dir for the durable
+/// settle. Guards mirror the live charge path: profile isolation always;
+/// goal-identity binding when the caller captured one at turn start
+/// (`expected_goal_id`). The tombstone STAYS parked so a turn charge and its
+/// verifier charge can both settle; it is replaced by the next clear on the
+/// key or evicted by the cap. Returns `None` when there is nothing to settle
+/// — the charge is then dropped exactly as before this fix.
+fn accrue_cleared_goal_tombstone_charge(
+    state: &mut AutonomyRuntimeState,
+    key: &SessionKey,
+    profile_id: &str,
+    expected_goal_id: Option<&str>,
+    tokens_consumed: u64,
+    elapsed_seconds: u64,
+) -> Option<(AutonomyGoalRecord, std::path::PathBuf)> {
+    if tokens_consumed == 0 && elapsed_seconds == 0 {
+        return None;
+    }
+    let tombstone = state.cleared_goal_tombstones.get_mut(key)?;
+    if tombstone.snapshot.profile_id != profile_id {
+        return None;
+    }
+    if expected_goal_id.is_some_and(|goal_id| goal_id != tombstone.snapshot.goal_id) {
+        return None;
+    }
+    tombstone.snapshot.tokens_used = tombstone
+        .snapshot
+        .tokens_used
+        .saturating_add(tokens_consumed);
+    tombstone.snapshot.time_used_seconds = tombstone
+        .snapshot
+        .time_used_seconds
+        .saturating_add(elapsed_seconds);
+    tombstone.snapshot.updated_at_ms = now_ms();
+    Some((
+        tombstone.snapshot.clone(),
+        tombstone.ledger_data_dir.clone(),
+    ))
+}
+
 /// #2003 — whether a marked session still has SUPERVISED WORK running, i.e.
 /// non-terminal background-task agents.
 ///
@@ -9916,6 +10150,24 @@ struct AutonomyRuntimeState {
     /// four different reason kinds stuck `queued` for 35 minutes, including the
     /// `goal_wrap_up` that would have explained the stall to the user).
     in_flight_goal_sessions: std::collections::HashMap<SessionKey, InFlightMarker>,
+    /// #2064(b) — goals cleared WHILE a dispatched turn was still in flight
+    /// (the in-flight marker was held at clear time), keyed by the scoped
+    /// goal-store key. `clear_goal` removes the live record and stamps the
+    /// durable row `cleared` immediately (crash-safe: the row must stop
+    /// claiming `active` the moment the user cleared, #1973 fix B), but the
+    /// running turn's spend is unknowable until the turn ends — octos charges
+    /// from turn OUTPUT, so there is nothing to flush at clear time. The
+    /// tombstone keeps the cleared snapshot + the resolved ledger dir so the
+    /// turn-end accountants (`charge_goal_tokens_gated`, `record_goal_turn`)
+    /// can settle the late charge into the cleared row via the guarded
+    /// upsert; the monotonic clauses make the settle commutative with the
+    /// clear's own stamp in either arrival order. Entries are parked only
+    /// when a turn is actually in flight AND a ledger dir was resolved,
+    /// replaced by a newer clear on the same key, and bounded by
+    /// [`MAX_CLEARED_GOAL_TOMBSTONES`] (an unsettled leftover — the turn
+    /// died without charging — is inert: the charge paths consult it only
+    /// when the key has no live goal, profile-checked and goal-id-bound).
+    cleared_goal_tombstones: std::collections::HashMap<SessionKey, ClearedGoalTombstone>,
     /// #1977 codex round 2 — test-only switch that makes the next monitor wake
     /// persist be treated as FAILED, simulating a crash exactly at the durable
     /// wake write. Per-instance (fresh `InProcessAgentOrchestrator::default()`
@@ -21323,6 +21575,38 @@ mod tests {
             "a rejected re-activation must not mutate the goal"
         );
 
+        // #2063 — raising the budget to a value STILL at or below tokens_used
+        // is not a resume either: the guard evaluates the EFFECTIVE budget
+        // (the one the caller is asking for), so 2_500 < 3_000 spent rejects.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "huge world cup site".into(),
+                status: Some("active".into()),
+                token_budget: Some(2_500),
+                transition_actor: Some("user".into()),
+            })
+            .expect_err("raising the budget below tokens already used must still be rejected");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+        );
+        // #2063 — and the failed resumes enqueued NOTHING: no continuation
+        // may drain for the still-limited goal.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !drained
+                .iter()
+                .any(|c| matches!(c.reason, MasterContinuationReason::GoalContinue)),
+            "a rejected resume must enqueue zero continuations: {drained:?}"
+        );
+
         // Raising the budget ABOVE tokens_used is the legitimate resume path.
         let resumed = orchestrator
             .set_goal(GoalSetRequest {
@@ -21515,6 +21799,339 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c.reason, MasterContinuationReason::GoalWrapUp)),
             "no second wrap-up may be queued once one was already emitted"
+        );
+    }
+
+    /// #2064(a) — `/goal clear` serializes with the continuation dispatcher
+    /// through the SAME in-flight claim the dispatcher holds. With the marker
+    /// free the clear CLAIMS it (a racing dispatcher cannot claim-and-launch
+    /// from state being destroyed) and releases it generation-keyed; with the
+    /// marker HELD the clear must not steal the running turn's #1529
+    /// protection. Removing the claim from the clear path fails this test.
+    #[test]
+    fn clear_goal_should_claim_dispatch_marker_when_free_and_never_steal_a_held_one() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-clear-serialize");
+        let set_goal = |objective: &str| {
+            orchestrator
+                .set_goal(GoalSetRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                    objective: objective.into(),
+                    status: Some("active".into()),
+                    token_budget: Some(10_000),
+                    transition_actor: None,
+                })
+                .expect("set goal");
+        };
+        set_goal("serialize me");
+        let key = orchestrator.scoped_goal_key(&session_id);
+
+        // The serialization seam itself: with the marker free the claim must
+        // HOLD the marker (this is what a concurrent dispatcher observes
+        // while the clear runs) and hand back its generation for release.
+        {
+            let mut state = orchestrator.state();
+            let claim = claim_clear_dispatch_slot(&mut state, &key)
+                .expect("a clear with no turn in flight must claim the dispatch marker");
+            assert!(
+                in_flight_marker_is_held(&state, &key),
+                "while the clear holds the claim, dispatchers must see the session as busy"
+            );
+            drop(state);
+            assert!(
+                orchestrator.clear_goal_dispatch_in_flight_generation(&key, claim),
+                "the clear releases exactly the claim it took (generation-keyed)"
+            );
+        }
+        // With the marker HELD, the claim must refuse and leave the running
+        // turn's marker untouched.
+        let dispatcher_generation = orchestrator.mark_goal_dispatch_in_flight(&key);
+        {
+            let mut state = orchestrator.state();
+            assert!(
+                claim_clear_dispatch_slot(&mut state, &key).is_none(),
+                "a clear during an in-flight turn must not claim (stamp-and-settle instead)"
+            );
+        }
+        // End-to-end: a full clear with the marker held leaves the
+        // dispatcher's own generation in place …
+        orchestrator
+            .clear_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("clear");
+        assert!(
+            orchestrator.clear_goal_dispatch_in_flight_generation(&key, dispatcher_generation),
+            "the clear must leave the running turn's marker intact (same generation)"
+        );
+        // … and a full clear with the marker FREE claims and releases without
+        // leaking the marker.
+        set_goal("serialize me again");
+        orchestrator
+            .clear_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("clear");
+        assert!(
+            !orchestrator.is_goal_dispatch_in_flight(&key),
+            "a clear that claimed the free marker must release it (no leak)"
+        );
+    }
+
+    /// #2064(b) — THE invariant: the cost recorded on a cleared goal equals
+    /// the cost of every turn that ran under it, cleared-mid-turn included.
+    /// A goal-bound turn is in flight (the dispatch marker is held), the user
+    /// clears, and the durable row is stamped `cleared` with the pre-turn
+    /// total. When the turn's charge lands it must SETTLE into the cleared
+    /// row — before the fix it found no record (`state.goals` entry removed)
+    /// and was silently dropped, so the tombstone under-reported forever.
+    #[test]
+    fn cleared_goal_ledger_row_should_include_a_mid_flight_turn_charge() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-clear-midflight");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "audit the tree".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 1_234);
+        let key = orchestrator.scoped_goal_key(&session_id);
+
+        // A dispatched turn is in flight for this goal.
+        let dispatcher_generation = orchestrator.mark_goal_dispatch_in_flight(&key);
+
+        // Mid-turn clear stamps the durable row `cleared` at the pre-turn total.
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(data_dir.path()),
+            )
+            .expect("clear");
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.status, "cleared");
+        assert_eq!(
+            row.tokens_used, 1_234,
+            "the clear stamps the pre-turn total"
+        );
+
+        // The in-flight turn finishes and its charge arrives: it must settle
+        // into the cleared row — with NO goal chip event, NO wrap-up, NO
+        // continuation (the goal stays gone for the client).
+        let event =
+            orchestrator.charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 5_000, 7);
+        assert!(
+            event.is_none(),
+            "a settled post-clear charge must not emit a goal-updated event"
+        );
+        // Runtime-less test: the settle offload runs inline, so the row is
+        // already reconciled when the charge returns.
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.status, "cleared", "settling never resurrects the goal");
+        assert_eq!(
+            row.tokens_used, 6_234,
+            "the cleared row's tokens_used must include the mid-flight turn's charge"
+        );
+        // Exactly the clear's ONE decision — the settle appends no audit row.
+        assert_eq!(ledger.count_decisions(&goal_id).expect("count"), 1);
+        // No wake from the clear/settle path.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "no continuation may be emitted from the clear/settle path: {drained:?}"
+        );
+        // The dispatcher still owns its marker — the clear did not steal it.
+        assert!(
+            orchestrator.clear_goal_dispatch_in_flight_generation(&key, dispatcher_generation),
+            "the running turn's dispatch claim must survive the clear (same generation)"
+        );
+    }
+
+    /// #2064(b) — the AUTONOMOUS accountant (`record_goal_turn`) settles the
+    /// same way: a continuation turn already running when the user cleared
+    /// lands its spend on the cleared row, and returns NO terminal snapshot
+    /// (cleared is not the complete/blocked reconcile family).
+    #[test]
+    fn record_goal_turn_should_settle_charge_into_cleared_goal_row() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-clear-autonomous");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "long continuation".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        let key = orchestrator.scoped_goal_key(&session_id);
+        let dispatcher_generation = orchestrator.mark_goal_dispatch_in_flight(&key);
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(data_dir.path()),
+            )
+            .expect("clear");
+
+        let settled = orchestrator.record_goal_turn(&session_id, "tenant-a", 4_000, 9);
+        assert!(
+            settled.is_none(),
+            "a cleared goal yields no complete/blocked reconcile snapshot"
+        );
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.status, "cleared");
+        assert_eq!(
+            row.tokens_used, 4_000,
+            "the autonomous turn's spend must land on the cleared row"
+        );
+        assert!(orchestrator.clear_goal_dispatch_in_flight_generation(&key, dispatcher_generation));
+    }
+
+    /// #2064(b) — the settle is BOUND and SCOPED: a charge carrying a foreign
+    /// goal_id must not land on the tombstone (goal-identity binding, exactly
+    /// like the live charge path), and a clear with NO turn in flight parks
+    /// nothing — a later stray charge is dropped exactly as today.
+    #[test]
+    fn cleared_goal_tombstone_should_reject_foreign_charges_and_idle_clears() {
+        // (1) Foreign goal_id: the tombstone refuses, then still settles the
+        // rightful charge (one rejection must not consume the tombstone).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-clear-binding");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "bound turn".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        let key = orchestrator.scoped_goal_key(&session_id);
+        orchestrator.mark_goal_dispatch_in_flight(&key);
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(data_dir.path()),
+            )
+            .expect("clear");
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", "goal_zz", 5_000, 7)
+                .is_none()
+        );
+        assert_eq!(
+            ledger
+                .get_goal(&goal_id)
+                .expect("query")
+                .expect("row")
+                .tokens_used,
+            0,
+            "a charge bound to a DIFFERENT goal incarnation must not settle here"
+        );
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 5_000, 7)
+                .is_none()
+        );
+        assert_eq!(
+            ledger
+                .get_goal(&goal_id)
+                .expect("query")
+                .expect("row")
+                .tokens_used,
+            5_000,
+            "the rightful charge still settles after a foreign one was refused"
+        );
+
+        // (2) Idle clear: no turn in flight, nothing to settle later — the
+        // tombstone is not parked and a stray charge stays dropped.
+        let idle_session = SessionKey::with_profile("tenant-a", "api", "goal-clear-idle");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: idle_session.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "idle clear".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let idle_goal_id = orchestrator
+            .goal_id_for_test(&idle_session)
+            .expect("goal id");
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: idle_session.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(data_dir.path()),
+            )
+            .expect("clear");
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&idle_session, "tenant-a", &idle_goal_id, 9_000, 3)
+                .is_none()
+        );
+        let idle_ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path()).join(
+            format!("{}.db", sanitize_filename_for_ledger(&idle_goal_id)),
+        );
+        let idle_ledger = octos_fleet::GoalLedger::open(&idle_ledger_path).expect("open ledger");
+        assert_eq!(
+            idle_ledger
+                .get_goal(&idle_goal_id)
+                .expect("query")
+                .expect("row")
+                .tokens_used,
+            0,
+            "no turn was in flight at clear time — a stray charge stays dropped"
         );
     }
 

@@ -540,11 +540,21 @@ impl GoalLedger {
     /// lower counters can detect the loss and retry once with max'd monotonic
     /// fields — instead of silently leaving the row on its old status while a
     /// decision row claims the transition happened.
+    /// #2063 — the VALUES status expression enforces the activation guard on
+    /// the snapshot's OWN arithmetic (`active` while `tokens_used >=
+    /// token_budget` lands `budget_limited`); `excluded.status` picks up the
+    /// transformed value, so the guard covers the insert arm AND the update
+    /// arm with one expression. Defense-in-depth here — the reachable hole is
+    /// the status-only [`Self::cas_goal_status`] — but the invariant lives in
+    /// every write of this family, not in its callers.
     pub fn upsert_goal(&self, goal: &Goal) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let admitted = conn.execute(
             "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2,
+                 CASE WHEN ?3 = 'active' AND ?5 > 0 AND ?4 >= ?5
+                 THEN 'budget_limited' ELSE ?3 END,
+                 ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(goal_id) DO UPDATE SET
                  objective = excluded.objective,
                  status = excluded.status,
@@ -629,6 +639,18 @@ impl GoalLedger {
     /// cannot detect — an equal-timestamp, same-status write (counters-only,
     /// same millisecond) — is safe by construction: the CAS writes only
     /// status + timestamp, so the interleaved counters survive untouched.
+    ///
+    /// #2063 — activation is CONDITIONAL ON THE ROW'S OWN ARITHMETIC:
+    /// `active` while `tokens_used >= token_budget` (budget > 0) writes
+    /// `budget_limited` instead, in the same statement. This is a status-only
+    /// write over counters the CALLER cannot see (the ledger is multi-process
+    /// WAL, and the #1973 retry that reaches this CAS fires precisely when
+    /// the caller's snapshot carries STALE LOWER counters than the row) — so
+    /// the in-memory resume guard is structurally unable to protect this
+    /// write, and the invariant must live here. The CAS still reports
+    /// `changed` (the pair matched and a stamp landed); the transition-sync
+    /// caller re-reads the row before appending its decision, so a flip to
+    /// the safe status suppresses the `active` audit row.
     pub fn cas_goal_status(
         &self,
         goal_id: &str,
@@ -639,7 +661,10 @@ impl GoalLedger {
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "UPDATE goals SET status = ?1, updated_at_ms = ?2
+            "UPDATE goals SET status = CASE
+                 WHEN ?1 = 'active' AND token_budget > 0 AND tokens_used >= token_budget
+                 THEN 'budget_limited' ELSE ?1 END,
+                 updated_at_ms = ?2
              WHERE goal_id = ?3 AND status = ?4 AND updated_at_ms = ?5
                AND status <> 'complete'",
             params![
@@ -983,6 +1008,9 @@ impl GoalLedger {
     /// Uses revision for compare-and-swap: only updates if the current revision
     /// matches expected_revision. Returns error if goal not found or revision mismatch
     /// (stale writer).
+    ///
+    /// #2063 — carries the same activation guard as [`Self::cas_goal_status`]:
+    /// `active` over an exhausted row writes `budget_limited` instead.
     pub fn update_goal_status(
         &self,
         goal_id: &str,
@@ -992,7 +1020,11 @@ impl GoalLedger {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let rows_affected = conn.execute(
-            "UPDATE goals SET status = ?1, revision = revision + 1, updated_at_ms = ?2 WHERE goal_id = ?3 AND revision = ?4",
+            "UPDATE goals SET status = CASE
+                 WHEN ?1 = 'active' AND token_budget > 0 AND tokens_used >= token_budget
+                 THEN 'budget_limited' ELSE ?1 END,
+                 revision = revision + 1, updated_at_ms = ?2
+             WHERE goal_id = ?3 AND revision = ?4",
             params![status, updated_at_ms, goal_id, expected_revision],
         )?;
 
@@ -1388,9 +1420,15 @@ impl GoalLedger {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        // Step 1: Update goal state (CAS)
+        // Step 1: Update goal state (CAS). #2063 — same activation guard as
+        // `cas_goal_status`: `active` over an exhausted row lands
+        // `budget_limited` in the same statement.
         let rows_affected = tx.execute(
-            "UPDATE goals SET status = ?1, revision = revision + 1, updated_at_ms = ?2 WHERE goal_id = ?3 AND revision = ?4",
+            "UPDATE goals SET status = CASE
+                 WHEN ?1 = 'active' AND token_budget > 0 AND tokens_used >= token_budget
+                 THEN 'budget_limited' ELSE ?1 END,
+                 revision = revision + 1, updated_at_ms = ?2
+             WHERE goal_id = ?3 AND revision = ?4",
             params![new_status, updated_at_ms, goal_id, expected_revision],
         )?;
 
@@ -1891,6 +1929,181 @@ mod tests {
         // CAS failure: nonexistent goal
         let result = ledger.update_goal_status("g999", "complete", 0, 3000);
         assert!(result.is_err());
+    }
+
+    /// #2063 — helper: a ledger with one goal row at the given spend/budget.
+    /// Returns the tempdir alongside so the db file outlives the helper.
+    fn ledger_with_goal(
+        tokens_used: u64,
+        token_budget: u64,
+        status: &str,
+    ) -> (tempfile::TempDir, GoalLedger) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "budget-guarded".to_string(),
+                status: status.to_string(),
+                tokens_used,
+                token_budget,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        (dir, ledger)
+    }
+
+    /// #2063 — `budget_limited` exists to stop spend, and whether a resume is
+    /// safe depends on an arithmetic fact (`tokens_used < token_budget`) the
+    /// status-only CAS cannot see in its caller: the in-memory guard evaluates
+    /// MEMORY's counters, but the multi-process row can be AHEAD of them (the
+    /// exact stale-lower-counters case the #1973 CAS retry exists for). The
+    /// write itself must therefore refuse to produce an active-and-exhausted
+    /// row: activating a row whose own counters are exhausted writes
+    /// `budget_limited` instead, in the same statement.
+    #[test]
+    fn should_write_budget_limited_when_cas_activates_exhausted_row() {
+        let (_dir, ledger) = ledger_with_goal(1_500, 1_000, "budget_limited");
+        let changed = ledger
+            .cas_goal_status("g1", "active", "budget_limited", 1000, 2000)
+            .unwrap();
+        assert!(
+            changed,
+            "the CAS fired (pair matched) — it wrote the SAFE status"
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            row.status, "budget_limited",
+            "activating an exhausted row must land budget_limited, never active-and-exhausted"
+        );
+        assert_eq!(row.updated_at_ms, 2000, "the stamp still lands");
+    }
+
+    /// #2063 — the legitimate resume: once the row's own budget covers its
+    /// spend, the same CAS writes `active` unchanged.
+    #[test]
+    fn should_write_active_when_cas_activates_row_within_budget() {
+        let (_dir, ledger) = ledger_with_goal(500, 1_000, "budget_limited");
+        let changed = ledger
+            .cas_goal_status("g1", "active", "budget_limited", 1000, 2000)
+            .unwrap();
+        assert!(changed);
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+    }
+
+    /// #2063 — same invariant on the snapshot writer: an incoming snapshot
+    /// whose own arithmetic is exhausted must not land `active`, on either the
+    /// insert arm (fresh row) or the update arm (existing row).
+    #[test]
+    fn should_flip_exhausted_active_snapshot_to_budget_limited_on_upsert() {
+        let (_dir, ledger) = ledger_with_goal(500, 1_000, "active");
+        // Update arm: the snapshot claims active but its own counters are
+        // exhausted (e.g. the budget field was lowered below the spend).
+        let admitted = ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "budget-guarded".to_string(),
+                status: "active".to_string(),
+                tokens_used: 1_500,
+                token_budget: 1_000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+        assert!(admitted);
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "budget_limited");
+        assert_eq!(row.tokens_used, 1_500, "the counters land verbatim");
+        // Insert arm: a fresh goal_id with an exhausted active snapshot.
+        assert!(
+            ledger
+                .upsert_goal(&Goal {
+                    goal_id: "g2".to_string(),
+                    objective: "fresh but exhausted".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 900,
+                    token_budget: 800,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 3000,
+                    updated_at_ms: 3000,
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().status,
+            "budget_limited",
+            "the insert arm enforces the same arithmetic"
+        );
+        // Control: an under-budget active snapshot still lands active.
+        assert!(
+            ledger
+                .upsert_goal(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "budget-guarded".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 1_500,
+                    token_budget: 5_000,
+                    continuations_used: 1,
+                    revision: 0,
+                    created_at_ms: 1000,
+                    updated_at_ms: 4000,
+                })
+                .unwrap()
+        );
+        assert_eq!(ledger.get_goal("g1").unwrap().unwrap().status, "active");
+    }
+
+    /// #2063 — the remaining status writers of the same family
+    /// (`update_goal_status`, `commit_state_with_audit`) carry the identical
+    /// guard: no code path may produce an active-and-exhausted row. A zero
+    /// budget is exempt (matches the in-memory guards' `token_budget > 0`).
+    #[test]
+    fn should_write_budget_limited_when_revision_cas_activates_exhausted_row() {
+        let (_dir, ledger) = ledger_with_goal(1_500, 1_000, "budget_limited");
+        ledger.update_goal_status("g1", "active", 0, 2000).unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().status,
+            "budget_limited"
+        );
+        // Raise the budget above the spend (upsert), then the same transition
+        // legitimately activates.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "budget-guarded".to_string(),
+                status: "budget_limited".to_string(),
+                tokens_used: 1_500,
+                token_budget: 5_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 3000,
+            })
+            .unwrap();
+        ledger.update_goal_status("g1", "active", 1, 4000).unwrap();
+        assert_eq!(ledger.get_goal("g1").unwrap().unwrap().status, "active");
+    }
+
+    /// #2063 — `commit_state_with_audit`'s in-transaction status write is the
+    /// same UPDATE shape; it must carry the same activation guard.
+    #[test]
+    fn should_write_budget_limited_when_audited_commit_activates_exhausted_row() {
+        let (_dir, ledger) = ledger_with_goal(1_500, 1_000, "budget_limited");
+        ledger
+            .commit_state_with_audit("g1", "active", 0, 2000, None, None)
+            .unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().status,
+            "budget_limited"
+        );
     }
 
     #[test]
