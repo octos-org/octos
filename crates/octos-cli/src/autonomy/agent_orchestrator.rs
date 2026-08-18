@@ -830,6 +830,9 @@ pub(crate) fn goal_task_settle_attempts_for(task_id: &str) -> u64 {
 /// hold's release steal the new incarnation's live flight). Production task
 /// ids are fresh UUIDv7s today, but the monotonic counter also pre-covers
 /// the same-id restoration path #2056 tracks.
+///
+/// u64 wrap is a non-concern by arithmetic: at a million stashes per second
+/// the counter takes about 5.8 × 10^5 years (~585 millennia) to wrap.
 fn next_goal_task_binding_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -879,6 +882,28 @@ struct GoalTaskLedgerBinding {
 }
 
 impl GoalTaskLedgerBinding {
+    /// Build a binding that has NOT been stashed yet: `generation` and
+    /// `in_flight` carry placeholder values here (round 8 — the one place
+    /// they appear) because the single stash point,
+    /// [`InProcessAgentOrchestrator::stash_goal_task_binding`], assigns
+    /// both authoritatively when the binding enters the map.
+    fn new_unstashed(
+        goal_row: octos_fleet::Goal,
+        title: String,
+        assigned_peer: Option<String>,
+        profile_data_dir: PathBuf,
+    ) -> Self {
+        Self {
+            goal_row,
+            title,
+            assigned_peer,
+            profile_data_dir,
+            retained_since: None,
+            generation: 0,
+            in_flight: 0,
+        }
+    }
+
     fn ledger_path(&self) -> PathBuf {
         InProcessAgentOrchestrator::goal_ledger_dir(&self.profile_data_dir).join(format!(
             "{}.db",
@@ -887,13 +912,15 @@ impl GoalTaskLedgerBinding {
     }
 }
 
-/// #2055 review round 6 (V2b) — THE one release point for a settle-attempt
-/// flight hold. Constructed at blocking-core entry, it releases the hold the
-/// attempt was scheduled with (the enqueue's take for attempt 0, the
-/// previous attempt's re-arm take for every retry) on EVERY exit path via
-/// `Drop` — success, budget exhaustion, fence-kill, and panic-unwind alike —
-/// so no exit can skip the release and no exit can release twice. The
-/// release is generation-matched inside
+/// #2055 review round 6 (V2b), ownership reworked in round 7 — THE one
+/// release point for a settle-attempt flight hold. Constructed by whoever
+/// SCHEDULES the attempt (the enqueue for attempt 0, the previous attempt's
+/// re-arm for every retry) and HANDED THROUGH the timer future and the
+/// blocking closure into the core, it releases the hold on EVERY fate of
+/// the attempt via `Drop` — success, budget exhaustion, fence-kill,
+/// panic-unwind, and a future dropped before it ever ran — so no exit can
+/// skip the release and no exit can release twice. The release is
+/// generation-matched inside
 /// [`InProcessAgentOrchestrator::release_goal_task_settle_flight`], so a
 /// hold whose entry was removed or re-stashed (the fence-kill cases) is a
 /// harmless no-op: the hold physically died with the old entry, and the new
@@ -5833,15 +5860,12 @@ impl InProcessAgentOrchestrator {
         // is the agent id. Every other kind has no peer identity.
         let assigned_peer = (task.tool_name == "native_agent" && !task.tool_call_id.is_empty())
             .then(|| task.tool_call_id.clone());
-        let mut binding = GoalTaskLedgerBinding {
+        let mut binding = GoalTaskLedgerBinding::new_unstashed(
             goal_row,
-            title: task.tool_name.clone(),
+            task.tool_name.clone(),
             assigned_peer,
-            profile_data_dir: profile_data_dir.to_path_buf(),
-            retained_since: None,
-            generation: 0,
-            in_flight: 0,
-        };
+            profile_data_dir.to_path_buf(),
+        );
         // Stash BEFORE the offload so a terminal racing in can already
         // resolve the binding; the settle write sequence converges with the
         // creation in either order. A re-stash (same task id) carries a
@@ -18047,8 +18071,8 @@ mod tests {
         goal_id: &str,
         task_id: &str,
     ) -> GoalTaskLedgerBinding {
-        let mut binding = GoalTaskLedgerBinding {
-            goal_row: octos_fleet::Goal {
+        let mut binding = GoalTaskLedgerBinding::new_unstashed(
+            octos_fleet::Goal {
                 goal_id: goal_id.to_string(),
                 objective: "converge".to_string(),
                 status: "active".to_string(),
@@ -18059,32 +18083,30 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 1,
             },
-            title: "web_probe".to_string(),
-            assigned_peer: None,
-            profile_data_dir: data_dir.to_path_buf(),
-            retained_since: None,
-            generation: 0,
-            in_flight: 0,
-        };
+            "web_probe".to_string(),
+            None,
+            data_dir.to_path_buf(),
+        );
         // Round 7 — stash through the PRODUCTION assignment path, so every
         // direct-core test runs under a real (globally monotonic) generation.
         binding.generation = orchestrator.stash_goal_task_binding(task_id, binding.clone());
         binding
     }
 
-    /// Construct the flight guard a scheduler would hand to an attempt for
-    /// `binding` — tests that drive the blocking core directly must supply
-    /// the hold the production enqueue/re-arm would have taken.
+    /// Take the flight hold a scheduler would hand to an attempt for
+    /// `binding` — round 8: through the REAL
+    /// `acquire_goal_task_settle_flight`, so test guards are
+    /// indistinguishable from production guards and every hold a test hands
+    /// to the core is BALANCED (a fabricated guard was an unbalanced
+    /// release that `saturating_sub` masked).
     fn test_flight_for(
         orchestrator: &InProcessAgentOrchestrator,
         task_id: &str,
         binding: &GoalTaskLedgerBinding,
     ) -> GoalTaskSettleFlightGuard {
-        GoalTaskSettleFlightGuard {
-            orchestrator: orchestrator.clone(),
-            task_id: task_id.to_owned(),
-            generation: binding.generation,
-        }
+        orchestrator
+            .acquire_goal_task_settle_flight(task_id, binding.generation)
+            .expect("the stashed entry admits the attempt's flight hold")
     }
 
     /// #2055 review round 2 (Additional-3): with the I/O offloaded, nothing
@@ -18209,17 +18231,12 @@ mod tests {
         let orchestrator = InProcessAgentOrchestrator::default();
         let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-gen", "task-gen-stale");
 
-        // Re-stash with a bumped generation — the captured `binding`
-        // (generation 0) is now stale.
-        {
-            let mut bindings = orchestrator
-                .shared
-                .goal_task_ledger_bindings
-                .lock()
-                .unwrap();
-            let entry = bindings.get_mut("task-gen-stale").expect("entry");
-            entry.generation += 1;
-        }
+        // The chain's hold is taken while its incarnation is live (the
+        // production shape), THEN the entry is re-stashed through the REAL
+        // stash path (round 8 — fresh counter-assigned generation) — the
+        // captured `binding` and its hold are now stale.
+        let stale_flight = test_flight_for(&orchestrator, "task-gen-stale", &binding);
+        orchestrator.stash_goal_task_binding("task-gen-stale", binding.clone());
 
         orchestrator.settle_goal_task_row_blocking(
             &binding,
@@ -18227,7 +18244,7 @@ mod tests {
             octos_fleet::TaskSettleAuthority::FinalFailure,
             true,
             0,
-            test_flight_for(&orchestrator, "task-gen-stale", &binding),
+            stale_flight,
         );
 
         // The stale chain died BEFORE any write: no ledger file, no row.
@@ -18984,23 +19001,14 @@ mod tests {
 
         // (2) exhaustion: every attempt fails (the ledger dir path is a
         // FILE), driven inline so the whole bounded chain runs to
-        // exhaustion synchronously. The enqueue's hold is simulated
-        // directly, as the scheduler would take it.
+        // exhaustion synchronously. The attempt-0 hold comes from the real
+        // acquire inside `test_flight_for` (round 8), exactly as the
+        // enqueue would take it.
         let dir2 = tempfile::TempDir::new().unwrap();
         let orchestrator = InProcessAgentOrchestrator::default();
         let blocked = dir2.path().join("blocked");
         std::fs::write(&blocked, b"not a dir").unwrap();
         let binding = stashed_test_binding(&orchestrator, &blocked, "goal-exhaust", "task-exhaust");
-        {
-            // Simulate the enqueue's flight take for attempt 0 (the local
-            // clone's counter is irrelevant; the map entry is the ledger).
-            let mut bindings = orchestrator
-                .shared
-                .goal_task_ledger_bindings
-                .lock()
-                .unwrap();
-            bindings.get_mut("task-exhaust").expect("entry").in_flight = 1;
-        }
         orchestrator.settle_goal_task_row_blocking(
             &binding,
             "task-exhaust",
@@ -19023,7 +19031,10 @@ mod tests {
         );
 
         // (3) fence-killed stale chain: the live re-stashed entry keeps its
-        // own accounting (no stale release lands on it).
+        // own accounting (no stale release lands on it). Round 8 — the
+        // stale hold is taken while its incarnation is live, then the
+        // re-stash goes through the REAL stash path, and the new
+        // incarnation takes its own hold through the real acquire.
         let dir3 = tempfile::TempDir::new().unwrap();
         let orchestrator3 = InProcessAgentOrchestrator::default();
         let stale = stashed_test_binding(
@@ -19032,23 +19043,19 @@ mod tests {
             "goal-stale",
             "task-stale-flight",
         );
-        {
-            let mut bindings = orchestrator3
-                .shared
-                .goal_task_ledger_bindings
-                .lock()
-                .unwrap();
-            let entry = bindings.get_mut("task-stale-flight").expect("entry");
-            entry.generation += 1; // re-stash: new incarnation
-            entry.in_flight = 1; // the new incarnation's own hold
-        }
+        let stale_flight = test_flight_for(&orchestrator3, "task-stale-flight", &stale);
+        let live_generation =
+            orchestrator3.stash_goal_task_binding("task-stale-flight", stale.clone());
+        let _live_hold = orchestrator3
+            .acquire_goal_task_settle_flight("task-stale-flight", live_generation)
+            .expect("the new incarnation admits its own hold");
         orchestrator3.settle_goal_task_row_blocking(
             &stale,
             "task-stale-flight",
             octos_fleet::TaskSettleAuthority::FinalFailure,
             true,
             0,
-            test_flight_for(&orchestrator3, "task-stale-flight", &stale),
+            stale_flight,
         );
         let live_in_flight = orchestrator3
             .shared

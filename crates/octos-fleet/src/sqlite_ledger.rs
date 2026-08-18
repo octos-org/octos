@@ -3954,9 +3954,14 @@ mod digest_integration_tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("the migration transaction is provably open");
 
-        // Fire the creation WHILE the migration transaction is open.
+        // Fire the creation WHILE the migration transaction is open. The
+        // creator signals immediately before calling `create_task` (round 8
+        // start-barrier), so the release below happens provably AFTER the
+        // creation began.
+        let (creation_begun_tx, creation_begun_rx) = std::sync::mpsc::channel::<()>();
         let creator = std::thread::spawn(move || {
             let begun = std::time::Instant::now();
+            let _ = creation_begun_tx.send(());
             creator_ledger
                 .create_task(&Task {
                     task_id: "race-task".to_string(),
@@ -3971,6 +3976,9 @@ mod digest_integration_tests {
                 .expect("creation succeeds after the migration commits");
             (begun, std::time::Instant::now())
         });
+        creation_begun_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the creation attempt has begun");
         // Hold the open transaction across the creation attempt, then
         // release and let everything settle.
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -3983,9 +3991,14 @@ mod digest_integration_tests {
         let (create_begun, create_done) = creator.join().expect("creator thread");
         *GoalLedger::migration_mid_transaction_hook().lock().unwrap() = None;
 
-        // The interleaving is PROVEN, not hoped: the creation observed the
-        // busy wait (blocked for essentially the whole hold) and completed
-        // only after the release.
+        // The interleaving is PROVEN, not hoped: the creation BEGAN before
+        // the release (a slow sequential post-release creation cannot
+        // masquerade), observed the busy wait (blocked for essentially the
+        // whole hold), and completed only after the release.
+        assert!(
+            create_begun < released_at,
+            "the creation must have begun while the migration transaction was still open"
+        );
         assert!(
             create_done >= released_at,
             "the creation must complete only after the migration transaction released"
