@@ -3905,19 +3905,20 @@ mod digest_integration_tests {
         assert_eq!(count_columns("authority"), 0);
     }
 
-    /// #2055 review round 6/7 (V3/W3) — creation-vs-migration concurrency
-    /// pin, DETERMINISTIC: the STRUCTURAL argument is what closes the race
-    /// (the creation APIs run inspection + insert inside `BEGIN IMMEDIATE`,
-    /// which serializes against the migration's own `BEGIN IMMEDIATE`
-    /// transaction, so a creation either fully precedes the migration —
-    /// legacy shape, then the backfill stamps the row FINAL — or fully
-    /// follows it, taking the derived-authority shape; the poisoned
-    /// interleaving cannot be scheduled). This test PROVES the mid-
-    /// transaction interleaving actually happened rather than hoping for
-    /// it: a test-only hook holds the migration transaction verifiably open
-    /// while the creation fires, the creation must complete only AFTER the
-    /// hook releases (blocked for the full hold, i.e. it observed the busy
-    /// wait), and the created terminal row must carry its real rank.
+    /// #2055 review rounds 6/7/9 (V3/W3/Y4) — creation-vs-migration
+    /// concurrency pin, deterministic BY CONSTRUCTION: the STRUCTURAL
+    /// argument is what closes the race (the creation APIs run inspection +
+    /// insert inside `BEGIN IMMEDIATE`, which serializes against the
+    /// migration's own `BEGIN IMMEDIATE` transaction, so a creation either
+    /// fully precedes the migration — legacy shape, then the backfill
+    /// stamps the row FINAL — or fully follows it, taking the
+    /// derived-authority shape; the poisoned interleaving cannot be
+    /// scheduled). This test PROVES contention with a single-threaded
+    /// busy-probe rather than timing: while a test-only hook parks the
+    /// migration transaction verifiably open, a zero-busy-timeout terminal
+    /// creation ON THE TEST THREAD must fail with lock contention — an
+    /// assertion no thread schedule can fake or break — and after release
+    /// the same creation succeeds with its real rank.
     #[test]
     fn should_never_leave_terminal_rows_unranked_when_creation_races_migration() {
         let dir = tempfile::tempdir().unwrap();
@@ -3927,9 +3928,12 @@ mod digest_integration_tests {
             conn.pragma_update(None, "journal_mode", "WAL").unwrap();
             create_legacy_schema(&conn, "");
         }
-        // The creator's connection is opened BEFORE the migration starts so
-        // the only step that can block below is its creation transaction.
-        let creator_ledger = GoalLedger::open(&path).unwrap();
+        // The probe's connection is opened at test start, BEFORE the hook is
+        // installed and the migration can take the write lock, so the open
+        // itself (a plain `GoalLedger::open` — no migration attempt, which
+        // would deadlock against the parked transaction) cannot block on
+        // anything below.
+        let probe_ledger = GoalLedger::open(&path).unwrap();
 
         // Install the in-transaction hook: signals the test, then blocks
         // this migration open until released.
@@ -3954,64 +3958,66 @@ mod digest_integration_tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("the migration transaction is provably open");
 
-        // Fire the creation WHILE the migration transaction is open. The
-        // creator signals immediately before calling `create_task` (round 8
-        // start-barrier), so the release below happens provably AFTER the
-        // creation began.
-        let (creation_begun_tx, creation_begun_rx) = std::sync::mpsc::channel::<()>();
-        let creator = std::thread::spawn(move || {
-            let begun = std::time::Instant::now();
-            let _ = creation_begun_tx.send(());
-            creator_ledger
-                .create_task(&Task {
-                    task_id: "race-task".to_string(),
-                    goal_id: "g1".to_string(),
-                    title: String::new(),
-                    detail: String::new(),
-                    status: "failed".to_string(),
-                    assigned_peer: None,
-                    created_at_ms: 1_000,
-                    updated_at_ms: 1_000,
-                })
-                .expect("creation succeeds after the migration commits");
-            (begun, std::time::Instant::now())
-        });
-        creation_begun_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("the creation attempt has begun");
-        // Hold the open transaction across the creation attempt, then
-        // release and let everything settle.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let released_at = std::time::Instant::now();
+        // Round 9 — the busy-probe, ON THIS THREAD, deterministic by
+        // construction: with the hook parked the migration transaction is
+        // provably holding the write lock AT THIS INSTANT, so a zero-
+        // busy-timeout terminal creation can only fail SQLITE_BUSY — and it
+        // can only fail SQLITE_BUSY because that lock is held. Both sides
+        // of the interleaving are sequenced by the test thread itself: no
+        // schedule can fake the contention and no deschedule can break it.
+        // (The previous timing shape could pass under a valid schedule that
+        // descheduled a creator thread between its begun-signal and its
+        // create call, running the whole creation post-release — timestamps
+        // cannot prove blocking.)
+        probe_ledger
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let probe_error = probe_ledger
+            .create_task(&Task {
+                task_id: "race-task".to_string(),
+                goal_id: "g1".to_string(),
+                title: String::new(),
+                detail: String::new(),
+                status: "failed".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .expect_err("a zero-timeout creation must observe the held migration lock");
+        assert!(
+            error_is_lock_contention(&probe_error),
+            "the probe must fail with lock contention, not a structural error: {probe_error}"
+        );
+
         release_tx.send(()).expect("release the migration hook");
         let migrated = migration
             .join()
             .expect("migration thread")
             .expect("migration open succeeds");
-        let (create_begun, create_done) = creator.join().expect("creator thread");
         *GoalLedger::migration_mid_transaction_hook().lock().unwrap() = None;
 
-        // The interleaving is PROVEN, not hoped: the creation BEGAN before
-        // the release (a slow sequential post-release creation cannot
-        // masquerade), observed the busy wait (blocked for essentially the
-        // whole hold), and completed only after the release.
-        assert!(
-            create_begun < released_at,
-            "the creation must have begun while the migration transaction was still open"
-        );
-        assert!(
-            create_done >= released_at,
-            "the creation must complete only after the migration transaction released"
-        );
-        assert!(
-            create_done.duration_since(create_begun) >= std::time::Duration::from_millis(250),
-            "the creation must have been blocked by the open migration transaction \
-             (took {:?})",
-            create_done.duration_since(create_begun)
-        );
+        // With the migration committed, the same terminal creation succeeds
+        // on a normal-timeout connection and takes the derived-authority
+        // shape.
+        migrated
+            .create_task(&Task {
+                task_id: "race-task".to_string(),
+                goal_id: "g1".to_string(),
+                title: String::new(),
+                detail: String::new(),
+                status: "failed".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .expect("creation succeeds after the migration commits");
+
         // And the outcome invariant: no terminal row at authority -1 — the
-        // legacy row was backfilled FINAL and the racing creation took the
-        // derived-authority shape.
+        // legacy row was backfilled FINAL and the post-migration creation
+        // took the derived-authority shape.
         let conn = migrated.conn.lock().unwrap();
         let unranked: i64 = conn
             .query_row(
