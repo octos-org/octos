@@ -33848,13 +33848,188 @@ async fn open_session_collecting_goal_cleared_frames(
         match frame["method"].as_str() {
             Some("session/goal/cleared") => cleared_frames.push(frame["params"].clone()),
             // The `session/opened` lifecycle notification closes the open
-            // path's send sequence.
+            // path's DIRECT send sequence.
             Some("session/open") => break,
             _ => {}
         }
     }
+    // #2062 fix round (codex #2065 H3): the null snapshot is delivered by the
+    // live-forwarder task — it must serialize BEHIND the broadcast backlog
+    // that raced the open handshake, so it lands after `session/opened`, not
+    // between the direct sends. Poll a bounded quiet window past the
+    // boundary: presence resolves as soon as the frame arrives; absence
+    // costs the full window once.
+    let quiet = tokio::time::Duration::from_millis(700);
+    while let Ok(frame) = tokio::time::timeout(quiet, recv_rpc_json(&mut rx)).await {
+        if frame["method"] == json!("session/goal/cleared") {
+            cleared_frames.push(frame["params"].clone());
+        }
+    }
     abort_live_forwarders(&forwarders, ledger).await;
     cleared_frames
+}
+
+/// #2062 fix round (codex #2065 H1) — the spurious-cleared profile skew: goal
+/// RPCs can bind under a caller-REQUESTED profile while `session/open`
+/// resolves the connection/auth profile (a bare open defaults to `_main`).
+/// The client's chip — and its cleared reducer — are SESSION-keyed with no
+/// profile check, so a profile-mismatched "absent" verdict on the server
+/// would blank a live chip. Existence under ANY profile must suppress the
+/// null.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_suppressed_when_goal_bound_under_other_profile() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-snap-other-profile".into());
+    default_agent_orchestrator()
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: "tenant-x".into(),
+            objective: "bound under a caller-requested profile".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal under tenant-x");
+
+    let cleared =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-d").await;
+
+    default_agent_orchestrator()
+        .clear_goal(GoalSessionRequest {
+            session_id: session_id.clone(),
+            profile_id: "tenant-x".into(),
+        })
+        .expect("cleanup goal");
+
+    assert!(
+        cleared.is_empty(),
+        "codex #2065 H1: the open resolves `_main` but the goal lives under \
+         `tenant-x`; a cleared here would blank the live session-keyed chip: {cleared:?}"
+    );
+}
+
+/// #2062 fix round (codex #2065 H2, held): ANY stored status suppresses the
+/// null — a `budget_limited` goal is still a live chip (frozen for
+/// scheduling, not for display), so the open must not blank it.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_suppressed_when_goal_budget_limited() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-snap-budget-limited".into());
+    default_agent_orchestrator()
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "budget exhausted but still the session's goal".into(),
+            status: Some("budget_limited".into()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind budget_limited goal");
+
+    let cleared =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-e").await;
+
+    default_agent_orchestrator()
+        .clear_goal(GoalSessionRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("cleanup goal");
+
+    assert!(
+        cleared.is_empty(),
+        "a budget_limited goal is still bound; the open must not blank it: {cleared:?}"
+    );
+}
+
+/// #2062 fix round (codex #2065 H3) — ordering at the protocol layer,
+/// asserted on WIRE FRAME ORDER, not client state. The open subscribes to
+/// the live broadcast BEFORE its replay snapshot, so a stale
+/// `session/goal/updated` can be sitting in the receiver when the forwarder
+/// starts; the forwarder's ledger-send path does not run the #1959
+/// generation guard and the client's `updated` reducer applies
+/// unconditionally, so if the null were emitted before that backlog
+/// flushes, the stale update would repaint the chip the null just blanked.
+/// The null must therefore be the FINAL goal-state frame of the open
+/// sequence: backlog first, null second.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_ordered_after_buffered_stale_update() {
+    let (ws, mut rx_frames) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-order".into());
+    // Subscribe FIRST — mirrors handle_session_open, which subscribes
+    // before the replay snapshot; the event appended below then sits in
+    // this receiver's buffer exactly like one that raced the handshake.
+    let live_rx = ledger.subscribe(&session_id);
+    ledger.append_notification(UiNotification::SessionGoalUpdated(
+        octos_core::ui_protocol::SessionGoalUpdatedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            goal: octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                goal_id: "goal-stale".into(),
+                objective: "stale positive state raced the open".into(),
+                status: "active".into(),
+                token_budget: 1_000,
+                tokens_used: 10,
+                time_used_seconds: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            transition_actor: "backend".into(),
+            // Unstamped, like a pre-#1959 producer — the guardless
+            // forwarder lane delivers it regardless.
+            generation: 0,
+        },
+    ));
+    let null =
+        UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            cleared: true,
+            goal: None,
+            transition_actor: "backend".into(),
+            generation: 0,
+        });
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    spawn_live_forwarder_with_goal_null_snapshot(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        live_rx,
+        forwarders.clone(),
+        Some(null),
+    )
+    .await;
+
+    let first = recv_rpc_json(&mut rx_frames).await;
+    assert_eq!(
+        first["method"],
+        json!("session/goal/updated"),
+        "the raced stale update must flush FIRST: {first}"
+    );
+    let second = recv_rpc_json(&mut rx_frames).await;
+    assert_eq!(
+        second["method"],
+        json!("session/goal/cleared"),
+        "the null must be the FINAL goal-state frame of the open sequence: {second}"
+    );
+    assert_eq!(second["params"]["cleared"], json!(true));
+    abort_live_forwarders(&forwarders, &ledger).await;
 }
 
 /// #2062 RED→GREEN: a session that opens with NO goal bound must receive an

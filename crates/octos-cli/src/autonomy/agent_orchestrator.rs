@@ -4285,21 +4285,38 @@ impl InProcessAgentOrchestrator {
     }
 
     /// #2062 — `SessionGoalCleared`-shaped NULL snapshot for the session
-    /// (re)open path: `Some(event JSON)` when NO goal is bound to
-    /// `session_id` for `profile_id`, `None` when a goal IS bound (the
-    /// positive chip state is owned by the durable replay + live update
-    /// pushes, untouched here). Silence is not a goal state: without this,
-    /// a client that cached a chip and reconnects after the goal was
-    /// cleared elsewhere (a second connection, another process on the same
-    /// data dir, or a serve restart that rebuilt the ledger) keeps
-    /// rendering it. "Removed", "never existed", and "removed while you
-    /// were away" must be ONE message — the same payload shape as the
-    /// explicit `session/goal/clear` result (`cleared: true` is what the
-    /// client's single null-the-chip reducer keys on).
+    /// (re)open path: `Some(event JSON)` when NO goal record exists for
+    /// `session_id`'s goal-store key, `None` when one IS bound (the positive
+    /// chip state is owned by the durable replay + live update pushes,
+    /// untouched here). Silence is not a goal state: without this, a client
+    /// that cached a chip and reconnects after the goal was cleared
+    /// elsewhere (a second connection, another process on the same data
+    /// dir, or a serve restart that rebuilt the ledger) keeps rendering it.
+    /// "Removed", "never existed", and "removed while you were away" must
+    /// be ONE message — the same payload shape as the explicit
+    /// `session/goal/clear` result (`cleared: true` is what the client's
+    /// single null-the-chip reducer keys on).
+    ///
+    /// Suppression is existence-under-ANY-profile, deliberately NOT a
+    /// profile match (codex #2065 H1): goal RPCs can bind under a
+    /// caller-REQUESTED profile while `session/open` resolves the
+    /// connection/auth profile (a bare open resolves `_main`), and the
+    /// client's chip — and its cleared reducer — are SESSION-keyed with no
+    /// profile check. A profile-mismatched "absent" verdict here would
+    /// therefore blank a LIVE chip. The server-side null must be at least
+    /// as conservative as the client-side clearing it triggers. Likewise
+    /// ANY stored status suppresses (a `budget_limited`/`paused` goal is
+    /// frozen for scheduling, not for display).
     ///
     /// Emit-only: no goal state is read-modified. The #1959 generation
-    /// bump is the shared ordering stamp EVERY goal chip event must carry —
-    /// an unstamped `0` would let a replayed stale update outrank the null.
+    /// bump is the process-local watermark stamp every goal chip event
+    /// carries so `goal_event_passes_generation_guard` can drop an
+    /// in-process stale update that races an out-of-band clear at that
+    /// update's OWN send site. It is NOT an ordering guarantee: the counter
+    /// is default-only runtime state and resets across restarts, so the
+    /// caller must order the null POSITIONALLY — after the open's replay
+    /// loop and after the live-broadcast backlog drain (see
+    /// `spawn_live_forwarder_with_goal_null_snapshot`).
     pub(crate) fn session_goal_hydrate_cleared_event_json(
         &self,
         session_id: &SessionKey,
@@ -4307,16 +4324,10 @@ impl InProcessAgentOrchestrator {
     ) -> Option<Value> {
         // #1666 residue — same scoped-store lookup as `clear_goal_impl`, so
         // folder A's bound goal never reads as "unbound" through folder B's
-        // reuse of the wire id. A goal bound under a DIFFERENT profile also
-        // renders as unbound: this connection's profile can never see that
-        // goal, so its null is truthful (and keeps the chip tenant-scoped).
+        // reuse of the wire id.
         let key = self.scoped_goal_key(session_id);
         let mut state = self.state();
-        if state
-            .goals
-            .get(&key)
-            .is_some_and(|goal| goal.profile_id == profile_id)
-        {
+        if state.goals.contains_key(&key) {
             return None;
         }
         let generation = next_goal_event_generation(&mut state);
