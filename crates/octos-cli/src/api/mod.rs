@@ -490,7 +490,7 @@ impl AppState {
             config_path: None,
             watchdog_enabled: None,
             alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
+            sysinfo: tokio::sync::Mutex::new(crate::sysinfo_budget::new_metrics_system()),
             tenant_store: None,
             run_id_cache: Arc::new(RunIdCache::new()),
             tunnel_domain: None,
