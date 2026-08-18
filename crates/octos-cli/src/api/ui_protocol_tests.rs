@@ -34177,7 +34177,340 @@ async fn session_open_goal_null_snapshot_reemitted_when_goal_cleared_elsewhere()
     let reopened_generation = reopened[0]["generation"].as_u64().expect("generation");
     assert!(
         reopened_generation > first_generation,
-        "the re-emitted null snapshot must carry a newer generation \
-         ({reopened_generation} vs {first_generation})"
+        "each emission is freshly stamped for the delivery loop's \
+         superseded-abandon bookkeeping ({reopened_generation} vs {first_generation})"
     );
+}
+
+/// A minimal valid frame used to occupy a capacity-1 writer queue so the
+/// #2062 null snapshot is forced to park on backpressure.
+fn plug_frame() -> WsMessage {
+    frame_for(&json!({"jsonrpc": "2.0", "method": "test/plug"})).expect("plug frame")
+}
+
+/// #2062 round 3 (codex #2065 round-2 Z2) — THE NULL IS A SNAPSHOT, NOT A
+/// COMMAND. Direct-path senders (the goal RPC durable send, the accountant's
+/// ephemeral repaint) share this connection's writer queue but not the
+/// forwarder task, so they cannot be serialized against a parked null — the
+/// null must instead ABANDON itself the moment any newer goal frame has been
+/// admitted for the session. An abandoned null is CORRECT: a newer
+/// authoritative frame reached the client, so the stale-chip condition the
+/// null exists to fix is already gone.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_abandoned_when_superseded_while_parked() {
+    let (ws, mut rx) = ws_connection_for_test(1);
+    // Fill the single writer slot: the null cannot enqueue and must park.
+    ws.send_durable(plug_frame(), "test/plug")
+        .expect("plug the writer queue");
+    let session_id = SessionKey("local:goal-null-superseded".into());
+    let null =
+        UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            cleared: true,
+            goal: None,
+            transition_actor: "backend".into(),
+            generation: 5,
+        });
+    let ws_null = ws.clone();
+    let features = ConnectionUiFeatures::stdio_defaults();
+    let delivery =
+        tokio::spawn(async move { send_open_catchup_notification(&ws_null, null, features).await });
+    // Let the null hit backpressure and park.
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    // A NEWER goal frame is admitted through the same #1959 guard entry the
+    // production direct senders use (RPC durable path / accountant path) —
+    // the session watermark moves past the parked null's generation.
+    let newer =
+        UiNotification::SessionGoalUpdated(octos_core::ui_protocol::SessionGoalUpdatedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            goal: octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                goal_id: "goal-live".into(),
+                objective: "set while the null was parked".into(),
+                status: "active".into(),
+                token_budget: 1_000,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            transition_actor: "user".into(),
+            generation: 6,
+        });
+    assert!(
+        goal_event_passes_generation_guard(&newer),
+        "the newer update must be admitted and recorded as the watermark"
+    );
+    // Free the writer slot — the parked null now CAN send, and must not.
+    let plug = recv_rpc_json(&mut rx).await;
+    assert_eq!(plug["method"], json!("test/plug"));
+    delivery
+        .await
+        .expect("delivery task")
+        .expect("abandoning is a clean outcome");
+    let late = tokio::time::timeout(
+        tokio::time::Duration::from_millis(400),
+        recv_rpc_json(&mut rx),
+    )
+    .await;
+    assert!(
+        late.is_err(),
+        "a superseded null must be ABANDONED, never delivered after the newer frame: {late:?}"
+    );
+}
+
+/// #2062 round 3 (codex #2065 round-2 Z3) — PARK-DON'T-DROP: a writer queue
+/// filled by a large replay parks the null until capacity frees; it is never
+/// terminally dropped on a live connection. (The round-2 bounded retry gave
+/// up after ~150ms and lost the frame — no cursor, so `replay_lossy` could
+/// never recover it.)
+#[tokio::test]
+async fn session_open_goal_null_snapshot_parks_until_writer_capacity_frees() {
+    let (ws, mut rx) = ws_connection_for_test(1);
+    ws.send_durable(plug_frame(), "test/plug")
+        .expect("plug the writer queue");
+    let session_id = SessionKey("local:goal-null-parked".into());
+    let null =
+        UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            cleared: true,
+            goal: None,
+            transition_actor: "backend".into(),
+            generation: 5,
+        });
+    let ws_null = ws.clone();
+    let features = ConnectionUiFeatures::stdio_defaults();
+    let delivery =
+        tokio::spawn(async move { send_open_catchup_notification(&ws_null, null, features).await });
+    // Park well past the round-2 bounded-retry budget before freeing the
+    // queue: a live connection must still receive the null afterwards.
+    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+    let plug = recv_rpc_json(&mut rx).await;
+    assert_eq!(plug["method"], json!("test/plug"));
+    let cleared = tokio::time::timeout(tokio::time::Duration::from_secs(5), recv_rpc_json(&mut rx))
+        .await
+        .expect("the parked null must deliver once capacity frees (never dropped)");
+    assert_eq!(
+        cleared["method"],
+        json!("session/goal/cleared"),
+        "the parked null must deliver once capacity frees: {cleared}"
+    );
+    delivery
+        .await
+        .expect("delivery task")
+        .expect("parked null delivers on a live connection");
+}
+
+/// #2062 round 3 (codex #2065 round-2 Z5) — capability gating on ALL lanes:
+/// a connection that did not negotiate `coding.goal_runtime.v1` (the same
+/// capability the goal RPC surface requires) must receive ZERO goal frames
+/// through the full open sequence — replay, forwarder drain, live pump, and
+/// the null snapshot alike. Round 2 gated only the null's CONSTRUCTION;
+/// replayed/pumped `session/goal/*` frames still leaked through.
+#[tokio::test]
+async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-capability".into());
+    // Seed the REPLAY lane with a durable goal frame from another connection.
+    ledger.append_notification_from(
+        UiNotification::SessionGoalUpdated(octos_core::ui_protocol::SessionGoalUpdatedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            goal: octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                goal_id: "goal-replayed".into(),
+                objective: "durable goal history".into(),
+                status: "active".into(),
+                token_budget: 1_000,
+                tokens_used: 1,
+                time_used_seconds: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            transition_actor: "backend".into(),
+            generation: 0,
+        }),
+        ConnectionId::next(),
+    );
+
+    let features = ConnectionUiFeatures {
+        coding_goal_runtime_v1: false,
+        ..ConnectionUiFeatures::stdio_defaults()
+    };
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        None,
+        features,
+        "open-no-goal-runtime".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "session/open must succeed");
+    // Feed the LIVE PUMP lane too, from another connection.
+    ledger.append_notification_from(
+        UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            cleared: true,
+            goal: None,
+            transition_actor: "user".into(),
+            generation: 0,
+        }),
+        ConnectionId::next(),
+    );
+    // Collect the full open sequence plus a quiet window of live pumping.
+    let mut goal_frames = Vec::new();
+    let quiet = tokio::time::Duration::from_millis(700);
+    while let Ok(frame) = tokio::time::timeout(quiet, recv_rpc_json(&mut rx)).await {
+        if let Some(method) = frame["method"].as_str() {
+            if method.starts_with("session/goal/") {
+                goal_frames.push(frame.clone());
+            }
+        }
+    }
+    abort_live_forwarders(&forwarders, &ledger).await;
+    assert!(
+        goal_frames.is_empty(),
+        "a connection without coding.goal_runtime.v1 must see zero goal frames: {goal_frames:?}"
+    );
+}
+
+/// #2062 round 3 (codex #2065 round-2 Z1) — the null's suppression lookup
+/// must inspect the goal-store key PINNED at this open's registration, not a
+/// re-resolution of the process-global last-writer-wins cwd map: a
+/// concurrent same-wire/different-cwd open can flip that map mid-open, and
+/// a recomputed key would then inspect the OTHER folder's (empty) slot and
+/// emit a spurious cleared for THIS folder's live chip.
+#[test]
+fn session_open_goal_null_snapshot_pinned_key_survives_concurrent_cwd_flip() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let orchestrator = default_agent_orchestrator();
+    let wire = SessionKey("local:goal-null-cwd-pin".into());
+    orchestrator.set_goal_scope(&wire, Some("aaaa1111".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "folder A's live goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal under folder A's cwd scope");
+    // This open pins its goal-store identity at registration time.
+    let pinned = orchestrator.scoped_goal_key(&wire);
+    // A concurrent same-wire open for a DIFFERENT folder flips the
+    // last-writer-wins map before the null snapshot is computed.
+    orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+
+    let verdict = orchestrator.session_goal_hydrate_cleared_event_json(&pinned, MAIN_PROFILE_ID);
+
+    // Cleanup the process-global store BEFORE asserting.
+    orchestrator.set_goal_scope(&wire, Some("aaaa1111".into()));
+    orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("cleanup goal");
+    orchestrator.set_goal_scope(&wire, None);
+
+    assert!(
+        verdict.is_none(),
+        "suppression must inspect the OPEN-pinned key (folder A), not the \
+         flipped cwd map (folder B): {verdict:?}"
+    );
+}
+
+/// #2062 round 3 (codex #2065 round-2 Z5-lifecycle) — a re-open must fully
+/// retire the previous live forwarder BEFORE the replacement starts pumping,
+/// so "one live lane per (connection, session)" holds across reopens and an
+/// event is never double-delivered by two overlapping pumps.
+#[tokio::test]
+async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-lane-handover".into());
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let first_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder_with_goal_null_snapshot(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        first_rx,
+        forwarders.clone(),
+        None,
+    )
+    .await;
+
+    // Re-open on the SAME connection and session.
+    let second_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder_with_goal_null_snapshot(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        second_rx,
+        forwarders.clone(),
+        None,
+    )
+    .await;
+
+    // An event appended after the handover must arrive exactly once.
+    ledger.append_notification_from(
+        UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "exactly once".into(),
+        }),
+        ConnectionId::next(),
+    );
+    let delivered =
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), recv_rpc_json(&mut rx))
+            .await
+            .expect("the replacement forwarder delivers the live event");
+    assert_eq!(delivered["method"], json!("message/delta"));
+    let duplicate = tokio::time::timeout(
+        tokio::time::Duration::from_millis(400),
+        recv_rpc_json(&mut rx),
+    )
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "the retired forwarder must not double-deliver: {duplicate:?}"
+    );
+    abort_live_forwarders(&forwarders, &ledger).await;
 }

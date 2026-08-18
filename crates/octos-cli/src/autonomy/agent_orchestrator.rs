@@ -4309,30 +4309,40 @@ impl InProcessAgentOrchestrator {
     /// frozen for scheduling, not for display).
     ///
     /// Emit-only: no goal state is read-modified. The #1959 generation
-    /// bump is the process-local watermark stamp every goal chip event
-    /// carries so `goal_event_passes_generation_guard` can drop an
-    /// in-process stale update that races an out-of-band clear at that
-    /// update's OWN send site. It is NOT an ordering guarantee: the counter
-    /// is default-only runtime state and resets across restarts, so the
-    /// caller must order the null POSITIONALLY — after the open's replay
-    /// loop and after the live-broadcast backlog drain (see
+    /// bump is process-local bookkeeping with two jobs: (a) recorded as the
+    /// session watermark by `goal_event_passes_generation_guard`, it drops
+    /// an in-process stale update racing an out-of-band clear at that
+    /// update's OWN send site, and (b) the delivery loop re-reads the
+    /// watermark before every attempt and ABANDONS this null once any newer
+    /// goal frame was admitted (superseded-abandon — the null is a
+    /// snapshot, not a command). It is NOT an ordering guarantee: the
+    /// counter is default-only runtime state and resets across restarts, so
+    /// the caller must order the null POSITIONALLY — after the open's
+    /// replay loop and after the live-broadcast backlog drain (see
     /// `spawn_live_forwarder_with_goal_null_snapshot`).
+    ///
+    /// codex #2065 round-2 Z1 — takes the goal-store key the caller PINNED
+    /// at open-registration time instead of a wire id this fn would
+    /// re-resolve: `scoped_goal_key` reads the process-global
+    /// last-writer-wins cwd map, which a concurrent same-wire/different-cwd
+    /// `session/open` can flip mid-open — suppression would then inspect
+    /// the OTHER folder's key and emit a spurious cleared for this folder's
+    /// live chip. Same discipline as the turn path's turn-pinned scoped
+    /// key. The wire id the client keys the chip by is recovered via
+    /// [`wire_key_from_goal_key`] (a pinned key is the wire id itself, or
+    /// wire id + `\u{0}~cwd-` suffix).
     pub(crate) fn session_goal_hydrate_cleared_event_json(
         &self,
-        session_id: &SessionKey,
+        pinned_goal_key: &SessionKey,
         profile_id: &str,
     ) -> Option<Value> {
-        // #1666 residue — same scoped-store lookup as `clear_goal_impl`, so
-        // folder A's bound goal never reads as "unbound" through folder B's
-        // reuse of the wire id.
-        let key = self.scoped_goal_key(session_id);
         let mut state = self.state();
-        if state.goals.contains_key(&key) {
+        if state.goals.contains_key(pinned_goal_key) {
             return None;
         }
         let generation = next_goal_event_generation(&mut state);
         Some(json!({
-            "session_id": session_id,
+            "session_id": wire_key_from_goal_key(pinned_goal_key),
             "profile_id": profile_id,
             "cleared": true,
             "goal": Value::Null,
