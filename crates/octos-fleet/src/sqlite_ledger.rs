@@ -233,7 +233,7 @@ impl GoalLedger {
                 .and_then(|ledger| {
                     {
                         let mut conn = ledger.conn.lock().unwrap();
-                        Self::migrate_tasks_authority_column(&mut conn)?;
+                        Self::migrate_tasks_authority_column(&mut conn, path)?;
                     }
                     Ok(ledger)
                 });
@@ -382,6 +382,23 @@ impl GoalLedger {
         Ok(())
     }
 
+    /// #2055 review round 7 (W3 test hook) — a test-only hook invoked INSIDE
+    /// the migration transaction, between the schema statements and the
+    /// commit, keyed by ledger path so parallel tests' migrations pass
+    /// through untouched. `None` in production builds by construction
+    /// (`cfg(test)` — zero cost). The callback is cloned out of the slot
+    /// before invocation so a blocking hook cannot stall other migrations
+    /// on the slot lock.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn migration_mid_transaction_hook()
+    -> &'static Mutex<Option<(std::path::PathBuf, Arc<dyn Fn() + Send + Sync>)>> {
+        static HOOK: std::sync::OnceLock<
+            Mutex<Option<(std::path::PathBuf, Arc<dyn Fn() + Send + Sync>)>>,
+        > = std::sync::OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
     /// Whether the `tasks` table currently carries `column` — schema
     /// inspection via `pragma_table_info`, which never references the column
     /// itself and returns an empty set for a missing table, so it is safe on
@@ -424,7 +441,9 @@ impl GoalLedger {
     /// fully-migrated database; the checks are REPEATED inside the
     /// transaction because two blocking-context openers can race the fast
     /// path, and only the in-transaction view is serialized.
-    fn migrate_tasks_authority_column(conn: &mut Connection) -> Result<()> {
+    fn migrate_tasks_authority_column(conn: &mut Connection, path: &Path) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = path;
         if Self::tasks_has_column(conn, "authority")?
             && !Self::tasks_has_column(conn, "correctable")?
         {
@@ -443,6 +462,21 @@ impl GoalLedger {
         }
         if Self::tasks_has_column(&tx, "correctable")? {
             tx.execute("ALTER TABLE tasks DROP COLUMN correctable", [])?;
+        }
+        // W3 test hook: lets a test hold THIS transaction provably open
+        // while it fires concurrent creation attempts. Path-keyed; absent
+        // in production builds.
+        #[cfg(test)]
+        {
+            let hook = Self::migration_mid_transaction_hook()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(hook_path, _)| hook_path == path)
+                .map(|(_, callback)| Arc::clone(callback));
+            if let Some(callback) = hook {
+                callback();
+            }
         }
         tx.commit()?;
         Ok(())
@@ -3712,8 +3746,9 @@ mod digest_integration_tests {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         // No `tasks` table at all: the inspection reports the column absent
         // and the in-transaction ALTER fails with "no such table".
-        let error = GoalLedger::migrate_tasks_authority_column(&mut conn)
-            .expect_err("a migration failure must propagate");
+        let error =
+            GoalLedger::migrate_tasks_authority_column(&mut conn, Path::new("unused-in-memory"))
+                .expect_err("a migration failure must propagate");
         assert!(
             error.to_string().contains("no such table"),
             "unexpected error: {error}"
@@ -3729,7 +3764,7 @@ mod digest_integration_tests {
                  authority INTEGER NOT NULL DEFAULT -1);",
         )
         .unwrap();
-        GoalLedger::migrate_tasks_authority_column(&mut conn)
+        GoalLedger::migrate_tasks_authority_column(&mut conn, Path::new("unused-in-memory"))
             .expect("an already-migrated table is a no-op");
     }
 
@@ -3870,80 +3905,121 @@ mod digest_integration_tests {
         assert_eq!(count_columns("authority"), 0);
     }
 
-    /// #2055 review round 6 (V3) — creation-vs-migration concurrency pin.
-    /// The STRUCTURAL argument is what closes the race: the creation APIs
-    /// run inspection + insert inside `BEGIN IMMEDIATE`, which serializes
-    /// against the migration's own `BEGIN IMMEDIATE` transaction, so a
-    /// creation either fully precedes the migration (legacy shape, then the
-    /// backfill stamps the row FINAL) or fully follows it (derived-authority
-    /// shape) — the poisoned interleaving (inspect legacy → migration
-    /// commits → legacy insert on the migrated table → terminal row at
-    /// authority `-1` after the backfill already ran) cannot be scheduled.
-    /// This test is a TRIPWIRE, not the proof: a creation hammer races the
-    /// migration mid-hammer (barrier-started so they verifiably overlap)
-    /// and no terminal row may ever end at authority `-1`.
+    /// #2055 review round 6/7 (V3/W3) — creation-vs-migration concurrency
+    /// pin, DETERMINISTIC: the STRUCTURAL argument is what closes the race
+    /// (the creation APIs run inspection + insert inside `BEGIN IMMEDIATE`,
+    /// which serializes against the migration's own `BEGIN IMMEDIATE`
+    /// transaction, so a creation either fully precedes the migration —
+    /// legacy shape, then the backfill stamps the row FINAL — or fully
+    /// follows it, taking the derived-authority shape; the poisoned
+    /// interleaving cannot be scheduled). This test PROVES the mid-
+    /// transaction interleaving actually happened rather than hoping for
+    /// it: a test-only hook holds the migration transaction verifiably open
+    /// while the creation fires, the creation must complete only AFTER the
+    /// hook releases (blocked for the full hold, i.e. it observed the busy
+    /// wait), and the created terminal row must carry its real rank.
     #[test]
     fn should_never_leave_terminal_rows_unranked_when_creation_races_migration() {
-        for iteration in 0..20 {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("ledger.db");
-            {
-                let conn = rusqlite::Connection::open(&path).unwrap();
-                conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-                create_legacy_schema(&conn, "");
-            }
-
-            let (warmed_tx, warmed_rx) = std::sync::mpsc::channel::<()>();
-            let hammer_path = path.clone();
-            let hammer = std::thread::spawn(move || {
-                let ledger = GoalLedger::open(&hammer_path).unwrap();
-                for i in 0..300 {
-                    if i == 50 {
-                        let _ = warmed_tx.send(());
-                    }
-                    let task = Task {
-                        task_id: format!("race-{i}"),
-                        goal_id: "g1".to_string(),
-                        title: String::new(),
-                        detail: String::new(),
-                        status: "failed".to_string(),
-                        assigned_peer: None,
-                        created_at_ms: 1_000,
-                        updated_at_ms: 1_000,
-                    };
-                    // Busy collisions with the migration transaction are
-                    // expected; retry until this create lands.
-                    let mut attempts = 0;
-                    while ledger.create_task(&task).is_err() {
-                        attempts += 1;
-                        assert!(attempts < 200, "create retry budget exceeded");
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                }
-            });
-            // Start the migration only once the hammer is verifiably
-            // mid-flight, so the two genuinely overlap every iteration.
-            warmed_rx.recv().expect("hammer warmup");
-            let migrated =
-                GoalLedger::open_with_busy_retry(&path).expect("migration open succeeds");
-            hammer.join().expect("hammer thread");
-
-            let unranked: i64 = migrated
-                .conn
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT COUNT(*) FROM tasks
-                     WHERE status IN ('complete', 'failed') AND authority = -1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                unranked, 0,
-                "iteration {iteration}: no terminal row may ever end at authority -1"
-            );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            create_legacy_schema(&conn, "");
         }
+        // The creator's connection is opened BEFORE the migration starts so
+        // the only step that can block below is its creation transaction.
+        let creator_ledger = GoalLedger::open(&path).unwrap();
+
+        // Install the in-transaction hook: signals the test, then blocks
+        // this migration open until released.
+        let (in_transaction_tx, in_transaction_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        *GoalLedger::migration_mid_transaction_hook().lock().unwrap() = Some((
+            path.clone(),
+            Arc::new(move || {
+                let _ = in_transaction_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30));
+            }),
+        ));
+
+        let migration_path = path.clone();
+        let migration =
+            std::thread::spawn(move || GoalLedger::open_with_busy_retry(migration_path));
+        in_transaction_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the migration transaction is provably open");
+
+        // Fire the creation WHILE the migration transaction is open.
+        let creator = std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            creator_ledger
+                .create_task(&Task {
+                    task_id: "race-task".to_string(),
+                    goal_id: "g1".to_string(),
+                    title: String::new(),
+                    detail: String::new(),
+                    status: "failed".to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .expect("creation succeeds after the migration commits");
+            (begun, std::time::Instant::now())
+        });
+        // Hold the open transaction across the creation attempt, then
+        // release and let everything settle.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let released_at = std::time::Instant::now();
+        release_tx.send(()).expect("release the migration hook");
+        let migrated = migration
+            .join()
+            .expect("migration thread")
+            .expect("migration open succeeds");
+        let (create_begun, create_done) = creator.join().expect("creator thread");
+        *GoalLedger::migration_mid_transaction_hook().lock().unwrap() = None;
+
+        // The interleaving is PROVEN, not hoped: the creation observed the
+        // busy wait (blocked for essentially the whole hold) and completed
+        // only after the release.
+        assert!(
+            create_done >= released_at,
+            "the creation must complete only after the migration transaction released"
+        );
+        assert!(
+            create_done.duration_since(create_begun) >= std::time::Duration::from_millis(250),
+            "the creation must have been blocked by the open migration transaction \
+             (took {:?})",
+            create_done.duration_since(create_begun)
+        );
+        // And the outcome invariant: no terminal row at authority -1 — the
+        // legacy row was backfilled FINAL and the racing creation took the
+        // derived-authority shape.
+        let conn = migrated.conn.lock().unwrap();
+        let unranked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE status IN ('complete', 'failed') AND authority = -1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unranked, 0, "no terminal row may ever end at authority -1");
+        let raced_authority: i64 = conn
+            .query_row(
+                "SELECT authority FROM tasks WHERE task_id = 'race-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            raced_authority, 2,
+            "the racing terminal creation lands post-migration with its real rank"
+        );
     }
 
     /// #2055 review round 5 (terminal-creation authority) — a row CREATED
