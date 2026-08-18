@@ -2921,6 +2921,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::Warning(event) => &event.session_id,
         UiNotification::TurnCompleted(event) => &event.session_id,
         UiNotification::TurnError(event) => &event.session_id,
+        UiNotification::TurnSteerDropped(event) => &event.session_id,
         UiNotification::ReplayLossy(event) => &event.session_id,
         UiNotification::TurnSpawnComplete(event) => &event.session_id,
         UiNotification::FileAttached(event) => &event.session_id,

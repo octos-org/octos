@@ -8639,6 +8639,7 @@ async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() 
         &turn_id,
         None,
         Some(details.clone()),
+        None,
     )
     .await;
 
@@ -8699,6 +8700,7 @@ async fn try_emit_terminal_with_no_details_omits_token_fields() {
         &ledger,
         &session_id,
         &turn_id,
+        None,
         None,
         None,
     )
@@ -11014,6 +11016,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11083,6 +11086,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11197,6 +11201,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11266,6 +11271,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11328,6 +11334,7 @@ fn shell_approval_still_emits_risk_field() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -11433,6 +11440,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14084,6 +14092,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
+            turn_steer_dropped_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -33387,4 +33396,386 @@ async fn interactive_sentinel_skips_verifier_without_completion_claim() {
         .goal_counters_for_test(&wire)
         .expect("goal exists");
     assert_eq!(tokens_used, 0, "nothing charged without a claim");
+}
+
+// ---- task-return-unconsumed-steer-inputs: accepted-but-undrained steers are
+// returned to the client as `turn/steer_dropped` at turn end ----
+
+fn steer_dropped_frame(writer_rx: &std::sync::mpsc::Receiver<WsMessage>) -> Value {
+    let message = writer_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("a frame reaches the stdio writer");
+    let WsMessage::Text(text) = message else {
+        panic!("expected a text frame");
+    };
+    serde_json::from_str::<Value>(text.as_ref()).expect("valid JSON frame")
+}
+
+fn ledgered_steer_dropped(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+) -> Vec<octos_core::ui_protocol::TurnSteerDroppedEvent> {
+    let baseline = UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    };
+    ledger
+        .replay_after(session_id, Some(&baseline))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| match &e.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSteerDropped(event)) => {
+                Some(event.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dropped".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("first steer".into());
+    buffer.push("second steer".into());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
+
+    assert_eq!(returned, 2);
+    assert!(buffer.is_empty(), "the buffer is drained");
+    let frame = steer_dropped_frame(&writer_rx);
+    assert_eq!(frame["method"], json!("turn/steer_dropped"));
+    assert_eq!(frame["params"]["session_id"], json!("local:steer-dropped"));
+    assert_eq!(frame["params"]["turn_id"], json!(turn_id));
+    assert_eq!(
+        frame["params"]["inputs"],
+        json!(["first steer", "second steer"]),
+        "buffer order is preserved"
+    );
+    assert_eq!(frame["params"]["reason"], json!("interrupted"));
+
+    let ledgered = ledgered_steer_dropped(&ledger, &session_id);
+    assert_eq!(
+        ledgered.len(),
+        1,
+        "the return is durable for reconnect replay"
+    );
+    assert_eq!(ledgered[0].inputs, vec!["first steer", "second steer"]);
+    assert_eq!(ledgered[0].reason, "interrupted");
+}
+
+#[test]
+fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dropped-ended".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("late steer".into());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        false,
+    );
+
+    assert_eq!(returned, 1);
+    let frame = steer_dropped_frame(&writer_rx);
+    assert_eq!(frame["params"]["reason"], json!("turn_ended"));
+    assert_eq!(frame["params"]["inputs"], json!(["late steer"]));
+}
+
+#[test]
+fn no_leftover_steers_emits_nothing() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-none".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
+
+    assert_eq!(returned, 0);
+    assert!(
+        writer_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "an empty buffer must not produce an empty return frame"
+    );
+    assert!(ledgered_steer_dropped(&ledger, &session_id).is_empty());
+    // Terminal payload shapes are untouched by this task: the legacy
+    // `turn/error` frame still carries exactly its four fields.
+    let error = UiNotification::TurnError(TurnErrorEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_id.clone(),
+        code: "interrupted".into(),
+        message: "turn interrupted by client".into(),
+    })
+    .into_rpc_notification()
+    .expect("serialize turn/error");
+    let keys: Vec<&str> = error
+        .params
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["session_id", "turn_id", "code", "message"]);
+}
+
+#[test]
+fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    let ws = WsConnection::new_stdio(writer_tx);
+    // Simulate a dead stdio peer: the receiver is gone, so every send fails.
+    drop(writer_rx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:steer-dead-peer".into());
+    let turn_id = TurnId::new();
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("orphaned steer".into());
+
+    let returned = settle_leftover_steers(
+        &buffer,
+        SteerReturnSink::Live {
+            ws: &ws,
+            ledger: &ledger,
+        },
+        &session_id,
+        &turn_id,
+        true,
+    );
+
+    assert_eq!(returned, 1);
+    let ledgered = ledgered_steer_dropped(&ledger, &session_id);
+    assert_eq!(ledgered.len(), 1, "text survives in the ledger for replay");
+    assert_eq!(ledgered[0].inputs, vec!["orphaned steer"]);
+}
+
+/// task-return-unconsumed-steer-inputs (v2 ordering): once the turn flips to
+/// Terminal, its accepted-but-undrained steers are returned as ONE
+/// `turn/steer_dropped` BEFORE the terminal frame, on the same connection —
+/// so a client may treat "terminal without a preceding steer_dropped naming
+/// my steer" as "consumed". Drives `try_emit_terminal` directly (the wire-side
+/// closure), like the #1332 test above.
+#[tokio::test]
+async fn steer_dropped_is_emitted_before_the_terminal_frame() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+    let ws = WsConnection::new(tx);
+    let ledger = UiProtocolLedger::new(32);
+    let session_id = SessionKey("local:steer-order".into());
+    let turn_id = TurnId::new();
+    let turn_state = TokioMutex::new(TurnState::Active);
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("accepted but never drained".into());
+
+    try_emit_terminal(
+        &turn_state,
+        TerminalReason::Interrupted,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        Some(("interrupted", "turn interrupted by client")),
+        None,
+        Some(&buffer),
+    )
+    .await;
+
+    let mut methods = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let axum::extract::ws::Message::Text(text) = msg {
+            let frame: Value = serde_json::from_str(text.as_ref()).expect("json frame");
+            if let Some(method) = frame.get("method").and_then(Value::as_str) {
+                methods.push(method.to_string());
+                if method == "turn/steer_dropped" {
+                    assert_eq!(
+                        frame["params"]["inputs"],
+                        json!(["accepted but never drained"])
+                    );
+                    assert_eq!(frame["params"]["reason"], json!("interrupted"));
+                }
+            }
+        }
+    }
+    let dropped_at = methods.iter().position(|m| m == "turn/steer_dropped");
+    let terminal_at = methods.iter().position(|m| m == "turn/error");
+    assert!(dropped_at.is_some(), "steer_dropped emitted: {methods:?}");
+    assert!(terminal_at.is_some(), "terminal emitted: {methods:?}");
+    assert!(
+        dropped_at < terminal_at,
+        "steer_dropped must precede the terminal: {methods:?}"
+    );
+    assert!(buffer.is_empty());
+    assert!(matches!(
+        *turn_state.lock().await,
+        TurnState::Terminal(TerminalReason::Interrupted)
+    ));
+
+    // A second terminal attempt is a no-op (idempotent) and returns nothing more.
+    try_emit_terminal(
+        &turn_state,
+        TerminalReason::Interrupted,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        Some(("interrupted", "turn interrupted by client")),
+        None,
+        Some(&buffer),
+    )
+    .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "no duplicate frames after the terminal"
+    );
+}
+
+/// Once the state is Terminal, `turn/steer` can no longer be accepted for the
+/// turn — the settlement above therefore saw the complete set of inputs.
+#[tokio::test]
+async fn steer_is_not_accepted_after_terminal_transition() {
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let transition = transition_to_terminal(&turn_state, TerminalReason::Completed).await;
+    assert!(transition.is_some());
+    // The steer admission check reads the same state: Terminal → NoActiveTurn.
+    let terminal = matches!(*turn_state.lock().await, TurnState::Terminal(_));
+    assert!(terminal, "post-terminal steers fall back to a fresh turn");
+}
+
+/// The dropped-before-terminal guarantee is advertised as
+/// `event.turn_steer_dropped.v1` — on by default for stdio, and honoured when
+/// a ws client requests it — so a client can decide whether "terminal without
+/// steer_dropped" means "consumed" (new server) or "unknown" (old server).
+#[test]
+fn turn_steer_dropped_feature_is_advertised_when_requested_and_by_stdio_default() {
+    let stdio = ConnectionUiFeatures::stdio_defaults().negotiated_capabilities();
+    assert!(
+        stdio
+            .supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+        "{:?}",
+        stdio.supported_features
+    );
+    let ws = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1],
+        false,
+    )
+    .negotiated_capabilities();
+    assert!(
+        ws.supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1)
+    );
+    let legacy = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1],
+        false,
+    )
+    .negotiated_capabilities();
+    assert!(
+        !legacy
+            .supported_features
+            .iter()
+            .any(|f| f == UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+        "not advertised unless requested"
+    );
+}
+
+/// task-return-unconsumed-steer-inputs (review round 3, P0): the connection-
+/// close abort path is a terminal outlet too. It must go through the same
+/// gate, so the ledger a reconnecting client replays reads
+/// `turn/steer_dropped` strictly BEFORE `turn/error(connection_closed)`.
+#[tokio::test]
+async fn connection_close_settles_steers_before_connection_closed_terminal() {
+    let session_id = SessionKey("api:profile/local:closing".into());
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let buffer: octos_agent::SharedSteerBuffer = Arc::new(octos_agent::SteerBuffer::default());
+    buffer.push("typed just before the socket died".into());
+    let mut entry = test_active_turn(turn_id.clone(), handle.abort_handle());
+    entry.steer = Some(buffer.clone());
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    connection_turns
+        .lock()
+        .await
+        .insert(session_id.clone(), turn_id.clone());
+
+    let scopes = ScopePolicy::default();
+    let ledger = UiProtocolLedger::new(16);
+    let approvals = PendingApprovalStore::default();
+    let user_questions = PendingQuestionStore::default();
+    abort_connection_turns(
+        &active_turns,
+        &connection_turns,
+        &scopes,
+        &ledger,
+        &approvals,
+        &user_questions,
+    )
+    .await;
+
+    let baseline = UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    };
+    let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
+    let kinds: Vec<String> = replay
+        .iter()
+        .filter_map(|e| match &e.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSteerDropped(d)) => {
+                assert_eq!(d.inputs, vec!["typed just before the socket died"]);
+                assert_eq!(d.reason, "interrupted");
+                Some("turn/steer_dropped".to_string())
+            }
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnError(err)) => {
+                Some(format!("turn/error:{}", err.code))
+            }
+            _ => None,
+        })
+        .collect();
+    let dropped_at = kinds.iter().position(|k| k == "turn/steer_dropped");
+    let terminal_at = kinds
+        .iter()
+        .position(|k| k == "turn/error:connection_closed");
+    assert!(dropped_at.is_some() && terminal_at.is_some(), "{kinds:?}");
+    assert!(
+        dropped_at < terminal_at,
+        "replay order must be steer_dropped → terminal: {kinds:?}"
+    );
+    assert!(
+        buffer.is_empty(),
+        "the aborted turn's later safety-net drain finds nothing"
+    );
+    handle.abort();
 }

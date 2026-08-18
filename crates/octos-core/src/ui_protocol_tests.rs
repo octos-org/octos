@@ -1113,6 +1113,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "event.voice_audio.v1",
                 "plan.todos.v1",
                 "event.background_activity.v1",
+                "event.turn_steer_dropped.v1",
                 "smart_home.v1"
             ]
         })
@@ -7241,4 +7242,64 @@ fn monitor_notifications_roundtrip_as_ui_notifications() {
     let rpc = expired.clone().into_rpc_notification().expect("encode");
     let decoded = UiNotification::from_rpc_notification(rpc).expect("decode monitor/expired");
     assert_eq!(decoded, expired);
+}
+
+// ---- task-return-unconsumed-steer-inputs: `turn/steer_dropped` shape ----
+
+#[test]
+fn turn_steer_dropped_round_trips_through_method_and_params() {
+    let event = TurnSteerDroppedEvent {
+        session_id: SessionKey("local:demo".into()),
+        topic: None,
+        turn_id: TurnId(Uuid::from_u128(7)),
+        inputs: vec!["first steer".into(), "second steer".into()],
+        reason: "interrupted".into(),
+    };
+    let notification = UiNotification::TurnSteerDropped(event.clone());
+    assert_eq!(notification.method(), methods::TURN_STEER_DROPPED);
+    assert_eq!(methods::TURN_STEER_DROPPED, "turn/steer_dropped");
+
+    let rpc = notification
+        .into_rpc_notification()
+        .expect("serialize turn/steer_dropped");
+    assert_eq!(rpc.method, "turn/steer_dropped");
+    assert_eq!(
+        rpc.params,
+        json!({
+            "session_id": "local:demo",
+            "turn_id": TurnId(Uuid::from_u128(7)),
+            "inputs": ["first steer", "second steer"],
+            "reason": "interrupted"
+        })
+    );
+
+    let decoded = UiNotification::from_method_and_params("turn/steer_dropped", rpc.params)
+        .expect("decode turn/steer_dropped");
+    assert_eq!(decoded, UiNotification::TurnSteerDropped(event));
+}
+
+#[test]
+fn turn_steer_dropped_topic_routing_matches_other_turn_events() {
+    let mut notification = UiNotification::TurnSteerDropped(TurnSteerDroppedEvent {
+        session_id: SessionKey("local:demo#coding".into()),
+        topic: None,
+        turn_id: TurnId(Uuid::from_u128(8)),
+        inputs: vec!["late steer".into()],
+        reason: "turn_ended".into(),
+    });
+    // Absent topic falls back to the session key's topic suffix, like TurnError.
+    assert_eq!(notification.topic(), Some("coding"));
+    assert_eq!(
+        notification.session_id(),
+        &SessionKey("local:demo#coding".into())
+    );
+
+    // An explicit topic is never overwritten by the routing stamp.
+    if let UiNotification::TurnSteerDropped(event) = &mut notification {
+        event.topic = Some("explicit".into());
+    }
+    let rpc = notification
+        .into_rpc_notification()
+        .expect("serialize with explicit topic");
+    assert_eq!(rpc.params["topic"], json!("explicit"));
 }

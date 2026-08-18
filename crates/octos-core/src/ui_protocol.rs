@@ -267,6 +267,16 @@ pub const UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1: &str = "event.voice_audio.v1";
 /// as before, and this stream is NEVER fed back into model context.
 pub const UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1: &str = "event.background_activity.v1";
 
+/// task-return-unconsumed-steer-inputs: the server settles `turn/steer` input
+/// at turn end — after the turn can no longer accept steers and BEFORE the
+/// terminal frame it emits one `turn/steer_dropped` carrying every accepted
+/// input that was never drained into the conversation. A client that sees
+/// this feature may treat "terminal without a preceding `turn/steer_dropped`
+/// naming my steer" as "the server consumed it" (no client-side re-stage
+/// needed); without it, the client must fall back to its own terminal
+/// re-stage heuristics.
+pub const UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1: &str = "event.turn_steer_dropped.v1";
+
 /// Feature flag for the model-authored plan/todo checklist. When negotiated,
 /// the server pushes `plan/updated` notifications carrying the agent's current
 /// ordered checklist (the `update_plan` tool's live state), and replays the
@@ -315,6 +325,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
 ];
 
@@ -1090,6 +1101,15 @@ pub mod methods {
     pub const TURN_STARTED: &str = "turn/started";
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_ERROR: &str = "turn/error";
+    /// task-return-unconsumed-steer-inputs: emitted at turn end — after the
+    /// turn can no longer accept steers and BEFORE its terminal frame
+    /// (`event.turn_steer_dropped.v1`) — when `turn/steer` inputs the server
+    /// had accepted (`steered:true`) were still sitting in the pending-input
+    /// buffer, i.e. never drained into the conversation. Carries the texts
+    /// back, in order, so the client can re-queue them deterministically; a
+    /// terminal without a preceding `turn/steer_dropped` naming a steer means
+    /// the server consumed it.
+    pub const TURN_STEER_DROPPED: &str = "turn/steer_dropped";
     pub const MESSAGE_DELTA: &str = "message/delta";
     pub const MESSAGE_REASONING_DELTA: &str = "message/reasoning_delta";
     pub const TOOL_STARTED: &str = "tool/started";
@@ -6312,6 +6332,21 @@ pub struct TurnErrorEvent {
     pub message: String,
 }
 
+/// task-return-unconsumed-steer-inputs: `turn/steer_dropped` payload. See
+/// [`methods::TURN_STEER_DROPPED`]. `inputs` preserves the buffer order;
+/// `reason` is `"interrupted"` when the turn was interrupted by the client and
+/// `"turn_ended"` otherwise. Sent BEFORE the turn's terminal event on the same
+/// stream (`event.turn_steer_dropped.v1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSteerDroppedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub turn_id: TurnId,
+    pub inputs: Vec<String>,
+    pub reason: String,
+}
+
 /// Wire signal that one or more durable notifications were dropped due to
 /// per-connection backpressure. Clients should diverge from their cursor and
 /// rehydrate via REST snapshot or `session/open` replay.
@@ -6604,6 +6639,9 @@ pub enum UiNotification {
     Warning(WarningEvent),
     TurnCompleted(TurnCompletedEvent),
     TurnError(TurnErrorEvent),
+    /// task-return-unconsumed-steer-inputs: accepted-but-undrained steer
+    /// inputs returned at turn end.
+    TurnSteerDropped(TurnSteerDroppedEvent),
     ReplayLossy(ReplayLossyEvent),
     /// Legacy completion event for durable records written before the v2-only
     /// background-child projection migration. New writes use `EnvelopeV2`.
@@ -6723,6 +6761,7 @@ impl UiNotification {
             Self::Warning(_) => methods::WARNING,
             Self::TurnCompleted(_) => methods::TURN_COMPLETED,
             Self::TurnError(_) => methods::TURN_ERROR,
+            Self::TurnSteerDropped(_) => methods::TURN_STEER_DROPPED,
             Self::ReplayLossy(_) => methods::REPLAY_LOSSY,
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
             Self::FileAttached(_) => methods::FILE_ATTACHED,
@@ -6780,6 +6819,7 @@ impl UiNotification {
             Self::Warning(event) => &event.session_id,
             Self::TurnCompleted(event) => &event.session_id,
             Self::TurnError(event) => &event.session_id,
+            Self::TurnSteerDropped(event) => &event.session_id,
             Self::ReplayLossy(event) => &event.session_id,
             Self::TurnSpawnComplete(event) => &event.session_id,
             Self::FileAttached(event) => &event.session_id,
@@ -6861,6 +6901,9 @@ impl UiNotification {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
             Self::TurnError(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::TurnSteerDropped(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
             Self::TurnSpawnComplete(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
@@ -6904,6 +6947,7 @@ impl UiNotification {
             Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TurnSteerDropped(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VoiceAudioChunk(event) => set_topic_if_absent(&mut event.topic, &topic),
@@ -6942,6 +6986,7 @@ impl UiNotification {
             Self::Warning(params) => serde_json::to_value(params),
             Self::TurnCompleted(params) => serde_json::to_value(params),
             Self::TurnError(params) => serde_json::to_value(params),
+            Self::TurnSteerDropped(params) => serde_json::to_value(params),
             Self::ReplayLossy(params) => serde_json::to_value(params),
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
             Self::FileAttached(params) => serde_json::to_value(params),
@@ -7082,6 +7127,9 @@ impl UiNotification {
             methods::WARNING => Ok(Self::Warning(decode_params(method, params)?)),
             methods::TURN_COMPLETED => Ok(Self::TurnCompleted(decode_params(method, params)?)),
             methods::TURN_ERROR => Ok(Self::TurnError(decode_params(method, params)?)),
+            methods::TURN_STEER_DROPPED => {
+                Ok(Self::TurnSteerDropped(decode_params(method, params)?))
+            }
             methods::REPLAY_LOSSY => Ok(Self::ReplayLossy(decode_params(method, params)?)),
             methods::TURN_SPAWN_COMPLETE => {
                 Ok(Self::TurnSpawnComplete(decode_params(method, params)?))

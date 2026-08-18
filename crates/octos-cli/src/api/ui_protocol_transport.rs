@@ -61,15 +61,15 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
     UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
-    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -1896,6 +1896,9 @@ struct ConnectionUiFeatures {
     skill_actions_v1: bool,
     /// Persisted background skill action jobs and their update events.
     skill_action_jobs_v1: bool,
+    /// task-return-unconsumed-steer-inputs: client asked for the
+    /// dropped-before-terminal steer settlement guarantee.
+    turn_steer_dropped_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -1995,6 +1998,11 @@ impl ConnectionUiFeatures {
                 query,
                 APPUI_FEATURE_SKILL_ACTION_JOBS_V1,
             ),
+            turn_steer_dropped_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2043,6 +2051,7 @@ impl ConnectionUiFeatures {
             user_question_v1: true,
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
+            turn_steer_dropped_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -2087,6 +2096,7 @@ impl ConnectionUiFeatures {
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
+            turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
             header_present: true,
             stdio_transport,
         }
@@ -2186,6 +2196,9 @@ impl ConnectionUiFeatures {
         }
         if self.skill_action_jobs_v1 {
             requested.push(APPUI_FEATURE_SKILL_ACTION_JOBS_V1);
+        }
+        if self.turn_steer_dropped_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -19632,7 +19645,15 @@ async fn handle_turn_steer(
                 // counts as live: the client asked to stop, and a raced
                 // steer behaves like the codex loop-exit race (buffered,
                 // possibly dropped at turn end — logged, never mis-routed).
-                let terminal = matches!(*existing.state.lock().await, TurnState::Terminal(_));
+                // task-return-unconsumed-steer-inputs: hold the turn-state
+                // guard across check AND push. `try_emit_terminal` settles
+                // the steer buffer right after it flips the state to
+                // `Terminal` (under this same lock) and BEFORE the terminal
+                // frame — so any input accepted here is either drained by
+                // the loop, or returned by that settlement; nothing can slip
+                // in between the settlement and the terminal frame.
+                let state = existing.state.lock().await;
+                let terminal = matches!(*state, TurnState::Terminal(_));
                 if terminal {
                     TurnSteerDecision::NoActiveTurn
                 } else if params
@@ -25859,7 +25880,18 @@ async fn run_m9_fixture_turn(
         topic: None,
     });
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
-        let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
+        let _ = transition_to_terminal_settling_steers(
+            &turn_state,
+            TerminalReason::Errored,
+            None,
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+        )
+        .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -26206,6 +26238,7 @@ async fn run_m9_fixture_turn(
                     None,
                     // M9 fixtures replay canned events; no live LLM token data.
                     None,
+                    None,
                 )
                 .await;
             }
@@ -26219,6 +26252,7 @@ async fn run_m9_fixture_turn(
                 &session_id,
                 &turn_id,
                 Some((code, message.as_str())),
+                None,
                 None,
             )
             .await;
@@ -26251,6 +26285,7 @@ async fn run_m9_fixture_turn(
                     "interrupted",
                     captured_interrupt_origin(&turn_state).await.message(),
                 )),
+                None,
                 None,
             )
             .await;
@@ -27028,7 +27063,18 @@ async fn run_native_code_review_turn(
         topic: None,
     });
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
-        let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
+        let _ = transition_to_terminal_settling_steers(
+            &turn_state,
+            TerminalReason::Errored,
+            None,
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+        )
+        .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -27054,6 +27100,7 @@ async fn run_native_code_review_turn(
                     &turn_id,
                     Some(("runtime_unavailable", message.as_str())),
                     None,
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -27069,6 +27116,7 @@ async fn run_native_code_review_turn(
                     &session_id,
                     &turn_id,
                     Some(("runtime_unavailable", message.as_str())),
+                    None,
                     None,
                 )
                 .await;
@@ -27091,6 +27139,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
+                None,
                 None,
             )
             .await;
@@ -27119,6 +27168,7 @@ async fn run_native_code_review_turn(
                 &session_id,
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
+                None,
                 None,
             )
             .await;
@@ -27352,6 +27402,7 @@ async fn run_native_code_review_turn(
                     &turn_id,
                     Some(("interrupted", "review/start interrupted by client")),
                     None,
+                    None,
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -27474,6 +27525,7 @@ async fn run_native_code_review_turn(
         // review/start scatter-join does not run a single LLM turn end
         // to end; the summary message is emitted ad-hoc. No aggregated
         // token data is in scope here.
+        None,
         None,
     )
     .await;
@@ -28905,7 +28957,18 @@ async fn run_standalone_turn(
     // transition the turn to a terminal state so the registry doesn't keep
     // an orphaned `Active` entry.
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
-        let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
+        let _ = transition_to_terminal_settling_steers(
+            &turn_state,
+            TerminalReason::Errored,
+            steer_buffer.as_ref(),
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+        )
+        .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
@@ -28971,6 +29034,7 @@ async fn run_standalone_turn(
             &turn_id,
             Some(("runtime_unavailable", error.as_str())),
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29020,6 +29084,7 @@ async fn run_standalone_turn(
                 &turn_id,
                 Some(("permission_denied", message.as_str())),
                 None,
+                steer_buffer.as_ref(),
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29048,6 +29113,7 @@ async fn run_standalone_turn(
                 &turn_id,
                 Some(("runtime_unavailable", &error.to_string())),
                 None,
+                steer_buffer.as_ref(),
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29337,7 +29403,7 @@ async fn run_standalone_turn(
     // forward `FailoverEvent`s as `router/failover` notifications for
     // the duration of this turn. The abort handle ends the forwarder
     // when the turn ends — see the `.abort()` call near
-    // `try_emit_terminal()` below.
+    // `try_emit_terminal(, steer_buffer.as_ref())` below.
     let failover_forwarder = spawn_router_failover_forwarder(
         ws.clone(),
         ledger.clone(),
@@ -29386,6 +29452,7 @@ async fn run_standalone_turn(
             // Slash-command shortcut bypasses the LLM entirely; the
             // reply is canned and no token meter ran.
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -30985,6 +31052,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     Some(("profile_config_unavailable", &error.to_string())),
                     None,
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -31039,6 +31107,7 @@ async fn run_standalone_turn(
             &turn_id,
             None,
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -32178,6 +32247,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     None,
                     Some(details),
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 break;
@@ -32278,6 +32348,7 @@ async fn run_standalone_turn(
                     &turn_id,
                     Some((code, wire_msg.as_str())),
                     None,
+                    steer_buffer.as_ref(),
                 )
                 .await;
                 break;
@@ -32644,6 +32715,7 @@ async fn run_standalone_turn(
                 captured_interrupt_origin(&turn_state).await.message(),
             )),
             None,
+            steer_buffer.as_ref(),
         )
         .await;
         // codex #2 residual — a client-interrupted peer takes THIS branch, not
@@ -32662,21 +32734,34 @@ async fn run_standalone_turn(
 
     let _ = agent_task.await;
 
-    // `turn/steer` turn-end race residual (codex §5 parity): the loop keeps
-    // the turn alive for steers that land BEFORE its final EndTurn check,
-    // but a steer accepted in the narrow window between that check and this
-    // point never drains. Make the drop observable rather than silent — the
-    // registry entry is still keyed to this turn, so no later turn can
-    // consume the leftovers.
+    // `turn/steer` turn-end residual: the loop keeps the turn alive for
+    // steers that land BEFORE its final EndTurn check, but a steer accepted
+    // after that check — or, far more commonly, one accepted while a tool
+    // was running when the client then INTERRUPTED the turn (incident
+    // 2026-08-17: 32 s between accept and abort) — never drains.
+    // task-return-unconsumed-steer-inputs: the terminal gate
+    // (`transition_to_terminal_settling_steers`) already returned every
+    // leftover BEFORE the terminal frame, and the state lock in
+    // `handle_turn_steer` guarantees nothing was accepted after the flip —
+    // so this is a safety net that should find an empty buffer. If it ever
+    // does not, returning late is still better than dropping the text.
     if let Some(buffer) = steer_buffer.as_ref() {
-        let leftovers = buffer.drain();
-        if !leftovers.is_empty() {
+        let late = settle_leftover_steers(
+            buffer,
+            SteerReturnSink::Live {
+                ws: &ws,
+                ledger: &ledger,
+            },
+            &session_id,
+            &turn_id,
+            interrupt_observed,
+        );
+        if late > 0 {
             warn!(
                 session = %session_id.0,
                 turn = %turn_id.0,
-                dropped = leftovers.len(),
-                "turn/steer input(s) arrived as the turn ended and were dropped; \
-                 the client should re-send (a fresh call now falls back to a new turn)"
+                late,
+                "turn/steer leftovers found AFTER the terminal gate — ordering invariant violated"
             );
         }
     }
@@ -33599,9 +33684,23 @@ async fn try_emit_terminal(
     turn_id: &TurnId,
     error_payload: Option<(&str, &str)>,
     completion_details: Option<TurnCompletionDetails>,
+    // task-return-unconsumed-steer-inputs: the turn's `turn/steer` buffer, if
+    // it has one. Settled (returned as `turn/steer_dropped`) after the state
+    // flips to Terminal and BEFORE the terminal frame below — see
+    // `settle_leftover_steers`.
+    steer_buffer: Option<&octos_agent::SharedSteerBuffer>,
 ) {
-    let Some(TerminalTransition { reason, ack }) =
-        transition_to_terminal(turn_state, expected_reason).await
+    // Single terminal gate: state → Terminal, then the steer settlement
+    // (`turn/steer_dropped`), then — below — the terminal frame.
+    let Some(TerminalTransition { reason, ack }) = transition_to_terminal_settling_steers(
+        turn_state,
+        expected_reason,
+        steer_buffer,
+        SteerReturnSink::Live { ws, ledger },
+        session_id,
+        turn_id,
+    )
+    .await
     else {
         return;
     };
@@ -33825,8 +33924,15 @@ async fn try_emit_completed_terminal_with_forced_backpressure(
     session_id: &SessionKey,
     turn_id: &TurnId,
 ) {
-    let Some(TerminalTransition { ack, .. }) =
-        transition_to_terminal(turn_state, TerminalReason::Completed).await
+    let Some(TerminalTransition { ack, .. }) = transition_to_terminal_settling_steers(
+        turn_state,
+        TerminalReason::Completed,
+        None,
+        SteerReturnSink::Live { ws, ledger },
+        session_id,
+        turn_id,
+    )
+    .await
     else {
         return;
     };
@@ -34489,12 +34595,14 @@ async fn abort_connection_turns(
     let mut active = active_turns.lock().await;
     for (session_id, turn_id) in turns {
         let mut aborted_state: Option<Arc<TokioMutex<TurnState>>> = None;
+        let mut aborted_steer: Option<octos_agent::SharedSteerBuffer> = None;
         let should_abort = active
             .get(&session_id)
             .is_some_and(|active| active.turn_id == turn_id);
         if should_abort {
             if let Some(active) = active.remove(&session_id) {
                 aborted_state = Some(active.state.clone());
+                aborted_steer = active.steer.clone();
                 active.abort.abort();
             }
         }
@@ -34506,8 +34614,21 @@ async fn abort_connection_turns(
         // with a natural completion / interrupt that may already have
         // flipped state to Terminal.
         if let Some(state) = aborted_state {
-            if let Some(transition) =
-                transition_to_terminal(state.as_ref(), TerminalReason::Interrupted).await
+            // task-return-unconsumed-steer-inputs: same terminal gate as the
+            // live path — state Terminal → `turn/steer_dropped` (ledger-only:
+            // the connection is gone, the reconnecting client replays it) →
+            // terminal. Without this the aborted turn task's safety-net drain
+            // would land AFTER this terminal and a same-process reconnect
+            // would lose the steer.
+            if let Some(transition) = transition_to_terminal_settling_steers(
+                state.as_ref(),
+                TerminalReason::Interrupted,
+                aborted_steer.as_ref(),
+                SteerReturnSink::LedgerOnly { ledger },
+                &session_id,
+                &turn_id,
+            )
+            .await
             {
                 let _ = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
                     session_id: session_id.clone(),
@@ -35912,6 +36033,97 @@ fn send_raw_notification_ephemeral(
     ws.send_ephemeral(frame, method)
 }
 
+/// task-return-unconsumed-steer-inputs: where a `turn/steer_dropped` return
+/// goes. The live connection sends durably AND ledgers; a closed connection
+/// (see `abort_connection_turns`) can only ledger — the reconnecting client
+/// replays it, still ahead of the terminal.
+pub(crate) enum SteerReturnSink<'a> {
+    Live {
+        ws: &'a WsConnection,
+        ledger: &'a UiProtocolLedger,
+    },
+    LedgerOnly {
+        ledger: &'a UiProtocolLedger,
+    },
+}
+
+/// task-return-unconsumed-steer-inputs: drain whatever `turn/steer` inputs the
+/// server accepted (`steered:true`) but never fed to the loop, and return
+/// them to the client as ONE `turn/steer_dropped` notification (buffer
+/// order preserved). Sent durable — the payload is user text, so it must not
+/// be lost to backpressure — and appended to the ledger so a reconnecting
+/// client replays it. Emits nothing for an empty buffer. Returns the number
+/// of inputs returned.
+///
+/// ORDER CONTRACT (`event.turn_steer_dropped.v1`): this runs after the turn
+/// state flipped to Terminal (no more steers can be accepted) and BEFORE the
+/// terminal frame — see `transition_to_terminal_settling_steers`, the single
+/// gate every terminal outlet goes through. A client that sees the terminal
+/// without a preceding `turn/steer_dropped` naming its steer may conclude the
+/// steer was consumed.
+pub(crate) fn settle_leftover_steers(
+    buffer: &octos_agent::SharedSteerBuffer,
+    sink: SteerReturnSink<'_>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    interrupt_observed: bool,
+) -> usize {
+    let leftovers = buffer.drain();
+    let count = leftovers.len();
+    let Some(notification) = crate::steer_return::leftover_steer_notification(
+        session_id,
+        turn_id,
+        leftovers,
+        interrupt_observed,
+    ) else {
+        return 0;
+    };
+    warn!(
+        session = %session_id.0,
+        turn = %turn_id.0,
+        dropped = count,
+        interrupted = interrupt_observed,
+        "turn/steer input(s) were still pending when the turn ended; returning them \
+         to the client as turn/steer_dropped ahead of the terminal"
+    );
+    match sink {
+        SteerReturnSink::Live { ws, ledger } => {
+            let _ = send_notification_durable(ws, ledger, notification);
+        }
+        SteerReturnSink::LedgerOnly { ledger } => {
+            let _ = ledger.append_notification(notification);
+        }
+    }
+    count
+}
+
+/// task-return-unconsumed-steer-inputs: THE terminal gate. Every terminal
+/// outlet (live `try_emit_terminal`, the connection-close abort path, the
+/// early `turn/started`-failed bail-outs) flips the state through here so the
+/// `event.turn_steer_dropped.v1` order — state Terminal → steers settled →
+/// terminal frame — cannot be bypassed. Returns the transition for the caller
+/// to emit its terminal frame, or `None` if the turn was already terminal.
+async fn transition_to_terminal_settling_steers(
+    turn_state: &TokioMutex<TurnState>,
+    expected_reason: TerminalReason,
+    steer_buffer: Option<&octos_agent::SharedSteerBuffer>,
+    sink: SteerReturnSink<'_>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) -> Option<TerminalTransition> {
+    let transition = transition_to_terminal(turn_state, expected_reason).await?;
+    if let Some(buffer) = steer_buffer {
+        settle_leftover_steers(
+            buffer,
+            sink,
+            session_id,
+            turn_id,
+            matches!(transition.reason, TerminalReason::Interrupted),
+        );
+    }
+    Some(transition)
+}
+
 fn send_turn_error(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -36629,6 +36841,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::ProgressUpdated(_)
             | UiNotification::Warning(_)
             | UiNotification::TurnError(_)
+            | UiNotification::TurnSteerDropped(_)
             // ReplayLossy references a `last_durable_cursor` belonging to
             // the events it summarises, not its own — surfacing it here
             // would re-loop the replay flag onto itself.

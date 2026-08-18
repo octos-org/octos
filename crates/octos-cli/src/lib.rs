@@ -25,6 +25,10 @@ pub mod auth;
 // full `dead_code` enforcement.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod autonomy;
+/// task-return-unconsumed-steer-inputs: feature-independent shape of the
+/// `turn/steer_dropped` return (the `api` module does the sending).
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod steer_return;
 /// task-sysinfo-proc-stat-fd-budget: the one place the metrics `sysinfo::System`
 /// is constructed (handle cache off, no startup process snapshot).
 pub(crate) mod sysinfo_budget;
