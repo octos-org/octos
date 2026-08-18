@@ -3071,6 +3071,13 @@ impl InProcessAgentOrchestrator {
     /// in-flight sessions so a long-running goal turn (> 30s) can't
     /// be re-dispatched in the await gap between turn-terminal
     /// emission and `record_goal_turn`. Idempotent.
+    ///
+    /// #2066 round 2 (codex R2) — TEST ONLY: the unconditional mark
+    /// OVERWRITES whatever marker exists, which is exactly the overwrite
+    /// hazard R2 removed from production (every production claim is atomic
+    /// now — try-claim / drain-and-claim / clear-claim). Tests use it to
+    /// simulate a foreign dispatcher's turn being in flight.
+    #[cfg(test)]
     pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) -> u64 {
         // #2003 — (re)stamp the marker. A live long-running turn that re-marks
         // keeps a FRESH timestamp, so the staleness sweep never evicts it.
@@ -3169,32 +3176,23 @@ impl InProcessAgentOrchestrator {
         in_flight_marker_is_held(&self.state(), session_id)
     }
 
-    /// #1140 codex P1 re-review #4 — RAII drop-guard for the
-    /// in-flight marker. Use this from the AppUI tick path so the
-    /// marker is cleared on ANY exit path (cancellation,
-    /// early-terminal-error, panic), not just the happy
-    /// post-accounting path. The guard captures a 'static reference
-    /// to the orchestrator singleton, so it's safe to move across
-    /// await points / into spawned tasks.
-    pub(crate) fn goal_dispatch_in_flight_guard(
-        &'static self,
-        session_id: SessionKey,
-    ) -> GoalDispatchInFlightGuard {
-        let generation = self.mark_goal_dispatch_in_flight(&session_id);
-        GoalDispatchInFlightGuard {
-            orchestrator: self,
-            session_id,
-            generation,
-            disarmed: false,
-        }
-    }
+    // #2066 round 2 (codex R2) — `goal_dispatch_in_flight_guard` (the
+    // UNCONDITIONAL mark-and-guard, #1140) is deleted: its one production
+    // caller — the AppUI continuation spawn — silently OVERWROTE whatever
+    // marker existed (a clear's claim, another dispatcher's live turn) and
+    // was the root of the launch-from-destroyed-state race. Every production
+    // claim is now atomic: [`Self::try_claim_goal_in_flight`] (dispatch +
+    // interactive), [`Self::drain_and_claim_ready_continuation_for_session`]
+    // (session actor), and `claim_clear_dispatch_slot` (the clear path). The
+    // source guard `appui_continuation_spawn_should_use_atomic_try_claim_
+    // source_guard` pins the spawn site against reintroduction.
 
     /// #1650 — atomic, OWNER-AWARE claim of the in-flight marker for an
     /// interactive turn, returning a drop-guard ONLY if the marker was
     /// free.
     ///
-    /// Unlike [`Self::goal_dispatch_in_flight_guard`] (which marks
-    /// unconditionally), this checks-and-inserts under a single lock and
+    /// Unlike the deleted unconditional `goal_dispatch_in_flight_guard`,
+    /// this checks-and-inserts under a single lock and
     /// returns `None` if another dispatcher already owns the marker —
     /// e.g. a `SessionActor` `GoalContinue` running for the same session
     /// on the CLI/gateway path (which AppUI's `active_turns` can't see).
@@ -9648,7 +9646,9 @@ fn in_flight_marker_is_held(state: &AutonomyRuntimeState, session_id: &SessionKe
 }
 
 /// #1140 codex P1 re-review #4 — RAII drop-guard returned by
-/// `InProcessAgentOrchestrator::goal_dispatch_in_flight_guard`. On
+/// `InProcessAgentOrchestrator::try_claim_goal_in_flight` (#2066 round 2:
+/// the unconditional `goal_dispatch_in_flight_guard` constructor is deleted
+/// — every production claim is atomic now). On
 /// `Drop` it clears the in-flight marker for the captured session
 /// id, so the marker is removed even when the AppUI turn is
 /// aborted, panics, or returns through an early-terminal path
