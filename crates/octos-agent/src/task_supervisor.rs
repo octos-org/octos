@@ -372,6 +372,15 @@ impl BackgroundTask {
 /// Callback invoked when a task's status changes.
 type OnChangeCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
 
+/// #2055 — callback invoked once per SUCCESSFUL registration, with the
+/// freshly inserted task snapshot. The registration-side twin of
+/// [`OnTerminalCallback`]: octos-agent cannot see octos-fleet, so the
+/// goal-ledger task-row creation lives in octos-cli and is wired through
+/// this observer next to `set_on_terminal`. `Arc` (not `Box`) so
+/// `notify_register` can clone it out of its mutex and invoke it with no
+/// supervisor locks held, exactly like `notify_change`.
+type OnRegisterCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
+
 /// Payload emitted when a `spawn_only` background task transitions to
 /// `Failed`. Consumers (e.g. the session actor) use this to schedule a
 /// synthetic recovery turn so the LLM can re-engage with an actionable
@@ -851,6 +860,7 @@ impl std::fmt::Debug for TaskSupervisor {
             .field("on_change", &"<callback>")
             .field("on_failure", &"<callback>")
             .field("on_terminal", &"<callback>")
+            .field("on_register", &"<callback>")
             .field("on_relaunch", &"<callback>")
             .field("progress_reporter", &progress_reporter_attached)
             .field(
@@ -904,6 +914,10 @@ pub struct TaskSupervisor {
     /// callbacks (strangler — both live during migration; shared dedupe
     /// keys collapse double-delivery to one continuation).
     on_terminal: Arc<Mutex<Option<OnTerminalCallback>>>,
+    /// #2055 — registration observer, fired once from `register_full`'s
+    /// single success path (covers every `register*` entry point). The
+    /// octos-cli runtime wires the goal-ledger task-row creation here.
+    on_register: Arc<Mutex<Option<OnRegisterCallback>>>,
     on_relaunch: Arc<Mutex<Option<OnRelaunchCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
     /// Optional reporter that receives a [`ProgressEvent::ToolProgress`]
@@ -1243,6 +1257,7 @@ impl TaskSupervisor {
             on_change_listeners: Arc::new(Mutex::new(HashMap::new())),
             on_failure: Arc::new(Mutex::new(None)),
             on_terminal: Arc::new(Mutex::new(None)),
+            on_register: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
             progress_reporter: Arc::new(Mutex::new(None)),
@@ -1584,6 +1599,19 @@ impl TaskSupervisor {
     pub fn set_on_terminal(&self, cb: impl Fn(&TerminalEvent) + Send + Sync + 'static) {
         let mut guard = self.on_terminal.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Box::new(cb));
+    }
+
+    /// #2055 — set the registration observer, fired once per SUCCESSFUL
+    /// registration with the freshly inserted task snapshot. Fired from
+    /// `register_full`'s single success return, AFTER the task is inserted
+    /// and its snapshot persisted, so ONE call site covers every
+    /// registration kind (background/spawn_only, sub-agents, MCP sessions,
+    /// peers). Refused registrations (terminal parent, fan-out cap) never
+    /// fire it. The latest observer wins — runtimes re-wire it per turn /
+    /// per actor next to [`Self::set_on_terminal`].
+    pub fn set_on_register(&self, cb: impl Fn(&BackgroundTask) + Send + Sync + 'static) {
+        let mut guard = self.on_register.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Arc::new(cb));
     }
 
     /// Attach a [`ProgressReporter`] that receives a
@@ -2296,6 +2324,10 @@ impl TaskSupervisor {
                 "detached"
             },
         );
+        // #2055 — the single success path every `register*` entry point
+        // funnels through: fire the registration observer AFTER the insert
+        // and snapshot persist, with no locks held (see `notify_register`).
+        self.notify_register(&id);
         Ok(id)
     }
 
@@ -3364,6 +3396,38 @@ impl TaskSupervisor {
         for cb in listeners {
             cb(task);
         }
+    }
+
+    /// #2055 — fire the registration observer (if set) with a snapshot of
+    /// the just-registered task. Mirrors `notify_change`'s locking
+    /// discipline exactly: the callback is cloned out of its own mutex and
+    /// invoked with NO supervisor locks held — it is user code that may
+    /// take other locks (the octos-cli closure opens the goal ledger and
+    /// re-enters orchestrator state) and may re-enter the supervisor.
+    ///
+    /// Cheap early-out mirroring `notify_terminal`: an unwired supervisor
+    /// returns before the map lookup and before cloning the task snapshot,
+    /// so registration-hot unwired builds pay one mutex probe and nothing
+    /// else.
+    fn notify_register(&self, task_id: &str) {
+        let callback = {
+            let guard = self.on_register.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(callback) => Arc::clone(callback),
+                None => return,
+            }
+        };
+        // Snapshot under the `tasks` mutex, invoke after releasing it. The
+        // lookup is by id rather than a pre-insert clone so the observer
+        // sees the task exactly as the map holds it post-insert.
+        let snapshot = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            match tasks.get(task_id) {
+                Some(task) => task.clone(),
+                None => return,
+            }
+        };
+        callback(&snapshot);
     }
 
     /// Gap-1 unification: fire the unified `on_terminal` callback (if set)

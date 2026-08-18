@@ -3403,6 +3403,38 @@ impl ActorFactory {
         supervisor.set_on_change(move |task| {
             forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
         });
+        // #2055 — create the goal-ledger task row at registration time,
+        // wired next to the unified terminal sink below (whose settle half,
+        // #2054, flips the row at terminal). The gateway actor wires its
+        // callbacks ONCE at init while goals come and go over the session's
+        // life, so the goal binding resolves at CALLBACK time via
+        // `active_goal_id` — the same resolver the #1935 interactive
+        // binding snapshot uses on the WS path. No active goal ⇒ no row;
+        // that is correct behavior, not an error. The recorder swallows
+        // every ledger error (registration must never fail, block, or panic
+        // on ledger I/O). `self.data_dir` is the profile data dir this path
+        // already hands to the goal-ledger sync (see
+        // `maybe_advance_goal_runtime_after_turn`).
+        let register_session_key = session_key.clone();
+        let register_profile_id = session_key
+            .profile_id()
+            .unwrap_or(MAIN_PROFILE_ID)
+            .to_owned();
+        let register_data_dir = self.data_dir.clone();
+        supervisor.set_on_register(move |task| {
+            let orchestrator = default_agent_orchestrator();
+            let Some(goal_id) =
+                orchestrator.active_goal_id(&register_session_key, &register_profile_id)
+            else {
+                return;
+            };
+            orchestrator.record_goal_task_registration(
+                &register_data_dir,
+                &register_profile_id,
+                &goal_id,
+                task,
+            );
+        });
         // Gap-1 unification: the single terminal sink, also wired BEFORE
         // `enable_persistence` (see the combined ordering note above). Routes
         // BOTH success (ChildCompleted) AND failure (recovery) re-entry

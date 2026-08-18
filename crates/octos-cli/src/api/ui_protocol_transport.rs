@@ -29682,6 +29682,45 @@ async fn run_standalone_turn(
                 Some(change_profile_id.as_str()),
             );
         });
+        // #2055 — create the goal-ledger task row at registration time,
+        // wired next to the unified terminal sink below (whose settle half,
+        // #2054, flips the row at terminal). The turn's goal binding is
+        // snapshotted HERE at wiring time, mirroring the #1650
+        // dispatch-time `interactive_goal_binding` semantics: an autonomous
+        // continuation carries `goal_context` (its goal resolves under the
+        // already-scoped store key it was enqueued with, family-2 — never
+        // re-scoped), an interactive turn uses the #1935
+        // `interactive_goal_id` snapshot. This wiring is REPLACED every
+        // turn, so a goal-less turn overwrites a prior goal turn's closure
+        // with the no-op rather than leaking a stale binding. No binding ⇒
+        // no rows — correct behavior, not an error. The recorder swallows
+        // every ledger error (registration must never fail, block, or
+        // panic on ledger I/O). The ledger lives under the PROFILE data
+        // dir (#1957 rule — never the relocatable sessions root).
+        let register_goal_binding: Option<(String, String)> = goal_context
+            .as_ref()
+            .and_then(|goal_ctx| {
+                default_agent_orchestrator()
+                    .active_goal_id_under_goal_key(&goal_ctx.goal_session_key, &goal_ctx.profile_id)
+                    .map(|goal_id| (goal_id, goal_ctx.profile_id.clone()))
+            })
+            .or_else(|| {
+                interactive_goal_id
+                    .clone()
+                    .map(|goal_id| (goal_id, goal_charge_profile.clone()))
+            });
+        let register_ledger_data_dir = session_runtime.profile.data_dir.clone();
+        task_supervisor.set_on_register(move |task| {
+            let Some((goal_id, profile_id)) = register_goal_binding.as_ref() else {
+                return;
+            };
+            default_agent_orchestrator().record_goal_task_registration(
+                &register_ledger_data_dir,
+                profile_id,
+                goal_id,
+                task,
+            );
+        });
         // Gap-1 unification: the single terminal sink. Routes BOTH success
         // (ChildCompleted) AND failure (recovery) re-entry through ONE
         // profile-resolving call into the master continuation queue. Runs

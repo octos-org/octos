@@ -500,6 +500,37 @@ impl GoalLedger {
         Ok(())
     }
 
+    /// #2055 — create a task row only when none exists yet
+    /// (`INSERT … ON CONFLICT(task_id) DO NOTHING`).
+    ///
+    /// Registration is the caller: the same task can be registered,
+    /// relaunched, and re-registered across a restart, and findings /
+    /// denials / escalations still write FK stubs for tasks that may already
+    /// have a row. All of those must PRESERVE an existing row — its status
+    /// (including a status that already went terminal via
+    /// [`Self::update_task_status`]), title, and timestamps — rather than
+    /// error or overwrite. Returns `Ok(true)` when a row was inserted,
+    /// `Ok(false)` for the preserve-existing no-op.
+    pub fn create_task_if_absent(&self, task: &Task) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(task_id) DO NOTHING",
+            params![
+                task.task_id,
+                task.goal_id,
+                task.title,
+                task.detail,
+                task.status,
+                task.assigned_peer,
+                task.created_at_ms,
+                task.updated_at_ms,
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
     /// Get a task by ID.
     pub fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
         let conn = self.conn.lock().unwrap();
@@ -3123,5 +3154,116 @@ mod digest_integration_tests {
             .collect();
         assert_eq!(g2.get("running"), Some(&1));
         assert_eq!(g2.get("complete"), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // #2055 — idempotent row creation at task registration.
+    //
+    // Registration legitimately repeats (relaunch, restart, re-registration
+    // of a task the supervisor restored), so row creation must be an upsert
+    // that PRESERVES an existing row — including its status and timestamps,
+    // and including a row that already went terminal — instead of relying on
+    // a swallowed UNIQUE violation.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn should_insert_row_when_task_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        // FK enforcement is on (bundled SQLite defaults foreign_keys=1):
+        // the parent goals row must exist before any task row.
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "test".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        assert!(
+            ledger
+                .create_task_if_absent(&Task {
+                    task_id: "t1".to_string(),
+                    goal_id: "g1".to_string(),
+                    title: "web_probe".to_string(),
+                    detail: String::new(),
+                    status: "running".to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap(),
+            "a fresh task id inserts a row"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "running");
+        assert_eq!(task.title, "web_probe");
+    }
+
+    #[test]
+    fn should_preserve_existing_row_when_task_is_reregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        assert!(
+            !ledger
+                .create_task_if_absent(&Task {
+                    task_id: "t1".to_string(),
+                    goal_id: "g1".to_string(),
+                    title: "replacement title".to_string(),
+                    detail: "replacement detail".to_string(),
+                    status: "pending".to_string(),
+                    assigned_peer: Some("peer-a".to_string()),
+                    created_at_ms: 9_000,
+                    updated_at_ms: 9_000,
+                })
+                .unwrap(),
+            "re-registration reports no-op"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "running", "existing status is preserved");
+        assert_eq!(task.title, "", "existing title is preserved");
+        assert_eq!(task.assigned_peer, None);
+        assert_eq!(task.updated_at_ms, 1_000);
+    }
+
+    /// The load-bearing half of idempotency: a re-registration AFTER the row
+    /// went terminal (relaunch/restart replaying an old registration) must
+    /// not resurrect it to `running` — first-terminal-wins extends across
+    /// the create path, not just `update_task_status`.
+    #[test]
+    fn should_preserve_terminal_row_when_task_is_reregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+        ledger.update_task_status("t1", "complete", 2_000).unwrap();
+
+        assert!(
+            !ledger
+                .create_task_if_absent(&Task {
+                    task_id: "t1".to_string(),
+                    goal_id: "g1".to_string(),
+                    title: String::new(),
+                    detail: String::new(),
+                    status: "running".to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 3_000,
+                    updated_at_ms: 3_000,
+                })
+                .unwrap(),
+            "re-registration of a terminal row reports no-op"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "complete", "terminal status survives");
+        assert_eq!(task.updated_at_ms, 2_000);
     }
 }

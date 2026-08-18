@@ -4217,3 +4217,186 @@ async fn start_reaper_loop_reaps_stuck_task_on_interval() {
     );
     assert!(supervisor.cancel_token(&id).is_cancelled());
 }
+
+// ---------------------------------------------------------------------------
+// #2055 — registration observer (`set_on_register`).
+//
+// The goal-ledger task-row creation lives in octos-cli (octos-agent cannot
+// see octos-fleet), so the supervisor exposes a registration callback the
+// runtime wires next to `set_on_terminal`. Fired from `register_full`'s
+// single success path, so ONE call site covers every registration kind
+// (background/spawn_only, sub-agents, MCP, peers).
+// ---------------------------------------------------------------------------
+
+/// The observer fires exactly once per successful registration, with the
+/// freshly inserted task snapshot.
+#[test]
+fn on_register_fires_exactly_once_per_successful_registration() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let supervisor = TaskSupervisor::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<BackgroundTask>::new()));
+    let calls_c = calls.clone();
+    let seen_c = seen.clone();
+    supervisor.set_on_register(move |task| {
+        calls_c.fetch_add(1, Ordering::SeqCst);
+        seen_c.lock().unwrap().push(task.clone());
+    });
+
+    let id = supervisor.register("web_probe", "call-reg-1", Some("api:sess-reg"));
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one successful registration fires the observer exactly once"
+    );
+    let snapshots = seen.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].id, id);
+    assert_eq!(snapshots[0].tool_name, "web_probe");
+    assert_eq!(snapshots[0].tool_call_id, "call-reg-1");
+    assert_eq!(
+        snapshots[0].parent_session_key.as_deref(),
+        Some("api:sess-reg")
+    );
+
+    // Subsequent lifecycle transitions must NOT re-fire the observer.
+    supervisor.mark_running(&id);
+    supervisor.mark_completed(&id, vec![]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "on_register is a registration observer, not a change feed"
+    );
+}
+
+/// Every `register*` entry point funnels through `register_full`, so the
+/// observer covers all of them without per-entry-point wiring.
+#[test]
+fn on_register_fires_for_every_register_entry_point() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let supervisor = TaskSupervisor::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_c = calls.clone();
+    supervisor.set_on_register(move |_| {
+        calls_c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    supervisor.register("t1", "call-ep-1", Some("api:sess-ep"));
+    supervisor.register_with_lineage("t2", "call-ep-2", Some("api:sess-ep"), None);
+    supervisor.register_with_input(
+        "t3",
+        "call-ep-3",
+        Some("api:sess-ep"),
+        Some(serde_json::json!({"a": 1})),
+    );
+    supervisor.register_with_input_and_cmid("t4", "call-ep-4", Some("api:sess-ep"), None, None);
+    supervisor
+        .try_register_with_input("t5", "call-ep-5", Some("api:sess-ep"), None)
+        .expect("strict registration succeeds");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+
+/// The callback is invoked with NO supervisor locks held (cloned out of its
+/// own mutex first, like `notify_change`), so user code that re-enters the
+/// supervisor — the octos-cli closure resolves goal bindings and may read
+/// task state — cannot deadlock.
+#[test]
+fn on_register_callback_may_reenter_the_supervisor_without_deadlock() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let reentrant = Arc::clone(&supervisor);
+    let observed = Arc::new(std::sync::Mutex::new(Option::<usize>::None));
+    let observed_c = observed.clone();
+    supervisor.set_on_register(move |task| {
+        // Re-enter through read paths that take the `tasks` mutex.
+        let all = reentrant.get_all_tasks();
+        assert!(reentrant.get_task(&task.id).is_some());
+        *observed_c.lock().unwrap() = Some(all.len());
+    });
+
+    supervisor.register("web_probe", "call-reenter", Some("api:sess-re"));
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(1),
+        "the re-entrant read observed the freshly inserted task"
+    );
+}
+
+/// A REFUSED registration (terminal parent / fan-out cap) never fires the
+/// observer — there is no task to create a ledger row for.
+#[test]
+fn on_register_does_not_fire_for_refused_registrations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Terminal-parent refusal.
+    let supervisor = TaskSupervisor::new();
+    let parent_tcid = "call-onreg-parent";
+    let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-onreg"));
+    supervisor.mark_running(&parent);
+    supervisor.mark_failed(&parent, "orphaned across restart".to_string());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_c = calls.clone();
+    supervisor.set_on_register(move |_| {
+        calls_c.fetch_add(1, Ordering::SeqCst);
+    });
+    supervisor
+        .try_register_node_task("pipeline:analyze", parent_tcid, Some("sess-onreg"))
+        .expect_err("terminal parent refuses the child registration");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a ParentTerminal refusal must not fire on_register"
+    );
+
+    // Fan-out-cap refusal. The cap reader caches once per process
+    // (`OnceLock`), so exercise the production cap: fill it with the
+    // observer UNWIRED, wire the observer, then assert the refused
+    // overflow attempt fires nothing.
+    let cap_calls = Arc::new(AtomicUsize::new(0));
+    let cap_calls_c = cap_calls.clone();
+    let capped = TaskSupervisor::new();
+    for i in 0..MAX_CHILDREN_PER_PARENT {
+        capped
+            .try_register_with_input(
+                "tts",
+                &format!("call-cap-onreg-{i}"),
+                Some("sess-cap-onreg"),
+                None,
+            )
+            .unwrap_or_else(|err| panic!("register #{i} should succeed; got {err}"));
+    }
+    capped.set_on_register(move |_| {
+        cap_calls_c.fetch_add(1, Ordering::SeqCst);
+    });
+    capped
+        .try_register_with_input(
+            "tts",
+            "call-cap-onreg-overflow",
+            Some("sess-cap-onreg"),
+            None,
+        )
+        .expect_err("overflow child exceeds the cap");
+    assert_eq!(
+        cap_calls.load(Ordering::SeqCst),
+        0,
+        "a ChildFanoutExceeded refusal must not fire on_register"
+    );
+}
+
+/// An unwired supervisor registers exactly as before — the observer hook is
+/// a no-op (the guard early-outs before taking any task snapshot).
+#[test]
+fn unwired_on_register_leaves_registration_untouched() {
+    let supervisor = TaskSupervisor::new();
+    let id = supervisor.register("web_probe", "call-unwired", Some("api:sess-unwired"));
+    assert!(!id.is_empty());
+    assert_eq!(
+        supervisor.get_task(&id).unwrap().status,
+        TaskStatus::Spawned
+    );
+}
