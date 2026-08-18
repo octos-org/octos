@@ -18057,6 +18057,17 @@ pub(crate) fn session_workspace_root_for_state(
 /// wording — the SPA's reducer matches on it heuristically and must
 /// not change.
 fn append_workspace_root_hint(mut prompt: String, workspace_root: Option<&Path>) -> String {
+    // Prompt-cache stability opt-out: the per-session workspace path embeds
+    // the session id, so this hint is the ONLY volatile byte in an otherwise
+    // byte-identical system prompt across sessions — it single-handedly
+    // breaks KV-cache prefix reuse for every new session (measured on the
+    // appui card-generation path: 35% shared prefix with the hint, ~99%
+    // without). Hosts whose agents never do file work (the phone's
+    // card-generation appui) set OCTOS_OMIT_WORKSPACE_HINT=1 in the kernel's
+    // spawn env to drop it; every other surface keeps today's bytes.
+    if std::env::var_os("OCTOS_OMIT_WORKSPACE_HINT").is_some_and(|v| v == "1") {
+        return prompt;
+    }
     if let Some(workspace_root) = workspace_root {
         prompt.push_str("\n\nAppUi session workspace root: ");
         prompt.push_str(&workspace_root.to_string_lossy());
