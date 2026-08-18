@@ -392,6 +392,39 @@ impl GoalLedger {
         Ok(admitted > 0)
     }
 
+    /// #2055 review round 2 — create a goals row only when none exists yet
+    /// (`INSERT … ON CONFLICT(goal_id) DO NOTHING`), the goals-side twin of
+    /// [`Self::create_task_if_absent`].
+    ///
+    /// For FK-parent seeding by the task-row registration recorder, which
+    /// must NEVER update a goals row: [`Self::upsert_goal`]'s monotonic
+    /// guard admits equal `updated_at_ms` (millisecond resolution), so a
+    /// delayed stale `active` snapshot could overwrite a same-millisecond
+    /// `paused`/`blocked`/`budget_limited`/`cleared` row and regress its
+    /// counters. This can't: an existing row — whatever its state — is
+    /// preserved byte-for-byte. Returns `Ok(true)` when a row was inserted,
+    /// `Ok(false)` for the preserve-existing no-op.
+    pub fn create_goal_if_absent(&self, goal: &Goal) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(goal_id) DO NOTHING",
+            params![
+                goal.goal_id,
+                goal.objective,
+                goal.status,
+                goal.tokens_used,
+                goal.token_budget,
+                goal.continuations_used,
+                goal.revision,
+                goal.created_at_ms,
+                goal.updated_at_ms,
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
     /// #1973 fix-round 3/4 — targeted STATUS compare-and-swap for an
     /// administrative transition (park/clear) whose guarded [`Self::upsert_goal`]
     /// was rejected by the monotonic-token clause. Flips ONLY the status (+
@@ -577,14 +610,23 @@ impl GoalLedger {
     /// - `running` → terminal  → 1 row  → `true`
     /// - terminal → same       → guard excludes → `false` (redelivery)
     /// - terminal → `running`  → guard excludes → `false` (late refresh)
-    /// - terminal → other terminal → guard excludes → `false`
+    /// - `failed` → `complete` → 1 row  → `true` (owner correction — below)
+    /// - any other terminal → terminal → guard excludes → `false`
     ///
-    /// `updated_at_ms` therefore records the FIRST terminal, never a duplicate
-    /// or a straggler, and cannot regress.
+    /// #2055 review round 2 — `failed → complete` is the ONE admitted
+    /// terminal→terminal transition, mirroring the supervisor's own
+    /// authority model: `TaskSupervisor::mark_completed` overrides an
+    /// OBSERVER-derived provisional failure when the owner watched the
+    /// worker actually finish (task_supervisor.rs:2527's correction
+    /// semantics), and the ledger must be able to receive that correction.
+    /// `complete` remains immutable; `failed` refuses every non-`complete`
+    /// write; `updated_at_ms` records the LATEST admitted write and cannot
+    /// regress to a straggler.
     ///
-    /// Fidelity note: `TerminalOutcome` collapses `Cancelled` into `Failed`
-    /// upstream, so a cancelled task lands here as `"failed"` and the two are
-    /// indistinguishable in the ledger.
+    /// Fidelity note: cancellation is collapsed into failure upstream
+    /// (`TerminalOutcome` has no `Cancelled`; the change-feed settle maps
+    /// `TaskStatus::Cancelled` to `"failed"` too), so a cancelled task lands
+    /// here as `"failed"` and the two are indistinguishable in the ledger.
     pub fn update_task_status(
         &self,
         task_id: &str,
@@ -594,7 +636,9 @@ impl GoalLedger {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
             "UPDATE tasks SET status = ?1, updated_at_ms = ?2
-             WHERE task_id = ?3 AND status NOT IN ('complete', 'failed')",
+             WHERE task_id = ?3
+               AND (status NOT IN ('complete', 'failed')
+                    OR (status = 'failed' AND ?1 = 'complete'))",
             params![new_status, updated_at_ms, task_id],
         )?;
         Ok(changed > 0)
@@ -3091,13 +3135,47 @@ mod digest_integration_tests {
                 "a terminal task refuses the late non-terminal write {late:?}"
             );
         }
-        // `complete` after `failed` is equally a regression: the first
-        // terminal wins, so a disagreeing second terminal cannot flip it.
-        assert!(!ledger.update_task_status("t1", "complete", 4_000).unwrap());
+        // #2055 review round 2 — `complete` after `failed` is now the ONE
+        // admitted terminal→terminal transition (this test originally
+        // asserted it refused): the supervisor's own authority model allows
+        // exactly it — `TaskSupervisor::mark_completed` overrides an
+        // OBSERVER-derived provisional failure when the owner watched the
+        // worker actually finish (task_supervisor.rs:2527's correction
+        // semantics), and the ledger must be able to receive that
+        // correction. `complete` remains immutable, and `failed` still
+        // refuses every non-`complete` write (asserted above).
+        assert!(ledger.update_task_status("t1", "complete", 4_000).unwrap());
 
         let task = ledger.get_task("t1").unwrap().unwrap();
-        assert_eq!(task.status, "failed");
-        assert_eq!(task.updated_at_ms, 2_000);
+        assert_eq!(task.status, "complete");
+        assert_eq!(task.updated_at_ms, 4_000);
+    }
+
+    /// #2055 review round 2 — the correction transition in full: a
+    /// provisional observer failure lands `failed`, the owner's completion
+    /// corrects it to `complete`, and from there the row is immutable
+    /// (a straggler `failed` redelivery cannot undo the correction).
+    #[test]
+    fn should_allow_exactly_failed_to_complete_and_keep_complete_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        ledger.update_task_status("t1", "failed", 2_000).unwrap();
+        assert!(
+            ledger.update_task_status("t1", "complete", 3_000).unwrap(),
+            "failed → complete is the owner-correction transition"
+        );
+        for late in ["failed", "running", "pending"] {
+            assert!(
+                !ledger.update_task_status("t1", late, 4_000).unwrap(),
+                "complete refuses every subsequent write ({late:?})"
+            );
+        }
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "complete");
+        assert_eq!(task.updated_at_ms, 3_000);
     }
 
     /// The goal-facing point of the whole exercise: `task_status_counts` is
@@ -3265,5 +3343,87 @@ mod digest_integration_tests {
         let task = ledger.get_task("t1").unwrap().unwrap();
         assert_eq!(task.status, "complete", "terminal status survives");
         assert_eq!(task.updated_at_ms, 2_000);
+    }
+
+    // ---------------------------------------------------------------------
+    // #2055 review round 2 — FK-parent goals row via if-absent insert.
+    //
+    // Registration must NEVER update a goals row: `upsert_goal`'s monotonic
+    // guard admits equal timestamps, so a delayed stale `active` snapshot
+    // could overwrite a same-millisecond administrative transition
+    // (`paused` / `blocked` / `cleared`) and regress counters. The
+    // registration recorder therefore only ever INSERTs the FK parent when
+    // no row exists; the goal engine's own transition sync remains the only
+    // goals-row updater.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn should_insert_goal_row_when_goal_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        assert!(
+            ledger
+                .create_goal_if_absent(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "ship".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 5,
+                    token_budget: 10_000,
+                    continuations_used: 1,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap(),
+            "a fresh goal id inserts a row"
+        );
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "active");
+        assert_eq!(goal.objective, "ship");
+    }
+
+    #[test]
+    fn should_preserve_existing_goal_row_even_with_equal_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        // The row a same-millisecond administrative transition just wrote.
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "ship".to_string(),
+                status: "paused".to_string(),
+                tokens_used: 500,
+                token_budget: 10_000,
+                continuations_used: 3,
+                revision: 7,
+                created_at_ms: 1_000,
+                updated_at_ms: 2_000,
+            })
+            .unwrap();
+
+        // The delayed stale registration snapshot: same updated_at_ms,
+        // higher tokens — exactly the shape `upsert_goal`'s guard admits.
+        assert!(
+            !ledger
+                .create_goal_if_absent(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "ship".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 600,
+                    token_budget: 10_000,
+                    continuations_used: 4,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 2_000,
+                })
+                .unwrap(),
+            "an existing goal row reports no-op"
+        );
+
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "paused", "the administrative status survives");
+        assert_eq!(goal.tokens_used, 500, "counters are untouched");
+        assert_eq!(goal.continuations_used, 3);
+        assert_eq!(goal.revision, 7);
     }
 }

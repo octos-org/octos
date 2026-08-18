@@ -10617,6 +10617,42 @@ async fn invoke_skill_action_tool_binding(
     Ok(Value::Object(response))
 }
 
+/// #2055 review round 2 (coverage holes c + d) — wire the goal-task-row
+/// observer pair onto a CACHED session supervisor (`session_runtime.tools`),
+/// which outlives goals coming and going, so the goal binding resolves at
+/// CALLBACK time via `active_goal_id` — the gateway idiom, not the per-turn
+/// dispatch snapshot. Installed idempotently at each point of use, the same
+/// pattern as [`install_skill_action_job_projection_listener`] below (the
+/// SessionRuntime constructor is deliberately left out of the loop: the
+/// session-cache layer has no autonomy coupling today, and point-of-use
+/// wiring keeps it that way). Snapshots taken from this registry
+/// (`snapshot_excluding` — e.g. the native-review specialist swarm) inherit
+/// the pair onto their fresh supervisors.
+fn wire_goal_task_row_observers_for_cached_supervisor(
+    supervisor: &octos_agent::TaskSupervisor,
+    session_id: &SessionKey,
+    profile_id: &str,
+    profile_data_dir: &std::path::Path,
+) {
+    let register_session = session_id.clone();
+    let register_profile = profile_id.to_owned();
+    let register_data_dir = profile_data_dir.to_path_buf();
+    supervisor.set_on_register(move |task| {
+        let orchestrator = default_agent_orchestrator();
+        let Some(goal_id) = orchestrator.active_goal_id(&register_session, &register_profile)
+        else {
+            return;
+        };
+        orchestrator.record_goal_task_registration(
+            &register_data_dir,
+            &register_profile,
+            &goal_id,
+            task,
+        );
+    });
+    crate::autonomy::agent_orchestrator::install_goal_task_row_settle_listener(supervisor);
+}
+
 fn install_skill_action_job_projection_listener(
     supervisor: &octos_agent::TaskSupervisor,
     profile_id: &str,
@@ -11021,6 +11057,16 @@ async fn raw_skill_action_invoke(
             let batch_permit = reserve_skill_action_batch()?;
             let profile_id = session_runtime.profile.profile_id.clone();
             let supervisor = session_runtime.tools.supervisor();
+            // #2055 review round 2 (hole d) — background skill actions
+            // register on THIS cached supervisor, not the per-turn snapshot
+            // the turn path wires, so give it the goal-task-row observer
+            // pair here (resolve-at-callback; idempotent re-install).
+            wire_goal_task_row_observers_for_cached_supervisor(
+                &supervisor,
+                &params.session_id,
+                &profile_id,
+                &session_runtime.profile.data_dir,
+            );
             install_skill_action_job_projection_listener(
                 &supervisor,
                 &profile_id,
@@ -27227,6 +27273,17 @@ async fn run_native_code_review_turn(
     let workspace_root = session_runtime.workspace_root.clone();
     let llm_provider = session_runtime.profile.llm.clone();
     let memory_store = session_runtime.profile.memory.clone();
+    // #2055 review round 2 (hole c) — the review specialists run on a FRESH
+    // snapshot registry whose supervisor used to carry no observers, so
+    // their `native_agent` registrations were invisible to the goal ledger.
+    // Wire the cached supervisor first; the snapshot below inherits the
+    // observer pair (`snapshot_excluding` → `inherit_registration_observers`).
+    wire_goal_task_row_observers_for_cached_supervisor(
+        &session_runtime.tools.supervisor(),
+        &session_id,
+        &profile_id,
+        &session_runtime.profile.data_dir,
+    );
     let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
     let agent_config = session_runtime.agent.agent_config();
     // UPCR follow-up to #1561: refresh named prompt segments (memory) on
@@ -29721,6 +29778,14 @@ async fn run_standalone_turn(
                 task,
             );
         });
+        // #2054 (review round 2) — the settle half rides the change feed as
+        // a NAMED listener (not the `on_terminal` sink below): `cancel`
+        // emits only `notify_change`, and the sink's once-per-task dedupe
+        // would swallow the owner's failed→complete correction. Inherited
+        // by nested child supervisors together with `on_register`.
+        crate::autonomy::agent_orchestrator::install_goal_task_row_settle_listener(
+            &task_supervisor,
+        );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
         // (ChildCompleted) AND failure (recovery) re-entry through ONE
         // profile-resolving call into the master continuation queue. Runs

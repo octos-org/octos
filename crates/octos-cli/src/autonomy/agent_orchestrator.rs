@@ -753,24 +753,61 @@ struct OrchestratorShared {
     /// the start of the next fleet-outbox drain tick.
     fleet_wake_retry: StdMutex<Vec<MasterContinuationRequest>>,
     /// #2055/#2054 — supervisor task id → the goal-ledger location its row
-    /// was created under at registration time. The terminal sink consumes
-    /// (removes) the entry to settle the SAME row — resolving afresh at
+    /// was created under at registration time. The change-feed settle
+    /// resolves the entry to settle the SAME row — resolving afresh at
     /// terminal time would chase whatever goal the session holds by then,
-    /// which can differ after a mid-flight clear/recreate. In-memory only:
-    /// entries are bounded by the supervisor's fan-out caps and removed at
-    /// terminal; a restart drops them, and the row a restored task left
-    /// behind stays `running` until re-registration/settle catches it —
-    /// delivery durability across restarts is #2056, out of scope here.
+    /// which can differ after a mid-flight clear/recreate. An entry is
+    /// removed only after a SUCCESSFUL settle write whose terminal is
+    /// final (`complete`, cancellation, owner-reported failure); an
+    /// observer-provisional failure keeps its entry so the owner's later
+    /// correcting completion (task_supervisor.rs:2527 semantics) can still
+    /// reach the ledger. In-memory only: entries are bounded by the
+    /// supervisor's fan-out caps (the retained-failure residue matches the
+    /// supervisor's own never-pruned task map); a restart drops them, and
+    /// the row a restored task left behind stays `running` — delivery
+    /// durability across restarts is #2056, out of scope here.
     goal_task_ledger_bindings: StdMutex<HashMap<String, GoalTaskLedgerBinding>>,
 }
 
-/// #2055/#2054 — where one supervisor task's goal-ledger row lives: enough
-/// to re-derive the per-goal ledger path (`<profile_data_dir>/goal-ledgers/
-/// <goal_id>.db`) at terminal time without re-resolving the session's goal.
+/// #2055/#2054 — everything the ledger I/O for one task's row needs, captured
+/// at registration-stash time so BOTH the offloaded row creation and any
+/// later settle can run without re-entering orchestrator state: the FK-parent
+/// goals-row snapshot (only ever inserted if absent — never an update), the
+/// task row seed, and the profile data dir the per-goal ledger path derives
+/// from (`<profile_data_dir>/goal-ledgers/<goal_id>.db`).
 #[derive(Debug, Clone)]
 struct GoalTaskLedgerBinding {
-    goal_id: String,
+    goal_row: octos_fleet::Goal,
+    title: String,
+    assigned_peer: Option<String>,
     profile_data_dir: PathBuf,
+}
+
+impl GoalTaskLedgerBinding {
+    fn ledger_path(&self) -> PathBuf {
+        InProcessAgentOrchestrator::goal_ledger_dir(&self.profile_data_dir).join(format!(
+            "{}.db",
+            sanitize_filename_for_ledger(&self.goal_row.goal_id)
+        ))
+    }
+}
+
+/// #2055 review round 2 (H9) — run goal-ledger I/O off the async executor.
+/// The registration/settle observers fire synchronously inside tokio-driven
+/// paths (SpawnTool's async execute, the session actor), and the I/O behind
+/// them is contended-open SQLite with multi-second busy budgets — so inside
+/// a runtime it goes to the blocking pool (detached: the observers are
+/// fire-and-forget by contract and must never stall registration), mirroring
+/// `sync_transition_to_ledger`'s `spawn_blocking` treatment. Without a
+/// runtime (plain threads, sync tests) the work runs inline — such a thread
+/// is not an executor worker, which is the only thing H9 protects.
+fn offload_goal_ledger_io(work: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(work);
+        }
+        Err(_) => work(),
+    }
 }
 
 /// The plain WIRE session id underlying a (possibly cwd-scoped) goal-store
@@ -985,13 +1022,11 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
     event: &octos_agent::TerminalEvent,
     runtime_profile_id: Option<&str>,
 ) {
-    // #2054 — settle the goal-ledger task row FIRST, before any continuation
-    // routing (and before the failure arm's suppression early-returns: a
-    // synth-ack-suppressed failure still finished, and its row must flip).
-    // This writes one ledger cell and NOTHING else — no continuation, event,
-    // notification, or wake may originate here (completed → sink →
-    // ChildCompleted → wake is a cycle; fresh ids defeat dedupe).
-    default_agent_orchestrator().settle_goal_task_row(event);
+    // #2054 settling does NOT live here (review round 2): this sink never
+    // fires for `cancel` (which emits only `notify_change`) and its
+    // once-per-task dedupe would swallow the owner's failed→complete
+    // correction. The goal-ledger settle rides the change feed instead —
+    // see `install_goal_task_row_settle_listener`.
     match &event.outcome {
         octos_agent::TerminalOutcome::Completed => {
             // Mirror the terminal agent record; the upsert's terminal
@@ -1050,6 +1085,23 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
             }
         }
     }
+}
+
+/// #2054 (review round 2) — stable key for the goal-task-row settle observer
+/// on `TaskSupervisor::on_change_listeners`. A NAMED listener (not the
+/// primary `on_change`, which every runtime mode already owns for its own
+/// wake wiring), re-installed idempotently wherever a supervisor is wired
+/// and inherited by child/nested supervisors alongside `on_register`.
+pub(crate) const GOAL_TASK_ROW_SETTLE_LISTENER_KEY: &str = "goal-task-row-settle";
+
+/// #2054 (review round 2) — install the change-feed settle observer on a
+/// supervisor. See [`InProcessAgentOrchestrator::settle_goal_task_row_from_change`]
+/// for why settling rides the change feed rather than the `on_terminal`
+/// sink (cancel coverage + the failed→complete owner correction).
+pub(crate) fn install_goal_task_row_settle_listener(supervisor: &octos_agent::TaskSupervisor) {
+    supervisor.set_on_change_listener(GOAL_TASK_ROW_SETTLE_LISTENER_KEY, |task| {
+        default_agent_orchestrator().settle_goal_task_row_from_change(task);
+    });
 }
 
 // "Workspace is known in-memory" predicate accepted by
@@ -5547,23 +5599,20 @@ impl InProcessAgentOrchestrator {
         (goal.profile_id == profile_id && goal.status == "active").then(|| goal.goal_id.clone())
     }
 
-    /// #2055 — create the goal-ledger `tasks` row for a task the
-    /// `TaskSupervisor` just registered, and remember where it lives so the
-    /// terminal sink can settle it (#2054). Called from the `on_register`
-    /// closures both runtime modes wire next to `set_on_terminal`.
+    /// #2055 — record a task the `TaskSupervisor` just registered: stash the
+    /// ledger binding (synchronously — this is all the `on_register`
+    /// callback pays on the caller's thread) and offload the row creation to
+    /// the blocking pool. Called from the `on_register` closures the runtime
+    /// modes wire next to their settle listener.
     ///
     /// Best-effort BY CONTRACT: registration must never fail, block, or
-    /// panic on ledger I/O, so every error is swallowed with a
-    /// `tracing::debug!`. Locates the ledger exactly like
-    /// [`Self::model_goal_record_peer_finding`]
-    /// (`<profile_data_dir>/goal-ledgers/<goal_id>.db`), and upserts the
-    /// goals row first for the same reason that path does — the bundled
-    /// SQLite enforces `FOREIGN KEY (goal_id)` (`foreign_keys=1` compile
-    /// default), and this row may be the ledger file's very first write.
-    /// Row creation is the idempotent [`octos_fleet::GoalLedger::
-    /// create_task_if_absent`], so re-registration across relaunch/restart
-    /// preserves an existing row and its status — including one that
-    /// already went terminal.
+    /// panic on ledger I/O — the synchronous part is one state read plus one
+    /// map insert, every I/O error in the offloaded part is swallowed with a
+    /// `tracing::debug!`, and a lost offload (process exit) is converged
+    /// later by the settle side, which is self-sufficient (it creates the
+    /// row with the terminal status when none exists). Locates the ledger
+    /// exactly like [`Self::model_goal_record_peer_finding`]
+    /// (`<profile_data_dir>/goal-ledgers/<goal_id>.db`).
     pub(crate) fn record_goal_task_registration(
         &self,
         profile_data_dir: &Path,
@@ -5571,10 +5620,15 @@ impl InProcessAgentOrchestrator {
         goal_id: &str,
         task: &octos_agent::BackgroundTask,
     ) {
-        // Fresh goal snapshot for the FK-parent goals row (mirrors the
-        // peer-finding recorder). A goal cleared between binding resolution
-        // and this callback simply skips the write — no goal, no row. The
-        // state lock drops before any file I/O below.
+        // Goal snapshot for the FK-parent goals row. Captured ONCE, at stash
+        // time, and carried on the binding for both the creation offload and
+        // any later settle — it is only ever INSERTED-if-absent (H3: the
+        // registration path must never update a goals row; `upsert_goal`'s
+        // monotonic guard admits equal millisecond timestamps, so a delayed
+        // stale snapshot could regress an administrative transition). A goal
+        // cleared between binding resolution and this callback simply skips
+        // the write — no goal, no row. The state lock drops before anything
+        // else.
         let goal_row = {
             let state = self.state();
             state
@@ -5588,7 +5642,7 @@ impl InProcessAgentOrchestrator {
                     tokens_used: goal.tokens_used,
                     token_budget: goal.token_budget,
                     continuations_used: goal.continuations_used,
-                    revision: 0, // preserved on conflict by upsert_goal
+                    revision: 0,
                     created_at_ms: goal.created_at_ms.max(0) as u64,
                     updated_at_ms: goal.updated_at_ms.max(0) as u64,
                 })
@@ -5602,125 +5656,213 @@ impl InProcessAgentOrchestrator {
             );
             return;
         };
-        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        // `assigned_peer` is derivable only for the native-specialist kind
+        // (peers and supervisor-spawned specialists), whose `tool_call_id`
+        // is the agent id. Every other kind has no peer identity.
+        let assigned_peer = (task.tool_name == "native_agent" && !task.tool_call_id.is_empty())
+            .then(|| task.tool_call_id.clone());
+        let binding = GoalTaskLedgerBinding {
+            goal_row,
+            title: task.tool_name.clone(),
+            assigned_peer,
+            profile_data_dir: profile_data_dir.to_path_buf(),
+        };
+        // Stash BEFORE the offload so a terminal racing in can already
+        // resolve the binding; the settle write sequence converges with the
+        // creation in either order.
+        self.shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task.id.clone(), binding.clone());
+        let task_id = task.id.clone();
+        offload_goal_ledger_io(move || {
+            Self::record_goal_task_row_blocking(&binding, &task_id);
+        });
+    }
+
+    /// #2055 — the blocking half of [`Self::record_goal_task_registration`]:
+    /// FK-parent goals row via the never-updating
+    /// [`octos_fleet::GoalLedger::create_goal_if_absent`] (the bundled
+    /// SQLite enforces `foreign_keys=1`, and this can be the ledger file's
+    /// very first write), then the `running` task row via the idempotent
+    /// [`octos_fleet::GoalLedger::create_task_if_absent`] — so
+    /// re-registration across relaunch/restart preserves an existing row and
+    /// its status, including one the settle side already wrote terminal.
+    /// Runs on the blocking pool (or a non-executor thread), so the
+    /// contended-open profile (`open_with_busy_retry`) applies — the
+    /// fresh-WAL first-init race the plain `open` documents is exactly the
+    /// creation-vs-settle race this path can hit.
+    fn record_goal_task_row_blocking(binding: &GoalTaskLedgerBinding, task_id: &str) {
+        let ledger_dir = Self::goal_ledger_dir(&binding.profile_data_dir);
         if let Err(error) = std::fs::create_dir_all(&ledger_dir) {
             tracing::debug!(
-                goal_id,
-                task_id = %task.id,
+                goal_id = %binding.goal_row.goal_id,
+                task_id,
                 path = %ledger_dir.display(),
                 %error,
                 "goal task-row registration skipped: ledger dir unavailable"
             );
             return;
         }
-        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
-        let ledger = match octos_fleet::GoalLedger::open(&ledger_path) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                tracing::debug!(
-                    goal_id,
-                    task_id = %task.id,
-                    path = %ledger_path.display(),
-                    %error,
-                    "goal task-row registration skipped: ledger open failed"
-                );
-                return;
-            }
-        };
-        // FK parent first (guarded upsert; a stale-snapshot rejection still
-        // leaves a valid parent row in place).
-        let _ = ledger.upsert_goal(&goal_row);
         let now = now_ms_u64();
-        // `assigned_peer` is derivable only for the native-specialist kind
-        // (peers and supervisor-spawned specialists), whose `tool_call_id`
-        // is the agent id. Every other kind has no peer identity.
-        let assigned_peer = (task.tool_name == "native_agent" && !task.tool_call_id.is_empty())
-            .then(|| task.tool_call_id.clone());
         let row = octos_fleet::Task {
-            task_id: task.id.clone(),
-            goal_id: goal_id.to_owned(),
-            title: task.tool_name.clone(),
+            task_id: task_id.to_owned(),
+            goal_id: binding.goal_row.goal_id.clone(),
+            title: binding.title.clone(),
             detail: String::new(),
             status: "running".to_owned(),
-            assigned_peer,
+            assigned_peer: binding.assigned_peer.clone(),
             created_at_ms: now,
             updated_at_ms: now,
         };
-        if let Err(error) = ledger.create_task_if_absent(&row) {
+        let written = octos_fleet::GoalLedger::open_with_busy_retry(binding.ledger_path())
+            .and_then(|ledger| {
+                ledger.create_goal_if_absent(&binding.goal_row)?;
+                ledger.create_task_if_absent(&row)
+            });
+        if let Err(error) = written {
             tracing::debug!(
-                goal_id,
-                task_id = %task.id,
+                goal_id = %binding.goal_row.goal_id,
+                task_id,
                 %error,
-                "goal task-row registration failed; continuing without a row"
+                "goal task-row registration write failed; settle will converge if the task finishes"
             );
-            return;
         }
-        // Remember where the row lives so the terminal sink can settle it
-        // even if the session's goal binding changes mid-flight.
-        self.shared
-            .goal_task_ledger_bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                task.id.clone(),
-                GoalTaskLedgerBinding {
-                    goal_id: goal_id.to_owned(),
-                    profile_data_dir: profile_data_dir.to_path_buf(),
-                },
-            );
     }
 
-    /// #2054 — settle the goal-ledger task row for a terminal transition.
-    /// Consumes the registration-time binding (`on_terminal` fires at most
-    /// once per task, so the entry is done after this) and writes ONE ledger
-    /// cell via the first-terminal-wins
-    /// [`octos_fleet::GoalLedger::update_task_status`]. `Ok(false)` is a
-    /// normal no-op (absent row / already terminal). Emits NO continuation,
-    /// event, notification, or wake — `completed → sink → ChildCompleted →
-    /// wake` is a cycle whose fresh ids defeat dedupe.
+    /// #2054 (review round 2) — the change-feed settle: fired for every task
+    /// status change through the NAMED `on_change_listeners` observer (see
+    /// [`install_goal_task_row_settle_listener`]), filtering to terminal
+    /// statuses. The change feed — not the `on_terminal` sink — because:
     ///
-    /// Fidelity note: `TerminalOutcome` collapses `Cancelled` into `Failed`
-    /// upstream, so a cancelled task settles as `"failed"`.
-    pub(crate) fn settle_goal_task_row(&self, event: &octos_agent::TerminalEvent) {
+    /// - `TaskSupervisor::cancel` emits ONLY `notify_change`; on the sink,
+    ///   every cancelled goal-bound task leaked its binding and a `running`
+    ///   row forever.
+    /// - the sink's once-per-task dedupe swallows the owner's correcting
+    ///   completion after an observer-provisional failure
+    ///   (task_supervisor.rs:2527); the change feed delivers it, and the
+    ///   ledger's one admitted terminal→terminal transition
+    ///   (`failed → complete`) receives it.
+    /// - the feed's multi-fire redelivery is absorbed by the ledger's
+    ///   first-terminal-wins idempotency.
+    ///
+    /// Emits NO continuation, event, notification, or wake — this writes
+    /// ledger cells and nothing else (`completed → sink → ChildCompleted →
+    /// wake` is a cycle whose fresh ids defeat dedupe). All I/O runs on the
+    /// blocking pool via [`offload_goal_ledger_io`].
+    ///
+    /// Binding lifecycle: the entry is removed only AFTER a successful write
+    /// (a BUSY/open failure keeps it so a redelivered change event retries),
+    /// and only for FINAL terminals — completion, cancellation, and
+    /// owner-reported failure. An observer-provisional failure
+    /// (`failed_by_observer`) keeps its entry so the correction can still
+    /// settle; the owner's authoritative re-mark or completion then closes
+    /// it.
+    ///
+    /// Fidelity note: cancellation settles as `"failed"` — the ledger keeps
+    /// the #2054 status vocabulary (`TerminalOutcome` collapses the two the
+    /// same way upstream).
+    pub(crate) fn settle_goal_task_row_from_change(&self, task: &octos_agent::BackgroundTask) {
+        let (status, remove_on_success) = match task.status {
+            octos_agent::TaskStatus::Completed => ("complete", true),
+            octos_agent::TaskStatus::Cancelled => ("failed", true),
+            octos_agent::TaskStatus::Failed => ("failed", !task.failed_by_observer),
+            octos_agent::TaskStatus::Spawned | octos_agent::TaskStatus::Running => return,
+        };
         let binding = self
             .shared
             .goal_task_ledger_bindings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&event.task.id);
+            .get(&task.id)
+            .cloned();
         let Some(binding) = binding else {
             return;
         };
-        let status = match &event.outcome {
-            octos_agent::TerminalOutcome::Completed => "complete",
-            octos_agent::TerminalOutcome::Failed(_) => "failed",
+        let this = self.clone();
+        let task_id = task.id.clone();
+        offload_goal_ledger_io(move || {
+            this.settle_goal_task_row_blocking(&binding, &task_id, status, remove_on_success);
+        });
+    }
+
+    /// #2054 (review round 2) — the blocking half of the change-feed settle.
+    /// SELF-SUFFICIENT: seeds the FK-parent goals row and the task row
+    /// (directly with the terminal status) if the creation offload has not
+    /// landed yet — creation-then-settle and settle-then-creation converge
+    /// on the same terminal row — then applies the guarded
+    /// [`octos_fleet::GoalLedger::update_task_status`], whose `Ok(false)` is
+    /// a normal no-op (row already carries this terminal).
+    fn settle_goal_task_row_blocking(
+        &self,
+        binding: &GoalTaskLedgerBinding,
+        task_id: &str,
+        status: &str,
+        remove_on_success: bool,
+    ) {
+        let ledger_dir = Self::goal_ledger_dir(&binding.profile_data_dir);
+        let now = now_ms_u64();
+        let seed_row = octos_fleet::Task {
+            task_id: task_id.to_owned(),
+            goal_id: binding.goal_row.goal_id.clone(),
+            title: binding.title.clone(),
+            detail: String::new(),
+            status: status.to_owned(),
+            assigned_peer: binding.assigned_peer.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
         };
-        let ledger_path = Self::goal_ledger_dir(&binding.profile_data_dir).join(format!(
-            "{}.db",
-            sanitize_filename_for_ledger(&binding.goal_id)
-        ));
-        match octos_fleet::GoalLedger::open(&ledger_path)
-            .and_then(|ledger| ledger.update_task_status(&event.task.id, status, now_ms_u64()))
-        {
+        let written = std::fs::create_dir_all(&ledger_dir)
+            .map_err(|error| eyre::eyre!("ledger dir unavailable: {error}"))
+            .and_then(|()| octos_fleet::GoalLedger::open_with_busy_retry(binding.ledger_path()))
+            .and_then(|ledger| {
+                ledger.create_goal_if_absent(&binding.goal_row)?;
+                ledger.create_task_if_absent(&seed_row)?;
+                ledger.update_task_status(task_id, status, now)
+            });
+        match written {
             Ok(moved) => {
+                if remove_on_success {
+                    self.shared
+                        .goal_task_ledger_bindings
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(task_id);
+                }
                 tracing::debug!(
-                    task_id = %event.task.id,
-                    goal_id = %binding.goal_id,
+                    task_id,
+                    goal_id = %binding.goal_row.goal_id,
                     status,
                     moved,
+                    remove_on_success,
                     "goal task-row terminal settle"
                 );
             }
             Err(error) => {
+                // Binding deliberately left in place: a redelivered change
+                // event (the feed multi-fires for terminal tasks) retries.
                 tracing::debug!(
-                    task_id = %event.task.id,
-                    goal_id = %binding.goal_id,
+                    task_id,
+                    goal_id = %binding.goal_row.goal_id,
                     status,
                     %error,
-                    "goal task-row terminal settle failed; row left as-is"
+                    "goal task-row terminal settle failed; binding kept for retry"
                 );
             }
         }
+    }
+
+    /// #2055 review round 2 — test-only visibility into the binding map so
+    /// effect tests can assert the lifecycle (kept across an observer-
+    /// provisional failure, removed after a final settle).
+    #[cfg(test)]
+    pub(crate) fn goal_task_binding_exists_for_test(&self, task_id: &str) -> bool {
+        self.shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(task_id)
     }
 
     /// #1857 PR 5a — stash the controller workspace binding on the goal record
@@ -17046,8 +17188,12 @@ mod tests {
 
     /// Wire a real `TaskSupervisor` exactly the way the runtime modes do:
     /// `set_on_register` resolves the session's active goal and records the
-    /// row; `set_on_terminal` routes into the unified sink (which settles
-    /// the row before any continuation routing).
+    /// row; the NAMED change listener settles terminal transitions; the
+    /// `on_terminal` sink stays wired for continuation routing (and must not
+    /// interfere with settling). These tests run WITHOUT a tokio runtime, so
+    /// `offload_goal_ledger_io` executes the ledger I/O inline and every
+    /// assertion below is deterministic; the offload branch has its own
+    /// `#[tokio::test]` coverage.
     fn wire_supervisor_for_goal_task_rows(
         supervisor: &octos_agent::TaskSupervisor,
         session: &SessionKey,
@@ -17070,6 +17216,7 @@ mod tests {
                 task,
             );
         });
+        install_goal_task_row_settle_listener(supervisor);
         supervisor.set_on_terminal(move |event| {
             route_terminal_event_to_continuation_queue(event, None);
         });
@@ -17131,14 +17278,15 @@ mod tests {
         assert_eq!(counts.get("running"), None);
     }
 
-    /// #2054 failure side: a failed task flips its row to `failed` through
-    /// the sink — INCLUDING a failure whose synth-ack was never emitted
-    /// (the sink suppresses the recovery continuation for those, but the
-    /// ledger settle must still happen). `Cancelled` collapses into
-    /// `Failed` upstream in `TerminalOutcome`, so `failed` is also what a
-    /// cancelled task lands as.
+    /// #2054 failure side: an owner-reported failure flips its row to
+    /// `failed` through the change feed — INCLUDING a failure whose
+    /// synth-ack was never emitted (the terminal sink suppresses the
+    /// recovery continuation for those; settling rides `notify_change`, so
+    /// the ledger write is unaffected). An owner failure is FINAL
+    /// (`mark_completed` refuses to override it), so the binding is
+    /// released on settle.
     #[test]
-    fn goal_bound_registration_failure_settles_failed_row_through_the_sink() {
+    fn goal_bound_registration_failure_settles_failed_row_through_the_change_feed() {
         let dir = tempfile::TempDir::new().unwrap();
         let profile = "tenant-taskrows-fail";
         let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-fail");
@@ -17161,6 +17309,210 @@ mod tests {
             row.status, "failed",
             "a synth-ack-suppressed failure still settles its ledger row"
         );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "an owner failure is final — the binding is released"
+        );
+    }
+
+    /// #2055 review round 2 (hole a): `cancel` never fires `notify_terminal`
+    /// — settling rides the change feed precisely so a cancelled goal-bound
+    /// task neither leaks its binding nor leaves a `running` row. The
+    /// ledger keeps the #2054 vocabulary: cancellation lands as `failed`.
+    #[test]
+    fn cancelled_goal_bound_task_settles_failed_and_releases_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-cancel";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-cancel");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register("web_probe", "call-rows-cancel", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        supervisor.cancel(&task_id).expect("cancel");
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "failed",
+            "cancellation settles as `failed` (the #2054 vocabulary)"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "cancellation is final — the binding is released"
+        );
+    }
+
+    /// #2055 review round 2 (Additional-1): an OBSERVER-provisional failure
+    /// settles `failed` but keeps its binding, so the owner's later
+    /// completion (`mark_completed` overriding `failed_by_observer` —
+    /// task_supervisor.rs:2527) corrects the row to `complete` through the
+    /// change feed and the ledger's one admitted terminal→terminal
+    /// transition. The binding is released once the correction lands.
+    #[test]
+    fn observer_failure_then_owner_completion_corrects_row_to_complete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-correct";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-correct");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register(
+            "review_worker",
+            "call-rows-correct",
+            Some(&wire.to_string()),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed_observed(&task_id, "unknown tool: write_file".to_string());
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(row.status, "failed", "the provisional failure lands first");
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "a provisional failure keeps the binding open for the correction"
+        );
+
+        supervisor.mark_completed(&task_id, vec![]);
+
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "complete",
+            "the owner's completion corrects the provisional failure in the ledger"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the correction closes the binding"
+        );
+    }
+
+    /// #2055 review round 2 (H4/H6 ii): the production nesting path — a
+    /// snapshot registry's FRESH supervisor inherits the observer pair, so
+    /// a registration on the nested child still creates its ledger row.
+    #[test]
+    fn nested_snapshot_child_registration_creates_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-nested";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-nested");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let parent_registry = octos_agent::ToolRegistry::new();
+        wire_supervisor_for_goal_task_rows(
+            &parent_registry.supervisor(),
+            &wire,
+            profile,
+            dir.path(),
+        );
+
+        let child_registry = parent_registry.snapshot_excluding(&[]);
+        let child = child_registry.supervisor();
+        let task_id = child.register("nested_probe", "call-rows-nested", Some(&wire.to_string()));
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger
+            .get_task(&task_id)
+            .expect("read row")
+            .expect("the nested child's registration created a row");
+        assert_eq!(row.status, "running");
+        assert_eq!(row.title, "nested_probe");
+
+        // And the inherited settle listener flips it at terminal.
+        child.mark_running(&task_id);
+        child.mark_completed(&task_id, vec![]);
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(row.status, "complete");
+    }
+
+    /// #2055 review round 2 (Additional-3): with the I/O offloaded, nothing
+    /// orders the creation write against the settle write. Drive the two
+    /// blocking cores directly in REVERSE order: the settle seeds the row
+    /// with its terminal status, and the late creation write preserves it —
+    /// both orders converge on the same terminal row.
+    #[test]
+    fn settle_before_create_ordering_converges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let binding = GoalTaskLedgerBinding {
+            goal_row: octos_fleet::Goal {
+                goal_id: "goal-order".to_string(),
+                objective: "converge".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            title: "web_probe".to_string(),
+            assigned_peer: None,
+            profile_data_dir: dir.path().to_path_buf(),
+        };
+
+        // Settle lands FIRST (fresh ledger file — the settle is
+        // self-sufficient and seeds goal + task rows itself).
+        orchestrator.settle_goal_task_row_blocking(&binding, "task-order", "complete", true);
+        // The creation offload arrives LATE and must not resurrect it.
+        InProcessAgentOrchestrator::record_goal_task_row_blocking(&binding, "task-order");
+
+        let ledger = octos_fleet::GoalLedger::open(binding.ledger_path()).expect("open ledger");
+        let row = ledger
+            .get_task("task-order")
+            .expect("read row")
+            .expect("settle created the row");
+        assert_eq!(
+            row.status, "complete",
+            "a late creation write preserves the settled terminal"
+        );
+    }
+
+    /// #2055 review round 2 (H9): inside a tokio runtime the observer
+    /// callbacks only stash and spawn — the SQLite I/O lands on the
+    /// blocking pool. Bounded poll for the offloaded row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offloaded_registration_write_lands_from_within_a_runtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-offload";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-offload");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id =
+            supervisor.register("web_probe", "call-rows-offload", Some(&wire.to_string()));
+
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+        let mut row = None;
+        for _ in 0..100 {
+            if let Ok(ledger) = octos_fleet::GoalLedger::open(&ledger_path)
+                && let Ok(found @ Some(_)) = ledger.get_task(&task_id)
+            {
+                row = found;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let row = row.expect("the offloaded creation write landed");
+        assert_eq!(row.status, "running");
     }
 
     /// A session with NO goal binding creates nothing — that is correct
@@ -17249,25 +17601,6 @@ mod tests {
             .expect("open ledger");
         let row = ledger.get_task(&task_id).expect("read row").expect("row");
         assert_eq!(row.status, "complete");
-    }
-
-    /// #2055 wiring guard: BOTH runtime modes must wire the registration
-    /// observer next to their existing `set_on_terminal` call. Source-scan
-    /// needle in the `commands::serve::tests` tradition — the closures
-    /// themselves are exercised by the supervisor-driven tests above; this
-    /// pins that production actually installs them.
-    #[test]
-    fn runtime_modes_wire_the_registration_observer() {
-        let session_actor = include_str!("../session_actor.rs");
-        assert!(
-            session_actor.contains("set_on_register"),
-            "session_actor (gateway mode) must wire TaskSupervisor::set_on_register"
-        );
-        let ui_protocol_transport = include_str!("../api/ui_protocol_transport.rs");
-        assert!(
-            ui_protocol_transport.contains("set_on_register"),
-            "ui_protocol_transport (WS/serve mode) must wire TaskSupervisor::set_on_register"
-        );
     }
 
     /// Peer-fleet auto-synthesis — the synthesis continuation dedupes PER-MASTER:

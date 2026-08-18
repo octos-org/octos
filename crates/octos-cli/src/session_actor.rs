@@ -3435,6 +3435,12 @@ impl ActorFactory {
                 task,
             );
         });
+        // #2054 (review round 2) — the settle half rides the change feed as
+        // a NAMED listener (not the `on_terminal` sink below): `cancel`
+        // emits only `notify_change`, and the sink's once-per-task dedupe
+        // would swallow the owner's failed→complete correction. Inherited
+        // by nested child supervisors together with `on_register`.
+        crate::autonomy::agent_orchestrator::install_goal_task_row_settle_listener(&supervisor);
         // Gap-1 unification: the single terminal sink, also wired BEFORE
         // `enable_persistence` (see the combined ordering note above). Routes
         // BOTH success (ChildCompleted) AND failure (recovery) re-entry

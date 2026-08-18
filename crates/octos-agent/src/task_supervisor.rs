@@ -1614,6 +1614,49 @@ impl TaskSupervisor {
         *guard = Some(Arc::new(cb));
     }
 
+    /// #2055 review round 2 — copy the REGISTRATION observers from `parent`
+    /// onto this (freshly created) supervisor: the `on_register` callback
+    /// and the NAMED `on_change_listeners` map. Called wherever a child /
+    /// nested supervisor is minted (`ToolRegistry::snapshot_excluding`, the
+    /// nested-spawn child registry), so goal-ledger task rows cover nested
+    /// subagent registrations instead of silently stopping at the first
+    /// fresh supervisor.
+    ///
+    /// Deliberately NOT copied: the primary `on_change`, `on_failure`,
+    /// `on_terminal`, and `on_relaunch` callbacks — their wake/continuation
+    /// semantics are per-instance by design (a child's terminal event must
+    /// not double-drive the parent's re-entry wiring). Existing entries
+    /// under the same listener key are replaced; entries only the child has
+    /// are kept. Both copies are `Arc` clones — cheap, and later re-wiring
+    /// on either side does not affect the other.
+    pub fn inherit_registration_observers(&self, parent: &TaskSupervisor) {
+        let parent_register = parent
+            .on_register
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(callback) = parent_register {
+            let mut guard = self.on_register.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(callback);
+        }
+        let parent_listeners: Vec<(String, OnChangeCallback)> = parent
+            .on_change_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(key, callback)| (key.clone(), Arc::clone(callback)))
+            .collect();
+        if !parent_listeners.is_empty() {
+            let mut guard = self
+                .on_change_listeners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (key, callback) in parent_listeners {
+                guard.insert(key, callback);
+            }
+        }
+    }
+
     /// Attach a [`ProgressReporter`] that receives a
     /// [`ProgressEvent::ToolProgress`] for every supervised runtime-state
     /// transition. The emitted event carries the originating `tool_call_id`

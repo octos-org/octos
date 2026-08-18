@@ -4400,3 +4400,110 @@ fn unwired_on_register_leaves_registration_untouched() {
         TaskStatus::Spawned
     );
 }
+
+/// #2055 review round 2 — child/nested supervisors must inherit the
+/// REGISTRATION observers (`on_register` + the NAMED `on_change_listeners`
+/// map) so goal-ledger task rows cover nested subagent registries — and
+/// must NOT inherit the primary `on_change` / `on_failure` / `on_terminal`
+/// callbacks, whose wake semantics are deliberately per-instance.
+#[test]
+fn inherit_registration_observers_copies_observer_pair_but_not_wake_callbacks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let parent = TaskSupervisor::new();
+    let register_calls = Arc::new(AtomicUsize::new(0));
+    let named_calls = Arc::new(AtomicUsize::new(0));
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let terminal_calls = Arc::new(AtomicUsize::new(0));
+
+    let register_c = register_calls.clone();
+    parent.set_on_register(move |_| {
+        register_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let named_c = named_calls.clone();
+    parent.set_on_change_listener("settle", move |_| {
+        named_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let primary_c = primary_calls.clone();
+    parent.set_on_change(move |_| {
+        primary_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let terminal_c = terminal_calls.clone();
+    parent.set_on_terminal(move |_| {
+        terminal_c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let child = TaskSupervisor::new();
+    child.inherit_registration_observers(&parent);
+
+    let id = child.register("web_probe", "call-inherit-1", Some("api:sess-inherit"));
+    child.mark_running(&id);
+    child.mark_completed(&id, vec![]);
+
+    assert_eq!(
+        register_calls.load(Ordering::SeqCst),
+        1,
+        "the child inherits on_register"
+    );
+    assert!(
+        named_calls.load(Ordering::SeqCst) >= 1,
+        "the child inherits the NAMED change listeners"
+    );
+    assert_eq!(
+        primary_calls.load(Ordering::SeqCst),
+        0,
+        "the primary on_change is per-instance and must NOT be inherited"
+    );
+    assert_eq!(
+        terminal_calls.load(Ordering::SeqCst),
+        0,
+        "on_terminal is per-instance and must NOT be inherited"
+    );
+}
+
+/// #2055 review round 2 — the production nesting path: a registry snapshot
+/// (`ToolRegistry::snapshot_excluding`) mints a FRESH supervisor (the
+/// deliberate per-subtree isolation), which used to drop the registration
+/// observers entirely — nested subagent registrations were invisible to the
+/// goal ledger. The fresh supervisor now inherits the observer pair while
+/// the task maps stay isolated.
+#[test]
+fn snapshot_excluding_child_supervisor_inherits_registration_observers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let parent_registry = crate::ToolRegistry::new();
+    let register_calls = Arc::new(AtomicUsize::new(0));
+    let named_calls = Arc::new(AtomicUsize::new(0));
+    let register_c = register_calls.clone();
+    parent_registry.supervisor().set_on_register(move |_| {
+        register_c.fetch_add(1, Ordering::SeqCst);
+    });
+    let named_c = named_calls.clone();
+    parent_registry
+        .supervisor()
+        .set_on_change_listener("settle", move |_| {
+            named_c.fetch_add(1, Ordering::SeqCst);
+        });
+
+    let child_registry = parent_registry.snapshot_excluding(&[]);
+    let child = child_registry.supervisor();
+    let id = child.register("nested_tool", "call-snap-1", Some("api:sess-snap"));
+    child.mark_running(&id);
+
+    assert_eq!(
+        register_calls.load(Ordering::SeqCst),
+        1,
+        "a registration on the snapshot's fresh supervisor reaches the parent's observer"
+    );
+    assert!(
+        named_calls.load(Ordering::SeqCst) >= 1,
+        "the named change listeners ride along onto the snapshot"
+    );
+    // The isolation contract is untouched: the child's task lives in the
+    // child's map only.
+    assert!(
+        parent_registry.supervisor().get_task(&id).is_none(),
+        "task maps stay per-subtree"
+    );
+    assert!(child.get_task(&id).is_some());
+}

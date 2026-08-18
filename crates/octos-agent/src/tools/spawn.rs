@@ -3892,6 +3892,21 @@ impl Tool for SpawnTool {
             // fan-out cap is per-subtree, not global. The grandchild's RESULT
             // still flows back via the inherited result sender / inline
             // output; only its task-tracking row stays subtree-local.
+            // #2055 review round 2 — the child registry above was built from
+            // scratch (`with_builtins_and_sandbox`), so its private
+            // supervisor has NO observers: nested subagent registrations
+            // were invisible to the goal-ledger recorder. Inherit the
+            // REGISTRATION observer pair (`on_register` + named
+            // `on_change_listeners`) from this delegate's own supervisor —
+            // the session/turn one the runtime wired — while the task map
+            // stays subtree-private (the isolation rationale above is about
+            // task-tracking rows, not observers). Wake callbacks are
+            // deliberately not inherited.
+            if let Some(parent_supervisor) = self.task_supervisor.as_ref() {
+                tools
+                    .supervisor()
+                    .inherit_registration_observers(parent_supervisor);
+            }
             let mut child_spawn = self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             child_spawn.task_supervisor = Some(tools.supervisor());
             tools.register(child_spawn);
