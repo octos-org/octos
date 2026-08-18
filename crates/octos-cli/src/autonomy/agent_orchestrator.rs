@@ -1394,7 +1394,20 @@ impl InProcessAgentOrchestrator {
     /// `ledger.set_session_scope` so the goal store and the ledger agree on
     /// each session's cwd scope. Mirrors
     /// [`UiProtocolLedger::set_session_scope`].
-    pub(crate) fn set_goal_scope(&self, session_id: &SessionKey, scope: Option<String>) {
+    /// Returns the goal-store key this registration establishes for
+    /// `session_id`, computed INSIDE the same `goal_scopes` lock acquisition
+    /// (codex #2065 round-3 W5): registration and capture used to be two
+    /// separate lock acquisitions (`set_goal_scope` then `scoped_goal_key`),
+    /// a TOCTOU on a multi-thread runtime — a concurrent same-wire open
+    /// could flip the last-writer-wins map between them and the caller
+    /// would pin the OTHER open's key. A caller that pins the RETURNED key
+    /// cannot observe an interleaved flip; the race is unrepresentable at
+    /// this capture site.
+    pub(crate) fn set_goal_scope(
+        &self,
+        session_id: &SessionKey,
+        scope: Option<String>,
+    ) -> SessionKey {
         // #1973 fix-round 4b — GC snapshot: the scoped-goal keys currently in
         // the store, taken (and the state lock RELEASED) BEFORE the
         // goal_scopes lock — the two locks must never nest in that order
@@ -1405,6 +1418,12 @@ impl InProcessAgentOrchestrator {
             .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Same injective encoding as `scoped_goal_key`, evaluated under THIS
+        // lock so it reflects exactly the registration below.
+        let registered_key = match scope.as_deref() {
+            Some(scope) => SessionKey(format!("{}\u{0}~cwd-{scope}", session_id.0)),
+            None => session_id.clone(),
+        };
         let changed = match scope {
             Some(scope) => {
                 self.mark_scope_wire_live(session_id);
@@ -1419,6 +1438,7 @@ impl InProcessAgentOrchestrator {
         if changed {
             self.persist_goal_scopes_locked(&scopes, Some(&gc_live_goal_keys));
         }
+        registered_key
     }
 
     /// PR 4b — register `scope` for `session_id` ONLY when no scope is registered
@@ -4312,20 +4332,23 @@ impl InProcessAgentOrchestrator {
     /// bump is process-local bookkeeping with two jobs: (a) recorded as the
     /// session watermark by `goal_event_passes_generation_guard`, it drops
     /// an in-process stale update racing an out-of-band clear at that
-    /// update's OWN send site, and (b) the delivery loop re-reads the
-    /// watermark before every attempt and ABANDONS this null once any newer
-    /// goal frame was admitted (superseded-abandon — the null is a
-    /// snapshot, not a command). It is NOT an ordering guarantee: the
-    /// counter is default-only runtime state and resets across restarts, so
-    /// the caller must order the null POSITIONALLY — after the open's
-    /// replay loop and after the live-broadcast backlog drain (see
-    /// `spawn_live_forwarder_with_goal_null_snapshot`).
+    /// update's OWN send site, and (b) the emit site re-reads the watermark
+    /// once more, admission-adjacent under the guard's own lock, and
+    /// ABANDONS this null if any newer goal frame was admitted since it was
+    /// built (superseded-abandon — the null is a snapshot, not a command).
+    /// It is NOT an ordering guarantee: the counter is default-only runtime
+    /// state and resets across restarts, so the caller must order the null
+    /// POSITIONALLY — synchronously in the open sequence, after the replay
+    /// loop and the live-broadcast backlog drain (see
+    /// `drain_open_backlog_then_emit_goal_null`).
     ///
-    /// codex #2065 round-2 Z1 — takes the goal-store key the caller PINNED
-    /// at open-registration time instead of a wire id this fn would
-    /// re-resolve: `scoped_goal_key` reads the process-global
-    /// last-writer-wins cwd map, which a concurrent same-wire/different-cwd
-    /// `session/open` can flip mid-open — suppression would then inspect
+    /// codex #2065 round-2 Z1 + round-3 W5 — takes the goal-store key the
+    /// caller PINNED at open-registration time: the key
+    /// [`Self::set_goal_scope`] RETURNS from inside its own lock, so
+    /// registration and capture are one acquisition and a concurrent
+    /// same-wire/different-cwd `session/open` can never flip the
+    /// last-writer-wins map between them. Re-resolving here (or capturing
+    /// via a second `scoped_goal_key` read) would let suppression inspect
     /// the OTHER folder's key and emit a spurious cleared for this folder's
     /// live chip. Same discipline as the turn path's turn-pinned scoped
     /// key. The wire id the client keys the chip by is recovered via
