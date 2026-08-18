@@ -4508,6 +4508,20 @@ impl Tool for SpawnTool {
                 for factory in &child_tool_factories {
                     tools.register_arc(factory());
                 }
+                // #2055 review round 3 — this DETACHED (background-mode,
+                // the default) branch builds its child registry from scratch
+                // exactly like the sync branch, so its private supervisor
+                // starts with no observers. Inherit the REGISTRATION
+                // observer pair from the parent supervisor here too —
+                // without this, a nested spawn under the DEFAULT mode
+                // registered its grandchild invisibly to the goal ledger
+                // while the (non-default) sync branch was covered. Task maps
+                // stay subtree-private; wake callbacks are not inherited.
+                if let Some(parent_supervisor) = task_supervisor.as_ref() {
+                    tools
+                        .supervisor()
+                        .inherit_registration_observers(parent_supervisor);
+                }
                 // Bind the detached child's OWN native `spawn` delegate (see
                 // the foreground `child_spawn_template` build). Mirrors the
                 // sync path: bind the template to THIS child registry's own

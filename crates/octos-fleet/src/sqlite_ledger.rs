@@ -235,6 +235,12 @@ impl GoalLedger {
                 assigned_peer TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
+                -- #2055 review round 3: provenance mark for the ONE admitted
+                -- terminal-to-terminal transition. 1 = this `failed` row is an
+                -- OBSERVER-provisional verdict the owner may still correct to
+                -- `complete` (task_supervisor.rs:2527); 0 = final (owner
+                -- failure, cancellation, or any non-failed status).
+                correctable INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (goal_id) REFERENCES goals(goal_id)
             );
 
@@ -301,6 +307,16 @@ impl GoalLedger {
             CREATE INDEX IF NOT EXISTS idx_decisions_goal ON decisions(goal_id, decided_at_ms);
             ",
         )?;
+        // #2055 review round 3 — best-effort migration for a tasks table
+        // created before `correctable` existed (`CREATE TABLE IF NOT EXISTS`
+        // never alters an existing table). The duplicate-column error on an
+        // already-migrated database is expected and swallowed; any other
+        // failure is also non-fatal here because the first statement that
+        // actually touches the column surfaces it loudly.
+        let _ = conn.execute(
+            "ALTER TABLE tasks ADD COLUMN correctable INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(())
     }
 
@@ -610,38 +626,97 @@ impl GoalLedger {
     /// - `running` → terminal  → 1 row  → `true`
     /// - terminal → same       → guard excludes → `false` (redelivery)
     /// - terminal → `running`  → guard excludes → `false` (late refresh)
-    /// - `failed` → `complete` → 1 row  → `true` (owner correction — below)
+    /// - correctable `failed` → `complete` → 1 row → `true` (correction)
     /// - any other terminal → terminal → guard excludes → `false`
     ///
-    /// #2055 review round 2 — `failed → complete` is the ONE admitted
-    /// terminal→terminal transition, mirroring the supervisor's own
-    /// authority model: `TaskSupervisor::mark_completed` overrides an
-    /// OBSERVER-derived provisional failure when the owner watched the
-    /// worker actually finish (task_supervisor.rs:2527's correction
-    /// semantics), and the ledger must be able to receive that correction.
-    /// `complete` remains immutable; `failed` refuses every non-`complete`
-    /// write; `updated_at_ms` records the LATEST admitted write and cannot
-    /// regress to a straggler.
+    /// #2055 review round 3 — the ONE admitted terminal→terminal transition
+    /// is PROVENANCE-GATED: `failed → complete` requires the row to carry
+    /// `correctable = 1`, which only
+    /// [`Self::update_task_status_with_provenance`] can stamp and only for a
+    /// `failed` write. That mirrors the supervisor's authority model —
+    /// `TaskSupervisor::mark_completed` overrides exactly an
+    /// OBSERVER-derived provisional failure (task_supervisor.rs:2527) — and
+    /// keeps every FINAL `failed` row (owner failure, cancellation) closed:
+    /// blanket failed→complete admission would let a genuinely-cancelled
+    /// row be flipped by a racing completion from another supervisor copy
+    /// (#2060). The correction clears the mark; `complete` is immutable;
+    /// `updated_at_ms` records the latest admitted write and cannot regress
+    /// to a straggler.
     ///
     /// Fidelity note: cancellation is collapsed into failure upstream
     /// (`TerminalOutcome` has no `Cancelled`; the change-feed settle maps
     /// `TaskStatus::Cancelled` to `"failed"` too), so a cancelled task lands
-    /// here as `"failed"` and the two are indistinguishable in the ledger.
+    /// here as `"failed"` and the two are indistinguishable in the ledger —
+    /// distinguishable only through the provenance mark.
+    ///
+    /// This plain form writes owner-final provenance (`correctable = 0`).
     pub fn update_task_status(
         &self,
         task_id: &str,
         new_status: &str,
         updated_at_ms: u64,
     ) -> Result<bool> {
+        self.update_task_status_with_provenance(task_id, new_status, false, updated_at_ms)
+    }
+
+    /// #2055 review round 3 — [`Self::update_task_status`] with explicit
+    /// correction provenance. `correctable = true` is meaningful only for a
+    /// `"failed"` write (the observer-provisional verdict); it is clamped to
+    /// `0` for every other status, so a completion can never re-open a row.
+    ///
+    /// Besides the correction itself, a correctable `failed` row also admits
+    /// an owner-final `failed` DOWNGRADE (`correctable 1 → 0`, status
+    /// unchanged): when the owner re-marks an observer-failed task, the
+    /// supervisor clears the provisional stamp, and the row must follow —
+    /// otherwise the correction window would stay open forever on a failure
+    /// the owner already confirmed. A provisional redelivery (`1 → 1`) stays
+    /// a no-op.
+    pub fn update_task_status_with_provenance(
+        &self,
+        task_id: &str,
+        new_status: &str,
+        correctable: bool,
+        updated_at_ms: u64,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        let stamp_correctable = i64::from(correctable && new_status == "failed");
         let changed = conn.execute(
-            "UPDATE tasks SET status = ?1, updated_at_ms = ?2
+            "UPDATE tasks SET status = ?1, updated_at_ms = ?2, correctable = ?4
              WHERE task_id = ?3
                AND (status NOT IN ('complete', 'failed')
-                    OR (status = 'failed' AND ?1 = 'complete'))",
-            params![new_status, updated_at_ms, task_id],
+                    OR (status = 'failed' AND correctable = 1 AND ?1 = 'complete')
+                    OR (status = 'failed' AND correctable = 1 AND ?1 = 'failed' AND ?4 = 0))",
+            params![new_status, updated_at_ms, task_id, stamp_correctable],
         )?;
         Ok(changed > 0)
+    }
+
+    /// #2055 review round 3 — every task row bound to `goal_id`, oldest
+    /// first. Read-side companion to [`Self::task_status_counts`] for
+    /// callers that need titles/status rather than aggregates.
+    pub fn tasks_for_goal(&self, goal_id: &str) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms
+             FROM tasks WHERE goal_id = ?1 ORDER BY created_at_ms, task_id",
+        )?;
+        let rows = stmt.query_map(params![goal_id], |row| {
+            Ok(Task {
+                task_id: row.get(0)?,
+                goal_id: row.get(1)?,
+                title: row.get(2)?,
+                detail: row.get(3)?,
+                status: row.get(4)?,
+                assigned_peer: row.get(5)?,
+                created_at_ms: row.get(6)?,
+                updated_at_ms: row.get(7)?,
+            })
+        })?;
+        let mut tasks = Vec::new();
+        for task in rows {
+            tasks.push(task?);
+        }
+        Ok(tasks)
     }
 
     /// Update goal status.
@@ -3135,38 +3210,45 @@ mod digest_integration_tests {
                 "a terminal task refuses the late non-terminal write {late:?}"
             );
         }
-        // #2055 review round 2 — `complete` after `failed` is now the ONE
-        // admitted terminal→terminal transition (this test originally
-        // asserted it refused): the supervisor's own authority model allows
-        // exactly it — `TaskSupervisor::mark_completed` overrides an
-        // OBSERVER-derived provisional failure when the owner watched the
-        // worker actually finish (task_supervisor.rs:2527's correction
-        // semantics), and the ledger must be able to receive that
-        // correction. `complete` remains immutable, and `failed` still
-        // refuses every non-`complete` write (asserted above).
-        assert!(ledger.update_task_status("t1", "complete", 4_000).unwrap());
+        // #2055 review round 3 — `complete` after an OWNER-reported `failed`
+        // is refused again: the correction admission is provenance-gated on
+        // the `correctable` column, and the plain writer stamps
+        // `correctable = 0` (owner-final). Only a row written through
+        // `update_task_status_with_provenance(.., correctable = true, ..)` —
+        // the observer-provisional case — admits the later completion.
+        // Blanket failed→complete admission would let a genuinely-cancelled
+        // row (cancellation also lands as `failed`) be flipped by a racing
+        // completion from another supervisor copy (#2060).
+        assert!(!ledger.update_task_status("t1", "complete", 4_000).unwrap());
 
         let task = ledger.get_task("t1").unwrap().unwrap();
-        assert_eq!(task.status, "complete");
-        assert_eq!(task.updated_at_ms, 4_000);
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.updated_at_ms, 2_000);
     }
 
-    /// #2055 review round 2 — the correction transition in full: a
-    /// provisional observer failure lands `failed`, the owner's completion
-    /// corrects it to `complete`, and from there the row is immutable
+    /// #2055 review round 3 — the provenance-gated correction in full: an
+    /// observer-provisional failure (written with `correctable = true`)
+    /// admits exactly the owner's later `complete`
+    /// (task_supervisor.rs:2527's correction semantics); the correction
+    /// clears the provenance mark, and from there the row is immutable
     /// (a straggler `failed` redelivery cannot undo the correction).
     #[test]
-    fn should_allow_exactly_failed_to_complete_and_keep_complete_immutable() {
+    fn should_allow_failed_to_complete_only_with_correctable_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
         seed_goal_with_task(&ledger, "g1", "t1", "running");
 
-        ledger.update_task_status("t1", "failed", 2_000).unwrap();
+        assert!(
+            ledger
+                .update_task_status_with_provenance("t1", "failed", true, 2_000)
+                .unwrap(),
+            "the provisional failure lands with correctable provenance"
+        );
         assert!(
             ledger.update_task_status("t1", "complete", 3_000).unwrap(),
-            "failed → complete is the owner-correction transition"
+            "failed → complete is admitted for a correctable row"
         );
-        for late in ["failed", "running", "pending"] {
+        for late in ["failed", "running", "pending", "complete"] {
             assert!(
                 !ledger.update_task_status("t1", late, 4_000).unwrap(),
                 "complete refuses every subsequent write ({late:?})"
@@ -3176,6 +3258,116 @@ mod digest_integration_tests {
         let task = ledger.get_task("t1").unwrap().unwrap();
         assert_eq!(task.status, "complete");
         assert_eq!(task.updated_at_ms, 3_000);
+        // The correction cleared the provenance mark (defense in depth —
+        // `complete` is immutable regardless). Same-module test, so the raw
+        // column read is fine.
+        let correctable: i64 = ledger
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT correctable FROM tasks WHERE task_id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(correctable, 0, "the correction clears correctable");
+    }
+
+    /// #2055 review round 3 — the owner's authoritative re-failure closes
+    /// the correction window: a correctable `failed` row admits the
+    /// owner-final `failed` downgrade (provenance cleared), after which the
+    /// completion is refused like any other final failure.
+    #[test]
+    fn should_close_correction_window_when_owner_confirms_the_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        assert!(
+            ledger
+                .update_task_status_with_provenance("t1", "failed", true, 2_000)
+                .unwrap()
+        );
+        // A provisional redelivery is a no-op, not a churn write.
+        assert!(
+            !ledger
+                .update_task_status_with_provenance("t1", "failed", true, 2_500)
+                .unwrap()
+        );
+        // The owner's confirming failure downgrades the provenance mark.
+        assert!(
+            ledger.update_task_status("t1", "failed", 3_000).unwrap(),
+            "the owner-final downgrade of a correctable row is admitted"
+        );
+        assert!(
+            !ledger.update_task_status("t1", "complete", 4_000).unwrap(),
+            "after the owner confirmed the failure, the completion is refused"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.updated_at_ms, 3_000);
+    }
+
+    /// #2055 review round 3 — the `correctable` column arrives via a
+    /// best-effort `ALTER TABLE` for databases created before the column
+    /// existed; the provenance-gated correction works on such a ledger.
+    #[test]
+    fn should_migrate_tasks_table_missing_the_correctable_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        // A pre-round-3 database shape: tasks table WITHOUT `correctable`.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                     title TEXT NOT NULL, detail TEXT NOT NULL,
+                     status TEXT NOT NULL, assigned_peer TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
+                 INSERT INTO goals VALUES ('g1', 'ship', 'active', 0, 1000, 0, 0, 1, 1);
+                 INSERT INTO tasks VALUES ('t1', 'g1', '', '', 'running', NULL, 1, 1);",
+            )
+            .unwrap();
+        }
+
+        let ledger = GoalLedger::open(&path).unwrap();
+        assert!(
+            ledger
+                .update_task_status_with_provenance("t1", "failed", true, 2_000)
+                .unwrap(),
+            "the migrated column accepts the provenance write"
+        );
+        assert!(
+            ledger.update_task_status("t1", "complete", 3_000).unwrap(),
+            "the correction works on a migrated ledger"
+        );
+        assert_eq!(ledger.get_task("t1").unwrap().unwrap().status, "complete");
+    }
+
+    /// #2055 review round 3 — goal-scoped task listing (used by effect
+    /// tests that identify rows by title when the task id is internal to a
+    /// detached child supervisor).
+    #[test]
+    fn should_list_tasks_for_exactly_one_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+        seed_goal_with_task(&ledger, "g2", "t2", "running");
+
+        let tasks = ledger.tasks_for_goal("g1").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "t1");
+        assert!(ledger.tasks_for_goal("g3").unwrap().is_empty());
     }
 
     /// The goal-facing point of the whole exercise: `task_status_counts` is

@@ -10634,23 +10634,14 @@ fn wire_goal_task_row_observers_for_cached_supervisor(
     profile_id: &str,
     profile_data_dir: &std::path::Path,
 ) {
-    let register_session = session_id.clone();
-    let register_profile = profile_id.to_owned();
-    let register_data_dir = profile_data_dir.to_path_buf();
-    supervisor.set_on_register(move |task| {
-        let orchestrator = default_agent_orchestrator();
-        let Some(goal_id) = orchestrator.active_goal_id(&register_session, &register_profile)
-        else {
-            return;
-        };
-        orchestrator.record_goal_task_registration(
-            &register_data_dir,
-            &register_profile,
-            &goal_id,
-            task,
-        );
-    });
-    crate::autonomy::agent_orchestrator::install_goal_task_row_settle_listener(supervisor);
+    // Round 3 — thin adapter over the SHARED installer so this site cannot
+    // drift from the per-turn / gateway wiring or from the effect tests.
+    crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+        supervisor,
+        session_id,
+        profile_id,
+        profile_data_dir,
+    );
 }
 
 fn install_skill_action_job_projection_listener(
@@ -29766,25 +29757,17 @@ async fn run_standalone_turn(
                     .clone()
                     .map(|goal_id| (goal_id, goal_charge_profile.clone()))
             });
-        let register_ledger_data_dir = session_runtime.profile.data_dir.clone();
-        task_supervisor.set_on_register(move |task| {
-            let Some((goal_id, profile_id)) = register_goal_binding.as_ref() else {
-                return;
-            };
-            default_agent_orchestrator().record_goal_task_registration(
-                &register_ledger_data_dir,
-                profile_id,
-                goal_id,
-                task,
-            );
-        });
-        // #2054 (review round 2) — the settle half rides the change feed as
-        // a NAMED listener (not the `on_terminal` sink below): `cancel`
-        // emits only `notify_change`, and the sink's once-per-task dedupe
-        // would swallow the owner's failed→complete correction. Inherited
-        // by nested child supervisors together with `on_register`.
-        crate::autonomy::agent_orchestrator::install_goal_task_row_settle_listener(
+        // Round 3 — the SHARED installer wires both halves (recorder +
+        // change-feed settle listener), with THIS turn's dispatch-time
+        // binding snapshot as the resolver. The settle rides the change
+        // feed as a NAMED listener (not the `on_terminal` sink below):
+        // `cancel` emits only `notify_change`, and the sink's once-per-task
+        // dedupe would swallow the owner's failed→complete correction.
+        // Inherited by nested child supervisors.
+        crate::autonomy::agent_orchestrator::install_goal_task_row_observers(
             &task_supervisor,
+            &session_runtime.profile.data_dir,
+            move || register_goal_binding.clone(),
         );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
         // (ChildCompleted) AND failure (recovery) re-entry through ONE
