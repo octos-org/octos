@@ -522,6 +522,53 @@ impl GoalLedger {
         Ok(rows.next().transpose()?)
     }
 
+    /// #2054 — settle a task's status. This is the writer whose absence left
+    /// every row frozen on the `"running"` FK stub it was inserted with, so
+    /// `task_status_counts` could only ever answer `{"running": N}` and a goal
+    /// could never observe its own work finishing.
+    ///
+    /// Returns `Ok(true)` when the row actually moved, `Ok(false)` for an
+    /// accepted no-op. A no-op is NOT an error: the caller is
+    /// `TaskSupervisor`'s terminal sink, which legitimately fires for tasks
+    /// that have no ledger row (never bound to a goal) and can fire more than
+    /// once for one task, because the strangler wiring keeps the legacy
+    /// `on_change` / `on_failure` callbacks alive alongside `on_terminal`.
+    ///
+    /// The guard is deliberately a first-terminal-wins rule rather than a
+    /// caller-supplied CAS pair like [`Self::cas_goal_status`]. The terminal
+    /// sink does not know what the ledger currently holds — it knows only what
+    /// just happened to the task — so demanding an `expected_status` would
+    /// force a read-then-write race at exactly the layer that must stay
+    /// fire-and-forget. Encoding the rule in the `WHERE` clause makes
+    /// redelivery and out-of-order delivery both harmless in one statement:
+    ///
+    /// - absent row            → 0 rows → `false`
+    /// - `running` → terminal  → 1 row  → `true`
+    /// - terminal → same       → guard excludes → `false` (redelivery)
+    /// - terminal → `running`  → guard excludes → `false` (late refresh)
+    /// - terminal → other terminal → guard excludes → `false`
+    ///
+    /// `updated_at_ms` therefore records the FIRST terminal, never a duplicate
+    /// or a straggler, and cannot regress.
+    ///
+    /// Fidelity note: `TerminalOutcome` collapses `Cancelled` into `Failed`
+    /// upstream, so a cancelled task lands here as `"failed"` and the two are
+    /// indistinguishable in the ledger.
+    pub fn update_task_status(
+        &self,
+        task_id: &str,
+        new_status: &str,
+        updated_at_ms: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE tasks SET status = ?1, updated_at_ms = ?2
+             WHERE task_id = ?3 AND status NOT IN ('complete', 'failed')",
+            params![new_status, updated_at_ms, task_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Update goal status.
     /// Update goal status with optimistic concurrency control (CAS).
     ///
@@ -2901,5 +2948,180 @@ mod digest_integration_tests {
             ledger.list_expired_open_escalations(11_001).unwrap().len(),
             1
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #2054 — task-status writer.
+    //
+    // Until this landed the ledger had `create_task` / `get_task` /
+    // `task_status_counts` and no `UPDATE tasks` anywhere, so every row
+    // stayed on the status it was inserted with (always `"running"`, written
+    // as an FK stub) and a goal could never observe one of its tasks
+    // finishing.
+    // ---------------------------------------------------------------------
+
+    /// Seed a goal + one task, both at `1_000`.
+    fn seed_goal_with_task(ledger: &GoalLedger, goal_id: &str, task_id: &str, status: &str) {
+        ledger
+            .create_goal(&Goal {
+                goal_id: goal_id.to_string(),
+                objective: "test".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        ledger
+            .create_task(&Task {
+                task_id: task_id.to_string(),
+                goal_id: goal_id.to_string(),
+                title: String::new(),
+                detail: String::new(),
+                status: status.to_string(),
+                assigned_peer: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn should_write_terminal_status_when_task_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        assert!(
+            ledger.update_task_status("t1", "complete", 2_000).unwrap(),
+            "a running task accepts a terminal transition"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "complete");
+        assert_eq!(task.updated_at_ms, 2_000);
+    }
+
+    #[test]
+    fn should_report_false_when_task_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+
+        assert!(
+            !ledger
+                .update_task_status("nope", "complete", 2_000)
+                .unwrap(),
+            "an absent task reports no-op rather than erroring — the terminal \
+             sink fires for tasks that predate goal binding"
+        );
+    }
+
+    /// Redelivery safety. The terminal sink is fire-and-forget and can fire
+    /// twice for one task (the strangler wiring deliberately keeps the legacy
+    /// `on_change` / `on_failure` callbacks alive alongside `on_terminal`), so
+    /// a repeat MUST NOT be an error and MUST NOT move the timestamp
+    /// backwards.
+    #[test]
+    fn should_stay_idempotent_when_the_same_terminal_is_redelivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        assert!(ledger.update_task_status("t1", "complete", 2_000).unwrap());
+        assert!(
+            !ledger.update_task_status("t1", "complete", 3_000).unwrap(),
+            "redelivery is a no-op, not a second write"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "complete");
+        assert_eq!(
+            task.updated_at_ms, 2_000,
+            "timestamp reflects the first delivery, not the duplicate"
+        );
+    }
+
+    /// Ordering safety. Nothing guarantees the supervisor's terminal event
+    /// reaches the ledger before a slower in-flight `running` refresh, so a
+    /// late non-terminal write must not resurrect a finished task.
+    #[test]
+    fn should_refuse_to_regress_once_the_task_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+        ledger.update_task_status("t1", "failed", 2_000).unwrap();
+
+        for late in ["running", "pending"] {
+            assert!(
+                !ledger.update_task_status("t1", late, 3_000).unwrap(),
+                "a terminal task refuses the late non-terminal write {late:?}"
+            );
+        }
+        // `complete` after `failed` is equally a regression: the first
+        // terminal wins, so a disagreeing second terminal cannot flip it.
+        assert!(!ledger.update_task_status("t1", "complete", 4_000).unwrap());
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.updated_at_ms, 2_000);
+    }
+
+    /// The goal-facing point of the whole exercise: `task_status_counts` is
+    /// what goal evaluation reads, and before #2054 it could only ever report
+    /// `{"running": N}`.
+    #[test]
+    fn should_reflect_terminal_writes_in_task_status_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+        for id in ["t2", "t3"] {
+            ledger
+                .create_task(&Task {
+                    task_id: id.to_string(),
+                    goal_id: "g1".to_string(),
+                    title: String::new(),
+                    detail: String::new(),
+                    status: "running".to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap();
+        }
+
+        ledger.update_task_status("t1", "complete", 2_000).unwrap();
+        ledger.update_task_status("t2", "failed", 2_000).unwrap();
+
+        let counts: std::collections::BTreeMap<String, u64> = ledger
+            .task_status_counts("g1")
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(counts.get("complete"), Some(&1));
+        assert_eq!(counts.get("failed"), Some(&1));
+        assert_eq!(counts.get("running"), Some(&1));
+    }
+
+    /// A task belongs to exactly one goal; a sibling goal's counts must not
+    /// shift when this one's task settles.
+    #[test]
+    fn should_leave_other_goals_untouched_when_a_task_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+        seed_goal_with_task(&ledger, "g2", "t2", "running");
+
+        ledger.update_task_status("t1", "complete", 2_000).unwrap();
+
+        let g2: std::collections::BTreeMap<String, u64> = ledger
+            .task_status_counts("g2")
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(g2.get("running"), Some(&1));
+        assert_eq!(g2.get("complete"), None);
     }
 }
