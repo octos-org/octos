@@ -4380,6 +4380,12 @@ impl Drop for AbortOnDrop {
 /// (`tick % 8 == 0`) so the cadence feels identical across surfaces.
 const STATUS_WORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// #2066 round 4 (codex fix 2) — cadence of the AppUI goal-turn in-flight
+/// heartbeat, mirroring the session actor's `IN_FLIGHT_HEARTBEAT_INTERVAL`
+/// (#2003): well under the 30-minute staleness horizon, coarse enough to be
+/// free.
+const APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// CJK code-point check shared with `status_indicator::has_cjk` — kept
 /// inline here to avoid pulling the channel-aware status_indicator
 /// module into the WS turn path.
@@ -31426,6 +31432,38 @@ async fn run_standalone_turn(
     // task future is dropped.
     let token_tracker = std::sync::Arc::new(octos_agent::TokenTracker::new());
     let token_tracker_task = std::sync::Arc::clone(&token_tracker);
+    // #2066 round 4 (codex fix 2) — the AppUI twin of the session actor's
+    // #2003 in-flight heartbeat: keep this goal turn's dispatch marker fresh
+    // WHILE the turn is genuinely producing. AppUI had NO refresh at all, so
+    // a legitimately long (>30min) goal turn's marker read stale — its settle
+    // tombstone purged before the late charge arrived, and a concurrent
+    // `/goal clear` could claim the "free" slot without parking a tombstone.
+    // Progress-gated exactly like the actor's: the refresh fires only when
+    // the shared TokenTracker has ADVANCED since the last tick, so a wedged
+    // turn stops being refreshed and ages out normally (#2003's contract).
+    // Touches the SCOPED goal store key — the key the drain claimed the
+    // marker under — not the wire session id. Aborted on every exit with the
+    // turn (AbortOnDrop).
+    let _in_flight_heartbeat = goal_context.as_ref().map(|ctx| {
+        let tracker = std::sync::Arc::clone(&token_tracker);
+        let marker_key = ctx.goal_session_key.clone();
+        let heartbeat = tokio::spawn(async move {
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let mut last = 0_u64;
+            loop {
+                tokio::time::sleep(APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL).await;
+                let seen = u64::from(tracker.input_tokens.load(AtomicOrdering::Relaxed))
+                    + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
+                if seen > last {
+                    last = seen;
+                    default_agent_orchestrator().touch_goal_dispatch_in_flight(&marker_key);
+                }
+            }
+        });
+        AbortOnDrop {
+            abort: heartbeat.abort_handle(),
+        }
+    });
     // task-turn-interrupt-steer-correlation-logs: every agent-side log line
     // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
     // `session`/`turn` from this span (postfix `.instrument` keeps the block
