@@ -477,6 +477,14 @@ jobs:
       - name: Background activity human sink (octos-cli)
         run: cargo test -p octos-cli --features api background_activity -- --nocapture
 
+      # #2062 goal-chip null snapshot: session/open must push an explicit
+      # `session/goal/cleared` when no goal is bound, so a goal cleared
+      # elsewhere can't survive a reconnect as a stale cached chip. Lives in
+      # the `api`-gated ui_protocol module — invisible to the unfeatured runs
+      # above, same reason as the §6 guard.
+      - name: Session-open goal null snapshot (octos-cli)
+        run: cargo test -p octos-cli --features api session_open_goal -- --nocapture
+
       # The smart_home/* WS methods are `api`-gated too, so the unfeatured
       # integration run above compiles this file to zero tests. Run it
       # explicitly: it is the only end-to-end coverage of the WS dispatch →

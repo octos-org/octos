@@ -16832,6 +16832,11 @@ async fn handle_session_open(
 ) -> bool {
     normalize_session_open_params_topic(&mut params);
     let topic_scope = params.topic.clone();
+    // #2062 — captured before `params` moves into `open_session_result`: the
+    // goal-chip null snapshot below resolves its profile with the SAME
+    // `resolve_autonomy_profile_id` the goal RPC surface uses, and that
+    // resolution wants the client's requested profile as its first input.
+    let requested_profile_id = params.profile_id.clone();
 
     // Subscribe to the live ledger broadcast BEFORE the replay query so any
     // event that lands while we're still computing replay/opened sits in the
@@ -16974,6 +16979,52 @@ async fn handle_session_open(
         for (task, _data_dir) in store.raw_tasks_for_session(&session_id.0) {
             if let Some(notification) = replay_task_updated_notification(&session_id, &task) {
                 let _ = send_notification_ephemeral(ws, ledger, notification);
+            }
+        }
+    }
+
+    // #2062 — goal-chip NULL snapshot. The chip is client state fed by server
+    // pushes, and everything above only re-delivers what the ledger retained:
+    // a goal cleared elsewhere (a second connection, another process on this
+    // data dir, or a serve restart that rebuilt the ledger) leaves this
+    // reconnect SILENT about goal state, so a client's cached chip survives —
+    // absence-of-message is indistinguishable from message-not-yet-arrived.
+    // Push the SAME `session/goal/cleared` the explicit clear RPC emits
+    // whenever no goal is bound for the resolved (session, profile): now
+    // "removed", "never existed", and "removed while you were away" are one
+    // message (codex `ThreadGoalCleared` parity). Sent EPHEMERAL like the
+    // task snapshot above (one client's catch-up state, not session history —
+    // reopen spam must not grow the durable ledger), AFTER the replay loop so
+    // a replayed stale `session/goal/updated` cannot land behind it on the
+    // wire, and stamped with a fresh #1959 generation so it also outranks one
+    // on the client's ordering rule. When a goal IS bound this emits nothing:
+    // the positive replay/live paths own the chip, and a spurious cleared
+    // would blank a live one.
+    if let Ok(goal_profile_id) = resolve_autonomy_profile_id(
+        Some(&session_id),
+        requested_profile_id.as_deref(),
+        connection_profile_id,
+    ) {
+        if let Some(cleared_json) = default_agent_orchestrator()
+            .session_goal_hydrate_cleared_event_json(&session_id, &goal_profile_id)
+        {
+            match serde_json::from_value::<octos_core::ui_protocol::SessionGoalClearedEvent>(
+                cleared_json,
+            ) {
+                Ok(event) => {
+                    let _ = send_notification_ephemeral(
+                        ws,
+                        ledger,
+                        UiNotification::SessionGoalCleared(event),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        session_id = %session_id,
+                        "session/open no-goal snapshot produced an unparseable cleared event",
+                    );
+                }
             }
         }
     }

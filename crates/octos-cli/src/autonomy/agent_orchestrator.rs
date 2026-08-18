@@ -4284,6 +4284,52 @@ impl InProcessAgentOrchestrator {
         }))
     }
 
+    /// #2062 — `SessionGoalCleared`-shaped NULL snapshot for the session
+    /// (re)open path: `Some(event JSON)` when NO goal is bound to
+    /// `session_id` for `profile_id`, `None` when a goal IS bound (the
+    /// positive chip state is owned by the durable replay + live update
+    /// pushes, untouched here). Silence is not a goal state: without this,
+    /// a client that cached a chip and reconnects after the goal was
+    /// cleared elsewhere (a second connection, another process on the same
+    /// data dir, or a serve restart that rebuilt the ledger) keeps
+    /// rendering it. "Removed", "never existed", and "removed while you
+    /// were away" must be ONE message — the same payload shape as the
+    /// explicit `session/goal/clear` result (`cleared: true` is what the
+    /// client's single null-the-chip reducer keys on).
+    ///
+    /// Emit-only: no goal state is read-modified. The #1959 generation
+    /// bump is the shared ordering stamp EVERY goal chip event must carry —
+    /// an unstamped `0` would let a replayed stale update outrank the null.
+    pub(crate) fn session_goal_hydrate_cleared_event_json(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> Option<Value> {
+        // #1666 residue — same scoped-store lookup as `clear_goal_impl`, so
+        // folder A's bound goal never reads as "unbound" through folder B's
+        // reuse of the wire id. A goal bound under a DIFFERENT profile also
+        // renders as unbound: this connection's profile can never see that
+        // goal, so its null is truthful (and keeps the chip tenant-scoped).
+        let key = self.scoped_goal_key(session_id);
+        let mut state = self.state();
+        if state
+            .goals
+            .get(&key)
+            .is_some_and(|goal| goal.profile_id == profile_id)
+        {
+            return None;
+        }
+        let generation = next_goal_event_generation(&mut state);
+        Some(json!({
+            "session_id": session_id,
+            "profile_id": profile_id,
+            "cleared": true,
+            "goal": Value::Null,
+            "generation": generation,
+            "transition_actor": "backend",
+        }))
+    }
+
     /// #1696 — read-only goal snapshot for the model's `goal_get` tool.
     /// Never errors: no goal (or a goal outside the profile scope) renders
     /// as `status: "none"` so the model gets a stable shape either way.

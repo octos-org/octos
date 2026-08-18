@@ -33779,3 +33779,230 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
     );
     handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// #2062 — session/open pushes an explicit NO-GOAL snapshot (goal-chip null
+// state). "No goal" used to be represented by SILENCE on (re)open, so a client
+// that cached a goal chip and reconnected after the goal was cleared elsewhere
+// (a second connection, another process on the same data dir, or a serve
+// restart that rebuilt the ledger) kept rendering the stale chip —
+// absence-of-message is indistinguishable from message-not-yet-arrived. The
+// open path now emits the SAME `session/goal/cleared` shape the explicit
+// `session/goal/clear` RPC emits whenever no goal is bound for the resolved
+// (session, profile), ephemeral (one client's catch-up state, not session
+// history) and AFTER the ledger replay loop so a replayed stale
+// `session/goal/updated` can never land behind it.
+//
+// CI: these run under the `session_open_goal` name filter in
+// .github/workflows/ci.yml (test-octos-cli job) — the `api`-gated module is
+// invisible to the unfeatured lib/integration steps (#2029).
+// ---------------------------------------------------------------------------
+
+/// Open `session_id` on a FRESH connection against the shared `state`/`ledger`
+/// (modelling a reconnect) and return every `session/goal/cleared` params
+/// payload pushed before the `session/opened` lifecycle notification (method
+/// `session/open`) — the last frame the open path sends before handing the
+/// connection to the live forwarder. A cleared emitted after that boundary
+/// would be indistinguishable from a live event, so collection stops there.
+async fn open_session_collecting_goal_cleared_frames(
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    request_id: &str,
+) -> Vec<Value> {
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let opened = handle_session_open(
+        &ws,
+        state,
+        ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        request_id.to_owned(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "session/open must succeed for {session_id}");
+    let result = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        result["id"],
+        json!(request_id),
+        "first frame is the RPC result"
+    );
+    let mut cleared_frames = Vec::new();
+    loop {
+        let frame = recv_rpc_json(&mut rx).await;
+        match frame["method"].as_str() {
+            Some("session/goal/cleared") => cleared_frames.push(frame["params"].clone()),
+            // The `session/opened` lifecycle notification closes the open
+            // path's send sequence.
+            Some("session/open") => break,
+            _ => {}
+        }
+    }
+    abort_live_forwarders(&forwarders, ledger).await;
+    cleared_frames
+}
+
+/// #2062 RED→GREEN: a session that opens with NO goal bound must receive an
+/// explicit `session/goal/cleared` null snapshot — silence is not a goal
+/// state. Payload matches the explicit `session/goal/clear` RPC shape:
+/// `cleared: true`, `goal: null`, a real (#1959) generation stamp, and the
+/// wire session id the client keys the chip by.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_emitted_when_no_goal_bound() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-snap-unbound".into());
+
+    let cleared =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-a").await;
+
+    assert_eq!(
+        cleared.len(),
+        1,
+        "open with no goal bound must push exactly one explicit no-goal snapshot"
+    );
+    let event = &cleared[0];
+    assert_eq!(event["session_id"], json!(session_id.0));
+    assert_eq!(event["profile_id"], json!(MAIN_PROFILE_ID));
+    assert_eq!(
+        event["cleared"],
+        json!(true),
+        "the client nulls the chip only on cleared=true"
+    );
+    assert!(
+        event["goal"].is_null(),
+        "a null snapshot carries no goal record"
+    );
+    assert!(
+        event["generation"].as_u64().unwrap_or(0) > 0,
+        "#1959 — every goal chip event must carry a real generation stamp"
+    );
+}
+
+/// #2062 inverse guard: a session that opens WITH a goal bound must NOT
+/// receive a `session/goal/cleared` — a spurious cleared would blank a live
+/// chip. The positive snapshot path (durable ledger replay + live charge
+/// pushes) stays untouched.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_suppressed_when_goal_bound() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-snap-bound".into());
+    default_agent_orchestrator()
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "keep the chip painted across reconnect".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal");
+
+    let cleared =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-b").await;
+
+    // Cleanup the process-global orchestrator BEFORE asserting so a failure
+    // does not leak the goal into sibling tests.
+    default_agent_orchestrator()
+        .clear_goal(GoalSessionRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("cleanup goal");
+
+    assert!(
+        cleared.is_empty(),
+        "open with a bound goal must not push a cleared (it would blank a live chip): {cleared:?}"
+    );
+}
+
+/// #2062 end-to-end shape from the issue: bind a goal, clear it "elsewhere"
+/// (directly on the orchestrator — no ledger event, exactly like a second
+/// connection or another process on the same data dir), then re-open. The
+/// reopen must re-emit the cleared null snapshot (idempotent null), and its
+/// #1959 generation must supersede the one from the first open so a stale
+/// update can never outrank it.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_reemitted_when_goal_cleared_elsewhere() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-snap-reopen".into());
+
+    // First open: nothing bound yet → explicit null snapshot.
+    let first =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-c1").await;
+    assert_eq!(
+        first.len(),
+        1,
+        "first open with no goal pushes the null snapshot"
+    );
+
+    default_agent_orchestrator()
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "cleared while you were away".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal");
+
+    // Reconnect while the goal is live → no cleared.
+    let bound =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-c2").await;
+    assert!(
+        bound.is_empty(),
+        "reopen with the goal live must stay positive: {bound:?}"
+    );
+
+    // The goal is cleared elsewhere: this connection's ledger never sees a
+    // `session/goal/cleared`, so WITHOUT the open-path push the client's
+    // cached chip would survive the next reconnect on silence alone.
+    default_agent_orchestrator()
+        .clear_goal(GoalSessionRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("clear goal elsewhere");
+
+    let reopened =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-c3").await;
+    assert_eq!(
+        reopened.len(),
+        1,
+        "reopen after an out-of-band clear must re-push the null snapshot"
+    );
+    let first_generation = first[0]["generation"].as_u64().expect("generation");
+    let reopened_generation = reopened[0]["generation"].as_u64().expect("generation");
+    assert!(
+        reopened_generation > first_generation,
+        "the re-emitted null snapshot must carry a newer generation \
+         ({reopened_generation} vs {first_generation})"
+    );
+}
