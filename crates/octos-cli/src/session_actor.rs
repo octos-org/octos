@@ -3403,6 +3403,31 @@ impl ActorFactory {
         supervisor.set_on_change(move |task| {
             forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
         });
+        // #2055 — create the goal-ledger task row at registration time,
+        // wired next to the unified terminal sink below (whose settle half,
+        // #2054, flips the row at terminal). The gateway actor wires its
+        // callbacks ONCE at init while goals come and go over the session's
+        // life, so the goal binding resolves at CALLBACK time via
+        // `active_goal_id` — the same resolver the #1935 interactive
+        // binding snapshot uses on the WS path. No active goal ⇒ no row;
+        // that is correct behavior, not an error. The recorder swallows
+        // every ledger error (registration must never fail, block, or panic
+        // on ledger I/O). `self.data_dir` is the profile data dir this path
+        // already hands to the goal-ledger sync (see
+        // `maybe_advance_goal_runtime_after_turn`).
+        // Round 3 — the SHARED installer wires both halves (recorder +
+        // change-feed settle listener), so this site cannot drift from the
+        // WS / cached-supervisor wiring or from the effect tests. The settle
+        // rides the change feed as a NAMED listener (not the `on_terminal`
+        // sink below): `cancel` emits only `notify_change`, and the sink's
+        // once-per-task dedupe would swallow the owner's failed→complete
+        // correction. Inherited by nested child supervisors.
+        crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+            &supervisor,
+            &session_key,
+            session_key.profile_id().unwrap_or(MAIN_PROFILE_ID),
+            &self.data_dir,
+        );
         // Gap-1 unification: the single terminal sink, also wired BEFORE
         // `enable_persistence` (see the combined ordering note above). Routes
         // BOTH success (ChildCompleted) AND failure (recovery) re-entry

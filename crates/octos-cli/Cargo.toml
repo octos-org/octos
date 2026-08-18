@@ -194,6 +194,11 @@ octos-store = { workspace = true, features = ["test-util"] }
 octos-services = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 wiremock = { workspace = true }
+# #2055 round 3 — the goal-task-row contention tests hold a real SQLite
+# write transaction against the goal ledger while asserting the executor
+# stays responsive and the settle retry converges. Test-only; production
+# SQLite access stays behind octos-fleet.
+rusqlite = { workspace = true }
 
 [[test]]
 name = "build_output_dir_validation"

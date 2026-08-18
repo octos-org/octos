@@ -283,6 +283,14 @@ jobs:
       - name: Test octos-pipeline
         run: cargo test -p octos-pipeline
 
+      # #2055 — octos-fleet was missing from this list entirely (the #2029
+      # failure mode at crate granularity: absent coverage prints nothing and
+      # looks like passing coverage), so the goal-ledger suite — including the
+      # #2054/#2057 task-status writer and the #2055 idempotent task-row
+      # upsert — never ran in CI.
+      - name: Test octos-fleet
+        run: cargo test -p octos-fleet
+
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
 

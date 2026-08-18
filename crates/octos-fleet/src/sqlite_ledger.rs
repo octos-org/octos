@@ -44,6 +44,56 @@ pub struct Task {
     pub updated_at_ms: u64,
 }
 
+/// #2055 review round 4 — the terminal authority of a task-settle write.
+/// Ranked to make the settled outcome ORDER-INDEPENDENT across scrambled
+/// write delivery (offloaded/retried writes give no ordering guarantee):
+/// a write lands iff its rank is strictly greater than the row's stored
+/// rank, first-wins within equal rank. The ledger status is DERIVED from
+/// the authority, so an illegal status/authority pairing is
+/// unrepresentable.
+///
+/// The ranking mirrors the authority model `TaskSupervisor` enforces
+/// internally (task_supervisor.rs:2575): an observer-provisional failure is
+/// the weakest verdict (the owner's completion corrects it), and a final
+/// failure — owner-reported failure or cancellation — refuses a later
+/// completion. Rank 2 beating rank 1 additionally makes the D-present
+/// orderings converge on `failed` even when the completion write was
+/// DELIVERED first; within one supervisor a final failure after a
+/// completion cannot be emitted at all (the supervisor's terminal guard
+/// refuses it), and whether a STALE supervisor copy's cancel should outrank
+/// the true owner's completion is cross-supervisor truth — #2060's problem,
+/// not this rule's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSettleAuthority {
+    /// An OBSERVER classified a mid-run signal as fatal without watching
+    /// the worker stop; the owner may still correct it. Lands `failed`.
+    ProvisionalFailure,
+    /// The owner watched its worker actually finish. Lands `complete`.
+    Completion,
+    /// Owner-reported failure or cancellation. Lands `failed`.
+    FinalFailure,
+}
+
+impl TaskSettleAuthority {
+    /// The persisted rank (`tasks.authority`); `-1` in the column means no
+    /// terminal verdict has been recorded yet.
+    pub fn rank(self) -> i64 {
+        match self {
+            TaskSettleAuthority::ProvisionalFailure => 0,
+            TaskSettleAuthority::Completion => 1,
+            TaskSettleAuthority::FinalFailure => 2,
+        }
+    }
+
+    /// The ledger status this authority writes.
+    pub fn ledger_status(self) -> &'static str {
+        match self {
+            TaskSettleAuthority::ProvisionalFailure | TaskSettleAuthority::FinalFailure => "failed",
+            TaskSettleAuthority::Completion => "complete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     /// Monotonic row ID (SQLite rowid, assigned on insert, never changes).
@@ -174,7 +224,20 @@ impl GoalLedger {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            match Self::open_inner(path, Some(std::time::Duration::from_secs(1))) {
+            // #2055 review round 4 — the `authority` schema migration runs
+            // HERE, inside the attempt (never in the common `open`, which
+            // executes on tokio workers): this profile is only ever called
+            // from blocking contexts, and a migration transaction that loses
+            // a lock race is retried exactly like a contended open.
+            let attempt_result = Self::open_inner(path, Some(std::time::Duration::from_secs(1)))
+                .and_then(|ledger| {
+                    {
+                        let mut conn = ledger.conn.lock().unwrap();
+                        Self::migrate_tasks_authority_column(&mut conn, path)?;
+                    }
+                    Ok(ledger)
+                });
+            match attempt_result {
                 Ok(ledger) => return Ok(ledger),
                 Err(err) if error_is_lock_contention(&err) && attempt + 1 < ATTEMPTS => {
                     last_err = Some(err);
@@ -235,6 +298,13 @@ impl GoalLedger {
                 assigned_peer TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
+                -- #2055 review round 4: persisted TERMINAL AUTHORITY rank.
+                -- -1 = no terminal verdict recorded; 0 = observer-provisional
+                -- failure; 1 = completion; 2 = final failure (owner failure /
+                -- cancellation). A settle write lands iff its rank is
+                -- STRICTLY greater than the stored rank, making the outcome
+                -- order-independent across scrambled write delivery.
+                authority INTEGER NOT NULL DEFAULT -1,
                 FOREIGN KEY (goal_id) REFERENCES goals(goal_id)
             );
 
@@ -301,6 +371,114 @@ impl GoalLedger {
             CREATE INDEX IF NOT EXISTS idx_decisions_goal ON decisions(goal_id, decided_at_ms);
             ",
         )?;
+        // #2055 review round 4: NO column migration here. `create_tables`
+        // runs inside the COMMON `open`, which executes on tokio workers
+        // (`goal_get` and every inline reader), and migration DDL is exactly
+        // the synchronous work this PR keeps off the executor. The
+        // `authority` migration lives in [`Self::open_with_busy_retry`],
+        // which is only ever called from blocking contexts — and every code
+        // path that references the column opens through it. Plain-`open`
+        // readers reference only pre-migration columns by name.
+        Ok(())
+    }
+
+    /// #2055 review round 7 (W3 test hook) — a test-only hook invoked INSIDE
+    /// the migration transaction, between the schema statements and the
+    /// commit, keyed by ledger path so parallel tests' migrations pass
+    /// through untouched. `None` in production builds by construction
+    /// (`cfg(test)` — zero cost). The callback is cloned out of the slot
+    /// before invocation so a blocking hook cannot stall other migrations
+    /// on the slot lock.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn migration_mid_transaction_hook()
+    -> &'static Mutex<Option<(std::path::PathBuf, Arc<dyn Fn() + Send + Sync>)>> {
+        static HOOK: std::sync::OnceLock<
+            Mutex<Option<(std::path::PathBuf, Arc<dyn Fn() + Send + Sync>)>>,
+        > = std::sync::OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Whether the `tasks` table currently carries `column` — schema
+    /// inspection via `pragma_table_info`, which never references the column
+    /// itself and returns an empty set for a missing table, so it is safe on
+    /// every schema generation.
+    fn tasks_has_column(conn: &Connection, column: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+            params![column],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// #2055 review round 5 — bring an existing `tasks` table onto the
+    /// `authority` schema, ATOMICALLY. All steps run inside ONE
+    /// `BEGIN IMMEDIATE` transaction and are decided by SCHEMA INSPECTION
+    /// (`pragma_table_info`), never by error-message substrings:
+    ///
+    /// - the previous statement-by-statement shape could commit the
+    ///   ALTER-ADD and then fail before the backfill; every later opener
+    ///   then saw the column present, skipped the backfill forever, and
+    ///   legacy terminal rows sat at authority `-1` (correctable).
+    /// - the `"no such column"` substring also matched REAL failures (a
+    ///   dependent index on the dropped column reports
+    ///   `error in index … no such column`), silently eating them.
+    ///
+    /// Steps, inside the transaction: (1) when `authority` is absent, add
+    /// it (default `-1`, identical to the `CREATE TABLE` shape) and stamp
+    /// every pre-existing terminal row FINAL (`authority = 2`) — a legacy
+    /// `failed` row must NOT become correctable, and the backfill can never
+    /// touch rows the current code writes because it runs only in the same
+    /// transaction as the column creation; (2) when the short-lived round-3
+    /// `correctable` column is present, drop it. Any statement failure
+    /// rolls the WHOLE migration back (the `Transaction` drop path), so no
+    /// partial schema state can persist; any error propagates to the caller
+    /// (`open_with_busy_retry`'s attempt loop, which retries the
+    /// lock-contention class and surfaces the rest).
+    ///
+    /// The pre-transaction fast path skips the write lock entirely on a
+    /// fully-migrated database; the checks are REPEATED inside the
+    /// transaction because two blocking-context openers can race the fast
+    /// path, and only the in-transaction view is serialized.
+    fn migrate_tasks_authority_column(conn: &mut Connection, path: &Path) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = path;
+        if Self::tasks_has_column(conn, "authority")?
+            && !Self::tasks_has_column(conn, "correctable")?
+        {
+            return Ok(());
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !Self::tasks_has_column(&tx, "authority")? {
+            tx.execute(
+                "ALTER TABLE tasks ADD COLUMN authority INTEGER NOT NULL DEFAULT -1",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET authority = 2 WHERE status IN ('complete', 'failed')",
+                [],
+            )?;
+        }
+        if Self::tasks_has_column(&tx, "correctable")? {
+            tx.execute("ALTER TABLE tasks DROP COLUMN correctable", [])?;
+        }
+        // W3 test hook: lets a test hold THIS transaction provably open
+        // while it fires concurrent creation attempts. Path-keyed; absent
+        // in production builds.
+        #[cfg(test)]
+        {
+            let hook = Self::migration_mid_transaction_hook()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(hook_path, _)| hook_path == path)
+                .map(|(_, callback)| Arc::clone(callback));
+            if let Some(callback) = hook {
+                callback();
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -392,6 +570,39 @@ impl GoalLedger {
         Ok(admitted > 0)
     }
 
+    /// #2055 review round 2 — create a goals row only when none exists yet
+    /// (`INSERT … ON CONFLICT(goal_id) DO NOTHING`), the goals-side twin of
+    /// [`Self::create_task_if_absent`].
+    ///
+    /// For FK-parent seeding by the task-row registration recorder, which
+    /// must NEVER update a goals row: [`Self::upsert_goal`]'s monotonic
+    /// guard admits equal `updated_at_ms` (millisecond resolution), so a
+    /// delayed stale `active` snapshot could overwrite a same-millisecond
+    /// `paused`/`blocked`/`budget_limited`/`cleared` row and regress its
+    /// counters. This can't: an existing row — whatever its state — is
+    /// preserved byte-for-byte. Returns `Ok(true)` when a row was inserted,
+    /// `Ok(false)` for the preserve-existing no-op.
+    pub fn create_goal_if_absent(&self, goal: &Goal) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(goal_id) DO NOTHING",
+            params![
+                goal.goal_id,
+                goal.objective,
+                goal.status,
+                goal.tokens_used,
+                goal.token_budget,
+                goal.continuations_used,
+                goal.revision,
+                goal.created_at_ms,
+                goal.updated_at_ms,
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
     /// #1973 fix-round 3/4 — targeted STATUS compare-and-swap for an
     /// administrative transition (park/clear) whose guarded [`Self::upsert_goal`]
     /// was rejected by the monotonic-token clause. Flips ONLY the status (+
@@ -480,24 +691,140 @@ impl GoalLedger {
         Ok(rows.next().transpose()?)
     }
 
+    /// #2055 review round 5 — the authority rank a freshly CREATED row
+    /// starts at, derived from the status it is created with: a terminal
+    /// status written at creation is an owner-recorded fact, so `complete`
+    /// starts at the completion rank and `failed` at the FINAL-failure rank
+    /// (an observer-provisional failure is only ever expressible through
+    /// [`Self::settle_task_status`], never at creation). Without this, a
+    /// terminal creation sat at `-1` and the nonterminal-refresh guard
+    /// admitted a plain `running` write over a valid terminal row.
+    fn creation_authority_for_status(status: &str) -> i64 {
+        match status {
+            "complete" => TaskSettleAuthority::Completion.rank(),
+            "failed" => TaskSettleAuthority::FinalFailure.rank(),
+            _ => -1,
+        }
+    }
+
     /// Create a new task.
+    ///
+    /// Round 5: the initial `authority` is derived from `task.status` (see
+    /// [`Self::creation_authority_for_status`]) when the column exists; on a
+    /// not-yet-migrated legacy database (reachable through the plain
+    /// [`Self::open`], which deliberately runs no migration) the statement
+    /// falls back to the legacy shape and never references the column.
+    ///
+    /// Round 6 (V3): the schema inspection and the insert run inside ONE
+    /// `BEGIN IMMEDIATE` transaction. As two autocommit statements they were
+    /// a TOCTOU: a concurrent connection could commit the migration between
+    /// the check and the insert, and the busy handler makes that the COMMON
+    /// interleaving, not a rare one — the legacy-shape insert blocks on the
+    /// migration's write lock and then executes on the migrated table,
+    /// landing a terminal row at authority `-1` AFTER the backfill already
+    /// ran (permanently wrong-ranked). `BEGIN IMMEDIATE` serializes against
+    /// the migration's own `BEGIN IMMEDIATE` transaction, so the pair
+    /// either runs fully before the migration (and the backfill stamps the
+    /// row) or fully after it (and the derived-authority shape is chosen) —
+    /// the interleaving is impossible, not merely unlikely. Structural
+    /// argument only; the concurrency test is a tripwire.
     pub fn create_task(&self, task: &Task) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                task.task_id,
-                task.goal_id,
-                task.title,
-                task.detail,
-                task.status,
-                task.assigned_peer,
-                task.created_at_ms,
-                task.updated_at_ms,
-            ],
-        )?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if Self::tasks_has_column(&tx, "authority")? {
+            tx.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms, authority)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                    Self::creation_authority_for_status(&task.status),
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// #2055 — create a task row only when none exists yet
+    /// (`INSERT … ON CONFLICT(task_id) DO NOTHING`).
+    ///
+    /// Registration is the caller: the same task can be registered,
+    /// relaunched, and re-registered across a restart, and findings /
+    /// denials / escalations still write FK stubs for tasks that may already
+    /// have a row. All of those must PRESERVE an existing row — its status
+    /// (including a status that already went terminal via
+    /// [`Self::update_task_status`]), title, and timestamps — rather than
+    /// error or overwrite. Returns `Ok(true)` when a row was inserted,
+    /// `Ok(false)` for the preserve-existing no-op.
+    ///
+    /// Round 5: the initial `authority` is derived from `task.status` (see
+    /// [`Self::creation_authority_for_status`]) when the column exists; the
+    /// legacy fallback mirrors [`Self::create_task`].
+    ///
+    /// Round 6 (V3): inspection + insert in ONE `BEGIN IMMEDIATE`
+    /// transaction — see [`Self::create_task`] for the TOCTOU this closes
+    /// and the serialization argument.
+    pub fn create_task_if_absent(&self, task: &Task) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = if Self::tasks_has_column(&tx, "authority")? {
+            tx.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms, authority)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(task_id) DO NOTHING",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                    Self::creation_authority_for_status(&task.status),
+                ],
+            )?
+        } else {
+            tx.execute(
+                "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(task_id) DO NOTHING",
+                params![
+                    task.task_id,
+                    task.goal_id,
+                    task.title,
+                    task.detail,
+                    task.status,
+                    task.assigned_peer,
+                    task.created_at_ms,
+                    task.updated_at_ms,
+                ],
+            )?
+        };
+        tx.commit()?;
+        Ok(inserted > 0)
     }
 
     /// Get a task by ID.
@@ -542,31 +869,112 @@ impl GoalLedger {
     /// fire-and-forget. Encoding the rule in the `WHERE` clause makes
     /// redelivery and out-of-order delivery both harmless in one statement:
     ///
-    /// - absent row            → 0 rows → `false`
-    /// - `running` → terminal  → 1 row  → `true`
-    /// - terminal → same       → guard excludes → `false` (redelivery)
-    /// - terminal → `running`  → guard excludes → `false` (late refresh)
-    /// - terminal → other terminal → guard excludes → `false`
+    /// - absent row                   → 0 rows → `false`
+    /// - no verdict (`-1`) → any rank → 1 row  → `true`
+    /// - equal rank redelivery        → guard excludes → `false` (first wins)
+    /// - lower rank after higher      → guard excludes → `false`
+    /// - higher rank after lower      → 1 row  → `true`
+    /// - non-terminal refresh after any verdict → guard excludes → `false`
     ///
-    /// `updated_at_ms` therefore records the FIRST terminal, never a duplicate
-    /// or a straggler, and cannot regress.
+    /// #2055 review round 4 — terminal writes route through
+    /// [`Self::settle_task_status`]'s authority-rank rule (see
+    /// [`TaskSettleAuthority`]); this string-status compatibility form maps
+    /// `"complete"` → `Completion` and `"failed"` → `FinalFailure`
+    /// (owner-final — the historical semantics of this API), and treats any
+    /// other status as a non-terminal refresh admitted only while the row
+    /// carries no terminal verdict.
     ///
-    /// Fidelity note: `TerminalOutcome` collapses `Cancelled` into `Failed`
-    /// upstream, so a cancelled task lands here as `"failed"` and the two are
-    /// indistinguishable in the ledger.
+    /// Requires the migrated schema: every statement here references the
+    /// `authority` column, so production callers reach this only through
+    /// connections opened by [`Self::open_with_busy_retry`] (which runs the
+    /// migration) or on databases created by the current schema batch.
+    ///
+    /// Fidelity note: cancellation is collapsed into failure upstream
+    /// (`TerminalOutcome` has no `Cancelled`; the change-feed settle maps
+    /// `TaskStatus::Cancelled` to `FinalFailure` too), so a cancelled task
+    /// lands here as `"failed"` and the two are indistinguishable in the
+    /// ledger — distinguishable only through the authority rank.
     pub fn update_task_status(
         &self,
         task_id: &str,
         new_status: &str,
         updated_at_ms: u64,
     ) -> Result<bool> {
+        match new_status {
+            "complete" => {
+                self.settle_task_status(task_id, TaskSettleAuthority::Completion, updated_at_ms)
+            }
+            "failed" => {
+                self.settle_task_status(task_id, TaskSettleAuthority::FinalFailure, updated_at_ms)
+            }
+            _ => {
+                let conn = self.conn.lock().unwrap();
+                let changed = conn.execute(
+                    "UPDATE tasks SET status = ?1, updated_at_ms = ?2
+                     WHERE task_id = ?3 AND authority < 0",
+                    params![new_status, updated_at_ms, task_id],
+                )?;
+                Ok(changed > 0)
+            }
+        }
+    }
+
+    /// #2055 review round 4 — the ONE terminal admission rule: the write
+    /// lands iff its authority rank is STRICTLY greater than the row's
+    /// stored rank (first-wins within equal rank), and both the status and
+    /// the stored rank come from the [`TaskSettleAuthority`] itself, so an
+    /// illegal status/authority pairing cannot be expressed. `Ok(false)` is
+    /// a normal no-op (absent row, redelivery, or an outranked write).
+    ///
+    /// Order-independence this buys (P = provisional failure, C =
+    /// completion, D = final failure): every delivery order containing a D
+    /// ends `failed`; P and C alone end `complete` in either order.
+    pub fn settle_task_status(
+        &self,
+        task_id: &str,
+        authority: TaskSettleAuthority,
+        updated_at_ms: u64,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "UPDATE tasks SET status = ?1, updated_at_ms = ?2
-             WHERE task_id = ?3 AND status NOT IN ('complete', 'failed')",
-            params![new_status, updated_at_ms, task_id],
+            "UPDATE tasks SET status = ?1, updated_at_ms = ?2, authority = ?4
+             WHERE task_id = ?3 AND ?4 > authority",
+            params![
+                authority.ledger_status(),
+                updated_at_ms,
+                task_id,
+                authority.rank()
+            ],
         )?;
         Ok(changed > 0)
+    }
+
+    /// #2055 review round 3 — every task row bound to `goal_id`, oldest
+    /// first. Read-side companion to [`Self::task_status_counts`] for
+    /// callers that need titles/status rather than aggregates.
+    pub fn tasks_for_goal(&self, goal_id: &str) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms
+             FROM tasks WHERE goal_id = ?1 ORDER BY created_at_ms, task_id",
+        )?;
+        let rows = stmt.query_map(params![goal_id], |row| {
+            Ok(Task {
+                task_id: row.get(0)?,
+                goal_id: row.get(1)?,
+                title: row.get(2)?,
+                detail: row.get(3)?,
+                status: row.get(4)?,
+                assigned_peer: row.get(5)?,
+                created_at_ms: row.get(6)?,
+                updated_at_ms: row.get(7)?,
+            })
+        })?;
+        let mut tasks = Vec::new();
+        for task in rows {
+            tasks.push(task?);
+        }
+        Ok(tasks)
     }
 
     /// Update goal status.
@@ -3060,13 +3468,712 @@ mod digest_integration_tests {
                 "a terminal task refuses the late non-terminal write {late:?}"
             );
         }
-        // `complete` after `failed` is equally a regression: the first
-        // terminal wins, so a disagreeing second terminal cannot flip it.
+        // #2055 review round 4 — `complete` after an OWNER-reported `failed`
+        // is refused: the plain writer maps `"failed"` to `FinalFailure`
+        // (rank 2), which outranks `Completion` (rank 1). Only an
+        // observer-provisional failure (rank 0, written through
+        // `settle_task_status`) admits the later completion. Blanket
+        // failed→complete admission would let a genuinely-cancelled row
+        // (cancellation also lands as `failed`) be flipped by a racing
+        // completion from another supervisor copy (#2060).
         assert!(!ledger.update_task_status("t1", "complete", 4_000).unwrap());
 
         let task = ledger.get_task("t1").unwrap().unwrap();
         assert_eq!(task.status, "failed");
         assert_eq!(task.updated_at_ms, 2_000);
+    }
+
+    /// #2055 review round 4 — the authority-gated correction: an
+    /// observer-provisional failure (rank 0) admits exactly the owner's
+    /// later completion (rank 1, task_supervisor.rs:2527's correction
+    /// semantics); afterwards the row refuses provisional redeliveries,
+    /// non-terminal refreshes, and completion redeliveries — only a FINAL
+    /// failure (rank 2) can still land, which is the deliberate
+    /// order-independence rule verified exhaustively below.
+    #[test]
+    fn should_allow_failed_to_complete_only_with_provisional_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        assert!(
+            ledger
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_000)
+                .unwrap(),
+            "the provisional failure lands at rank 0"
+        );
+        assert!(
+            ledger.update_task_status("t1", "complete", 3_000).unwrap(),
+            "failed → complete is admitted over a provisional verdict"
+        );
+        assert!(
+            !ledger
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 4_000)
+                .unwrap(),
+            "a straggler provisional write cannot undo the correction"
+        );
+        assert!(
+            !ledger.update_task_status("t1", "complete", 4_000).unwrap(),
+            "a completion redelivery is a no-op (first wins within a rank)"
+        );
+        for late in ["running", "pending"] {
+            assert!(
+                !ledger.update_task_status("t1", late, 4_000).unwrap(),
+                "a settled row refuses the non-terminal refresh {late:?}"
+            );
+        }
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "complete");
+        assert_eq!(task.updated_at_ms, 3_000);
+        // The stored rank is the completion's. Same-module test, so the raw
+        // column read is fine.
+        let authority: i64 = ledger
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT authority FROM tasks WHERE task_id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authority, 1);
+    }
+
+    /// #2055 review round 4 — the owner's authoritative re-failure closes
+    /// the correction window: rank 2 lands over the provisional rank 0,
+    /// after which the completion (rank 1) is refused. A provisional
+    /// redelivery in between is a no-op, not a retention refresh.
+    #[test]
+    fn should_close_correction_window_when_owner_confirms_the_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        assert!(
+            ledger
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_000)
+                .unwrap()
+        );
+        // A provisional redelivery is a no-op, not a churn write.
+        assert!(
+            !ledger
+                .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_500)
+                .unwrap()
+        );
+        // The owner's confirming failure outranks the provisional verdict.
+        assert!(
+            ledger.update_task_status("t1", "failed", 3_000).unwrap(),
+            "the owner-final failure is admitted over the provisional rank"
+        );
+        assert!(
+            !ledger.update_task_status("t1", "complete", 4_000).unwrap(),
+            "after the owner confirmed the failure, the completion is refused"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.updated_at_ms, 3_000);
+    }
+
+    /// #2055 review round 4 — the load-bearing order-independence matrix:
+    /// with P = provisional failure, C = completion, D = final failure,
+    /// EVERY delivery order containing a D ends `failed`, and P/C alone end
+    /// `complete` in either order. The write layer alone guarantees this —
+    /// no delivery-order assumptions anywhere above it.
+    #[test]
+    fn should_converge_every_authority_delivery_order() {
+        use TaskSettleAuthority::{Completion, FinalFailure, ProvisionalFailure};
+        let three_event_orders: [[TaskSettleAuthority; 3]; 6] = [
+            [ProvisionalFailure, Completion, FinalFailure],
+            [ProvisionalFailure, FinalFailure, Completion],
+            [Completion, ProvisionalFailure, FinalFailure],
+            [Completion, FinalFailure, ProvisionalFailure],
+            [FinalFailure, ProvisionalFailure, Completion],
+            [FinalFailure, Completion, ProvisionalFailure],
+        ];
+        for (index, order) in three_event_orders.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+            seed_goal_with_task(&ledger, "g1", "t1", "running");
+            for authority in order {
+                let _ = ledger.settle_task_status("t1", *authority, 2_000).unwrap();
+            }
+            let task = ledger.get_task("t1").unwrap().unwrap();
+            assert_eq!(
+                task.status, "failed",
+                "order #{index} {order:?} contains a final failure and must end failed"
+            );
+        }
+        for order in [
+            [ProvisionalFailure, Completion],
+            [Completion, ProvisionalFailure],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+            seed_goal_with_task(&ledger, "g1", "t1", "running");
+            for authority in order {
+                let _ = ledger.settle_task_status("t1", authority, 2_000).unwrap();
+            }
+            let task = ledger.get_task("t1").unwrap().unwrap();
+            assert_eq!(
+                task.status, "complete",
+                "{order:?} has no final failure and must end complete"
+            );
+        }
+    }
+
+    /// #2055 review round 4 — the `authority` column arrives via the
+    /// migration in `open_with_busy_retry` (never the common `open`, which
+    /// runs on tokio workers). Pre-existing terminal rows are stamped FINAL
+    /// — a legacy `failed` row must NOT become correctable — while legacy
+    /// non-terminal rows settle exactly like fresh ones.
+    #[test]
+    fn should_migrate_tasks_table_missing_the_authority_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        // A pre-#2055 database shape: tasks table with neither `authority`
+        // nor the short-lived round-3 `correctable`.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                     title TEXT NOT NULL, detail TEXT NOT NULL,
+                     status TEXT NOT NULL, assigned_peer TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
+                 INSERT INTO goals VALUES ('g1', 'ship', 'active', 0, 1000, 0, 0, 1, 1);
+                 INSERT INTO tasks VALUES ('legacy-failed', 'g1', '', '', 'failed', NULL, 1, 1);
+                 INSERT INTO tasks VALUES ('legacy-live', 'g1', '', '', 'running', NULL, 1, 1);",
+            )
+            .unwrap();
+        }
+
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        assert!(
+            !ledger
+                .update_task_status("legacy-failed", "complete", 2_000)
+                .unwrap(),
+            "a legacy failed row is stamped FINAL by the migration backfill \
+             and must not become correctable"
+        );
+        assert_eq!(
+            ledger.get_task("legacy-failed").unwrap().unwrap().status,
+            "failed"
+        );
+        // A legacy live row settles exactly like a fresh one.
+        assert!(
+            ledger
+                .settle_task_status(
+                    "legacy-live",
+                    TaskSettleAuthority::ProvisionalFailure,
+                    2_000
+                )
+                .unwrap()
+        );
+        assert!(
+            ledger
+                .update_task_status("legacy-live", "complete", 3_000)
+                .unwrap(),
+            "the provisional-then-correction flow works on a migrated ledger"
+        );
+    }
+
+    /// #2055 review round 4 — a database created from the short-lived
+    /// round-3 shape (with `correctable`) migrates too: the column is
+    /// dropped and its terminal rows are stamped FINAL alongside the
+    /// `authority` addition.
+    #[test]
+    fn should_migrate_round3_correctable_column_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                     title TEXT NOT NULL, detail TEXT NOT NULL,
+                     status TEXT NOT NULL, assigned_peer TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     correctable INTEGER NOT NULL DEFAULT 0,
+                     FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
+                 INSERT INTO goals VALUES ('g1', 'ship', 'active', 0, 1000, 0, 0, 1, 1);
+                 INSERT INTO tasks VALUES ('t1', 'g1', '', '', 'failed', NULL, 1, 1, 1);",
+            )
+            .unwrap();
+        }
+
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        let correctable_exists: i64 = ledger
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'correctable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(correctable_exists, 0, "the round-3 column is dropped");
+        assert!(
+            !ledger.update_task_status("t1", "complete", 2_000).unwrap(),
+            "the round-3 terminal row is stamped FINAL, not carried over as correctable"
+        );
+    }
+
+    /// #2055 review round 4/5 — a migration failure propagates; nothing is
+    /// swallowed by error-message matching (steps are decided by schema
+    /// inspection). Forced here by presenting a connection whose `tasks`
+    /// table does not exist.
+    #[test]
+    fn should_propagate_non_duplicate_migration_failures() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        // No `tasks` table at all: the inspection reports the column absent
+        // and the in-transaction ALTER fails with "no such table".
+        let error =
+            GoalLedger::migrate_tasks_authority_column(&mut conn, Path::new("unused-in-memory"))
+                .expect_err("a migration failure must propagate");
+        assert!(
+            error.to_string().contains("no such table"),
+            "unexpected error: {error}"
+        );
+        // And on an already-migrated table the helper is a clean no-op that
+        // takes no write transaction at all (fast path).
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                 task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                 title TEXT NOT NULL, detail TEXT NOT NULL,
+                 status TEXT NOT NULL, assigned_peer TEXT,
+                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                 authority INTEGER NOT NULL DEFAULT -1);",
+        )
+        .unwrap();
+        GoalLedger::migrate_tasks_authority_column(&mut conn, Path::new("unused-in-memory"))
+            .expect("an already-migrated table is a no-op");
+    }
+
+    /// The raw pre-#2055 schema (no `authority`, no `correctable`), used by
+    /// the atomicity fixtures below.
+    fn create_legacy_schema(conn: &rusqlite::Connection, extra: &str) {
+        conn.execute_batch(&format!(
+            "CREATE TABLE goals (
+                 goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                 status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                 token_budget INTEGER NOT NULL,
+                 continuations_used INTEGER NOT NULL DEFAULT 0,
+                 revision INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+             CREATE TABLE tasks (
+                 task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                 title TEXT NOT NULL, detail TEXT NOT NULL,
+                 status TEXT NOT NULL, assigned_peer TEXT,
+                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL{extra},
+                 FOREIGN KEY (goal_id) REFERENCES goals(goal_id));
+             INSERT INTO goals VALUES ('g1', 'ship', 'active', 0, 1000, 0, 0, 1, 1);
+             INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
+             VALUES ('legacy-failed', 'g1', '', '', 'failed', NULL, 1, 1);",
+        ))
+        .unwrap();
+    }
+
+    /// #2055 review round 5 (migration atomicity) — a failure AFTER the
+    /// ALTER-ADD rolls the WHOLE migration back: the pre-migration shape is
+    /// restored, so the next opener re-runs everything instead of seeing
+    /// the column present and skipping the terminal backfill forever. The
+    /// mid-migration failure is forced with an aborting trigger on the
+    /// backfill's UPDATE — a real table, a real partial-failure point.
+    #[test]
+    fn should_roll_back_whole_migration_when_a_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            create_legacy_schema(&conn, "");
+            conn.execute_batch(
+                "CREATE TRIGGER abort_backfill BEFORE UPDATE ON tasks
+                 BEGIN SELECT RAISE(ABORT, 'backfill aborted by test trigger'); END;",
+            )
+            .unwrap();
+        }
+
+        let error = GoalLedger::open_with_busy_retry(&path)
+            .err()
+            .expect("the aborted backfill must fail the open");
+        assert!(
+            error.to_string().contains("backfill aborted"),
+            "unexpected error: {error}"
+        );
+        // Partial state must NOT persist: the ALTER-ADD was rolled back
+        // together with the failed backfill.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let authority_present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'authority'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            authority_present, 0,
+            "a failed migration must leave the pre-migration shape intact"
+        );
+
+        // With the trigger gone, the SAME database migrates cleanly and the
+        // legacy terminal row is FINAL — the backfill was not lost.
+        conn.execute_batch("DROP TRIGGER abort_backfill;").unwrap();
+        drop(conn);
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        assert!(
+            !ledger
+                .update_task_status("legacy-failed", "complete", 2_000)
+                .unwrap(),
+            "the re-run migration stamps the legacy terminal row FINAL"
+        );
+    }
+
+    /// #2055 review round 5 — a second opener after a completed migration is
+    /// a clean no-op (the fast path sees the migrated shape and takes no
+    /// write transaction).
+    #[test]
+    fn should_treat_second_open_after_migration_as_clean_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            create_legacy_schema(&conn, "");
+        }
+        let first = GoalLedger::open_with_busy_retry(&path).expect("first open migrates");
+        drop(first);
+        let second = GoalLedger::open_with_busy_retry(&path).expect("second open is a no-op");
+        assert!(
+            !second
+                .update_task_status("legacy-failed", "complete", 2_000)
+                .unwrap(),
+            "the migrated FINAL stamp survives the second open"
+        );
+    }
+
+    /// #2055 review round 5 — a dependent index on the round-3 column makes
+    /// the DROP fail LOUDLY (the old substring match ate exactly this error),
+    /// and the failure rolls back the whole migration.
+    #[test]
+    fn should_propagate_drop_failure_when_an_index_depends_on_the_old_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            create_legacy_schema(&conn, ", correctable INTEGER NOT NULL DEFAULT 0");
+            conn.execute_batch("CREATE INDEX idx_tasks_correctable ON tasks(correctable);")
+                .unwrap();
+        }
+
+        let error = GoalLedger::open_with_busy_retry(&path)
+            .err()
+            .expect("a dependent index must fail the column drop loudly");
+        assert!(
+            error.to_string().contains("index"),
+            "unexpected error: {error}"
+        );
+        // The whole migration rolled back: `correctable` is still there and
+        // `authority` never landed.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count_columns = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count_columns("correctable"), 1);
+        assert_eq!(count_columns("authority"), 0);
+    }
+
+    /// #2055 review rounds 6/7/9 (V3/W3/Y4) — creation-vs-migration
+    /// concurrency pin, deterministic BY CONSTRUCTION: the STRUCTURAL
+    /// argument is what closes the race (the creation APIs run inspection +
+    /// insert inside `BEGIN IMMEDIATE`, which serializes against the
+    /// migration's own `BEGIN IMMEDIATE` transaction, so a creation either
+    /// fully precedes the migration — legacy shape, then the backfill
+    /// stamps the row FINAL — or fully follows it, taking the
+    /// derived-authority shape; the poisoned interleaving cannot be
+    /// scheduled). This test PROVES contention with a single-threaded
+    /// busy-probe rather than timing: while a test-only hook parks the
+    /// migration transaction verifiably open, a zero-busy-timeout terminal
+    /// creation ON THE TEST THREAD must fail with lock contention — an
+    /// assertion no thread schedule can fake or break — and after release
+    /// the same creation succeeds with its real rank.
+    #[test]
+    fn should_never_leave_terminal_rows_unranked_when_creation_races_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            create_legacy_schema(&conn, "");
+        }
+        // The probe's connection is opened at test start, BEFORE the hook is
+        // installed and the migration can take the write lock, so the open
+        // itself (a plain `GoalLedger::open` — no migration attempt, which
+        // would deadlock against the parked transaction) cannot block on
+        // anything below.
+        let probe_ledger = GoalLedger::open(&path).unwrap();
+
+        // Install the in-transaction hook: signals the test, then blocks
+        // this migration open until released.
+        let (in_transaction_tx, in_transaction_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        *GoalLedger::migration_mid_transaction_hook().lock().unwrap() = Some((
+            path.clone(),
+            Arc::new(move || {
+                let _ = in_transaction_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30));
+            }),
+        ));
+
+        let migration_path = path.clone();
+        let migration =
+            std::thread::spawn(move || GoalLedger::open_with_busy_retry(migration_path));
+        in_transaction_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the migration transaction is provably open");
+
+        // Round 9 — the busy-probe, ON THIS THREAD, deterministic by
+        // construction: with the hook parked the migration transaction is
+        // provably holding the write lock AT THIS INSTANT, so a zero-
+        // busy-timeout terminal creation can only fail SQLITE_BUSY — and it
+        // can only fail SQLITE_BUSY because that lock is held. Both sides
+        // of the interleaving are sequenced by the test thread itself: no
+        // schedule can fake the contention and no deschedule can break it.
+        // (The previous timing shape could pass under a valid schedule that
+        // descheduled a creator thread between its begun-signal and its
+        // create call, running the whole creation post-release — timestamps
+        // cannot prove blocking.)
+        probe_ledger
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let probe_error = probe_ledger
+            .create_task(&Task {
+                task_id: "race-task".to_string(),
+                goal_id: "g1".to_string(),
+                title: String::new(),
+                detail: String::new(),
+                status: "failed".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .expect_err("a zero-timeout creation must observe the held migration lock");
+        assert!(
+            error_is_lock_contention(&probe_error),
+            "the probe must fail with lock contention, not a structural error: {probe_error}"
+        );
+
+        release_tx.send(()).expect("release the migration hook");
+        let migrated = migration
+            .join()
+            .expect("migration thread")
+            .expect("migration open succeeds");
+        *GoalLedger::migration_mid_transaction_hook().lock().unwrap() = None;
+
+        // With the migration committed, the same terminal creation succeeds
+        // on a normal-timeout connection and takes the derived-authority
+        // shape.
+        migrated
+            .create_task(&Task {
+                task_id: "race-task".to_string(),
+                goal_id: "g1".to_string(),
+                title: String::new(),
+                detail: String::new(),
+                status: "failed".to_string(),
+                assigned_peer: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .expect("creation succeeds after the migration commits");
+
+        // And the outcome invariant: no terminal row at authority -1 — the
+        // legacy row was backfilled FINAL and the post-migration creation
+        // took the derived-authority shape.
+        let conn = migrated.conn.lock().unwrap();
+        let unranked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE status IN ('complete', 'failed') AND authority = -1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unranked, 0, "no terminal row may ever end at authority -1");
+        let raced_authority: i64 = conn
+            .query_row(
+                "SELECT authority FROM tasks WHERE task_id = 'race-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            raced_authority, 2,
+            "the racing terminal creation lands post-migration with its real rank"
+        );
+    }
+
+    /// #2055 review round 5 (terminal-creation authority) — a row CREATED
+    /// with a terminal status starts at the matching authority rank, so the
+    /// nonterminal-refresh guard cannot let a plain `running` write
+    /// overwrite it (the reproduced `failed/-1 → running/-1` hole).
+    #[test]
+    fn should_refuse_running_refresh_on_freshly_created_terminal_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "ship".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        let terminal_task = |id: &str, status: &str| Task {
+            task_id: id.to_string(),
+            goal_id: "g1".to_string(),
+            title: String::new(),
+            detail: String::new(),
+            status: status.to_string(),
+            assigned_peer: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        ledger
+            .create_task_if_absent(&terminal_task("t-failed", "failed"))
+            .unwrap();
+        ledger
+            .create_task(&terminal_task("t-complete", "complete"))
+            .unwrap();
+
+        for late in ["running", "pending"] {
+            assert!(
+                !ledger.update_task_status("t-failed", late, 2_000).unwrap(),
+                "a created terminal row refuses the nonterminal refresh {late:?}"
+            );
+        }
+        assert_eq!(
+            ledger.get_task("t-failed").unwrap().unwrap().status,
+            "failed"
+        );
+        // Rank consistency: a created `failed` is FINAL (refuses completion),
+        // a created `complete` sits at the completion rank (a final failure
+        // still outranks it, per the order-independence rule).
+        assert!(
+            !ledger
+                .update_task_status("t-failed", "complete", 2_000)
+                .unwrap()
+        );
+        assert!(
+            !ledger
+                .update_task_status("t-complete", "running", 2_000)
+                .unwrap()
+        );
+        assert!(
+            ledger
+                .settle_task_status("t-complete", TaskSettleAuthority::FinalFailure, 2_000)
+                .unwrap()
+        );
+    }
+
+    /// #2055 review round 4 — fresh-schema and migrated-schema databases
+    /// behave identically under the same write sequence.
+    #[test]
+    fn should_behave_identically_on_fresh_and_migrated_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fresh: created by the current schema batch.
+        let fresh = GoalLedger::open_with_busy_retry(dir.path().join("fresh.db")).unwrap();
+        // Migrated: created without the column, then opened through the
+        // migrating profile.
+        let migrated_path = dir.path().join("migrated.db");
+        {
+            let conn = rusqlite::Connection::open(&migrated_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+                 CREATE TABLE tasks (
+                     task_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL,
+                     title TEXT NOT NULL, detail TEXT NOT NULL,
+                     status TEXT NOT NULL, assigned_peer TEXT,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                     FOREIGN KEY (goal_id) REFERENCES goals(goal_id));",
+            )
+            .unwrap();
+        }
+        let migrated = GoalLedger::open_with_busy_retry(&migrated_path).unwrap();
+
+        for ledger in [&fresh, &migrated] {
+            seed_goal_with_task(ledger, "g1", "t1", "running");
+            assert!(
+                ledger
+                    .settle_task_status("t1", TaskSettleAuthority::ProvisionalFailure, 2_000)
+                    .unwrap()
+            );
+            assert!(ledger.update_task_status("t1", "complete", 3_000).unwrap());
+            assert!(
+                ledger
+                    .settle_task_status("t1", TaskSettleAuthority::FinalFailure, 4_000)
+                    .unwrap(),
+                "a final failure outranks the completion on both shapes"
+            );
+            let task = ledger.get_task("t1").unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            assert_eq!(task.updated_at_ms, 4_000);
+        }
+    }
+
+    /// #2055 review round 3 — goal-scoped task listing (used by effect
+    /// tests that identify rows by title when the task id is internal to a
+    /// detached child supervisor).
+    #[test]
+    fn should_list_tasks_for_exactly_one_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+        seed_goal_with_task(&ledger, "g2", "t2", "running");
+
+        let tasks = ledger.tasks_for_goal("g1").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "t1");
+        assert!(ledger.tasks_for_goal("g3").unwrap().is_empty());
     }
 
     /// The goal-facing point of the whole exercise: `task_status_counts` is
@@ -3123,5 +4230,198 @@ mod digest_integration_tests {
             .collect();
         assert_eq!(g2.get("running"), Some(&1));
         assert_eq!(g2.get("complete"), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // #2055 — idempotent row creation at task registration.
+    //
+    // Registration legitimately repeats (relaunch, restart, re-registration
+    // of a task the supervisor restored), so row creation must be an upsert
+    // that PRESERVES an existing row — including its status and timestamps,
+    // and including a row that already went terminal — instead of relying on
+    // a swallowed UNIQUE violation.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn should_insert_row_when_task_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        // FK enforcement is on (bundled SQLite defaults foreign_keys=1):
+        // the parent goals row must exist before any task row.
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "test".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 10_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        assert!(
+            ledger
+                .create_task_if_absent(&Task {
+                    task_id: "t1".to_string(),
+                    goal_id: "g1".to_string(),
+                    title: "web_probe".to_string(),
+                    detail: String::new(),
+                    status: "running".to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap(),
+            "a fresh task id inserts a row"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "running");
+        assert_eq!(task.title, "web_probe");
+    }
+
+    #[test]
+    fn should_preserve_existing_row_when_task_is_reregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+
+        assert!(
+            !ledger
+                .create_task_if_absent(&Task {
+                    task_id: "t1".to_string(),
+                    goal_id: "g1".to_string(),
+                    title: "replacement title".to_string(),
+                    detail: "replacement detail".to_string(),
+                    status: "pending".to_string(),
+                    assigned_peer: Some("peer-a".to_string()),
+                    created_at_ms: 9_000,
+                    updated_at_ms: 9_000,
+                })
+                .unwrap(),
+            "re-registration reports no-op"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "running", "existing status is preserved");
+        assert_eq!(task.title, "", "existing title is preserved");
+        assert_eq!(task.assigned_peer, None);
+        assert_eq!(task.updated_at_ms, 1_000);
+    }
+
+    /// The load-bearing half of idempotency: a re-registration AFTER the row
+    /// went terminal (relaunch/restart replaying an old registration) must
+    /// not resurrect it to `running` — first-terminal-wins extends across
+    /// the create path, not just `update_task_status`.
+    #[test]
+    fn should_preserve_terminal_row_when_task_is_reregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "t1", "running");
+        ledger.update_task_status("t1", "complete", 2_000).unwrap();
+
+        assert!(
+            !ledger
+                .create_task_if_absent(&Task {
+                    task_id: "t1".to_string(),
+                    goal_id: "g1".to_string(),
+                    title: String::new(),
+                    detail: String::new(),
+                    status: "running".to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 3_000,
+                    updated_at_ms: 3_000,
+                })
+                .unwrap(),
+            "re-registration of a terminal row reports no-op"
+        );
+
+        let task = ledger.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, "complete", "terminal status survives");
+        assert_eq!(task.updated_at_ms, 2_000);
+    }
+
+    // ---------------------------------------------------------------------
+    // #2055 review round 2 — FK-parent goals row via if-absent insert.
+    //
+    // Registration must NEVER update a goals row: `upsert_goal`'s monotonic
+    // guard admits equal timestamps, so a delayed stale `active` snapshot
+    // could overwrite a same-millisecond administrative transition
+    // (`paused` / `blocked` / `cleared`) and regress counters. The
+    // registration recorder therefore only ever inserts the FK parent when
+    // no row exists; the goal engine's own transition sync remains the only
+    // goals-row updater.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn should_insert_goal_row_when_goal_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        assert!(
+            ledger
+                .create_goal_if_absent(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "ship".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 5,
+                    token_budget: 10_000,
+                    continuations_used: 1,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap(),
+            "a fresh goal id inserts a row"
+        );
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "active");
+        assert_eq!(goal.objective, "ship");
+    }
+
+    #[test]
+    fn should_preserve_existing_goal_row_even_with_equal_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        // The row a same-millisecond administrative transition just wrote.
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "ship".to_string(),
+                status: "paused".to_string(),
+                tokens_used: 500,
+                token_budget: 10_000,
+                continuations_used: 3,
+                revision: 7,
+                created_at_ms: 1_000,
+                updated_at_ms: 2_000,
+            })
+            .unwrap();
+
+        // The delayed stale registration snapshot: same updated_at_ms,
+        // higher tokens — exactly the shape `upsert_goal`'s guard admits.
+        assert!(
+            !ledger
+                .create_goal_if_absent(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "ship".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 600,
+                    token_budget: 10_000,
+                    continuations_used: 4,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 2_000,
+                })
+                .unwrap(),
+            "an existing goal row reports no-op"
+        );
+
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.status, "paused", "the administrative status survives");
+        assert_eq!(goal.tokens_used, 500, "counters are untouched");
+        assert_eq!(goal.continuations_used, 3);
+        assert_eq!(goal.revision, 7);
     }
 }

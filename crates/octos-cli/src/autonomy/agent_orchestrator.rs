@@ -752,6 +752,208 @@ struct OrchestratorShared {
     /// consumed — never re-queued — by [`Self::retry_stashed_fleet_wakes`] at
     /// the start of the next fleet-outbox drain tick.
     fleet_wake_retry: StdMutex<Vec<MasterContinuationRequest>>,
+    /// #2055/#2054 — supervisor task id → the goal-ledger location its row
+    /// was created under at registration time. The change-feed settle
+    /// resolves the entry to settle the SAME row — resolving afresh at
+    /// terminal time would chase whatever goal the session holds by then,
+    /// which can differ after a mid-flight clear/recreate. An entry is
+    /// removed only after a SUCCESSFUL settle write whose terminal is
+    /// final (`complete`, cancellation, owner-reported failure); an
+    /// observer-provisional failure keeps its entry so the owner's later
+    /// correcting completion (task_supervisor.rs:2527 semantics) can still
+    /// reach the ledger. In-memory only: entries are bounded by the
+    /// supervisor's fan-out caps (the retained-failure residue matches the
+    /// supervisor's own never-pruned task map); a restart drops them, and
+    /// the row a restored task left behind stays `running` — delivery
+    /// durability across restarts is #2056, out of scope here.
+    goal_task_ledger_bindings: StdMutex<HashMap<String, GoalTaskLedgerBinding>>,
+}
+
+/// #2055 review round 3 — how long a settled OBSERVER-provisional failure
+/// keeps its binding open for the owner's correcting completion. The
+/// supervisor's correction (task_supervisor.rs:2527) fires when the owner
+/// watches its worker actually finish, which happens promptly after the
+/// observer's premature verdict or never — a correction arriving later than
+/// this is not a plausible owner signal, and the map is a process-global
+/// singleton that nothing else prunes (the supervisor task map never prunes,
+/// and detached registrations skip even the fan-out cap), so unbounded
+/// retention would grow with every provisionally-failed task for the
+/// process lifetime. A purged entry just drops the binding: the ledger row
+/// already reads `failed`, the honest final state when no correction came.
+const PROVISIONAL_CORRECTION_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// #2055 review round 3 — bounded retry budget for a settle whose ledger
+/// write failed (BUSY exhaustion, transient I/O). Cancellation emits exactly
+/// one change event, so without a retry a transient failure left the row
+/// `running` forever; five attempts with exponential backoff cover
+/// multi-second contention without unbounded queues.
+const GOAL_TASK_SETTLE_ATTEMPTS: u32 = 5;
+
+/// Exponential backoff for the settle retry chain. With
+/// [`GOAL_TASK_SETTLE_ATTEMPTS`] = 5 the reachable waits are 100ms, 200ms,
+/// 400ms, and 800ms (a failure at attempt N schedules attempt N+1 after
+/// `backoff(N)`; attempt 4's failure exhausts the budget, so the 2s cap
+/// below is reached only if the attempt budget is ever raised).
+fn goal_task_settle_backoff(attempt: u32) -> std::time::Duration {
+    let base = std::time::Duration::from_millis(100);
+    let capped = base.saturating_mul(1u32 << attempt.min(4));
+    capped.min(std::time::Duration::from_secs(2))
+}
+
+/// #2055 review round 5 — settle blocking-core entries, keyed PER TASK so a
+/// contention test's release gate observes exactly ITS chain's attempts:
+/// the earlier process-global counter could be satisfied by parallel tests'
+/// attempts before this task's retry ever entered (a false pass).
+#[cfg(test)]
+fn goal_task_settle_attempt_counts() -> &'static StdMutex<HashMap<String, u64>> {
+    static COUNTS: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// #2055 review round 5 — how many settle blocking-core attempts have
+/// entered for exactly `task_id`.
+#[cfg(test)]
+pub(crate) fn goal_task_settle_attempts_for(task_id: &str) -> u64 {
+    goal_task_settle_attempt_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(task_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// #2055 review round 7 (W2) — the single source of binding generations: a
+/// process-wide monotonic counter, so a generation value can never repeat
+/// for any entry, ever — including a remove-then-re-stash of the SAME task
+/// id, which per-entry arithmetic restarted at zero (the ABA that let an old
+/// hold's release steal the new incarnation's live flight). Production task
+/// ids are fresh UUIDv7s today, but the monotonic counter also pre-covers
+/// the same-id restoration path #2056 tracks.
+///
+/// u64 wrap is a non-concern by arithmetic: at a million stashes per second
+/// the counter takes about 5.8 × 10^5 years (~585 millennia) to wrap.
+fn next_goal_task_binding_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #2055/#2054 — everything the ledger I/O for one task's row needs, captured
+/// at registration-stash time so BOTH the offloaded row creation and any
+/// later settle can run without re-entering orchestrator state: the FK-parent
+/// goals-row snapshot (only ever inserted if absent — never an update), the
+/// task row seed, and the profile data dir the per-goal ledger path derives
+/// from (`<profile_data_dir>/goal-ledgers/<goal_id>.db`).
+#[derive(Debug, Clone)]
+struct GoalTaskLedgerBinding {
+    goal_row: octos_fleet::Goal,
+    title: String,
+    assigned_peer: Option<String>,
+    profile_data_dir: PathBuf,
+    /// `None` while the task is live (or its settle is still retrying);
+    /// stamped ONCE when a provisional-failed settle first SUCCEEDS and the
+    /// binding is retained purely as the correction window — the purge
+    /// deadline ([`PROVISIONAL_CORRECTION_RETENTION`]) applies only to that
+    /// state, so a legitimately long-running task can never be purged
+    /// mid-flight, and a redelivery no-op never refreshes the clock.
+    retained_since: Option<std::time::Instant>,
+    /// #2055 review round 4 — chain-staleness fence. A settle chain captures
+    /// the generation it was started under and re-checks presence AND
+    /// generation immediately before EVERY write attempt; a re-registration
+    /// re-stashes with a fresh generation, and removal (success or purge)
+    /// deletes the entry, so a stale chain dies at its next check instead of
+    /// writing after its sleep.
+    ///
+    /// Round 7 (W2) — generations come from ONE process-wide monotonic
+    /// counter ([`next_goal_task_binding_generation`]), never from per-entry
+    /// arithmetic: a remove-then-re-stash of the same task id used to
+    /// restart at zero, so an old generation-0 hold could match the new
+    /// incarnation (ABA) and its release could steal a live flight.
+    generation: u64,
+    /// #2055 review round 5 — settle flights currently holding this entry:
+    /// incremented under the map lock at the moment settle work is enqueued,
+    /// decremented (generation-matched) when the chain ends in success or
+    /// budget exhaustion. The purge NEVER drops an entry with a flight in
+    /// progress, however expired — the staleness fence would otherwise kill
+    /// a queued/backing-off correction whose window expired mid-flight
+    /// (`TaskTerminalGuard` clears liveness BEFORE the final transition, so
+    /// liveness alone cannot protect it).
+    in_flight: u32,
+}
+
+impl GoalTaskLedgerBinding {
+    /// Build a binding that has NOT been stashed yet: `generation` and
+    /// `in_flight` carry placeholder values here (round 8 — the one place
+    /// they appear) because the single stash point,
+    /// [`InProcessAgentOrchestrator::stash_goal_task_binding`], assigns
+    /// both authoritatively when the binding enters the map.
+    fn new_unstashed(
+        goal_row: octos_fleet::Goal,
+        title: String,
+        assigned_peer: Option<String>,
+        profile_data_dir: PathBuf,
+    ) -> Self {
+        Self {
+            goal_row,
+            title,
+            assigned_peer,
+            profile_data_dir,
+            retained_since: None,
+            generation: 0,
+            in_flight: 0,
+        }
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        InProcessAgentOrchestrator::goal_ledger_dir(&self.profile_data_dir).join(format!(
+            "{}.db",
+            sanitize_filename_for_ledger(&self.goal_row.goal_id)
+        ))
+    }
+}
+
+/// #2055 review round 6 (V2b), ownership reworked in round 7 — THE one
+/// release point for a settle-attempt flight hold. Constructed by whoever
+/// SCHEDULES the attempt (the enqueue for attempt 0, the previous attempt's
+/// re-arm for every retry) and HANDED THROUGH the timer future and the
+/// blocking closure into the core, it releases the hold on EVERY fate of
+/// the attempt via `Drop` — success, budget exhaustion, fence-kill,
+/// panic-unwind, and a future dropped before it ever ran — so no exit can
+/// skip the release and no exit can release twice. The release is
+/// generation-matched inside
+/// [`InProcessAgentOrchestrator::release_goal_task_settle_flight`], so a
+/// hold whose entry was removed or re-stashed (the fence-kill cases) is a
+/// harmless no-op: the hold physically died with the old entry, and the new
+/// incarnation's accounting is never touched.
+struct GoalTaskSettleFlightGuard {
+    orchestrator: InProcessAgentOrchestrator,
+    task_id: String,
+    generation: u64,
+}
+
+impl Drop for GoalTaskSettleFlightGuard {
+    fn drop(&mut self) {
+        self.orchestrator
+            .release_goal_task_settle_flight(&self.task_id, self.generation);
+    }
+}
+
+/// #2055 review round 2 (H9) — run goal-ledger I/O off the async executor.
+/// The registration/settle observers fire synchronously inside tokio-driven
+/// paths (SpawnTool's async execute, the session actor), and the I/O behind
+/// them is contended-open SQLite with multi-second busy budgets — so inside
+/// a runtime it goes to the blocking pool (detached: the observers are
+/// fire-and-forget by contract and must never stall registration), mirroring
+/// `sync_transition_to_ledger`'s `spawn_blocking` treatment. Without a
+/// runtime (plain threads, sync tests) the work runs inline — such a thread
+/// is not an executor worker, which is the only thing H9 protects.
+fn offload_goal_ledger_io(work: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(work);
+        }
+        Err(_) => work(),
+    }
 }
 
 /// The plain WIRE session id underlying a (possibly cwd-scoped) goal-store
@@ -966,6 +1168,11 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
     event: &octos_agent::TerminalEvent,
     runtime_profile_id: Option<&str>,
 ) {
+    // #2054 settling does NOT live here (review round 2): this sink never
+    // fires for `cancel` (which emits only `notify_change`) and its
+    // once-per-task dedupe would swallow the owner's failed→complete
+    // correction. The goal-ledger settle rides the change feed instead —
+    // see `install_goal_task_row_settle_listener`.
     match &event.outcome {
         octos_agent::TerminalOutcome::Completed => {
             // Mirror the terminal agent record; the upsert's terminal
@@ -1024,6 +1231,73 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
             }
         }
     }
+}
+
+/// #2054 (review round 2) — stable key for the goal-task-row settle observer
+/// on `TaskSupervisor::on_change_listeners`. A NAMED listener (not the
+/// primary `on_change`, which every runtime mode already owns for its own
+/// wake wiring), re-installed idempotently wherever a supervisor is wired
+/// and inherited by child/nested supervisors alongside `on_register`.
+pub(crate) const GOAL_TASK_ROW_SETTLE_LISTENER_KEY: &str = "goal-task-row-settle";
+
+/// #2054 (review round 2) — install the change-feed settle observer on a
+/// supervisor. See [`InProcessAgentOrchestrator::settle_goal_task_row_from_change`]
+/// for why settling rides the change feed rather than the `on_terminal`
+/// sink (cancel coverage + the failed→complete owner correction).
+pub(crate) fn install_goal_task_row_settle_listener(supervisor: &octos_agent::TaskSupervisor) {
+    supervisor.set_on_change_listener(GOAL_TASK_ROW_SETTLE_LISTENER_KEY, |task| {
+        default_agent_orchestrator().settle_goal_task_row_from_change(task);
+    });
+}
+
+/// #2055 review round 3 — THE one installer for the goal-task-row observer
+/// pair (`on_register` recorder + the named settle listener). Every
+/// production wiring site AND the effect tests go through this function, so
+/// test wiring cannot drift from production wiring: only the goal-binding
+/// RESOLVER differs per site (the per-turn WS path passes a dispatch-time
+/// snapshot; callback-time resolution uses
+/// [`install_goal_task_row_observers_resolving_at_callback`]).
+pub(crate) fn install_goal_task_row_observers(
+    supervisor: &octos_agent::TaskSupervisor,
+    profile_data_dir: &Path,
+    resolve_binding: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
+) {
+    let data_dir = profile_data_dir.to_path_buf();
+    supervisor.set_on_register(move |task| {
+        // (goal_id, profile_id); `None` ⇒ no goal bound ⇒ no row — correct
+        // behavior, not an error.
+        let Some((goal_id, profile_id)) = resolve_binding() else {
+            return;
+        };
+        default_agent_orchestrator().record_goal_task_registration(
+            &data_dir,
+            &profile_id,
+            &goal_id,
+            task,
+        );
+    });
+    install_goal_task_row_settle_listener(supervisor);
+}
+
+/// #2055 review round 3 — [`install_goal_task_row_observers`] with the
+/// callback-time resolver: the session's ACTIVE goal is looked up on every
+/// registration via [`InProcessAgentOrchestrator::active_goal_id`]. For
+/// supervisors that outlive goals coming and going — the gateway actor's,
+/// and the cached `session_runtime.tools` supervisor the out-of-turn WS
+/// paths use — where a dispatch-time snapshot would go stale.
+pub(crate) fn install_goal_task_row_observers_resolving_at_callback(
+    supervisor: &octos_agent::TaskSupervisor,
+    session_id: &SessionKey,
+    profile_id: &str,
+    profile_data_dir: &Path,
+) {
+    let session = session_id.clone();
+    let profile = profile_id.to_owned();
+    install_goal_task_row_observers(supervisor, profile_data_dir, move || {
+        default_agent_orchestrator()
+            .active_goal_id(&session, &profile)
+            .map(|goal_id| (goal_id, profile.clone()))
+    });
 }
 
 // "Workspace is known in-memory" predicate accepted by
@@ -1103,6 +1377,12 @@ impl InProcessAgentOrchestrator {
         // #1973 fix D — a stashed retry must not leak across singleton tests.
         self.shared
             .fleet_wake_retry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        // #2055 — registration-time ledger bindings are equally per-test state.
+        self.shared
+            .goal_task_ledger_bindings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -4996,6 +5276,10 @@ impl InProcessAgentOrchestrator {
         // FK constraint: findings with task_id reference tasks(task_id), so
         // we must ALSO upsert a task stub when task_id is Some (codex PR
         // review merge blocker). Same minimal-stub pattern as goals above.
+        // #2055 — explicit if-absent upsert: registration usually created
+        // the real row first (possibly already settled terminal by #2054),
+        // and this stub must PRESERVE it rather than rely on a swallowed
+        // UNIQUE violation.
         if let Some(task_id_str) = task_id {
             let task_stub = octos_fleet::Task {
                 task_id: task_id_str.to_owned(),
@@ -5007,7 +5291,7 @@ impl InProcessAgentOrchestrator {
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
             };
-            let _ = ledger.create_task(&task_stub);
+            let _ = ledger.create_task_if_absent(&task_stub);
         }
         let finding_id = format!("peer-{}-{}", peer_slug, uuid::Uuid::now_v7());
         let finding = octos_fleet::Finding {
@@ -5132,6 +5416,8 @@ impl InProcessAgentOrchestrator {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // #2055 — if-absent upsert preserves a registration-created (and
+        // possibly already-settled) row; see model_goal_record_peer_finding.
         let task_stub = octos_fleet::Task {
             task_id: task_id.clone(),
             goal_id: goal_id.clone(),
@@ -5142,7 +5428,7 @@ impl InProcessAgentOrchestrator {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
-        let _ = ledger.create_task(&task_stub);
+        let _ = ledger.create_task_if_absent(&task_stub);
         let finding = octos_fleet::Finding {
             rowid: None,
             finding_id: format!("denied-{fleet_id}-{}", uuid::Uuid::now_v7()),
@@ -5252,6 +5538,8 @@ impl InProcessAgentOrchestrator {
         // FK constraint: escalations with task_id reference tasks(task_id),
         // so we must ALSO upsert a task stub when task_id is Some (codex PR
         // review merge blocker). Same minimal-stub pattern as findings above.
+        // #2055 — if-absent upsert preserves a registration-created (and
+        // possibly already-settled) row.
         if let Some(task_id_str) = task_id {
             let task_stub = octos_fleet::Task {
                 task_id: task_id_str.to_owned(),
@@ -5263,7 +5551,7 @@ impl InProcessAgentOrchestrator {
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
             };
-            let _ = ledger.create_task(&task_stub);
+            let _ = ledger.create_task_if_absent(&task_stub);
         }
         let escalation_id = format!("esc-{}-{}", peer_slug, uuid::Uuid::now_v7());
         let escalation = octos_fleet::Escalation {
@@ -5489,6 +5777,579 @@ impl InProcessAgentOrchestrator {
     /// permissions (0755) by `model_goal_record_peer_finding`.
     fn goal_ledger_dir(profile_data_dir: &std::path::Path) -> std::path::PathBuf {
         profile_data_dir.join("goal-ledgers")
+    }
+
+    /// #2055 — goal binding for ledger task-row creation on an autonomous
+    /// goal-continuation turn, keyed DIRECTLY by the already-scoped goal
+    /// store key the continuation carries (family-2, like `record_goal_turn`
+    /// / `set_goal_workspace_binding` — never re-scoped). Interactive turns
+    /// use [`Self::active_goal_id`] instead (wire key + re-scope), matching
+    /// how their #1935 `interactive_goal_binding` snapshot was resolved.
+    pub(crate) fn active_goal_id_under_goal_key(
+        &self,
+        goal_session_key: &SessionKey,
+        profile_id: &str,
+    ) -> Option<String> {
+        let state = self.state();
+        let goal = state.goals.get(goal_session_key)?;
+        (goal.profile_id == profile_id && goal.status == "active").then(|| goal.goal_id.clone())
+    }
+
+    /// #2055 — record a task the `TaskSupervisor` just registered: stash the
+    /// ledger binding (synchronously — this is all the `on_register`
+    /// callback pays on the caller's thread) and offload the row creation to
+    /// the blocking pool. Called from the `on_register` closures the runtime
+    /// modes wire next to their settle listener.
+    ///
+    /// Best-effort BY CONTRACT: registration must never fail, block, or
+    /// panic on ledger I/O — the synchronous part is one state read plus one
+    /// map insert, every I/O error in the offloaded part is swallowed with a
+    /// `tracing::debug!`, and a lost offload (process exit) is converged
+    /// later by the settle side, which is self-sufficient (it creates the
+    /// row with the terminal status when none exists). Locates the ledger
+    /// exactly like [`Self::model_goal_record_peer_finding`]
+    /// (`<profile_data_dir>/goal-ledgers/<goal_id>.db`).
+    pub(crate) fn record_goal_task_registration(
+        &self,
+        profile_data_dir: &Path,
+        profile_id: &str,
+        goal_id: &str,
+        task: &octos_agent::BackgroundTask,
+    ) {
+        // Round 3 — opportunistic retention purge on every map touch (no
+        // background sweeper): expired correction windows drop here.
+        self.purge_expired_goal_task_bindings();
+        // Goal snapshot for the FK-parent goals row. Captured ONCE, at stash
+        // time, and carried on the binding for both the creation offload and
+        // any later settle — it is only ever inserted-if-absent (H3: the
+        // registration path must never update a goals row; `upsert_goal`'s
+        // monotonic guard admits equal millisecond timestamps, so a delayed
+        // stale snapshot could regress an administrative transition). A goal
+        // cleared between binding resolution and this callback simply skips
+        // the write — no goal, no row. The state lock drops before anything
+        // else.
+        let goal_row = {
+            let state = self.state();
+            state
+                .goals
+                .values()
+                .find(|goal| goal.goal_id == goal_id && goal.profile_id == profile_id)
+                .map(|goal| octos_fleet::Goal {
+                    goal_id: goal.goal_id.clone(),
+                    objective: goal.objective.clone(),
+                    status: goal.status.clone(),
+                    tokens_used: goal.tokens_used,
+                    token_budget: goal.token_budget,
+                    continuations_used: goal.continuations_used,
+                    revision: 0,
+                    created_at_ms: goal.created_at_ms.max(0) as u64,
+                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
+                })
+        };
+        let Some(goal_row) = goal_row else {
+            tracing::debug!(
+                goal_id,
+                profile_id,
+                task_id = %task.id,
+                "goal task-row registration skipped: goal record no longer present"
+            );
+            return;
+        };
+        // `assigned_peer` is derivable only for the native-specialist kind
+        // (peers and supervisor-spawned specialists), whose `tool_call_id`
+        // is the agent id. Every other kind has no peer identity.
+        let assigned_peer = (task.tool_name == "native_agent" && !task.tool_call_id.is_empty())
+            .then(|| task.tool_call_id.clone());
+        let mut binding = GoalTaskLedgerBinding::new_unstashed(
+            goal_row,
+            task.tool_name.clone(),
+            assigned_peer,
+            profile_data_dir.to_path_buf(),
+        );
+        // Stash BEFORE the offload so a terminal racing in can already
+        // resolve the binding; the settle write sequence converges with the
+        // creation in either order. A re-stash (same task id) carries a
+        // FRESH generation from the process-wide counter, so any settle
+        // chain started under a previous incarnation dies at its next
+        // pre-write check — and no removed incarnation's generation can
+        // ever be reused (round 7, W2).
+        binding.generation = self.stash_goal_task_binding(&task.id, binding.clone());
+        let task_id = task.id.clone();
+        offload_goal_ledger_io(move || {
+            Self::record_goal_task_row_blocking(&binding, &task_id);
+        });
+    }
+
+    /// #2055 review round 7 (W2) — THE one stash point: assigns the entry's
+    /// generation from the process-wide monotonic counter and inserts it
+    /// (replacing any previous incarnation, whose flight accounting dies
+    /// with it). Returns the assigned generation. Shared by production
+    /// registration and the ABA test, so the assignment rule cannot drift.
+    fn stash_goal_task_binding(&self, task_id: &str, mut binding: GoalTaskLedgerBinding) -> u64 {
+        let generation = next_goal_task_binding_generation();
+        binding.generation = generation;
+        binding.in_flight = 0;
+        self.shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.to_owned(), binding);
+        generation
+    }
+
+    /// #2055 — the blocking half of [`Self::record_goal_task_registration`]:
+    /// FK-parent goals row via the never-updating
+    /// [`octos_fleet::GoalLedger::create_goal_if_absent`] (the bundled
+    /// SQLite enforces `foreign_keys=1`, and this can be the ledger file's
+    /// very first write), then the `running` task row via the idempotent
+    /// [`octos_fleet::GoalLedger::create_task_if_absent`] — so
+    /// re-registration across relaunch/restart preserves an existing row and
+    /// its status, including one the settle side already wrote terminal.
+    /// Runs on the blocking pool (or a non-executor thread), so the
+    /// contended-open profile (`open_with_busy_retry`) applies — the
+    /// fresh-WAL first-init race the plain `open` documents is exactly the
+    /// creation-vs-settle race this path can hit.
+    fn record_goal_task_row_blocking(binding: &GoalTaskLedgerBinding, task_id: &str) {
+        let ledger_dir = Self::goal_ledger_dir(&binding.profile_data_dir);
+        if let Err(error) = std::fs::create_dir_all(&ledger_dir) {
+            tracing::debug!(
+                goal_id = %binding.goal_row.goal_id,
+                task_id,
+                path = %ledger_dir.display(),
+                %error,
+                "goal task-row registration skipped: ledger dir unavailable"
+            );
+            return;
+        }
+        let now = now_ms_u64();
+        let row = octos_fleet::Task {
+            task_id: task_id.to_owned(),
+            goal_id: binding.goal_row.goal_id.clone(),
+            title: binding.title.clone(),
+            detail: String::new(),
+            status: "running".to_owned(),
+            assigned_peer: binding.assigned_peer.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let written = octos_fleet::GoalLedger::open_with_busy_retry(binding.ledger_path())
+            .and_then(|ledger| {
+                ledger.create_goal_if_absent(&binding.goal_row)?;
+                ledger.create_task_if_absent(&row)
+            });
+        if let Err(error) = written {
+            tracing::debug!(
+                goal_id = %binding.goal_row.goal_id,
+                task_id,
+                %error,
+                "goal task-row registration write failed; settle will converge if the task finishes"
+            );
+        }
+    }
+
+    /// #2054 (review round 2) — the change-feed settle: fired for every task
+    /// status change through the NAMED `on_change_listeners` observer (see
+    /// [`install_goal_task_row_settle_listener`]), filtering to terminal
+    /// statuses. The change feed — not the `on_terminal` sink — because:
+    ///
+    /// - `TaskSupervisor::cancel` emits ONLY `notify_change`; on the sink,
+    ///   every cancelled goal-bound task leaked its binding and a `running`
+    ///   row forever.
+    /// - the sink's once-per-task dedupe swallows the owner's correcting
+    ///   completion after an observer-provisional failure
+    ///   (task_supervisor.rs:2527); the change feed delivers it, and the
+    ///   ledger's authority-ranked writer admits it over the provisional
+    ///   verdict.
+    /// - the feed's multi-fire redelivery is absorbed by the ranked
+    ///   writer's first-wins-within-a-rank idempotency.
+    ///
+    /// Emits NO continuation, event, notification, or wake — this writes
+    /// ledger cells and nothing else (`completed → sink → ChildCompleted →
+    /// wake` is a cycle whose fresh ids defeat dedupe). All I/O runs on the
+    /// blocking pool via [`offload_goal_ledger_io`].
+    ///
+    /// Binding lifecycle: the entry is removed only AFTER a successful write
+    /// (a BUSY/open failure keeps it so a redelivered change event retries),
+    /// and only for FINAL terminals — completion, cancellation, and
+    /// owner-reported failure. An observer-provisional failure
+    /// (`failed_by_observer`) keeps its entry so the correction can still
+    /// settle; the owner's authoritative re-mark or completion then closes
+    /// it.
+    ///
+    /// Fidelity note: cancellation settles as `"failed"` — the ledger keeps
+    /// the #2054 status vocabulary; the two are distinguishable only through
+    /// the persisted authority rank.
+    ///
+    /// Round 5 ordering note: the flight mark is taken ATOMICALLY with the
+    /// binding fetch, BEFORE the retention purge runs — an expired
+    /// correction whose settle is being enqueued right now must not be
+    /// purged out from under its own chain (`TaskTerminalGuard` clears
+    /// liveness before the final transition, so the liveness consult alone
+    /// cannot protect it).
+    pub(crate) fn settle_goal_task_row_from_change(&self, task: &octos_agent::BackgroundTask) {
+        let (authority, remove_on_success) = match task.status {
+            octos_agent::TaskStatus::Completed => {
+                (octos_fleet::TaskSettleAuthority::Completion, true)
+            }
+            octos_agent::TaskStatus::Cancelled => {
+                (octos_fleet::TaskSettleAuthority::FinalFailure, true)
+            }
+            octos_agent::TaskStatus::Failed if task.failed_by_observer => {
+                (octos_fleet::TaskSettleAuthority::ProvisionalFailure, false)
+            }
+            octos_agent::TaskStatus::Failed => {
+                (octos_fleet::TaskSettleAuthority::FinalFailure, true)
+            }
+            octos_agent::TaskStatus::Spawned | octos_agent::TaskStatus::Running => return,
+        };
+        // Fetch + flight-mark under ONE lock acquisition. The attempt-0 hold
+        // is taken as an OWNING guard (round 7): it rides the offload
+        // closure into the blocking core, so even a closure that never runs
+        // (pool/runtime shutdown) releases it on drop.
+        let fetched = {
+            let mut bindings = self
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match bindings.get_mut(&task.id) {
+                Some(entry) => {
+                    entry.in_flight += 1;
+                    let flight = GoalTaskSettleFlightGuard {
+                        orchestrator: self.clone(),
+                        task_id: task.id.clone(),
+                        generation: entry.generation,
+                    };
+                    Some((entry.clone(), flight))
+                }
+                None => None,
+            }
+        };
+        // Opportunistic retention purge AFTER the flight mark (see doc note).
+        self.purge_expired_goal_task_bindings();
+        let Some((binding, flight)) = fetched else {
+            return;
+        };
+        let this = self.clone();
+        let task_id = task.id.clone();
+        offload_goal_ledger_io(move || {
+            this.settle_goal_task_row_blocking(
+                &binding,
+                &task_id,
+                authority,
+                remove_on_success,
+                0,
+                flight,
+            );
+        });
+    }
+
+    /// #2055 review round 5 — release one settle flight on `task_id`,
+    /// generation-matched: a re-stashed entry (bumped generation) starts its
+    /// own flight accounting, and a stale chain's release must not touch it.
+    fn release_goal_task_settle_flight(&self, task_id: &str, generation: u64) {
+        let mut bindings = self
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = bindings.get_mut(task_id)
+            && entry.generation == generation
+        {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+        }
+    }
+
+    /// #2055 review round 6 (V2a) — take one settle-flight hold on
+    /// `task_id`, generation-matched. Used at enqueue for attempt 0 and by
+    /// the retry re-arm to take the NEXT attempt's hold BEFORE the current
+    /// attempt's guard releases its own, so `in_flight` never touches zero
+    /// across the backoff gap and the purge cannot kill a chain between
+    /// attempts.
+    ///
+    /// Round 7 — returns the OWNING [`GoalTaskSettleFlightGuard`] rather
+    /// than a bare flag: the guard travels through the timer future and the
+    /// `spawn_blocking` closure into the blocking core, so the hold is
+    /// released on EVERY fate of the scheduled attempt — including a future
+    /// dropped before it ever runs (runtime shutdown) — closing the orphan
+    /// window between acquisition and core entry. `None` means the entry is
+    /// gone or re-stashed: the chain is already dead.
+    fn acquire_goal_task_settle_flight(
+        &self,
+        task_id: &str,
+        generation: u64,
+    ) -> Option<GoalTaskSettleFlightGuard> {
+        let mut bindings = self
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match bindings.get_mut(task_id) {
+            Some(entry) if entry.generation == generation => {
+                entry.in_flight += 1;
+                Some(GoalTaskSettleFlightGuard {
+                    orchestrator: self.clone(),
+                    task_id: task_id.to_owned(),
+                    generation,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// #2054 — the blocking half of the change-feed settle. SELF-SUFFICIENT:
+    /// seeds the FK-parent goals row and the task row (as `running`) if the
+    /// creation offload has not landed yet, then applies the
+    /// authority-ranked [`octos_fleet::GoalLedger::settle_task_status`] —
+    /// creation-then-settle and settle-then-creation converge, and the
+    /// persisted rank makes the outcome independent of write delivery order
+    /// (see [`octos_fleet::TaskSettleAuthority`]). An `Ok(false)` from the
+    /// ranked write is a normal no-op (redelivery or an outranked write).
+    ///
+    /// Staleness fence (round 4): before EVERY write attempt — the first and
+    /// each retry re-entry — the chain re-checks that the binding is still
+    /// present under the generation it captured; otherwise it dies. This
+    /// stops redundant work and duplicate chains (removal or a
+    /// re-registration bump kills survivors at their next check), not
+    /// corruption: the ranked write itself is order-safe, and a
+    /// completion-correction arriving after a purge would be a semantically
+    /// legitimate late correction that simply no longer has a binding to
+    /// route it.
+    ///
+    /// Bounded retry (round 3): `open_with_busy_retry` covers only the OPEN,
+    /// a write can still exhaust the busy handler, and cancellation emits
+    /// exactly ONE change event — so a transiently-failed settle would
+    /// otherwise leave the row `running` forever. On failure the SAME settle
+    /// re-arms through an async `tokio::time::sleep` backoff and a fresh
+    /// `spawn_blocking`. The retry chain itself parks no sleeps on the
+    /// blocking pool (the backoff rides the executor timer; without a
+    /// runtime the bounded chain runs inline on the caller's non-executor
+    /// thread) — `open_with_busy_retry`'s own 50ms inter-attempt sleeps DO
+    /// run on the blocking pool, by design: that is where sleeping is
+    /// allowed. At most [`GOAL_TASK_SETTLE_ATTEMPTS`] attempts.
+    fn settle_goal_task_row_blocking(
+        &self,
+        binding: &GoalTaskLedgerBinding,
+        task_id: &str,
+        authority: octos_fleet::TaskSettleAuthority,
+        remove_on_success: bool,
+        attempt: u32,
+        flight: GoalTaskSettleFlightGuard,
+    ) {
+        #[cfg(test)]
+        {
+            *goal_task_settle_attempt_counts()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(task_id.to_owned())
+                .or_insert(0) += 1;
+        }
+        // Round 6 (V2b) / round 7 — this attempt's flight hold is released
+        // on EVERY exit path (success, exhaustion, fence-kill,
+        // panic-unwind) by the RECEIVED guard's Drop, and nowhere else: one
+        // release point, exactly once per attempt. The guard was
+        // constructed by whoever SCHEDULED the attempt — the enqueue for
+        // attempt 0, the previous attempt's re-arm for a retry — and rode
+        // the timer future / closure here, so an attempt that never runs
+        // (dropped future, pool shutdown) still releases on drop.
+        let _flight_guard = flight;
+        // Staleness fence — see the doc comment.
+        {
+            let bindings = self
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if bindings.get(task_id).map(|entry| entry.generation) != Some(binding.generation) {
+                tracing::debug!(
+                    task_id,
+                    goal_id = %binding.goal_row.goal_id,
+                    attempt,
+                    "goal task-row settle chain is stale (binding removed or re-stashed); dying"
+                );
+                return;
+            }
+        }
+        let ledger_dir = Self::goal_ledger_dir(&binding.profile_data_dir);
+        let now = now_ms_u64();
+        let seed_row = octos_fleet::Task {
+            task_id: task_id.to_owned(),
+            goal_id: binding.goal_row.goal_id.clone(),
+            title: binding.title.clone(),
+            detail: String::new(),
+            status: "running".to_owned(),
+            assigned_peer: binding.assigned_peer.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let written = std::fs::create_dir_all(&ledger_dir)
+            .map_err(|error| eyre::eyre!("ledger dir unavailable: {error}"))
+            .and_then(|()| octos_fleet::GoalLedger::open_with_busy_retry(binding.ledger_path()))
+            .and_then(|ledger| {
+                ledger.create_goal_if_absent(&binding.goal_row)?;
+                ledger.create_task_if_absent(&seed_row)?;
+                ledger.settle_task_status(task_id, authority, now)
+            });
+        match written {
+            Ok(moved) => {
+                let mut bindings = self
+                    .shared
+                    .goal_task_ledger_bindings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Every map mutation below is generation-gated (round 5): a
+                // re-stash between this chain's fence and its success means
+                // the entry — and its flight accounting — belongs to the new
+                // incarnation, which this chain must not touch.
+                match bindings.get_mut(task_id) {
+                    Some(entry) if entry.generation == binding.generation => {
+                        if remove_on_success {
+                            bindings.remove(task_id);
+                        } else {
+                            // Provisional failure settled: the binding stays
+                            // purely as the correction window. Stamp the
+                            // purge clock ONCE — a redelivery no-op must not
+                            // extend retention. The flight hold is released
+                            // by `_flight_guard`, like every other exit.
+                            entry
+                                .retained_since
+                                .get_or_insert_with(std::time::Instant::now);
+                        }
+                    }
+                    _ => {}
+                }
+                drop(bindings);
+                tracing::debug!(
+                    task_id,
+                    goal_id = %binding.goal_row.goal_id,
+                    authority = ?authority,
+                    moved,
+                    remove_on_success,
+                    attempt,
+                    "goal task-row terminal settle"
+                );
+            }
+            Err(error) => {
+                let next_attempt = attempt + 1;
+                if next_attempt >= GOAL_TASK_SETTLE_ATTEMPTS {
+                    // Chain end; `_flight_guard` releases the hold.
+                    tracing::debug!(
+                        task_id,
+                        goal_id = %binding.goal_row.goal_id,
+                        authority = ?authority,
+                        attempt,
+                        %error,
+                        "goal task-row terminal settle failed; retry budget exhausted"
+                    );
+                    return;
+                }
+                // Round 6 (V2a) — take the NEXT attempt's hold BEFORE the
+                // timer is queued and before this attempt's guard releases
+                // its own, so `in_flight` stays above zero across the whole
+                // backoff gap and the purge cannot kill the chain between
+                // attempts. A failed take means the entry is gone or
+                // re-stashed — the chain is already dead, so don't re-arm.
+                let Some(next_flight) =
+                    self.acquire_goal_task_settle_flight(task_id, binding.generation)
+                else {
+                    tracing::debug!(
+                        task_id,
+                        goal_id = %binding.goal_row.goal_id,
+                        attempt,
+                        "goal task-row settle chain lost its binding at re-arm; dying"
+                    );
+                    return;
+                };
+                tracing::debug!(
+                    task_id,
+                    goal_id = %binding.goal_row.goal_id,
+                    authority = ?authority,
+                    attempt,
+                    %error,
+                    "goal task-row terminal settle failed; re-scheduling"
+                );
+                let this = self.clone();
+                let binding = binding.clone();
+                let task_id = task_id.to_owned();
+                let backoff = goal_task_settle_backoff(attempt);
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        let blocking_handle = handle.clone();
+                        handle.spawn(async move {
+                            tokio::time::sleep(backoff).await;
+                            blocking_handle.spawn_blocking(move || {
+                                this.settle_goal_task_row_blocking(
+                                    &binding,
+                                    &task_id,
+                                    authority,
+                                    remove_on_success,
+                                    next_attempt,
+                                    next_flight,
+                                );
+                            });
+                        });
+                    }
+                    Err(_) => {
+                        // Inline mode: the caller's plain (non-executor)
+                        // thread; the bounded chain may sleep here.
+                        std::thread::sleep(backoff);
+                        this.settle_goal_task_row_blocking(
+                            &binding,
+                            &task_id,
+                            authority,
+                            remove_on_success,
+                            next_attempt,
+                            next_flight,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2055 review round 3 (liveness consult in round 4) — drop correction
+    /// windows older than [`PROVISIONAL_CORRECTION_RETENTION`], but NEVER a
+    /// live task's: eligibility requires BOTH an expired `retained_since`
+    /// stamp AND the process-global worker liveness
+    /// ([`octos_agent::task_is_live`]) reporting the worker gone — a
+    /// still-running provisionally-failed worker keeps its correction
+    /// window however long it runs. A binding with no stamp (task live or
+    /// settle still retrying) is never eligible at all. Called
+    /// opportunistically from registration and settle map touches; no
+    /// background sweeper.
+    fn purge_expired_goal_task_bindings(&self) {
+        self.shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|task_id, binding| {
+                // Round 5 — an entry with a settle flight in progress is
+                // NEVER purged, however expired: dropping it would make the
+                // chain's staleness fence kill a queued/backing-off
+                // correction (right fence, wrong victim).
+                if binding.in_flight > 0 {
+                    return true;
+                }
+                match binding.retained_since {
+                    Some(retained_since) => {
+                        retained_since.elapsed() < PROVISIONAL_CORRECTION_RETENTION
+                            || octos_agent::task_is_live(task_id)
+                    }
+                    None => true,
+                }
+            });
+    }
+
+    /// #2055 review round 2 — test-only visibility into the binding map so
+    /// effect tests can assert the lifecycle (kept across an observer-
+    /// provisional failure, removed after a final settle).
+    #[cfg(test)]
+    pub(crate) fn goal_task_binding_exists_for_test(&self, task_id: &str) -> bool {
+        self.shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(task_id)
     }
 
     /// #1857 PR 5a — stash the controller workspace binding on the goal record
@@ -16805,6 +17666,1497 @@ mod tests {
             1,
             "WS failure routing must enqueue exactly one recovery continuation",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2055 / #2054 — goal-ledger task rows: created at registration, settled
+    // at terminal through the unified sink.
+    // -----------------------------------------------------------------------
+
+    /// Wire a real `TaskSupervisor` through the SHARED production installer
+    /// (round 3, review R8): tests and every production site call the same
+    /// [`install_goal_task_row_observers_resolving_at_callback`], so test
+    /// wiring cannot drift from production wiring — deleting or gutting the
+    /// installer breaks these tests. The `on_terminal` sink stays wired for
+    /// continuation routing (and must not interfere with settling). Full
+    /// serve-boot integration coverage is out of scope here. Tests without
+    /// a tokio runtime run the ledger I/O inline (deterministic); the
+    /// offload branch has its own `#[tokio::test]` coverage.
+    fn wire_supervisor_for_goal_task_rows(
+        supervisor: &octos_agent::TaskSupervisor,
+        session: &SessionKey,
+        profile: &str,
+        data_dir: &std::path::Path,
+    ) {
+        install_goal_task_row_observers_resolving_at_callback(
+            supervisor, session, profile, data_dir,
+        );
+        supervisor.set_on_terminal(move |event| {
+            route_terminal_event_to_continuation_queue(event, None);
+        });
+    }
+
+    fn goal_task_ledger_path(data_dir: &std::path::Path, goal_id: &str) -> std::path::PathBuf {
+        InProcessAgentOrchestrator::goal_ledger_dir(data_dir)
+            .join(format!("{}.db", sanitize_filename_for_ledger(goal_id)))
+    }
+
+    /// #2055 (creation) + #2054 (settlement, success side): a goal-bound
+    /// session registering a background task creates a `running` row, and
+    /// the task completing flips it to `complete` THROUGH THE SINK — no
+    /// direct settle call anywhere in this test.
+    #[test]
+    fn goal_bound_registration_creates_running_row_and_completion_settles_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-ok";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-ok");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register("web_probe", "call-rows-1", Some(&wire.to_string()));
+        assert!(!task_id.is_empty(), "registration succeeds");
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("ledger exists after registration");
+        let row = ledger
+            .get_task(&task_id)
+            .expect("read row")
+            .expect("registration created a task row");
+        assert_eq!(row.status, "running");
+        assert_eq!(row.goal_id, goal_id);
+        assert_eq!(row.title, "web_probe", "title carries the tool name");
+
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "complete",
+            "the unified terminal sink settles the row on completion"
+        );
+        let counts: std::collections::BTreeMap<String, u64> = ledger
+            .task_status_counts(&goal_id)
+            .expect("counts")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            counts.get("complete"),
+            Some(&1),
+            "task_status_counts observes the completion"
+        );
+        assert_eq!(counts.get("running"), None);
+    }
+
+    /// #2054 failure side: an owner-reported failure flips its row to
+    /// `failed` through the change feed — INCLUDING a failure whose
+    /// synth-ack was never emitted (the terminal sink suppresses the
+    /// recovery continuation for those; settling rides `notify_change`, so
+    /// the ledger write is unaffected). An owner failure is FINAL
+    /// (`mark_completed` refuses to override it), so the binding is
+    /// released on settle.
+    #[test]
+    fn goal_bound_registration_failure_settles_failed_row_through_the_change_feed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-fail";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-fail");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register("web_probe", "call-rows-2", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(&task_id, "probe exited 1".to_string());
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "failed",
+            "a synth-ack-suppressed failure still settles its ledger row"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "an owner failure is final — the binding is released"
+        );
+    }
+
+    /// #2055 review round 2 (hole a): `cancel` never fires `notify_terminal`
+    /// — settling rides the change feed precisely so a cancelled goal-bound
+    /// task neither leaks its binding nor leaves a `running` row. The
+    /// ledger keeps the #2054 vocabulary: cancellation lands as `failed`.
+    #[test]
+    fn cancelled_goal_bound_task_settles_failed_and_releases_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-cancel";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-cancel");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register("web_probe", "call-rows-cancel", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        supervisor.cancel(&task_id).expect("cancel");
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "failed",
+            "cancellation settles as `failed` (the #2054 vocabulary)"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "cancellation is final — the binding is released"
+        );
+    }
+
+    /// #2055 review round 2 (Additional-1): an OBSERVER-provisional failure
+    /// settles `failed` but keeps its binding, so the owner's later
+    /// completion (`mark_completed` overriding `failed_by_observer` —
+    /// task_supervisor.rs:2527) corrects the row to `complete` through the
+    /// change feed and the ledger's one admitted terminal→terminal
+    /// transition. The binding is released once the correction lands.
+    #[test]
+    fn observer_failure_then_owner_completion_corrects_row_to_complete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-correct";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-correct");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register(
+            "review_worker",
+            "call-rows-correct",
+            Some(&wire.to_string()),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed_observed(&task_id, "unknown tool: write_file".to_string());
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(row.status, "failed", "the provisional failure lands first");
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "a provisional failure keeps the binding open for the correction"
+        );
+
+        supervisor.mark_completed(&task_id, vec![]);
+
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "complete",
+            "the owner's completion corrects the provisional failure in the ledger"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the correction closes the binding"
+        );
+    }
+
+    /// #2055 review round 2 (H4/H6 ii): the production nesting path — a
+    /// snapshot registry's FRESH supervisor inherits the observer pair, so
+    /// a registration on the nested child still creates its ledger row.
+    #[test]
+    fn nested_snapshot_child_registration_creates_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-nested";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-nested");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let parent_registry = octos_agent::ToolRegistry::new();
+        wire_supervisor_for_goal_task_rows(
+            &parent_registry.supervisor(),
+            &wire,
+            profile,
+            dir.path(),
+        );
+
+        let child_registry = parent_registry.snapshot_excluding(&[]);
+        let child = child_registry.supervisor();
+        let task_id = child.register("nested_probe", "call-rows-nested", Some(&wire.to_string()));
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger
+            .get_task(&task_id)
+            .expect("read row")
+            .expect("the nested child's registration created a row");
+        assert_eq!(row.status, "running");
+        assert_eq!(row.title, "nested_probe");
+
+        // And the inherited settle listener flips it at terminal.
+        child.mark_running(&task_id);
+        child.mark_completed(&task_id, vec![]);
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(row.status, "complete");
+    }
+
+    /// #2055 review round 3 (P1): scripted provider for the REAL
+    /// default-mode nested spawn — the FIRST model turn (the outer
+    /// background child's) calls `spawn_agent`, every later turn (the
+    /// child's follow-up and the grandchild's whole run) ends immediately.
+    struct NestedSpawnScriptProvider {
+        spawned: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NestedSpawnScriptProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let first = !self.spawned.swap(true, std::sync::atomic::Ordering::SeqCst);
+            if first {
+                Ok(octos_llm::ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call-nested-grandchild".to_string(),
+                        name: "spawn_agent".to_string(),
+                        arguments: serde_json::json!({
+                            "task": "reply with the word done",
+                            "label": "nested-grandchild",
+                        }),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            } else {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+        }
+
+        fn model_id(&self) -> &str {
+            "nested-spawn-script"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// #2055 review round 3 (P1): the DEFAULT-mode (background) nested
+    /// spawn, driven through the REAL spawn path end-to-end — no hand-built
+    /// child registry anywhere. The outer spawn omits `mode` (background is
+    /// the default), so the DETACHED branch builds the child registry; the
+    /// scripted child model then calls `spawn_agent`, whose registration
+    /// lands on that detached registry's private supervisor. Only the
+    /// detached-branch observer inheritance makes the grandchild's SQLite
+    /// row exist — this is exactly the hole class the deleted grep tests
+    /// hid (a hand-built registry would pass without the production path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_mode_background_nested_spawn_lands_grandchild_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-bgnest";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-bgnest");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        // The parent (session) supervisor, wired through the SHARED
+        // production installer.
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(dir.path().join("memory"))
+                .await
+                .expect("episode store"),
+        );
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(16);
+        let spawn_tool = octos_agent::SpawnTool::new(
+            Arc::new(NestedSpawnScriptProvider {
+                spawned: std::sync::atomic::AtomicBool::new(false),
+            }),
+            memory,
+            dir.path().join("work"),
+            inbound_tx,
+        )
+        .with_task_supervisor(
+            Arc::clone(&supervisor),
+            wire.to_string(),
+            dir.path().join("tasks.jsonl"),
+        );
+        std::fs::create_dir_all(dir.path().join("work")).unwrap();
+
+        // No "mode" key: background IS the default, and the default is the
+        // branch under test.
+        let result = octos_agent::Tool::execute(
+            &spawn_tool,
+            &serde_json::json!({
+                "task": "spawn one nested helper, then finish",
+                "label": "outer-background-child",
+            }),
+        )
+        .await
+        .expect("outer spawn dispatch");
+        assert!(result.success, "outer background spawn must start");
+
+        // The grandchild's task id lives on the DETACHED child registry's
+        // private supervisor (invisible from here), so identify its row by
+        // title — registration records the tool label.
+        let mut titles = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            let path = ledger_path.clone();
+            let gid = goal_id.clone();
+            titles = tokio::task::spawn_blocking(move || {
+                octos_fleet::GoalLedger::open(&path)
+                    .ok()
+                    .and_then(|ledger| ledger.tasks_for_goal(&gid).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|task| task.title)
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap();
+            if titles.iter().any(|title| title == "nested-grandchild") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            titles.iter().any(|title| title == "outer-background-child"),
+            "the outer background child has a row (parent supervisor wiring); rows: {titles:?}"
+        );
+        assert!(
+            titles.iter().any(|title| title == "nested-grandchild"),
+            "the DEFAULT-mode nested grandchild must land a row via detached-branch \
+             observer inheritance; rows: {titles:?}"
+        );
+    }
+
+    /// Build a binding AND stash it in the orchestrator's map (the settle
+    /// core's staleness fence requires a present, generation-matched entry),
+    /// for tests that drive the private blocking cores directly.
+    fn stashed_test_binding(
+        orchestrator: &InProcessAgentOrchestrator,
+        data_dir: &std::path::Path,
+        goal_id: &str,
+        task_id: &str,
+    ) -> GoalTaskLedgerBinding {
+        let mut binding = GoalTaskLedgerBinding::new_unstashed(
+            octos_fleet::Goal {
+                goal_id: goal_id.to_string(),
+                objective: "converge".to_string(),
+                status: "active".to_string(),
+                tokens_used: 0,
+                token_budget: 1_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            "web_probe".to_string(),
+            None,
+            data_dir.to_path_buf(),
+        );
+        // Round 7 — stash through the PRODUCTION assignment path, so every
+        // direct-core test runs under a real (globally monotonic) generation.
+        binding.generation = orchestrator.stash_goal_task_binding(task_id, binding.clone());
+        binding
+    }
+
+    /// Take the flight hold a scheduler would hand to an attempt for
+    /// `binding` — round 8: through the REAL
+    /// `acquire_goal_task_settle_flight`, so test guards are
+    /// indistinguishable from production guards and every hold a test hands
+    /// to the core is BALANCED (a fabricated guard was an unbalanced
+    /// release that `saturating_sub` masked).
+    fn test_flight_for(
+        orchestrator: &InProcessAgentOrchestrator,
+        task_id: &str,
+        binding: &GoalTaskLedgerBinding,
+    ) -> GoalTaskSettleFlightGuard {
+        orchestrator
+            .acquire_goal_task_settle_flight(task_id, binding.generation)
+            .expect("the stashed entry admits the attempt's flight hold")
+    }
+
+    /// #2055 review round 2 (Additional-3): with the I/O offloaded, nothing
+    /// orders the creation write against the settle write. This test
+    /// DELIBERATELY invokes the two PRIVATE blocking cores directly (review
+    /// round 3, R9-b): forcing the reverse order deterministically is only
+    /// possible below the offload layer, and pure write-ordering is exactly
+    /// what the cores own. The settle seeds the row and applies its
+    /// terminal; the late creation write preserves it — both orders
+    /// converge on the same terminal row.
+    #[test]
+    fn settle_before_create_ordering_converges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-order", "task-order");
+
+        // Settle lands FIRST (fresh ledger file — the settle is
+        // self-sufficient and seeds goal + task rows itself).
+        orchestrator.settle_goal_task_row_blocking(
+            &binding,
+            "task-order",
+            octos_fleet::TaskSettleAuthority::Completion,
+            true,
+            0,
+            test_flight_for(&orchestrator, "task-order", &binding),
+        );
+        // The creation offload arrives LATE and must not resurrect it.
+        InProcessAgentOrchestrator::record_goal_task_row_blocking(&binding, "task-order");
+
+        let ledger = octos_fleet::GoalLedger::open(binding.ledger_path()).expect("open ledger");
+        let row = ledger
+            .get_task("task-order")
+            .expect("read row")
+            .expect("settle created the row");
+        assert_eq!(
+            row.status, "complete",
+            "a late creation write preserves the settled terminal"
+        );
+    }
+
+    /// #2055 review round 4 (P1 terminal authority): every delivery order of
+    /// P = provisional failure, C = completion, D = final failure converges
+    /// through the REAL blocking cores — all six D-present orders end
+    /// `failed`; P/C alone end `complete` either way. `remove_on_success`
+    /// is passed as `false` throughout so the binding survives between
+    /// writes and the test isolates pure write-order convergence: in
+    /// production a D event after a final settle removed the binding cannot
+    /// be EMITTED by the owning supervisor at all (its terminal guard), and
+    /// cross-supervisor scrambles are #2060's problem — the ranked writer
+    /// below is what makes any of them harmless.
+    #[test]
+    fn every_authority_order_converges_through_the_blocking_cores() {
+        use octos_fleet::TaskSettleAuthority::{Completion, FinalFailure, ProvisionalFailure};
+        let three_event_orders: [[octos_fleet::TaskSettleAuthority; 3]; 6] = [
+            [ProvisionalFailure, Completion, FinalFailure],
+            [ProvisionalFailure, FinalFailure, Completion],
+            [Completion, ProvisionalFailure, FinalFailure],
+            [Completion, FinalFailure, ProvisionalFailure],
+            [FinalFailure, ProvisionalFailure, Completion],
+            [FinalFailure, Completion, ProvisionalFailure],
+        ];
+        for (index, order) in three_event_orders.iter().enumerate() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let task_id = format!("task-order-{index}");
+            let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-order", &task_id);
+            for authority in order {
+                orchestrator.settle_goal_task_row_blocking(
+                    &binding,
+                    &task_id,
+                    *authority,
+                    false,
+                    0,
+                    test_flight_for(&orchestrator, &task_id, &binding),
+                );
+            }
+            let ledger = octos_fleet::GoalLedger::open(binding.ledger_path()).expect("open ledger");
+            let row = ledger.get_task(&task_id).expect("read").expect("row");
+            assert_eq!(
+                row.status, "failed",
+                "order #{index} {order:?} contains a final failure and must end failed"
+            );
+        }
+        for (index, order) in [
+            [ProvisionalFailure, Completion],
+            [Completion, ProvisionalFailure],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = tempfile::TempDir::new().unwrap();
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let task_id = format!("task-nod-{index}");
+            let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-order", &task_id);
+            for authority in order {
+                orchestrator.settle_goal_task_row_blocking(
+                    &binding,
+                    &task_id,
+                    *authority,
+                    false,
+                    0,
+                    test_flight_for(&orchestrator, &task_id, &binding),
+                );
+            }
+            let ledger = octos_fleet::GoalLedger::open(binding.ledger_path()).expect("open ledger");
+            let row = ledger.get_task(&task_id).expect("read").expect("row");
+            assert_eq!(
+                row.status, "complete",
+                "{order:?} has no final failure and must end complete"
+            );
+        }
+    }
+
+    /// #2055 review round 4 (retry-chain lifecycle): a settle chain captures
+    /// its binding generation and re-checks presence + generation before
+    /// EVERY write attempt — a re-stash under a bumped generation kills the
+    /// stale chain even though an entry EXISTS under the same task id, so a
+    /// presence-only check cannot pass this test.
+    #[test]
+    fn stale_settle_chain_dies_on_generation_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let binding = stashed_test_binding(&orchestrator, dir.path(), "goal-gen", "task-gen-stale");
+
+        // The chain's hold is taken while its incarnation is live (the
+        // production shape), THEN the entry is re-stashed through the REAL
+        // stash path (round 8 — fresh counter-assigned generation) — the
+        // captured `binding` and its hold are now stale.
+        let stale_flight = test_flight_for(&orchestrator, "task-gen-stale", &binding);
+        orchestrator.stash_goal_task_binding("task-gen-stale", binding.clone());
+
+        orchestrator.settle_goal_task_row_blocking(
+            &binding,
+            "task-gen-stale",
+            octos_fleet::TaskSettleAuthority::FinalFailure,
+            true,
+            0,
+            stale_flight,
+        );
+
+        // The stale chain died BEFORE any write: no ledger file, no row.
+        assert!(
+            octos_fleet::GoalLedger::open(binding.ledger_path())
+                .ok()
+                .and_then(|ledger| ledger.get_task("task-gen-stale").ok().flatten())
+                .is_none(),
+            "a generation-stale chain must not write"
+        );
+        // And the current-generation entry is untouched.
+        assert!(
+            orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap()
+                .contains_key("task-gen-stale")
+        );
+    }
+
+    /// #2055 review round 4 (purge vs liveness): an expired correction
+    /// window is purged ONLY when the process-global worker liveness agrees
+    /// the worker is gone — a still-live provisionally-failed task keeps
+    /// its binding past the deadline.
+    #[test]
+    fn retention_purge_spares_live_workers_past_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-purge-live";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-purge-live");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id = supervisor.register("web_probe", "call-purge-alive", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        // Arm the process-global liveness for this worker (the guard is what
+        // real workers hold for their whole critical section).
+        let live_guard =
+            octos_agent::TaskTerminalGuard::new(Arc::clone(&supervisor), task_id.clone());
+        supervisor.mark_failed_observed(&task_id, "flaky".to_string());
+
+        // Backdate the correction window past the deadline.
+        {
+            let mut bindings = default_agent_orchestrator()
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            let entry = bindings.get_mut(&task_id).expect("retained entry");
+            entry.retained_since = std::time::Instant::now()
+                .checked_sub(PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1));
+        }
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "a LIVE worker's expired correction window must survive the purge"
+        );
+
+        // Once the worker is genuinely gone, the expired window purges.
+        drop(live_guard);
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the same expired window purges once the worker liveness clears"
+        );
+    }
+
+    /// #2055 review round 3 (retention purge): a binding retained purely as
+    /// a correction window is dropped once it outlives the deadline; a LIVE
+    /// task's binding (no `retained_since`) is never purged.
+    #[test]
+    fn retention_purge_drops_only_expired_correction_windows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-purge";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-purge");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let live_id = supervisor.register("web_probe", "call-purge-live", Some(&wire.to_string()));
+        let provisional_id =
+            supervisor.register("web_probe", "call-purge-prov", Some(&wire.to_string()));
+        supervisor.mark_running(&provisional_id);
+        supervisor.mark_failed_observed(&provisional_id, "flaky".to_string());
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&provisional_id),
+            "the settled provisional failure retains its correction window"
+        );
+
+        // Backdate the correction window past the deadline, then run the
+        // opportunistic purge directly (it also fires on every map touch).
+        {
+            let orchestrator = default_agent_orchestrator();
+            let mut bindings = orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            let entry = bindings.get_mut(&provisional_id).expect("retained entry");
+            entry.retained_since = std::time::Instant::now()
+                .checked_sub(PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1));
+            assert!(
+                entry.retained_since.is_some(),
+                "backdate must be representable"
+            );
+        }
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&provisional_id),
+            "an expired correction window is purged"
+        );
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&live_id),
+            "a live task's binding is never purged, however old"
+        );
+    }
+
+    /// Poll a ledger row's status from the blocking pool (test-side reads
+    /// must not commit the runtime-thread SQLite pattern this PR removes).
+    async fn poll_row_status(
+        ledger_path: &std::path::Path,
+        task_id: &str,
+        want: &str,
+        deadline: std::time::Duration,
+    ) -> Option<String> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            let path = ledger_path.to_path_buf();
+            let id = task_id.to_owned();
+            let found = tokio::task::spawn_blocking(move || {
+                octos_fleet::GoalLedger::open(&path)
+                    .ok()
+                    .and_then(|ledger| ledger.get_task(&id).ok().flatten())
+                    .map(|row| row.status)
+            })
+            .await
+            .unwrap();
+            if found.as_deref() == Some(want) {
+                return found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    /// Hold `BEGIN IMMEDIATE` on the ledger from the blocking pool. The
+    /// returned oneshot resolves AFTER the transaction actually began (the
+    /// lock-acquired handshake), and the returned sender releases it — no
+    /// fixed sleeps anywhere, so scheduler delays cannot invert the test's
+    /// phases.
+    fn hold_ledger_write_lock(
+        ledger_path: &std::path::Path,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let path = ledger_path.to_path_buf();
+        let holder = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            let _ = held_tx.send(());
+            // Held until the test says otherwise (or it dropped the sender).
+            let _ = release_rx.recv();
+            conn.execute_batch("COMMIT;").unwrap();
+        });
+        (held_rx, release_tx, holder)
+    }
+
+    /// #2055 review round 2 (H9), tightened in rounds 3-4: inside a tokio
+    /// runtime the observer callbacks only stash and spawn — the SQLite I/O
+    /// lands on the blocking pool. Proven under handshaked CONTENTION on a
+    /// SINGLE-worker runtime: with a real write transaction verifiably held,
+    /// (1) the register call returns promptly, (2) a verifiably-started
+    /// heartbeat keeps beating through a two-second window (inline I/O
+    /// would park the only worker on the busy handler and starve it), and
+    /// (3) the task's row genuinely lands — the post-release completion
+    /// settles it through the self-sufficient settle path, so no assertion
+    /// depends on the lock releasing before any internal busy budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn offloaded_registration_stays_off_the_executor_under_contention() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-offload";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-offload");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        // Materialize the ledger file so the holder has something to lock.
+        {
+            let path = ledger_path.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                octos_fleet::GoalLedger::open(&path).unwrap();
+            })
+            .await
+            .unwrap();
+        }
+        let (held, release, holder) = hold_ledger_write_lock(&ledger_path);
+        held.await.expect("lock-acquired handshake");
+
+        // Heartbeat with a started-handshake: the measured window opens only
+        // after the first beat has demonstrably run.
+        let heartbeat = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat_task = {
+            let heartbeat = heartbeat.clone();
+            tokio::spawn(async move {
+                loop {
+                    heartbeat.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+        };
+        while heartbeat.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let register_started = std::time::Instant::now();
+        let task_id =
+            supervisor.register("web_probe", "call-rows-offload", Some(&wire.to_string()));
+        let register_elapsed = register_started.elapsed();
+        assert!(
+            register_elapsed < std::time::Duration::from_millis(1_500),
+            "registration must return promptly under held ledger contention \
+             (took {register_elapsed:?} — inline I/O would ride the busy handler)"
+        );
+
+        // The single worker must keep serving the heartbeat while the
+        // offloaded write busy-waits on the blocking pool behind the held
+        // lock. Two full seconds, wide tolerance (nominal ~200 beats).
+        let beats_before = heartbeat.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let beats = heartbeat.load(std::sync::atomic::Ordering::SeqCst) - beats_before;
+        assert!(
+            beats >= 40,
+            "the executor worker must keep beating under contention; got {beats} beats"
+        );
+        heartbeat_task.abort();
+        release.send(()).expect("release the held lock");
+        holder.await.unwrap();
+
+        // The row genuinely lands: the completion settle is self-sufficient
+        // (it seeds the row if the contended creation write lost its busy
+        // window), so this holds regardless of how long the lock was held.
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+        let status = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "complete",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(
+            status.as_deref(),
+            Some("complete"),
+            "the registered task's row must land in the ledger"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the settled completion releases the binding"
+        );
+    }
+
+    /// #2055 review rounds 3-4 (bounded settle retry): with the lock
+    /// verifiably held past the first attempt's busy budget, the settle
+    /// re-arms — the release is triggered by the ATTEMPT COUNTER observing a
+    /// retry entry, not by a fixed sleep, so scheduler delays cannot invert
+    /// the phases — and the chain converges the row once the lock releases.
+    /// Cancellation emits exactly one change event, so without the retry
+    /// this row would stay `running` forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contended_settle_retries_until_the_row_converges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-retry";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-retry");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id = supervisor.register("web_probe", "call-rows-retry", Some(&wire.to_string()));
+
+        // Wait for the registration write to land so the contention below
+        // targets the settle, not the creation.
+        let created = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "running",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(created.as_deref(), Some("running"), "creation landed");
+
+        let (held, release, holder) = hold_ledger_write_lock(&ledger_path);
+        held.await.expect("lock-acquired handshake");
+
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+
+        // Hold until THIS task's per-task attempt count proves a RETRY
+        // entered (first attempt + at least one re-arm), then release. The
+        // round-5 counter is keyed by task id, so parallel tests' attempts
+        // cannot satisfy this gate (the earlier global delta could release
+        // before this task's retry ever entered — a false pass).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let attempts = goal_task_settle_attempts_for(&task_id);
+            if attempts >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no settle retry entered within the deadline (this task's attempts: {attempts})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        release.send(()).expect("release the held lock");
+        holder.await.unwrap();
+
+        let status = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "complete",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(
+            status.as_deref(),
+            Some("complete"),
+            "the settle retry chain must converge the row after the lock releases"
+        );
+        assert!(
+            goal_task_settle_attempts_for(&task_id) >= 2,
+            "at least one outer retry fired for exactly this task"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the converged settle releases the binding"
+        );
+    }
+
+    /// #2055 review round 5 (retry-proof isolation): the attempt counter is
+    /// keyed per task — attempts recorded for one task are invisible to
+    /// another task's gate, so a parallel test can never satisfy this
+    /// test's release condition.
+    #[test]
+    fn settle_attempt_counter_is_scoped_per_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let binding =
+            stashed_test_binding(&orchestrator, dir.path(), "goal-scoped", "task-scoped-a");
+        assert_eq!(goal_task_settle_attempts_for("task-scoped-b"), 0);
+
+        orchestrator.settle_goal_task_row_blocking(
+            &binding,
+            "task-scoped-a",
+            octos_fleet::TaskSettleAuthority::Completion,
+            false,
+            0,
+            test_flight_for(&orchestrator, "task-scoped-a", &binding),
+        );
+
+        assert!(
+            goal_task_settle_attempts_for("task-scoped-a") >= 1,
+            "the driven task's attempts are recorded under its own key"
+        );
+        assert_eq!(
+            goal_task_settle_attempts_for("task-scoped-b"),
+            0,
+            "another task's gate observes NONE of them"
+        );
+    }
+
+    /// #2055 review round 5 (purge vs in-flight correction): an expired,
+    /// liveness-cleared correction whose settle is queued/backing off must
+    /// NOT be purged out from under its own chain — the write fence would
+    /// kill it permanently. The flight mark protects it; the entry is then
+    /// removed by the SETTLE, not the purge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_spares_in_flight_correction_and_the_settle_lands_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-inflight";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-inflight");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id = supervisor.register(
+            "review_worker",
+            "call-rows-inflight",
+            Some(&wire.to_string()),
+        );
+        supervisor.mark_running(&task_id);
+
+        // Provisional failure settles and retains the correction window.
+        supervisor.mark_failed_observed(&task_id, "flaky verdict".to_string());
+        let failed = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "failed",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(failed.as_deref(), Some("failed"));
+        // Wait for the provisional chain to fully finish (flight released,
+        // correction window stamped). No liveness guard is armed for this
+        // task, so later only the in-flight mark can protect the correction.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                {
+                    let bindings = default_agent_orchestrator()
+                        .shared
+                        .goal_task_ledger_bindings
+                        .lock()
+                        .unwrap();
+                    if let Some(entry) = bindings.get(&task_id)
+                        && entry.in_flight == 0
+                        && entry.retained_since.is_some()
+                    {
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "provisional settle did not retain the binding in time"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        let attempts_after_provisional = goal_task_settle_attempts_for(&task_id);
+
+        // Hold the ledger, fire the owner's correction, and wait until its
+        // chain has verifiably ENTERED (scoped attempt counter) — it is now
+        // queued/backing off against the held lock.
+        let (held, release, holder) = hold_ledger_write_lock(&ledger_path);
+        held.await.expect("lock-acquired handshake");
+        supervisor.mark_completed(&task_id, vec![]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while goal_task_settle_attempts_for(&task_id) <= attempts_after_provisional {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the correction chain never entered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Force expiry only NOW, with the correction's flight hold already
+        // taken: an entry that is expired AND hold-free is legitimately
+        // purgeable (the accepted post-purge semantics), so expiring it
+        // before the enqueue would let any parallel test's purge — or the
+        // production-shaped hammer below — drop it in the setup gap and
+        // turn this into a test of its own scaffolding.
+        {
+            let mut bindings = default_agent_orchestrator()
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            bindings
+                .get_mut(&task_id)
+                .expect("held entry")
+                .retained_since = std::time::Instant::now()
+                .checked_sub(PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1));
+        }
+
+        // Purge explicitly mid-attempt: expired + liveness-cleared, but a
+        // flight is in progress — the entry must survive.
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+        assert!(
+            default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the purge must spare the in-flight correction's binding"
+        );
+        // Round 6 (V2a) — and HAMMER the purge through the rest of the
+        // contention window, so it also lands inside the retry BACKOFF gap:
+        // the re-arm's hold hand-off keeps `in_flight` above zero between
+        // attempts, and without it (the mutation) some hammer hit lands at
+        // zero, drops the binding, and the correction never lands.
+        let hammer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer = {
+            let stop = hammer_stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    default_agent_orchestrator().purge_expired_goal_task_bindings();
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+        // Keep the lock held until attempt 2 has verifiably ENTERED: that
+        // proves attempt 1 exhausted its busy budget, failed, and the chain
+        // crossed a real backoff gap while the hammer was pounding — the
+        // exact window the hand-off protects.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while goal_task_settle_attempts_for(&task_id) <= attempts_after_provisional + 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the correction chain never crossed a backoff gap"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        release.send(()).expect("release the held lock");
+        holder.await.unwrap();
+
+        // The correction lands, and the SETTLE removes the entry.
+        let status = poll_row_status(
+            &ledger_path,
+            &task_id,
+            "complete",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        hammer_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        hammer.await.unwrap();
+        assert_eq!(
+            status.as_deref(),
+            Some("complete"),
+            "the spared correction must still land"
+        );
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "the entry is removed by the settle, not the purge"
+        );
+    }
+
+    /// #2055 review round 7 (W2 ABA): a stale hold from a REMOVED
+    /// incarnation can never act on a re-stashed entry under the same task
+    /// id — generations come from one process-wide monotonic counter and
+    /// are never reused, so the old guard's release is generation-fenced
+    /// into a no-op and the new incarnation keeps its own live hold (and
+    /// with it, its purge protection). Production task ids are fresh
+    /// UUIDv7s today; this pre-covers the same-id restoration path #2056
+    /// tracks.
+    #[test]
+    fn rebound_task_id_cannot_be_stolen_by_a_stale_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let first = stashed_test_binding(&orchestrator, dir.path(), "goal-aba", "task-aba");
+        let stale_hold = orchestrator
+            .acquire_goal_task_settle_flight("task-aba", first.generation)
+            .expect("hold on the first incarnation");
+
+        // The first incarnation is removed (the success-removal / purge
+        // shape), then the SAME task id is re-stashed — the ABA setup.
+        orchestrator
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap()
+            .remove("task-aba");
+        let second_generation = orchestrator.stash_goal_task_binding("task-aba", first.clone());
+        assert_ne!(
+            second_generation, first.generation,
+            "generations are globally monotonic and never reused"
+        );
+
+        // The new incarnation holds its own live flight...
+        let _live_hold = orchestrator
+            .acquire_goal_task_settle_flight("task-aba", second_generation)
+            .expect("hold on the new incarnation");
+        // ...and the stale hold's late release must not steal it.
+        drop(stale_hold);
+        let live = orchestrator
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap()
+            .get("task-aba")
+            .map(|entry| entry.in_flight);
+        assert_eq!(
+            live,
+            Some(1),
+            "the stale incarnation's release must not touch the live hold"
+        );
+        // Purge protection is intact under the live hold, even expired.
+        {
+            let mut bindings = orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            bindings.get_mut("task-aba").expect("entry").retained_since = std::time::Instant::now()
+                .checked_sub(PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1));
+        }
+        orchestrator.purge_expired_goal_task_bindings();
+        assert!(
+            orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap()
+                .contains_key("task-aba"),
+            "the live hold keeps the re-stashed entry purge-protected"
+        );
+    }
+
+    /// #2055 review round 7 (blast-radius orphan): the hold taken for a
+    /// scheduled attempt is OWNED by the guard riding the timer future /
+    /// closure, so an attempt that never runs — here, the re-arm's timer
+    /// future dropped by a runtime shutdown before it fires — still
+    /// releases on drop, and the entry becomes purgeable again instead of
+    /// being orphaned unpurgeable forever.
+    #[test]
+    fn dropped_retry_future_releases_its_flight_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        // Every attempt fails instantly: the ledger dir path is a FILE.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let binding = stashed_test_binding(&orchestrator, &blocked, "goal-dropfut", "task-dropfut");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        {
+            let orchestrator = orchestrator.clone();
+            let binding = binding.clone();
+            rt.block_on(async move {
+                let flight = orchestrator
+                    .acquire_goal_task_settle_flight("task-dropfut", binding.generation)
+                    .expect("attempt-0 hold");
+                // Attempt 0 fails fast and re-arms: the NEXT attempt's hold
+                // is taken and moved into the pending 100ms timer future.
+                orchestrator.settle_goal_task_row_blocking(
+                    &binding,
+                    "task-dropfut",
+                    octos_fleet::TaskSettleAuthority::FinalFailure,
+                    true,
+                    0,
+                    flight,
+                );
+            });
+        }
+        // Shut the runtime down BEFORE the timer fires: the pending future
+        // is dropped without ever running, and the hold it owns must die
+        // with it. (If the timer already fired, the chain runs on and every
+        // later scheduling inside a shutting-down runtime is equally
+        // dropped — either way the balance converges to zero.)
+        drop(rt);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let in_flight = orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap()
+                .get("task-dropfut")
+                .map(|entry| entry.in_flight);
+            if in_flight == Some(0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped future's hold must be released; still {in_flight:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // And the entry is purgeable again.
+        {
+            let mut bindings = orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            bindings
+                .get_mut("task-dropfut")
+                .expect("entry")
+                .retained_since = std::time::Instant::now()
+                .checked_sub(PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1));
+        }
+        orchestrator.purge_expired_goal_task_bindings();
+        assert!(
+            !orchestrator
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap()
+                .contains_key("task-dropfut"),
+            "with the hold released, the expired entry purges"
+        );
+    }
+
+    /// Read a binding entry's live flight count (test-side visibility for
+    /// the exactly-once release accounting).
+    fn in_flight_for(task_id: &str) -> Option<u32> {
+        default_agent_orchestrator()
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .map(|entry| entry.in_flight)
+    }
+
+    /// #2055 review round 6 (V2b) — every chain exit releases its flight
+    /// hold EXACTLY ONCE (the drop-guard is the single release point):
+    ///
+    /// 1. a retained-success chain leaves `in_flight` at zero and the entry
+    ///    purgeable once expired;
+    /// 2. an EXHAUSTED chain (every attempt fails) leaves `in_flight` at
+    ///    zero and the entry purgeable;
+    /// 3. a fence-killed stale chain leaves the LIVE re-stashed entry's
+    ///    accounting untouched (its hold died with the replaced entry; the
+    ///    generation-matched release is a no-op, no underflow).
+    #[test]
+    fn settle_flight_hold_returns_to_zero_on_every_chain_exit() {
+        // (1) retained success, through the real inline flow.
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-flight";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-flight");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id = supervisor.register("web_probe", "call-flight-1", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed_observed(&task_id, "flaky".to_string());
+        assert_eq!(
+            in_flight_for(&task_id),
+            Some(0),
+            "a completed retained settle must release its hold"
+        );
+        {
+            let mut bindings = default_agent_orchestrator()
+                .shared
+                .goal_task_ledger_bindings
+                .lock()
+                .unwrap();
+            bindings.get_mut(&task_id).expect("entry").retained_since = std::time::Instant::now()
+                .checked_sub(PROVISIONAL_CORRECTION_RETENTION + std::time::Duration::from_secs(1));
+        }
+        default_agent_orchestrator().purge_expired_goal_task_bindings();
+        assert!(
+            !default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+            "with the hold released, the expired window purges"
+        );
+
+        // (2) exhaustion: every attempt fails (the ledger dir path is a
+        // FILE), driven inline so the whole bounded chain runs to
+        // exhaustion synchronously. The attempt-0 hold comes from the real
+        // acquire inside `test_flight_for` (round 8), exactly as the
+        // enqueue would take it.
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let blocked = dir2.path().join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let binding = stashed_test_binding(&orchestrator, &blocked, "goal-exhaust", "task-exhaust");
+        orchestrator.settle_goal_task_row_blocking(
+            &binding,
+            "task-exhaust",
+            octos_fleet::TaskSettleAuthority::FinalFailure,
+            true,
+            0,
+            test_flight_for(&orchestrator, "task-exhaust", &binding),
+        );
+        let exhausted_in_flight = orchestrator
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap()
+            .get("task-exhaust")
+            .map(|entry| entry.in_flight);
+        assert_eq!(
+            exhausted_in_flight,
+            Some(0),
+            "an exhausted chain must release exactly its own hold"
+        );
+
+        // (3) fence-killed stale chain: the live re-stashed entry keeps its
+        // own accounting (no stale release lands on it). Round 8 — the
+        // stale hold is taken while its incarnation is live, then the
+        // re-stash goes through the REAL stash path, and the new
+        // incarnation takes its own hold through the real acquire.
+        let dir3 = tempfile::TempDir::new().unwrap();
+        let orchestrator3 = InProcessAgentOrchestrator::default();
+        let stale = stashed_test_binding(
+            &orchestrator3,
+            dir3.path(),
+            "goal-stale",
+            "task-stale-flight",
+        );
+        let stale_flight = test_flight_for(&orchestrator3, "task-stale-flight", &stale);
+        let live_generation =
+            orchestrator3.stash_goal_task_binding("task-stale-flight", stale.clone());
+        let _live_hold = orchestrator3
+            .acquire_goal_task_settle_flight("task-stale-flight", live_generation)
+            .expect("the new incarnation admits its own hold");
+        orchestrator3.settle_goal_task_row_blocking(
+            &stale,
+            "task-stale-flight",
+            octos_fleet::TaskSettleAuthority::FinalFailure,
+            true,
+            0,
+            stale_flight,
+        );
+        let live_in_flight = orchestrator3
+            .shared
+            .goal_task_ledger_bindings
+            .lock()
+            .unwrap()
+            .get("task-stale-flight")
+            .map(|entry| entry.in_flight);
+        assert_eq!(
+            live_in_flight,
+            Some(1),
+            "a fence-killed stale chain must not touch the live incarnation's hold"
+        );
+    }
+
+    /// A session with NO goal binding creates nothing — that is correct
+    /// behavior, not an error. No ledger directory, no row, and the
+    /// registration itself is untouched.
+    #[test]
+    fn registration_without_goal_binding_creates_no_ledger_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-nogoal";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-nogoal");
+        // Deliberately NO seed_goal.
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register("web_probe", "call-rows-3", Some(&wire.to_string()));
+        assert!(!task_id.is_empty(), "registration is unaffected");
+        assert!(
+            !InProcessAgentOrchestrator::goal_ledger_dir(dir.path()).exists(),
+            "no goal binding ⇒ no ledger write of any kind"
+        );
+    }
+
+    /// Ledger I/O failure must never fail, block, or panic registration.
+    /// Force `create_dir_all` to fail by pre-creating `goal-ledgers` as a
+    /// FILE; the recorder swallows the error and the register call still
+    /// returns a live task id.
+    #[test]
+    fn ledger_error_does_not_break_registration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-err";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-err");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        // A FILE where the ledger DIRECTORY should be.
+        std::fs::write(
+            InProcessAgentOrchestrator::goal_ledger_dir(dir.path()),
+            b"not a directory",
+        )
+        .unwrap();
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+
+        let task_id = supervisor.register("web_probe", "call-rows-4", Some(&wire.to_string()));
+        assert!(
+            !task_id.is_empty(),
+            "a ledger I/O failure must not break registration"
+        );
+        assert_eq!(
+            supervisor.get_task(&task_id).unwrap().status,
+            octos_agent::TaskStatus::Spawned
+        );
+    }
+
+    /// A goal-bound task whose goal record disappears between registration
+    /// and terminal still settles: the binding captured at registration
+    /// addresses the ORIGINAL ledger, not whatever goal the session holds
+    /// at terminal time.
+    #[test]
+    fn settle_uses_the_binding_captured_at_registration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-rebind";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-rebind");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        let task_id = supervisor.register("web_probe", "call-rows-5", Some(&wire.to_string()));
+
+        // The goal is cleared mid-flight; the terminal must still settle
+        // the row created above.
+        default_agent_orchestrator()
+            .clear_goal(GoalSessionRequest {
+                session_id: wire.clone(),
+                profile_id: profile.into(),
+            })
+            .expect("clear goal");
+
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(row.status, "complete");
     }
 
     /// Peer-fleet auto-synthesis — the synthesis continuation dedupes PER-MASTER:

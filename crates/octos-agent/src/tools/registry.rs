@@ -1015,6 +1015,11 @@ impl ToolRegistry {
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: None,
+            // Fresh per-snapshot supervisor (deliberate per-subtree
+            // isolation of task maps); #2055 review round 2 — the
+            // REGISTRATION observers are inherited right below so a nested
+            // registration still reaches the goal-ledger recorder/settle
+            // wiring installed on the parent.
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1048,6 +1053,14 @@ impl ToolRegistry {
             let cell = snapshot.live_catalog_handle();
             snapshot.register(ToolSuggestTool::new(cell));
         }
+        // #2055 review round 2 — the fresh supervisor keeps its task map
+        // isolated per-subtree, but the REGISTRATION observers (`on_register`
+        // + the named `on_change_listeners`) ride along so goal-ledger task
+        // rows cover registrations on the snapshot. Wake callbacks
+        // (`on_change`/`on_failure`/`on_terminal`) stay per-instance.
+        snapshot
+            .supervisor
+            .inherit_registration_observers(&self.supervisor);
         snapshot.refresh_live_catalog();
         snapshot
     }

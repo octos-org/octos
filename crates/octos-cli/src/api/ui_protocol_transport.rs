@@ -10617,6 +10617,33 @@ async fn invoke_skill_action_tool_binding(
     Ok(Value::Object(response))
 }
 
+/// #2055 review round 2 (coverage holes c + d) — wire the goal-task-row
+/// observer pair onto a CACHED session supervisor (`session_runtime.tools`),
+/// which outlives goals coming and going, so the goal binding resolves at
+/// CALLBACK time via `active_goal_id` — the gateway idiom, not the per-turn
+/// dispatch snapshot. Installed idempotently at each point of use, the same
+/// pattern as [`install_skill_action_job_projection_listener`] below (the
+/// SessionRuntime constructor is deliberately left out of the loop: the
+/// session-cache layer has no autonomy coupling today, and point-of-use
+/// wiring keeps it that way). Snapshots taken from this registry
+/// (`snapshot_excluding` — e.g. the native-review specialist swarm) inherit
+/// the pair onto their fresh supervisors.
+fn wire_goal_task_row_observers_for_cached_supervisor(
+    supervisor: &octos_agent::TaskSupervisor,
+    session_id: &SessionKey,
+    profile_id: &str,
+    profile_data_dir: &std::path::Path,
+) {
+    // Round 3 — thin adapter over the SHARED installer so this site cannot
+    // drift from the per-turn / gateway wiring or from the effect tests.
+    crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+        supervisor,
+        session_id,
+        profile_id,
+        profile_data_dir,
+    );
+}
+
 fn install_skill_action_job_projection_listener(
     supervisor: &octos_agent::TaskSupervisor,
     profile_id: &str,
@@ -11021,6 +11048,16 @@ async fn raw_skill_action_invoke(
             let batch_permit = reserve_skill_action_batch()?;
             let profile_id = session_runtime.profile.profile_id.clone();
             let supervisor = session_runtime.tools.supervisor();
+            // #2055 review round 2 (hole d) — background skill actions
+            // register on THIS cached supervisor, not the per-turn snapshot
+            // the turn path wires, so give it the goal-task-row observer
+            // pair here (resolve-at-callback; idempotent re-install).
+            wire_goal_task_row_observers_for_cached_supervisor(
+                &supervisor,
+                &params.session_id,
+                &profile_id,
+                &session_runtime.profile.data_dir,
+            );
             install_skill_action_job_projection_listener(
                 &supervisor,
                 &profile_id,
@@ -27227,6 +27264,17 @@ async fn run_native_code_review_turn(
     let workspace_root = session_runtime.workspace_root.clone();
     let llm_provider = session_runtime.profile.llm.clone();
     let memory_store = session_runtime.profile.memory.clone();
+    // #2055 review round 2 (hole c) — the review specialists run on a FRESH
+    // snapshot registry whose supervisor used to carry no observers, so
+    // their `native_agent` registrations were invisible to the goal ledger.
+    // Wire the cached supervisor first; the snapshot below inherits the
+    // observer pair (`snapshot_excluding` → `inherit_registration_observers`).
+    wire_goal_task_row_observers_for_cached_supervisor(
+        &session_runtime.tools.supervisor(),
+        &session_id,
+        &profile_id,
+        &session_runtime.profile.data_dir,
+    );
     let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
     let agent_config = session_runtime.agent.agent_config();
     // UPCR follow-up to #1561: refresh named prompt segments (memory) on
@@ -29682,6 +29730,45 @@ async fn run_standalone_turn(
                 Some(change_profile_id.as_str()),
             );
         });
+        // #2055 — create the goal-ledger task row at registration time,
+        // wired next to the unified terminal sink below (whose settle half,
+        // #2054, flips the row at terminal). The turn's goal binding is
+        // snapshotted HERE at wiring time, mirroring the #1650
+        // dispatch-time `interactive_goal_binding` semantics: an autonomous
+        // continuation carries `goal_context` (its goal resolves under the
+        // already-scoped store key it was enqueued with, family-2 — never
+        // re-scoped), an interactive turn uses the #1935
+        // `interactive_goal_id` snapshot. This wiring is REPLACED every
+        // turn, so a goal-less turn overwrites a prior goal turn's closure
+        // with the no-op rather than leaking a stale binding. No binding ⇒
+        // no rows — correct behavior, not an error. The recorder swallows
+        // every ledger error (registration must never fail, block, or
+        // panic on ledger I/O). The ledger lives under the PROFILE data
+        // dir (#1957 rule — never the relocatable sessions root).
+        let register_goal_binding: Option<(String, String)> = goal_context
+            .as_ref()
+            .and_then(|goal_ctx| {
+                default_agent_orchestrator()
+                    .active_goal_id_under_goal_key(&goal_ctx.goal_session_key, &goal_ctx.profile_id)
+                    .map(|goal_id| (goal_id, goal_ctx.profile_id.clone()))
+            })
+            .or_else(|| {
+                interactive_goal_id
+                    .clone()
+                    .map(|goal_id| (goal_id, goal_charge_profile.clone()))
+            });
+        // Round 3 — the SHARED installer wires both halves (recorder +
+        // change-feed settle listener), with THIS turn's dispatch-time
+        // binding snapshot as the resolver. The settle rides the change
+        // feed as a NAMED listener (not the `on_terminal` sink below):
+        // `cancel` emits only `notify_change`, and the sink's once-per-task
+        // dedupe would swallow the owner's failed→complete correction.
+        // Inherited by nested child supervisors.
+        crate::autonomy::agent_orchestrator::install_goal_task_row_observers(
+            &task_supervisor,
+            &session_runtime.profile.data_dir,
+            move || register_goal_binding.clone(),
+        );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
         // (ChildCompleted) AND failure (recovery) re-entry through ONE
         // profile-resolving call into the master continuation queue. Runs
