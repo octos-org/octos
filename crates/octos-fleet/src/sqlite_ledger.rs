@@ -680,10 +680,25 @@ impl GoalLedger {
     /// not-yet-migrated legacy database (reachable through the plain
     /// [`Self::open`], which deliberately runs no migration) the statement
     /// falls back to the legacy shape and never references the column.
+    ///
+    /// Round 6 (V3): the schema inspection and the insert run inside ONE
+    /// `BEGIN IMMEDIATE` transaction. As two autocommit statements they were
+    /// a TOCTOU: a concurrent connection could commit the migration between
+    /// the check and the insert, and the busy handler makes that the COMMON
+    /// interleaving, not a rare one — the legacy-shape insert blocks on the
+    /// migration's write lock and then executes on the migrated table,
+    /// landing a terminal row at authority `-1` AFTER the backfill already
+    /// ran (permanently wrong-ranked). `BEGIN IMMEDIATE` serializes against
+    /// the migration's own `BEGIN IMMEDIATE` transaction, so the pair
+    /// either runs fully before the migration (and the backfill stamps the
+    /// row) or fully after it (and the derived-authority shape is chosen) —
+    /// the interleaving is impossible, not merely unlikely. Structural
+    /// argument only; the concurrency test is a tripwire.
     pub fn create_task(&self, task: &Task) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        if Self::tasks_has_column(&conn, "authority")? {
-            conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if Self::tasks_has_column(&tx, "authority")? {
+            tx.execute(
                 "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms, authority)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
@@ -699,7 +714,7 @@ impl GoalLedger {
                 ],
             )?;
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
@@ -714,6 +729,7 @@ impl GoalLedger {
                 ],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -732,10 +748,15 @@ impl GoalLedger {
     /// Round 5: the initial `authority` is derived from `task.status` (see
     /// [`Self::creation_authority_for_status`]) when the column exists; the
     /// legacy fallback mirrors [`Self::create_task`].
+    ///
+    /// Round 6 (V3): inspection + insert in ONE `BEGIN IMMEDIATE`
+    /// transaction — see [`Self::create_task`] for the TOCTOU this closes
+    /// and the serialization argument.
     pub fn create_task_if_absent(&self, task: &Task) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let inserted = if Self::tasks_has_column(&conn, "authority")? {
-            conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = if Self::tasks_has_column(&tx, "authority")? {
+            tx.execute(
                 "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms, authority)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(task_id) DO NOTHING",
@@ -752,7 +773,7 @@ impl GoalLedger {
                 ],
             )?
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO tasks (task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(task_id) DO NOTHING",
@@ -768,6 +789,7 @@ impl GoalLedger {
                 ],
             )?
         };
+        tx.commit()?;
         Ok(inserted > 0)
     }
 
@@ -3846,6 +3868,82 @@ mod digest_integration_tests {
         };
         assert_eq!(count_columns("correctable"), 1);
         assert_eq!(count_columns("authority"), 0);
+    }
+
+    /// #2055 review round 6 (V3) — creation-vs-migration concurrency pin.
+    /// The STRUCTURAL argument is what closes the race: the creation APIs
+    /// run inspection + insert inside `BEGIN IMMEDIATE`, which serializes
+    /// against the migration's own `BEGIN IMMEDIATE` transaction, so a
+    /// creation either fully precedes the migration (legacy shape, then the
+    /// backfill stamps the row FINAL) or fully follows it (derived-authority
+    /// shape) — the poisoned interleaving (inspect legacy → migration
+    /// commits → legacy insert on the migrated table → terminal row at
+    /// authority `-1` after the backfill already ran) cannot be scheduled.
+    /// This test is a TRIPWIRE, not the proof: a creation hammer races the
+    /// migration mid-hammer (barrier-started so they verifiably overlap)
+    /// and no terminal row may ever end at authority `-1`.
+    #[test]
+    fn should_never_leave_terminal_rows_unranked_when_creation_races_migration() {
+        for iteration in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.db");
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+                create_legacy_schema(&conn, "");
+            }
+
+            let (warmed_tx, warmed_rx) = std::sync::mpsc::channel::<()>();
+            let hammer_path = path.clone();
+            let hammer = std::thread::spawn(move || {
+                let ledger = GoalLedger::open(&hammer_path).unwrap();
+                for i in 0..300 {
+                    if i == 50 {
+                        let _ = warmed_tx.send(());
+                    }
+                    let task = Task {
+                        task_id: format!("race-{i}"),
+                        goal_id: "g1".to_string(),
+                        title: String::new(),
+                        detail: String::new(),
+                        status: "failed".to_string(),
+                        assigned_peer: None,
+                        created_at_ms: 1_000,
+                        updated_at_ms: 1_000,
+                    };
+                    // Busy collisions with the migration transaction are
+                    // expected; retry until this create lands.
+                    let mut attempts = 0;
+                    while ledger.create_task(&task).is_err() {
+                        attempts += 1;
+                        assert!(attempts < 200, "create retry budget exceeded");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            });
+            // Start the migration only once the hammer is verifiably
+            // mid-flight, so the two genuinely overlap every iteration.
+            warmed_rx.recv().expect("hammer warmup");
+            let migrated =
+                GoalLedger::open_with_busy_retry(&path).expect("migration open succeeds");
+            hammer.join().expect("hammer thread");
+
+            let unranked: i64 = migrated
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks
+                     WHERE status IN ('complete', 'failed') AND authority = -1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                unranked, 0,
+                "iteration {iteration}: no terminal row may ever end at authority -1"
+            );
+        }
     }
 
     /// #2055 review round 5 (terminal-creation authority) — a row CREATED
