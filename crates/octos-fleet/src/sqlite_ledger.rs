@@ -3352,7 +3352,7 @@ mod digest_integration_tests {
     // guard admits equal timestamps, so a delayed stale `active` snapshot
     // could overwrite a same-millisecond administrative transition
     // (`paused` / `blocked` / `cleared`) and regress counters. The
-    // registration recorder therefore only ever INSERTs the FK parent when
+    // registration recorder therefore only ever inserts the FK parent when
     // no row exists; the goal engine's own transition sync remains the only
     // goals-row updater.
     // ---------------------------------------------------------------------
