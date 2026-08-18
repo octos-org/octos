@@ -32155,26 +32155,35 @@ async fn run_standalone_turn(
         // can wake us out of `progress_rx.recv()` even if the agent task is
         // mid-await. The state mutex is the actual race winner; this select
         // is a notification, not a guard.
-        let event = tokio::select! {
-            biased;
-            _ = interrupt_rx.recv(), if !interrupt_observed => {
+        //
+        // task-interrupt-breaks-progress-wait: on `Interrupted` we BREAK
+        // right here. The old shape (`continue`, then a post-select check)
+        // re-entered the select with the interrupt arm disabled and waited
+        // for the NEXT progress event — a silent long tool (`bash sleep …`)
+        // held the terminal back until the ~8 s status_word heartbeat and the
+        // client's 5 s turn/interrupt ack timed out.
+        let event = match crate::turn_loop::next_turn_loop_step(
+            &mut interrupt_rx,
+            &mut progress_rx,
+            interrupt_observed,
+        )
+        .await
+        {
+            crate::turn_loop::TurnLoopStep::Interrupted => {
+                // The handler transitioned state to `Interrupting`. Drop any
+                // remaining progress events on the floor; they are no longer
+                // observable to the client.
                 interrupt_observed = true;
-                continue;
+                break;
             }
-            recv = progress_rx.recv() => match recv {
-                Some(data) => match serde_json::from_str::<Value>(&data) {
+            crate::turn_loop::TurnLoopStep::Closed => break,
+            crate::turn_loop::TurnLoopStep::Progress(data) => {
+                match serde_json::from_str::<Value>(&data) {
                     Ok(event) => event,
                     Err(_) => continue,
-                },
-                None => break,
+                }
             }
         };
-        if interrupt_observed {
-            // The handler transitioned state to `Interrupting`. Drop any
-            // remaining progress events on the floor; they are no longer
-            // observable to the client.
-            break;
-        }
         match event.get("type").and_then(Value::as_str) {
             Some("done") => {
                 if !saw_delta {
