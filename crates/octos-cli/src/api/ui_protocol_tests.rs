@@ -34153,6 +34153,243 @@ async fn session_open_goal_state_response_null_again_after_out_of_band_clear() {
     );
 }
 
+/// #2062 round 7 (codex R6-OPEN-SNAPSHOT-ORDER) — the response's
+/// `goal_state` is captured AT ENQUEUE, so a goal repaint landing in the
+/// window between open-start and response-enqueue is REFLECTED by the
+/// response instead of being overwritten backwards by a stale early
+/// capture. Barrier: the test holds the sessions-manager lock (which the
+/// open acquires AFTER the round-6 early-capture site and BEFORE the
+/// response enqueue), mutates the goal and delivers the repaint through
+/// the real ephemeral path inside that window, then releases. Asserts
+/// both directions: the repaint frame precedes the response on the wire,
+/// the response carries the POST-repaint state, and no goal frame carrying
+/// older state follows the response.
+#[tokio::test]
+async fn session_open_goal_state_response_fresh_at_enqueue_after_mid_open_repaint() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-state-fresh-at-enqueue".into());
+    let orchestrator = default_agent_orchestrator();
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "before the mid-open repaint".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind the pre-open goal");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    ws.update_live_features(ConnectionUiFeatures::stdio_defaults());
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // BARRIER: hold the sessions-manager lock so the spawned open blocks
+    // inside `open_session_result` — after the (round-6) early-capture
+    // site, before the response enqueue.
+    let sessions_gate = state.sessions.as_ref().expect("sessions").clone();
+    let gate = sessions_gate.lock().await;
+    let open_task = tokio::spawn({
+        let ws = ws.clone();
+        let state = state.clone();
+        let ledger = ledger.clone();
+        let forwarders = forwarders.clone();
+        let session_id = session_id.clone();
+        async move {
+            let approvals = PendingApprovalStore::default();
+            let questions = PendingQuestionStore::default();
+            handle_session_open(
+                &ws,
+                &state,
+                &ledger,
+                &approvals,
+                &questions,
+                &forwarders,
+                None,
+                ConnectionUiFeatures::stdio_defaults(),
+                "open-fresh".into(),
+                SessionOpenParams {
+                    session_id,
+                    topic: None,
+                    profile_id: None,
+                    cwd: None,
+                    sandbox: None,
+                    after: None,
+                },
+                false,
+            )
+            .await
+        }
+    });
+    // Let the open reach the barrier.
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+    // The mid-open mutation: an already-running turn's goal_update — the
+    // store changes AND the repaint is delivered to THIS wire through the
+    // real ephemeral path (guard-admitted, watermark moved).
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "after the mid-open repaint".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("mid-open goal mutation");
+    let repaint_json = orchestrator
+        .session_goal_updated_event_json(&session_id, MAIN_PROFILE_ID)
+        .expect("repaint for the live goal");
+    let repaint: octos_core::ui_protocol::SessionGoalUpdatedEvent =
+        serde_json::from_value(repaint_json).expect("updated event");
+    send_notification_ephemeral(&ws, &ledger, UiNotification::SessionGoalUpdated(repaint))
+        .expect("deliver the mid-open repaint");
+    drop(gate);
+    assert!(open_task.await.expect("open task"), "open must succeed");
+
+    // Wire order: the repaint frame precedes the response; the response's
+    // snapshot reflects the POST-repaint state.
+    let mut saw_repaint = false;
+    let result = loop {
+        let frame = recv_rpc_json(&mut rx).await;
+        if frame["method"] == json!("session/goal/updated") {
+            assert_eq!(
+                frame["params"]["goal"]["objective"],
+                json!("after the mid-open repaint")
+            );
+            saw_repaint = true;
+            continue;
+        }
+        if frame["id"] == json!("open-fresh") {
+            break frame;
+        }
+    };
+    assert!(saw_repaint, "the mid-open repaint precedes the response");
+    assert_eq!(
+        result["result"]["goal_state"]["objective"],
+        json!("after the mid-open repaint"),
+        "the snapshot is captured at enqueue, after the repaint: {:?}",
+        result["result"]["goal_state"]
+    );
+    // No goal frame carrying older state may follow the response.
+    let quiet = tokio::time::Duration::from_millis(400);
+    while let Ok(frame) = tokio::time::timeout(quiet, recv_rpc_json(&mut rx)).await {
+        if let Some(method) = frame["method"].as_str() {
+            assert!(
+                !method.starts_with("session/goal/"),
+                "no goal frame may follow the response: {frame}"
+            );
+        }
+    }
+    orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("cleanup goal");
+}
+
+/// #2062 round 7 (codex R6-PIN-MUTATION-COVERAGE) — the PRODUCTION path's
+/// snapshot must use the open-pinned scoped key, not a re-resolution at
+/// the enqueue callsite: with folder A's goal bound and the open in
+/// flight, a concurrent same-wire open flips the last-writer-wins cwd map
+/// to folder B inside the window — the response must still carry folder
+/// A's goal. A callsite mutant that re-resolves the key would read folder
+/// B's empty slot and answer `null`.
+#[tokio::test]
+async fn session_open_goal_state_response_pinned_across_mid_open_scope_flip() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let wire = SessionKey("local:goal-state-mid-open-flip".into());
+    let orchestrator = default_agent_orchestrator();
+    let _pinned_a = orchestrator.set_goal_scope(&wire, Some("aaaa1111".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "folder A's live goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal under folder A's cwd scope");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let sessions_gate = state.sessions.as_ref().expect("sessions").clone();
+    let gate = sessions_gate.lock().await;
+    let open_task = tokio::spawn({
+        let ws = ws.clone();
+        let state = state.clone();
+        let ledger = ledger.clone();
+        let forwarders = forwarders.clone();
+        let wire = wire.clone();
+        async move {
+            let approvals = PendingApprovalStore::default();
+            let questions = PendingQuestionStore::default();
+            handle_session_open(
+                &ws,
+                &state,
+                &ledger,
+                &approvals,
+                &questions,
+                &forwarders,
+                None,
+                ConnectionUiFeatures::stdio_defaults(),
+                "open-flip".into(),
+                SessionOpenParams {
+                    session_id: wire,
+                    topic: None,
+                    profile_id: None,
+                    cwd: None,
+                    sandbox: None,
+                    after: None,
+                },
+                false,
+            )
+            .await
+        }
+    });
+    // The open captured its pin (folder A) before blocking at the barrier;
+    // a concurrent same-wire open now flips the map to folder B.
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+    let _flipped = orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+    drop(gate);
+    assert!(open_task.await.expect("open task"), "open must succeed");
+
+    let result = loop {
+        let frame = recv_rpc_json(&mut rx).await;
+        if frame["id"] == json!("open-flip") {
+            break frame;
+        }
+    };
+
+    // Cleanup the process-global store BEFORE asserting.
+    let _ = orchestrator.set_goal_scope(&wire, Some("aaaa1111".into()));
+    orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("cleanup goal");
+    let _ = orchestrator.set_goal_scope(&wire, None);
+
+    assert_eq!(
+        result["result"]["goal_state"]["objective"],
+        json!("folder A's live goal"),
+        "the enqueue-time snapshot must use the OPEN-pinned key (folder A), \
+         not the flipped cwd map (folder B): {:?}",
+        result["result"]["goal_state"]
+    );
+}
+
 /// A minimal valid frame used to occupy a capacity-1 writer queue.
 fn plug_frame() -> WsMessage {
     frame_for(&json!({"jsonrpc": "2.0", "method": "test/plug"})).expect("plug frame")
