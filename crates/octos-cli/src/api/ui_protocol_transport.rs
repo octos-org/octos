@@ -16924,6 +16924,15 @@ async fn handle_session_open(
     // the offloaded send's capacity park) is cancellable, and an enqueue
     // is an atomic `try_send` — there is no detached in-flight segment for
     // the join to miss (see `send_durable_offloaded`).
+    //
+    // Delivery semantics across the handover are AT-LEAST-ONCE, not
+    // exactly-once (codex #2065 round-4 S5, tracked): a durable frame the
+    // old lane already delivered may be re-delivered by this open's replay
+    // (the client's `after` cursor lags what was enqueued), and the client
+    // merges durable frames by id/cursor — the normal reconnect-replay
+    // overlap every reopen already has. What the retire-before-baseline
+    // order guarantees is the absence of CONCURRENT old-pump/new-replay
+    // delivery, not global dedupe.
     let previous_forwarder = live_forwarders
         .lock()
         .await
@@ -17323,47 +17332,78 @@ async fn drain_open_backlog_then_emit_goal_null(
 /// - EPHEMERAL in content: never appended to the ledger — a reopen is one
 ///   client's catch-up state, not session history. The frame carries no
 ///   cursor, so no cursor-based recovery exists for it either.
-/// - SUPERSEDED-ABANDON, admission-adjacent (round-3 W2): the #1959 guard
-///   lock is held across the final watermark re-read AND the non-blocking
-///   enqueue. Every producer records its generation under that same lock
-///   BEFORE enqueueing, so either a newer frame's record precedes this
-///   check (→ abandon; the RPC durable path also ledgers unconditionally,
-///   so that newer frame reaches this client via the post-open pump — the
-///   abandon is sound) or its record waits on the lock until the null is
+/// - SUPERSEDED-ABANDON, admission-adjacent (round-3 W2, round-4 S3): the
+///   #1959 guard lock is held across the final watermark re-read AND the
+///   non-blocking enqueue, and the watermark is keyed by the SCOPED goal
+///   identity (`goal_event_watermark_identity`) — another cwd scope's
+///   frames on the same wire session move a DIFFERENT watermark and can
+///   never abandon this null (cross-scope pollution, the round-4 S3 bug).
+///   Every producer records its generation under that same lock BEFORE
+///   enqueueing, so either a same-scope newer frame's record precedes this
+///   check (→ abandon — sound per-scope: a same-scope superseder implies
+///   the goal now EXISTS under this scope, and RPC-created goals ledger
+///   their positive state durably (`session/goal/set` appends before any
+///   per-connection filtering), so it reaches this client via the
+///   post-open pump) or its record waits on the lock until the null is
 ///   already enqueued (→ wire order null-then-newer, newest wins). The
-///   only residual is an EPHEMERAL-only superseder (accountant repaint,
-///   not ledgered) admitted in this instant whose own lossy enqueue then
-///   drops — the pre-existing spec §9 ephemeral-chip lossiness class,
-///   recovered by the next reopen. There is no parked window: same-
+///   honest residual: a goal created by the model's tool DURING a turn has
+///   ephemeral-only positive frames — if its repaint is admitted in this
+///   instant and then dropped by its own lossy enqueue, the chip stays
+///   empty until the next repaint/reopen — the pre-existing spec §9
+///   ephemeral-chip lossiness class. There is no parked window: same-
 ///   connection RPCs cannot interleave at all (the read loops dispatch
 ///   inline-awaited), and spawned turn tasks are exactly what the held
 ///   lock serializes against.
 /// - BACKPRESSURE couples to `protocol/replay_lossy` (round-3 PATH B(3)):
 ///   a full writer here means the SAME section was already dropping replay
 ///   frames. The drop is accounted into the shared dropped-frame counter
-///   and the lossy signal raised opportunistically; the client surfaces
-///   "reconnect to rehydrate" (it performs no automatic resync — verified
-///   in the octoscode reducer), and the reopen it is told to perform
-///   re-emits this snapshot (idempotent null). On the stdio lane this is a
-///   deliberate divergence from the blocking durable enqueue: the null
-///   uses the non-blocking try lane so the supersession check stays atomic
-///   — a drop there is recovered identically.
+///   and the lossy signal raised opportunistically — and if that emit ALSO
+///   fails on the still-full queue, the debt survives and the live pump's
+///   FIRST action flushes it through the capacity-aware lane (round-4 S2,
+///   `flush_replay_lossy_debt_cooperatively`), so the client always gets
+///   the "reconnect to rehydrate" prompt (it performs no automatic resync
+///   — verified in the octoscode reducer), and the reopen it is told to
+///   perform re-emits this snapshot (idempotent null). On the stdio lane
+///   this is a deliberate divergence from the blocking durable enqueue:
+///   the null uses the non-blocking try lane so the supersession check
+///   stays atomic — a drop there is recovered identically.
 fn emit_open_goal_null_now(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
     features: ConnectionUiFeatures,
 ) -> Result<(), SendError> {
-    // Entry admit: records this null's generation as the session watermark
+    emit_open_goal_null_with_pre_lock_hook(ws, ledger, notification, features, None)
+}
+
+/// Body of [`emit_open_goal_null_now`] with a test seam (codex #2065
+/// round-4 S7): `pre_lock_hook` runs after the entry guard admitted this
+/// null but before the final in-lock recheck — the exact window a spawned
+/// turn task can occupy — so a test can deliver a REAL newer frame there
+/// and pin that the in-lock recheck (not the entry guard) abandons the
+/// null. Production always passes `None`.
+fn emit_open_goal_null_with_pre_lock_hook(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+    features: ConnectionUiFeatures,
+    pre_lock_hook: Option<&dyn Fn()>,
+) -> Result<(), SendError> {
+    // Entry admit: records this null's generation as its scope's watermark
     // (or abandons immediately when a newer goal frame already admitted).
     if !goal_event_passes_generation_guard(&notification) {
         return Ok(());
     }
-    let (watermark_session, own_generation) = match &notification {
+    let (wire_session, own_generation) = match &notification {
         UiNotification::SessionGoalCleared(event) => (event.session_id.0.clone(), event.generation),
         UiNotification::SessionGoalUpdated(event) => (event.session_id.0.clone(), event.generation),
         _ => (String::new(), 0),
     };
+    // S3: the recheck below compares against the SCOPED watermark identity
+    // (resolved before the guard lock; the orchestrator-state and guard
+    // locks never nest). The wire session id stays for logs + the client-
+    // facing lossy signal.
+    let watermark_identity = goal_event_watermark_identity(&wire_session, own_generation);
     let method = notification.method().to_string();
     let filter_event = UiProtocolLedgerEvent::Notification(notification.clone());
     let delivery_metric = ui_protocol_delivery_metric(&filter_event);
@@ -17388,6 +17428,9 @@ fn emit_open_goal_null_now(
     let Some(frame) = frame_for(&rpc) else {
         return Err(SendError::BackpressureDrop);
     };
+    if let Some(hook) = pre_lock_hook {
+        hook();
+    }
     // Final re-read + enqueue under ONE guard-lock acquisition. No await and
     // no blocking call happens under the lock (`try_enqueue` is a
     // non-blocking `try_send` on both lanes).
@@ -17397,7 +17440,7 @@ fn emit_open_goal_null_now(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if own_generation > 0
             && watermarks
-                .get(watermark_session.as_str())
+                .get(watermark_identity.as_str())
                 .copied()
                 .unwrap_or(0)
                 > own_generation
@@ -17405,7 +17448,7 @@ fn emit_open_goal_null_now(
             tracing::debug!(
                 target: "octos::ui_protocol::ws",
                 method = %method,
-                session_id = %watermark_session,
+                session_id = %wire_session,
                 "open goal null snapshot superseded by a newer goal frame; abandoned"
             );
             return Ok(());
@@ -17424,11 +17467,11 @@ fn emit_open_goal_null_now(
             // reopen — re-emits this snapshot.
             ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("ws.send.drop.backpressure", "method" => method.clone()).increment(1);
-            emit_replay_lossy_opportunistic(ws, ledger, watermark_session.as_str());
+            emit_replay_lossy_opportunistic(ws, ledger, wire_session.as_str());
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
                 method = %method,
-                session_id = %watermark_session,
+                session_id = %wire_session,
                 "open goal null snapshot dropped under backpressure; replay_lossy raised, \
                  the next reopen re-emits it"
             );
@@ -17493,8 +17536,11 @@ async fn forward_live_ledger_event(
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
     }
-    // codex #2065 round-2 Z3 — offloaded send: a full stdio queue parks a
-    // blocking-pool thread, never this async task's executor worker.
+    // codex #2065 round-2 Z3 / round-3 W6 — await-safe send: a full stdio
+    // queue parks THIS task cooperatively (non-blocking probe + async
+    // sleep), never a blocking `SyncSender::send` on any thread — so the
+    // park is cancellable and an abort+join retires it with no detached
+    // in-flight work.
     match send_ledger_event_durable_offloaded(ws, ledger, event_for_wire).await {
         Err(err @ (SendError::Closed | SendError::FatalClosed)) => Err(err),
         _ => Ok(()),
@@ -17516,6 +17562,62 @@ fn log_live_forwarder_lag(session_id: &SessionKey, skipped: u64, features: Conne
         skipped_events = skipped,
         "live ledger forwarder lagged; client must rehydrate via cursor"
     );
+}
+
+/// codex #2065 round-4 S2 — deliver any accumulated replay-lossy debt
+/// through a capacity-aware park before the pump forwards its first event.
+///
+/// The debt can otherwise exist with NO delivered signal: the open-section
+/// null (cursorless — no cursor-based recovery exists for it) and even the
+/// `SessionOpened` frame can drop on a full writer, and the opportunistic
+/// lossy emit fails on that same full queue and restores the count; the
+/// ledgered lossy row's broadcast copy is self-connection-deduped, and no
+/// later send was guaranteed to happen. The chain then dead-ended: the
+/// client never saw the "reconnect to rehydrate" prompt, so the dropped
+/// null was never re-emitted. The pump — which already parks cooperatively
+/// on capacity — is the natural retry lane: one ledgered lossy row per
+/// accumulated batch, the frame parked (non-blocking probe + async sleep,
+/// cancellable at every await, atomic enqueue) until delivered. Debt that
+/// accumulates while parked is taken by the next loop pass; a dead
+/// connection makes delivery moot.
+async fn flush_replay_lossy_debt_cooperatively(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+) {
+    const CAPACITY_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(15);
+    loop {
+        let dropped = ws.metrics.dropped_count.swap(0, Ordering::Relaxed);
+        if dropped == 0 {
+            return;
+        }
+        let last_cursor = ws.metrics.snapshot_last_cursor();
+        let lossy = UiNotification::ReplayLossy(ReplayLossyEvent {
+            session_id: session_id.clone(),
+            dropped_count: dropped,
+            last_durable_cursor: last_cursor,
+        });
+        // One durable row per batch (same as the opportunistic emitter);
+        // tagged with our connection id so this pump's own broadcast copy
+        // is self-deduped.
+        let event = ledger.append_notification_from(lossy, ws.connection_id);
+        let Some(frame) = frame_from_ledger(event.event) else {
+            return;
+        };
+        loop {
+            if ws.is_failed() {
+                return;
+            }
+            match ws.try_enqueue(frame.clone()) {
+                Ok(()) => break,
+                Err(SendError::BackpressureDrop) => {
+                    tokio::time::sleep(CAPACITY_PROBE_WINDOW).await;
+                }
+                // Closed / latched: the connection is gone, delivery moot.
+                Err(_) => return,
+            }
+        }
+    }
 }
 
 /// Pump live ledger events for `session_id` into the connection's WS write
@@ -17583,6 +17685,16 @@ async fn spawn_live_forwarder(
 
     let session_for_log = session_id.clone();
     let task = tokio::spawn(async move {
+        // codex #2065 round-4 S2 — FIRST action, before forwarding any
+        // event: deliver any pending replay-lossy debt. The open section
+        // can leave debt with NO delivered signal — the null (and even the
+        // SessionOpened frame) dropped on a full writer, and the
+        // opportunistic lossy emit failing on that same full queue and
+        // restoring the count. The pump is the natural retry lane: it
+        // parks cooperatively on capacity, so the "reconnect to rehydrate"
+        // prompt reaches the client as soon as the queue frees, and the
+        // reopen it prompts re-emits the dropped null. Zero new tasks.
+        flush_replay_lossy_debt_cooperatively(&ws, &ledger, &session_for_log).await;
         loop {
             match rx.recv().await {
                 Ok(event) => {
@@ -37145,25 +37257,52 @@ fn send_notification_lifecycle_forced_backpressure_fixture(
     Err(SendError::LifecycleFailure(reason.into()))
 }
 
-/// #1959 process-global watermark map: wire session id → highest goal-frame
-/// generation an admitted `SessionGoalUpdated` / `SessionGoalCleared` has
-/// recorded. Module-scoped (not fn-local in the guard) so the #2062
-/// open-time null snapshot can hold THIS lock across its final
-/// superseded re-check AND its non-blocking enqueue
+/// #1959 process-global watermark map: SCOPED goal identity → highest
+/// goal-frame generation an admitted `SessionGoalUpdated` /
+/// `SessionGoalCleared` has recorded. Module-scoped (not fn-local in the
+/// guard) so the #2062 open-time null snapshot can hold THIS lock across
+/// its final superseded re-check AND its non-blocking enqueue
 /// (`emit_open_goal_null_now`) — every producer records its generation
 /// here BEFORE enqueueing, which is what makes that check-and-send atomic
 /// against them (codex #2065 rounds 2–3).
+///
+/// codex #2065 round-4 S3 — the key is the SCOPED goal-store key resolved
+/// via [`goal_event_watermark_identity`], NOT the plain wire session id
+/// the frames carry: two cwd scopes can share one wire id, and wire-keyed
+/// watermarks let connection B's scope-B repaint (delivered only to B)
+/// advance the watermark that connection A's scope-A null checks — the
+/// null would abandon with A receiving nothing, #2062 surviving through
+/// cross-scope watermark pollution.
 static GOAL_EVENT_GENERATION_GUARD: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
 
 fn goal_event_guard_map() -> &'static StdMutex<HashMap<String, u64>> {
     GOAL_EVENT_GENERATION_GUARD.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-/// #1959 — per-session monotonic guard for goal chip events. Returns `false`
+/// codex #2065 round-4 S3 — the #1959 watermark identity for a goal frame:
+/// the SCOPED goal-store key its generation was allocated under (registered
+/// atomically with the allocation by `next_goal_event_generation` — the
+/// producer's BUILD-TIME key, never a later re-resolution of the
+/// last-writer-wins cwd map, which a concurrent open flips). Falls back to
+/// the plain wire session id for unstamped/unregistered generations
+/// (legacy events, hand-built test frames, FIFO-evicted entries) — exactly
+/// the pre-S3 behavior for exactly the events that predate the registry.
+///
+/// Takes the orchestrator STATE lock briefly; callers must resolve this
+/// BEFORE taking the guard-map lock (the two never nest).
+fn goal_event_watermark_identity(wire_session: &str, generation: u64) -> String {
+    default_agent_orchestrator()
+        .goal_event_watermark_key(generation)
+        .map(|key| key.0)
+        .unwrap_or_else(|| wire_session.to_owned())
+}
+
+/// #1959 — per-scope monotonic guard for goal chip events. Returns `false`
 /// (DROP) when a `SessionGoalUpdated` / `SessionGoalCleared` carries a
 /// `generation` that is not greater than the last goal event already emitted
-/// for the same wire session — so a stale update that races behind a clear can
-/// never be delivered after it (the client would otherwise resurrect the
+/// for the same SCOPED goal identity (S3; wire-session fallback for
+/// unregistered generations) — so a stale update that races behind a clear
+/// can never be delivered after it (the client would otherwise resurrect the
 /// cleared chip). Non-goal notifications and legacy `generation == 0` events
 /// (older backend, or events built before #1959) always pass. Both direct-send
 /// boundaries (`send_notification_durable` for the RPC-derived clear,
@@ -37175,10 +37314,13 @@ fn goal_event_passes_generation_guard(notification: &UiNotification) -> bool {
         UiNotification::SessionGoalCleared(e) => (e.session_id.0.as_str(), e.generation),
         _ => return true,
     };
+    // S3: resolve the scoped identity FIRST (orchestrator state lock,
+    // released) — then take the guard lock. The two never nest.
+    let identity = goal_event_watermark_identity(session, generation);
     let mut guard = goal_event_guard_map()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    goal_event_generation_admits(&mut guard, session, generation)
+    goal_event_generation_admits(&mut guard, &identity, generation)
 }
 
 /// Pure core of [`goal_event_passes_generation_guard`] (extracted for testing:
@@ -37376,10 +37518,13 @@ fn send_ledger_event_durable(
 }
 
 /// Async twin of [`send_ledger_event_durable`] for the live-forwarder task
-/// (codex #2065 round-2 Z3): identical prep, metrics, and `replay_lossy`
-/// semantics — keep the two in lockstep — but the enqueue goes through
-/// [`WsConnection::send_durable_offloaded`], so a full stdio queue parks a
-/// blocking-pool thread instead of stalling an async executor worker.
+/// (codex #2065 round-2 Z3 / round-3 W6): identical prep, metrics, and
+/// `replay_lossy` semantics — keep the two in lockstep — but the enqueue
+/// goes through [`WsConnection::send_durable_offloaded`], whose stdio lane
+/// parks THIS task cooperatively (non-blocking probe + async sleep) instead
+/// of a blocking `SyncSender::send` — never an executor-worker stall, and
+/// cancellable with an atomic enqueue so abort+join leaves nothing
+/// detached in flight.
 async fn send_ledger_event_durable_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,

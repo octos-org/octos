@@ -34202,6 +34202,11 @@ async fn session_open_goal_null_snapshot_abandoned_when_newer_frame_already_deli
     let ledger = Arc::new(UiProtocolLedger::new(16));
     let session_id = SessionKey("local:goal-null-superseded".into());
     ws.update_live_features(ConnectionUiFeatures::stdio_defaults());
+    // Fabricated generations sit FAR above anything the real allocator
+    // reaches in a test process: the S3 registry maps every REAL generation
+    // to its owner's scoped key, so a low fabricated value would collide
+    // with a sibling test's allocation and resolve to a foreign identity.
+    // Unregistered generations fall back to the (per-test-unique) wire key.
     let null =
         UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
             session_id: session_id.clone(),
@@ -34209,7 +34214,7 @@ async fn session_open_goal_null_snapshot_abandoned_when_newer_frame_already_deli
             cleared: true,
             goal: None,
             transition_actor: "backend".into(),
-            generation: 5,
+            generation: 9_100_000_001,
         });
     // The newer frame is admitted, ledgered, AND delivered to this wire
     // through the same durable path the goal RPC handler uses.
@@ -34229,7 +34234,7 @@ async fn session_open_goal_null_snapshot_abandoned_when_newer_frame_already_deli
                 updated_at_ms: 0,
             },
             transition_actor: "user".into(),
-            generation: 6,
+            generation: 9_100_000_002,
         });
     send_notification_durable(&ws, &ledger, newer).expect("deliver the newer frame");
 
@@ -34280,7 +34285,9 @@ async fn session_open_goal_null_snapshot_backpressure_drop_signals_replay_lossy(
             cleared: true,
             goal: None,
             transition_actor: "backend".into(),
-            generation: 5,
+            // Above the real allocator's range — see the S3 registry note
+            // in `…abandoned_when_newer_frame_already_delivered`.
+            generation: 9_200_000_001,
         });
 
     let outcome =
@@ -34587,5 +34594,257 @@ async fn session_open_goal_stdio_lane_retire_leaves_no_inflight_send() {
     assert!(
         frames.try_recv().is_err(),
         "no in-flight send may survive lane retirement"
+    );
+}
+
+/// #2062 round 5 (codex #2065 round-4 S3) — cross-scope watermark
+/// pollution: two cwd scopes share one wire session id. Scope B's repaint
+/// (built by the real orchestrator builder, delivered through the real
+/// ephemeral path — but only to B's connection) must advance B's watermark
+/// ONLY; scope A's null — for A's folder, where a stale chip legitimately
+/// needs clearing — must still deliver. With a wire-keyed watermark, B's
+/// later-generation frame falsely abandoned A's null and connection A
+/// received NOTHING: #2062 surviving through watermark pollution.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_survives_other_scope_watermark_pollution() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let orchestrator = default_agent_orchestrator();
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let wire = SessionKey("local:goal-null-scope-pollution".into());
+    // Folder B registers its scope and binds a live goal under it.
+    let pinned_b = orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "folder B's live goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal under folder B's cwd scope");
+    // Folder A opens the same wire session: registers (flips the map) and
+    // pins its own scope, then builds its null — no goal under scope A.
+    let pinned_a = orchestrator.set_goal_scope(&wire, Some("aaaa1111".into()));
+    let null_json = orchestrator
+        .session_goal_hydrate_cleared_event_json(&pinned_a, MAIN_PROFILE_ID)
+        .expect("scope A has no goal; the null must be built");
+    let null: octos_core::ui_protocol::SessionGoalClearedEvent =
+        serde_json::from_value(null_json).expect("cleared event");
+    // Scope B's repaint is built AFTER A's null (higher generation — the
+    // exact pollution ordering: the turn-end accountant fires while A's
+    // open is between null construction and emit) and delivered through
+    // the REAL ephemeral path to B's OWN connection.
+    let b_update_json = orchestrator
+        .session_goal_updated_event_json(&pinned_b, MAIN_PROFILE_ID)
+        .expect("scope B has a goal; the repaint must be built");
+    let b_update: octos_core::ui_protocol::SessionGoalUpdatedEvent =
+        serde_json::from_value(b_update_json).expect("updated event");
+    assert!(
+        b_update.generation > null.generation,
+        "the pollution ordering requires B's frame to be newer"
+    );
+    let (ws_b, mut rx_b) = ws_connection_for_test(8);
+    ws_b.update_live_features(ConnectionUiFeatures::stdio_defaults());
+    send_notification_ephemeral(&ws_b, &ledger, UiNotification::SessionGoalUpdated(b_update))
+        .expect("deliver B's repaint to B's connection");
+    let b_frame = recv_rpc_json(&mut rx_b).await;
+    assert_eq!(
+        b_frame["method"],
+        json!("session/goal/updated"),
+        "B's repaint was admitted and delivered (its watermark moved)"
+    );
+
+    // A's null must still deliver: B's record moved SCOPE B's watermark,
+    // not scope A's.
+    let (ws_a, mut rx_a) = ws_connection_for_test(8);
+    let outcome = emit_open_goal_null_now(
+        &ws_a,
+        &ledger,
+        UiNotification::SessionGoalCleared(null),
+        ConnectionUiFeatures::stdio_defaults(),
+    );
+
+    // Cleanup the process-global store BEFORE asserting.
+    let _ = orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+    orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("cleanup B's goal");
+    let _ = orchestrator.set_goal_scope(&wire, None);
+
+    assert!(outcome.is_ok(), "the null emit must not error: {outcome:?}");
+    let a_frame = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        recv_rpc_json(&mut rx_a),
+    )
+    .await
+    .expect("scope A's null must DELIVER despite scope B's newer frame");
+    assert_eq!(
+        a_frame["method"],
+        json!("session/goal/cleared"),
+        "cross-scope pollution must not abandon the null: {a_frame}"
+    );
+}
+
+/// #2062 round 5 (codex #2065 round-4 S2) — the dropped-null recovery
+/// chain, end to end WITHOUT manual queue manipulation: the writer is full
+/// when the real open emits the null (the null is the first dropped frame),
+/// the opportunistic lossy emit fails on the same full queue, and the
+/// PUMP's first action flushes the retained debt through its
+/// capacity-aware lane the moment the client drains the queue — so the
+/// "reconnect to rehydrate" prompt is guaranteed, and the reopen it
+/// prompts re-emits the null.
+#[tokio::test]
+async fn session_open_goal_null_drop_pump_flushes_replay_lossy_then_reopen_reemits() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-lossy-chain".into());
+    // Capacity 2: the plug takes one slot, the open's RPC result (a
+    // lifecycle frame that must not drop) takes the other — the queue is
+    // full at exactly the moment the null tries to enqueue.
+    let (ws, mut rx) = ws_connection_for_test(2);
+    ws.send_durable(plug_frame(), "test/plug")
+        .expect("plug one writer slot");
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "open-lossy-chain".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "the open itself succeeds; only frames dropped");
+
+    // The client drains the queue: plug, then the open's RPC result.
+    let plug = recv_rpc_json(&mut rx).await;
+    assert_eq!(plug["method"], json!("test/plug"));
+    let result = recv_rpc_json(&mut rx).await;
+    assert_eq!(result["id"], json!("open-lossy-chain"));
+    // Capacity is free now — the pump's debt flush must deliver the lossy
+    // signal with no further action from anyone.
+    let lossy = tokio::time::timeout(tokio::time::Duration::from_secs(5), recv_rpc_json(&mut rx))
+        .await
+        .expect("the pump's first action flushes the replay-lossy debt");
+    assert_eq!(
+        lossy["method"],
+        json!("protocol/replay_lossy"),
+        "the dropped null must surface the reconnect prompt: {lossy}"
+    );
+
+    // The prompted reconnect (a fresh connection, as a real client would)
+    // re-emits the null.
+    let reopened =
+        open_session_collecting_goal_cleared_frames(&state, &ledger, &session_id, "open-lossy-2")
+            .await;
+    abort_live_forwarders(&forwarders, &ledger).await;
+    assert_eq!(
+        reopened.len(),
+        1,
+        "the reopen must re-emit the dropped null snapshot"
+    );
+}
+
+/// #2062 round 5 (codex #2065 round-4 S7) — the INTERLEAVED supersession:
+/// the newer frame lands AFTER the null passed its entry guard but before
+/// the in-lock section — the exact window a spawned turn task occupies.
+/// Only the final in-lock recheck can catch this (the entry guard already
+/// admitted); deleting just that recheck fails THIS test while the
+/// early-delivery test (`…abandoned_when_newer_frame_already_delivered`)
+/// still passes. The newer frame goes through the real durable send path.
+#[tokio::test]
+async fn session_open_goal_null_snapshot_abandoned_by_in_lock_recheck_when_frame_interleaves() {
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-interleaved".into());
+    ws.update_live_features(ConnectionUiFeatures::stdio_defaults());
+    let null =
+        UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            cleared: true,
+            goal: None,
+            transition_actor: "backend".into(),
+            // Unregistered generations (far above the real allocator's
+            // range — see the S3 registry note in
+            // `…abandoned_when_newer_frame_already_delivered`) resolve to
+            // the wire-key watermark fallback — both frames share it,
+            // exactly like two frames of one scope.
+            generation: 9_300_000_001,
+        });
+    let newer = octos_core::ui_protocol::SessionGoalUpdatedEvent {
+        session_id: session_id.clone(),
+        profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+        goal: octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            goal_id: "goal-live".into(),
+            objective: "set in the entry-guard-to-lock window".into(),
+            status: "active".into(),
+            token_budget: 1_000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+        transition_actor: "user".into(),
+        generation: 9_300_000_002,
+    };
+    let hook = || {
+        send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::SessionGoalUpdated(newer.clone()),
+        )
+        .expect("deliver the newer frame inside the window");
+    };
+
+    let outcome = emit_open_goal_null_with_pre_lock_hook(
+        &ws,
+        &ledger,
+        null,
+        ConnectionUiFeatures::stdio_defaults(),
+        Some(&hook),
+    );
+    assert!(
+        outcome.is_ok(),
+        "abandoning at the in-lock recheck is a clean outcome: {outcome:?}"
+    );
+
+    let first = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        first["method"],
+        json!("session/goal/updated"),
+        "the interleaved newer frame is the final goal state: {first}"
+    );
+    let late = tokio::time::timeout(
+        tokio::time::Duration::from_millis(400),
+        recv_rpc_json(&mut rx),
+    )
+    .await;
+    assert!(
+        late.is_err(),
+        "the in-lock recheck must abandon the null, never deliver it after \
+         the newer frame: {late:?}"
     );
 }
