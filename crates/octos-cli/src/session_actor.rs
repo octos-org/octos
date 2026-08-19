@@ -5145,9 +5145,26 @@ impl SessionActor {
             } else {
                 None
             };
+            // Stamp the loop onto anything the cron tool creates during this
+            // turn, so deleting the loop can find those jobs again. Set right
+            // before the turn and cleared right after: a stale value would tag a
+            // user's own job with a loop it has nothing to do with, and the reap
+            // would then delete a schedule the user asked for.
+            if let Some(ref cron) = self.cron_tool {
+                cron.set_origin(octos_bus::CronOrigin {
+                    session_id: Some(self.session_key.to_string()),
+                    loop_id: loop_id_for_self_paced.clone(),
+                    // The actor carries no profile id; `loop_id` is the key the
+                    // reap matches on, so this stays None rather than guessing.
+                    profile_id: None,
+                });
+            }
             let synthetic = self.synthetic_master_continuation_inbound(&continuation);
             self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
                 .await;
+            if let Some(ref cron) = self.cron_tool {
+                cron.set_origin(octos_bus::CronOrigin::default());
+            }
             // If this fire was a self-paced or maintenance loop, peek at
             // the model's reply and re-schedule via the orchestrator.
             // `apply_self_paced_response` no-ops for fixed_interval mode,
@@ -5771,6 +5788,13 @@ impl SessionActor {
                                 if !self.channel.is_empty() && !self.chat_id.is_empty() {
                                     cron.set_context(&self.channel, &self.chat_id);
                                 }
+                                // A real inbound message is not a loop fire, so
+                                // clear any loop attribution left by one.
+                                cron.set_origin(octos_bus::CronOrigin {
+                                    session_id: Some(self.session_key.to_string()),
+                                    loop_id: None,
+                                    profile_id: None,
+                                });
                             }
 
                             // Check for abort trigger before processing

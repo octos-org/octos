@@ -1259,6 +1259,12 @@ impl ProfileRuntime {
         let runtime_lifecycle = Some(Arc::new(ProfileRuntimeLifecycle {
             cron_service: Some(cron_service.clone()),
         }));
+        // Hand the same service to the AppUI orchestrator so `loop/delete` can
+        // reap the cron jobs a loop created. Without this the orchestrator has
+        // no cron handle at all and the reap silently does nothing.
+        #[cfg(feature = "api")]
+        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+            .set_cron_service(cron_service.clone());
         // #1935 — resolve the INDEPENDENT goal-completion verifier lane
         // (`sub_providers` key `goal_verifier`) once at profile build. It is
         // threaded into the `goal_update` tool below and stored on the
