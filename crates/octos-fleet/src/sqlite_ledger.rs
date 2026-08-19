@@ -483,11 +483,18 @@ impl GoalLedger {
     }
 
     /// Create a new goal.
+    /// #2066 round 2 (codex R3) — creation writers carry the same #2063
+    /// activation guard as the update writers: an `active` snapshot whose own
+    /// arithmetic is exhausted lands `budget_limited`. No code path may
+    /// produce an active-and-exhausted row, including the very first insert.
     pub fn create_goal(&self, goal: &Goal) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2,
+                 CASE WHEN ?3 = 'active' AND ?5 > 0 AND ?4 >= ?5
+                 THEN 'budget_limited' ELSE ?3 END,
+                 ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 goal.goal_id,
                 goal.objective,
@@ -532,6 +539,11 @@ impl GoalLedger {
     ///     writer ever moves an existing `complete` row back to active/blocked.
     ///     `blocked` is deliberately NOT protected — a blocked goal is
     ///     user-resumable to `active` under the same id.
+    ///     #2066 round 2 (codex R3) — `cleared` joins `complete` as an
+    ///     immutable STATUS: an under-budget snapshot must not resurrect a
+    ///     cleared row to `active`. Counters on a cleared row may still
+    ///     accrue via [`Self::settle_cleared_goal_cost_delta`] (the
+    ///     post-clear settle path), which never touches status.
     ///
     /// #1973 fix-round — returns whether the write was ADMITTED (`true`: the
     /// row was inserted, or the guarded update fired), via SQLite's
@@ -540,11 +552,21 @@ impl GoalLedger {
     /// lower counters can detect the loss and retry once with max'd monotonic
     /// fields — instead of silently leaving the row on its old status while a
     /// decision row claims the transition happened.
+    /// #2063 — the VALUES status expression enforces the activation guard on
+    /// the snapshot's OWN arithmetic (`active` while `tokens_used >=
+    /// token_budget` lands `budget_limited`); `excluded.status` picks up the
+    /// transformed value, so the guard covers the insert arm AND the update
+    /// arm with one expression. Defense-in-depth here — the reachable hole is
+    /// the status-only [`Self::cas_goal_status`] — but the invariant lives in
+    /// every write of this family, not in its callers.
     pub fn upsert_goal(&self, goal: &Goal) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let admitted = conn.execute(
             "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2,
+                 CASE WHEN ?3 = 'active' AND ?5 > 0 AND ?4 >= ?5
+                 THEN 'budget_limited' ELSE ?3 END,
+                 ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(goal_id) DO UPDATE SET
                  objective = excluded.objective,
                  status = excluded.status,
@@ -554,7 +576,8 @@ impl GoalLedger {
                  updated_at_ms = excluded.updated_at_ms
              WHERE excluded.updated_at_ms >= goals.updated_at_ms
                AND excluded.tokens_used >= goals.tokens_used
-               AND NOT (goals.status = 'complete' AND excluded.status <> 'complete')",
+               AND NOT (goals.status = 'complete' AND excluded.status <> 'complete')
+               AND NOT (goals.status = 'cleared' AND excluded.status <> 'cleared')",
             params![
                 goal.goal_id,
                 goal.objective,
@@ -586,7 +609,10 @@ impl GoalLedger {
         let conn = self.conn.lock().unwrap();
         let inserted = conn.execute(
             "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2,
+                 CASE WHEN ?3 = 'active' AND ?5 > 0 AND ?4 >= ?5
+                 THEN 'budget_limited' ELSE ?3 END,
+                 ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(goal_id) DO NOTHING",
             params![
                 goal.goal_id,
@@ -629,6 +655,18 @@ impl GoalLedger {
     /// cannot detect — an equal-timestamp, same-status write (counters-only,
     /// same millisecond) — is safe by construction: the CAS writes only
     /// status + timestamp, so the interleaved counters survive untouched.
+    ///
+    /// #2063 — activation is CONDITIONAL ON THE ROW'S OWN ARITHMETIC:
+    /// `active` while `tokens_used >= token_budget` (budget > 0) writes
+    /// `budget_limited` instead, in the same statement. This is a status-only
+    /// write over counters the CALLER cannot see (the ledger is multi-process
+    /// WAL, and the #1973 retry that reaches this CAS fires precisely when
+    /// the caller's snapshot carries STALE LOWER counters than the row) — so
+    /// the in-memory resume guard is structurally unable to protect this
+    /// write, and the invariant must live here. The CAS still reports
+    /// `changed` (the pair matched and a stamp landed); the transition-sync
+    /// caller re-reads the row before appending its decision, so a flip to
+    /// the safe status suppresses the `active` audit row.
     pub fn cas_goal_status(
         &self,
         goal_id: &str,
@@ -639,9 +677,12 @@ impl GoalLedger {
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "UPDATE goals SET status = ?1, updated_at_ms = ?2
+            "UPDATE goals SET status = CASE
+                 WHEN ?1 = 'active' AND token_budget > 0 AND tokens_used >= token_budget
+                 THEN 'budget_limited' ELSE ?1 END,
+                 updated_at_ms = ?2
              WHERE goal_id = ?3 AND status = ?4 AND updated_at_ms = ?5
-               AND status <> 'complete'",
+               AND status NOT IN ('complete', 'cleared')",
             params![
                 new_status,
                 updated_at_ms,
@@ -983,6 +1024,12 @@ impl GoalLedger {
     /// Uses revision for compare-and-swap: only updates if the current revision
     /// matches expected_revision. Returns error if goal not found or revision mismatch
     /// (stale writer).
+    ///
+    /// #2063 — carries the same activation guard as [`Self::cas_goal_status`]:
+    /// `active` over an exhausted row writes `budget_limited` instead.
+    /// #2066 round 2 (codex R3) — and the same terminal protection: a
+    /// `complete`/`cleared` row refuses any revision-CAS status overwrite
+    /// (surfaces as the same Err as a revision mismatch).
     pub fn update_goal_status(
         &self,
         goal_id: &str,
@@ -992,7 +1039,12 @@ impl GoalLedger {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let rows_affected = conn.execute(
-            "UPDATE goals SET status = ?1, revision = revision + 1, updated_at_ms = ?2 WHERE goal_id = ?3 AND revision = ?4",
+            "UPDATE goals SET status = CASE
+                 WHEN ?1 = 'active' AND token_budget > 0 AND tokens_used >= token_budget
+                 THEN 'budget_limited' ELSE ?1 END,
+                 revision = revision + 1, updated_at_ms = ?2
+             WHERE goal_id = ?3 AND revision = ?4
+               AND status NOT IN ('complete', 'cleared')",
             params![status, updated_at_ms, goal_id, expected_revision],
         )?;
 
@@ -1376,6 +1428,18 @@ impl GoalLedger {
     ///
     /// This is the TRUE cross-table transaction: state transition and audit log
     /// are committed together, or both roll back.
+    ///
+    /// #2066 round 2 (codex R3 + HIGH) — the status write carries the #2063
+    /// activation guard and the terminal protection, and the AUDIT row is
+    /// derived from the STORED outcome, not the caller's request: when the
+    /// guard overrode the requested status (asked `active`, stored
+    /// `budget_limited`), inserting the caller's decision unchanged would
+    /// make the audit trail contradict the goals row. The override is
+    /// surfaced instead — the decision insert is SKIPPED and the returned
+    /// stored status tells the caller what actually landed (the finding, if
+    /// any, still lands: it is evidence, not a status claim).
+    ///
+    /// Returns the status the row carries after the commit.
     pub fn commit_state_with_audit(
         &self,
         goal_id: &str,
@@ -1384,51 +1448,156 @@ impl GoalLedger {
         updated_at_ms: u64,
         finding: Option<&Finding>,
         decision: Option<&Decision>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        // Step 1: Update goal state (CAS)
+        // Step 1: Update goal state (CAS). #2063 — same activation guard as
+        // `cas_goal_status`; #2066 round 2 — same terminal protection.
         let rows_affected = tx.execute(
-            "UPDATE goals SET status = ?1, revision = revision + 1, updated_at_ms = ?2 WHERE goal_id = ?3 AND revision = ?4",
+            "UPDATE goals SET status = CASE
+                 WHEN ?1 = 'active' AND token_budget > 0 AND tokens_used >= token_budget
+                 THEN 'budget_limited' ELSE ?1 END,
+                 revision = revision + 1, updated_at_ms = ?2
+             WHERE goal_id = ?3 AND revision = ?4
+               AND status NOT IN ('complete', 'cleared')",
             params![new_status, updated_at_ms, goal_id, expected_revision],
         )?;
 
         if rows_affected == 0 {
             return Err(eyre::eyre!(
-                "commit_state_with_audit failed: goal {} not found or revision mismatch",
+                "commit_state_with_audit failed: goal {} not found, revision mismatch, \
+                 or terminal status",
                 goal_id
             ));
         }
+
+        // The STORED status — re-read inside the same transaction so the
+        // audit decision below can never claim a status the row does not
+        // carry (the activation guard may have written `budget_limited`
+        // instead of a requested `active`).
+        let stored_status: String = tx.query_row(
+            "SELECT status FROM goals WHERE goal_id = ?1",
+            params![goal_id],
+            |row| row.get(0),
+        )?;
 
         // Step 2: Append finding (if provided) — uses SHARED validated insert
         if let Some(f) = finding {
             Self::insert_finding_validated(&tx, f, goal_id)?;
         }
 
-        // Step 3: Append decision (if provided)
+        // Step 3: Append decision (if provided) — ONLY when the stored status
+        // matches the caller's request; a guard override skips the insert so
+        // the audit trail cannot contradict the goals row.
         if let Some(d) = decision {
-            tx.execute(
-                "INSERT INTO decisions (decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    d.decision_id,
-                    goal_id,
-                    d.task_id,
-                    d.question,
-                    d.options_considered,
-                    d.choice,
-                    d.rationale,
-                    d.based_on_findings,
-                    d.based_on_rev,
-                    d.decided_at_ms,
-                    d.decided_by,
-                ],
-            )?;
+            if stored_status == new_status {
+                tx.execute(
+                    "INSERT INTO decisions (decision_id, goal_id, task_id, question, options_considered, choice, rationale, based_on_findings, based_on_rev, decided_at_ms, decided_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        d.decision_id,
+                        goal_id,
+                        d.task_id,
+                        d.question,
+                        d.options_considered,
+                        d.choice,
+                        d.rationale,
+                        d.based_on_findings,
+                        d.based_on_rev,
+                        d.decided_at_ms,
+                        d.decided_by,
+                    ],
+                )?;
+            }
         }
 
         tx.commit()?;
-        Ok(())
+        Ok(stored_status)
+    }
+
+    /// #2066 round 3 (codex fix 1) — the CLEAR STAMP: per-column MAX-merge on
+    /// counters, CASE on status, insert-if-absent. This writer deliberately
+    /// drops the row-level all-or-nothing guard of [`Self::upsert_goal`] —
+    /// that reject-whole-row shape is exactly what made the round-2 mixed
+    /// model order-dependent (a same-millisecond stamp landing after the
+    /// settle OVERWROTE the settled delta; a newer-timestamp settle made a
+    /// later stamp reject and lose the entire pre-clear lag). With both the
+    /// stamp and the settle MAX-merging on `tokens_used`, order-independence
+    /// is arithmetic: for row lag `L`, frozen clear-time base `B`, late
+    /// delta `D` — stamp→settle = `MAX(L,B)+D = B+D`; settle→stamp =
+    /// `MAX(MAX(L,B)+D, B) = B+D` (deltas are positive); every interleaving
+    /// of further deltas commutes the same way.
+    ///
+    /// Status: `cleared` unless the row is the stronger `complete` terminal
+    /// (clearing an already-complete goal keeps the row `complete`).
+    /// `objective`/`token_budget` take the clear-time values — the clear is
+    /// this row's single stamp writer, and the settle never touches them.
+    ///
+    /// Returns the STORED status so the caller can gate its audit decision
+    /// on what actually landed (`cleared` ⇒ append; `complete` ⇒ skip).
+    pub fn stamp_goal_cleared(&self, goal: &Goal) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO goals (goal_id, objective, status, tokens_used, token_budget, continuations_used, revision, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 'cleared', ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(goal_id) DO UPDATE SET
+                 objective = excluded.objective,
+                 status = CASE WHEN goals.status = 'complete' THEN goals.status ELSE 'cleared' END,
+                 tokens_used = MAX(goals.tokens_used, excluded.tokens_used),
+                 token_budget = excluded.token_budget,
+                 continuations_used = MAX(goals.continuations_used, excluded.continuations_used),
+                 updated_at_ms = MAX(goals.updated_at_ms, excluded.updated_at_ms)",
+            params![
+                goal.goal_id,
+                goal.objective,
+                goal.tokens_used,
+                goal.token_budget,
+                goal.continuations_used,
+                goal.revision,
+                goal.created_at_ms,
+                goal.updated_at_ms,
+            ],
+        )?;
+        let stored: String = conn.query_row(
+            "SELECT status FROM goals WHERE goal_id = ?1",
+            params![goal.goal_id],
+            |row| row.get(0),
+        )?;
+        Ok(stored)
+    }
+
+    /// #2066 round 2 (codex R6) / round 3 (codex fix 1 + 5) — GENUINELY
+    /// counters-only settle for a post-clear turn charge: `tokens_used`
+    /// MAX-merges the frozen clear-time base and adds the charge's DELTA,
+    /// `updated_at_ms` only ever moves forward, and STATUS is never touched
+    /// (round 3 removed the round-2 `cleared` CASE — the stamp owns the
+    /// status dimension, and a settle must never stamp a row it races). The
+    /// MAX-fold of the base is what makes settle-first converge: a stamp
+    /// arriving later MAX-merges to the same total (see
+    /// [`Self::stamp_goal_cleared`] for the arithmetic).
+    ///
+    /// Idempotency assumption: per-charge SINGLE DELIVERY — each in-process
+    /// accountant charge settles exactly once (one offload per charge); this
+    /// write has no dedupe key, so a replayed delta would double-count.
+    ///
+    /// Returns whether a row changed (false ⇒ no such goal row — the caller
+    /// creates it first via [`Self::create_goal_if_absent`] and retries).
+    pub fn settle_cleared_goal_cost_delta(
+        &self,
+        goal_id: &str,
+        frozen_base_tokens: u64,
+        tokens_delta: u64,
+        updated_at_ms: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE goals SET tokens_used = MAX(tokens_used, ?1) + ?2,
+                 updated_at_ms = MAX(updated_at_ms, ?3)
+             WHERE goal_id = ?4",
+            params![frozen_base_tokens, tokens_delta, updated_at_ms, goal_id],
+        )?;
+        Ok(changed > 0)
     }
 
     /// List findings for a goal (level-triggered: only changes since `since_rowid`).
@@ -1891,6 +2060,466 @@ mod tests {
         // CAS failure: nonexistent goal
         let result = ledger.update_goal_status("g999", "complete", 0, 3000);
         assert!(result.is_err());
+    }
+
+    /// #2063 — helper: a ledger with one goal row at the given spend/budget.
+    /// Returns the tempdir alongside so the db file outlives the helper.
+    fn ledger_with_goal(
+        tokens_used: u64,
+        token_budget: u64,
+        status: &str,
+    ) -> (tempfile::TempDir, GoalLedger) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        ledger
+            .create_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "budget-guarded".to_string(),
+                status: status.to_string(),
+                tokens_used,
+                token_budget,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            })
+            .unwrap();
+        (dir, ledger)
+    }
+
+    /// #2063 — `budget_limited` exists to stop spend, and whether a resume is
+    /// safe depends on an arithmetic fact (`tokens_used < token_budget`) the
+    /// status-only CAS cannot see in its caller: the in-memory guard evaluates
+    /// MEMORY's counters, but the multi-process row can be AHEAD of them (the
+    /// exact stale-lower-counters case the #1973 CAS retry exists for). The
+    /// write itself must therefore refuse to produce an active-and-exhausted
+    /// row: activating a row whose own counters are exhausted writes
+    /// `budget_limited` instead, in the same statement.
+    #[test]
+    fn should_write_budget_limited_when_cas_activates_exhausted_row() {
+        let (_dir, ledger) = ledger_with_goal(1_500, 1_000, "budget_limited");
+        let changed = ledger
+            .cas_goal_status("g1", "active", "budget_limited", 1000, 2000)
+            .unwrap();
+        assert!(
+            changed,
+            "the CAS fired (pair matched) — it wrote the SAFE status"
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            row.status, "budget_limited",
+            "activating an exhausted row must land budget_limited, never active-and-exhausted"
+        );
+        assert_eq!(row.updated_at_ms, 2000, "the stamp still lands");
+    }
+
+    /// #2063 — the legitimate resume: once the row's own budget covers its
+    /// spend, the same CAS writes `active` unchanged.
+    #[test]
+    fn should_write_active_when_cas_activates_row_within_budget() {
+        let (_dir, ledger) = ledger_with_goal(500, 1_000, "budget_limited");
+        let changed = ledger
+            .cas_goal_status("g1", "active", "budget_limited", 1000, 2000)
+            .unwrap();
+        assert!(changed);
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+    }
+
+    /// #2063 — same invariant on the snapshot writer: an incoming snapshot
+    /// whose own arithmetic is exhausted must not land `active`, on either the
+    /// insert arm (fresh row) or the update arm (existing row).
+    #[test]
+    fn should_flip_exhausted_active_snapshot_to_budget_limited_on_upsert() {
+        let (_dir, ledger) = ledger_with_goal(500, 1_000, "active");
+        // Update arm: the snapshot claims active but its own counters are
+        // exhausted (e.g. the budget field was lowered below the spend).
+        let admitted = ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "budget-guarded".to_string(),
+                status: "active".to_string(),
+                tokens_used: 1_500,
+                token_budget: 1_000,
+                continuations_used: 1,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+        assert!(admitted);
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "budget_limited");
+        assert_eq!(row.tokens_used, 1_500, "the counters land verbatim");
+        // Insert arm: a fresh goal_id with an exhausted active snapshot.
+        assert!(
+            ledger
+                .upsert_goal(&Goal {
+                    goal_id: "g2".to_string(),
+                    objective: "fresh but exhausted".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 900,
+                    token_budget: 800,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 3000,
+                    updated_at_ms: 3000,
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().status,
+            "budget_limited",
+            "the insert arm enforces the same arithmetic"
+        );
+        // Control: an under-budget active snapshot still lands active.
+        assert!(
+            ledger
+                .upsert_goal(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "budget-guarded".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 1_500,
+                    token_budget: 5_000,
+                    continuations_used: 1,
+                    revision: 0,
+                    created_at_ms: 1000,
+                    updated_at_ms: 4000,
+                })
+                .unwrap()
+        );
+        assert_eq!(ledger.get_goal("g1").unwrap().unwrap().status, "active");
+    }
+
+    /// #2063 — the remaining status writers of the same family
+    /// (`update_goal_status`, `commit_state_with_audit`) carry the identical
+    /// guard: no code path may produce an active-and-exhausted row. A zero
+    /// budget is exempt (matches the in-memory guards' `token_budget > 0`).
+    #[test]
+    fn should_write_budget_limited_when_revision_cas_activates_exhausted_row() {
+        let (_dir, ledger) = ledger_with_goal(1_500, 1_000, "budget_limited");
+        ledger.update_goal_status("g1", "active", 0, 2000).unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().status,
+            "budget_limited"
+        );
+        // Raise the budget above the spend (upsert), then the same transition
+        // legitimately activates.
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "budget-guarded".to_string(),
+                status: "budget_limited".to_string(),
+                tokens_used: 1_500,
+                token_budget: 5_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 3000,
+            })
+            .unwrap();
+        ledger.update_goal_status("g1", "active", 1, 4000).unwrap();
+        assert_eq!(ledger.get_goal("g1").unwrap().unwrap().status, "active");
+    }
+
+    /// #2063 — `commit_state_with_audit`'s in-transaction status write is the
+    /// same UPDATE shape; it must carry the same activation guard. #2066
+    /// round 2 — the returned status is the STORED outcome, so the caller
+    /// learns about the override.
+    #[test]
+    fn should_write_budget_limited_when_audited_commit_activates_exhausted_row() {
+        let (_dir, ledger) = ledger_with_goal(1_500, 1_000, "budget_limited");
+        let stored = ledger
+            .commit_state_with_audit("g1", "active", 0, 2000, None, None)
+            .unwrap();
+        assert_eq!(stored, "budget_limited", "the caller sees what landed");
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().status,
+            "budget_limited"
+        );
+    }
+
+    /// #2066 round 2 (codex R3) — the CREATION writers enforce the same
+    /// activation guard: the very first insert of an exhausted `active`
+    /// snapshot lands `budget_limited`, on both `create_goal` and
+    /// `create_goal_if_absent`.
+    #[test]
+    fn should_write_budget_limited_when_creation_writers_insert_exhausted_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        let exhausted = |goal_id: &str| Goal {
+            goal_id: goal_id.to_string(),
+            objective: "born exhausted".to_string(),
+            status: "active".to_string(),
+            tokens_used: 1_500,
+            token_budget: 1_000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+        ledger.create_goal(&exhausted("g1")).unwrap();
+        assert_eq!(
+            ledger.get_goal("g1").unwrap().unwrap().status,
+            "budget_limited"
+        );
+        assert!(ledger.create_goal_if_absent(&exhausted("g2")).unwrap());
+        assert_eq!(
+            ledger.get_goal("g2").unwrap().unwrap().status,
+            "budget_limited"
+        );
+    }
+
+    /// #2066 round 2 (codex R3) — `cleared` is an immutable STATUS on every
+    /// writer: an under-budget `active` write must not resurrect a cleared
+    /// row, while the counters-only delta settle still accrues on it.
+    #[test]
+    fn should_refuse_to_resurrect_a_cleared_row() {
+        let (_dir, ledger) = ledger_with_goal(500, 100_000, "cleared");
+        // upsert: whole write refused (status clause), counters untouched.
+        assert!(
+            !ledger
+                .upsert_goal(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "resurrect?".to_string(),
+                    status: "active".to_string(),
+                    tokens_used: 9_000,
+                    token_budget: 100_000,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1000,
+                    updated_at_ms: 5000,
+                })
+                .unwrap(),
+            "an under-budget active snapshot must not resurrect a cleared row"
+        );
+        // status CAS: refused by the terminal clause.
+        assert!(
+            !ledger
+                .cas_goal_status("g1", "active", "cleared", 1000, 5000)
+                .unwrap()
+        );
+        // revision CAS: refused (same Err class as a revision mismatch).
+        assert!(ledger.update_goal_status("g1", "active", 0, 5000).is_err());
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "cleared");
+        assert_eq!(row.tokens_used, 500);
+        // The counters-only settle still lands on the cleared tombstone.
+        assert!(
+            ledger
+                .settle_cleared_goal_cost_delta("g1", 500, 4_000, 6000)
+                .unwrap()
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "cleared");
+        assert_eq!(row.tokens_used, 4_500);
+        assert_eq!(row.updated_at_ms, 6000);
+    }
+
+    /// #2066 round 2 (codex HIGH) — the audit row derives from the STORED
+    /// outcome: when the activation guard overrides a requested `active` to
+    /// `budget_limited`, the supplied decision is SKIPPED (an inserted
+    /// "active" decision would contradict the goals row) and the returned
+    /// status surfaces the override. A non-overridden transition still
+    /// inserts its decision.
+    #[test]
+    fn should_skip_contradicting_decision_when_audited_commit_overrides_activation() {
+        let (_dir, ledger) = ledger_with_goal(1_500, 1_000, "budget_limited");
+        let decision = |id: &str, choice: &str| Decision {
+            decision_id: id.to_string(),
+            goal_id: "g1".to_string(),
+            task_id: None,
+            question: format!("transition goal to `{choice}`"),
+            options_considered: None,
+            choice: choice.to_string(),
+            rationale: "test".to_string(),
+            based_on_findings: None,
+            based_on_rev: 0,
+            decided_at_ms: 2000,
+            decided_by: "tester".to_string(),
+        };
+        let stored = ledger
+            .commit_state_with_audit(
+                "g1",
+                "active",
+                0,
+                2000,
+                None,
+                Some(&decision("d1", "active")),
+            )
+            .unwrap();
+        assert_eq!(stored, "budget_limited");
+        assert_eq!(
+            ledger.count_decisions("g1").unwrap(),
+            0,
+            "a decision claiming `active` must not land beside a budget_limited row"
+        );
+        // Control: a legitimate transition (paused — no guard involvement)
+        // inserts its decision and returns the requested status.
+        let stored = ledger
+            .commit_state_with_audit(
+                "g1",
+                "paused",
+                1,
+                3000,
+                None,
+                Some(&decision("d2", "paused")),
+            )
+            .unwrap();
+        assert_eq!(stored, "paused");
+        assert_eq!(ledger.count_decisions("g1").unwrap(), 1);
+    }
+
+    /// #2066 round 3 (codex fix 1) — THE order-independence pin, with the
+    /// adversarial fixture the round-2 test masked (it seeded ledger == base):
+    /// row lag `L=0` STRICTLY BELOW the frozen clear-time base `B=100`, late
+    /// delta `D=10`, and ALL writers stamping the SAME millisecond (the tie
+    /// that let the round-2 guarded upsert overwrite a settled delta). Every
+    /// order must land exactly `B + ΣD` with status `cleared`:
+    /// stamp→delta = `MAX(0,100)+10`; delta→stamp = `MAX(MAX(0,100)+10,100)`;
+    /// delta-only then a late stamp retry converges the same way.
+    #[test]
+    fn should_settle_identical_rows_for_clear_stamp_and_delta_in_both_orders() {
+        // Frozen clear-time snapshot: B=100 (the ledger row lags at L=0
+        // because ordinary nonterminal turns deliberately never sync it).
+        let clear_snapshot = Goal {
+            goal_id: "g1".to_string(),
+            objective: "both orders".to_string(),
+            status: "cleared".to_string(),
+            tokens_used: 100,
+            token_budget: 100_000,
+            continuations_used: 0,
+            revision: 0,
+            created_at_ms: 1000,
+            updated_at_ms: 2000, // clear time == charge time (same-ms tie)
+        };
+        let stamp_cleared = |ledger: &GoalLedger| {
+            let stored = ledger.stamp_goal_cleared(&clear_snapshot).unwrap();
+            assert_eq!(stored, "cleared");
+        };
+        let settle = |ledger: &GoalLedger, delta: u64| {
+            // The production settle: create-if-absent (frozen base), then the
+            // MAX-merged delta — same-millisecond timestamp as the stamp.
+            assert!(ledger.create_goal_if_absent(&clear_snapshot).is_ok());
+            assert!(
+                ledger
+                    .settle_cleared_goal_cost_delta("g1", 100, delta, 2000)
+                    .unwrap()
+            );
+        };
+
+        // Order A: stamp, then delta.
+        let (_dir_a, ledger_a) = ledger_with_goal(0, 100_000, "active");
+        stamp_cleared(&ledger_a);
+        settle(&ledger_a, 10);
+        let row_a = ledger_a.get_goal("g1").unwrap().unwrap();
+
+        // Order B: delta first, then the SAME-MILLISECOND stamp (the round-2
+        // loss case: the all-or-nothing upsert admitted and overwrote 110
+        // back to 100; the MAX-merge stamp must not).
+        let (_dir_b, ledger_b) = ledger_with_goal(0, 100_000, "active");
+        settle(&ledger_b, 10);
+        stamp_cleared(&ledger_b);
+        let row_b = ledger_b.get_goal("g1").unwrap().unwrap();
+
+        assert_eq!(row_a.status, "cleared");
+        assert_eq!(
+            (row_a.status, row_a.tokens_used, row_a.updated_at_ms),
+            (row_b.status, row_b.tokens_used, row_b.updated_at_ms),
+            "the settled row must be identical in both arrival orders"
+        );
+        assert_eq!(
+            row_b.tokens_used, 110,
+            "B(100) + D(10): neither the late delta nor the pre-clear lag may be lost"
+        );
+
+        // Multi-delta interleaving: delta, delta, stamp — still B + ΣD.
+        let (_dir_c, ledger_c) = ledger_with_goal(0, 100_000, "active");
+        settle(&ledger_c, 10);
+        settle(&ledger_c, 5);
+        stamp_cleared(&ledger_c);
+        assert_eq!(
+            ledger_c.get_goal("g1").unwrap().unwrap().tokens_used,
+            115,
+            "B(100) + D1(10) + D2(5) in every interleaving"
+        );
+
+        // Fix 5 pin: the settle is GENUINELY counters-only — before the stamp
+        // lands, a settled row keeps whatever status it had (the stamp owns
+        // the status dimension).
+        let (_dir_d, ledger_d) = ledger_with_goal(0, 100_000, "active");
+        settle(&ledger_d, 10);
+        assert_eq!(
+            ledger_d.get_goal("g1").unwrap().unwrap().status,
+            "active",
+            "a settle racing ahead of the stamp must not flip status"
+        );
+        stamp_cleared(&ledger_d);
+        assert_eq!(ledger_d.get_goal("g1").unwrap().unwrap().status, "cleared");
+    }
+
+    /// #2066 round 2 (codex R6) — the settle sequence on a goal whose ledger
+    /// row does not exist yet: the delta alone matches nothing; the caller's
+    /// create-if-absent + delta sequence creates the cleared tombstone (the
+    /// frozen base INSERT carries status `cleared`) and lands the charge.
+    #[test]
+    fn should_create_the_cleared_row_when_settling_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        assert!(
+            !ledger
+                .settle_cleared_goal_cost_delta("g1", 500, 4_000, 3000)
+                .unwrap(),
+            "a bare delta on a missing row changes nothing"
+        );
+        assert!(
+            ledger
+                .create_goal_if_absent(&Goal {
+                    goal_id: "g1".to_string(),
+                    objective: "late row".to_string(),
+                    status: "cleared".to_string(),
+                    tokens_used: 500,
+                    token_budget: 100_000,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1000,
+                    updated_at_ms: 2000,
+                })
+                .unwrap()
+        );
+        assert!(
+            ledger
+                .settle_cleared_goal_cost_delta("g1", 500, 4_000, 3000)
+                .unwrap()
+        );
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!((row.status.as_str(), row.tokens_used), ("cleared", 4_500));
+    }
+
+    /// #2066 round 3 (codex fix 1) — the stamp keeps `complete` (terminal
+    /// parity) while still MAX-merging counters, and reports the stored
+    /// status so the caller's decision gate can skip the audit row.
+    #[test]
+    fn should_keep_complete_when_stamping_cleared_over_a_complete_row() {
+        let (_dir, ledger) = ledger_with_goal(500, 100_000, "complete");
+        let stored = ledger
+            .stamp_goal_cleared(&Goal {
+                goal_id: "g1".to_string(),
+                objective: "clear a finished goal".to_string(),
+                status: "cleared".to_string(),
+                tokens_used: 700,
+                token_budget: 100_000,
+                continuations_used: 0,
+                revision: 0,
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            })
+            .unwrap();
+        assert_eq!(stored, "complete", "complete is the stronger terminal");
+        let row = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.tokens_used, 700, "counters still MAX-merge");
     }
 
     #[test]

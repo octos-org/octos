@@ -5211,8 +5211,19 @@ impl SessionActor {
                 Some("processed_by_session_actor".to_owned()),
             );
             if is_goal_turn {
-                self.maybe_advance_goal_runtime_after_turn(&profile_id, goal_turn_start)
-                    .await;
+                // #2066 round 2 (codex R1c) — thread the continuation's bound
+                // goal identity into the accountant so a post-clear charge is
+                // goal-id-bound (settles the cleared goal's tombstone, never a
+                // replacement goal).
+                self.maybe_advance_goal_runtime_after_turn(
+                    &profile_id,
+                    continuation
+                        .goal_id
+                        .as_ref()
+                        .map(|goal_id| goal_id.as_str()),
+                    goal_turn_start,
+                )
+                .await;
             }
         }
         drained
@@ -5234,6 +5245,7 @@ impl SessionActor {
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
         profile_id: &str,
+        bound_goal_id: Option<&str>,
         goal_turn_start: Instant,
     ) {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
@@ -5242,6 +5254,7 @@ impl SessionActor {
         if let Some(snapshot) = orchestrator.record_goal_turn(
             &self.session_key,
             profile_id,
+            bound_goal_id,
             tokens_consumed,
             elapsed_seconds,
         ) {

@@ -4380,6 +4380,12 @@ impl Drop for AbortOnDrop {
 /// (`tick % 8 == 0`) so the cadence feels identical across surfaces.
 const STATUS_WORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// #2066 round 4 (codex fix 2) — cadence of the AppUI goal-turn in-flight
+/// heartbeat, mirroring the session actor's `IN_FLIGHT_HEARTBEAT_INTERVAL`
+/// (#2003): well under the 30-minute staleness horizon, coarse enough to be
+/// free.
+const APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// CJK code-point check shared with `status_indicator::has_cjk` — kept
 /// inline here to avoid pulling the channel-aware status_indicator
 /// module into the WS turn path.
@@ -19826,27 +19832,33 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
-    // Cross-subsystem occupancy (#1529): a session actor draining a
-    // continuation turn for this session marks it in-flight but has no entry
-    // in this connection's `active_turns` map. Without this check the serve
-    // tick would drain + spawn a SECOND concurrent turn on the same session
-    // while the actor's turn runs. The actor clears the marker (RAII guard)
-    // when its turn ends, so the next tick re-dispatches normally.
-    if default_agent_orchestrator().is_goal_dispatch_in_flight(&goal_storage_key) {
-        return false;
-    }
-
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
             .approvals
             .pending_for_session(&session_id)
             .is_empty(),
     );
-    let Some(continuation) = default_agent_orchestrator()
-        .drain_ready_continuations_for_session(&goal_storage_key, &profile_id, runtime_state, 1)
-        .into_iter()
-        .next()
-    else {
+    // #2066 round 3 (codex fix 2) — ATOMIC drain-and-claim, the same
+    // primitive the session actor uses: the in-flight claim and the pop
+    // happen under ONE state lock, so this path can never pop a one-shot it
+    // does not own. The round-2 shape (separate occupancy check → pop →
+    // claim inside the spawned task) could pop an item, lose the claim race
+    // to another dispatcher, and complete the popped item UNEXECUTED — for a
+    // latched GoalWrapUp that meant permanently dropping the wrap-up
+    // (`wrap_up_emitted` never re-mints on a budget_limited goal). A held
+    // marker now drains NOTHING here (cross-subsystem occupancy, #1529,
+    // subsumed: the claim check is inside the same lock as the pop), and the
+    // returned guard travels into the spawned turn, released on every exit.
+    let (mut drained, claim_guard) = default_agent_orchestrator()
+        .drain_and_claim_ready_continuation_for_session(
+            &goal_storage_key,
+            &profile_id,
+            runtime_state,
+            1,
+        );
+    let Some(continuation) = drained.pop() else {
+        // Nothing owned: nothing was popped, nothing to complete. The guard
+        // (if any) drops here and releases immediately.
         return false;
     };
 
@@ -19981,6 +19993,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 // enqueued under; the post-turn accountant must charge THAT
                 // record, not the plain wire id.
                 goal_session_key: SessionKey(continuation.session_id.as_str().to_owned()),
+                bound_goal_id: continuation
+                    .goal_id
+                    .as_ref()
+                    .map(|goal_id| goal_id.as_str().to_owned()),
+                claim_generation: claim_guard.as_ref().map(|guard| guard.generation()),
             })
         }
         _ => None,
@@ -20012,30 +20029,52 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // post-turn `record_goal_turn` call below (which runs with
         // real token usage).
         //
-        // #1140 codex P2 re-review #3: mark the goal session as
-        // in-flight so `due_loop_targets`'s goal sweep + the
-        // `enqueue_due_goal_continuations` enqueue path both skip
-        // it until the post-turn accountant clears it. The
-        // timestamp alone isn't enough for goal turns > 30s.
+        // #1140 codex P2 re-review #3/#4: the in-flight claim keeps
+        // `due_loop_targets`'s goal sweep + the enqueue paths off this
+        // session until the post-turn accountant finishes, and the RAII
+        // guard clears it on every exit (abort, early terminal, panic).
         //
-        // #1140 codex P1 re-review #4: use the RAII drop-guard shape
-        // so the marker is cleared even if the spawned turn task is
-        // aborted (e.g. `abort_connection_turns` on connection close)
-        // or returns through an early terminal path. The Drop becomes
-        // the single canonical clear-point (codex P2 re-review #5).
+        // #2066 round 3 (codex fix 2) — the claim is no longer taken here:
+        // it was taken ATOMICALLY WITH THE POP by
+        // `drain_and_claim_ready_continuation_for_session` and travels into
+        // this task. Claim-failure therefore pops nothing and completes
+        // nothing (the round-2 try-claim-in-task shape popped first and
+        // completed the item UNEXECUTED on claim failure — permanently
+        // dropping a latched GoalWrapUp). Held for EVERY continuation
+        // reason, matching the session actor's claim semantics.
         //
-        // GoalWrapUp doesn't go through this guard because the
-        // goal is already `budget_limited` — `due_loop_targets`'s
-        // goal sweep already excludes non-active goals, and the
-        // pending-queue sweep handles wrap-up via #1141's path.
-        let _in_flight_guard = if let Some(ref ctx) = goal_context_for_appui {
+        // The post-claim goal RECHECK stays: with the claim held, a
+        // gone/mismatched goal is genuinely cleared/replaced (not a racing
+        // dispatcher), so completing the popped item is correct — launching
+        // the drained prompt would run a turn for a deleted goal. The abort
+        // stamps the internal turn slot Terminal (no wire event was emitted
+        // for this turn yet — the client never saw it) so the session's
+        // `active_turns` slot frees for the next dispatch.
+        let _in_flight_guard = claim_guard;
+        if let Some(ref ctx) = goal_context_for_appui {
             let session_key = SessionKey(continuation.session_id.as_str().to_owned());
+            if !default_agent_orchestrator().goal_dispatch_target_matches(
+                &session_key,
+                &ctx.profile_id,
+                ctx.bound_goal_id.as_deref(),
+            ) {
+                info!(
+                    session = %params.session_id,
+                    continuation_id = continuation.id.as_u64(),
+                    "goal was cleared/replaced between drain and launch; \
+                     aborting this turn"
+                );
+                *turn_state_for_task.lock().await = TurnState::Terminal(TerminalReason::Completed);
+                default_agent_orchestrator().mark_continuation_completed(
+                    &continuation,
+                    Some("goal_removed_before_launch".to_owned()),
+                );
+                // The claim guard drops here, releasing the slot.
+                return;
+            }
             default_agent_orchestrator()
                 .record_goal_dispatch_timestamp_only(&session_key, &ctx.profile_id);
-            Some(default_agent_orchestrator().goal_dispatch_in_flight_guard(session_key))
-        } else {
-            None
-        };
+        }
         // #436 P1 #2 — for a peer_send_input injection, track whether the turn
         // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
         // failed `TurnStarted`) is NOT marked completed and stays durable for
@@ -28601,6 +28640,19 @@ struct GoalContinuationContext {
     /// A goal turn would charge nothing (the wire key finds no scoped goal) and
     /// recur forever without ever hitting its budget.
     goal_session_key: SessionKey,
+    /// #2066 round 2 (codex R1c/R2) — the goal identity this continuation was
+    /// enqueued under (`QueuedMasterContinuation::goal_id`). Used twice: the
+    /// post-claim dispatch recheck refuses to launch when the live goal is no
+    /// longer this incarnation, and the post-turn accountant charges
+    /// goal-id-bound so a mid-turn clear(+recreate) settles the cleared
+    /// goal's tombstone instead of the replacement. `None` for legacy
+    /// persisted continuations without a stamped goal id.
+    bound_goal_id: Option<String>,
+    /// #2066 round 5 (codex fix 1) — the marker incarnation the atomic
+    /// drain-and-claim took for THIS turn. The in-flight heartbeat refreshes
+    /// generation-matched so a stale predecessor turn resuming production
+    /// can never keep a replacement turn's marker alive.
+    claim_generation: Option<u64>,
 }
 
 /// #1134 — pick the LAST non-empty assistant row after `pre` from a
@@ -31386,6 +31438,44 @@ async fn run_standalone_turn(
     // task future is dropped.
     let token_tracker = std::sync::Arc::new(octos_agent::TokenTracker::new());
     let token_tracker_task = std::sync::Arc::clone(&token_tracker);
+    // #2066 round 4 (codex fix 2) — the AppUI twin of the session actor's
+    // #2003 in-flight heartbeat: keep this goal turn's dispatch marker fresh
+    // WHILE the turn is genuinely producing. AppUI had NO refresh at all, so
+    // a legitimately long (>30min) goal turn's marker read stale — its settle
+    // tombstone purged before the late charge arrived, and a concurrent
+    // `/goal clear` could claim the "free" slot without parking a tombstone.
+    // Progress-gated exactly like the actor's: the refresh fires only when
+    // the shared TokenTracker has ADVANCED since the last tick, so a wedged
+    // turn stops being refreshed and ages out normally (#2003's contract).
+    // Touches the SCOPED goal store key — the key the drain claimed the
+    // marker under — not the wire session id. #2066 round 5 (codex fix 1):
+    // GENERATION-MATCHED — the refresh names the marker incarnation THIS
+    // turn's drain-and-claim took, so a stale predecessor that resumes
+    // producing after eviction can never keep a replacement turn's marker
+    // alive (no generation ⇒ no claim was taken ⇒ no heartbeat). Aborted on
+    // every exit with the turn (AbortOnDrop).
+    let _in_flight_heartbeat = goal_context.as_ref().and_then(|ctx| {
+        let claim_generation = ctx.claim_generation?;
+        let tracker = std::sync::Arc::clone(&token_tracker);
+        let marker_key = ctx.goal_session_key.clone();
+        let heartbeat = tokio::spawn(async move {
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let mut last = 0_u64;
+            loop {
+                tokio::time::sleep(APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL).await;
+                let seen = u64::from(tracker.input_tokens.load(AtomicOrdering::Relaxed))
+                    + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
+                if seen > last {
+                    last = seen;
+                    default_agent_orchestrator()
+                        .touch_goal_dispatch_in_flight_generation(&marker_key, claim_generation);
+                }
+            }
+        });
+        Some(AbortOnDrop {
+            abort: heartbeat.abort_handle(),
+        })
+    });
     // task-turn-interrupt-steer-correlation-logs: every agent-side log line
     // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
     // `session`/`turn` from this span (postfix `.instrument` keeps the block
@@ -33465,6 +33555,10 @@ async fn run_standalone_turn(
         if let Some(snapshot) = orchestrator.record_goal_turn(
             goal_key,
             &goal_ctx.profile_id,
+            // #2066 round 2 (codex R1c) — goal-id-bound charge: a mid-turn
+            // clear(+recreate) settles the cleared goal's tombstone, never
+            // the replacement goal.
+            goal_ctx.bound_goal_id.as_deref(),
             final_tokens_consumed,
             elapsed_seconds,
         ) {
