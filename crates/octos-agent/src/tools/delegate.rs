@@ -4,8 +4,9 @@
 //! issues `delegate_task`, waits for the child to reach a terminal lifecycle
 //! state, and returns the child's output through the contract-gated delivery
 //! path. Children inherit the parent's workspace contract but run under the
-//! `group:delegated` deny list (no re-delegation, no user messaging, no
-//! memory writes).
+//! `group:delegated` deny list (no re-delegation, no spawning/driving of
+//! sub-agents, no user messaging, no memory writes, no arbitrary code
+//! execution — every shell alias is denied).
 //!
 //! The [`DepthBudget`] is typed and serde-stable. Each level adds 1 to
 //! `current`; when a child would exceed `max` (default [`MAX_DEPTH`] = 2),
@@ -498,7 +499,7 @@ impl Tool for DelegateTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a subtask synchronously to a restricted child agent. The caller blocks until the child's task reaches a terminal lifecycle state. Children inherit the parent's workspace but cannot re-delegate, spawn background workers, or message the user directly."
+        "Delegate a subtask synchronously to a restricted child agent. The caller blocks until the child's task reaches a terminal lifecycle state. Children inherit the parent's workspace but cannot re-delegate, spawn background workers, message the user directly, write memory, or run shell commands."
     }
 
     fn tags(&self) -> &[&str] {
@@ -1075,6 +1076,17 @@ mod tests {
         assert!(!policy.is_allowed("send_message"));
         assert!(!policy.is_allowed("save_memory"));
         assert!(!policy.is_allowed("execute_code"));
+        // SECURITY (peer-review fix): the real escape surfaces must be
+        // denied too — a delegated child with any shell alias executes
+        // arbitrary code; with spawn_agent/send_input it spawns and drives
+        // its own sub-agents. Deny-wins means even the explicit
+        // `allowed_tools: ["shell"]` above cannot re-open the hole.
+        assert!(!policy.is_allowed("shell"));
+        assert!(!policy.is_allowed("bash"));
+        assert!(!policy.is_allowed("spawn_agent"));
+        assert!(!policy.is_allowed("send_input"));
+        assert!(!policy.is_allowed("delegate"));
+        assert!(!narrowed.is_allowed("shell"));
     }
 
     #[test]

@@ -303,7 +303,19 @@ async fn should_apply_group_delegated_deny_list_to_child() {
     assert!(!policy.is_allowed("execute_code"));
     // Explicitly allowed non-denied tools remain usable by the child.
     assert!(policy.is_allowed("read_file"));
-    assert!(policy.is_allowed("shell"));
+    // SECURITY (peer-review fix): `shell` is in `group:delegated` — it IS
+    // the arbitrary-code-execution surface the group's contract bans — so
+    // deny-wins overrides even the explicit `allowed_tools: ["shell"]`
+    // grant above. This test previously asserted the child kept shell
+    // ("explicitly allowed non-denied tools remain usable"), which encoded
+    // the escape as expected behavior: shell was only "non-denied" because
+    // the group had drifted to a phantom `execute_code` name. A delegated
+    // child that can reach any shell alias escapes its confinement.
+    assert!(!policy.is_allowed("shell"));
+    assert!(!policy.is_allowed("bash"));
+    assert!(!policy.is_allowed("spawn_agent"));
+    assert!(!policy.is_allowed("send_input"));
+    assert!(!policy.is_allowed("delegate"));
 }
 
 #[tokio::test]

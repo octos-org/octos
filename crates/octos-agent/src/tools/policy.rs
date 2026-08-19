@@ -248,16 +248,51 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     // messages, write memory, or execute arbitrary code. Policy evaluation
     // is deny-wins, so adding `group:delegated` to a child's deny list is
     // sufficient to gate all of these surfaces regardless of allow list.
+    //
+    // SECURITY INVARIANT (peer-review fix): this list must stay a SUPERSET
+    // of `group:sessions` and `group:runtime`. The group machinery has no
+    // group-in-group expansion, so the union is maintained by hand and
+    // locked by `group_delegated_supersets_sessions_and_runtime`. The
+    // original list denied the phantom names `execute_code` / `send_message`
+    // (registered by no builtin) while the real code-execution surface
+    // (`shell` / `exec_command` / `write_stdin` / `bash`) and the real
+    // re-delegation / spawn surfaces (`delegate`, `spawn_agent`,
+    // `send_input`, ...) stayed reachable — a full confinement escape for
+    // delegated children.
     ToolGroupInfo {
         name: "group:delegated",
         description: "Delegated child deny list: re-delegation, spawning, user messaging, memory writes, and arbitrary code execution.",
         tools: &[
+            // Re-delegation: every delegation entry point, including the
+            // codex-compat one-call `delegate` wrapper — per the
+            // group:sessions #1172 note it keeps its own Arc handle to the
+            // bound `spawn_agent` and can spawn a child even when
+            // `spawn` / `spawn_agent` are gone from the registry.
             "delegate_task",
+            "delegate",
+            // Background workers + driving live agents (all of
+            // group:sessions).
             "spawn",
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+            // User messaging. `send_message` is registered by no builtin
+            // but kept: a plugin or MCP server could register that name.
             "send_message",
             "message",
+            // Memory writes.
             "save_memory",
             "memory_note",
+            // Arbitrary code execution (all of group:runtime — the shell
+            // aliases are one capability, see #1172 and
+            // `policy_equivalent_tool_names`). `execute_code` is registered
+            // by no builtin but kept for the same plugin/MCP reason.
+            "shell",
+            "exec_command",
+            "write_stdin",
+            "bash",
             "execute_code",
         ],
     },
@@ -426,13 +461,20 @@ mod tests {
     #[test]
     fn should_expand_group_delegated_to_restricted_child_toolset() {
         let info = tool_group_info("group:delegated").expect("group:delegated must be registered");
-        // The invariant tests lock in this exact set; don't widen without
-        // coordinating with DelegateTool documentation.
+        // Membership floor. The superset-of-sessions-and-runtime invariant
+        // is locked separately by
+        // `group_delegated_supersets_sessions_and_runtime`; don't SHRINK
+        // this set without coordinating with DelegateTool documentation.
         assert!(info.tools.contains(&"delegate_task"));
+        assert!(info.tools.contains(&"delegate"));
         assert!(info.tools.contains(&"spawn"));
+        assert!(info.tools.contains(&"spawn_agent"));
+        assert!(info.tools.contains(&"send_input"));
         assert!(info.tools.contains(&"send_message"));
         assert!(info.tools.contains(&"save_memory"));
         assert!(info.tools.contains(&"execute_code"));
+        assert!(info.tools.contains(&"shell"));
+        assert!(info.tools.contains(&"bash"));
     }
 
     #[test]
@@ -447,9 +489,83 @@ mod tests {
         assert!(!policy.is_allowed("send_message"));
         assert!(!policy.is_allowed("save_memory"));
         assert!(!policy.is_allowed("execute_code"));
-        // Tools not in the group remain allowed by default.
+        // Tools not in the group remain allowed by default. NOTE: `shell`
+        // was previously the "not in the group" specimen here, which
+        // encoded the escape itself as expected behavior — the group's own
+        // contract says delegated children may never execute arbitrary
+        // code, so no shell alias can ever serve as the out-of-group
+        // example (peer-review fix; oversight, not a capability grant).
         assert!(policy.is_allowed("read_file"));
-        assert!(policy.is_allowed("shell"));
+        assert!(policy.is_allowed("glob"));
+        assert!(!policy.is_allowed("shell"));
+    }
+
+    /// SECURITY (peer-review finding: group:delegated escape): this test
+    /// prevents a delegated-child sandbox escape — if `group:sessions` or
+    /// `group:runtime` ever holds a tool that `group:delegated` does not
+    /// deny, a delegated child can spawn/drive its own sub-agents
+    /// (`spawn_agent`, `send_input`, the codex-compat `delegate` wrapper)
+    /// or execute arbitrary code through any shell alias (`shell`,
+    /// `exec_command`, `write_stdin`, `bash`), defeating the group's own
+    /// "may never ... execute arbitrary code" contract.
+    ///
+    /// The group machinery has no group-in-group expansion (`expand_group`
+    /// returns a flat static slice), so the union must be maintained by
+    /// hand — this test iterates the static tables and fails the moment
+    /// either sibling group gains a member `group:delegated` lacks. That
+    /// exact drift already happened once: the list denied the phantom
+    /// names `execute_code` / `send_message` (registered by no tool) while
+    /// every real shell and sub-agent surface stayed reachable.
+    #[test]
+    fn group_delegated_supersets_sessions_and_runtime() {
+        let delegated =
+            tool_group_info("group:delegated").expect("group:delegated must be registered");
+        for sibling in ["group:sessions", "group:runtime"] {
+            let info = tool_group_info(sibling).expect("sibling group must be registered");
+            for tool in info.tools {
+                assert!(
+                    delegated.tools.contains(tool),
+                    "group:delegated must deny {tool:?} (member of {sibling}); \
+                     a delegated child that can reach it escapes confinement"
+                );
+            }
+        }
+    }
+
+    /// SECURITY (peer-review finding: group:delegated escape): denying
+    /// `group:delegated` must gate EVERY code-execution and re-delegation
+    /// entry point. Pre-fix, a delegated child could call `shell` / `bash` /
+    /// `exec_command` / `write_stdin` (arbitrary code) and `spawn_agent` /
+    /// `send_input` / `delegate` (spawn and drive its own sub-agents)
+    /// because the group only listed `execute_code` — a name no builtin
+    /// registers.
+    #[test]
+    fn should_deny_every_escape_surface_when_group_delegated_is_denied() {
+        let policy = ToolPolicy {
+            deny: vec!["group:delegated".into()],
+            ..Default::default()
+        };
+        for escape in [
+            // group:runtime — every shell alias is one capability (#1172/#1607).
+            "shell",
+            "exec_command",
+            "write_stdin",
+            "bash",
+            // group:sessions — spawning and driving sub-agents.
+            "spawn",
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+            "delegate",
+            "delegate_task",
+        ] {
+            assert!(
+                !policy.is_allowed(escape),
+                "{escape} must be denied when group:delegated is in the deny list"
+            );
+        }
     }
 
     #[test]
