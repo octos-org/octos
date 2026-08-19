@@ -33781,16 +33781,17 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
 }
 
 // ---------------------------------------------------------------------------
-// #2062 round 6 — the goal snapshot rides IN the `session/open` RPC RESPONSE
-// (`SessionOpenResult::goal_state`): either the goal object or EXPLICIT
-// `null`, always present on new servers. The response's fixed position in
-// the client's own processing order makes the snapshot race-free by
-// construction — the client applies it while handling the open result,
-// before any subsequently delivered frame, and every later goal frame is by
-// definition newer and simply overwrites it. Rounds 2-5 pursued
-// ordered-notification delivery instead; codex's null-suppresses-null proof
-// showed that abstraction unsound, and the notification machinery was
-// deleted wholesale in favor of this field.
+// #2062 rounds 6-8 — the VERSIONED goal snapshot rides IN the `session/open`
+// RPC RESPONSE (`SessionOpenResult::goal_state`):
+// `{ "version": u64, "goal": object|null }`, always present on new servers.
+// The version is the scope's latest #1959 generation — the same number
+// space stamped on SessionGoalUpdated/Cleared frames — captured together
+// with the state under ONE state-lock acquisition. The wire does NOT carry
+// freshness (codex round-7 F1: producers release the guard and enqueue
+// later, so no server-side ordering scheme can — five notification rounds,
+// response position, and capture-at-enqueue all failed on that rock); the
+// DATA carries it, and the client resolves any arrival order by version
+// (apply iff version >= last applied, within one connection).
 //
 // CI: these run under the `session_open_goal` name filter in
 // .github/workflows/ci.yml (test-octos-cli job) — the `api`-gated module is
@@ -33841,12 +33842,14 @@ async fn open_session_result_frame(
     result
 }
 
-/// #2062 round 6, tests (a)+(d) — an open with NO goal bound answers with
-/// an EXPLICIT `"goal_state": null` in the RPC result: the key is PRESENT
-/// (null is a statement, not an omission — an absent key is the old-server
-/// legacy shape a new client treats as no-op).
+/// #2062 round 8 — an open with NO goal bound answers with an EXPLICIT
+/// versioned null snapshot: the `goal_state` key is PRESENT (a statement,
+/// not an omission), carries a `version` (u64) and `goal: null`. Also pins
+/// the old-server compat contract: the same result payload with the field
+/// STRIPPED still parses (`#[serde(default)]` → `Null`), which is exactly
+/// what a new client sees from an old server.
 #[tokio::test]
-async fn session_open_goal_state_response_is_explicit_null_when_no_goal_bound() {
+async fn session_open_goal_state_response_is_versioned_null_when_no_goal_bound() {
     let temp = tempfile::tempdir().expect("tempdir");
     let state = state_with_sessions(temp.path());
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -33862,9 +33865,29 @@ async fn session_open_goal_state_response_is_explicit_null_when_no_goal_bound() 
         "the field is ALWAYS present on a new server: {result:?}"
     );
     assert!(
-        result["goal_state"].is_null(),
-        "no goal bound => explicit null: {:?}",
+        result["goal_state"]["version"].is_u64(),
+        "the snapshot is versioned: {:?}",
         result["goal_state"]
+    );
+    assert!(
+        result["goal_state"]["goal"].is_null(),
+        "no goal bound => goal: null: {:?}",
+        result["goal_state"]
+    );
+
+    // Old-server compat: strip the field and reparse — a new client
+    // receiving an old server's payload sees the serde default (`Null`,
+    // legacy no-op), never a parse failure.
+    let mut legacy = frame["result"].clone();
+    legacy
+        .as_object_mut()
+        .expect("result object")
+        .remove("goal_state");
+    let parsed: SessionOpenResult =
+        serde_json::from_value(legacy).expect("old-server payload (field absent) still parses");
+    assert!(
+        parsed.goal_state.is_null(),
+        "absent field defaults to Null (old server, no snapshot)"
     );
 }
 
@@ -33902,16 +33925,20 @@ async fn session_open_goal_state_response_carries_bound_goal() {
 
     let goal_state = &frame["result"]["goal_state"];
     assert!(
-        goal_state.is_object(),
+        goal_state["version"].is_u64(),
+        "the snapshot is versioned: {goal_state:?}"
+    );
+    assert!(
+        goal_state["goal"].is_object(),
         "a bound goal rides in the response: {goal_state:?}"
     );
     assert_eq!(
-        goal_state["objective"],
+        goal_state["goal"]["objective"],
         json!("ship the goal snapshot in the open response")
     );
-    assert_eq!(goal_state["status"], json!("active"));
+    assert_eq!(goal_state["goal"]["status"], json!("active"));
     assert!(
-        goal_state["goal_id"].is_string(),
+        goal_state["goal"]["goal_id"].is_string(),
         "the goal object carries its id: {goal_state:?}"
     );
 }
@@ -33950,7 +33977,7 @@ async fn session_open_goal_state_response_carries_budget_limited_goal() {
 
     let goal_state = &frame["result"]["goal_state"];
     assert_eq!(
-        goal_state["status"],
+        goal_state["goal"]["status"],
         json!("budget_limited"),
         "any bound status rides in the response: {goal_state:?}"
     );
@@ -33991,7 +34018,7 @@ async fn session_open_goal_state_response_null_for_other_profile_goal() {
         .expect("cleanup goal");
 
     assert!(
-        frame["result"]["goal_state"].is_null(),
+        frame["result"]["goal_state"]["goal"].is_null(),
         "the open resolves `_main`; tenant-x's goal must not leak into its \
          response: {:?}",
         frame["result"]["goal_state"]
@@ -34039,12 +34066,12 @@ async fn session_open_goal_state_response_scoped_to_pinned_scope() {
     let _ = orchestrator.set_goal_scope(&wire, None);
 
     assert!(
-        frame_a["result"]["goal_state"].is_null(),
+        frame_a["result"]["goal_state"]["goal"].is_null(),
         "scope A reports its own (empty) slot, not folder B's goal: {:?}",
         frame_a["result"]["goal_state"]
     );
     assert_eq!(
-        frame_b["result"]["goal_state"]["objective"],
+        frame_b["result"]["goal_state"]["goal"]["objective"],
         json!("folder B's goal"),
         "scope B's own open still carries its goal: {:?}",
         frame_b["result"]["goal_state"]
@@ -34095,7 +34122,7 @@ fn session_open_goal_state_snapshot_uses_pinned_key_not_cwd_map() {
     let _ = orchestrator.set_goal_scope(&wire, None);
 
     assert_eq!(
-        snapshot["objective"],
+        snapshot["goal"]["objective"],
         json!("folder A's live goal"),
         "the snapshot must read the OPEN-pinned key (folder A), not the \
          flipped cwd map (folder B): {snapshot:?}"
@@ -34119,7 +34146,7 @@ async fn session_open_goal_state_response_null_again_after_out_of_band_clear() {
     let session_id = SessionKey("local:goal-state-oob-clear".into());
 
     let first = open_session_result_frame(&state, &ledger, &session_id, "open-gs-1").await;
-    assert!(first["result"]["goal_state"].is_null());
+    assert!(first["result"]["goal_state"]["goal"].is_null());
 
     default_agent_orchestrator()
         .set_goal(GoalSetRequest {
@@ -34133,7 +34160,7 @@ async fn session_open_goal_state_response_null_again_after_out_of_band_clear() {
         .expect("bind goal");
     let second = open_session_result_frame(&state, &ledger, &session_id, "open-gs-2").await;
     assert_eq!(
-        second["result"]["goal_state"]["objective"],
+        second["result"]["goal_state"]["goal"]["objective"],
         json!("cleared while you were away")
     );
 
@@ -34147,9 +34174,176 @@ async fn session_open_goal_state_response_null_again_after_out_of_band_clear() {
         .expect("clear goal out of band");
     let third = open_session_result_frame(&state, &ledger, &session_id, "open-gs-3").await;
     assert!(
-        third["result"]["goal_state"].is_null(),
+        third["result"]["goal_state"]["goal"].is_null(),
         "a goal cleared elsewhere must not survive the reopen: {:?}",
         third["result"]["goal_state"]
+    );
+}
+
+/// #2062 round 8, test (a) — the snapshot's version and state are captured
+/// under ONE state-lock acquisition and cannot disagree: after a repaint
+/// frame at generation G, the response's version is >= G with matching
+/// state; after an OUT-OF-BAND clear at generation G' (never admitted
+/// through the send guard — nothing enqueued anywhere), the reopen's
+/// version is >= G' with `goal: null`. The clear leg is what pins the
+/// version SOURCE: allocation-time bookkeeping (the state-lock
+/// `goal_scope_versions`), not the send guard's admission watermark — a
+/// version sourced from admission bookkeeping (a separate lock, a separate
+/// notion of "happened") would sit below G' and let the pre-clear frame
+/// beat the null under the client rule.
+#[tokio::test]
+async fn session_open_goal_state_response_version_consistent_with_state() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-state-version-consistency".into());
+    let orchestrator = default_agent_orchestrator();
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "versioned goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal");
+    let repaint_json = orchestrator
+        .session_goal_updated_event_json(&session_id, MAIN_PROFILE_ID)
+        .expect("repaint for the live goal");
+    let repaint_generation = repaint_json["generation"].as_u64().expect("generation");
+
+    let bound = open_session_result_frame(&state, &ledger, &session_id, "open-gs-vc1").await;
+    let bound_version = bound["result"]["goal_state"]["version"]
+        .as_u64()
+        .expect("version");
+    assert!(
+        bound_version >= repaint_generation,
+        "the snapshot's version covers the latest frame's generation \
+         ({bound_version} vs {repaint_generation})"
+    );
+    assert_eq!(
+        bound["result"]["goal_state"]["goal"]["objective"],
+        json!("versioned goal"),
+        "version and state travel together: {:?}",
+        bound["result"]["goal_state"]
+    );
+
+    // OUT-OF-BAND clear: allocates a generation but never admits/enqueues
+    // a frame anywhere.
+    let clear_result = orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("clear goal out of band");
+    let clear_generation = clear_result["generation"].as_u64().expect("generation");
+
+    let cleared = open_session_result_frame(&state, &ledger, &session_id, "open-gs-vc2").await;
+    let cleared_version = cleared["result"]["goal_state"]["version"]
+        .as_u64()
+        .expect("version");
+    assert!(
+        cleared["result"]["goal_state"]["goal"].is_null(),
+        "cleared out of band => goal: null: {:?}",
+        cleared["result"]["goal_state"]
+    );
+    assert!(
+        cleared_version >= clear_generation,
+        "the null is versioned AT the clear's allocation ({cleared_version} vs \
+         {clear_generation}) — a stale pre-clear frame can never beat it"
+    );
+}
+
+/// #2062 round 8, test (b) — order independence: a repaint at a HIGHER
+/// version arriving before OR after the response resolves to the same
+/// final state under the documented client rule (apply iff version >= last
+/// applied). Asserted at the protocol level with real versioned artifacts:
+/// the response from a real open, the frame from the real builder.
+#[tokio::test]
+async fn session_open_goal_state_version_resolves_order_both_ways() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-state-order-both-ways".into());
+    let orchestrator = default_agent_orchestrator();
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "snapshot state".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind goal");
+
+    let frame = open_session_result_frame(&state, &ledger, &session_id, "open-gs-order").await;
+    let response_version = frame["result"]["goal_state"]["version"]
+        .as_u64()
+        .expect("version");
+    let response_goal = frame["result"]["goal_state"]["goal"].clone();
+
+    // A NEWER frame, built after the response (real builder, real
+    // generation — strictly greater than the response's version).
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "newer frame state".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("newer mutation");
+    let newer_json = orchestrator
+        .session_goal_updated_event_json(&session_id, MAIN_PROFILE_ID)
+        .expect("newer repaint");
+    let newer_generation = newer_json["generation"].as_u64().expect("generation");
+    let newer_goal = newer_json["goal"].clone();
+    assert!(newer_generation > response_version);
+
+    orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: session_id.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("cleanup goal");
+
+    // The documented client rule: apply iff version >= last applied.
+    fn apply(last_applied: &mut Option<u64>, chip: &mut Value, version: u64, goal: &Value) {
+        let admit = match last_applied {
+            Some(last) => version >= *last,
+            None => true,
+        };
+        if admit {
+            *last_applied = Some(version);
+            *chip = goal.clone();
+        }
+    }
+    // Order 1: response first, frame second.
+    let (mut last1, mut chip1) = (None, Value::Null);
+    apply(&mut last1, &mut chip1, response_version, &response_goal);
+    apply(&mut last1, &mut chip1, newer_generation, &newer_goal);
+    // Order 2: frame first, response second (the round-7 F1 hazard order).
+    let (mut last2, mut chip2) = (None, Value::Null);
+    apply(&mut last2, &mut chip2, newer_generation, &newer_goal);
+    apply(&mut last2, &mut chip2, response_version, &response_goal);
+
+    assert_eq!(
+        chip1, chip2,
+        "both arrival orders resolve to the same final state"
+    );
+    assert_eq!(
+        chip1["objective"],
+        json!("newer frame state"),
+        "the newer state wins regardless of arrival order: {chip1:?}"
     );
 }
 
@@ -34160,12 +34354,13 @@ async fn session_open_goal_state_response_null_again_after_out_of_band_clear() {
 /// capture. Barrier: the test holds the sessions-manager lock (which the
 /// open acquires AFTER the round-6 early-capture site and BEFORE the
 /// response enqueue), mutates the goal and delivers the repaint through
-/// the real ephemeral path inside that window, then releases. Asserts
-/// both directions: the repaint frame precedes the response on the wire,
-/// the response carries the POST-repaint state, and no goal frame carrying
-/// older state follows the response.
+/// the real ephemeral path inside that window, then releases. Asserts:
+/// the repaint frame precedes the response on the wire, the response
+/// carries the POST-repaint state with a version >= the repaint frame's
+/// generation (same number space — the client rule resolves either
+/// arrival order), and no goal frame follows the response.
 #[tokio::test]
-async fn session_open_goal_state_response_fresh_at_enqueue_after_mid_open_repaint() {
+async fn session_open_goal_state_response_reflects_mid_open_mutation() {
     use crate::autonomy::agent_orchestrator::{
         AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
     };
@@ -34245,6 +34440,7 @@ async fn session_open_goal_state_response_fresh_at_enqueue_after_mid_open_repain
         .expect("repaint for the live goal");
     let repaint: octos_core::ui_protocol::SessionGoalUpdatedEvent =
         serde_json::from_value(repaint_json).expect("updated event");
+    let repaint_generation = repaint.generation;
     send_notification_ephemeral(&ws, &ledger, UiNotification::SessionGoalUpdated(repaint))
         .expect("deliver the mid-open repaint");
     drop(gate);
@@ -34269,10 +34465,19 @@ async fn session_open_goal_state_response_fresh_at_enqueue_after_mid_open_repain
     };
     assert!(saw_repaint, "the mid-open repaint precedes the response");
     assert_eq!(
-        result["result"]["goal_state"]["objective"],
+        result["result"]["goal_state"]["goal"]["objective"],
         json!("after the mid-open repaint"),
-        "the snapshot is captured at enqueue, after the repaint: {:?}",
+        "the snapshot reflects the mid-open mutation: {:?}",
         result["result"]["goal_state"]
+    );
+    assert!(
+        result["result"]["goal_state"]["version"]
+            .as_u64()
+            .expect("version")
+            >= repaint_generation,
+        "the snapshot's version covers the repaint it reflects \
+         ({:?} vs frame generation {repaint_generation})",
+        result["result"]["goal_state"]["version"]
     );
     // No goal frame carrying older state may follow the response.
     let quiet = tokio::time::Duration::from_millis(400);
@@ -34382,9 +34587,9 @@ async fn session_open_goal_state_response_pinned_across_mid_open_scope_flip() {
     let _ = orchestrator.set_goal_scope(&wire, None);
 
     assert_eq!(
-        result["result"]["goal_state"]["objective"],
+        result["result"]["goal_state"]["goal"]["objective"],
         json!("folder A's live goal"),
-        "the enqueue-time snapshot must use the OPEN-pinned key (folder A), \
+        "the snapshot must use the OPEN-pinned key (folder A), \
          not the flipped cwd map (folder B): {:?}",
         result["result"]["goal_state"]
     );

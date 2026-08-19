@@ -4631,18 +4631,38 @@ pub struct SessionOpened {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenResult {
     pub opened: SessionOpened,
-    /// #2062 — the session's goal state for the opener's resolved (pinned
-    /// cwd scope, profile), carried IN the open response: either the goal
-    /// object (same shape as `SessionGoalUpdated`'s `goal` field) or
-    /// EXPLICIT `null` meaning "no goal bound" — `null` is a statement,
-    /// not an omission, so new servers ALWAYS serialize this field.
+    /// #2062 — the session's VERSIONED goal snapshot for the opener's
+    /// resolved (pinned cwd scope, profile), carried IN the open response:
+    ///
+    /// ```json
+    /// "goal_state": { "version": 42, "goal": { ...goal object... } }
+    /// "goal_state": { "version": 42, "goal": null }
+    /// ```
+    ///
+    /// `goal` is the same shape as `SessionGoalUpdated`'s `goal` field, or
+    /// `null` meaning "no goal bound" — a statement, not an omission, so
+    /// new servers ALWAYS serialize this field. `version` is the goal
+    /// scope's latest #1959 generation — the SAME monotonic number space
+    /// stamped as `generation` on `SessionGoalUpdated` /
+    /// `SessionGoalCleared` frames — captured together with the state
+    /// under one server-side lock acquisition, so the pair is internally
+    /// consistent.
+    ///
+    /// CLIENT RULE (the wire contract, written down once): apply a goal
+    /// state — this snapshot or any goal frame — only if its
+    /// version/`generation` is `>=` the last version applied for the
+    /// session's chip; drop older. Both the snapshot and every frame carry
+    /// versions, so arrival order never matters: a stale snapshot cannot
+    /// overwrite a fresher frame, and a stale frame cannot overwrite the
+    /// snapshot. Versions are comparable only WITHIN one connection to one
+    /// server process (the generation counter is process-local): on a new
+    /// connection the client clears its last-applied tracking and this
+    /// snapshot re-establishes it. Legacy `generation: 0` frames (pre-#1959
+    /// producers) apply unconditionally, as before.
     ///
     /// Compatibility needs no capability negotiation: an old client
     /// ignores the unknown field; a new client treats an ABSENT field as
-    /// "old server, no snapshot" (legacy no-op) and `null`/object as
-    /// authoritative. The response's fixed position in the client's own
-    /// processing order is what makes the snapshot race-free — see
-    /// `session_open_goal_state` on the server for the full argument.
+    /// "old server, no snapshot" (legacy no-op).
     #[serde(default)]
     pub goal_state: Value,
 }
@@ -4655,8 +4675,9 @@ impl SessionOpenResult {
         }
     }
 
-    /// Attach the #2062 open-response goal snapshot (goal object, or
-    /// `Value::Null` for "no goal bound").
+    /// Attach the #2062 open-response goal snapshot: the versioned
+    /// `{ "version": u64, "goal": object|null }` object (see the field
+    /// doc for the client-side contract).
     pub fn with_goal_state(mut self, goal_state: Value) -> Self {
         self.goal_state = goal_state;
         self

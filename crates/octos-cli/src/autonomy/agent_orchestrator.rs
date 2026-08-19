@@ -4307,38 +4307,37 @@ impl InProcessAgentOrchestrator {
         }))
     }
 
-    /// #2062 round 6 — the goal snapshot carried IN the `session/open`
-    /// RESPONSE (the codex-CLI design: its ThreadGoal null snapshot rides
-    /// adjacent to the thread-resume response, ordered by the response
-    /// channel). Returns the goal object (same shape as
-    /// `SessionGoalUpdated`'s `goal` field) when a goal is bound under the
-    /// caller's open-registration-PINNED scoped key AND the open's resolved
-    /// profile; EXPLICIT `Value::Null` otherwise — "no goal", "cleared
-    /// while you were away", and "never existed" are one statement.
+    /// #2062 rounds 6–8 — the VERSIONED goal snapshot carried IN the
+    /// `session/open` RESPONSE: `{ "version": u64, "goal": object|null }`.
+    /// `goal` is the goal object (same shape as `SessionGoalUpdated`'s
+    /// `goal` field) when one is bound under the caller's
+    /// open-registration-PINNED scoped key AND the open's resolved profile,
+    /// else `null` — "no goal", "cleared while you were away", and "never
+    /// existed" are one statement. `version` is the scope's LATEST #1959
+    /// generation (`goal_scope_versions`, recorded atomically with every
+    /// allocation) — the SAME number space stamped on outgoing
+    /// `SessionGoalUpdated`/`SessionGoalCleared` frames, so the client can
+    /// compare snapshot and frames apples-to-apples.
     ///
-    /// WHY THIS IS SOUND where five rounds of ordered-notification delivery
-    /// were not: the response occupies a FIXED position in the client's own
-    /// processing order — the client applies this snapshot while handling
-    /// the open result, BEFORE it processes any subsequently delivered
-    /// frame, and every later goal frame (update or cleared, from ANY
-    /// connection or path) is by definition newer and simply overwrites it.
-    /// There is no race to win, no supersession to detect, and no delivery
-    /// to guarantee beyond the RPC result itself (whose failure fails the
-    /// whole open — already handled). Same-connection ordering is the read
-    /// loops' inline-await dispatch. A snapshot carried this way needs no
-    /// generation, no watermark, and no enqueue — it is a plain
-    /// profile-filtered read under the goal-state lock, and it never
-    /// participates in the #1959 generation space (the round-5 design fell
-    /// to exactly that: nulls consuming generations suppressed each other
-    /// across connections).
+    /// WHY VERSIONING, not wire ordering (codex round-7 F1 terminated the
+    /// ordering family): producers release the #1959 guard and enqueue
+    /// LATER, after ledger/filter/serialization work — admission order can
+    /// never establish enqueue order, so NO server-side scheme (five
+    /// notification rounds, response position, capture-at-enqueue) can make
+    /// wire order carry freshness without holding a lock across a blocking
+    /// stdio send, which stalls every goal producer. So the wire stops
+    /// carrying order: the DATA carries it. State and version are read
+    /// under ONE state-lock acquisition (the pair cannot disagree), the
+    /// response is enqueued wherever convenient, and the client resolves
+    /// any arrival order by version — see `SessionOpenResult::goal_state`
+    /// in octos-core for the client-side contract.
     ///
     /// Profile filtering is the leak gate: a goal bound under a DIFFERENT
-    /// profile than this open resolves reads as `null` — the snapshot
+    /// profile than this open resolves reads as `goal: null` — the snapshot
     /// carries objective text, and it goes only to THIS connection, whose
-    /// own `goal/get` equally reports "none". (The round-1 "blank a live
-    /// chip" hazard was a broadcast-channel artifact: this snapshot reaches
-    /// only the connection that opened, so its null describes exactly that
-    /// connection's own view.)
+    /// own `goal/get` equally reports "none". (The version still reflects
+    /// the scope's latest allocation: the null is versioned exactly like a
+    /// cleared state, so a stale pre-clear frame can never beat it.)
     ///
     /// The pinned key is the one [`Self::set_goal_scope`] RETURNS from
     /// inside its own lock at open-registration (codex round-3 W5) — never
@@ -4349,15 +4348,25 @@ impl InProcessAgentOrchestrator {
         pinned_goal_key: &SessionKey,
         profile_id: &str,
     ) -> Value {
+        // ONE lock acquisition for BOTH reads: the (version, state) pair is
+        // internally consistent by construction — a producer cannot
+        // interleave between them (every mutation + its version allocation
+        // happen under this same lock).
         let state = self.state();
-        match state
+        let version = state
+            .goal_scope_versions
+            .get(pinned_goal_key)
+            .copied()
+            .unwrap_or(0);
+        let goal = match state
             .goals
             .get(pinned_goal_key)
             .filter(|goal| goal.profile_id == profile_id)
         {
             Some(goal) => autonomy_goal_json(goal),
             None => Value::Null,
-        }
+        };
+        json!({ "version": version, "goal": goal })
     }
 
     /// codex #2065 round-4 S3 — the SCOPED goal-store key event
@@ -4369,9 +4378,10 @@ impl InProcessAgentOrchestrator {
     /// wire session id keep independently monotonic guard streams: scope
     /// A's clear can no longer falsely drop scope B's
     /// later-delivered-but-earlier-built live repaint at the send guard.
-    /// (Round 6 note: the open-response goal snapshot does NOT participate
-    /// in this generation space at all — the registry serves the four
-    /// remaining REAL producers: set, clear, token-charge, turn repaint.)
+    /// (Round 8 note: the open-response goal snapshot never ALLOCATES in
+    /// this generation space — the four real producers do: set, clear,
+    /// token-charge, turn repaint. The snapshot only READS the scope's
+    /// latest allocation as its `version`, via `goal_scope_versions`.)
     pub(crate) fn goal_event_watermark_key(&self, generation: u64) -> Option<SessionKey> {
         if generation == 0 {
             return None;
@@ -9989,12 +9999,26 @@ struct AutonomyRuntimeState {
     /// event was built from, registered atomically with the allocation (same
     /// state lock). The transport's #1959 watermark is keyed by THIS
     /// identity, not the plain wire session id: two cwd scopes can share a
-    /// wire id, and wire-keyed watermarks let one folder's repaint falsely
-    /// abandon the other folder's open-time null snapshot (cross-scope
-    /// pollution). Bounded FIFO — see `next_goal_event_generation`.
+    /// wire id, and a wire-keyed watermark advanced by one scope's clear
+    /// would falsely drop the sibling scope's later-delivered live repaint
+    /// at the send guard. Bounded FIFO — see `next_goal_event_generation`.
     goal_event_scope_index: HashMap<u64, SessionKey>,
     /// FIFO eviction order for [`Self::goal_event_scope_index`].
     goal_event_scope_fifo: std::collections::VecDeque<u64>,
+    /// #2062 round 8 — SCOPED goal-store key → the LATEST #1959 generation
+    /// allocated for that scope, recorded atomically with the allocation
+    /// (same state lock). This is the VERSION the `session/open` response's
+    /// `goal_state` snapshot pairs with its state: allocation-time
+    /// bookkeeping covers out-of-band mutations that never emit a frame
+    /// (an orchestrator-direct clear still allocates), which
+    /// admission-time bookkeeping (the transport guard's watermark) does
+    /// not. Same number space as the `generation` stamped on outgoing
+    /// `SessionGoalUpdated`/`SessionGoalCleared` frames, so client-side
+    /// version comparison is apples-to-apples. Bounded like the #1959
+    /// guard map: when huge, cleared wholesale (an evicted scope reads 0 —
+    /// pre-versioning behavior for scopes idle across thousands of
+    /// allocations).
+    goal_scope_versions: HashMap<SessionKey, u64>,
     /// #991 / M15-B — per-agent cancellation handles registered by
     /// `run_native_specialist` (and future specialist runners) so that
     /// `interrupt_agent` / `close_agent` can signal a *real* abort to
@@ -12309,6 +12333,20 @@ fn next_goal_event_generation(state: &mut AutonomyRuntimeState, watermark_key: &
             state.goal_event_scope_index.remove(&evicted);
         }
     }
+    // #2062 round 8 — record this allocation as the scope's LATEST version,
+    // in the same state-lock hold, so the open-response snapshot can pair
+    // its state with the exact version it was read at (see
+    // `goal_scope_versions`). Bounded like the #1959 guard map: reset when
+    // huge rather than leak (an evicted scope reads 0 until it allocates
+    // again).
+    if state.goal_scope_versions.len() >= GOAL_EVENT_SCOPE_INDEX_CAP
+        && !state.goal_scope_versions.contains_key(watermark_key)
+    {
+        state.goal_scope_versions.clear();
+    }
+    state
+        .goal_scope_versions
+        .insert(watermark_key.clone(), generation);
     generation
 }
 

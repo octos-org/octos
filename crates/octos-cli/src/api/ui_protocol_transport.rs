@@ -16973,8 +16973,6 @@ async fn handle_session_open(
     if session_ingress {
         filter_capabilities_for_session_ingress(&mut outcome.result.opened.capabilities);
     }
-    let pinned_goal_key = outcome.pinned_goal_key.clone();
-    let goal_profile_id = outcome.goal_profile_id.clone();
     let result = match serde_json::to_value(outcome.result) {
         Ok(result) => result,
         Err(error) => {
@@ -16990,19 +16988,10 @@ async fn handle_session_open(
     };
     // session/open reply is the lifecycle frame that the client blocks on;
     // if it fails the connection is doomed for this command. The #2062
-    // `goal_state` snapshot is captured AT this enqueue (codex
-    // R6-OPEN-SNAPSHOT-ORDER) — see the sender for the two-direction
-    // total-order argument.
-    if send_open_result_with_goal_state_at_enqueue(
-        ws,
-        id,
-        result,
-        &pinned_goal_key,
-        goal_profile_id.as_deref(),
-    )
-    .await
-    .is_err()
-    {
+    // `goal_state` snapshot rides in it, VERSIONED (round 8): its arrival
+    // position needs no guarantee — the client resolves order by version
+    // (see `SessionOpenResult::goal_state`).
+    if send_rpc_result(ws, id, result).is_err() {
         return false;
     }
     // Replay frames are durable: drops surface as `protocol/replay_lossy`
@@ -17820,16 +17809,6 @@ struct SessionOpenOutcome {
     /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
     replay_baseline_seq: u64,
     profile_id: String,
-    /// #2062 round 7 — THIS open's goal-store identity, pinned at
-    /// open-registration (the key `set_goal_scope` returns from inside its
-    /// own lock; legacy fallback: one map read). The response's
-    /// `goal_state` is captured against THIS key at enqueue time by
-    /// `send_open_result_with_goal_state_at_enqueue`.
-    pinned_goal_key: SessionKey,
-    /// The open's resolved goal profile (same resolver as the goal RPC
-    /// surface); `None` (resolution error, effectively unreachable) keeps
-    /// the snapshot at `null`.
-    goal_profile_id: Option<String>,
 }
 
 // Threading both the approval store and the (UPCR-2026-023) question store
@@ -18046,19 +18025,12 @@ async fn open_session_result(
     // wire-id fallthrough unless an earlier profiled open scoped this wire).
     let pinned_goal_key = pinned_goal_key
         .unwrap_or_else(|| default_agent_orchestrator().scoped_goal_key(&params.session_id));
-    // #2062 rounds 6–7 — the goal snapshot rides IN this open's RPC
-    // response, but it is CAPTURED AT ENQUEUE, not here (codex
-    // R6-OPEN-SNAPSHOT-ORDER: several awaits separate this point from the
-    // response enqueue, and an already-spawned turn's repaint landing in
-    // that window would make an early-captured snapshot overwrite the
-    // fresher frame backwards on the client). Only the PROFILE RESOLUTION
-    // is captured here, where `params` lives — the SAME resolution the
-    // goal RPC surface uses; a resolution error resolves to `None` and the
-    // snapshot stays `null` (never leak, never fabricate; the open already
-    // passed `validate_session_scope`, so the error arm is effectively
-    // unreachable). The snapshot itself is computed by
-    // `send_open_result_with_goal_state_at_enqueue` against the pinned key
-    // above at the moment the response joins the writer queue.
+    // #2062 round 8 — the goal snapshot's PROFILE resolution, captured here
+    // where `params` lives: the SAME resolution the goal RPC surface uses.
+    // A resolution error resolves to `None` and the snapshot's `goal` stays
+    // `null` (never leak, never fabricate; the open already passed
+    // `validate_session_scope`, so the error arm is effectively
+    // unreachable).
     let goal_profile_id = resolve_autonomy_profile_id(
         Some(&params.session_id),
         params.profile_id.as_deref(),
@@ -18080,6 +18052,23 @@ async fn open_session_result(
         let data_dir = sessions.data_dir();
         let session = sessions.get_or_create(&params.session_id).await;
         (data_dir, session.messages.clone())
+    };
+    // #2062 round 8 — capture the VERSIONED snapshot (state + the scope's
+    // latest #1959 generation, read under ONE state-lock acquisition so the
+    // pair cannot disagree). Its position in this function no longer
+    // matters for correctness: the version is what lets the client resolve
+    // any arrival order (codex round-7 F1 showed wire order can never carry
+    // freshness — producers release the guard and enqueue later, so
+    // admission order cannot establish enqueue order; the round-7
+    // capture-at-enqueue loop and its stale-shipping bound are deleted).
+    // It sits after the sessions-lock block only so the mid-open tests can
+    // barrier on that lock and pin the pinned-key/versioning behavior at
+    // the production callsite.
+    let goal_state = match goal_profile_id.as_deref() {
+        Some(profile_id) => {
+            default_agent_orchestrator().session_open_goal_state(&pinned_goal_key, profile_id)
+        }
+        None => json!({ "version": 0, "goal": Value::Null }),
     };
     let (context, context_state, open_compaction_events) = appui_context_open_snapshot(
         &data_dir,
@@ -18197,15 +18186,13 @@ async fn open_session_result(
         unreachable!("session/open ledger append returns session/open notification");
     };
     Ok(SessionOpenOutcome {
-        result: SessionOpenResult::new(opened),
+        result: SessionOpenResult::new(opened).with_goal_state(goal_state),
         replay,
         pending_approvals,
         pending_questions,
         opened_event,
         replay_baseline_seq,
         profile_id: ledger_profile_id,
-        pinned_goal_key,
-        goal_profile_id,
     })
 }
 
@@ -36718,168 +36705,6 @@ fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), S
     match frame_for(&RpcResponse::success(id.clone(), result)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, Some(id)),
-    }
-}
-
-/// #2062 round 7 (codex R6-OPEN-SNAPSHOT-ORDER) — enqueue the
-/// `session/open` RPC result with its `goal_state` snapshot captured AT
-/// ENQUEUE, not at the round-6 early site several awaits upstream (where an
-/// already-spawned turn's goal repaint could land in the window and the
-/// stale unversioned response would then overwrite the fresher frame
-/// backwards on the client). Response position alone is not snapshot
-/// freshness — the capture must join the writer queue at its build
-/// position.
-///
-/// Per attempt: read the pinned scope's #1959 watermark (guard lock,
-/// released) → snapshot the goal state (orchestrator state lock, released)
-/// → build the frame → under ONE guard-lock acquisition, re-read the
-/// watermark and, if unmoved, `try_enqueue` in-section. Watermark-first
-/// ordering is deliberate: a producer landing between the watermark read
-/// and the snapshot moves the watermark while its mutation is already IN
-/// the snapshot, so the recheck retries with an already-fresh capture —
-/// conservative, never stale.
-///
-/// The two-direction total-order argument (replacing round 6's
-/// fixed-position claim): every goal producer records its generation under
-/// the guard lock BEFORE enqueueing, so a live goal frame either
-/// (a) admitted before this in-section enqueue — the watermark moved, this
-/// loop recaptures, and the response carries state ≥ that frame (client
-/// order frame → response: a fresher-or-equal overwrite, correct); or
-/// (b) admits after — its own enqueue then follows this one on the FIFO
-/// per-connection writer (client order response → frame: newer overwrites,
-/// correct). Out-of-order builds among the frames themselves are already
-/// collapsed by the #1959 send guard. The response therefore slots into
-/// the LIVE total order at its build position. (Replayed HISTORICAL goal
-/// frames ride the client's cursor semantics — snapshot-vs-replay
-/// precedence is the pairing client change's domain.)
-///
-/// Why capture-then-recheck instead of holding a lock across the enqueue:
-/// the lifecycle lane's stdio enqueue is a BLOCKING `SyncSender::send`
-/// (`enqueue_durable_or_lifecycle`), and holding the orchestrator state
-/// lock or the guard lock across a blocking channel send would stall every
-/// goal producer process-wide behind one slow stdio consumer.
-/// `try_enqueue` is non-blocking on both lanes, so the guard-lock section
-/// spans exactly [recheck + try_enqueue].
-///
-/// Lifecycle semantics are preserved per lane: WS backpressure/closed
-/// latch the connection failed exactly like `send_lifecycle`; a full stdio
-/// queue parks cooperatively (the stdio lifecycle lane never drops) and
-/// each retry re-verifies freshness. The recapture loop is bounded: after
-/// `MAX_GOAL_STATE_RECAPTURES` consecutive stale detections (a sustained
-/// same-scope goal-frame storm inside microsecond windows — unreachable in
-/// practice, goal frames are RPC/turn-scale), the freshest capture is
-/// enqueued anyway and the residual at-most-one-frame staleness is logged.
-async fn send_open_result_with_goal_state_at_enqueue(
-    ws: &WsConnection,
-    id: String,
-    mut result: Value,
-    pinned_goal_key: &SessionKey,
-    goal_profile_id: Option<&str>,
-) -> Result<(), SendError> {
-    const MAX_GOAL_STATE_RECAPTURES: u32 = 16;
-    const STDIO_CAPACITY_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(15);
-    enum EnqueueOutcome {
-        Sent,
-        Stale,
-        Full,
-        Failed(SendError),
-    }
-    let mut recaptures: u32 = 0;
-    loop {
-        let expected_watermark = {
-            let watermarks = goal_event_guard_map()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            watermarks
-                .get(pinned_goal_key.0.as_str())
-                .copied()
-                .unwrap_or(0)
-        };
-        let goal_state = match goal_profile_id {
-            Some(profile_id) => {
-                default_agent_orchestrator().session_open_goal_state(pinned_goal_key, profile_id)
-            }
-            None => Value::Null,
-        };
-        result["goal_state"] = goal_state;
-        let Some(frame) = frame_for(&RpcResponse::success(id.clone(), result.clone())) else {
-            // Oversized result: same fallback as `send_rpc_result`.
-            return send_minimal_rpc_error_fallback(ws, Some(id));
-        };
-        let outcome = {
-            let watermarks = goal_event_guard_map()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let current = watermarks
-                .get(pinned_goal_key.0.as_str())
-                .copied()
-                .unwrap_or(0);
-            if current != expected_watermark && recaptures < MAX_GOAL_STATE_RECAPTURES {
-                EnqueueOutcome::Stale
-            } else {
-                if current != expected_watermark {
-                    tracing::debug!(
-                        target: "octos::ui_protocol::ws",
-                        session = %pinned_goal_key.0,
-                        recaptures,
-                        "goal_state recapture bound hit; enqueueing the freshest capture"
-                    );
-                }
-                match ws.try_enqueue(frame) {
-                    Ok(()) => EnqueueOutcome::Sent,
-                    Err(SendError::BackpressureDrop) => EnqueueOutcome::Full,
-                    Err(error) => EnqueueOutcome::Failed(error),
-                }
-            }
-        };
-        match outcome {
-            EnqueueOutcome::Sent => return Ok(()),
-            EnqueueOutcome::Stale => {
-                recaptures += 1;
-                continue;
-            }
-            EnqueueOutcome::Full => {
-                if ws.stdio_writer.is_some() {
-                    // The stdio lifecycle lane never drops: park
-                    // cooperatively and retry — the retry re-verifies
-                    // freshness before enqueueing.
-                    tokio::time::sleep(STDIO_CAPACITY_PROBE_WINDOW).await;
-                    continue;
-                }
-                // WS lifecycle backpressure is a connection failure —
-                // mirror `send_lifecycle`'s arm (#922.2).
-                metrics::counter!("ws.send.error.lifecycle").increment(1);
-                tracing::warn!(
-                    target: "octos::ui_protocol::ws",
-                    reason = "backpressure",
-                    "lifecycle ws send failed; aborting connection"
-                );
-                ws.mark_failed();
-                return Err(SendError::LifecycleFailure(
-                    "writer channel full for lifecycle frame".into(),
-                ));
-            }
-            EnqueueOutcome::Failed(SendError::Closed) => {
-                metrics::counter!("ws.send.error.lifecycle").increment(1);
-                tracing::warn!(
-                    target: "octos::ui_protocol::ws",
-                    reason = "closed",
-                    "lifecycle ws send failed; aborting connection"
-                );
-                ws.mark_failed();
-                return Err(SendError::LifecycleFailure(
-                    "writer channel closed for lifecycle frame".into(),
-                ));
-            }
-            EnqueueOutcome::Failed(SendError::FatalClosed) => {
-                // #924 BLOCK 2: a prior lifecycle send already latched the
-                // connection failed; surface the lifecycle-shape error.
-                return Err(SendError::LifecycleFailure(
-                    "connection already latched as failed".into(),
-                ));
-            }
-            EnqueueOutcome::Failed(error) => return Err(error),
-        }
     }
 }
 
