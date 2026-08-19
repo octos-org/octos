@@ -32,8 +32,10 @@ pub struct ToolPolicy {
     /// Tools, groups, or wildcards to deny. Always wins over allow.
     #[serde(default)]
     pub deny: Vec<String>,
-    /// Required tags: only tools matching at least one tag are visible.
-    /// Empty = no tag filtering. Composable with allow/deny (deny still wins).
+    /// Required tags: only tools declaring at least one matching tag are
+    /// visible. Empty = no tag filtering. Composable with allow/deny (deny
+    /// still wins). Untagged tools FAIL a non-empty filter (fail closed) —
+    /// see [`ToolPolicy::is_allowed_with_tags`].
     #[serde(default)]
     pub require_tags: Vec<String>,
 }
@@ -90,7 +92,14 @@ impl ToolPolicy {
 
     /// Check if a tool is permitted by both name policy and tag requirements.
     /// When `require_tags` is non-empty, the tool must have at least one matching tag.
-    /// Tools with no tags always pass the tag check (they are universal).
+    ///
+    /// SECURITY / BEHAVIOR CHANGE (peer-review fix): untagged tools FAIL a
+    /// non-empty `require_tags` gate. The previous rule ("tools with no tags
+    /// are universal") made the gate fail open on exactly the inputs least
+    /// likely to be audited — plugin/skill binaries, MCP server tools, and
+    /// newly added builtins all default to `tags() == &[]`, so a profile
+    /// confined to `require_tags: [..]` silently exposed all of them. Any
+    /// tool that should pass a tag filter must now declare a matching tag.
     pub fn is_allowed_with_tags(&self, tool_name: &str, tool_tags: &[&str]) -> bool {
         if !self.is_allowed(tool_name) {
             return false;
@@ -101,12 +110,8 @@ impl ToolPolicy {
             return true;
         }
 
-        // Tools with no tags are universal (pass any filter)
-        if tool_tags.is_empty() {
-            return true;
-        }
-
-        // Tool must have at least one matching required tag
+        // Tool must have at least one matching required tag. An empty
+        // `tool_tags` therefore never matches — fail closed, per above.
         tool_tags
             .iter()
             .any(|tag| self.require_tags.iter().any(|req| req == tag))
@@ -434,8 +439,10 @@ mod tests {
         assert!(policy.is_allowed_with_tags("shell", &["runtime", "code"]));
         // Tool without matching tag fails
         assert!(!policy.is_allowed_with_tags("web_search", &["web"]));
-        // Tool with no tags passes (empty tags = universal)
-        assert!(policy.is_allowed_with_tags("custom_tool", &[]));
+        // Tool with no tags fails a non-empty gate (fail closed — this
+        // assertion previously locked in the fail-open bypass; see
+        // should_fail_closed_for_untagged_tool_when_require_tags_set).
+        assert!(!policy.is_allowed_with_tags("custom_tool", &[]));
     }
 
     #[test]
@@ -456,6 +463,27 @@ mod tests {
         let policy = ToolPolicy::default();
         assert!(policy.is_allowed_with_tags("anything", &["web"]));
         assert!(policy.is_allowed_with_tags("anything", &[]));
+    }
+
+    /// SECURITY (peer-review finding: untagged-tool tag bypass): an untagged
+    /// tool must FAIL a non-empty `require_tags` gate. The old "no tags are
+    /// universal" rule made the confinement gate fail open on exactly the
+    /// inputs least likely to be audited — every plugin/skill binary, every
+    /// MCP server tool, and any newly added builtin ships with `tags() ==
+    /// &[]`, so a profile confined to `require_tags: ["code"]` still exposed
+    /// all of them. This test prevents that bypass from returning.
+    #[test]
+    fn should_fail_closed_for_untagged_tool_when_require_tags_set() {
+        let policy = ToolPolicy {
+            require_tags: vec!["code".into()],
+            ..Default::default()
+        };
+        assert!(
+            !policy.is_allowed_with_tags("unaudited_plugin_tool", &[]),
+            "untagged tools must fail a non-empty require_tags gate (fail closed)"
+        );
+        // No gate at all (empty require_tags) still passes untagged tools.
+        assert!(ToolPolicy::default().is_allowed_with_tags("unaudited_plugin_tool", &[]));
     }
 
     #[test]
