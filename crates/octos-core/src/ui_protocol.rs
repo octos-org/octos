@@ -4631,11 +4631,35 @@ pub struct SessionOpened {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenResult {
     pub opened: SessionOpened,
+    /// #2062 — the session's goal state for the opener's resolved (pinned
+    /// cwd scope, profile), carried IN the open response: either the goal
+    /// object (same shape as `SessionGoalUpdated`'s `goal` field) or
+    /// EXPLICIT `null` meaning "no goal bound" — `null` is a statement,
+    /// not an omission, so new servers ALWAYS serialize this field.
+    ///
+    /// Compatibility needs no capability negotiation: an old client
+    /// ignores the unknown field; a new client treats an ABSENT field as
+    /// "old server, no snapshot" (legacy no-op) and `null`/object as
+    /// authoritative. The response's fixed position in the client's own
+    /// processing order is what makes the snapshot race-free — see
+    /// `session_open_goal_state` on the server for the full argument.
+    #[serde(default)]
+    pub goal_state: Value,
 }
 
 impl SessionOpenResult {
     pub fn new(opened: SessionOpened) -> Self {
-        Self { opened }
+        Self {
+            opened,
+            goal_state: Value::Null,
+        }
+    }
+
+    /// Attach the #2062 open-response goal snapshot (goal object, or
+    /// `Value::Null` for "no goal bound").
+    pub fn with_goal_state(mut self, goal_state: Value) -> Self {
+        self.goal_state = goal_state;
+        self
     }
 }
 

@@ -4307,75 +4307,57 @@ impl InProcessAgentOrchestrator {
         }))
     }
 
-    /// #2062 — `SessionGoalCleared`-shaped NULL snapshot for the session
-    /// (re)open path: `Some(event JSON)` when NO goal record exists for
-    /// `session_id`'s goal-store key, `None` when one IS bound (the positive
-    /// chip state is owned by the durable replay + live update pushes,
-    /// untouched here). Silence is not a goal state: without this, a client
-    /// that cached a chip and reconnects after the goal was cleared
-    /// elsewhere (a second connection, another process on the same data
-    /// dir, or a serve restart that rebuilt the ledger) keeps rendering it.
-    /// "Removed", "never existed", and "removed while you were away" must
-    /// be ONE message — the same payload shape as the explicit
-    /// `session/goal/clear` result (`cleared: true` is what the client's
-    /// single null-the-chip reducer keys on).
+    /// #2062 round 6 — the goal snapshot carried IN the `session/open`
+    /// RESPONSE (the codex-CLI design: its ThreadGoal null snapshot rides
+    /// adjacent to the thread-resume response, ordered by the response
+    /// channel). Returns the goal object (same shape as
+    /// `SessionGoalUpdated`'s `goal` field) when a goal is bound under the
+    /// caller's open-registration-PINNED scoped key AND the open's resolved
+    /// profile; EXPLICIT `Value::Null` otherwise — "no goal", "cleared
+    /// while you were away", and "never existed" are one statement.
     ///
-    /// Suppression is existence-under-ANY-profile, deliberately NOT a
-    /// profile match (codex #2065 H1): goal RPCs can bind under a
-    /// caller-REQUESTED profile while `session/open` resolves the
-    /// connection/auth profile (a bare open resolves `_main`), and the
-    /// client's chip — and its cleared reducer — are SESSION-keyed with no
-    /// profile check. A profile-mismatched "absent" verdict here would
-    /// therefore blank a LIVE chip. The server-side null must be at least
-    /// as conservative as the client-side clearing it triggers. Likewise
-    /// ANY stored status suppresses (a `budget_limited`/`paused` goal is
-    /// frozen for scheduling, not for display).
+    /// WHY THIS IS SOUND where five rounds of ordered-notification delivery
+    /// were not: the response occupies a FIXED position in the client's own
+    /// processing order — the client applies this snapshot while handling
+    /// the open result, BEFORE it processes any subsequently delivered
+    /// frame, and every later goal frame (update or cleared, from ANY
+    /// connection or path) is by definition newer and simply overwrites it.
+    /// There is no race to win, no supersession to detect, and no delivery
+    /// to guarantee beyond the RPC result itself (whose failure fails the
+    /// whole open — already handled). Same-connection ordering is the read
+    /// loops' inline-await dispatch. A snapshot carried this way needs no
+    /// generation, no watermark, and no enqueue — it is a plain
+    /// profile-filtered read under the goal-state lock, and it never
+    /// participates in the #1959 generation space (the round-5 design fell
+    /// to exactly that: nulls consuming generations suppressed each other
+    /// across connections).
     ///
-    /// Emit-only: no goal state is read-modified. The #1959 generation
-    /// bump is process-local bookkeeping with two jobs: (a) recorded as the
-    /// session watermark by `goal_event_passes_generation_guard`, it drops
-    /// an in-process stale update racing an out-of-band clear at that
-    /// update's OWN send site, and (b) the emit site re-reads the watermark
-    /// once more, admission-adjacent under the guard's own lock, and
-    /// ABANDONS this null if any newer goal frame was admitted since it was
-    /// built (superseded-abandon — the null is a snapshot, not a command).
-    /// It is NOT an ordering guarantee: the counter is default-only runtime
-    /// state and resets across restarts, so the caller must order the null
-    /// POSITIONALLY — synchronously in the open sequence, after the replay
-    /// loop and the live-broadcast backlog drain (see
-    /// `drain_open_backlog_then_emit_goal_null`).
+    /// Profile filtering is the leak gate: a goal bound under a DIFFERENT
+    /// profile than this open resolves reads as `null` — the snapshot
+    /// carries objective text, and it goes only to THIS connection, whose
+    /// own `goal/get` equally reports "none". (The round-1 "blank a live
+    /// chip" hazard was a broadcast-channel artifact: this snapshot reaches
+    /// only the connection that opened, so its null describes exactly that
+    /// connection's own view.)
     ///
-    /// codex #2065 round-2 Z1 + round-3 W5 — takes the goal-store key the
-    /// caller PINNED at open-registration time: the key
-    /// [`Self::set_goal_scope`] RETURNS from inside its own lock, so
-    /// registration and capture are one acquisition and a concurrent
-    /// same-wire/different-cwd `session/open` can never flip the
-    /// last-writer-wins map between them. Re-resolving here (or capturing
-    /// via a second `scoped_goal_key` read) would let suppression inspect
-    /// the OTHER folder's key and emit a spurious cleared for this folder's
-    /// live chip. Same discipline as the turn path's turn-pinned scoped
-    /// key. The wire id the client keys the chip by is recovered via
-    /// [`wire_key_from_goal_key`] (a pinned key is the wire id itself, or
-    /// wire id + `\u{0}~cwd-` suffix).
-    pub(crate) fn session_goal_hydrate_cleared_event_json(
+    /// The pinned key is the one [`Self::set_goal_scope`] RETURNS from
+    /// inside its own lock at open-registration (codex round-3 W5) — never
+    /// a later re-resolution of the last-writer-wins cwd map, which a
+    /// concurrent same-wire/different-cwd open can flip.
+    pub(crate) fn session_open_goal_state(
         &self,
         pinned_goal_key: &SessionKey,
         profile_id: &str,
-    ) -> Option<Value> {
-        let mut state = self.state();
-        if state.goals.contains_key(pinned_goal_key) {
-            return None;
+    ) -> Value {
+        let state = self.state();
+        match state
+            .goals
+            .get(pinned_goal_key)
+            .filter(|goal| goal.profile_id == profile_id)
+        {
+            Some(goal) => autonomy_goal_json(goal),
+            None => Value::Null,
         }
-        // S3: watermark identity = the pinned scoped key this null describes.
-        let generation = next_goal_event_generation(&mut state, pinned_goal_key);
-        Some(json!({
-            "session_id": wire_key_from_goal_key(pinned_goal_key),
-            "profile_id": profile_id,
-            "cleared": true,
-            "goal": Value::Null,
-            "generation": generation,
-            "transition_actor": "backend",
-        }))
     }
 
     /// codex #2065 round-4 S3 — the SCOPED goal-store key event
@@ -4384,8 +4366,12 @@ impl InProcessAgentOrchestrator {
     /// its map by this identity (falling back to the plain wire session id
     /// for unstamped/unregistered generations — legacy events, hand-built
     /// test frames, FIFO-evicted entries), so two cwd scopes sharing one
-    /// wire session id keep independent watermarks: scope B's repaint can
-    /// no longer falsely supersede scope A's open-time null snapshot.
+    /// wire session id keep independently monotonic guard streams: scope
+    /// A's clear can no longer falsely drop scope B's
+    /// later-delivered-but-earlier-built live repaint at the send guard.
+    /// (Round 6 note: the open-response goal snapshot does NOT participate
+    /// in this generation space at all — the registry serves the four
+    /// remaining REAL producers: set, clear, token-charge, turn repaint.)
     pub(crate) fn goal_event_watermark_key(&self, generation: u64) -> Option<SessionKey> {
         if generation == 0 {
             return None;
