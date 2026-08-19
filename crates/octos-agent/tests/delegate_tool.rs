@@ -297,25 +297,27 @@ async fn should_apply_group_delegated_deny_list_to_child() {
     assert!(policy.deny.contains(&DELEGATED_DENY_GROUP.to_string()));
     assert!(!policy.is_allowed("delegate_task"));
     assert!(!policy.is_allowed("spawn"));
-    assert!(!policy.is_allowed("send_message"));
     assert!(!policy.is_allowed("message"));
     assert!(!policy.is_allowed("save_memory"));
-    assert!(!policy.is_allowed("execute_code"));
-    // Explicitly allowed non-denied tools remain usable by the child.
-    assert!(policy.is_allowed("read_file"));
-    // SECURITY (peer-review fix): `shell` is in `group:delegated` — it IS
-    // the arbitrary-code-execution surface the group's contract bans — so
-    // deny-wins overrides even the explicit `allowed_tools: ["shell"]`
-    // grant above. This test previously asserted the child kept shell
-    // ("explicitly allowed non-denied tools remain usable"), which encoded
-    // the escape as expected behavior: shell was only "non-denied" because
-    // the group had drifted to a phantom `execute_code` name. A delegated
-    // child that can reach any shell alias escapes its confinement.
-    assert!(!policy.is_allowed("shell"));
-    assert!(!policy.is_allowed("bash"));
+    // RECURSION GUARD (peer-review fix): the whole spawn/delegation family
+    // is denied, not just `spawn` — otherwise a child spawns and drives its
+    // own sub-agents past the recursion guard via these entry points.
     assert!(!policy.is_allowed("spawn_agent"));
     assert!(!policy.is_allowed("send_input"));
     assert!(!policy.is_allowed("delegate"));
+    // Explicitly allowed non-denied tools remain usable by the child.
+    assert!(policy.is_allowed("read_file"));
+    // `shell` staying allowed is DELIBERATE. Delegated (and peer) agents
+    // are universal replicas of the master, as capable as it is — a child
+    // told "fix this test" must be able to run the build and the test.
+    // `group:delegated` is RECURSION AND RESOURCE control (no unbounded
+    // delegate chains, no spawn storms), NOT a confinement boundary:
+    // security cannot be guaranteed at the tool-policy layer, so it is not
+    // attempted there. Confinement is the outer sandbox's job (isolated
+    // machine / SELinux-confined account / container). Do not "harden" this
+    // into a deny — it would buy illusory security at the cost of real
+    // capability.
+    assert!(policy.is_allowed("shell"));
 }
 
 #[tokio::test]
