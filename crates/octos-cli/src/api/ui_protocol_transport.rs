@@ -818,20 +818,19 @@ impl WsConnection {
         }
     }
 
-    /// codex #2065 round-2 Z3 + round-3 W6 — await-safe durable enqueue for
-    /// the live-forwarder task. The stdio durable lane
-    /// (`enqueue_durable_or_lifecycle`) is a BLOCKING `SyncSender::send`:
-    /// correct backpressure on a blocking-capable caller, an
-    /// executor-worker stall when a full stdio queue parks an async task
-    /// (round-2 Z3) — and a round-3 W6 hazard when hopped to
-    /// `spawn_blocking`, because an in-flight blocking closure survives the
+    /// #2065 — await-safe durable enqueue for the live-forwarder task. The
+    /// stdio durable lane (`enqueue_durable_or_lifecycle`) is a BLOCKING
+    /// `SyncSender::send`: correct backpressure on a blocking-capable
+    /// caller, but an executor-worker stall when a full stdio queue parks
+    /// an async task — and hopping it to `spawn_blocking` trades that for
+    /// a worse hazard, because an in-flight blocking closure survives the
     /// task's abort and can enqueue a stale frame AFTER the lane was
     /// retired. Here the stdio lane instead parks COOPERATIVELY: a
     /// non-blocking `try_send` probe with a bounded async sleep between
     /// probes. That keeps the stdio never-drop durable semantics (the frame
     /// waits for capacity, exactly like the blocking send did), never
-    /// occupies an executor worker, and — the W6 point — is cancellable at
-    /// every await with an ATOMIC enqueue: after abort+join there is no
+    /// occupies an executor worker, and is cancellable at every await with
+    /// an ATOMIC enqueue: after abort+join there is no
     /// detached in-flight work that could still enqueue. The WS lane keeps
     /// its non-blocking `try_send`+`replay_lossy` semantics via
     /// [`Self::send_durable`], byte-identical to the sync callers.
@@ -4016,15 +4015,10 @@ fn combine_typed_prompt_with_transcript(typed_prompt: &str, transcript: &str) ->
 /// MUST be called before the flow replays the session (`session/open` calls
 /// it right after the runtime cache materializes, before
 /// `replay_after_with_head`) so replay and subsequent appends agree.
-/// Returns the goal-store key this open's registration established for the
-/// session key — handed back from INSIDE `set_goal_scope`'s own lock (codex
-/// #2065 round-3 W5), so the caller's pin and the registration are one
-/// acquisition and no concurrent same-wire open can flip the
-/// last-writer-wins map in between.
 fn register_session_ledger_scope(
     ledger: &UiProtocolLedger,
     runtime: &crate::runtime::SessionRuntime,
-) -> SessionKey {
+) {
     let scope = (runtime.sessions_root != runtime.profile.data_dir).then(|| {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -4044,8 +4038,7 @@ fn register_session_ledger_scope(
     // what makes the goal store isolate cwds exactly as the transcript already
     // does. The goal continuation dispatch strips this scope back to the wire
     // key when it reaches the session runtime / actor.
-    let pinned_goal_key =
-        default_agent_orchestrator().set_goal_scope(&runtime.session_key, scope.clone());
+    let _ = default_agent_orchestrator().set_goal_scope(&runtime.session_key, scope.clone());
     // Topic-suffixed sessions also emit ledger events under their BASE key:
     // the alpha-9 file/visual bridges deliberately strip the `#topic` before
     // appending so base-bucket subscribers see them (see
@@ -4058,7 +4051,6 @@ fn register_session_ledger_scope(
         ledger.set_session_scope(&SessionKey(base.to_owned()), scope.clone());
         let _ = default_agent_orchestrator().set_goal_scope(&SessionKey(base.to_owned()), scope);
     }
-    pinned_goal_key
 }
 
 /// Process-global event ledger.
@@ -16909,20 +16901,20 @@ async fn handle_session_open(
     let session_id_for_subscribe = params.session_id.clone();
     let live_rx = ledger.subscribe(&session_id_for_subscribe);
 
-    // codex #2065 round-3 W6.1 — retire the PREVIOUS forwarder for this
-    // session BEFORE `open_session_result` computes the replay baseline
-    // (order: subscribe new receiver → retire old lane → baseline → replay
-    // → response, carrying the #2062 `goal_state` snapshot → pump). With
-    // the old order the previous pump stayed live through the new replay
-    // window and could deliver a post-baseline event CONCURRENTLY with the
-    // replay that also carries it. abort+join fully retires the lane:
+    // #2065 — retire the PREVIOUS forwarder for this session BEFORE
+    // `open_session_result` computes the replay baseline (order: subscribe
+    // new receiver → retire old lane → baseline → replay → response →
+    // pump). With the old order the previous pump stayed live through the
+    // new replay window and could deliver a post-baseline event
+    // CONCURRENTLY with the replay that also carries it. abort+join fully
+    // retires the lane:
     // every await point in the forwarder (recv, the offloaded send's
     // capacity park) is cancellable, and an enqueue is an atomic
     // `try_send` — there is no detached in-flight segment for the join to
     // miss (see `send_durable_offloaded`).
     //
     // Delivery semantics across the handover are AT-LEAST-ONCE, not
-    // exactly-once (codex #2065 round-4 S5, tracked): a durable frame the
+    // exactly-once (#2065, tracked): a durable frame the
     // old lane already delivered may be re-delivered by this open's replay
     // (the client's `after` cursor lags what was enqueued), and the client
     // merges durable frames by id/cursor — the normal reconnect-replay
@@ -16987,10 +16979,7 @@ async fn handle_session_open(
         }
     };
     // session/open reply is the lifecycle frame that the client blocks on;
-    // if it fails the connection is doomed for this command. The #2062
-    // `goal_state` snapshot rides in it, VERSIONED (round 8): its arrival
-    // position needs no guarantee — the client resolves order by version
-    // (see `SessionOpenResult::goal_state`).
+    // if it fails the connection is doomed for this command.
     if send_rpc_result(ws, id, result).is_err() {
         return false;
     }
@@ -17075,14 +17064,6 @@ async fn handle_session_open(
             }
         }
     }
-
-    // #2062 round 6 — the goal snapshot is carried IN the `session/open`
-    // RPC RESPONSE (`SessionOpenResult::goal_state`, computed in
-    // `open_session_result` against the registration-pinned scoped key):
-    // the response's fixed position in the client's own processing order
-    // makes the snapshot race-free by construction, so this handler emits
-    // NO goal frames of its own — every live goal frame the pump later
-    // delivers is by definition newer and simply overwrites the snapshot.
 
     // #1594 follow-up: the SessionOpened NOTIFICATION is a documented
     // capability-discovery path (UPCR-2026-007), so an ingress connection's
@@ -17229,7 +17210,7 @@ async fn forward_live_ledger_event(
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
     }
-    // codex #2065 round-2 Z3 / round-3 W6 — await-safe send: a full stdio
+    // #2065 — await-safe send: a full stdio
     // queue parks THIS task cooperatively (non-blocking probe + async
     // sleep), never a blocking `SyncSender::send` on any thread — so the
     // park is cancellable and an abort+join retires it with no detached
@@ -17264,14 +17245,12 @@ fn log_live_forwarder_lag(session_id: &SessionKey, skipped: u64, features: Conne
 /// closes (peer gone), the broadcast sender is dropped (rare), or the
 /// connection cleanup aborts the handle.
 ///
-/// #2062 round 6 — this is a PUMP ONLY: the goal snapshot rides in the
-/// `session/open` RPC response (`SessionOpenResult::goal_state`), so no
-/// goal frames originate here. Every await point (recv, the offloaded
-/// send's capacity park) is cancellable and every enqueue is an atomic
-/// `try_send`, so abort+join retires the lane with no detached in-flight
-/// work — the round-3 W6 hazard (an uncancellable
-/// `spawn_blocking(SyncSender::send)` outliving the abort) is gone by
-/// construction, see `send_durable_offloaded`.
+/// #2065 — every await point here (recv, the offloaded send's capacity
+/// park) is cancellable and every enqueue is an atomic `try_send`, so
+/// abort+join retires the lane with no detached in-flight work: an
+/// uncancellable `spawn_blocking(SyncSender::send)` used to be able to
+/// outlive the abort and enqueue a stale frame onto the replacement lane.
+/// See `send_durable_offloaded`.
 // Each parameter is an independent piece of the forwarder's runtime state
 // (connection, ledger, replay baseline, negotiated features, broadcast
 // receiver); grouping them would only obscure the per-connection wiring.
@@ -17304,11 +17283,11 @@ async fn spawn_live_forwarder(
     // `projection.envelope.v1` client did not negotiate to receive.
     ws.update_live_features(features);
 
-    // codex #2065 round-2 Z5-lifecycle — retire any PREVIOUS forwarder for
+    // #2065 — retire any PREVIOUS forwarder for
     // this session BEFORE the replacement exists, so "one live lane per
     // (connection, session)" holds across re-opens. The production open
     // path already retired it even earlier — before the replay baseline
-    // was computed (round-3 W6.1, see `handle_session_open`) — so this is
+    // was computed (see `handle_session_open`) — so this is
     // an idempotent second line of defense for direct callers. abort+join
     // is a full retirement: cancellation lands at a recv/park await and
     // enqueues are atomic, so nothing detached survives the join.
@@ -17688,14 +17667,13 @@ fn live_event_passes_capability_filter(
             return false;
         }
     }
-    // codex #2065 round-2 Z5 — goal-chip frames are gated on the SAME
+    // #2065 — goal-chip frames are gated on the SAME
     // `coding.goal_runtime.v1` capability the goal RPC surface requires
-    // (`raw_method_feature_gate`). The #2062 null snapshot already gated its
-    // CONSTRUCTION; this arm closes the remaining lanes — session/open
-    // replay, the forwarder's open-backlog drain and live pump, and the
-    // direct sends — all of which funnel through this one filter. A client
-    // that cannot call the goal surface has no chip to maintain and must
-    // see zero goal frames.
+    // (`raw_method_feature_gate`). Every lane that can deliver a
+    // `session/goal/*` frame — session/open replay, the live pump, and the
+    // direct sends — funnels through this one filter, so a client that
+    // cannot call the goal surface has no chip to maintain and sees zero
+    // goal frames instead of ones it would report as unknown.
     if !features.goal_runtime_available() {
         if let UiProtocolLedgerEvent::Notification(
             UiNotification::SessionGoalUpdated(_) | UiNotification::SessionGoalCleared(_),
@@ -17896,11 +17874,6 @@ async fn open_session_result(
     // materializes (profile-less open), which makes the snapshot fail open
     // (publish without compacting) rather than guess a window.
     let mut open_context_provider: Option<Arc<dyn octos_llm::LlmProvider>> = None;
-    // #2062 codex round-2 Z1 + round-3 W5 — THIS open's goal-store identity,
-    // pinned from INSIDE the registration's own lock when the runtime arm
-    // below registers a scope (see `register_session_ledger_scope`); the
-    // one-lock return makes a registration-to-capture flip unrepresentable.
-    let mut pinned_goal_key: Option<SessionKey> = None;
     if let Some(profile_runtime) =
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
@@ -17934,8 +17907,7 @@ async fn open_session_result(
                 // `replay_after_with_head` below, so this open replays (and
                 // this session's turns later append) under the per-cwd
                 // storage identity. No-op when the store wasn't relocated.
-                // The returned key is this open's goal-store pin (W5).
-                pinned_goal_key = Some(register_session_ledger_scope(ledger, &runtime));
+                register_session_ledger_scope(ledger, &runtime);
                 open_context_provider = Some(
                     peer_lane_provider_for(&params.session_id, &runtime)
                         .unwrap_or_else(|| runtime.profile.llm.clone()),
@@ -18018,25 +17990,6 @@ async fn open_session_result(
     // of event the UPCR-2026-026 surface exists for. Feature-gating is the
     // replay filter's job (`ContextCompaction*` events are dropped for
     // connections without `context_lifecycle`).
-    // Legacy/profile-less opens perform NO scope registration above; there
-    // is no registration for the pin to be atomic with, so a single read of
-    // the current map value is the only meaning available (such sessions
-    // also never register cwd scopes of their own — the read is a plain
-    // wire-id fallthrough unless an earlier profiled open scoped this wire).
-    let pinned_goal_key = pinned_goal_key
-        .unwrap_or_else(|| default_agent_orchestrator().scoped_goal_key(&params.session_id));
-    // #2062 round 8 — the goal snapshot's PROFILE resolution, captured here
-    // where `params` lives: the SAME resolution the goal RPC surface uses.
-    // A resolution error resolves to `None` and the snapshot's `goal` stays
-    // `null` (never leak, never fabricate; the open already passed
-    // `validate_session_scope`, so the error arm is effectively
-    // unreachable).
-    let goal_profile_id = resolve_autonomy_profile_id(
-        Some(&params.session_id),
-        params.profile_id.as_deref(),
-        connection_profile_id,
-    )
-    .ok();
     let Some(sessions) = resolve_sessions_for_lookup(
         state,
         connection_profile_id,
@@ -18052,23 +18005,6 @@ async fn open_session_result(
         let data_dir = sessions.data_dir();
         let session = sessions.get_or_create(&params.session_id).await;
         (data_dir, session.messages.clone())
-    };
-    // #2062 round 8 — capture the VERSIONED snapshot (state + the scope's
-    // latest #1959 generation, read under ONE state-lock acquisition so the
-    // pair cannot disagree). Its position in this function no longer
-    // matters for correctness: the version is what lets the client resolve
-    // any arrival order (codex round-7 F1 showed wire order can never carry
-    // freshness — producers release the guard and enqueue later, so
-    // admission order cannot establish enqueue order; the round-7
-    // capture-at-enqueue loop and its stale-shipping bound are deleted).
-    // It sits after the sessions-lock block only so the mid-open tests can
-    // barrier on that lock and pin the pinned-key/versioning behavior at
-    // the production callsite.
-    let goal_state = match goal_profile_id.as_deref() {
-        Some(profile_id) => {
-            default_agent_orchestrator().session_open_goal_state(&pinned_goal_key, profile_id)
-        }
-        None => json!({ "version": 0, "goal": Value::Null }),
     };
     let (context, context_state, open_compaction_events) = appui_context_open_snapshot(
         &data_dir,
@@ -18186,7 +18122,7 @@ async fn open_session_result(
         unreachable!("session/open ledger append returns session/open notification");
     };
     Ok(SessionOpenOutcome {
-        result: SessionOpenResult::new(opened).with_goal_state(goal_state),
+        result: SessionOpenResult::new(opened),
         replay,
         pending_approvals,
         pending_questions,
@@ -36906,35 +36842,31 @@ fn send_notification_lifecycle_forced_backpressure_fixture(
 
 /// #1959 process-global watermark map: SCOPED goal identity → highest
 /// goal-frame generation an admitted `SessionGoalUpdated` /
-/// `SessionGoalCleared` has recorded. Module-scoped (not fn-local in the
-/// guard) because it has TWO consumers: the send guard below, and the
-/// #2062 open-response snapshot
-/// (`send_open_result_with_goal_state_at_enqueue`), which uses the pinned
-/// scope's watermark as its freshness marker and holds THIS lock across
-/// its recheck + non-blocking response enqueue — every producer records
-/// its generation here BEFORE enqueueing, which is what slots the response
-/// into the live total order at its build position (codex #2065 round 7).
+/// `SessionGoalCleared` has recorded.
 ///
-/// codex #2065 round-4 S3 — the key is the SCOPED goal-store key resolved
-/// via [`goal_event_watermark_identity`], NOT the plain wire session id
-/// the frames carry: two cwd scopes can share one wire id, and a
-/// wire-keyed watermark advanced by scope A's clear would falsely drop
-/// scope B's later-delivered-but-earlier-built live repaint at the send
-/// guard (cross-scope suppression among real frames).
+/// #2065 — the key is the SCOPED goal-store key resolved via
+/// [`goal_event_watermark_identity`], NOT the plain wire session id the
+/// frames carry. Two cwd scopes can share one wire session id
+/// (`appui.sessions_in_cwd`), and the guard is strictly monotonic per key:
+/// wire-keyed, one scope's later-ALLOCATED clear advanced the watermark
+/// past a sibling scope's earlier-built repaint, so that repaint was
+/// dropped at the guard and the sibling's live goal chip silently stopped
+/// updating. Per-scope identities keep the two streams independent, which
+/// is what the guard's monotonicity assumption requires.
 static GOAL_EVENT_GENERATION_GUARD: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
 
 fn goal_event_guard_map() -> &'static StdMutex<HashMap<String, u64>> {
     GOAL_EVENT_GENERATION_GUARD.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-/// codex #2065 round-4 S3 — the #1959 watermark identity for a goal frame:
-/// the SCOPED goal-store key its generation was allocated under (registered
+/// #2065 — the #1959 watermark identity for a goal frame: the SCOPED
+/// goal-store key its generation was allocated under (registered
 /// atomically with the allocation by `next_goal_event_generation` — the
 /// producer's BUILD-TIME key, never a later re-resolution of the
 /// last-writer-wins cwd map, which a concurrent open flips). Falls back to
 /// the plain wire session id for unstamped/unregistered generations
 /// (legacy events, hand-built test frames, FIFO-evicted entries) — exactly
-/// the pre-S3 behavior for exactly the events that predate the registry.
+/// the pre-fix behavior for exactly the events that predate the registry.
 ///
 /// Takes the orchestrator STATE lock briefly; callers must resolve this
 /// BEFORE taking the guard-map lock (the two never nest).
@@ -37166,7 +37098,7 @@ fn send_ledger_event_durable(
 }
 
 /// Async twin of [`send_ledger_event_durable`] for the live-forwarder task
-/// (codex #2065 round-2 Z3 / round-3 W6): identical prep, metrics, and
+/// (#2065): identical prep, metrics, and
 /// `replay_lossy` semantics — keep the two in lockstep — but the enqueue
 /// goes through [`WsConnection::send_durable_offloaded`], whose stdio lane
 /// parks THIS task cooperatively (non-blocking probe + async sleep) instead
