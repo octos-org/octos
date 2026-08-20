@@ -2871,43 +2871,70 @@ fn should_deliver_a_restore_exactly_once_however_the_wiring_is_ordered() {
     );
 }
 
-/// #2056 round 3 (R5) — the lost wakeup, pinned deterministically rather than
-/// hoped away. The round-2 shape observed "no observer wired" under one lock,
-/// RELEASED it, and only then raised a separate flag; an installer landing in
-/// that gap wired its callback, saw the flag still clear, and delivered
-/// nothing — after which nothing ever would, because the same-path re-enable
-/// returns at the idempotence guard.
+/// #2056 round 3/4 (R5) — the lost wakeup, pinned with POSITIVE EVIDENCE.
+/// The round-2 shape observed "no observer wired" under one lock, RELEASED it,
+/// and only then raised a separate flag; an installer landing in that gap
+/// wired its callback, saw the flag still clear, and delivered nothing — after
+/// which nothing ever would, because the same-path re-enable returns at the
+/// idempotence guard.
 ///
-/// The proof does not race and hope. A cfg-gated hook runs INSIDE the slot's
-/// critical section, on exactly the branch that decides "nobody could take
-/// this". While it holds that section it waits for a concurrent installer to
-/// finish — and asserts that the installer CANNOT, because it must block on
-/// the same mutex. An installer that completes there is only possible if
-/// installation is not under the lock, which is precisely the defect; no
-/// schedule can fake the blocking, and the wait has a bound so the test cannot
-/// hang. Then, after the section is released, the delivery must still happen
-/// exactly once.
+/// A cfg-gated hook runs INSIDE the slot's critical section, on exactly the
+/// branch that decides "nobody could take this", and holds it while a
+/// concurrent installer tries to wire itself. The installer must not be able
+/// to COMPLETE there — it has to block on the same mutex — and the delivery
+/// must still happen exactly once after the section is released.
 ///
-/// TWO THINGS HERE ARE LOAD-BEARING. Do not "simplify" either of them.
+/// THREE THINGS HERE ARE LOAD-BEARING. Do not "simplify" any of them.
 ///
-/// 1. **The handshake runs hook-first.** The installer thread blocks until the
-///    hook says it is already inside the critical section. Signalling the other
-///    way round — installer announces, hook waits for it — lets the installer
-///    win the race: `notify_restore` then takes its `Some` branch, the hook
-///    never runs, and the test passes having exercised nothing. That is not
-///    hypothetical; it is what the first draft of this test did, and it went
-///    green in 0.01s.
+/// 1. **The handshake runs hook-first.** The installer thread does not start
+///    until the hook says it is already inside the critical section.
+///    Signalling the other way round — installer announces, hook waits for it
+///    — lets the installer win the race: `notify_restore` then takes its
+///    `Some` branch, the hook never runs, and the test passes having exercised
+///    nothing. That is not hypothetical; it is what the first draft of this
+///    test did, and it went green in 0.01s.
 /// 2. **`hook_ran` is asserted.** It is the tripwire for exactly that failure.
 ///    Without it, any future change that stops this test reaching the
 ///    missed-restore branch — a different lock order, an extra early return,
 ///    an observer wired earlier by a helper — converts it from a proof into a
-///    green no-op, silently. The runtime is the other tell: this test should
-///    take ~250ms (the bounded wait actually elapsing). If it ever drops to
-///    milliseconds, the race is no longer being exercised.
+///    green no-op, silently.
+/// 3. **The installer ACKNOWLEDGES reaching its lock attempt, and a missing
+///    ack FAILS the test.** This is the difference between evidence and
+///    inference, and it is subtler than the two above. The second draft held
+///    the section and treated "no completion signal arrived" as proof the
+///    installer was blocked — but silence has more than one cause. On a loaded
+///    runner the installer thread can simply remain UNSCHEDULED for the whole
+///    window; then, even with the broken split handshake in place, the hook
+///    times out, the pending mark is raised afterwards, the installer runs and
+///    delivers once, and every assertion passes. The ack is what rules that
+///    out: it proves the thread was runnable and had reached the call, so a
+///    subsequent absence of completion is attributable to the lock rather than
+///    to the scheduler.
+///
+/// What the ~500ms runtime does and does not tell you: it shows the held
+/// window actually elapsed, which is necessary. It does NOT show the installer
+/// was blocked rather than merely late — only the ack does that. A version of
+/// this test that keeps the timing but drops the ack is strictly weaker than
+/// it looks.
+///
+/// Residual, stated rather than hidden: between sending the ack and reaching
+/// the mutex the installer executes a few instructions, so "blocked" is proven
+/// modulo a descheduling window of that size, backed up by the happens-after
+/// assertion that the install completed only after the hook released. Every
+/// wait is bounded — including the join — so no failure mode hangs the suite.
 #[test]
 fn should_not_lose_a_restore_when_wiring_races_the_missed_restore_mark() {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
+    use std::time::Instant;
+
+    // How long the hook holds the critical section once the installer has
+    // acknowledged reaching its lock attempt. Generous enough that an
+    // UNBLOCKED installer would comfortably finish inside it.
+    const HELD_WINDOW: Duration = Duration::from_millis(500);
+    // Budget for the installer's "I reached the lock attempt" ack. Exceeding
+    // this FAILS the test — the run proved nothing and must say so.
+    const ACK_BUDGET: Duration = Duration::from_secs(10);
 
     let dir = tempfile::TempDir::new().unwrap();
     let ledger_path = seeded_restore_ledger(&dir);
@@ -2916,44 +2943,73 @@ fn should_not_lose_a_restore_when_wiring_races_the_missed_restore_mark() {
     let deliveries = Arc::new(AtomicUsize::new(0));
     let installed_inside_the_section = Arc::new(AtomicBool::new(false));
     let hook_ran = Arc::new(AtomicBool::new(false));
+    let installer_acked = Arc::new(AtomicBool::new(false));
+    let hook_exit_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let installed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
-    // The handshake runs HOOK-FIRST, so the interleaving is forced rather than
-    // raced for: the installer thread does not start until the hook says it is
-    // already inside the critical section. (Signalling the other way round
-    // lets the installer win, `notify_restore` take its `Some` branch, and the
-    // hook never run at all — a test that passes without exercising anything.)
     let (inside_tx, inside_rx) = mpsc::channel::<()>();
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
     let (installed_tx, installed_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     // `Receiver` is not `Sync`; the hook must be.
+    let reached_rx = Mutex::new(reached_rx);
     let installed_rx = Mutex::new(installed_rx);
+
     let observed = Arc::clone(&installed_inside_the_section);
     let ran = Arc::clone(&hook_ran);
+    let acked = Arc::clone(&installer_acked);
+    let exit_at = Arc::clone(&hook_exit_at);
     supervisor.set_restore_notify_hook_for_test(move || {
         ran.store(true, Ordering::SeqCst);
         // Release the installer only now — this section is held.
         inside_tx.send(()).expect("installer waiting");
-        // It must not be able to COMPLETE while this section is held.
-        if installed_rx
+        // POSITIVE evidence that the installer thread is runnable and has
+        // reached its lock attempt. Without this, the silence below is
+        // ambiguous (see the doc comment).
+        if reached_rx
             .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_millis(250))
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(ACK_BUDGET)
             .is_ok()
         {
-            observed.store(true, Ordering::SeqCst);
+            acked.store(true, Ordering::SeqCst);
+            // Having established the installer is AT the lock, it must not be
+            // able to get PAST it while this section is held.
+            if installed_rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv_timeout(HELD_WINDOW)
+                .is_ok()
+            {
+                observed.store(true, Ordering::SeqCst);
+            }
         }
+        *exit_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     });
 
     let installer = supervisor.clone();
     let installer_deliveries = Arc::clone(&deliveries);
+    let installer_installed_at = Arc::clone(&installed_at);
     let handle = std::thread::spawn(move || {
         inside_rx.recv().expect("hook entered the critical section");
+        // Ack immediately before the call that must block.
+        reached_tx.send(()).expect("hook awaiting the ack");
         installer.set_on_restore(move |_| {
             installer_deliveries.fetch_add(1, Ordering::SeqCst);
         });
+        *installer_installed_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         let _ = installed_tx.send(());
+        let _ = done_tx.send(());
     });
 
     supervisor.enable_persistence(&ledger_path).unwrap();
+    // Bounded completion before the (now guaranteed-immediate) join, so a
+    // regression cannot hang the suite instead of failing it.
+    done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("installer thread must finish once the section is released");
     handle.join().expect("installer thread");
 
     assert!(
@@ -2962,9 +3018,27 @@ fn should_not_lose_a_restore_when_wiring_races_the_missed_restore_mark() {
          proved nothing",
     );
     assert!(
+        installer_acked.load(Ordering::SeqCst),
+        "the installer never acknowledged reaching its lock attempt, so this \
+         run cannot distinguish 'blocked' from 'never scheduled' — the result \
+         is inconclusive, which is a failure, not a pass",
+    );
+    assert!(
         !installed_inside_the_section.load(Ordering::SeqCst),
         "installing an observer completed while the missed-restore decision \
          was still being made — that gap IS the lost wakeup",
+    );
+    let exit = hook_exit_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .expect("hook recorded its exit");
+    let installed = installed_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .expect("installer recorded its completion");
+    assert!(
+        installed >= exit,
+        "the install completed before the critical section was released",
     );
     assert_eq!(
         deliveries.load(Ordering::SeqCst),
