@@ -14,6 +14,19 @@ const TOKEN =
   '';
 const PROFILE = process.env.OCTOS_PROFILE || 'admin';
 
+// The default profile above is a LOCAL-HARNESS default, not something CI has.
+// `e2e-live-nightly` sets no OCTOS_PROFILE and its serve configures no
+// `admin` profile, so every nightly run failed at session/open with
+// `-32602 profile 'admin' is not configured for this AppUI session` — before
+// reaching a single assertion. Require the profile to be named explicitly so
+// the missing prerequisite reads as skipped rather than as a failing
+// pipeline. See #2073.
+test.skip(
+  !process.env.OCTOS_PROFILE,
+  'set OCTOS_PROFILE to a profile the target server actually has ' +
+    "(the 'admin' default is a local-harness convention, not a CI fixture)",
+);
+
 test.setTimeout(180_000);
 
 function waitForMatchingNotification(
