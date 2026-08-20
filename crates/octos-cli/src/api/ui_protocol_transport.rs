@@ -556,7 +556,6 @@ pub(crate) struct WsConnection {
     /// [`update_live_features`]). Reads are far more frequent than
     /// writes, so `RwLock` is the right fit.
     live_features: Arc<std::sync::RwLock<ConnectionUiFeatures>>,
-    live_profile_id: Arc<std::sync::RwLock<String>>,
 }
 
 impl WsConnection {
@@ -569,7 +568,6 @@ impl WsConnection {
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
-            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -585,7 +583,6 @@ impl WsConnection {
             live_features: Arc::new(std::sync::RwLock::new(
                 ConnectionUiFeatures::stdio_defaults(),
             )),
-            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -610,21 +607,6 @@ impl WsConnection {
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = features;
-    }
-
-    fn snapshot_live_profile_id(&self) -> String {
-        match self.live_profile_id.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
-    fn update_live_profile_id(&self, profile_id: String) {
-        let mut guard = match self.live_profile_id.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = profile_id;
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -16873,7 +16855,14 @@ async fn handle_session_open(
             return false;
         }
     };
-    ws.update_live_profile_id(outcome.profile_id.clone());
+    // #2067 (H2) — this session's resolved profile, captured for the live
+    // forwarder installed at the end of this function. It is deliberately a
+    // per-forwarder value and NOT connection-wide state: a connection keeps one
+    // forwarder PER SESSION, and an unscoped connection may open a second
+    // session under a different profile. Sharing one mutable cell across
+    // forwarders let the second open silently retarget the first session's
+    // pump, starving it of every profile-carrying frame.
+    let live_profile_scope = outcome.profile_id.clone();
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -17012,6 +17001,7 @@ async fn handle_session_open(
         ws.connection_id,
         features,
         topic_scope,
+        live_profile_scope,
         live_rx,
         live_forwarders.clone(),
     )
@@ -17084,6 +17074,16 @@ fn ledger_event_matches_topic_scope(
 /// profile" is deployment-dependent — see the KNOWN LIMITATION on the
 /// interactive goal-charge binding.
 ///
+/// NOT filtered, deliberately: `AgentUpdated`, `PeerStaged` and `PeerClosed`.
+/// All three are durable and all three leak, but they are stamped from the
+/// TURN's `ProfileRuntime` rather than from `validate_session_scope`, and those
+/// two resolutions diverge when an unscoped connection carries a routed profile
+/// (`connection_profile_id.or(routed_profile_id)` — `validate_session_scope`
+/// never consults the routed id). Filtering them before that divergence is
+/// closed would starve exactly the reconnect-replay path they exist for. See
+/// issue #2081. `LoopCompleted` / `MonitorExpired` have no producer at all
+/// (issue #2080).
+///
 /// Every arm below prefers the event's top-level stamp and falls back to the
 /// profile on the record it carries. The fallback is not cosmetic: the
 /// `loop/pause`, `loop/resume` and `loop/delete` results omit the top-level
@@ -17140,6 +17140,30 @@ fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id:
         ),
         UiNotification::MonitorFired(fired) => {
             optional_profile_scope_matches(fired.profile_id.as_deref(), profile_id)
+        }
+        // `session/open` is appended for BROADCAST — the emit site tags it with
+        // the opening connection id specifically so OTHER connections observe
+        // it — and it carries `workspace_root`, the context snapshot and pane
+        // snapshots, i.e. another tenant's paths and buffers on a shared key.
+        // Filtering it cannot starve its own opener: that connection's
+        // forwarder skips the broadcast copy via `from_connection`, and its own
+        // frame arrives through the UNFILTERED `send_ledger_event_durable`
+        // direct send in `handle_session_open`. The scopes also agree by
+        // construction — `ledger_profile_id` IS `active_profile_id
+        // .unwrap_or(MAIN_PROFILE_ID)`, which is exactly this normalization.
+        UiNotification::SessionOpened(opened) => {
+            optional_profile_scope_matches(opened.active_profile_id.as_deref(), profile_id)
+        }
+        // `background/activity` is raw OBSERVED text — a monitor's stdout, a
+        // fleet summary — and the ledger is its entire delivery mechanism: the
+        // sink appends it over a detached connection whose writer is drained to
+        // nowhere, so every real client receives it through replay or its own
+        // forwarder. Both production emitters stamp a concrete id that descends
+        // from `resolve_autonomy_profile_id` (the monitor origin carries the
+        // very id `monitor/fired` carries, already filtered above), so this arm
+        // adds no starvation surface that the monitor arm did not already.
+        UiNotification::BackgroundActivity(activity) => {
+            optional_profile_scope_matches(activity.profile_id.as_deref(), profile_id)
         }
         _ => true,
     }
@@ -17198,6 +17222,12 @@ async fn spawn_live_forwarder(
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     topic_scope: Option<String>,
+    // #2067 (H2) — the profile this SESSION resolved to at `session/open`,
+    // captured immutably for the lifetime of this forwarder exactly like
+    // `topic_scope`. Never re-read from the connection: a later
+    // `session/open` on the same connection can resolve a different profile,
+    // and a shared cell would retarget this pump mid-flight.
+    profile_scope: String,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
 ) {
@@ -17237,10 +17267,7 @@ async fn spawn_live_forwarder(
                     if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
                         continue;
                     }
-                    if !ledger_event_matches_profile_scope(
-                        &event.event,
-                        &ws.snapshot_live_profile_id(),
-                    ) {
+                    if !ledger_event_matches_profile_scope(&event.event, &profile_scope) {
                         continue;
                     }
                     // Stage 1 v2 is a wire projection of this existing

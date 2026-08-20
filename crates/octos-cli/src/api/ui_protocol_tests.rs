@@ -13436,6 +13436,345 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
+/// #2067 round 2 (H2) — the live forwarder's profile scope must be captured
+/// PER FORWARDER, exactly like `topic_scope`.
+///
+/// `WsConnection` holds ONE shared `live_profile_id` cell, every successful
+/// `session/open` overwrites it, and a connection keeps one forwarder PER
+/// SESSION. An unscoped/admin connection that opens session A under profile A
+/// and then session B under profile B therefore rewrites the scope that A's
+/// already-running forwarder observes — starving session A of every
+/// profile-carrying frame from that moment on. Reading the connection-wide
+/// mutable cell inside the pump is the defect; the fix is to capture the
+/// resolved profile at spawn time.
+#[tokio::test]
+async fn should_keep_delivering_first_session_frames_when_a_second_session_opens_another_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    // An UNSCOPED (admin) connection: `connection_profile_id` is `None`, so
+    // each `session/open` may name its own profile.
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_alpha = SessionKey("web-alpha-session".into());
+    let session_beta = SessionKey("web-beta-session".into());
+
+    for (session_id, profile_id, rpc_id) in [
+        (&session_alpha, "alpha", "open-alpha"),
+        (&session_beta, "beta", "open-beta"),
+    ] {
+        let opened = handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &forwarders,
+            None,
+            ConnectionUiFeatures::default(),
+            rpc_id.into(),
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: Some(profile_id.into()),
+                cwd: None,
+                sandbox: None,
+                after: Some(UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            },
+            false,
+        )
+        .await;
+        assert!(opened, "{profile_id} session must open");
+        drain_session_open_frames(&mut rx).await;
+    }
+
+    // Session A's forwarder is still installed and still owns profile alpha —
+    // opening session B under profile beta must not have retargeted it.
+    ledger.append_notification(goal_updated_notification(
+        &session_alpha,
+        Some("alpha"),
+        "alpha objective",
+    ));
+
+    let live = next_frame_within(&mut rx, 2_000).await.expect(
+        "session A's forwarder must still deliver alpha's goal frames after session B opened \
+         under another profile",
+    );
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED),
+    );
+    assert_eq!(live["params"]["session_id"], json!(session_alpha.0));
+    assert_eq!(
+        live["params"]["goal"]["objective"],
+        json!("alpha objective")
+    );
+
+    // …and session B's forwarder is still scoped to beta: an alpha-owned frame
+    // on B's stream stays out.
+    ledger.append_notification(goal_updated_notification(
+        &session_beta,
+        Some("alpha"),
+        "alpha objective on beta's session",
+    ));
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "session B's forwarder must still reject alpha-owned frames"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 2 (H4) — `session/open` is ledger-appended for BROADCAST
+/// (`open_session_result` tags it with the opening connection id precisely so
+/// other connections observe it), and it carries `workspace_root`, the context
+/// snapshot and pane snapshots. On a shared wire key those are another
+/// tenant's paths and buffers.
+///
+/// Filtering it cannot starve its own opener: the opener's forwarder skips the
+/// broadcast copy via `from_connection`, and its own frame arrives through the
+/// UNFILTERED `send_ledger_event_durable` direct send at the end of
+/// `handle_session_open`. And the scopes agree by construction —
+/// `active_profile_id` is the same `Option` that `ledger_profile_id` is
+/// `unwrap_or(_main)`-ed from, which is exactly how this filter normalizes.
+#[tokio::test]
+async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_another_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-shared-opened".into());
+
+    let beta_opened = |workspace_root: &str| {
+        UiNotification::SessionOpened(SessionOpened {
+            session_id: session_id.clone(),
+            active_profile_id: Some("beta".to_owned()),
+            workspace_root: Some(workspace_root.to_owned()),
+            context: None,
+            context_state: None,
+            cursor: None,
+            panes: None,
+            capabilities: UiProtocolCapabilities::first_server_slice(),
+            reasoning_effort: None,
+        })
+    };
+
+    // Beta opened this shared key first; its open frame is durable history.
+    ledger.append_notification(beta_opened("/home/beta/secret-workspace"));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        Some("alpha"),
+        ConnectionUiFeatures::default(),
+        "open-alpha-shared".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "alpha must be able to open the shared session");
+
+    // The drain stops at the first `session/open` NOTIFICATION. Alpha must see
+    // exactly one — its own — and never beta's workspace root.
+    let frames = drain_session_open_frames(&mut rx).await;
+    let opened_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| {
+            frame.get("id").is_none()
+                && frame.get("method").and_then(Value::as_str)
+                    == Some(octos_core::ui_protocol::methods::SESSION_OPEN)
+        })
+        .collect();
+    assert_eq!(
+        opened_frames.len(),
+        1,
+        "alpha must receive exactly one session/open notification: {frames:#?}"
+    );
+    assert_eq!(
+        opened_frames[0]["params"]["active_profile_id"],
+        json!("alpha"),
+        "the session/open alpha receives must be its OWN, not beta's replayed frame"
+    );
+
+    // Live: beta re-opens the shared key from another connection.
+    ledger.append_notification(beta_opened("/home/beta/second-workspace"));
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "beta's live session/open must not reach an alpha-scoped connection"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 2 (H4) — `background/activity` carries RAW observed text (a
+/// monitor's stdout lines, a fleet summary) and the ledger is its ENTIRE
+/// delivery mechanism: the sink appends it over a detached `WsConnection`
+/// whose writer is drained to nowhere, so every real client gets it from
+/// replay or its live forwarder — both of which run this filter.
+///
+/// Filtering is safe because no production emitter passes `None`: the monitor
+/// origin stamps `AutonomyMonitorRecord.profile_id` and the fleet origin
+/// stamps `FleetRecord.profile_id`, both concrete and both normalized through
+/// `resolve_autonomy_profile_id`. The monitor origin in particular carries the
+/// SAME id as `monitor/fired`, which is already filtered — so this arm adds no
+/// new starvation surface for it.
+#[tokio::test]
+async fn should_drop_cross_profile_background_activity_frames_when_connection_scopes_another_profile()
+ {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
+    )
+    .expect("create alpha profile");
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_id = SessionKey("web-shared-activity".into());
+    // `background/activity` is capability-gated; negotiate it or the frames
+    // never reach the wire for reasons unrelated to profile scope.
+    let features = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+
+    let activity = |profile_id: &str, text: &str| {
+        UiNotification::BackgroundActivity(octos_core::ui_protocol::BackgroundActivityEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(profile_id.to_owned()),
+            origin_kind: "monitor".to_owned(),
+            origin_id: format!("monitor-{profile_id}"),
+            origin_label: Some(format!("{profile_id}-tail")),
+            text: text.to_owned(),
+            emitted_at_ms: 1_760_000_000_000,
+            dropped_count: None,
+            suppressed: false,
+        })
+    };
+
+    ledger.append_notification(activity("beta", "beta secret log line"));
+    ledger.append_notification(activity("alpha", "alpha log line"));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        Some("alpha"),
+        features,
+        "open-alpha-activity".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "alpha must be able to open the shared session");
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    let replayed: Vec<String> = frames
+        .iter()
+        .filter(|frame| {
+            frame.get("method").and_then(Value::as_str)
+                == Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY)
+        })
+        .map(|frame| {
+            frame["params"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec!["alpha log line".to_owned()],
+        "replay must not put another tenant's observed text on an alpha connection"
+    );
+
+    // Live forwarder leg.
+    ledger.append_notification(activity("beta", "beta live log line"));
+    ledger.append_notification(activity("alpha", "alpha live log line"));
+
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("alpha's own live activity must still be forwarded");
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+        "the only live activity frame alpha may see is its own: {live}"
+    );
+    assert_eq!(live["params"]["text"], json!("alpha live log line"));
+    assert!(
+        next_frame_within(&mut rx, 250).await.is_none(),
+        "beta's live activity must not reach an alpha-scoped connection"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
 #[test]
 fn session_scope_allows_matching_authenticated_profile() {
     let session_id = SessionKey::with_profile("profile-a", "api", "chat-1");
@@ -23133,6 +23472,7 @@ async fn live_forwarder_topic_scope_drops_other_topic_events() {
         ws_alpha.connection_id(),
         ConnectionUiFeatures::default(),
         Some("alpha".into()),
+        MAIN_PROFILE_ID.to_owned(),
         alpha_live_rx,
         forwarders_alpha.clone(),
     )
@@ -23147,6 +23487,7 @@ async fn live_forwarder_topic_scope_drops_other_topic_events() {
         ws_beta.connection_id(),
         ConnectionUiFeatures::default(),
         Some("beta".into()),
+        MAIN_PROFILE_ID.to_owned(),
         beta_live_rx,
         forwarders_beta.clone(),
     )
@@ -23253,6 +23594,7 @@ async fn live_forwarder_delivers_file_attached_to_topic_scoped_subscriber() {
         ws.connection_id(),
         features_for_file_attached_test(true),
         Some("slides".into()),
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -23305,6 +23647,7 @@ async fn live_forwarder_delivers_tool_and_approval_events_to_topic_scoped_subscr
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         Some("slides".into()),
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -23430,6 +23773,7 @@ async fn live_forwarder_drops_mismatched_topic_for_tool_and_approval_events() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         Some("slides".into()),
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -23523,6 +23867,7 @@ async fn live_forwarder_pushes_v2_assistant_persisted_to_subscribed_ws() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -23567,6 +23912,7 @@ async fn live_forwarder_skips_events_at_or_below_baseline_seq() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -23612,6 +23958,7 @@ async fn live_forwarder_delivers_v2_without_a_capability_flag() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -23961,6 +24308,7 @@ async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
         ws.connection_id(),
         features_for_projection_envelope_v2_test(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders,
     )
@@ -24138,6 +24486,7 @@ async fn v2_background_child_never_appends_to_parent_after_terminal() {
         ws.connection_id(),
         features_for_projection_envelope_v2_test(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders,
     )
@@ -24229,6 +24578,7 @@ async fn unnegotiated_connection_receives_only_canonical_v2_wire_shape() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -24742,6 +25092,7 @@ async fn live_forwarder_routes_background_child_as_canonical_v2() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -25529,6 +25880,7 @@ async fn live_forwarder_delivers_background_child_without_legacy_fallback() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -25573,6 +25925,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         ws_a.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         rx_a_live,
         forwarders_a.clone(),
     )
@@ -25586,6 +25939,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         ws_b.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         rx_b_live,
         forwarders_b.clone(),
     )
@@ -25697,6 +26051,7 @@ async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_instal
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -25743,6 +26098,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
@@ -25780,6 +26136,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         ws_other.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx_other,
         forwarders_other.clone(),
     )
@@ -25940,6 +26297,7 @@ async fn live_forwarder_survives_broadcast_lag_and_keeps_pumping() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
+        MAIN_PROFILE_ID.to_owned(),
         live_rx,
         forwarders.clone(),
     )
