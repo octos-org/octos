@@ -13,7 +13,17 @@ use crate::{HookConfig, HookEvent};
 /// while the only change under test was one line of `.github/workflows/ci.yml`.
 /// These loops spawn real subprocesses, so their wall-clock cost tracks host
 /// load rather than anything the test controls.
+///
+/// #2053: the Windows runners miss fixed-duration waits that pass everywhere
+/// else — `test_background_spawn_persists_workflow_phase_transitions` failed
+/// this ceiling on `check-windows` while an in-job retry of the SAME job
+/// produced a different failure set, and a plain re-run went green. These
+/// loops break on content the instant it appears, so a larger Windows ceiling
+/// costs a passing run nothing.
+#[cfg(not(windows))]
 const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(windows)]
+const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
 
 #[test]
 fn frame_subagent_task_leads_with_identity_and_directive() {

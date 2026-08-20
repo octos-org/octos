@@ -7,6 +7,28 @@ use async_trait::async_trait;
 /// nothing, and a broken run (hook never fires) still fails — just later.
 /// Mirrors `octos_agent`'s `spawn_tests::BACKGROUND_DEADLINE`.
 const HOOK_DEADLINE: Duration = Duration::from_secs(60);
+
+/// #2053 — scale a test's WAITING budget on Windows, where the runners
+/// routinely miss fixed-duration waits that pass everywhere else
+/// (`test_speculative_overflow_concurrent` failed `check-windows` while the
+/// diff under test could not affect it; a plain re-run went green).
+///
+/// Apply this to DEADLINES only — the upper bound on how long a test is
+/// willing to wait. Never apply it to a duration that drives behaviour (a
+/// mock's response delay, a sleep sized against a production patience
+/// window): scaling a stimulus changes what the test proves, while scaling a
+/// deadline costs a passing run nothing and still fails a broken one, just
+/// later.
+fn waiting_budget(base: Duration) -> Duration {
+    #[cfg(windows)]
+    {
+        base * 4
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
 #[cfg(unix)]
 use octos_agent::{HookConfig, HookEvent};
 use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
@@ -3501,7 +3523,7 @@ async fn test_speculative_overflow_concurrent() {
     for i in 0..5 {
         tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
         // Wait for response
-        let resp = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let resp = tokio::time::timeout(waiting_budget(Duration::from_secs(5)), rx.recv())
             .await
             .expect("warmup response timeout")
             .expect("channel closed");
@@ -3524,7 +3546,7 @@ async fn test_speculative_overflow_concurrent() {
     // user-message session_result emission added by #616 fix carries
     // routing metadata in `_session_result` but no body).
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + waiting_budget(Duration::from_secs(15));
     while responses.len() < 2 {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(msg)) => {
@@ -3596,7 +3618,7 @@ async fn test_speculative_overflow_concurrent() {
 
     // Clean shutdown
     drop(tx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    let _ = tokio::time::timeout(waiting_budget(Duration::from_secs(5)), handle).await;
 }
 
 /// FA-11 defect B regression: the overflow assistant reply MUST carry
