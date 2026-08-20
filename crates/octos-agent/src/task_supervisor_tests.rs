@@ -2763,6 +2763,199 @@ fn should_fire_on_restore_once_with_the_swept_table_when_persistence_is_enabled(
     );
 }
 
+/// #2056 round 3 (R5) — seed a ledger with one finished task and return its
+/// path, so a fresh supervisor enabling on it performs a REAL restore.
+fn seeded_restore_ledger(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let ledger_path = dir.path().join("tasks.jsonl");
+    let writer = TaskSupervisor::new();
+    writer.enable_persistence(&ledger_path).unwrap();
+    let task = writer.register("search", "call-restore-seed", Some("api:session"));
+    writer.mark_completed(&task, vec![]);
+    drop(writer);
+    ledger_path
+}
+
+/// #2056 round 3 (R5) — the missed-restore handshake delivers EXACTLY ONCE,
+/// across every sequential wiring order. Counted at the observer itself: the
+/// previous pin compared goal-ledger settle attempts, which is vacuous once
+/// the first delivery has already settled the row (a duplicate finds no
+/// candidate and writes nothing either way).
+#[test]
+fn should_deliver_a_restore_exactly_once_however_the_wiring_is_ordered() {
+    use std::sync::atomic::AtomicUsize;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = seeded_restore_ledger(&dir);
+
+    let counting_observer = || {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::clone(&calls);
+        (calls, move |_: &[BackgroundTask]| {
+            sink.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+
+    // Never restored ⇒ nothing to deliver.
+    let never_restored = TaskSupervisor::new();
+    let (calls, observer) = counting_observer();
+    never_restored.set_on_restore(observer);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a supervisor that never restored must not fire its new observer",
+    );
+
+    // Wire, then restore.
+    let wire_first = TaskSupervisor::new();
+    let (calls, observer) = counting_observer();
+    wire_first.set_on_restore(observer);
+    wire_first.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one restore, one delivery");
+    wire_first.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the idempotent re-enable restores nothing and must not re-deliver",
+    );
+
+    // Restore, then wire — the missed-restore path.
+    let restore_first = TaskSupervisor::new();
+    restore_first.enable_persistence(&ledger_path).unwrap();
+    let (calls, observer) = counting_observer();
+    restore_first.set_on_restore(observer);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "wiring after the restore must deliver the one it missed",
+    );
+
+    // Re-wiring an already-delivered supervisor — the cached-supervisor idiom
+    // re-wires at every point of use — must not deliver again.
+    let (rewire_calls, observer) = counting_observer();
+    restore_first.set_on_restore(observer);
+    assert_eq!(
+        rewire_calls.load(Ordering::SeqCst),
+        0,
+        "the pending mark was consumed by the first install",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "and the replaced observer is not re-invoked either",
+    );
+
+    // LATE inheritance onto an already-restored supervisor must consume the
+    // missed restore too. Production children inherit before enabling, so this
+    // is the path a direct assignment would silently break.
+    let parent = TaskSupervisor::new();
+    let (inherited_calls, observer) = counting_observer();
+    parent.set_on_restore(observer);
+    let late_child = TaskSupervisor::new();
+    late_child.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        inherited_calls.load(Ordering::SeqCst),
+        0,
+        "precondition: the child restored with no observer of its own",
+    );
+    late_child.inherit_registration_observers(&parent);
+    assert_eq!(
+        inherited_calls.load(Ordering::SeqCst),
+        1,
+        "inheriting an observer must deliver the restore the child missed",
+    );
+    late_child.inherit_registration_observers(&parent);
+    assert_eq!(
+        inherited_calls.load(Ordering::SeqCst),
+        1,
+        "a repeat inheritance must not re-deliver",
+    );
+}
+
+/// #2056 round 3 (R5) — the lost wakeup, pinned deterministically rather than
+/// hoped away. The round-2 shape observed "no observer wired" under one lock,
+/// RELEASED it, and only then raised a separate flag; an installer landing in
+/// that gap wired its callback, saw the flag still clear, and delivered
+/// nothing — after which nothing ever would, because the same-path re-enable
+/// returns at the idempotence guard.
+///
+/// The proof does not race and hope. A cfg-gated hook runs INSIDE the slot's
+/// critical section, on exactly the branch that decides "nobody could take
+/// this". While it holds that section it waits for a concurrent installer to
+/// finish — and asserts that the installer CANNOT, because it must block on
+/// the same mutex. An installer that completes there is only possible if
+/// installation is not under the lock, which is precisely the defect; no
+/// schedule can fake the blocking, and the wait has a bound so the test cannot
+/// hang. Then, after the section is released, the delivery must still happen
+/// exactly once.
+#[test]
+fn should_not_lose_a_restore_when_wiring_races_the_missed_restore_mark() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = seeded_restore_ledger(&dir);
+
+    let supervisor = TaskSupervisor::new();
+    let deliveries = Arc::new(AtomicUsize::new(0));
+    let installed_inside_the_section = Arc::new(AtomicBool::new(false));
+    let hook_ran = Arc::new(AtomicBool::new(false));
+
+    // The handshake runs HOOK-FIRST, so the interleaving is forced rather than
+    // raced for: the installer thread does not start until the hook says it is
+    // already inside the critical section. (Signalling the other way round
+    // lets the installer win, `notify_restore` take its `Some` branch, and the
+    // hook never run at all — a test that passes without exercising anything.)
+    let (inside_tx, inside_rx) = mpsc::channel::<()>();
+    let (installed_tx, installed_rx) = mpsc::channel::<()>();
+    // `Receiver` is not `Sync`; the hook must be.
+    let installed_rx = Mutex::new(installed_rx);
+    let observed = Arc::clone(&installed_inside_the_section);
+    let ran = Arc::clone(&hook_ran);
+    supervisor.set_restore_notify_hook_for_test(move || {
+        ran.store(true, Ordering::SeqCst);
+        // Release the installer only now — this section is held.
+        inside_tx.send(()).expect("installer waiting");
+        // It must not be able to COMPLETE while this section is held.
+        if installed_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok()
+        {
+            observed.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let installer = supervisor.clone();
+    let installer_deliveries = Arc::clone(&deliveries);
+    let handle = std::thread::spawn(move || {
+        inside_rx.recv().expect("hook entered the critical section");
+        installer.set_on_restore(move |_| {
+            installer_deliveries.fetch_add(1, Ordering::SeqCst);
+        });
+        let _ = installed_tx.send(());
+    });
+
+    supervisor.enable_persistence(&ledger_path).unwrap();
+    handle.join().expect("installer thread");
+
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "the restore must have taken the missed-restore branch, or this test \
+         proved nothing",
+    );
+    assert!(
+        !installed_inside_the_section.load(Ordering::SeqCst),
+        "installing an observer completed while the missed-restore decision \
+         was still being made — that gap IS the lost wakeup",
+    );
+    assert_eq!(
+        deliveries.load(Ordering::SeqCst),
+        1,
+        "the restore the installer raced must still be delivered exactly once",
+    );
+}
+
 /// #2056 — the restore observer travels with the registration observer onto
 /// child / nested supervisors, so a child that persists its own task ledger
 /// reconciles its own rows.

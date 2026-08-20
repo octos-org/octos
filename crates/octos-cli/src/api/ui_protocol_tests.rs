@@ -1035,7 +1035,7 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
     .expect("switch dynamic profile runtime");
 
     assert_eq!(
-        load_skill_action_jobs(&profile_data_dir, &session_id)
+        load_skill_action_jobs(&profile_data_dir, "job-owner", &session_id)
             .expect("read jobs")
             .into_iter()
             .find(|job| job.job_id == task_id)

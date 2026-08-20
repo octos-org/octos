@@ -396,6 +396,37 @@ type OnRegisterCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
 /// reconciliation policy belongs to the consumer, not to octos-agent.
 type OnRestoreCallback = Arc<dyn Fn(&[BackgroundTask]) + Send + Sync>;
 
+/// #2056 round 3 — the restore observer and the "a restore happened with no
+/// observer wired" flag, deliberately under ONE mutex.
+///
+/// Round 2 held them apart (an `Option` behind one lock, an `AtomicBool`
+/// beside it) and that is a LOST WAKEUP: `notify_restore` could observe
+/// `None`, release the lock, and be descheduled; an installer would then wire
+/// its callback and find the flag still `false`, so it would not deliver; only
+/// afterwards would the first thread raise the flag. Nothing consumes it,
+/// `enable_persistence` on the same path returns at its idempotence guard, and
+/// the restore is never delivered at all — the exact hole the deferred
+/// delivery was added to close.
+///
+/// Sharing the lock makes "observe the callback, else mark pending" and
+/// "install the callback, taking any pending mark" two indivisible critical
+/// sections, so whichever runs second sees the other's effect and exactly one
+/// of them delivers.
+/// #2056 round 3 — the cfg-gated missed-restore hook (see
+/// [`TaskSupervisor::run_restore_notify_hook`]).
+#[cfg(test)]
+type RestoreNotifyHook = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct RestoreObserverSlot {
+    callback: Option<OnRestoreCallback>,
+    /// A restore completed while `callback` was `None`. Taken (and cleared) by
+    /// the next install, so re-wiring an already-delivered supervisor — the
+    /// cached-supervisor idiom re-wires at every point of use — does not
+    /// re-deliver.
+    undelivered: bool,
+}
+
 /// Payload emitted when a `spawn_only` background task transitions to
 /// `Failed`. Consumers (e.g. the session actor) use this to schedule a
 /// synthetic recovery turn so the LLM can re-engage with an actionable
@@ -933,21 +964,18 @@ pub struct TaskSupervisor {
     /// single success path (covers every `register*` entry point). The
     /// octos-cli runtime wires the goal-ledger task-row creation here.
     on_register: Arc<Mutex<Option<OnRegisterCallback>>>,
-    /// #2056 — restore observer, fired once at the end of
-    /// [`Self::enable_persistence`] with the rebuilt table. The octos-cli
-    /// runtime wires the goal-ledger reconciliation sweep here, next to the
-    /// registration observer above.
-    on_restore: Arc<Mutex<Option<OnRestoreCallback>>>,
-    /// #2056 round 2 — set when a restore completed with NO restore observer
-    /// wired, so installing one later still delivers it. The cached session
-    /// supervisor is enabled by whichever request touches it first, and some
-    /// of those sites install only their own listener; the later wiring
-    /// re-enables the SAME path, which returns at the idempotence guard in
-    /// [`Self::enable_persistence`] — so without this the missed restore could
-    /// never be delivered to that supervisor at all. Cleared by the delivery,
-    /// so re-installing an observer (the cached-supervisor idiom re-wires at
-    /// every point of use) does not re-deliver.
-    restore_undelivered: Arc<AtomicBool>,
+    /// #2056 — restore observer plus its missed-restore state, under ONE
+    /// mutex. The octos-cli runtime wires the goal-ledger reconciliation sweep
+    /// here, next to the registration observer above. See
+    /// [`RestoreObserverSlot`] for why the two fields must share a lock.
+    on_restore: Arc<Mutex<RestoreObserverSlot>>,
+    /// #2056 round 3 — test-only hook run INSIDE the slot's critical section
+    /// on the missed-restore branch, so a test can hold that section open and
+    /// prove an installer cannot slip through it. `None` in production builds,
+    /// and per-instance rather than process-global so parallel tests cannot
+    /// see each other's hook.
+    #[cfg(test)]
+    restore_notify_hook: Arc<Mutex<Option<RestoreNotifyHook>>>,
     on_relaunch: Arc<Mutex<Option<OnRelaunchCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
     /// Optional reporter that receives a [`ProgressEvent::ToolProgress`]
@@ -1288,8 +1316,9 @@ impl TaskSupervisor {
             on_failure: Arc::new(Mutex::new(None)),
             on_terminal: Arc::new(Mutex::new(None)),
             on_register: Arc::new(Mutex::new(None)),
-            on_restore: Arc::new(Mutex::new(None)),
-            restore_undelivered: Arc::new(AtomicBool::new(false)),
+            on_restore: Arc::new(Mutex::new(RestoreObserverSlot::default())),
+            #[cfg(test)]
+            restore_notify_hook: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
             progress_reporter: Arc::new(Mutex::new(None)),
@@ -1595,20 +1624,68 @@ impl TaskSupervisor {
     /// still receives it. See that method for why the alternative (waiting for
     /// the next restore) never happens on a shared supervisor.
     fn notify_restore(&self) {
-        let callback = self
-            .on_restore
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let Some(callback) = callback else {
-            self.restore_undelivered.store(true, Ordering::Release);
-            return;
+        // ONE critical section decides between "deliver now" and "remember
+        // that nobody could" — see [`RestoreObserverSlot`]. The guard is
+        // dropped before the snapshot and the invocation, so the observer
+        // still runs with no supervisor lock held.
+        let callback = {
+            let mut slot = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.callback.clone() {
+                Some(callback) => callback,
+                None => {
+                    slot.undelivered = true;
+                    #[cfg(test)]
+                    self.run_restore_notify_hook();
+                    return;
+                }
+            }
         };
         let snapshot: Vec<BackgroundTask> = {
             let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks.values().cloned().collect()
         };
         callback(&snapshot);
+    }
+
+    /// Run the cfg-gated missed-restore hook, if a test installed one. Called
+    /// while the slot lock is HELD, which is the whole point: it lets a test
+    /// pin that an installer cannot complete inside that section.
+    #[cfg(test)]
+    fn run_restore_notify_hook(&self) {
+        let hook = self
+            .restore_notify_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Install a missed-restore hook for tests. See
+    /// [`Self::run_restore_notify_hook`].
+    #[cfg(test)]
+    pub(crate) fn set_restore_notify_hook_for_test(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .restore_notify_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
+    }
+
+    /// #2056 round 3 — THE install path for the restore observer, shared by
+    /// [`Self::set_on_restore`] and observer inheritance so neither can bypass
+    /// the missed-restore handshake. Installing and taking the pending mark
+    /// happen in ONE critical section; the delivery runs after the guard is
+    /// dropped.
+    fn install_on_restore(&self, callback: OnRestoreCallback) {
+        let deliver_missed = {
+            let mut slot = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
+            slot.callback = Some(callback);
+            std::mem::replace(&mut slot.undelivered, false)
+        };
+        if deliver_missed {
+            self.notify_restore();
+        }
     }
 
     /// Set a callback that fires whenever a task's status changes.
@@ -1696,22 +1773,12 @@ impl TaskSupervisor {
     /// the observers are installed loses the sweep permanently: the later
     /// wiring re-enables the SAME path and returns at
     /// [`Self::enable_persistence`]'s idempotence guard, so no further restore
-    /// is ever notified. The pending flag is taken with a compare-exchange and
-    /// cleared by the delivery, so exactly one installer delivers it and a
-    /// re-install (the cached-supervisor idiom re-wires at every point of use)
-    /// does not re-run it.
+    /// is ever notified. Round 3 — the install and the taking of that pending
+    /// mark are ONE critical section (see [`RestoreObserverSlot`]); the
+    /// round-2 shape, which installed and then compare-exchanged a separate
+    /// flag, could lose the wakeup entirely.
     pub fn set_on_restore(&self, cb: impl Fn(&[BackgroundTask]) + Send + Sync + 'static) {
-        {
-            let mut guard = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(Arc::new(cb));
-        }
-        if self
-            .restore_undelivered
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.notify_restore();
-        }
+        self.install_on_restore(Arc::new(cb));
     }
 
     /// #2055 review round 2 — copy the REGISTRATION observers from `parent`
@@ -1741,15 +1808,20 @@ impl TaskSupervisor {
         }
         // #2056 — the restore observer travels with the registration
         // observer: a child supervisor that enables persistence over its own
-        // ledger must reconcile its own rows too.
+        // ledger must reconcile its own rows too. Round 3 — through
+        // `install_on_restore`, NOT a direct assignment: production children
+        // inherit before enabling and so have nothing pending, but a LATE
+        // inheritance (onto a supervisor that already restored) must consume
+        // the missed restore exactly like `set_on_restore` does. A direct
+        // write would silently drop it.
         let parent_restore = parent
             .on_restore
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .callback
             .clone();
         if let Some(callback) = parent_restore {
-            let mut guard = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(callback);
+            self.install_on_restore(callback);
         }
         let parent_listeners: Vec<(String, OnChangeCallback)> = parent
             .on_change_listeners

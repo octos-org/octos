@@ -11184,9 +11184,15 @@ async fn load_skill_action_job_view(
         }
         Err(_) => {
             let (profile_id, store_root) = skill_action_profile_data_dir(state, active_profile_id)?;
-            let jobs = load_skill_action_jobs(&store_root, session_id).map_err(|error| {
-                RpcError::internal_error(format!("failed to restore skill action tasks: {error}"))
-            })?;
+            // #2056 round 3 (R4) — `store_root` IS the profile data dir, so the
+            // throwaway supervisor inside can wire the goal-task-row observers
+            // and reconcile like every other restore path.
+            let jobs =
+                load_skill_action_jobs(&store_root, &profile_id, session_id).map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "failed to restore skill action tasks: {error}"
+                    ))
+                })?;
             Ok((profile_id, jobs))
         }
     }

@@ -20711,15 +20711,17 @@ mod tests {
             "wiring the observers after the restore must still deliver the sweep"
         );
 
-        // And the delivery is not repeated: re-wiring on every point of use
-        // (the cached-supervisor idiom) must not re-run the sweep.
-        let attempts = goal_task_settle_attempts_for(&task_id);
-        wire_supervisor_for_goal_task_rows(&rebooted, &wire, profile, dir.path());
-        assert_eq!(
-            goal_task_settle_attempts_for(&task_id),
-            attempts,
-            "a repeat wiring must not re-deliver an already-observed restore"
-        );
+        // Round 3 (R5) — the "delivery is not repeated" half of this used to
+        // compare `goal_task_settle_attempts_for` across a re-wire, which is
+        // VACUOUS: that counter only moves once a candidate reaches the settle
+        // core, and by this point the row is `complete` at rank 1, so a
+        // duplicate delivery finds no candidate and the assertion holds either
+        // way. Exactly-once is pinned where it can actually be observed —
+        // at the observer itself, in `task_supervisor_tests.rs`
+        // (`should_deliver_a_restore_exactly_once_however_the_wiring_is_ordered`
+        // and `should_not_lose_a_restore_when_wiring_races_the_missed_restore_mark`).
+        // What this test owns is the EFFECT: wiring after the restore repairs
+        // the row at all.
     }
 
     /// #2056 round 2 (H2b) — restore goal resolution must NOT inherit the
