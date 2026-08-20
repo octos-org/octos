@@ -1018,35 +1018,64 @@ impl GoalLedger {
         Ok(tasks)
     }
 
-    /// #2056 — every task row of `goal_id` that carries NO terminal verdict
-    /// yet (`authority < 0`), oldest first. This is exactly the
-    /// "delivery owed" set: [`Self::settle_task_status`] stamps a rank ≥ 0 on
-    /// the first verdict that lands, so a row leaves this set permanently the
-    /// moment any terminal write succeeds — and a row that already carries a
-    /// verdict can never be re-examined, let alone regressed, by a reconcile
-    /// pass. Scoped to one goal, and each goal owns its own ledger file, so
-    /// the scan is bounded by that goal's own unsettled task count.
+    /// #2056 — every task row of `goal_id` a reconciliation pass may still
+    /// legitimately move, paired with the authority rank it currently holds,
+    /// oldest first. The cut is `authority < 1`
+    /// ([`TaskSettleAuthority::Completion`]'s rank), which is deliberately NOT
+    /// the same thing as "no verdict yet":
+    ///
+    /// - **rank −1** (no verdict) — any terminal verdict outranks it.
+    /// - **rank 0** (observer-provisional failure) — explicitly correctable:
+    ///   the owner that watched the worker finish may still land a completion
+    ///   over it, which is the behaviour
+    ///   `should_allow_failed_to_complete_only_with_provisional_authority`
+    ///   pins. Excluding rank 0 would strand exactly that correction whenever
+    ///   its delivery is lost, which is the failure a reconcile exists for.
+    /// - **ranks 1 and 2** (completion, final failure) — excluded. The only
+    ///   write that could still be admitted over a completion is a final
+    ///   failure, and at restore time the only way a supervisor produces one
+    ///   for a task the ledger already completed is the orphan sweep reaping a
+    ///   row whose completion append was lost — i.e. spurious. Within a single
+    ///   supervisor the terminal guard forbids completed → failed outright, so
+    ///   nothing legitimate is lost by refusing to look.
+    ///
+    /// The returned rank lets the caller skip rows its own verdict would not
+    /// outrank, so a reconcile that owes nothing issues no write at all;
+    /// [`Self::settle_task_status`]'s strictly-greater rule remains the
+    /// correctness guarantee underneath.
+    ///
+    /// Scoped to one goal, and each goal owns its own ledger file. Note the
+    /// available index is `(goal_id, status)`, so `goal_id` is served by the
+    /// index prefix and the `authority` predicate is applied as a filter over
+    /// that goal's rows — the scan is bounded by the goal's TOTAL task count,
+    /// not by the candidate count.
     ///
     /// Requires the migrated schema (the `authority` column), i.e. a
     /// connection from [`Self::open_with_busy_retry`].
-    pub fn tasks_awaiting_terminal_verdict(&self, goal_id: &str) -> Result<Vec<Task>> {
+    pub fn tasks_open_to_correction(&self, goal_id: &str) -> Result<Vec<(Task, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms
-             FROM tasks WHERE goal_id = ?1 AND authority < 0 ORDER BY created_at_ms, task_id",
+            "SELECT task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms, authority
+             FROM tasks WHERE goal_id = ?1 AND authority < ?2 ORDER BY created_at_ms, task_id",
         )?;
-        let rows = stmt.query_map(params![goal_id], |row| {
-            Ok(Task {
-                task_id: row.get(0)?,
-                goal_id: row.get(1)?,
-                title: row.get(2)?,
-                detail: row.get(3)?,
-                status: row.get(4)?,
-                assigned_peer: row.get(5)?,
-                created_at_ms: row.get(6)?,
-                updated_at_ms: row.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![goal_id, TaskSettleAuthority::Completion.rank()],
+            |row| {
+                Ok((
+                    Task {
+                        task_id: row.get(0)?,
+                        goal_id: row.get(1)?,
+                        title: row.get(2)?,
+                        detail: row.get(3)?,
+                        status: row.get(4)?,
+                        assigned_peer: row.get(5)?,
+                        created_at_ms: row.get(6)?,
+                        updated_at_ms: row.get(7)?,
+                    },
+                    row.get(8)?,
+                ))
+            },
+        )?;
         let mut tasks = Vec::new();
         for task in rows {
             tasks.push(task?);
@@ -4086,16 +4115,18 @@ mod digest_integration_tests {
             .unwrap();
     }
 
-    /// #2056 — the "delivery owed" predicate. A row leaves the set on the
-    /// FIRST verdict of any rank and can never re-enter it, which is what
-    /// makes a boot reconciliation sweep both convergent and unable to
-    /// re-examine (let alone regress) a row that has already been settled.
+    /// #2056 — the reconcile candidate predicate. The cut is by RANK, not by
+    /// "has a verdict": a provisional failure (rank 0) stays a candidate
+    /// because a completion may still legitimately displace it — the same
+    /// correction `should_allow_failed_to_complete_only_with_provisional_
+    /// authority` pins — while a completion (1) and a final failure (2) leave
+    /// the set for good, so a reconcile can never regress a settled row.
     #[test]
-    fn should_list_only_rows_without_a_terminal_verdict_when_reconciling() {
+    fn should_keep_correctable_rows_and_drop_settled_ones_when_reconciling() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
         seed_goal_with_task(&ledger, "g1", "owed", "running");
-        for task_id in ["settled-complete", "settled-provisional"] {
+        for task_id in ["settled-complete", "settled-final", "provisional"] {
             ledger
                 .create_task(&Task {
                     task_id: task_id.to_string(),
@@ -4109,18 +4140,27 @@ mod digest_integration_tests {
                 })
                 .unwrap();
         }
-        // A different goal's unsettled row must never leak into the scan.
+        // A different goal's candidate row must never leak into the scan.
         seed_goal_with_task(&ledger, "g2", "other-goal-owed", "running");
 
-        assert_eq!(
+        let candidates = |ledger: &GoalLedger| {
             ledger
-                .tasks_awaiting_terminal_verdict("g1")
+                .tasks_open_to_correction("g1")
                 .unwrap()
                 .into_iter()
-                .map(|task| task.task_id)
-                .collect::<Vec<_>>(),
-            vec!["owed", "settled-complete", "settled-provisional"],
-            "every row starts owed",
+                .map(|(task, authority)| (task.task_id, authority))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            candidates(&ledger),
+            vec![
+                ("owed".to_string(), -1),
+                ("provisional".to_string(), -1),
+                ("settled-complete".to_string(), -1),
+                ("settled-final".to_string(), -1),
+            ],
+            "every row starts a candidate, at rank -1",
         );
 
         assert!(
@@ -4128,12 +4168,15 @@ mod digest_integration_tests {
                 .settle_task_status("settled-complete", TaskSettleAuthority::Completion, 2_000)
                 .unwrap()
         );
-        // Even the LOWEST rank leaves the set: a provisional verdict is still
-        // a verdict, so a reconcile can never re-settle it as final.
+        assert!(
+            ledger
+                .settle_task_status("settled-final", TaskSettleAuthority::FinalFailure, 2_000)
+                .unwrap()
+        );
         assert!(
             ledger
                 .settle_task_status(
-                    "settled-provisional",
+                    "provisional",
                     TaskSettleAuthority::ProvisionalFailure,
                     2_000
                 )
@@ -4141,19 +4184,28 @@ mod digest_integration_tests {
         );
 
         assert_eq!(
-            ledger
-                .tasks_awaiting_terminal_verdict("g1")
-                .unwrap()
-                .into_iter()
-                .map(|task| task.task_id)
-                .collect::<Vec<_>>(),
-            vec!["owed"],
-            "a settled row is gone from the owed set, at either rank",
+            candidates(&ledger),
+            vec![("owed".to_string(), -1), ("provisional".to_string(), 0)],
+            "ranks 1 and 2 leave the set; the correctable rank 0 stays, with its rank",
         );
+
+        // And the correction the retained candidate exists for really lands.
+        assert!(
+            ledger
+                .settle_task_status("provisional", TaskSettleAuthority::Completion, 3_000)
+                .unwrap(),
+            "a completion must still be admitted over a provisional verdict",
+        );
+        assert_eq!(
+            candidates(&ledger),
+            vec![("owed".to_string(), -1)],
+            "once corrected, it leaves the set like any other completion",
+        );
+
         assert_eq!(ledger.task_authority("owed").unwrap(), Some(-1));
         assert_eq!(
-            ledger.task_authority("settled-provisional").unwrap(),
-            Some(TaskSettleAuthority::ProvisionalFailure.rank())
+            ledger.task_authority("settled-final").unwrap(),
+            Some(TaskSettleAuthority::FinalFailure.rank())
         );
         assert_eq!(ledger.task_authority("no-such-task").unwrap(), None);
     }

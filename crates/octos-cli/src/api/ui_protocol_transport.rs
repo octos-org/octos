@@ -11146,6 +11146,21 @@ async fn load_skill_action_job_view(
         Ok(runtime) => {
             let profile_id = runtime.profile.profile_id.clone();
             let supervisor = runtime.tools.supervisor();
+            // #2056 round 2 (H2a) — wire the goal-task-row pair BEFORE this
+            // path's `enable_persistence`. This request can be the FIRST thing
+            // to touch the cached session supervisor after boot; a later
+            // wiring re-enables the same ledger path and returns at
+            // `enable_persistence`'s idempotence guard, so the restore would
+            // otherwise be observed by nobody. (`set_on_restore` also delivers
+            // an already-missed restore, which covers any future site that
+            // enables first — this keeps the observers present from the very
+            // first touch so registrations in between are recorded too.)
+            wire_goal_task_row_observers_for_cached_supervisor(
+                &supervisor,
+                session_id,
+                &profile_id,
+                &runtime.profile.data_dir,
+            );
             install_skill_action_job_projection_listener(
                 &supervisor,
                 &profile_id,
@@ -29809,6 +29824,26 @@ async fn run_standalone_turn(
                     .clone()
                     .map(|goal_id| (goal_id, goal_charge_profile.clone()))
             });
+        // #2056 round 2 (H2b) — the RECONCILE binding is resolved separately
+        // and WITHOUT the active-only filter above. Registration is right to
+        // refuse a non-active goal (no new work should be recorded against
+        // one); reconciliation is not — a paused or budget-limited goal keeps
+        // its ledger, and its stranded rows are still wrong. Resolved at
+        // callback time, on the same keys, so a goal that leaves `active`
+        // mid-turn is still reconciled at the next restore. The profile falls
+        // back exactly like `terminal_profile_id` below, because
+        // `goal_charge_profile` degrades to `_main` on a goal-less turn.
+        let restore_goal_key = goal_context.as_ref().map(|goal_ctx| {
+            (
+                goal_ctx.goal_session_key.clone(),
+                goal_ctx.profile_id.clone(),
+            )
+        });
+        let restore_wire_key = session_id.clone();
+        let restore_wire_profile = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         // Round 3 — the SHARED installer wires both halves (recorder +
         // change-feed settle listener), with THIS turn's dispatch-time
         // binding snapshot as the resolver. The settle rides the change
@@ -29820,6 +29855,18 @@ async fn run_standalone_turn(
             &task_supervisor,
             &session_runtime.profile.data_dir,
             move || register_goal_binding.clone(),
+            move || {
+                let orchestrator = default_agent_orchestrator();
+                if let Some((goal_key, profile)) = restore_goal_key.as_ref()
+                    && let Some(goal_id) =
+                        orchestrator.bound_goal_id_under_goal_key(goal_key, profile)
+                {
+                    return Some((goal_id, profile.clone()));
+                }
+                orchestrator
+                    .bound_goal_id(&restore_wire_key, &restore_wire_profile)
+                    .map(|goal_id| (goal_id, restore_wire_profile.clone()))
+            },
         );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
         // (ChildCompleted) AND failure (recovery) re-entry through ONE

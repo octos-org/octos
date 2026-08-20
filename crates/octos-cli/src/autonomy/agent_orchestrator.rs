@@ -1315,21 +1315,26 @@ pub(crate) fn install_goal_task_row_settle_listener(supervisor: &octos_agent::Ta
 /// RESOLVER differs per site (the per-turn WS path passes a dispatch-time
 /// snapshot; callback-time resolution uses
 /// [`install_goal_task_row_observers_resolving_at_callback`]).
+///
+/// #2056 round 2 (H2b) — registration and reconciliation take SEPARATE
+/// resolvers, because they answer different questions. `resolve_register_
+/// binding` asks "may I record new work against a goal?", which is rightly
+/// active-only. `resolve_restore_binding` asks "whose ledger owns the rows
+/// this supervisor just rebuilt?", which must not be: a paused, blocked,
+/// budget-limited or completed goal keeps its stranded rows, and inheriting
+/// the active-only filter meant the sweep silently did nothing for every one
+/// of them.
 pub(crate) fn install_goal_task_row_observers(
     supervisor: &octos_agent::TaskSupervisor,
     profile_data_dir: &Path,
-    resolve_binding: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
+    resolve_register_binding: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
+    resolve_restore_binding: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
 ) {
-    // #2056 — the resolver is shared by the registration observer and the
-    // restore observer (both need the SAME (goal_id, profile_id) binding, and
-    // a site that resolves at callback time must do so for both).
-    let resolve_binding = Arc::new(resolve_binding);
     let data_dir = profile_data_dir.to_path_buf();
-    let register_binding = Arc::clone(&resolve_binding);
     supervisor.set_on_register(move |task| {
         // (goal_id, profile_id); `None` ⇒ no goal bound ⇒ no row — correct
         // behavior, not an error.
-        let Some((goal_id, profile_id)) = register_binding() else {
+        let Some((goal_id, profile_id)) = resolve_register_binding() else {
             return;
         };
         default_agent_orchestrator().record_goal_task_registration(
@@ -1345,10 +1350,11 @@ pub(crate) fn install_goal_task_row_observers(
     // which is the only moment the rebuilt table exists and the ledger is
     // reachable (octos-agent has no octos-fleet dependency, and
     // `enable_persistence` is a synchronous `std::io` API that may not park on
-    // SQLite — all ledger I/O below is offloaded).
+    // SQLite — all ledger I/O below is offloaded). `set_on_restore` also
+    // delivers a restore that already happened before this wiring ran.
     let restore_data_dir = profile_data_dir.to_path_buf();
     supervisor.set_on_restore(move |restored| {
-        let Some((goal_id, profile_id)) = resolve_binding() else {
+        let Some((goal_id, profile_id)) = resolve_restore_binding() else {
             return;
         };
         default_agent_orchestrator().reconcile_goal_task_rows_after_restore(
@@ -1367,19 +1373,34 @@ pub(crate) fn install_goal_task_row_observers(
 /// supervisors that outlive goals coming and going — the gateway actor's,
 /// and the cached `session_runtime.tools` supervisor the out-of-turn WS
 /// paths use — where a dispatch-time snapshot would go stale.
+///
+/// #2056 round 2 — reconciliation resolves through
+/// [`InProcessAgentOrchestrator::bound_goal_id`] instead, which drops the
+/// active-only filter.
 pub(crate) fn install_goal_task_row_observers_resolving_at_callback(
     supervisor: &octos_agent::TaskSupervisor,
     session_id: &SessionKey,
     profile_id: &str,
     profile_data_dir: &Path,
 ) {
-    let session = session_id.clone();
-    let profile = profile_id.to_owned();
-    install_goal_task_row_observers(supervisor, profile_data_dir, move || {
-        default_agent_orchestrator()
-            .active_goal_id(&session, &profile)
-            .map(|goal_id| (goal_id, profile.clone()))
-    });
+    let register_session = session_id.clone();
+    let register_profile = profile_id.to_owned();
+    let restore_session = session_id.clone();
+    let restore_profile = profile_id.to_owned();
+    install_goal_task_row_observers(
+        supervisor,
+        profile_data_dir,
+        move || {
+            default_agent_orchestrator()
+                .active_goal_id(&register_session, &register_profile)
+                .map(|goal_id| (goal_id, register_profile.clone()))
+        },
+        move || {
+            default_agent_orchestrator()
+                .bound_goal_id(&restore_session, &restore_profile)
+                .map(|goal_id| (goal_id, restore_profile.clone()))
+        },
+    );
 }
 
 // "Workspace is known in-memory" predicate accepted by
@@ -3571,6 +3592,27 @@ impl InProcessAgentOrchestrator {
         } else {
             None
         }
+    }
+
+    /// #2056 round 2 (H2b) — the goal BOUND to this session, whatever its
+    /// status. [`Self::active_goal_id`] additionally requires `active`, which
+    /// is right for recording NEW work and wrong for reconciling work that has
+    /// already been recorded: a paused, blocked, budget-limited or completed
+    /// goal keeps its ledger, and its stranded task rows are still wrong.
+    /// `budget_limited` in particular is not an edge case — a goal that spends
+    /// its budget sits there for the rest of its life.
+    ///
+    /// A CLEARED goal has no record at all (`clear_goal` REMOVES it from the
+    /// state map), so this returns `None` for it without a status test.
+    pub(crate) fn bound_goal_id(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> Option<String> {
+        let key = self.scoped_goal_key(session_id);
+        let state = self.state();
+        let goal = state.goals.get(&key)?;
+        (goal.profile_id == profile_id).then(|| goal.goal_id.clone())
     }
 
     /// #1650 — charge an *interactive* (user-driven) turn's token spend
@@ -6240,6 +6282,21 @@ impl InProcessAgentOrchestrator {
         (goal.profile_id == profile_id && goal.status == "active").then(|| goal.goal_id.clone())
     }
 
+    /// #2056 round 2 (H2b) — [`Self::bound_goal_id`] under an ALREADY-SCOPED
+    /// goal store key (family-2, never re-scoped), the continuation-side twin
+    /// of [`Self::active_goal_id_under_goal_key`] without the active-only
+    /// filter. See [`Self::bound_goal_id`] for why reconciliation must not
+    /// inherit that filter.
+    pub(crate) fn bound_goal_id_under_goal_key(
+        &self,
+        goal_session_key: &SessionKey,
+        profile_id: &str,
+    ) -> Option<String> {
+        let state = self.state();
+        let goal = state.goals.get(goal_session_key)?;
+        (goal.profile_id == profile_id).then(|| goal.goal_id.clone())
+    }
+
     /// #2055 — record a task the `TaskSupervisor` just registered: stash the
     /// ledger binding (synchronously — this is all the `on_register`
     /// callback pays on the caller's thread) and offload the row creation to
@@ -6449,23 +6506,33 @@ impl InProcessAgentOrchestrator {
     /// API is a synchronous `std::io` call that must not park on SQLite.
     ///
     /// **Direction: LEDGER-first, never supervisor-first.** The sweep
-    /// enumerates the rows the ledger says it is still OWED — `authority < 0`,
-    /// i.e. no terminal verdict recorded, via
-    /// `GoalLedger::tasks_awaiting_terminal_verdict` — and settles only those
-    /// whose restored supervisor row is terminal. Consequences, each
-    /// deliberate:
+    /// enumerates the rows the ledger says a reconcile may still legitimately
+    /// move (`GoalLedger::tasks_open_to_correction`, `authority < 1`) with the
+    /// rank each currently holds, and settles those whose restored supervisor
+    /// row is terminal AND strictly outranks the stored verdict. Consequences,
+    /// each deliberate:
     ///
-    /// - **A settled row is never re-examined.** The `authority < 0` predicate
-    ///   is load-bearing, not an optimisation: the sweep's own rank can be
+    /// - **The cut is by RANK, not by "has a verdict".** Round 2 (H1) — an
+    ///   earlier form of this excluded every existing verdict, which stranded
+    ///   the single most important repair: an observer-provisional failure
+    ///   lands rank 0 and the owner's later completion is EXPLICITLY allowed
+    ///   to displace it, so a completion whose delivery is lost after the
+    ///   JSONL append leaves `failed`/0 in the ledger with no way back.
+    ///   Rank 0 is therefore a candidate; ranks 1 and 2 are not.
+    /// - **A settled row is still never re-examined**, and that exclusion is
+    ///   load-bearing rather than an optimisation: the sweep's own rank can be
     ///   HIGHER than one that already landed (an orphan-swept `Failed` is
     ///   final-failure rank 2, which the strictly-greater rule would admit
     ///   over a completion's rank 1), so the SQL guard alone would not save
-    ///   the row. And that case is not hypothetical — a completion can settle
+    ///   the row. That case is not hypothetical — a completion can settle
     ///   while its JSONL append is lost, leaving the rebuilt row non-terminal
-    ///   for the orphan sweep to reap as `Failed`. Excluding rows that carry
-    ///   any verdict is what makes a supervisor-first regression impossible.
-    ///   The SQL guard still runs underneath and is what keeps a LOWER rank
-    ///   from ever displacing a higher one.
+    ///   for the orphan sweep to reap as `Failed`. Nothing legitimate is lost
+    ///   by refusing to look: within one supervisor the terminal guard forbids
+    ///   completed → failed outright.
+    /// - **The rank comparison happens before the write, too.** A candidate
+    ///   whose restored verdict does not outrank the stored one is skipped
+    ///   entirely rather than issuing a no-op `UPDATE`, so a boot that owes
+    ///   nothing writes nothing.
     /// - **The read-to-write window is the live path's own rule, not a hole.**
     ///   If a verdict lands between the query and the `UPDATE`, the admission
     ///   rule decides — exactly as it would have for the live delivery this
@@ -6485,20 +6552,26 @@ impl InProcessAgentOrchestrator {
     ///   #2020 removed.
     ///
     /// **Cost.** The synchronous part is a scan of the in-memory rebuilt table
-    /// for terminal rows; with none, there is no I/O at all. Otherwise one
-    /// `open_with_busy_retry` plus one `WHERE goal_id = ? AND authority < 0`
-    /// query, scoped to a single goal — and each goal owns its own ledger file
-    /// — followed by one settle per owed row. All of it is offloaded to the
-    /// blocking pool, so nothing lands on the restoring thread. The owed set
-    /// shrinks monotonically: a settled row is stamped with a rank ≥ 0 and can
-    /// never re-enter the query, so the steady state is one empty read.
+    /// for terminal rows; with none there is no further work at all. Otherwise
+    /// one filesystem metadata probe for the ledger file (the only I/O when
+    /// the goal has no ledger — no SQLite open, no write), then one
+    /// `open_with_busy_retry` plus one goal-scoped candidate query, then one
+    /// settle per row whose restored verdict outranks the stored one. All of
+    /// it is offloaded to the blocking pool, so nothing lands on the restoring
+    /// thread. The candidate set shrinks monotonically — a settled row is
+    /// stamped rank 1 or 2 and can never re-enter the query — so the steady
+    /// state is one probe plus one empty read. Note the query is bounded by
+    /// the goal's TOTAL row count, not its candidate count: the available
+    /// index is `(goal_id, status)`, so `goal_id` is served by the index
+    /// prefix and `authority` is a filter over that goal's rows.
     ///
-    /// **Scope limit, stated plainly.** The sweep repairs the CURRENTLY-BOUND
-    /// goal's ledger only. A session whose goal was cleared or replaced leaves
-    /// the previous goal's owed rows unrepaired — there is no binding to
-    /// resolve, so there is nothing to scope a sweep to. Repairing those needs
-    /// an enumeration over `goal-ledgers/` that is not tied to a session
-    /// restore at all, which is a different mechanism from this one.
+    /// **Scope limit, stated plainly.** The sweep repairs the goal BOUND to
+    /// this session, whatever its status (round 2 — a paused or budget-limited
+    /// goal is reconciled; only registration is active-only). A session whose
+    /// goal was cleared or replaced still leaves the previous goal's rows
+    /// unrepaired: the record is gone, so there is nothing to scope a sweep
+    /// to. Repairing those needs an enumeration over `goal-ledgers/` that is
+    /// not tied to a session restore at all, which is a different mechanism.
     pub(crate) fn reconcile_goal_task_rows_after_restore(
         &self,
         profile_data_dir: &Path,
@@ -6533,11 +6606,11 @@ impl InProcessAgentOrchestrator {
     }
 
     /// The blocking half of [`Self::reconcile_goal_task_rows_after_restore`]:
-    /// read the owed set, then re-drive the EXISTING settle path for each row
-    /// this supervisor can vouch for. Nothing here duplicates the settle
-    /// logic — the sweep re-stashes the binding the crashed process lost and
-    /// hands the restored task to `settle_goal_task_row_from_change`, so the
-    /// authority mapping, the FK-parent seeding, the bounded retry, the
+    /// read the candidate set, then re-drive the EXISTING settle path for each
+    /// row this supervisor can vouch for AND outrank. Nothing here duplicates
+    /// the settle logic — the sweep re-stashes the binding the crashed process
+    /// lost and hands the restored task to `settle_goal_task_row_from_change`,
+    /// so the authority mapping, the FK-parent seeding, the bounded retry, the
     /// generation fence, the flight accounting and the binding lifecycle are
     /// all the live path's, unmodified.
     ///
@@ -6556,13 +6629,13 @@ impl InProcessAgentOrchestrator {
         if !ledger_path.exists() {
             // No ledger file ⇒ this goal never recorded a task row ⇒ nothing
             // can be owed. Opening would CREATE the file (and its schema) for
-            // nothing, on every restore.
+            // nothing, on every restore. (One metadata probe, no SQLite open.)
             return;
         }
-        let owed = match octos_fleet::GoalLedger::open_with_busy_retry(&ledger_path)
-            .and_then(|ledger| ledger.tasks_awaiting_terminal_verdict(goal_id))
+        let candidates = match octos_fleet::GoalLedger::open_with_busy_retry(&ledger_path)
+            .and_then(|ledger| ledger.tasks_open_to_correction(goal_id))
         {
-            Ok(owed) => owed,
+            Ok(candidates) => candidates,
             Err(error) => {
                 tracing::debug!(
                     goal_id,
@@ -6573,13 +6646,23 @@ impl InProcessAgentOrchestrator {
             }
         };
         let mut settled = 0usize;
-        for row in owed {
+        for (row, stored_authority) in candidates {
             let Some(task) = terminal.get(&row.task_id) else {
                 // Not this supervisor's task (a nested child supervisor's row,
                 // or one still legitimately running elsewhere). Not ours to
                 // settle.
                 continue;
             };
+            // Round 2 (H1) — the candidate set now includes correctable rank-0
+            // rows, so apply the SAME strictly-greater rule the SQL guard
+            // applies, HERE, before doing any work: a redelivery whose rank
+            // matches what already landed must not even open a write.
+            let Some((authority, _)) = terminal_settle_authority(task) else {
+                continue;
+            };
+            if authority.rank() <= stored_authority {
+                continue;
+            }
             let binding = GoalTaskLedgerBinding::for_task(
                 goal_row.clone(),
                 task,
@@ -20510,6 +20593,195 @@ mod tests {
         assert_eq!(
             row.status, "running",
             "the owed row is left to its owner, not settled behind its back"
+        );
+    }
+
+    /// #2056 round 2 (H1) — a row that already carries the LOWEST verdict is
+    /// still owed a correction. An observer classifies a mid-run signal as
+    /// fatal, so the ledger settles `failed` at provisional rank 0 and KEEPS
+    /// the binding as a correction window. The owner then watches the worker
+    /// finish and calls `mark_completed`, which appends `Completed` to the
+    /// JSONL BEFORE notifying the change feed (`task_supervisor.rs`,
+    /// `persist_snapshot` then `notify_change`) — so a crash in that gap
+    /// leaves the durable supervisor state saying completed and the ledger
+    /// saying `failed`/0, with the correction lost.
+    ///
+    /// This is the exact stranded delivery this feature exists to repair, and
+    /// it is the reason the sweep cannot exclude every existing verdict: rank
+    /// 0 is legitimately displaceable (`sqlite_ledger.rs` pins completion over
+    /// a provisional verdict), while ranks 1 and 2 are not.
+    #[test]
+    fn should_settle_a_provisional_row_when_the_restored_verdict_is_a_completion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-provisional";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-provisional");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let jsonl = dir.path().join("tasks.jsonl");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        supervisor.enable_persistence(&jsonl).expect("persistence");
+        let task_id = supervisor.register("web_probe", "call-2056-prov", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed_observed(&task_id, "harness classified a mid-run error".to_owned());
+
+        {
+            let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+            assert_eq!(
+                ledger.task_authority(&task_id).expect("authority"),
+                Some(octos_fleet::TaskSettleAuthority::ProvisionalFailure.rank()),
+                "precondition: the observer verdict landed at provisional rank",
+            );
+            assert!(
+                default_agent_orchestrator().goal_task_binding_exists_for_test(&task_id),
+                "precondition: a provisional failure retains its correction window",
+            );
+        }
+
+        // The owner's correction is appended to the JSONL and then lost with
+        // the process before the ledger notification is delivered.
+        simulate_process_restart_losing_binding(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+        {
+            let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+            let row = ledger.get_task(&task_id).expect("read row").expect("row");
+            assert_eq!(
+                row.status, "failed",
+                "precondition: the correction never reached the ledger",
+            );
+        }
+
+        let rebooted = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&rebooted, &wire, profile, dir.path());
+        rebooted.enable_persistence(&jsonl).expect("persistence");
+
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "complete",
+            "the boot reconcile must repair a lost provisional→completion correction"
+        );
+        assert_eq!(
+            ledger.task_authority(&task_id).expect("authority"),
+            Some(octos_fleet::TaskSettleAuthority::Completion.rank()),
+        );
+    }
+
+    /// #2056 round 2 (H2a) — the sweep must survive a restore that happens
+    /// BEFORE the observers are wired. The cached session supervisor is
+    /// enabled by whichever request touches it first, and some of those sites
+    /// install only their own listener; a later wiring re-enables the SAME
+    /// path, which returns at `enable_persistence`'s idempotence guard, so a
+    /// restore-driven sweep would never fire for that supervisor again.
+    /// Installing the restore observer therefore delivers a restore that has
+    /// already happened and was not observed.
+    #[test]
+    fn should_reconcile_when_the_restore_happened_before_the_observers_were_wired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-late-wire";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-late-wire");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let jsonl = dir.path().join("tasks.jsonl");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        supervisor.enable_persistence(&jsonl).expect("persistence");
+        let task_id = supervisor.register("web_probe", "call-2056-late", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        simulate_process_restart_losing_binding(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+
+        // Reboot in the hostile order: restore first, wire second.
+        let rebooted = octos_agent::TaskSupervisor::new();
+        rebooted.enable_persistence(&jsonl).expect("persistence");
+        wire_supervisor_for_goal_task_rows(&rebooted, &wire, profile, dir.path());
+
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "complete",
+            "wiring the observers after the restore must still deliver the sweep"
+        );
+
+        // And the delivery is not repeated: re-wiring on every point of use
+        // (the cached-supervisor idiom) must not re-run the sweep.
+        let attempts = goal_task_settle_attempts_for(&task_id);
+        wire_supervisor_for_goal_task_rows(&rebooted, &wire, profile, dir.path());
+        assert_eq!(
+            goal_task_settle_attempts_for(&task_id),
+            attempts,
+            "a repeat wiring must not re-deliver an already-observed restore"
+        );
+    }
+
+    /// #2056 round 2 (H2b) — restore goal resolution must NOT inherit the
+    /// registration path's active-only filter. `active_goal_id` rejects every
+    /// paused / blocked / budget-limited / complete goal, and `budget_limited`
+    /// is a normal state a goal sits in for the rest of its life. Registration
+    /// is right to refuse it (no new work is being recorded); reconciliation
+    /// is not — the rows are already there and still wrong.
+    #[test]
+    fn should_reconcile_when_the_bound_goal_is_not_active() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-taskrows-nonactive";
+        let wire = SessionKey::with_profile(profile, "api", "goal-task-rows-nonactive");
+        let orchestrator = default_agent_orchestrator();
+        seed_goal(orchestrator, &wire, profile);
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+        let jsonl = dir.path().join("tasks.jsonl");
+        let ledger_path = goal_task_ledger_path(dir.path(), &goal_id);
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&supervisor, &wire, profile, dir.path());
+        supervisor.enable_persistence(&jsonl).expect("persistence");
+        let task_id = supervisor.register("web_probe", "call-2056-budget", Some(&wire.to_string()));
+        supervisor.mark_running(&task_id);
+        simulate_process_restart_losing_binding(&task_id);
+        supervisor.mark_completed(&task_id, vec![]);
+
+        // The goal exhausts its budget and freezes there — same goal id.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: wire.clone(),
+                profile_id: profile.to_owned(),
+                objective: "ship the thing".to_owned(),
+                status: Some("budget_limited".to_owned()),
+                token_budget: Some(1_000_000),
+                transition_actor: None,
+            })
+            .expect("freeze the goal at budget_limited");
+        assert_eq!(
+            orchestrator.goal_status_for_test(&wire).as_deref(),
+            Some("budget_limited"),
+            "precondition: the goal is no longer active",
+        );
+        assert_eq!(
+            orchestrator.goal_id_for_test(&wire).as_deref(),
+            Some(goal_id.as_str()),
+            "precondition: the status change kept the same goal id",
+        );
+        assert!(
+            orchestrator.active_goal_id(&wire, profile).is_none(),
+            "precondition: the registration resolver refuses a non-active goal",
+        );
+
+        let rebooted = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&rebooted, &wire, profile, dir.path());
+        rebooted.enable_persistence(&jsonl).expect("persistence");
+
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger.get_task(&task_id).expect("read row").expect("row");
+        assert_eq!(
+            row.status, "complete",
+            "a budget-limited goal's stranded rows must still be reconciled"
         );
     }
 

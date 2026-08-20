@@ -938,6 +938,16 @@ pub struct TaskSupervisor {
     /// runtime wires the goal-ledger reconciliation sweep here, next to the
     /// registration observer above.
     on_restore: Arc<Mutex<Option<OnRestoreCallback>>>,
+    /// #2056 round 2 — set when a restore completed with NO restore observer
+    /// wired, so installing one later still delivers it. The cached session
+    /// supervisor is enabled by whichever request touches it first, and some
+    /// of those sites install only their own listener; the later wiring
+    /// re-enables the SAME path, which returns at the idempotence guard in
+    /// [`Self::enable_persistence`] — so without this the missed restore could
+    /// never be delivered to that supervisor at all. Cleared by the delivery,
+    /// so re-installing an observer (the cached-supervisor idiom re-wires at
+    /// every point of use) does not re-deliver.
+    restore_undelivered: Arc<AtomicBool>,
     on_relaunch: Arc<Mutex<Option<OnRelaunchCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
     /// Optional reporter that receives a [`ProgressEvent::ToolProgress`]
@@ -1279,6 +1289,7 @@ impl TaskSupervisor {
             on_terminal: Arc::new(Mutex::new(None)),
             on_register: Arc::new(Mutex::new(None)),
             on_restore: Arc::new(Mutex::new(None)),
+            restore_undelivered: Arc::new(AtomicBool::new(false)),
             on_relaunch: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
             progress_reporter: Arc::new(Mutex::new(None)),
@@ -1578,6 +1589,11 @@ impl TaskSupervisor {
     /// rebuilt table. The callback is cloned out of its mutex and the task map
     /// snapshot taken before invocation, so the observer runs with NO
     /// supervisor lock held and may safely re-enter the supervisor.
+    ///
+    /// Round 2 (#2056) — with NO observer wired the restore is recorded as
+    /// undelivered rather than dropped, so a later [`Self::set_on_restore`]
+    /// still receives it. See that method for why the alternative (waiting for
+    /// the next restore) never happens on a shared supervisor.
     fn notify_restore(&self) {
         let callback = self
             .on_restore
@@ -1585,6 +1601,7 @@ impl TaskSupervisor {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let Some(callback) = callback else {
+            self.restore_undelivered.store(true, Ordering::Release);
             return;
         };
         let snapshot: Vec<BackgroundTask> = {
@@ -1673,9 +1690,28 @@ impl TaskSupervisor {
     /// consumer that mirrors task state into the goal ledger gets a chance to
     /// reconcile deliveries the previous process never made. The latest
     /// observer wins.
+    /// Round 2 (#2056) — if a restore already happened on this supervisor
+    /// while no observer was wired, the observer is invoked IMMEDIATELY with
+    /// the current table. Without that, a site that enables persistence before
+    /// the observers are installed loses the sweep permanently: the later
+    /// wiring re-enables the SAME path and returns at
+    /// [`Self::enable_persistence`]'s idempotence guard, so no further restore
+    /// is ever notified. The pending flag is taken with a compare-exchange and
+    /// cleared by the delivery, so exactly one installer delivers it and a
+    /// re-install (the cached-supervisor idiom re-wires at every point of use)
+    /// does not re-run it.
     pub fn set_on_restore(&self, cb: impl Fn(&[BackgroundTask]) + Send + Sync + 'static) {
-        let mut guard = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Arc::new(cb));
+        {
+            let mut guard = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(Arc::new(cb));
+        }
+        if self
+            .restore_undelivered
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.notify_restore();
+        }
     }
 
     /// #2055 review round 2 — copy the REGISTRATION observers from `parent`
