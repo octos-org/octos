@@ -248,11 +248,15 @@ fn cmd_add(
             deliver,
             channel,
             chat_id: to,
+            mode: Default::default(),
         },
         state: Default::default(),
         created_at_ms: now_ms,
         delete_after_run,
         timezone: None,
+        // Made from the CLI by a person, so there is no loop to attribute it to
+        // and nothing should ever reap it automatically.
+        origin: Default::default(),
     };
     job.compute_next_run(now_ms);
 

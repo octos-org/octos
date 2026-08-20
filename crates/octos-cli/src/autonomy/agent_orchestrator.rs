@@ -1756,6 +1756,13 @@ impl InProcessAgentOrchestrator {
     /// #1857 PR 4a — install the durable fleet-kernel store (opened async at
     /// serve boot). Mirrors `configure_supervisor_store`; the fleet outbox
     /// consumer (`autonomy::fleet_wake`) drives its drain against this orchestrator.
+    /// Install the profile's cron service so `loop/delete` can reap the cron
+    /// jobs that loop created. Mirrors [`Self::set_fleet_store`]; called at
+    /// serve boot, absent everywhere else.
+    pub(crate) fn set_cron_service(&self, service: std::sync::Arc<octos_bus::CronService>) {
+        let mut state = self.state();
+        state.cron_service = Some(service);
+    }
     pub(crate) fn set_fleet_store(&self, store: FleetKernelStore) {
         let mut state = self.state();
         state.fleet_store = Some(store);
@@ -9529,6 +9536,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     fn control_loop(&self, request: LoopControlRequest) -> Result<Value, RpcError> {
         let mut state = self.state();
         let supervisor_store = state.supervisor_store.clone();
+        // Cloned before the &mut borrow of `state.loops` below.
+        let cron_service = state.cron_service.clone();
         let Some(loop_record) = state.loops.get_mut(&request.loop_id) else {
             return Err(autonomy_error(
                 kinds::LOOP_NOT_FOUND,
@@ -9563,12 +9572,31 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 loop_record.status = "deleted".into();
                 loop_record.updated_at_ms = now;
                 persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
+                // Reap the cron jobs this loop created. Without it they keep
+                // firing forever with nothing left that wants them, and — since
+                // an agent job costs a model turn per fire — a 5s schedule bills
+                // 17k turns a day to answer a message no one reads.
+                //
+                // Reaped ids are reported so a client can say what went with the
+                // loop rather than silently deleting the user's schedules.
+                let reaped = cron_service
+                    .as_ref()
+                    .map(|svc| svc.remove_jobs_for_loop(&request.loop_id))
+                    .unwrap_or_default();
+                if !reaped.is_empty() {
+                    tracing::info!(
+                        loop_id = %request.loop_id,
+                        count = reaped.len(),
+                        "reaped cron jobs belonging to deleted loop"
+                    );
+                }
                 Ok(json!({
                     "loop_id": loop_record.loop_id,
                     "session_id": loop_record.session_id,
                     "deleted": true,
                     "ok": true,
                     "status": loop_record.status,
+                    "reaped_cron_job_ids": reaped,
                     "loop": autonomy_loop_json(loop_record)
                 }))
             }
@@ -10979,6 +11007,11 @@ struct AutonomyRuntimeState {
     /// it against `continuations`. `None` until `set_fleet_store` (never wired
     /// on the chat/gateway boot paths, which have no fleet kernel).
     fleet_store: Option<FleetKernelStore>,
+    /// Cron service for the profile, when serve installed one. Used to reap a
+    /// deleted loop's cron jobs. `None` in tests and in-process orchestrators
+    /// that never stood one up — the reap is then a no-op, never an error.
+    ///
+    cron_service: Option<std::sync::Arc<octos_bus::CronService>>,
     /// #1857 PR 5a — live fleet worker pool the goal keeper dispatches ready
     /// tasks onto (`model_dispatch_fleet`). Installed at serve boot from the
     /// keeper profile's `ProfileRuntime` (`set_fleet_pool`); `None` on the
