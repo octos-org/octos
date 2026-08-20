@@ -17063,13 +17063,110 @@ fn ledger_event_matches_topic_scope(
     }
 }
 
+/// #2067 — a durable event that names a profile must reach ONLY connections
+/// resolved to that profile. This filter runs at all three delivery boundaries
+/// (the `replay.retain` in `open_session_result`, the session/open replay send
+/// loop, and the live forwarder pump), so a variant it does not recognise
+/// leaks across tenants on every shared/unprofiled wire session key — which is
+/// exactly what `session/goal/updated` and `session/goal/cleared` did — and
+/// what the `loop/*` and `monitor/*` frames beside them did, since all of them
+/// are appended DURABLY by the same `record_autonomy_rpc_evidence` ->
+/// `send_notification_durable` dispatch and all of them carry tenant text
+/// (goal objective, loop prompt, monitor argv/name).
+///
+/// `profile_id` is the connection's RESOLVED scope and is always a concrete
+/// string — [`WsConnection`] seeds [`MAIN_PROFILE_ID`] and `session/open`
+/// overwrites it with `open_session_result`'s
+/// `active_profile_id.unwrap_or(MAIN_PROFILE_ID)`. `_main` is therefore a real
+/// scope on both sides of the wire, NOT a wildcard: the emitters normalize the
+/// same way (`resolve_autonomy_profile_id` returns `_main` for an unprofiled
+/// deployment), and treating an unscoped connection as "authorized for any
+/// profile" is deployment-dependent — see the KNOWN LIMITATION on the
+/// interactive goal-charge binding.
+///
+/// Every arm below prefers the event's top-level stamp and falls back to the
+/// profile on the record it carries. The fallback is not cosmetic: the
+/// `loop/pause`, `loop/resume` and `loop/delete` results omit the top-level
+/// `profile_id` entirely (see `AgentOrchestrator::control_loop`) and only the
+/// nested `loop` record names the owner. A fallback can only ever NARROW an
+/// event's audience, never widen it.
 fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id: &str) -> bool {
-    match event {
-        UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(update)) => {
-            update.profile_id == profile_id
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return true;
+    };
+    match notification {
+        UiNotification::SkillActionJobUpdated(update) => update.profile_id == profile_id,
+        // The goal chip's reducers are session-keyed and apply `updated`
+        // unconditionally, so a foreign profile's objective/budget would paint
+        // straight into this connection's chip.
+        UiNotification::SessionGoalUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.goal.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::SessionGoalCleared(cleared) => optional_profile_scope_matches(
+            cleared.profile_id.as_deref().or_else(|| {
+                cleared
+                    .goal
+                    .as_ref()
+                    .and_then(|goal| goal.profile_id.as_deref())
+            }),
+            profile_id,
+        ),
+        UiNotification::LoopUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.loop_state.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::LoopFired(fired) => optional_profile_scope_matches(
+            fired.profile_id.as_deref().or_else(|| {
+                fired
+                    .loop_state
+                    .as_ref()
+                    .and_then(|loop_state| loop_state.profile_id.as_deref())
+            }),
+            profile_id,
+        ),
+        UiNotification::MonitorUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.monitor_state.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::MonitorFired(fired) => {
+            optional_profile_scope_matches(fired.profile_id.as_deref(), profile_id)
         }
         _ => true,
     }
+}
+
+/// #2067 — compare an OPTIONAL wire profile id against a connection's resolved
+/// scope.
+///
+/// `event_profile_id` is the result of the caller's top-level-then-nested
+/// fallback, so a `None` here means the frame names no profile ANYWHERE. That
+/// is a LEGACY row: the field is `skip_serializing_if = "Option::is_none"`, and
+/// every current producer stamps a concrete id somewhere on the frame
+/// (`resolve_autonomy_profile_id` never returns an empty or absent id, and the
+/// stored `AutonomyGoalRecord` / `AutonomyLoopRecord` / `AutonomyMonitorRecord`
+/// hold a non-optional `profile_id`), so a fully unstamped frame can only have
+/// been persisted by a backend that predates the stamp. Only an
+/// unprofiled/single-tenant deployment could have produced one, and every
+/// connection there resolves to `_main` — so normalizing `None` to `_main` is
+/// lossless exactly where such rows exist, while still refusing to hand a
+/// legacy row to a real tenant. An empty/whitespace id normalizes the same way
+/// rather than becoming an accidental wildcard.
+fn optional_profile_scope_matches(event_profile_id: Option<&str>, profile_id: &str) -> bool {
+    event_profile_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(MAIN_PROFILE_ID)
+        == profile_id
 }
 
 fn stdio_session_open_candidate_profile(
