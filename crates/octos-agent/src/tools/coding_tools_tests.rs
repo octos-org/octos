@@ -2641,3 +2641,187 @@ fn should_declare_element_schema_when_spawn_agent_items_is_array() {
     assert!(items["items"]["properties"]["type"].is_object());
     assert!(items["items"]["properties"]["text"].is_object());
 }
+
+// ---------------------------------------------------------------------------
+// Sandbox-denial escalation
+// ---------------------------------------------------------------------------
+
+/// Stands in for a confining backend that refuses everything: whatever command
+/// it is handed, the child prints the denial a real seatbelt/Landlock child
+/// would print and exits 0 — the exact shape that used to reach the model
+/// unnoticed.
+struct DenyingSandbox;
+
+impl Sandbox for DenyingSandbox {
+    fn wrap_command(&self, _shell_command: &str, cwd: &Path) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo 'ls: ../blocked: Operation not permitted'")
+            .current_dir(cwd);
+        cmd
+    }
+}
+
+/// Records the prompt it was shown and answers with a fixed decision.
+struct ScriptedApprover {
+    decision: ToolApprovalDecision,
+    seen: std::sync::Mutex<Vec<ToolApprovalRequest>>,
+}
+
+impl ScriptedApprover {
+    fn new(decision: ToolApprovalDecision) -> Arc<Self> {
+        Arc::new(Self {
+            decision,
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl crate::tools::ToolApprovalRequester for ScriptedApprover {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        self.seen.lock().unwrap().push(request);
+        self.decision
+    }
+}
+
+fn exec_tool_with(sandbox: Arc<dyn Sandbox>) -> (ExecCommandTool, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = ExecCommandTool::new(dir.path().to_path_buf(), sandbox);
+    (tool, dir)
+}
+
+#[tokio::test]
+async fn approved_escalation_reruns_the_command_outside_the_sandbox() {
+    let (tool, _dir) = exec_tool_with(Arc::new(DenyingSandbox));
+    let approver = ScriptedApprover::new(ToolApprovalDecision::Approve);
+    let requester: Arc<dyn crate::tools::ToolApprovalRequester> = approver.clone();
+
+    let result = TOOL_APPROVAL_CTX
+        .scope(
+            requester,
+            tool.execute(&json!({ "cmd": "echo escalated-ok" })),
+        )
+        .await
+        .expect("execute should succeed");
+
+    // The re-run is unconfined, so the real command finally runs.
+    assert!(
+        result.output.contains("escalated-ok"),
+        "approved escalation should report the unconfined output; got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("outside the sandbox"),
+        "the model must be told the run was escalated; got: {}",
+        result.output
+    );
+    assert!(result.success);
+
+    let seen = approver.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "exactly one prompt per denied command");
+    assert!(
+        seen[0].body.contains("Operation not permitted"),
+        "prompt should quote what was refused; got: {}",
+        seen[0].body
+    );
+    assert_eq!(seen[0].command.as_deref(), Some("echo escalated-ok"));
+}
+
+#[tokio::test]
+async fn denied_escalation_keeps_the_original_output_and_says_so() {
+    let (tool, _dir) = exec_tool_with(Arc::new(DenyingSandbox));
+    let approver = ScriptedApprover::new(ToolApprovalDecision::Deny);
+    let requester: Arc<dyn crate::tools::ToolApprovalRequester> = approver.clone();
+
+    let result = TOOL_APPROVAL_CTX
+        .scope(
+            requester,
+            tool.execute(&json!({ "cmd": "echo escalated-ok" })),
+        )
+        .await
+        .expect("execute should succeed");
+
+    assert!(
+        result.output.contains("Operation not permitted"),
+        "the original denial must survive; got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("declined"),
+        "the model must learn the retry was refused so it stops trying; got: {}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("escalated-ok"),
+        "a denied escalation must not run the command; got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn unconfined_runs_never_prompt() {
+    // Under NoSandbox an EPERM is a real filesystem error, not a policy
+    // decision — prompting would be noise, and re-running changes nothing.
+    let (tool, _dir) = exec_tool_with(Arc::new(NoSandbox));
+    let approver = ScriptedApprover::new(ToolApprovalDecision::Approve);
+    let requester: Arc<dyn crate::tools::ToolApprovalRequester> = approver.clone();
+
+    let result = TOOL_APPROVAL_CTX
+        .scope(
+            requester,
+            tool.execute(&json!({
+                "cmd": "echo 'ls: /x: Operation not permitted'"
+            })),
+        )
+        .await
+        .expect("execute should succeed");
+
+    assert!(result.output.contains("Operation not permitted"));
+    assert!(
+        approver.seen.lock().unwrap().is_empty(),
+        "no sandbox in force means no escalation prompt",
+    );
+}
+
+#[tokio::test]
+async fn clean_confined_output_never_prompts() {
+    struct QuietSandbox;
+    impl Sandbox for QuietSandbox {
+        fn wrap_command(&self, shell_command: &str, cwd: &Path) -> tokio::process::Command {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(shell_command).current_dir(cwd);
+            cmd
+        }
+    }
+
+    let (tool, _dir) = exec_tool_with(Arc::new(QuietSandbox));
+    let approver = ScriptedApprover::new(ToolApprovalDecision::Approve);
+    let requester: Arc<dyn crate::tools::ToolApprovalRequester> = approver.clone();
+
+    let result = TOOL_APPROVAL_CTX
+        .scope(requester, tool.execute(&json!({ "cmd": "echo fine" })))
+        .await
+        .expect("execute should succeed");
+
+    assert!(result.output.contains("fine"));
+    assert!(
+        approver.seen.lock().unwrap().is_empty(),
+        "a command that was never refused must not prompt",
+    );
+}
+
+#[tokio::test]
+async fn non_interactive_runs_fall_back_to_todays_behaviour() {
+    // No TOOL_APPROVAL_CTX in scope: cron fires and headless runs have nobody
+    // to ask, and must not hang or fail differently than before.
+    let (tool, _dir) = exec_tool_with(Arc::new(DenyingSandbox));
+
+    let result = tool
+        .execute(&json!({ "cmd": "echo escalated-ok" }))
+        .await
+        .expect("execute should succeed");
+
+    assert!(result.output.contains("Operation not permitted"));
+    assert!(!result.output.contains("escalated-ok"));
+}

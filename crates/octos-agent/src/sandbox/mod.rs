@@ -4,6 +4,7 @@
 //! sandbox-exec on macOS, AppContainer on Windows, or no sandbox (pass-through).
 
 mod bwrap;
+mod denial;
 mod docker;
 #[cfg(target_os = "linux")]
 mod landlock;
@@ -12,6 +13,7 @@ mod macos;
 mod windows;
 
 pub use bwrap::BwrapSandbox;
+pub use denial::{SandboxDenial, detect_sandbox_denials};
 pub use docker::DockerSandbox;
 #[cfg(target_os = "linux")]
 pub use landlock::LinuxContainerSandbox;
