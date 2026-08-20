@@ -12947,7 +12947,7 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("alpha"),
-        None,
+        Some("alpha"),
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -13036,7 +13036,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
         &questions,
         &forwarders,
         Some("alpha"),
-        None,
+        Some("alpha"),
         ConnectionUiFeatures::default(),
         "open-alpha".into(),
         SessionOpenParams {
@@ -13100,13 +13100,18 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
-/// #2067 compatibility: an unprofiled connection resolves to `_main`
-/// (`WsConnection::new` seeds `MAIN_PROFILE_ID`; `open_session_result` returns
-/// `active_profile_id.unwrap_or(MAIN_PROFILE_ID)`), and every goal emitter
-/// stamps `_main` explicitly for an unprofiled deployment. A LEGACY row that
-/// predates the stamp carries no `profile_id` at all — it must normalize to
-/// `_main` so single-tenant deployments keep every frame they have today,
-/// while a genuinely foreign profile is still dropped.
+/// #2067 compatibility: an unprofiled connection must keep every frame it has
+/// today. It resolves to `_main`, every goal emitter stamps `_main` explicitly
+/// for an unprofiled deployment, and a LEGACY row predating the stamp carries
+/// no `profile_id` at all.
+///
+/// Such a connection is also not FILTERED at all — it has no frozen profile
+/// pin, so its session scope is not a tenant boundary (see
+/// `ledger_event_matches_profile_scope`) — which is why the foreign frame below
+/// is delivered too. That costs no isolation: an unscoped connection is an
+/// admin/operator authorized for every profile. The isolation guarantee lives
+/// on authenticated connections, pinned by the `should_drop_cross_profile_*`
+/// tests.
 #[tokio::test]
 async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -13170,13 +13175,17 @@ async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled
     let frames = drain_session_open_frames(&mut rx).await;
     assert_eq!(
         replayed_goal_objectives(&frames),
-        vec!["main objective".to_owned(), "legacy objective".to_owned()],
-        "a `_main` connection keeps both `_main` and legacy unstamped goal frames"
+        vec![
+            "main objective".to_owned(),
+            "legacy objective".to_owned(),
+            "beta secret objective".to_owned(),
+        ],
+        "an unfiltered connection keeps `_main`, legacy unstamped AND foreign goal frames"
     );
     assert_eq!(
         replayed_cleared_profiles(&frames),
         vec![Value::Null],
-        "a legacy `session/goal/cleared` with no profile must still reach `_main`"
+        "a legacy `session/goal/cleared` with no profile must still be replayed"
     );
 
     // Live forwarder: same compatibility contract on the live path.
@@ -13191,20 +13200,26 @@ async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled
         "legacy live objective",
     ));
 
-    let live = next_frame_within(&mut rx, 2_000)
-        .await
-        .expect("a legacy live goal frame must still reach a `_main` connection");
+    let mut live_objectives: Vec<String> = Vec::new();
+    while let Some(frame) = next_frame_within(&mut rx, 500).await {
+        if frame.get("method").and_then(Value::as_str)
+            == Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED)
+        {
+            live_objectives.push(
+                frame["params"]["goal"]["objective"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        }
+    }
     assert_eq!(
-        live.get("method").and_then(Value::as_str),
-        Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED),
-    );
-    assert_eq!(
-        live["params"]["goal"]["objective"],
-        json!("legacy live objective")
-    );
-    assert!(
-        next_frame_within(&mut rx, 250).await.is_none(),
-        "profile-b's live goal frame must not reach a `_main` connection"
+        live_objectives,
+        vec![
+            "beta live objective".to_owned(),
+            "legacy live objective".to_owned(),
+        ],
+        "the live path applies the same no-filter contract as replay"
     );
 
     abort_live_forwarders(&forwarders, &ledger).await;
@@ -13341,7 +13356,7 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
         &questions,
         &forwarders,
         Some("alpha"),
-        None,
+        Some("alpha"),
         ConnectionUiFeatures::default(),
         "open-alpha-autonomy".into(),
         SessionOpenParams {
@@ -13450,107 +13465,95 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
-/// #2067 round 2 (H2) — the live forwarder's profile scope must be captured
-/// PER FORWARDER, exactly like `topic_scope`.
+/// #2067 round 2 (H2) — a forwarder's profile scope must be captured PER
+/// FORWARDER, exactly like `topic_scope`.
 ///
-/// `WsConnection` holds ONE shared `live_profile_id` cell, every successful
-/// `session/open` overwrites it, and a connection keeps one forwarder PER
-/// SESSION. An unscoped/admin connection that opens session A under profile A
-/// and then session B under profile B therefore rewrites the scope that A's
-/// already-running forwarder observes — starving session A of every
-/// profile-carrying frame from that moment on. Reading the connection-wide
-/// mutable cell inside the pump is the defect; the fix is to capture the
-/// resolved profile at spawn time.
+/// The pump originally read a single `live_profile_id` cell on `WsConnection`
+/// that every `session/open` overwrote, while a connection keeps one forwarder
+/// PER SESSION — so opening a second session under another profile retargeted
+/// the first session's pump. The scope is now a `spawn_live_forwarder`
+/// parameter, owned by the spawned task.
+///
+/// Driven at the forwarder boundary because that is where the invariant lives:
+/// round 4 made an unscoped connection non-filterable, and an AUTHENTICATED
+/// connection forces every session it opens to the one frozen profile, so no
+/// `session/open` sequence can exhibit two live scopes on one connection any
+/// more. The invariant still has to hold — it becomes load-bearing again the
+/// moment the scope-resolution divergence in #2081 is closed.
 #[tokio::test]
-async fn should_keep_delivering_first_session_frames_when_a_second_session_opens_another_profile() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let state = local_profile_state_with_sessions(temp.path());
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Alpha Owner", "alpha", "alpha@example.com"),
-    )
-    .expect("create alpha profile");
-    create_or_get_local_solo_profile(
-        &state,
-        local_profile_params("Beta Owner", "beta", "beta@example.com"),
-    )
-    .expect("create beta profile");
-
-    // An UNSCOPED (admin) connection: `connection_profile_id` is `None`, so
-    // each `session/open` may name its own profile.
+async fn should_scope_each_forwarder_independently_when_one_connection_pumps_two_profiles() {
     let (ws, mut rx) = ws_connection_for_test(64);
     let ledger = Arc::new(UiProtocolLedger::new(64));
-    let approvals = PendingApprovalStore::default();
-    let questions = PendingQuestionStore::default();
     let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let session_alpha = SessionKey("web-alpha-session".into());
     let session_beta = SessionKey("web-beta-session".into());
 
-    for (session_id, profile_id, rpc_id) in [
-        (&session_alpha, "alpha", "open-alpha"),
-        (&session_beta, "beta", "open-beta"),
-    ] {
-        let opened = handle_session_open(
-            &ws,
-            &state,
-            &ledger,
-            &approvals,
-            &questions,
-            &forwarders,
-            None,
-            None,
+    for (session_id, profile_id) in [(&session_alpha, "alpha"), (&session_beta, "beta")] {
+        let live_rx = ledger.subscribe(session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
             ConnectionUiFeatures::default(),
-            rpc_id.into(),
-            SessionOpenParams {
-                session_id: session_id.clone(),
-                topic: None,
-                profile_id: Some(profile_id.into()),
-                cwd: None,
-                sandbox: None,
-                after: Some(UiCursor {
-                    stream: session_id.0.clone(),
-                    seq: 0,
-                }),
-            },
-            false,
+            None,
+            Some(profile_id.to_owned()),
+            live_rx,
+            forwarders.clone(),
         )
         .await;
-        assert!(opened, "{profile_id} session must open");
-        drain_session_open_frames(&mut rx).await;
     }
 
-    // Session A's forwarder is still installed and still owns profile alpha —
-    // opening session B under profile beta must not have retargeted it.
+    // Each forwarder keeps its OWN scope: the second spawn must not retarget
+    // the first, in either direction.
     ledger.append_notification(goal_updated_notification(
         &session_alpha,
         Some("alpha"),
         "alpha objective",
     ));
-
-    let live = next_frame_within(&mut rx, 2_000).await.expect(
-        "session A's forwarder must still deliver alpha's goal frames after session B opened \
-         under another profile",
-    );
-    assert_eq!(
-        live.get("method").and_then(Value::as_str),
-        Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED),
-    );
-    assert_eq!(live["params"]["session_id"], json!(session_alpha.0));
-    assert_eq!(
-        live["params"]["goal"]["objective"],
-        json!("alpha objective")
-    );
-
-    // …and session B's forwarder is still scoped to beta: an alpha-owned frame
-    // on B's stream stays out.
+    ledger.append_notification(goal_updated_notification(
+        &session_beta,
+        Some("beta"),
+        "beta objective",
+    ));
+    // …and each still rejects the other's profile on its own stream.
+    ledger.append_notification(goal_updated_notification(
+        &session_alpha,
+        Some("beta"),
+        "beta objective on alpha's session",
+    ));
     ledger.append_notification(goal_updated_notification(
         &session_beta,
         Some("alpha"),
         "alpha objective on beta's session",
     ));
-    assert!(
-        next_frame_within(&mut rx, 250).await.is_none(),
-        "session B's forwarder must still reject alpha-owned frames"
+
+    let mut delivered: Vec<(String, String)> = Vec::new();
+    while let Some(frame) = next_frame_within(&mut rx, 500).await {
+        if frame.get("method").and_then(Value::as_str)
+            == Some(octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED)
+        {
+            delivered.push((
+                frame["params"]["session_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                frame["params"]["goal"]["objective"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ));
+        }
+    }
+    delivered.sort();
+    assert_eq!(
+        delivered,
+        vec![
+            (session_alpha.0.clone(), "alpha objective".to_owned()),
+            (session_beta.0.clone(), "beta objective".to_owned()),
+        ],
+        "each forwarder must apply its own captured scope, not a shared one"
     );
 
     abort_live_forwarders(&forwarders, &ledger).await;
@@ -13615,7 +13618,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         &questions,
         &forwarders,
         Some("alpha"),
-        None,
+        Some("alpha"),
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
         SessionOpenParams {
@@ -13732,7 +13735,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         &questions,
         &forwarders,
         Some("alpha"),
-        None,
+        Some("alpha"),
         features,
         "open-alpha-activity".into(),
         SessionOpenParams {
@@ -13807,6 +13810,11 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
 /// frames those records later emit are stamped `beta`, so a `_main` filter
 /// drops the connection's OWN data.
 ///
+/// Round 4 generalised the guard: an unscoped connection has no frozen profile
+/// pin at all, however it was routed, so it is never filtered. This case is
+/// what motivated that guard, and it still pins it across three variants at
+/// once.
+///
 /// `background/activity` is the worst case: its sink appends over a detached
 /// connection whose writer is discarded, so replay and live forwarding are its
 /// only delivery paths — a filter drop there is total.
@@ -13873,10 +13881,11 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
         &approvals,
         &questions,
         &forwarders,
-        // admin / unscoped …
+        // Admin / unscoped: no authenticated profile …
         None,
-        // … but routed to `beta` by subdomain or header.
-        Some("beta"),
+        // … and therefore no frozen profile pin either, however the connection
+        // was routed. The WS handler passes `connection_profile_id` for both.
+        None,
         features,
         "open-routed-admin".into(),
         SessionOpenParams {
@@ -13923,6 +13932,175 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
         Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
     );
     assert_eq!(live["params"]["text"], json!("live log line"));
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 4 — an UNSCOPED connection's per-session scope diverges from the
+/// profile its own turns run under, with no routing header involved.
+///
+/// `session_open_profile_id` is a single per-connection cell overwritten by
+/// every successful open, and every later `turn/start` — including one on an
+/// EARLIER session — receives that latest value and selects that runtime. So:
+/// open bare A (resolves `_main`), open bare B as `beta`, then run a turn on A.
+/// A's forwarder still holds `_main` while the turn runs under `beta`, and a
+/// monitor the model creates in that turn is stamped `beta`
+/// (`runtime/profile.rs` -> `goal_tool.rs`). The turn misrouting is pre-existing;
+/// the DELIVERY DROP is not — it exists only because the frame is filtered.
+///
+/// `background/activity` is the worst case: its sink appends over a detached
+/// connection whose writer is discarded, so replay and live fan-out are its
+/// only delivery paths and the drop is total.
+#[tokio::test]
+async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_two_sessions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_a = SessionKey("web-two-open-a".into());
+    let session_b = SessionKey("web-two-open-b".into());
+    let features = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+
+    let beta_activity = |text: &str| {
+        UiNotification::BackgroundActivity(octos_core::ui_protocol::BackgroundActivityEvent {
+            session_id: session_a.clone(),
+            profile_id: Some("beta".to_owned()),
+            origin_kind: "monitor".to_owned(),
+            origin_id: "monitor-model-made".to_owned(),
+            origin_label: Some("ci-tail".to_owned()),
+            text: text.to_owned(),
+            emitted_at_ms: 1_760_000_000_000,
+            dropped_count: None,
+            suppressed: false,
+        })
+    };
+
+    // No routing header anywhere: this connection is plain unscoped.
+    let open = |session_id: SessionKey, profile_id: Option<&str>, rpc_id: &str| {
+        let params = SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: profile_id.map(ToOwned::to_owned),
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        };
+        (params, rpc_id.to_owned())
+    };
+
+    let (params_a, id_a) = open(session_a.clone(), None, "open-a");
+    assert!(
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &forwarders,
+            None,
+            None,
+            features,
+            id_a,
+            params_a,
+            false,
+        )
+        .await,
+        "bare session A must open on an unscoped connection"
+    );
+    drain_session_open_frames(&mut rx).await;
+
+    let (params_b, id_b) = open(session_b.clone(), Some("beta"), "open-b");
+    assert!(
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &forwarders,
+            None,
+            None,
+            features,
+            id_b,
+            params_b,
+            false,
+        )
+        .await,
+        "bare session B must open under beta on the same connection"
+    );
+    drain_session_open_frames(&mut rx).await;
+
+    // A turn on session A now runs under beta's runtime, so the monitor it
+    // creates emits beta-stamped activity onto session A's stream.
+    ledger.append_notification(beta_activity("live log line"));
+
+    let live = next_frame_within(&mut rx, 2_000).await.expect(
+        "session A must still receive the activity its own turn produced, even though the turn \
+         ran under the profile a later open bound",
+    );
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+    );
+    assert_eq!(live["params"]["text"], json!("live log line"));
+
+    // Same property on reconnect replay — the only other delivery path this
+    // notification has.
+    let (params_reconnect, id_reconnect) = open(session_a.clone(), None, "reopen-a");
+    assert!(
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            &forwarders,
+            None,
+            None,
+            features,
+            id_reconnect,
+            params_reconnect,
+            false,
+        )
+        .await,
+        "session A must reopen"
+    );
+    // Drain everything the reopen queued rather than stopping at the first
+    // `session/open` notification — on a reconnect the REPLAYED historical open
+    // frame precedes the activity we are looking for.
+    let mut replayed: Vec<String> = Vec::new();
+    while let Some(frame) = next_frame_within(&mut rx, 500).await {
+        if frame.get("method").and_then(Value::as_str)
+            == Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY)
+        {
+            replayed.push(
+                frame["params"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(
+        replayed,
+        vec!["live log line".to_owned()],
+        "reconnect replay must not drop session A's own activity"
+    );
 
     abort_live_forwarders(&forwarders, &ledger).await;
 }

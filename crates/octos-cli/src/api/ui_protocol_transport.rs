@@ -6016,7 +6016,9 @@ async fn ui_protocol_connection(
                     &contracts.user_questions,
                     &live_forwarders,
                     connection_profile_id,
-                    routed_profile_id,
+                    // Frozen at WS upgrade (and at session-ingress upgrade),
+                    // never rebound for the life of this connection.
+                    connection_profile_id,
                     features,
                     id,
                     params,
@@ -6788,8 +6790,10 @@ where
                     &contracts.user_questions,
                     &live_forwarders,
                     next_connection_profile_id.as_deref(),
-                    // stdio builds an EMPTY `HeaderMap`, so there is never a
-                    // routed profile to diverge from the session scope.
+                    // NOT pinned: stdio rebinds `connection_profile_id_owned`
+                    // after every successful open, so a later open under
+                    // another profile retargets this session's turns exactly
+                    // as `session_open_profile_id` does on the WS path.
                     None,
                     features,
                     id,
@@ -16817,12 +16821,11 @@ async fn handle_session_open(
     questions: &PendingQuestionStore,
     live_forwarders: &SharedLiveForwarders,
     connection_profile_id: Option<&str>,
-    // #2067 R3 — the profile this connection is ROUTED to by `Host`
-    // subdomain / `X-Profile-Id` header, which `validate_session_scope`
-    // deliberately does not consult. Needed here only to decide whether the
-    // resolved session scope may be used as a DELIVERY filter; it never
-    // changes what the session resolves to. `None` for stdio (no headers).
-    routed_profile_id: Option<&str>,
+    // #2067 — the profile this connection is FROZEN to for its whole lifetime,
+    // or `None` when the transport has no such pin. Used only to decide whether
+    // the session scope may serve as a DELIVERY filter; it never changes what
+    // the session resolves to. See `ledger_event_matches_profile_scope`.
+    pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     mut params: SessionOpenParams,
@@ -16848,7 +16851,7 @@ async fn handle_session_open(
         questions,
         ws.connection_id,
         connection_profile_id,
-        routed_profile_id,
+        pinned_profile_id,
         features,
         params,
     )
@@ -17109,55 +17112,48 @@ fn ledger_event_matches_topic_scope(
 /// `profile_id` entirely (see `AgentOrchestrator::control_loop`) and only the
 /// nested `loop` record names the owner. A fallback can only ever NARROW an
 /// event's audience, never widen it.
-/// #2067 R3 — may this connection's resolved session scope be used as a
-/// DELIVERY filter at all?
+/// #2067 — the profile scope a connection may be FILTERED against, or `None`
+/// when it has none and every delivery must pass.
 ///
-/// It may, precisely when the scope provably equals the profile the connection's
-/// own turns run under. Otherwise filtering starves the connection of its own
-/// data, because a turn's `ProfileRuntime` hard-binds its profile onto every
-/// record the model's tools create (`runtime/profile.rs` registers
-/// `MonitorCreateTool::new(profile.id)`, and the tool persists that id), and the
-/// durable frames those records emit carry it.
+/// Filtering is sound only when the scope a forwarder captured at
+/// `session/open` provably equals the profile that session's TURNS run under,
+/// for the whole life of the forwarder. That matters because a turn's
+/// `ProfileRuntime` hard-binds its profile onto every record the model's tools
+/// create (`runtime/profile.rs` registers `MonitorCreateTool::new(profile.id)`,
+/// and the tool persists that id), and the durable frames those records emit
+/// carry it. Filter against a scope the turn does not share and the connection
+/// is starved of its OWN data — fatally so for `background/activity`, whose
+/// sink appends over a detached connection and therefore has no delivery path
+/// except replay and live fan-out.
 ///
-/// The two resolutions:
-///   scope = `validate_session_scope(session, params.profile_id, connection)`
-///           `.unwrap_or(_main)`
-///   turn  = `session.profile_id().or(connection.or(routed)).unwrap_or(_main)`,
-///           where the caller passes `routed = header_routed.or(session_open)`
-///           and `session_open` is the scope of the last successful open.
+/// The turn resolves
+/// `session.profile_id().or(connection.or(routed.or(session_open)))`, and both
+/// `routed` and `session_open` are per-CONNECTION mutable state: `session_open`
+/// is a single cell that every successful open overwrites, so opening a second
+/// bare session under another profile retargets the turns of the FIRST one.
+/// A per-session captured scope can never track that.
 ///
-/// They agree in every case EXCEPT one:
-///   * `connection = Some(P)` — `validate_session_scope` returns `P`, and it
-///     rejects a session key belonging to any other profile, so
-///     `session.profile_id()` is `None` or `P` and the turn is `P` too. Equal.
-///     (A routed profile is authorized against the identity at WS upgrade, so
-///     for an authenticated identity it can only be `P`.)
-///   * `connection = None`, `header_routed = None` — the turn falls through to
-///     `session_open`, which is `params.profile_id.or(session.profile_id())
-///     .unwrap_or(_main)`: the same expression the scope resolves. Equal.
-///   * `connection = None`, `header_routed = Some(P)` — the scope is `_main`
-///     (or an explicitly requested id) while the turn is `P`. NOT equal, and
-///     this is the case we must not filter.
+/// The one binding that cannot drift is an authenticated connection profile:
+/// it is frozen at WS upgrade, and `validate_authenticated_session_scope`
+/// forces every session opened on that connection to it or rejects the open
+/// outright. So the whole connection has exactly one profile, every forwarder
+/// captures it, and `connection.or(..)` short-circuits onto it for every turn.
+/// That is the only case this filter may act on, and it is exactly the case
+/// #2067 reports: a tenant is an authenticated user.
 ///
-/// That last case is an admin/unauthenticated connection reached through a
-/// `Host` subdomain or `X-Profile-Id` header. Such a connection is already
-/// explicitly authorized across profiles by the WS upgrade gate, so its session
-/// scope was never a tenant boundary — treating it as one is the category
-/// error. Delivering unfiltered there costs no tenant isolation: the viewer is
-/// an operator already entitled to the data.
+/// A routed profile cannot break this even when it names a DIFFERENT profile —
+/// which it legitimately can, since an admin-role user is authorized for every
+/// profile and a parent user for its owned subaccounts, and both still present
+/// an authenticated `connection_profile_id`. `connection.or(routed)` never
+/// reaches `routed` while the connection profile is set, and a session key
+/// belonging to another profile is rejected before any turn starts.
 ///
-/// KNOWN RESIDUAL: `session_open` is last-writer-wins per connection, so an
-/// unscoped connection that opens several BARE keys under different explicit
-/// `params.profile_id`s runs the earlier sessions' turns under the latest
-/// profile. That is a pre-existing turn-routing defect, not one this filter
-/// creates, and it is tracked with the rest of the divergence in #2081.
-fn connection_filterable_profile_scope(
-    connection_profile_id: Option<&str>,
-    routed_profile_id: Option<&str>,
-) -> bool {
-    connection_profile_id.is_some() || routed_profile_id.is_none()
-}
-
+/// Callers pass `None` for a transport whose binding is NOT frozen — stdio
+/// rebinds `connection_profile_id_owned` after every successful open, so it
+/// drifts exactly as `session_open` does and must not be filtered. Declining to
+/// filter costs no tenant isolation: an unscoped WS connection is an
+/// admin/operator authorized for every profile (or auth is disabled and every
+/// route is deliberately open), and stdio is a single local user.
 fn ledger_event_matches_profile_scope(
     event: &UiProtocolLedgerEvent,
     profile_id: Option<&str>,
@@ -17866,7 +17862,7 @@ async fn open_session_result(
     questions: &PendingQuestionStore,
     connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
-    routed_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     mut params: SessionOpenParams,
 ) -> Result<SessionOpenOutcome, RpcError> {
@@ -17880,9 +17876,11 @@ async fn open_session_result(
     let ledger_profile_id = active_profile_id
         .clone()
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
-    let profile_scope =
-        connection_filterable_profile_scope(connection_profile_id, routed_profile_id)
-            .then(|| ledger_profile_id.clone());
+    // #2067 — see `ledger_event_matches_profile_scope`. `validate_session_scope`
+    // returns the connection profile verbatim when there is one, so this equals
+    // `ledger_profile_id` in that case; naming the pin directly keeps the
+    // invariant (scope == the turn's profile) visible at the resolution site.
+    let profile_scope = pinned_profile_id.map(ToOwned::to_owned);
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
