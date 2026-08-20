@@ -1044,7 +1044,10 @@ pub async fn test_provider(
         resolve_saved_key(&state, &identity, &req)?
     };
 
-    if api_key.is_empty() {
+    // Keyless local families (local/ollama/vllm) construct without a key —
+    // dead-ending them on "No API key provided" blocked the keyless
+    // onboarding flow entirely (red-team pass).
+    if api_key.is_empty() && !octos_llm::registry::is_keyless(&req.provider) {
         return Ok(Json(TestProviderResponse {
             ok: false,
             message: String::new(),
@@ -1054,7 +1057,9 @@ pub async fn test_provider(
 
     let provider: Arc<dyn LlmProvider> = {
         let params = octos_llm::registry::CreateParams {
-            api_key: Some(api_key.clone()),
+            // Empty means "keyless family" — let the factory apply its own
+            // fallback instead of sending an empty Bearer token.
+            api_key: (!api_key.is_empty()).then(|| api_key.clone()),
             model: Some(req.model.clone()),
             base_url: req.base_url.clone(),
             model_hints: None,

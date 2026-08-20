@@ -72,6 +72,7 @@ mod dashscope;
 mod deepseek;
 mod gemini;
 mod groq;
+mod local;
 mod minimax;
 mod moonshot;
 mod moonshot_coding;
@@ -197,6 +198,7 @@ static ALL: &[ProviderEntry] = &[
     nvidia::ENTRY,
     ollama::ENTRY,
     vllm::ENTRY,
+    local::ENTRY,
 ];
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -211,6 +213,13 @@ pub fn lookup(name: &str) -> Option<&'static ProviderEntry> {
 /// All registered provider entries.
 pub fn all_entries() -> &'static [ProviderEntry] {
     ALL
+}
+
+/// Whether `family` constructs a provider without an API key (`local`,
+/// `ollama`, `vllm`). Connection-test and fetch-models surfaces must not
+/// dead-end on "no API key" for these families.
+pub fn is_keyless(family: &str) -> bool {
+    lookup(family).is_some_and(|entry| !entry.requires_api_key)
 }
 
 /// All valid provider names (canonical + aliases).
@@ -261,6 +270,7 @@ mod tests {
             ("anthropic", "claude-sonnet-4-20250514"),
             ("deepseek", "deepseek-v4-flash"),
             ("gemini", "gemini-2.5-flash"),
+            ("local", "local-default"),
             ("minimax", "MiniMax-M3"),
             ("moonshot-coding", "k3"),
             ("openai", "gpt-4o"),
@@ -362,6 +372,47 @@ mod tests {
         assert_eq!(e.name, "r9s");
     }
 
+    /// Every engine name a user might type for a local OpenAI-compatible
+    /// server resolves to the ONE unified `local` family.
+    #[test]
+    fn should_resolve_local_engine_aliases_to_the_local_family() {
+        for alias in [
+            "local",
+            "llamacpp",
+            "llama.cpp",
+            "llama-server",
+            "llama_server",
+            "lmstudio",
+            "lm-studio",
+            "openai-compatible",
+        ] {
+            let e = lookup(alias).unwrap_or_else(|| panic!("{alias} must resolve"));
+            assert_eq!(e.name, "local", "{alias} must resolve to the local family");
+        }
+    }
+
+    /// `local` is fully optional: no key, no base URL, no model required —
+    /// zero-config onboarding is the family's contract.
+    #[test]
+    fn should_require_nothing_for_the_local_family() {
+        let e = lookup("local").unwrap();
+        assert!(e.api_key_env.is_none());
+        assert!(!e.requires_api_key);
+        assert!(!e.requires_base_url);
+        assert!(!e.requires_model);
+        assert_eq!(
+            e.default_base_url,
+            Some(crate::local_discovery::DEFAULT_BASE_URL)
+        );
+        // The default must also be a doctor discovery candidate, or the two
+        // lists have drifted.
+        assert!(
+            crate::local_discovery::CANDIDATE_BASE_URLS
+                .contains(&e.default_base_url.expect("default set")),
+            "local default base URL must appear in CANDIDATE_BASE_URLS"
+        );
+    }
+
     #[test]
     fn lookup_case_insensitive() {
         assert!(lookup("Anthropic").is_some());
@@ -376,7 +427,19 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 18);
+        assert_eq!(all_entries().len(), 19);
+    }
+
+    /// Keyless = provider construction succeeds with no API key. The
+    /// dashboard/TUI test + fetch-models surfaces gate on this.
+    #[test]
+    fn should_classify_keyless_families() {
+        assert!(is_keyless("local"));
+        assert!(is_keyless("ollama"));
+        assert!(is_keyless("vllm"));
+        assert!(!is_keyless("anthropic"));
+        assert!(!is_keyless("openai"));
+        assert!(!is_keyless("not-a-provider"));
     }
 
     /// The coding-plan families resolve to their coding endpoints + default

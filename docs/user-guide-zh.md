@@ -178,7 +178,7 @@ export SMTP_PASSWORD="your-app-password"
 
 ## 3. 配置 LLM 提供商
 
-Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对应的环境变量 API 密钥。
+Octos 开箱即用支持 16 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
 
 ### 3.1 支持的提供商
 
@@ -199,6 +199,7 @@ Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对�
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | — |
 | `vllm` | `VLLM_API_KEY` | *（必须指定）* | OpenAI 兼容 | — |
+| `local` | *（无需）* | local-default | OpenAI 兼容 | `llamacpp`、`llama.cpp`、`llama-server`、`lmstudio`、`openai-compatible` |
 
 #### 如何获取 API 密钥
 
@@ -374,6 +375,35 @@ octos auth logout --provider openai
 ```
 
 凭据存储在 `~/.octos/auth.json`（文件权限 0600）。解析 API 密钥时，认证存储**优先于**环境变量。
+
+### 3.6 本地模型（llama.cpp、Ollama、vLLM、LM Studio）
+
+主流本地模型服务器都提供 OpenAI 兼容 API，因此 Octos 将它们统一为**一个提供商家族：`local`**。无需关心背后是哪个引擎——选择 `local`，把 `base_url` 指向服务器即可。引擎名也可作为别名使用（`"provider": "llamacpp"`、`"lmstudio"` 等都会解析为 `local`）。
+
+零配置默认指向 llama.cpp `llama-server` 的标准端口：
+
+```json
+{
+  "provider": "local"
+}
+```
+
+这就是一份完整配置——无需 API 密钥、无需模型名（llama.cpp、LM Studio 这类单模型服务器会忽略 `model` 字段），`base_url` 默认为 `http://127.0.0.1:8080/v1`。
+
+其他引擎只需设置 `base_url`：
+
+| 引擎 | 常用 `base_url` | 说明 |
+|---|---|---|
+| llama.cpp（`llama-server`） | `http://127.0.0.1:8080/v1` | 默认值——用 `llama-server -m model.gguf --jinja` 启动 |
+| Ollama | `http://127.0.0.1:11434/v1` | 将 `model` 设为已拉取的模型（如 `llama3.2`），Ollama 按名称选择模型 |
+| vLLM | `http://127.0.0.1:8000/v1` | 将 `model` 设为所服务的模型 id |
+| LM Studio | `http://127.0.0.1:1234/v1` | 单模型；`model` 可不设 |
+
+如果服务器启动时设置了 API 密钥（llama.cpp 的 `--api-key`），照常通过 `api_key_env` 提供。在**共享/多用户机器**上，请务必为服务器设置密钥：未鉴权的 localhost 端点可被任意本地进程抢占绑定，从而截获你的完整对话内容。`ollama`、`vllm` 家族仍然可用且行为一致——推荐使用与引擎无关的 `local`。
+
+**用 `octos doctor` 验证配置。** 对本地家族，doctor 会查询服务器的 `/v1/models` 端点，报告实际加载的模型，并在配置的 `model` 不在列表中或端口无响应时给出警告（并列出常见的本地端点）。
+
+**工具调用注意事项：** Agent 循环依赖工具/函数调用，而对本地服务器来说这取决于*模型及其聊天模板*，与 Octos 无关。请使用支持工具调用的模型；llama.cpp 需以 `--jinja` 启动以启用模板的工具支持。如果聊天正常但工具异常，请首先检查这一点。
 
 ---
 

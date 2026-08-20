@@ -688,11 +688,29 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
     // echoes the env var name it looked up (live-caught residual).
     let env_redacted = env_name != raw_env;
     if entry.is_some() && registry_env.is_none() && config.api_key_env.is_none() {
-        checks.push(Check::pass(
-            CAT_PROVIDER,
-            "API key",
-            format!("{canonical} is a local provider — no API key required"),
-        ));
+        // Keyless family — but the runtime still opportunistically resolves
+        // the derived `{NAME}_API_KEY` chain and sends whatever it finds as a
+        // Bearer token (chat.rs provider factory). An ambient credential going
+        // out silently while doctor says "no key" is exactly the kind of
+        // contradiction doctor exists to surface — disclose it.
+        match config.get_api_key_with_env(canonical, None) {
+            Ok(_) => checks.push(
+                Check::pass(
+                    CAT_PROVIDER,
+                    "API key",
+                    format!(
+                        "{canonical} needs no API key, but a credential resolves via {env_name} \
+                         and WILL be sent as a Bearer token"
+                    ),
+                )
+                .with_value(env_name.clone()),
+            ),
+            Err(_) => checks.push(Check::pass(
+                CAT_PROVIDER,
+                "API key",
+                format!("{canonical} is a local provider — no API key required"),
+            )),
+        }
     } else {
         // Resolve exactly as the runtime does: pass the user's OWN
         // `api_key_env` config (None → the full chain INCLUDING the auth
@@ -736,10 +754,10 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
 
     // Endpoint reachability (advisory; skipped offline/tests).
     if with_network {
-        match endpoint {
+        match endpoint.as_deref() {
             Some(url) => {
                 let display = endpoint_display.unwrap_or_else(|| "(unparseable URL)".into());
-                match probe_endpoint(&url) {
+                match probe_endpoint(url) {
                     Ok(status) => checks.push(
                         Check::pass(
                             CAT_PROVIDER,
@@ -767,9 +785,226 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
                 ),
             )),
         }
+
+        // Local model servers all answer the OpenAI `GET /v1/models` shape —
+        // one request verifies the server AND surfaces the loaded model ids.
+        if is_local_server_family(canonical) {
+            // Authenticate exactly as the runtime would (auth store → env
+            // chain): a `llama-server --api-key` deployment must list models
+            // instead of false-alarming with 401 (codex + adversarial pass).
+            let api_key = config
+                .get_api_key_with_env(canonical, config.api_key_env.as_deref())
+                .ok();
+            checks.extend(local_server_checks(
+                canonical,
+                endpoint.as_deref(),
+                config.model.as_deref(),
+                api_key.as_deref(),
+            ));
+        }
     }
 
     checks
+}
+
+/// Families that are a local OpenAI-compatible server (unified `local` plus
+/// the engine-branded `ollama`/`vllm`), where `/models` discovery applies.
+fn is_local_server_family(canonical: &str) -> bool {
+    matches!(canonical, "local" | "ollama" | "vllm")
+}
+
+/// `/models` discovery for a local server: reachability with a model list on
+/// success, and a cross-check that the configured model is actually loaded
+/// (on Ollama-style servers the `model` field selects the model, so a
+/// mismatch means every request would 404).
+fn local_server_checks(
+    canonical: &str,
+    endpoint: Option<&str>,
+    configured_model: Option<&str>,
+    api_key: Option<&str>,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let Some(base) = endpoint else {
+        return checks;
+    };
+    match probe_models(base, api_key) {
+        Ok(Some(models)) if !models.is_empty() => {
+            const SHOWN: usize = 5;
+            let mut shown: Vec<String> =
+                models.iter().take(SHOWN).map(|id| sanitize_display_id(id)).collect();
+            let rest = models.len().saturating_sub(SHOWN);
+            if rest > 0 {
+                shown.push(format!("… +{rest} more"));
+            }
+            checks.push(
+                Check::pass(
+                    CAT_PROVIDER,
+                    "local models",
+                    format!("server lists {} model(s)", models.len()),
+                )
+                .with_value(shown.join(", ")),
+            );
+            // The unified family's placeholder stands for "single-model server
+            // that ignores the field" — never flag it.
+            if let Some(model) = configured_model
+                .filter(|m| *m != octos_llm::local_discovery::PLACEHOLDER_MODEL)
+            {
+                let loaded = models.iter().any(|id| local_model_matches(model, id));
+                if !loaded {
+                    checks.push(Check::warn(
+                        CAT_PROVIDER,
+                        "local model configured",
+                        format!("\"{model}\" is not among the server's listed models"),
+                        "set \"model\" to one of the listed ids (or leave it unset for single-model servers)",
+                    ));
+                }
+            }
+        }
+        Ok(Some(_)) => checks.push(Check::warn(
+            CAT_PROVIDER,
+            "local models",
+            "server answered /models but listed none",
+            "load a model first (llama.cpp: `llama-server -m model.gguf`; ollama: `ollama pull <model>`)",
+        )),
+        // Answered 2xx, but not the OpenAI list-models shape: most likely an
+        // unrelated app owns the port — "load a model" would be wrong advice.
+        Ok(None) => checks.push(Check::warn(
+            CAT_PROVIDER,
+            "local models",
+            "the endpoint answered, but not with an OpenAI-compatible model list — is something else running on this port?",
+            "point \"base_url\" at the model server's /v1 endpoint (llama.cpp default: http://127.0.0.1:8080/v1)",
+        )),
+        Err(error) => {
+            // A 401/403 means the server IS there and wants its key — "is the
+            // server running?" would be false advice (codex P2).
+            let auth_rejected = error.contains("HTTP 401") || error.contains("HTTP 403");
+            checks.push(if auth_rejected {
+                Check::warn(
+                    CAT_PROVIDER,
+                    "local models",
+                    format!(
+                        "server rejected the request as unauthorized ({error}) — model listing skipped"
+                    ),
+                    if api_key.is_some() {
+                        "the resolved API key was rejected — check it matches the server's --api-key"
+                    } else {
+                        "the server requires its API key — set \"api_key_env\" to the env var holding it"
+                    },
+                )
+            } else {
+                Check::warn(
+                    CAT_PROVIDER,
+                    "local models",
+                    format!("could not list models: {error}"),
+                    format!(
+                        "is the server running? common local endpoints: {}",
+                        octos_llm::local_discovery::CANDIDATE_BASE_URLS.join(", ")
+                    ),
+                )
+            });
+        }
+    }
+    // Agent use depends on tool calling, which local servers only provide
+    // with a tool-capable model + chat template — a connect-fine/tools-broken
+    // setup otherwise looks like an octos bug. Named "(advisory)" because
+    // nothing is verified here; a bare pass would read as a checked result.
+    if canonical == "local" {
+        checks.push(Check::pass(
+            CAT_PROVIDER,
+            "tool calling (advisory)",
+            "agent tools need a tool-capable model and chat template (llama.cpp: start llama-server with --jinja)",
+        ));
+    }
+    checks
+}
+
+/// Whether a configured model name refers to a server-listed id, with
+/// Ollama's tag semantics: comparison is case-insensitive, and a bare `name`
+/// is equivalent to `name:latest` — in BOTH directions, and ONLY for the
+/// `latest` tag. A bare `qwen2.5` does NOT match `qwen2.5:7b`: Ollama would
+/// resolve it to the absent `qwen2.5:latest`, so the request would fail and
+/// the warning is correct (codex P2 + adversarial pass, opposite directions).
+fn local_model_matches(configured: &str, listed: &str) -> bool {
+    fn canon(id: &str) -> String {
+        let lower = id.to_lowercase();
+        lower
+            .strip_suffix(":latest")
+            .map(str::to_owned)
+            .unwrap_or(lower)
+    }
+    canon(configured) == canon(listed)
+}
+
+/// One server-supplied string, made safe for terminal display: control
+/// characters (ANSI/OSC escapes included) become U+FFFD and the id is capped,
+/// so a squatted port cannot rewrite doctor's report (multi-model finding).
+/// Mirrors the `display_env_name` guard for the other untrusted-value path.
+fn sanitize_display_id(id: &str) -> String {
+    const MAX_ID_CHARS: usize = 96;
+    let mut out: String = id
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .take(MAX_ID_CHARS)
+        .collect();
+    if id.chars().count() > MAX_ID_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+/// Shared short-timeout, no-redirect blocking client for doctor's endpoint
+/// probes — one place for the hardening rules so `probe_endpoint` and
+/// `probe_models` cannot drift (maintainability pass).
+fn probe_client() -> std::result::Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        // No redirect following: a redirect target could carry credentials
+        // that would then be echoed through the error path (codex r2).
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// GET `{base}/models` (same credential-stripping and no-redirect rules as
+/// [`probe_endpoint`], via [`probe_client`]) and parse the OpenAI list-models
+/// body. The path segment is appended AFTER URL parsing so a base_url carrying
+/// a query/fragment cannot silently redirect the probe to the wrong path.
+/// Returns Ok(None) when the body is not the list-models shape. Body reads
+/// are capped; a body exceeding the cap is an explicit error, not a silent
+/// mis-parse of truncated JSON.
+fn probe_models(
+    base: &str,
+    api_key: Option<&str>,
+) -> std::result::Result<Option<Vec<String>>, String> {
+    use std::io::Read as _;
+    const MAX_BODY_BYTES: u64 = 256 * 1024;
+    let mut url = sanitized_http_url(base)?;
+    url.path_segments_mut()
+        .map_err(|_| "base_url cannot take a path".to_string())?
+        .pop_if_empty()
+        .push("models");
+    let client = probe_client()?;
+    let mut request = client.get(url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().map_err(|error| error.to_string())?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let mut body = String::new();
+    response
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_string(&mut body)
+        .map_err(|error| error.to_string())?;
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(format!(
+            "response larger than {}KB — not a model list",
+            MAX_BODY_BYTES / 1024
+        ));
+    }
+    Ok(octos_llm::local_discovery::parse_models_response(&body))
 }
 
 /// Guard an env-var NAME before it is echoed into report values / fix lines:
@@ -866,14 +1101,7 @@ fn sanitized_http_url(raw: &str) -> std::result::Result<reqwest::Url, String> {
 /// errors.
 fn probe_endpoint(url: &str) -> std::result::Result<u16, String> {
     let parsed = sanitized_http_url(url)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
-        // No redirect following: a redirect target could carry credentials
-        // that would then be echoed through the error path (codex r2).
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| error.to_string())?;
-    client
+    probe_client()?
         .get(parsed)
         .send()
         .map(|response| response.status().as_u16())
@@ -2469,5 +2697,265 @@ mod tests {
             !notes.contains("fine — ok"),
             "passing rows stay out of notes"
         );
+    }
+
+    /// One-shot localhost HTTP stub: answers a single request with `status`
+    /// and `body`, sends the captured request head to `request_tx`, and
+    /// returns the base URL to point checks at.
+    fn serve_one_status(
+        status: &'static str,
+        body: String,
+        request_tx: Option<std::sync::mpsc::Sender<String>>,
+    ) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if let Some(tx) = request_tx {
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn serve_one_response(body: &'static str) -> String {
+        serve_one_status("200 OK", body.to_string(), None)
+    }
+
+    /// Deterministically unreachable "server": accepts the connection and
+    /// closes it immediately, so the probe fails with a transport error
+    /// without depending on an ephemeral port staying unbound (the old
+    /// bind-then-drop stub was a TOCTOU flake — testing + adversarial pass).
+    fn serve_connection_reset() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[test]
+    fn should_list_models_and_pass_when_local_server_answers() {
+        let base = serve_one_response(r#"{"object":"list","data":[{"id":"llama3.2"}]}"#);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "local models" && c.detail.contains("1 model(s)")),
+            "model list surfaces: {checks:?}"
+        );
+        // The unified family always carries the tool-calling advisory —
+        // labeled as such so it cannot read as a verified result.
+        assert!(checks.iter().any(|c| c.name == "tool calling (advisory)"));
+    }
+
+    /// The advisory is scoped to the unified family — engine-branded
+    /// families must not receive it.
+    #[test]
+    fn should_not_emit_tool_calling_advisory_for_engine_branded_families() {
+        let base = serve_one_response(r#"{"data":[{"id":"llama3.2:latest"}]}"#);
+        let checks = local_server_checks("ollama", Some(&base), None, None);
+        assert!(!checks.iter().any(|c| c.name.starts_with("tool calling")));
+    }
+
+    #[test]
+    fn should_warn_when_configured_model_is_not_loaded() {
+        let base = serve_one_response(r#"{"data":[{"id":"qwen2.5-coder:7b"}]}"#);
+        let checks = local_server_checks("ollama", Some(&base), Some("llama3.2"), None);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "local model configured" && c.detail.contains("llama3.2")),
+            "mismatch warns: {checks:?}"
+        );
+    }
+
+    /// Ollama tag semantics, all four directions: bare ≡ :latest (both ways),
+    /// bare does NOT cover an arbitrary tag (Ollama would resolve it to the
+    /// absent `:latest`), and comparison is case-insensitive.
+    #[test]
+    fn should_match_models_with_ollama_latest_tag_semantics() {
+        assert!(local_model_matches("llama3.2", "llama3.2"));
+        assert!(local_model_matches("llama3.2", "llama3.2:latest"));
+        assert!(local_model_matches("llama3.2:latest", "llama3.2"));
+        assert!(local_model_matches("Qwen2.5-Coder:7B", "qwen2.5-coder:7b"));
+        assert!(!local_model_matches("qwen2.5", "qwen2.5:7b"));
+        assert!(!local_model_matches("qwen2.5:7b", "qwen2.5"));
+    }
+
+    /// The namespaced placeholder is never flagged against the server list.
+    #[test]
+    fn should_never_flag_the_placeholder_model() {
+        let base = serve_one_response(r#"{"data":[{"id":"whatever.gguf"}]}"#);
+        let checks = local_server_checks(
+            "local",
+            Some(&base),
+            Some(octos_llm::local_discovery::PLACEHOLDER_MODEL),
+            None,
+        );
+        assert!(!checks.iter().any(|c| c.name == "local model configured"));
+    }
+
+    /// Server-supplied ids are sanitized before terminal display: control
+    /// characters (ANSI/OSC escapes) never reach the report, and huge ids are
+    /// capped (security + adversarial pass).
+    #[test]
+    fn should_sanitize_server_supplied_ids_before_display() {
+        let base = serve_one_response(
+            "{\"data\":[{\"id\":\"\\u001b]0;pwned\\u0007\\u001b[32mfake-pass\"}]}",
+        );
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let value = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .and_then(|c| c.value.as_deref())
+            .expect("models check carries a value");
+        assert!(
+            !value.chars().any(|c| c.is_control()),
+            "no control chars may survive: {value:?}"
+        );
+        assert!(
+            value.contains("fake-pass"),
+            "printable content kept: {value:?}"
+        );
+
+        let long = sanitize_display_id(&"x".repeat(500));
+        assert!(
+            long.chars().count() <= 97,
+            "long ids are capped: {}",
+            long.len()
+        );
+    }
+
+    /// The probe authenticates exactly like the runtime: the resolved key
+    /// goes out as a Bearer header (codex P2 — llama-server --api-key setups
+    /// must list models instead of false-alarming with 401).
+    #[test]
+    fn should_send_bearer_header_when_key_resolves() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = serve_one_status("200 OK", r#"{"data":[{"id":"m"}]}"#.to_string(), Some(tx));
+        let checks = local_server_checks("local", Some(&base), None, Some("sekrit"));
+        assert!(checks.iter().any(|c| c.name == "local models"));
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            request.contains("authorization: Bearer sekrit")
+                || request.contains("Authorization: Bearer sekrit"),
+            "probe carries the resolved key: {request:?}"
+        );
+    }
+
+    /// 401/403 is "server wants its key", not "server down" — the fix line
+    /// must not send the user chasing a dead server.
+    #[test]
+    fn should_diagnose_auth_rejection_distinctly() {
+        let base = serve_one_status("401 Unauthorized", "{}".to_string(), None);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(warn.detail.contains("unauthorized"), "{checks:?}");
+        assert!(
+            warn.fix.as_deref().unwrap_or("").contains("api_key_env"),
+            "fix points at the key config: {checks:?}"
+        );
+    }
+
+    /// A 2xx that is not the list-models shape (an unrelated app owns the
+    /// port) is diagnosed as such — not as "no models loaded".
+    #[test]
+    fn should_diagnose_non_model_server_distinctly() {
+        let base = serve_one_status("200 OK", "<html>hello</html>".to_string(), None);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(
+            warn.detail
+                .contains("not with an OpenAI-compatible model list"),
+            "{checks:?}"
+        );
+    }
+
+    /// A list-shaped body with zero models keeps the "load a model first" fix.
+    #[test]
+    fn should_warn_when_server_lists_no_models() {
+        let base = serve_one_response(r#"{"object":"list","data":[]}"#);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(warn.detail.contains("listed none"), "{checks:?}");
+    }
+
+    /// Oversized bodies are an explicit error, not a silent mis-parse of
+    /// truncated JSON (adversarial pass).
+    #[test]
+    fn should_reject_oversized_models_response() {
+        let big = format!(r#"{{"data":[{{"id":"{}"}}]}}"#, "x".repeat(300 * 1024));
+        let base = serve_one_status("200 OK", big, None);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(warn.detail.contains("larger than"), "{checks:?}");
+    }
+
+    /// A base_url carrying a query string must not derail the /models path —
+    /// the segment is appended after parsing (adversarial pass: string concat
+    /// put "/models" inside the query, silently probing the wrong URL).
+    #[test]
+    fn should_append_models_segment_after_url_parsing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = serve_one_status("200 OK", r#"{"data":[]}"#.to_string(), Some(tx));
+        let with_query = format!("{}?key=x", base);
+        let _ = local_server_checks("local", Some(&with_query), None, None);
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            request.starts_with("GET /v1/models "),
+            "path is /v1/models with the query stripped: {request:?}"
+        );
+    }
+
+    #[test]
+    fn should_warn_with_candidate_endpoints_when_server_is_down() {
+        let base = serve_connection_reset();
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("down server still yields a models check");
+        assert!(
+            warn.fix.as_deref().unwrap_or("").contains("11434"),
+            "fix line lists candidate ports: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn should_skip_local_checks_without_an_endpoint() {
+        assert!(local_server_checks("local", None, None, None).is_empty());
+    }
+
+    #[test]
+    fn should_gate_local_discovery_to_local_families() {
+        assert!(is_local_server_family("local"));
+        assert!(is_local_server_family("ollama"));
+        assert!(is_local_server_family("vllm"));
+        assert!(!is_local_server_family("anthropic"));
+        assert!(!is_local_server_family("openai"));
     }
 }

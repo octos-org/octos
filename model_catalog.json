@@ -1870,6 +1870,20 @@
       "max_output": 131072
     },
     {
+      "provider": "local/local-default",
+      "type": "strong",
+      "default": true,
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0,
+      "cost_out": 0,
+      "context_window": 32768,
+      "max_output": 8192
+    },
+    {
       "provider": "vllm/mistralai/Mistral-Small-24B-Instruct-2501",
       "type": "fast",
       "stability": 1.0,

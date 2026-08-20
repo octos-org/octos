@@ -11961,22 +11961,30 @@ async fn raw_profile_llm_test(
         api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
     };
 
-    let Some(api_key) = secret_from_value(params.api_key).or_else(|| {
+    let resolved_key = secret_from_value(params.api_key).or_else(|| {
         route.api_key_env.as_ref().and_then(|env_name| {
             // Resolve a keychain marker to the real secret (e.g. a scoped Vertex
             // SA JSON); plain values pass through unchanged.
             let raw = profile.as_ref()?.config.env_vars.get(env_name)?;
             crate::auth::keychain::resolve_value(env_name, raw)
         })
-    }) else {
-        return Ok(profile_llm_test_result(
-            state,
-            &profile_id,
-            profile.as_ref(),
-            false,
-            "Provider connection failed",
-            Some("No API key provided".into()),
-        ));
+    });
+    let api_key = match resolved_key {
+        Some(key) => key,
+        // Keyless local families (local/ollama/vllm) construct without a
+        // key — dead-ending them on "No API key provided" blocked the
+        // keyless onboarding test entirely (red-team pass).
+        None if octos_llm::registry::is_keyless(&family_id) => String::new(),
+        None => {
+            return Ok(profile_llm_test_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                false,
+                "Provider connection failed",
+                Some("No API key provided".into()),
+            ));
+        }
     };
 
     let provider =
@@ -12095,13 +12103,19 @@ async fn raw_profile_llm_fetch_models(
         })
     });
 
-    let Some(api_key) = api_key else {
-        return Ok(json!({
-            "profile_id": profile_id,
-            "family_id": family_id,
-            "models": [],
-            "reason": "no_api_key",
-        }));
+    let api_key = match api_key {
+        Some(key) => key,
+        // Keyless local families still get model listing — their /v1/models
+        // answers without auth (red-team pass).
+        None if octos_llm::registry::is_keyless(&family_id) => String::new(),
+        None => {
+            return Ok(json!({
+                "profile_id": profile_id,
+                "family_id": family_id,
+                "models": [],
+                "reason": "no_api_key",
+            }));
+        }
     };
 
     let models =
@@ -12131,7 +12145,9 @@ fn build_test_llm_provider(
     api_key: &str,
 ) -> Result<Arc<dyn octos_llm::LlmProvider>, String> {
     let params = octos_llm::registry::CreateParams {
-        api_key: Some(api_key.to_owned()),
+        // Empty means "keyless family" — let the factory apply its own
+        // fallback instead of sending an empty Bearer token.
+        api_key: (!api_key.is_empty()).then(|| api_key.to_owned()),
         model: Some(model_id.to_owned()),
         base_url: base_url.clone(),
         model_hints: None,

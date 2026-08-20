@@ -2156,7 +2156,7 @@ fn is_valid_model_for_provider(provider: &str, model: &str) -> bool {
         "zai" | "z.ai" => true, // Z.AI hosts multiple models (GLM, Claude, etc.)
         "minimax" => m.contains("minimax"),
         // These host many models, accept any
-        "groq" | "nvidia" | "nim" | "ollama" | "vllm" | "openrouter" => true,
+        "groq" | "nvidia" | "nim" | "ollama" | "vllm" | "local" | "openrouter" => true,
         _ => true,
     }
 }
