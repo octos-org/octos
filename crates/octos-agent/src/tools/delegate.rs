@@ -4,8 +4,14 @@
 //! issues `delegate_task`, waits for the child to reach a terminal lifecycle
 //! state, and returns the child's output through the contract-gated delivery
 //! path. Children inherit the parent's workspace contract but run under the
-//! `group:delegated` deny list (no re-delegation, no user messaging, no
-//! memory writes).
+//! `group:delegated` deny list (no re-delegation, no spawning or driving of
+//! sub-agents, no user messaging, no memory writes).
+//!
+//! That deny list is RECURSION AND RESOURCE control, not confinement. A
+//! child keeps `shell` and every other command-execution alias on purpose —
+//! it is a universal replica of the master and must be able to run the build
+//! and the test it was asked to fix. Confinement is enforced by the outer
+//! sandbox ([`crate::sandbox`]), which is where it can be guaranteed.
 //!
 //! The [`DepthBudget`] is typed and serde-stable. Each level adds 1 to
 //! `current`; when a child would exceed `max` (default [`MAX_DEPTH`] = 2),
@@ -1072,9 +1078,20 @@ mod tests {
         assert_eq!(narrowed.allow, vec!["read_file", "shell"]);
         assert!(!policy.is_allowed("delegate_task"));
         assert!(!policy.is_allowed("spawn"));
-        assert!(!policy.is_allowed("send_message"));
+        assert!(!policy.is_allowed("message"));
         assert!(!policy.is_allowed("save_memory"));
-        assert!(!policy.is_allowed("execute_code"));
+        // RECURSION GUARD (peer-review fix): the rest of the spawn family
+        // must be denied too — with spawn_agent / send_input / the
+        // codex-compat `delegate` wrapper a child spawns and drives its own
+        // sub-agents, past the recursion guard.
+        assert!(!policy.is_allowed("spawn_agent"));
+        assert!(!policy.is_allowed("send_input"));
+        assert!(!policy.is_allowed("delegate"));
+        // Command execution stays available on purpose (a child asked to
+        // fix a test must run the build and the test). The deny list bounds
+        // recursion and resource use; confinement is the outer sandbox's
+        // job — see the `group:delegated` table comment in policy.rs.
+        assert!(narrowed.is_allowed("shell"));
     }
 
     #[test]

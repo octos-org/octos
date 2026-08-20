@@ -751,8 +751,9 @@ mod tests {
     /// - `group:media` -> mofa_* / fm_tts (write generated media)
     /// - `group:web` -> browser (persists screenshots to disk)
     /// - `group:research` -> deep_crawl / search (persist crawled pages)
-    /// - `group:delegated` -> delegate_task / spawn / send_message /
-    ///   save_memory / execute_code (every kind of side effect at once)
+    /// - `group:delegated` -> delegate_task / delegate / spawn /
+    ///   spawn_agent / send_input / message / save_memory (spawning plus
+    ///   messaging and memory writes)
     ///
     /// Read-only roles (`reviewer`, `explorer`) MUST advertise none
     /// of these; `test_worker` is allowed `group:runtime` because
