@@ -398,14 +398,32 @@ export function freshApprovalId(): ApprovalId { return randomUUID(); }
 export function freshPreviewId(): PreviewId { return randomUUID(); }
 export function freshTaskId(): TaskId { return randomUUID(); }
 
-/** Read live-server URL + token from the standard env vars. */
+/**
+ * Read live-server URL + token from the standard env vars.
+ *
+ * The URL falls back to `OCTOS_TEST_URL` the same way the token already fell
+ * back to `OCTOS_AUTH_TOKEN`, and hard-errors when neither is set. It used to
+ * default to a hardcoded `http://127.0.0.1:56831`, which nothing in CI ever
+ * listens on: `OCTOS_LIVE_URL` is set only by `e2e/tmux/run.sh`, so every
+ * m9-protocol spec in `e2e-live-nightly` dialled a dead port and failed with
+ * ECONNREFUSED. Because the token fallback DID resolve, the harness reached
+ * the connect attempt instead of reporting a missing precondition, and the
+ * whole protocol-conformance suite read as "running and red" while it had in
+ * fact never reached a server. A default that silently points at nothing is
+ * worse than no default.
+ */
 export function liveServerEnv(): { url: string; token: string; profileId?: string } {
-  const url = process.env.OCTOS_LIVE_URL || "http://127.0.0.1:56831";
+  const url = process.env.OCTOS_LIVE_URL || process.env.OCTOS_TEST_URL || "";
   const token =
     process.env.OCTOS_LIVE_TOKEN ||
     process.env.OCTOS_AUTH_TOKEN ||
     process.env.OCTOS_TEST_TOKEN ||
     "";
+  if (!url) {
+    throw new Error(
+      "m9-ws: OCTOS_LIVE_URL (or OCTOS_TEST_URL) must be set to run the protocol harness.",
+    );
+  }
   if (!token) {
     throw new Error(
       "m9-ws: OCTOS_LIVE_TOKEN (or OCTOS_AUTH_TOKEN) must be set to run the protocol harness.",
