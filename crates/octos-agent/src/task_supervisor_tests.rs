@@ -2887,6 +2887,23 @@ fn should_deliver_a_restore_exactly_once_however_the_wiring_is_ordered() {
 /// schedule can fake the blocking, and the wait has a bound so the test cannot
 /// hang. Then, after the section is released, the delivery must still happen
 /// exactly once.
+///
+/// TWO THINGS HERE ARE LOAD-BEARING. Do not "simplify" either of them.
+///
+/// 1. **The handshake runs hook-first.** The installer thread blocks until the
+///    hook says it is already inside the critical section. Signalling the other
+///    way round — installer announces, hook waits for it — lets the installer
+///    win the race: `notify_restore` then takes its `Some` branch, the hook
+///    never runs, and the test passes having exercised nothing. That is not
+///    hypothetical; it is what the first draft of this test did, and it went
+///    green in 0.01s.
+/// 2. **`hook_ran` is asserted.** It is the tripwire for exactly that failure.
+///    Without it, any future change that stops this test reaching the
+///    missed-restore branch — a different lock order, an extra early return,
+///    an observer wired earlier by a helper — converts it from a proof into a
+///    green no-op, silently. The runtime is the other tell: this test should
+///    take ~250ms (the bounded wait actually elapsing). If it ever drops to
+///    milliseconds, the race is no longer being exercised.
 #[test]
 fn should_not_lose_a_restore_when_wiring_races_the_missed_restore_mark() {
     use std::sync::atomic::AtomicUsize;
