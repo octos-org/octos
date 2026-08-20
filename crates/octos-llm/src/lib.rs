@@ -17,6 +17,7 @@ pub mod embedding;
 mod failover;
 mod fallback;
 pub mod lane;
+pub mod local_discovery;
 pub mod pricing;
 mod provider;
 pub mod responsiveness;

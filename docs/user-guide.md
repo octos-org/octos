@@ -240,7 +240,7 @@ Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`
 
 ## 3. Setting Up LLM Providers
 
-Octos supports 15 LLM providers out of the box. Each provider requires an API key set as an environment variable.
+Octos supports 16 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
 
 ### 3.1 Supported Providers
 
@@ -261,6 +261,7 @@ Octos supports 15 LLM providers out of the box. Each provider requires an API ke
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
+| `local` | *(none)* | default | OpenAI-compatible | `llamacpp`, `llama.cpp`, `llama-server`, `lmstudio`, `openai-compatible` |
 
 #### How to Get API Keys
 
@@ -406,6 +407,8 @@ Use `base_url` to point to self-hosted or proxy endpoints:
 }
 ```
 
+For local servers (llama.cpp, Ollama, vLLM, LM Studio), prefer the unified `local` family — see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio).
+
 ### 3.4 API Type Override
 
 The `api_type` field forces a specific API wire format:
@@ -444,6 +447,43 @@ octos auth logout --provider openai
 ```
 
 Credentials are stored in `~/.octos/auth.json` (file mode 0600). The auth store is checked **before** environment variables when resolving API keys.
+
+### 3.6 Local Models (llama.cpp, Ollama, vLLM, LM Studio)
+
+Every popular local model server speaks the same OpenAI-compatible API, so Octos unifies them under **one provider family: `local`**. You don't need to care which engine serves the model — pick `local`, point `base_url` at the server, done. The engine names also work as aliases (`"provider": "llamacpp"`, `"lmstudio"`, … all resolve to `local`).
+
+The zero-config default targets llama.cpp's `llama-server` on its standard port:
+
+```json
+{
+  "provider": "local"
+}
+```
+
+That's a complete config — no API key, no model name (single-model servers like llama.cpp and LM Studio ignore the `model` field and serve whatever they loaded), and `base_url` defaults to `http://127.0.0.1:8080/v1`.
+
+For other engines, set `base_url` to where the server listens:
+
+| Engine | Typical `base_url` | Notes |
+|---|---|---|
+| llama.cpp (`llama-server`) | `http://127.0.0.1:8080/v1` | the default — start with `llama-server -m model.gguf --jinja` |
+| Ollama | `http://127.0.0.1:11434/v1` | set `model` to a pulled model (e.g. `llama3.2`) — Ollama selects by name |
+| vLLM | `http://127.0.0.1:8000/v1` | set `model` to the served model id |
+| LM Studio | `http://127.0.0.1:1234/v1` | single-model; `model` can stay unset |
+
+```json
+{
+  "provider": "local",
+  "model": "llama3.2",
+  "base_url": "http://127.0.0.1:11434/v1"
+}
+```
+
+If the server was started with an API key (llama.cpp's `--api-key`), supply it via `api_key_env` as usual. The engine-branded `ollama` and `vllm` families remain available and behave identically — `local` is the recommended, engine-agnostic choice.
+
+**Verify the setup with `octos doctor`.** For local families it queries the server's `/v1/models` endpoint, reports which models are actually loaded, and warns when your configured `model` isn't among them or when nothing answers on the configured port (listing the common local endpoints to check).
+
+**Tool calling caveat:** the agent loop depends on tool/function calling, and with local servers that is a property of the *model and its chat template*, not of Octos. Use a tool-capable model, and for llama.cpp start the server with `--jinja` so the template's tool support is active. If chat works but tools misbehave, this is the first thing to check.
 
 ---
 

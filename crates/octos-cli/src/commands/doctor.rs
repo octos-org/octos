@@ -736,10 +736,10 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
 
     // Endpoint reachability (advisory; skipped offline/tests).
     if with_network {
-        match endpoint {
+        match endpoint.as_deref() {
             Some(url) => {
                 let display = endpoint_display.unwrap_or_else(|| "(unparseable URL)".into());
-                match probe_endpoint(&url) {
+                match probe_endpoint(url) {
                     Ok(status) => checks.push(
                         Check::pass(
                             CAT_PROVIDER,
@@ -767,9 +767,131 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
                 ),
             )),
         }
+
+        // Local model servers all answer the OpenAI `GET /v1/models` shape —
+        // one request verifies the server AND surfaces the loaded model ids.
+        if is_local_server_family(canonical) {
+            checks.extend(local_server_checks(
+                canonical,
+                endpoint.as_deref(),
+                config.model.as_deref(),
+            ));
+        }
     }
 
     checks
+}
+
+/// Families that are a local OpenAI-compatible server (unified `local` plus
+/// the engine-branded `ollama`/`vllm`), where `/models` discovery applies.
+fn is_local_server_family(canonical: &str) -> bool {
+    matches!(canonical, "local" | "ollama" | "vllm")
+}
+
+/// `/models` discovery for a local server: reachability with a model list on
+/// success, and a cross-check that the configured model is actually loaded
+/// (on Ollama-style servers the `model` field selects the model, so a
+/// mismatch means every request would 404).
+fn local_server_checks(
+    canonical: &str,
+    endpoint: Option<&str>,
+    configured_model: Option<&str>,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let Some(base) = endpoint else {
+        return checks;
+    };
+    let models_url = format!("{}/models", base.trim_end_matches('/'));
+    match probe_models(&models_url) {
+        Ok(models) if !models.is_empty() => {
+            const SHOWN: usize = 5;
+            let mut shown: Vec<&str> = models.iter().take(SHOWN).map(String::as_str).collect();
+            let rest = models.len().saturating_sub(SHOWN);
+            let more;
+            if rest > 0 {
+                more = format!("… +{rest} more");
+                shown.push(&more);
+            }
+            checks.push(
+                Check::pass(
+                    CAT_PROVIDER,
+                    "local models",
+                    format!("server lists {} model(s)", models.len()),
+                )
+                .with_value(shown.join(", ")),
+            );
+            // `default` is the unified family's placeholder for single-model
+            // servers that ignore the field — never flag it.
+            if let Some(model) = configured_model.filter(|m| *m != "default") {
+                let loaded = models
+                    .iter()
+                    .any(|id| id == model || id.starts_with(&format!("{model}:")));
+                if !loaded {
+                    checks.push(Check::warn(
+                        CAT_PROVIDER,
+                        "local model configured",
+                        format!("\"{model}\" is not among the server's listed models"),
+                        "set \"model\" to one of the listed ids (or leave it unset for single-model servers)",
+                    ));
+                }
+            }
+        }
+        Ok(_) => checks.push(Check::warn(
+            CAT_PROVIDER,
+            "local models",
+            "server answered /models but listed none",
+            "load a model first (llama.cpp: `llama-server -m model.gguf`; ollama: `ollama pull <model>`)",
+        )),
+        Err(error) => checks.push(Check::warn(
+            CAT_PROVIDER,
+            "local models",
+            format!("could not list models: {error}"),
+            format!(
+                "is the server running? common local endpoints: {}",
+                octos_llm::local_discovery::CANDIDATE_BASE_URLS.join(", ")
+            ),
+        )),
+    }
+    // Agent use depends on tool calling, which local servers only provide
+    // with a tool-capable model + chat template — a connect-fine/tools-broken
+    // setup otherwise looks like an octos bug.
+    if canonical == "local" {
+        checks.push(Check::pass(
+            CAT_PROVIDER,
+            "tool calling",
+            "agent tools need a tool-capable model and chat template (llama.cpp: start llama-server with --jinja)",
+        ));
+    }
+    checks
+}
+
+/// GET a `/models` URL (same credential-stripping and no-redirect rules as
+/// [`probe_endpoint`]) and parse the OpenAI list-models body. Body reads are
+/// capped — a local server is trusted-ish, but doctor never buffers unbounded
+/// input.
+fn probe_models(url: &str) -> std::result::Result<Vec<String>, String> {
+    use std::io::Read as _;
+    const MAX_BODY_BYTES: u64 = 256 * 1024;
+    let parsed = sanitized_http_url(url)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(parsed)
+        .send()
+        .map_err(|error| error.to_string())?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let mut body = String::new();
+    response
+        .take(MAX_BODY_BYTES)
+        .read_to_string(&mut body)
+        .map_err(|error| error.to_string())?;
+    Ok(octos_llm::local_discovery::parse_models_response(&body))
 }
 
 /// Guard an env-var NAME before it is echoed into report values / fix lines:
@@ -2469,5 +2591,97 @@ mod tests {
             !notes.contains("fine — ok"),
             "passing rows stay out of notes"
         );
+    }
+
+    /// One-shot localhost HTTP stub: answers a single request with `body`
+    /// and returns the base URL to point checks at.
+    fn serve_one_response(body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[test]
+    fn should_list_models_and_pass_when_local_server_answers() {
+        let base = serve_one_response(r#"{"object":"list","data":[{"id":"llama3.2"}]}"#);
+        let checks = local_server_checks("local", Some(&base), None);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "local models" && c.detail.contains("1 model(s)")),
+            "model list surfaces: {checks:?}"
+        );
+        // The unified family always carries the tool-calling advisory.
+        assert!(checks.iter().any(|c| c.name == "tool calling"));
+    }
+
+    #[test]
+    fn should_warn_when_configured_model_is_not_loaded() {
+        let base = serve_one_response(r#"{"data":[{"id":"qwen2.5-coder:7b"}]}"#);
+        let checks = local_server_checks("ollama", Some(&base), Some("llama3.2"));
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "local model configured" && c.detail.contains("llama3.2")),
+            "mismatch warns: {checks:?}"
+        );
+    }
+
+    /// An Ollama-style tagged id (`llama3.2:latest`) satisfies a bare
+    /// configured name, and the `default` placeholder is never flagged.
+    #[test]
+    fn should_accept_tagged_ids_and_default_placeholder() {
+        let base = serve_one_response(r#"{"data":[{"id":"llama3.2:latest"}]}"#);
+        let checks = local_server_checks("ollama", Some(&base), Some("llama3.2"));
+        assert!(!checks.iter().any(|c| c.name == "local model configured"));
+
+        let base = serve_one_response(r#"{"data":[{"id":"whatever.gguf"}]}"#);
+        let checks = local_server_checks("local", Some(&base), Some("default"));
+        assert!(!checks.iter().any(|c| c.name == "local model configured"));
+    }
+
+    #[test]
+    fn should_warn_with_candidate_endpoints_when_server_is_down() {
+        // Bind-then-drop: the port is closed by the time the probe runs.
+        let addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let base = format!("http://{addr}/v1");
+        let checks = local_server_checks("local", Some(&base), None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("down server still yields a models check");
+        assert!(
+            warn.fix.as_deref().unwrap_or("").contains("11434"),
+            "fix line lists candidate ports: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn should_skip_local_checks_without_an_endpoint() {
+        assert!(local_server_checks("local", None, None).is_empty());
+    }
+
+    #[test]
+    fn should_gate_local_discovery_to_local_families() {
+        assert!(is_local_server_family("local"));
+        assert!(is_local_server_family("ollama"));
+        assert!(is_local_server_family("vllm"));
+        assert!(!is_local_server_family("anthropic"));
+        assert!(!is_local_server_family("openai"));
     }
 }
