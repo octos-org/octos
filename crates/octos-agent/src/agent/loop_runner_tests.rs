@@ -892,7 +892,7 @@ struct TerminalFailureTool {
 #[async_trait]
 impl Tool for TerminalFailureTool {
     fn name(&self) -> &str {
-        "oll_generate_lesson"
+        "lesson_generate"
     }
 
     fn description(&self) -> &str {
@@ -939,7 +939,7 @@ impl LlmProvider for TerminalLessonRetryProvider {
             reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: format!("call_lesson_{call}"),
-                name: "oll_generate_lesson".to_string(),
+                name: "lesson_generate".to_string(),
                 // The actual incident changed context strings on every retry.
                 // The guard must key on terminal tool identity, not exact args.
                 arguments: serde_json::json!({ "tutor_context": suffix }),
@@ -1352,7 +1352,7 @@ async fn terminal_tool_failure_blocks_a_rewritten_retry_in_the_same_turn() {
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(
         result.content,
-        terminal_tool_retry_message("oll_generate_lesson"),
+        terminal_tool_retry_message("lesson_generate"),
     );
     assert_eq!(
         result
