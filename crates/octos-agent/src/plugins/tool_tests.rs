@@ -84,6 +84,15 @@ fn with_timeout_sets_custom() {
 }
 
 #[test]
+fn should_expose_manifest_timeout_with_cleanup_grace_to_dispatcher() {
+    let def = make_tool_def("lesson_generate", "Generate a lesson");
+    let tool = PluginTool::new("learning-coach".into(), def, PathBuf::from("/bin/true"))
+        .with_timeout(Duration::from_secs(300));
+
+    assert_eq!(tool.execution_timeout_secs(), Some(305));
+}
+
+#[test]
 fn trait_methods_delegate_to_tool_def() {
     let def = make_tool_def("my_tool", "A fine tool");
     let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
