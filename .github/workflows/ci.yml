@@ -1069,14 +1069,26 @@ jobs:
         run: |
           OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
             --config /tmp/octos-ci-serve.json &
-          # Wait for server to be ready
+          # Wait for server to be ready.
+          #
+          # `/api/status` is a 404 — this probe has never once succeeded, so the
+          # loop always burned its full 30 iterations and the job continued
+          # regardless of whether the server was up. `/health` is the endpoint
+          # that answers 200. Not being ready is now a hard failure instead of a
+          # silent 30-second sleep followed by racy assertions.
+          ready=""
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/api/status -H "Authorization: Bearer ci-test-token" > /dev/null 2>&1; then
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
               echo "Server ready after ${i}s"
+              ready=1
               break
             fi
             sleep 1
           done
+          if [ -z "$ready" ]; then
+            echo "::error::octos serve never answered /health on port 3000 after 30s."
+            exit 1
+          fi
 
       # Fail loudly at the precondition rather than inside four assertions that
       # each report it as `undefined`. If this step ever 404s again, the config
@@ -1130,6 +1142,25 @@ jobs:
         working-directory: e2e
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/tool-use-regression.spec.ts
 
+      # #2073 — the model-INDEPENDENT half of the m9 protocol suite, gating.
+      #
+      # These specs assert typed JSON-RPC envelopes and cursor semantics
+      # against a serve with no provider configured at all: unknown/malformed
+      # ids rejected as INVALID_PARAMS, baseline and strictly-later cursors,
+      # cursor_expired, cursor_stream_mismatch. No model is asked for anything,
+      # so nothing here can flake on phrasing — they belong on the required
+      # path, not in the nightly.
+      #
+      # Only these two files are listed because only these two are green
+      # without a configured profile. The rest of the m9 tree (turn/start,
+      # tool events, interrupt, most of fault-injection) needs a `_main`
+      # profile with a provider and answers `-32602 profile '_main' is not
+      # configured` without one; those stay in `e2e-live-nightly` until CI
+      # grows a profile fixture.
+      - name: Run m9 protocol conformance (model-independent)
+        working-directory: e2e
+        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts
+
       - name: Stop octos serve
         if: always()
         run: pkill -f "octos serve" || true
@@ -1181,13 +1212,21 @@ jobs:
         run: |
           OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
             --config /tmp/octos-ci-serve.json &
+          # `/api/status` is a 404; `/health` is the endpoint that answers 200.
+          # See the identical note in `e2e-tool-regression` above.
+          ready=""
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/api/status -H "Authorization: Bearer ci-test-token" > /dev/null 2>&1; then
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
               echo "Server ready after ${i}s"
+              ready=1
               break
             fi
             sleep 1
           done
+          if [ -z "$ready" ]; then
+            echo "::error::octos serve never answered /health on port 3000 after 30s."
+            exit 1
+          fi
 
       - name: Install e2e deps
         working-directory: e2e
