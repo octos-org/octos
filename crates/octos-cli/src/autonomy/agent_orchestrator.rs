@@ -22675,6 +22675,100 @@ mod tests {
         );
     }
 
+    /// #2068 round 2 (codex H6) — THE regression for an EXISTING user's
+    /// ledger. Every deployment that ran before this change has a `goals`
+    /// table with no time column, and `create_tables` (`IF NOT EXISTS`)
+    /// leaves it completely untouched. The clear stamp
+    /// (`stamp_goal_cleared_blocking`) and the post-clear settle
+    /// (`offload_cleared_goal_settle`) both open with the PLAIN profile, so
+    /// with a silently-dropping legacy fallback a cleared-mid-turn goal
+    /// ended at `time_used_seconds = 0` forever: the clear replaces the
+    /// supervisor record with a tombstone, the goal is terminal, and nothing
+    /// re-syncs it — a later migration only adds the column's default zero.
+    ///
+    /// Built on the REAL pre-#2068 file shape (raw `CREATE TABLE` with the
+    /// historical column list) and driven entirely through the production
+    /// clear/settle path, because that is the only fixture in which the bug
+    /// is expressible — a fresh ledger already has the column.
+    #[test]
+    fn should_settle_time_on_a_cleared_goal_when_the_ledger_predates_the_time_column() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-legacy-ledger-clear");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "audit the tree".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        let key = orchestrator.scoped_goal_key(&session_id);
+
+        // An EXISTING pre-#2068 ledger file, at exactly the path the
+        // orchestrator resolves for this goal.
+        let ledger_dir = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path());
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        {
+            let conn = rusqlite::Connection::open(&ledger_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE goals (
+                     goal_id TEXT PRIMARY KEY, objective TEXT NOT NULL,
+                     status TEXT NOT NULL, tokens_used INTEGER NOT NULL DEFAULT 0,
+                     token_budget INTEGER NOT NULL,
+                     continuations_used INTEGER NOT NULL DEFAULT 0,
+                     revision INTEGER NOT NULL DEFAULT 0,
+                     created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);",
+            )
+            .unwrap();
+        }
+
+        // Pre-clear spend through the production accountant.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 1_234, 60)
+                .is_some()
+        );
+        // A dispatched turn is in flight when the user clears.
+        let dispatcher_generation = orchestrator.mark_goal_dispatch_in_flight(&key);
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(data_dir.path()),
+            )
+            .expect("clear");
+        // The in-flight turn's late charge settles into the cleared row.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 5_000, 7)
+                .is_none()
+        );
+
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.status, "cleared");
+        assert_eq!(
+            row.tokens_used, 6_234,
+            "tokens settle on a legacy file today"
+        );
+        assert_eq!(
+            row.time_used_seconds, 67,
+            "an EXISTING ledger must not lose the goal's wall-clock spend: the \
+             clear stamps 60 and the in-flight turn settles 7 on top"
+        );
+        assert!(orchestrator.clear_goal_dispatch_in_flight_generation(&key, dispatcher_generation));
+    }
+
     /// #2064(b) — the settle is BOUND and SCOPED: a charge carrying a foreign
     /// goal_id must not land on the tombstone (goal-identity binding, exactly
     /// like the live charge path), and a clear with NO turn in flight parks
