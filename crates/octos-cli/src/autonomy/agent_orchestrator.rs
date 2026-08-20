@@ -18429,6 +18429,31 @@ mod tests {
         });
     }
 
+    /// #2053 / #2082 — scale a test's WAITING budget on Windows, where the
+    /// runners routinely miss fixed-duration waits that pass everywhere else.
+    /// Mirrors `session_actor_tests::waiting_budget`.
+    ///
+    /// Apply to DEADLINES only — the upper bound on how long a test is
+    /// willing to wait. Never to a duration that drives behaviour: scaling a
+    /// stimulus changes what the test proves, while scaling a deadline costs
+    /// a passing run nothing and still fails a broken one, just later.
+    ///
+    /// NB (#2077): a larger ceiling is NOT what fixes
+    /// `default_mode_background_nested_spawn_lands_grandchild_row` — its
+    /// break condition was. This only sizes the ceiling that the corrected
+    /// break condition made load-bearing, on the one runner already on
+    /// record missing waits of this class.
+    fn waiting_budget(base: std::time::Duration) -> std::time::Duration {
+        #[cfg(windows)]
+        {
+            base * 4
+        }
+        #[cfg(not(windows))]
+        {
+            base
+        }
+    }
+
     fn goal_task_ledger_path(data_dir: &std::path::Path, goal_id: &str) -> std::path::PathBuf {
         InProcessAgentOrchestrator::goal_ledger_dir(data_dir)
             .join(format!("{}.db", sanitize_filename_for_ledger(goal_id)))
@@ -18763,8 +18788,28 @@ mod tests {
         // The grandchild's task id lives on the DETACHED child registry's
         // private supervisor (invisible from here), so identify its row by
         // title — registration records the tool label.
+        //
+        // #2077 — wait for BOTH titles, not just the grandchild's. Each row
+        // is produced by two INDEPENDENT racing writers: the task's
+        // registration offload
+        // ([`InProcessAgentOrchestrator::record_goal_task_row_blocking`]) and
+        // its settle chain
+        // ([`InProcessAgentOrchestrator::settle_goal_task_row_blocking`],
+        // which seeds the row itself with `create_task_if_absent` before
+        // ranking the status). All four run on the blocking pool against the
+        // same SQLite file, so which of the two ROWS appears first is not
+        // determined. Breaking on the grandchild alone and then asserting the
+        // outer child made this test fail whenever the outer row lost that
+        // race — under a full-parallel `cargo test -p octos-cli --lib` the
+        // outer row was observed landing 78ms AFTER the grandchild's, with
+        // every registration and settle write reporting success (nothing was
+        // dropped; the row was simply still in flight). Waiting for both
+        // leaves the assertions exactly as strong: a row that never lands
+        // still fails the test, just at the end of the budget.
         let mut titles = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let wanted = ["outer-background-child", "nested-grandchild"];
+        let deadline =
+            std::time::Instant::now() + waiting_budget(std::time::Duration::from_secs(60));
         while std::time::Instant::now() < deadline {
             let path = ledger_path.clone();
             let gid = goal_id.clone();
@@ -18779,7 +18824,10 @@ mod tests {
             })
             .await
             .unwrap();
-            if titles.iter().any(|title| title == "nested-grandchild") {
+            if wanted
+                .iter()
+                .all(|want| titles.iter().any(|title| title == want))
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
