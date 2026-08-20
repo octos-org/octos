@@ -600,10 +600,14 @@ impl GoalLedger {
     /// #2055/#2059 established that migration DDL must stay off tokio worker
     /// threads. The invariant that rule protects is that a READER never has
     /// to take a write lock — `goal_get` and every inline consult open
-    /// plainly on an executor worker, and #2059's migration added a SEPARATE
-    /// `BEGIN IMMEDIATE` transaction plus a table-wide backfill `UPDATE` to
-    /// that reader path. [`Self::get_goal`] is deliberately untouched here:
-    /// it still takes no transaction and runs no DDL.
+    /// plainly on an executor worker, and #2059's authority migration is a
+    /// `BEGIN IMMEDIATE` transaction plus a table-wide backfill `UPDATE`,
+    /// which is why it runs ONLY under [`Self::open_with_busy_retry`] and
+    /// never under the plain `open` a reader uses. (An earlier revision of
+    /// this comment said that migration had been added *to* the reader path;
+    /// it never was.) [`Self::get_goal`] runs no DDL here either — it takes
+    /// only a DEFERRED read transaction, for snapshot consistency rather than
+    /// for writing.
     ///
     /// For a WRITER the calculus is different in kind, not degree. It is
     /// already inside `BEGIN IMMEDIATE`, so it already holds the RESERVED
@@ -907,17 +911,32 @@ impl GoalLedger {
 
     /// Get a goal by ID.
     ///
-    /// #2068 — the schema inspection here is deliberately NOT wrapped in a
-    /// transaction, unlike the goals writers: this is the reader tokio
-    /// workers run (`goal_get` and every inline consult), so it must never
-    /// take a write lock, and the race the writers close is benign for a
-    /// read. If a migration commits between the inspection and the SELECT,
-    /// the pre-#2068 shape still executes (it names only columns that
-    /// existed before it) and reports the dimension as `0` — which is
-    /// exactly the value the freshly-added column holds anyway.
+    /// #2068 — the schema probe and the SELECT it chooses run inside ONE
+    /// DEFERRED transaction, so they observe a single database state.
+    ///
+    /// They used to run as two bare statements, on the reasoning that a
+    /// migration committing between them was benign because the legacy shape
+    /// still executes and reports the dimension as `0`, "which is exactly the
+    /// value the freshly-added column holds anyway". That was wrong: the
+    /// `ALTER` and the writer's non-zero row write **commit together** in the
+    /// writer's `BEGIN IMMEDIATE` (see [`Self::ensure_goals_time_column`]), so
+    /// after that commit the column does NOT hold its default. A reader that
+    /// probed before it and selects after would return the writer's fresh
+    /// `status` / `tokens_used` alongside a synthesized `time_used_seconds: 0`
+    /// — a `Goal` that never existed as one database state. Narrow (only on an
+    /// existing ledger's first migration, since `has_time` is true forever
+    /// after) but a torn read all the same.
+    ///
+    /// DEFERRED is what makes this safe to add here. The invariant #2055/#2059
+    /// protect is that a READER never takes a write lock — `goal_get` and every
+    /// inline consult open plainly on a tokio worker. A deferred transaction
+    /// acquires only a shared read lock, and only on first access, so this
+    /// still runs no DDL and takes no write lock. It is rolled back on drop,
+    /// which for a read is a no-op.
     pub fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
         let conn = self.conn.lock().unwrap();
-        let has_time = Self::goals_has_time_column(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let has_time = Self::goals_has_time_column(&tx)?;
         let sql = if has_time {
             "SELECT goal_id, objective, status, tokens_used, token_budget, continuations_used, \
              revision, created_at_ms, updated_at_ms, time_used_seconds
@@ -927,22 +946,25 @@ impl GoalLedger {
              revision, created_at_ms, updated_at_ms
              FROM goals WHERE goal_id = ?1"
         };
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query_map(params![goal_id], |row| {
-            Ok(Goal {
-                goal_id: row.get(0)?,
-                objective: row.get(1)?,
-                status: row.get(2)?,
-                tokens_used: row.get(3)?,
-                token_budget: row.get(4)?,
-                time_used_seconds: if has_time { row.get(9)? } else { 0 },
-                continuations_used: row.get(5)?,
-                revision: row.get(6)?,
-                created_at_ms: row.get(7)?,
-                updated_at_ms: row.get(8)?,
-            })
-        })?;
-        Ok(rows.next().transpose()?)
+        let goal = {
+            let mut stmt = tx.prepare(sql)?;
+            let mut rows = stmt.query_map(params![goal_id], |row| {
+                Ok(Goal {
+                    goal_id: row.get(0)?,
+                    objective: row.get(1)?,
+                    status: row.get(2)?,
+                    tokens_used: row.get(3)?,
+                    token_budget: row.get(4)?,
+                    time_used_seconds: if has_time { row.get(9)? } else { 0 },
+                    continuations_used: row.get(5)?,
+                    revision: row.get(6)?,
+                    created_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
+                })
+            })?;
+            rows.next().transpose()?
+        };
+        Ok(goal)
     }
 
     /// #2055 review round 5 — the authority rank a freshly CREATED row
@@ -4915,6 +4937,86 @@ mod digest_integration_tests {
              VALUES ('legacy-failed', 'g1', '', '', 'failed', NULL, 1, 1);",
         ))
         .unwrap();
+    }
+
+    /// #2068 review — `get_goal`'s schema probe and its SELECT must observe
+    /// ONE database state.
+    ///
+    /// The first revision ran them as two bare statements, reasoning that a
+    /// migration landing between them was benign because the legacy shape
+    /// still executes and reports `0`, "which is exactly the value the
+    /// freshly-added column holds anyway". The `ALTER` and the writer's
+    /// non-zero row write commit TOGETHER, so after that commit the column
+    /// does not hold its default: a reader that probed before it and selected
+    /// after returned fresh `tokens_used` beside a synthesized
+    /// `time_used_seconds: 0` — a `Goal` that never existed as one state.
+    ///
+    /// The writer below only ever writes rows with BOTH dimensions non-zero,
+    /// so any observation of `tokens_used > 0 && time_used_seconds == 0` is a
+    /// torn read by construction, and no timing assumption is needed to
+    /// interpret it.
+    ///
+    /// This is a race-window test: it drives the window rather than pausing
+    /// inside it, so it is not a proof. It is kept because it reproduced the
+    /// defect on the unfixed reader on every attempt, and because the
+    /// structural argument (probe and SELECT inside one DEFERRED transaction)
+    /// is what actually closes it.
+    #[test]
+    fn should_never_read_a_torn_goal_when_a_writer_migrates_concurrently() {
+        for _round in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("torn.db");
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                create_legacy_schema(&conn, "");
+            }
+
+            // Both handles are opened BEFORE the threads start: `open` runs
+            // `create_tables`, which needs the write lock, and the plain-open
+            // profile carries a zero busy timeout by design (#2059) so it
+            // must not race another open.
+            let writer_ledger = GoalLedger::open(&path).unwrap();
+            let reader = GoalLedger::open(&path).unwrap();
+
+            let writer = std::thread::spawn(move || {
+                // Both dimensions non-zero, in one transaction that also
+                // performs the ALTER.
+                writer_ledger
+                    .upsert_goal(&Goal {
+                        goal_id: "g1".into(),
+                        objective: "ship".into(),
+                        status: "active".into(),
+                        tokens_used: 4_242,
+                        token_budget: 1_000_000,
+                        time_used_seconds: 77,
+                        continuations_used: 0,
+                        revision: 1,
+                        created_at_ms: 1,
+                        updated_at_ms: 2,
+                    })
+                    .unwrap();
+            });
+
+            let mut torn = None;
+            for _ in 0..600 {
+                if let Some(goal) = reader.get_goal("g1").unwrap()
+                    && goal.tokens_used > 0
+                    && goal.time_used_seconds == 0
+                {
+                    torn = Some(goal);
+                    break;
+                }
+            }
+            writer.join().unwrap();
+
+            assert!(
+                torn.is_none(),
+                "get_goal returned a goal that never existed as one database \
+                 state: tokens_used={} with time_used_seconds=0, while the only \
+                 writer writes both non-zero in a single transaction",
+                torn.map(|g| g.tokens_used).unwrap_or_default(),
+            );
+        }
     }
 
     /// #2068 — a ledger FILE created before the time column existed migrates
