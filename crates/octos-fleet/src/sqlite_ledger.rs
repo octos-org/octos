@@ -1018,6 +1018,66 @@ impl GoalLedger {
         Ok(tasks)
     }
 
+    /// #2056 — every task row of `goal_id` that carries NO terminal verdict
+    /// yet (`authority < 0`), oldest first. This is exactly the
+    /// "delivery owed" set: [`Self::settle_task_status`] stamps a rank ≥ 0 on
+    /// the first verdict that lands, so a row leaves this set permanently the
+    /// moment any terminal write succeeds — and a row that already carries a
+    /// verdict can never be re-examined, let alone regressed, by a reconcile
+    /// pass. Scoped to one goal, and each goal owns its own ledger file, so
+    /// the scan is bounded by that goal's own unsettled task count.
+    ///
+    /// Requires the migrated schema (the `authority` column), i.e. a
+    /// connection from [`Self::open_with_busy_retry`].
+    pub fn tasks_awaiting_terminal_verdict(&self, goal_id: &str) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, goal_id, title, detail, status, assigned_peer, created_at_ms, updated_at_ms
+             FROM tasks WHERE goal_id = ?1 AND authority < 0 ORDER BY created_at_ms, task_id",
+        )?;
+        let rows = stmt.query_map(params![goal_id], |row| {
+            Ok(Task {
+                task_id: row.get(0)?,
+                goal_id: row.get(1)?,
+                title: row.get(2)?,
+                detail: row.get(3)?,
+                status: row.get(4)?,
+                assigned_peer: row.get(5)?,
+                created_at_ms: row.get(6)?,
+                updated_at_ms: row.get(7)?,
+            })
+        })?;
+        let mut tasks = Vec::new();
+        for task in rows {
+            tasks.push(task?);
+        }
+        Ok(tasks)
+    }
+
+    /// #2056 — the persisted terminal-authority rank of one task row, or
+    /// `None` when the row does not exist. `-1` means no terminal verdict has
+    /// been recorded; see [`TaskSettleAuthority::rank`] for the ordering.
+    pub fn task_authority(&self, task_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT authority FROM tasks WHERE task_id = ?1")?;
+        let mut rows = stmt.query(params![task_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// #2056 — SQLite's `PRAGMA data_version` for this connection: a counter
+    /// that changes when a DIFFERENT connection commits to the database, and
+    /// never for this connection's own commits. Lets a caller (or a test)
+    /// prove that some other writer landed nothing at all, rather than
+    /// inferring it from the absence of a visible change.
+    pub fn data_version(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        Ok(version)
+    }
+
     /// Update goal status.
     /// Update goal status with optimistic concurrency control (CAS).
     ///
@@ -4024,6 +4084,78 @@ mod digest_integration_tests {
                 updated_at_ms: 1_000,
             })
             .unwrap();
+    }
+
+    /// #2056 — the "delivery owed" predicate. A row leaves the set on the
+    /// FIRST verdict of any rank and can never re-enter it, which is what
+    /// makes a boot reconciliation sweep both convergent and unable to
+    /// re-examine (let alone regress) a row that has already been settled.
+    #[test]
+    fn should_list_only_rows_without_a_terminal_verdict_when_reconciling() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = GoalLedger::open(dir.path().join("ledger.db")).unwrap();
+        seed_goal_with_task(&ledger, "g1", "owed", "running");
+        for task_id in ["settled-complete", "settled-provisional"] {
+            ledger
+                .create_task(&Task {
+                    task_id: task_id.to_string(),
+                    goal_id: "g1".to_string(),
+                    title: String::new(),
+                    detail: String::new(),
+                    status: "running".to_string(),
+                    assigned_peer: None,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap();
+        }
+        // A different goal's unsettled row must never leak into the scan.
+        seed_goal_with_task(&ledger, "g2", "other-goal-owed", "running");
+
+        assert_eq!(
+            ledger
+                .tasks_awaiting_terminal_verdict("g1")
+                .unwrap()
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            vec!["owed", "settled-complete", "settled-provisional"],
+            "every row starts owed",
+        );
+
+        assert!(
+            ledger
+                .settle_task_status("settled-complete", TaskSettleAuthority::Completion, 2_000)
+                .unwrap()
+        );
+        // Even the LOWEST rank leaves the set: a provisional verdict is still
+        // a verdict, so a reconcile can never re-settle it as final.
+        assert!(
+            ledger
+                .settle_task_status(
+                    "settled-provisional",
+                    TaskSettleAuthority::ProvisionalFailure,
+                    2_000
+                )
+                .unwrap()
+        );
+
+        assert_eq!(
+            ledger
+                .tasks_awaiting_terminal_verdict("g1")
+                .unwrap()
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            vec!["owed"],
+            "a settled row is gone from the owed set, at either rank",
+        );
+        assert_eq!(ledger.task_authority("owed").unwrap(), Some(-1));
+        assert_eq!(
+            ledger.task_authority("settled-provisional").unwrap(),
+            Some(TaskSettleAuthority::ProvisionalFailure.rank())
+        );
+        assert_eq!(ledger.task_authority("no-such-task").unwrap(), None);
     }
 
     #[test]

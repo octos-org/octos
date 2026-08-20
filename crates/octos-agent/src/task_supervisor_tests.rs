@@ -2710,6 +2710,87 @@ fn legacy_register_returns_empty_string_on_cap_rejection() {
     );
 }
 
+/// #2056 — the restore observer fires ONCE per restore, with the table in its
+/// FINAL post-sweep state, and never for a re-enable that restores nothing.
+/// Consumers that mirror task state elsewhere (the octos-cli goal ledger) use
+/// it to notice terminal transitions the previous process never delivered, so
+/// a snapshot taken before the orphan sweep would hand them a row that is
+/// about to change and a repeat firing would re-drive work already done.
+#[test]
+fn should_fire_on_restore_once_with_the_swept_table_when_persistence_is_enabled() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("tasks.jsonl");
+
+    let writer = TaskSupervisor::new();
+    writer.enable_persistence(&ledger_path).unwrap();
+    let orphan = writer.register("search", "call-orphan", Some("api:session"));
+    writer.mark_running(&orphan);
+    let finished = writer.register("fm_tts", "call-done", Some("api:session"));
+    writer.mark_completed(&finished, vec![]);
+    drop(writer);
+
+    type RestoredRows = Vec<(String, TaskStatus)>;
+    let observed: Arc<Mutex<Vec<RestoredRows>>> = Arc::new(Mutex::new(Vec::new()));
+    let restored = TaskSupervisor::new();
+    let sink = Arc::clone(&observed);
+    restored.set_on_restore(move |tasks| {
+        let mut rows: RestoredRows = tasks
+            .iter()
+            .map(|task| (task.id.clone(), task.status.clone()))
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        sink.lock().unwrap().push(rows);
+    });
+    restored.enable_persistence(&ledger_path).unwrap();
+
+    let calls = observed.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "exactly one firing per restore");
+    let rows: std::collections::HashMap<String, TaskStatus> = calls[0].iter().cloned().collect();
+    assert_eq!(
+        rows.get(&orphan),
+        Some(&TaskStatus::Failed),
+        "the observer sees the table AFTER the orphan sweep, not before it",
+    );
+    assert_eq!(rows.get(&finished), Some(&TaskStatus::Completed));
+
+    // Re-enabling the SAME path restores nothing (the idempotence guard) and
+    // must not re-fire.
+    restored.enable_persistence(&ledger_path).unwrap();
+    assert_eq!(
+        observed.lock().unwrap().len(),
+        1,
+        "a no-op re-enable must not re-fire the restore observer",
+    );
+}
+
+/// #2056 — the restore observer travels with the registration observer onto
+/// child / nested supervisors, so a child that persists its own task ledger
+/// reconciles its own rows.
+#[test]
+fn should_inherit_on_restore_when_registration_observers_are_inherited() {
+    use std::sync::atomic::AtomicUsize;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ledger_path = dir.path().join("child-tasks.jsonl");
+
+    let parent = TaskSupervisor::new();
+    let fired = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&fired);
+    parent.set_on_restore(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let child = TaskSupervisor::new();
+    child.inherit_registration_observers(&parent);
+    child.enable_persistence(&ledger_path).unwrap();
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the inherited restore observer fires on the child's own restore",
+    );
+}
+
 #[test]
 fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     // The bug: when the runtime crashes mid-task, the JSONL ledger has a

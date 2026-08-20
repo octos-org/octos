@@ -381,6 +381,21 @@ type OnChangeCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
 /// supervisor locks held, exactly like `notify_change`.
 type OnRegisterCallback = Arc<dyn Fn(&BackgroundTask) + Send + Sync>;
 
+/// #2056 — callback invoked ONCE at the end of
+/// [`TaskSupervisor::enable_persistence`], with the rebuilt task table as it
+/// stands after replay, the orphan sweep and the descendant cascade — i.e.
+/// every row already in its final restored state.
+///
+/// `enable_persistence` restores terminal rows into the map by direct insert;
+/// it fires neither `on_register` nor `on_change` for them, so a consumer that
+/// mirrors task state elsewhere (the octos-cli goal ledger) has no way to
+/// notice that a transition it was owed never arrived. This observer is that
+/// way. Like [`OnRegisterCallback`] it is an `Arc` so the notify can clone it
+/// out of its mutex and invoke it with NO supervisor locks held, and it is
+/// deliberately given the whole table rather than a filtered subset — the
+/// reconciliation policy belongs to the consumer, not to octos-agent.
+type OnRestoreCallback = Arc<dyn Fn(&[BackgroundTask]) + Send + Sync>;
+
 /// Payload emitted when a `spawn_only` background task transitions to
 /// `Failed`. Consumers (e.g. the session actor) use this to schedule a
 /// synthetic recovery turn so the LLM can re-engage with an actionable
@@ -918,6 +933,11 @@ pub struct TaskSupervisor {
     /// single success path (covers every `register*` entry point). The
     /// octos-cli runtime wires the goal-ledger task-row creation here.
     on_register: Arc<Mutex<Option<OnRegisterCallback>>>,
+    /// #2056 — restore observer, fired once at the end of
+    /// [`Self::enable_persistence`] with the rebuilt table. The octos-cli
+    /// runtime wires the goal-ledger reconciliation sweep here, next to the
+    /// registration observer above.
+    on_restore: Arc<Mutex<Option<OnRestoreCallback>>>,
     on_relaunch: Arc<Mutex<Option<OnRelaunchCallback>>>,
     persistence_path: Arc<Mutex<Option<PathBuf>>>,
     /// Optional reporter that receives a [`ProgressEvent::ToolProgress`]
@@ -1258,6 +1278,7 @@ impl TaskSupervisor {
             on_failure: Arc::new(Mutex::new(None)),
             on_terminal: Arc::new(Mutex::new(None)),
             on_register: Arc::new(Mutex::new(None)),
+            on_restore: Arc::new(Mutex::new(None)),
             on_relaunch: Arc::new(Mutex::new(None)),
             persistence_path: Arc::new(Mutex::new(None)),
             progress_reporter: Arc::new(Mutex::new(None)),
@@ -1539,7 +1560,38 @@ impl TaskSupervisor {
             self.mark_descendants_failed(parent_tcid, "parent task orphaned across restart");
         }
 
+        // #2056 — hand the FINAL rebuilt table to the restore observer. Fired
+        // last, after replay + orphan sweep + cascade, so every row is in the
+        // state this boot will act on; and with no supervisor lock held (the
+        // snapshot is taken and the guard dropped first), exactly like
+        // `notify_change` / `notify_register`. Consumers mirror task state
+        // elsewhere and use this to detect transitions the previous process
+        // owed them but never delivered. A repeat `enable_persistence` on the
+        // SAME path returns at the idempotence guard above, so this cannot
+        // re-fire for an unchanged restore.
+        self.notify_restore();
+
         Ok(self.tasks.lock().unwrap_or_else(|e| e.into_inner()).len())
+    }
+
+    /// Fire the [`OnRestoreCallback`], if one is wired, with a snapshot of the
+    /// rebuilt table. The callback is cloned out of its mutex and the task map
+    /// snapshot taken before invocation, so the observer runs with NO
+    /// supervisor lock held and may safely re-enter the supervisor.
+    fn notify_restore(&self) {
+        let callback = self
+            .on_restore
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(callback) = callback else {
+            return;
+        };
+        let snapshot: Vec<BackgroundTask> = {
+            let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks.values().cloned().collect()
+        };
+        callback(&snapshot);
     }
 
     /// Set a callback that fires whenever a task's status changes.
@@ -1614,6 +1666,18 @@ impl TaskSupervisor {
         *guard = Some(Arc::new(cb));
     }
 
+    /// #2056 — set the restore observer, fired ONCE at the end of
+    /// [`Self::enable_persistence`] with the rebuilt task table (see
+    /// [`OnRestoreCallback`]). Wired next to [`Self::set_on_register`] by the
+    /// runtime modes and inherited by child / nested supervisors, so the
+    /// consumer that mirrors task state into the goal ledger gets a chance to
+    /// reconcile deliveries the previous process never made. The latest
+    /// observer wins.
+    pub fn set_on_restore(&self, cb: impl Fn(&[BackgroundTask]) + Send + Sync + 'static) {
+        let mut guard = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Arc::new(cb));
+    }
+
     /// #2055 review round 2 — copy the REGISTRATION observers from `parent`
     /// onto this (freshly created) supervisor: the `on_register` callback
     /// and the NAMED `on_change_listeners` map. Called wherever a child /
@@ -1637,6 +1701,18 @@ impl TaskSupervisor {
             .clone();
         if let Some(callback) = parent_register {
             let mut guard = self.on_register.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(callback);
+        }
+        // #2056 — the restore observer travels with the registration
+        // observer: a child supervisor that enables persistence over its own
+        // ledger must reconcile its own rows too.
+        let parent_restore = parent
+            .on_restore
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(callback) = parent_restore {
+            let mut guard = self.on_restore.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(callback);
         }
         let parent_listeners: Vec<(String, OnChangeCallback)> = parent
