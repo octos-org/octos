@@ -3399,10 +3399,11 @@ impl InProcessAgentOrchestrator {
                 profile_id,
                 expected_goal_id,
                 tokens_consumed,
+                elapsed_seconds,
             );
             drop(state);
-            if let Some((base, ledger_data_dir, tokens_delta)) = settle {
-                Self::offload_cleared_goal_settle(base, ledger_data_dir, tokens_delta);
+            if let Some((base, ledger_data_dir, tokens_delta, time_delta)) = settle {
+                Self::offload_cleared_goal_settle(base, ledger_data_dir, tokens_delta, time_delta);
             }
             return None;
         }
@@ -3609,10 +3610,11 @@ impl InProcessAgentOrchestrator {
                 profile_id,
                 Some(expected_goal_id),
                 tokens_consumed,
+                elapsed_seconds,
             );
             drop(state);
-            if let Some((base, ledger_data_dir, tokens_delta)) = settle {
-                Self::offload_cleared_goal_settle(base, ledger_data_dir, tokens_delta);
+            if let Some((base, ledger_data_dir, tokens_delta, time_delta)) = settle {
+                Self::offload_cleared_goal_settle(base, ledger_data_dir, tokens_delta, time_delta);
             }
             return None;
         }
@@ -5031,6 +5033,7 @@ impl InProcessAgentOrchestrator {
             status: snapshot.status.clone(),
             tokens_used: snapshot.tokens_used,
             token_budget: snapshot.token_budget,
+            time_used_seconds: snapshot.time_used_seconds,
             continuations_used: snapshot.continuations_used,
             revision: 0,
             created_at_ms: snapshot.created_at_ms.max(0) as u64,
@@ -5138,10 +5141,21 @@ impl InProcessAgentOrchestrator {
     /// Idempotency assumption (codex R6 note): per-charge SINGLE DELIVERY —
     /// each in-process accountant charge settles exactly once (one offload
     /// per charge); the delta write has no dedupe key.
+    ///
+    /// #2068 — the settle carries BOTH cost dimensions. `time_used_seconds`
+    /// MAX-folds its own frozen clear-time base exactly as tokens do, and it
+    /// has to: the counter is monotonic per goal_id, the row lags the frozen
+    /// base (nonterminal turns never sync), and the clear stamp MAX-merges,
+    /// so plain accumulation would be order-DEPENDENT — a settle landing
+    /// before the stamp would store `lag + delta`, which the stamp then
+    /// collapses back to the base whenever the lag exceeds the delta (the
+    /// normal case: the lag is a whole goal's history). See
+    /// [`octos_fleet::GoalLedger::settle_cleared_goal_cost_delta`].
     fn offload_cleared_goal_settle(
         base_snapshot: AutonomyGoalRecord,
         ledger_data_dir: std::path::PathBuf,
         tokens_delta: u64,
+        time_delta: u64,
     ) {
         offload_goal_ledger_io(move || {
             let ledger_dir = Self::goal_ledger_dir(&ledger_data_dir);
@@ -5166,6 +5180,7 @@ impl InProcessAgentOrchestrator {
                 status: "cleared".to_owned(),
                 tokens_used: base_snapshot.tokens_used,
                 token_budget: base_snapshot.token_budget,
+                time_used_seconds: base_snapshot.time_used_seconds,
                 continuations_used: base_snapshot.continuations_used,
                 revision: 0,
                 created_at_ms: base_snapshot.created_at_ms.max(0) as u64,
@@ -5180,18 +5195,22 @@ impl InProcessAgentOrchestrator {
                 &base_snapshot.goal_id,
                 base_snapshot.tokens_used,
                 tokens_delta,
+                base_snapshot.time_used_seconds,
+                time_delta,
                 now_ms_u64(),
             ) {
                 Ok(true) => {}
                 Ok(false) => tracing::warn!(
                     goal_id = %base_snapshot.goal_id,
                     tokens_delta,
+                    time_delta,
                     "post-clear settle: no goals row matched even after \
                      create-if-absent; charge dropped"
                 ),
                 Err(error) => tracing::warn!(%error,
                     goal_id = %base_snapshot.goal_id,
                     tokens_delta,
+                    time_delta,
                     "post-clear settle: delta write failed (best-effort; charge dropped)"),
             }
         });
@@ -5238,6 +5257,7 @@ impl InProcessAgentOrchestrator {
             status: "cleared".to_owned(),
             tokens_used: snapshot.tokens_used,
             token_budget: snapshot.token_budget,
+            time_used_seconds: snapshot.time_used_seconds,
             continuations_used: snapshot.continuations_used,
             revision: 0,
             created_at_ms: snapshot.created_at_ms.max(0) as u64,
@@ -5587,6 +5607,7 @@ impl InProcessAgentOrchestrator {
                     status: snapshot.status.clone(),
                     tokens_used: snapshot.tokens_used,
                     token_budget: snapshot.token_budget,
+                    time_used_seconds: snapshot.time_used_seconds,
                     continuations_used: snapshot.continuations_used,
                     revision: 0, // preserved on conflict by upsert_goal
                     created_at_ms: snapshot.created_at_ms.max(0) as u64,
@@ -5737,6 +5758,7 @@ impl InProcessAgentOrchestrator {
                     status: goal.status.clone(),
                     tokens_used: goal.tokens_used,
                     token_budget: goal.token_budget,
+                    time_used_seconds: goal.time_used_seconds,
                     continuations_used: goal.continuations_used,
                     revision: 0, // preserved on conflict by upsert_goal
                     created_at_ms: goal.created_at_ms.max(0) as u64,
@@ -5857,6 +5879,7 @@ impl InProcessAgentOrchestrator {
                     status: goal.status.clone(),
                     tokens_used: goal.tokens_used,
                     token_budget: goal.token_budget,
+                    time_used_seconds: goal.time_used_seconds,
                     continuations_used: goal.continuations_used,
                     revision: 0,
                     created_at_ms: goal.created_at_ms.max(0) as u64,
@@ -6192,6 +6215,7 @@ impl InProcessAgentOrchestrator {
                     status: goal.status.clone(),
                     tokens_used: goal.tokens_used,
                     token_budget: goal.token_budget,
+                    time_used_seconds: goal.time_used_seconds,
                     continuations_used: goal.continuations_used,
                     revision: 0,
                     created_at_ms: goal.created_at_ms.max(0) as u64,
@@ -9654,6 +9678,10 @@ struct ClearedGoalTombstone {
     /// Total tokens settled through this tombstone so far (observability —
     /// surfaced in the eviction/purge debug logs).
     settled_tokens: u64,
+    /// #2068 — the wall-clock twin of `settled_tokens`: total seconds settled
+    /// through this tombstone. Same purpose (observability), and now backed
+    /// by a real durable column, so it is no longer dead accumulation.
+    settled_time_seconds: u64,
 }
 
 /// #2066 round 2 (codex R1) — drop tombstones past the settle horizon.
@@ -9693,6 +9721,7 @@ fn purge_stale_cleared_goal_tombstones(state: &mut AutonomyRuntimeState) {
                 session = %key,
                 goal_id = %dropped.snapshot.goal_id,
                 settled_tokens = dropped.settled_tokens,
+                settled_time_seconds = dropped.settled_time_seconds,
                 "cleared-goal tombstone aged past the settle horizon with no \
                  live in-flight marker; dropping it"
             );
@@ -9788,6 +9817,7 @@ fn park_cleared_goal_tombstone(
                     session = %oldest,
                     goal_id = %dropped.snapshot.goal_id,
                     settled_tokens = dropped.settled_tokens,
+                    settled_time_seconds = dropped.settled_time_seconds,
                     "cleared-goal tombstone cap reached; evicting the oldest \
                      (its turn's remaining late charges will be dropped)"
                 );
@@ -9804,6 +9834,7 @@ fn park_cleared_goal_tombstone(
             ledger_data_dir: ledger_data_dir.to_path_buf(),
             parked_at_ms: now_ms_u64(),
             settled_tokens: 0,
+            settled_time_seconds: 0,
         },
     );
 }
@@ -9820,20 +9851,29 @@ fn park_cleared_goal_tombstone(
 /// by the cap, or purged past [`CLEARED_GOAL_TOMBSTONE_TTL_MS`]. `None` ⇒
 /// nothing to settle — the charge is dropped exactly as before this fix.
 ///
-/// #2066 round 2 (codex MEDIUM) — deliberately tokens-only: the ledger
-/// schema has no time column anywhere (not a cleared-goal gap), so accruing
-/// wall-clock here could never persist; the schema addition is #2068 —
-/// accumulating dead state would be worse than not accruing.
+/// #2068 — the charge is TWO-DIMENSIONAL now. #2066 round 2 (codex MEDIUM)
+/// deliberately left wall-clock out because the ledger schema had no time
+/// column ANYWHERE (not a cleared-goal gap), so accruing it here could never
+/// persist — and accumulating structurally-dead state is worse than not
+/// accruing. `goals.time_used_seconds` exists as of this change, so the
+/// elapsed seconds of a cleared-mid-turn turn settle alongside its tokens.
+///
+/// A charge counts when EITHER dimension is nonzero: an elapsed-only turn
+/// (one that spent no tokens) is a real cost the cleared row must record, and
+/// the live charge path admits exactly the same pair
+/// ([`InProcessAgentOrchestrator::charge_goal_tokens_gated`]'s own zero-guard
+/// is `tokens == 0 && elapsed == 0`).
 fn accrue_cleared_goal_tombstone_charge(
     state: &mut AutonomyRuntimeState,
     key: &SessionKey,
     profile_id: &str,
     expected_goal_id: Option<&str>,
     tokens_consumed: u64,
-) -> Option<(AutonomyGoalRecord, std::path::PathBuf, u64)> {
+    elapsed_seconds: u64,
+) -> Option<(AutonomyGoalRecord, std::path::PathBuf, u64, u64)> {
     // R1c — refuse unbound settlement: no goal identity, no settle.
     let expected_goal_id = expected_goal_id?;
-    if tokens_consumed == 0 {
+    if tokens_consumed == 0 && elapsed_seconds == 0 {
         return None;
     }
     purge_stale_cleared_goal_tombstones(state);
@@ -9845,10 +9885,14 @@ fn accrue_cleared_goal_tombstone_charge(
         return None;
     }
     tombstone.settled_tokens = tombstone.settled_tokens.saturating_add(tokens_consumed);
+    tombstone.settled_time_seconds = tombstone
+        .settled_time_seconds
+        .saturating_add(elapsed_seconds);
     Some((
         tombstone.snapshot.clone(),
         tombstone.ledger_data_dir.clone(),
         tokens_consumed,
+        elapsed_seconds,
     ))
 }
 
@@ -18811,6 +18855,7 @@ mod tests {
                 status: "active".to_string(),
                 tokens_used: 0,
                 token_budget: 1_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1,
@@ -21431,6 +21476,7 @@ mod tests {
                 status: "active".to_owned(),
                 tokens_used: 0,
                 token_budget: 1_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1_000,
@@ -21668,6 +21714,7 @@ mod tests {
                 status: "active".to_owned(),
                 tokens_used: 0,
                 token_budget: 1_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1_000,
@@ -22506,7 +22553,126 @@ mod tests {
             row.tokens_used, 4_000,
             "the autonomous turn's spend must land on the cleared row"
         );
+        // #2068 — the wall-clock half of the same charge settles too.
+        assert_eq!(
+            row.time_used_seconds, 9,
+            "the autonomous turn's elapsed seconds must land on the cleared row"
+        );
         assert!(orchestrator.clear_goal_dispatch_in_flight_generation(&key, dispatcher_generation));
+    }
+
+    /// #2068 — the CLEARED-MID-TURN settle covers the wall-clock dimension:
+    /// the in-flight turn's elapsed seconds must appear in the cleared row
+    /// on top of the pre-clear total, exactly as its tokens do. #2066 round 2
+    /// deliberately left this accrual OUT because the ledger had nowhere to
+    /// write it; this is the durable half.
+    #[test]
+    fn should_include_the_mid_flight_elapsed_seconds_when_the_goal_was_cleared_mid_turn() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-clear-midflight-time");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "audit the tree".into(),
+                status: Some("active".into()),
+                token_budget: Some(100_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+        let goal_id = orchestrator.goal_id_for_test(&session_id).expect("goal id");
+        let key = orchestrator.scoped_goal_key(&session_id);
+
+        // Pre-clear spend, charged through the production accountant: the
+        // ledger row deliberately LAGS this (nonterminal turns never sync).
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 1_234, 60)
+                .is_some()
+        );
+
+        // A dispatched turn is in flight when the user clears.
+        let dispatcher_generation = orchestrator.mark_goal_dispatch_in_flight(&key);
+        orchestrator
+            .clear_goal_with_ledger_sync(
+                GoalSessionRequest {
+                    session_id: session_id.clone(),
+                    profile_id: "tenant-a".into(),
+                },
+                Some(data_dir.path()),
+            )
+            .expect("clear");
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(data_dir.path())
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.status, "cleared");
+        assert_eq!(
+            row.tokens_used, 1_234,
+            "the clear stamps the pre-turn total"
+        );
+        assert_eq!(
+            row.time_used_seconds, 60,
+            "the clear stamps the pre-turn wall-clock total"
+        );
+
+        // The in-flight turn finishes; its charge settles into the cleared row.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 5_000, 7)
+                .is_none(),
+            "a settled post-clear charge must not emit a goal-updated event"
+        );
+        // Runtime-less test: the settle offload runs inline.
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.status, "cleared", "settling never resurrects the goal");
+        assert_eq!(row.tokens_used, 6_234);
+        assert_eq!(
+            row.time_used_seconds, 67,
+            "the cleared row must include the in-flight turn's elapsed seconds"
+        );
+
+        // A SECOND late charge (the verifier's own usage) accumulates on top
+        // — the tombstone stays parked and both dimensions keep climbing.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 100, 3)
+                .is_none()
+        );
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.tokens_used, 6_334);
+        assert_eq!(row.time_used_seconds, 70);
+
+        // An ELAPSED-ONLY late charge (zero tokens) must still settle: the
+        // wall-clock dimension is now durable in its own right.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&session_id, "tenant-a", &goal_id, 0, 4)
+                .is_none()
+        );
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("query")
+            .expect("row present");
+        assert_eq!(row.tokens_used, 6_334, "a time-only charge adds no tokens");
+        assert_eq!(row.time_used_seconds, 74);
+
+        // Exactly the clear's ONE decision — no settle appends an audit row.
+        assert_eq!(ledger.count_decisions(&goal_id).expect("count"), 1);
+        assert!(
+            orchestrator.clear_goal_dispatch_in_flight_generation(&key, dispatcher_generation),
+            "the running turn's dispatch claim must survive the clear"
+        );
     }
 
     /// #2064(b) — the settle is BOUND and SCOPED: a charge carrying a foreign
@@ -29073,6 +29239,7 @@ mod tests {
                 status: "active".into(),
                 tokens_used: 0,
                 token_budget: 1_000_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1,
@@ -29101,6 +29268,52 @@ mod tests {
         assert_eq!(
             row.status, "paused",
             "the durable goals-row must read `paused` after a solo-boot park",
+        );
+    }
+
+    /// #2068 — a goal transition must sync `time_used_seconds` into the
+    /// durable row alongside `tokens_used`. The wall-clock dimension is
+    /// charged by every accountant and persisted to the supervisor store,
+    /// but the `octos_fleet::Goal` conversion silently DROPPED it (the
+    /// ledger had no time column at all), so the durable row's idea of what
+    /// a goal cost was permanently missing half the answer.
+    #[test]
+    fn should_sync_goal_time_used_seconds_into_the_ledger_when_a_goal_transitions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let wire = SessionKey::new("api", "goal-time-transition");
+        seed_goal(&orchestrator, &wire, "tenant-a");
+        let goal_id = orchestrator.goal_id_for_test(&wire).expect("goal id");
+
+        // A real interactive turn charges BOTH dimensions through the
+        // production accountant.
+        assert!(
+            orchestrator
+                .charge_active_goal_tokens(&wire, "tenant-a", &goal_id, 1_000, 45)
+                .is_some(),
+            "the interactive charge lands on the live goal"
+        );
+
+        // The solo-boot park is an ordinary production transition + sync.
+        let profile_dir = dir.path().join("profile-data");
+        let parked =
+            orchestrator.pause_restored_goals_for_solo_boot_with_ledger_sync(&|profile_id| {
+                (profile_id == "tenant-a").then(|| profile_dir.clone())
+            });
+        assert_eq!(parked.len(), 1, "the active goal is parked");
+
+        let ledger_path = InProcessAgentOrchestrator::goal_ledger_dir(&profile_dir)
+            .join(format!("{}.db", sanitize_filename_for_ledger(&goal_id)));
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("open ledger");
+        let row = ledger
+            .get_goal(&goal_id)
+            .expect("read row")
+            .expect("row exists");
+        assert_eq!(row.status, "paused");
+        assert_eq!(row.tokens_used, 1_000, "the token dimension syncs");
+        assert_eq!(
+            row.time_used_seconds, 45,
+            "the transition sync must carry the wall-clock dimension too",
         );
     }
 
@@ -29148,6 +29361,7 @@ mod tests {
                 status: "active".into(),
                 tokens_used: 0,
                 token_budget: 1_000_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1,
@@ -29205,6 +29419,7 @@ mod tests {
                 status: "active".into(),
                 tokens_used: 500,
                 token_budget: 1_000_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1,
@@ -29268,6 +29483,7 @@ mod tests {
                 status: "cleared".into(),
                 tokens_used: 500,
                 token_budget: 1_000_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1,
@@ -29350,6 +29566,7 @@ mod tests {
                 status: "complete".into(),
                 tokens_used: 0,
                 token_budget: 1_000_000,
+                time_used_seconds: 0,
                 continuations_used: 0,
                 revision: 0,
                 created_at_ms: 1,
