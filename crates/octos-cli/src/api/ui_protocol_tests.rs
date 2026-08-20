@@ -29493,6 +29493,7 @@ fn peer_close_resolves_open_goal_escalations_in_ledger() {
             status: "active".to_owned(),
             tokens_used: 0,
             token_budget: 1_000,
+            time_used_seconds: 0,
             continuations_used: 0,
             revision: 0,
             created_at_ms: 1_000,
