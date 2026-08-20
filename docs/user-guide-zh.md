@@ -199,7 +199,7 @@ Octos 开箱即用支持 16 个 LLM 提供商家族。云端提供商需要设�
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | — |
 | `vllm` | `VLLM_API_KEY` | *（必须指定）* | OpenAI 兼容 | — |
-| `local` | *（无需）* | default | OpenAI 兼容 | `llamacpp`、`llama.cpp`、`llama-server`、`lmstudio`、`openai-compatible` |
+| `local` | *（无需）* | local-default | OpenAI 兼容 | `llamacpp`、`llama.cpp`、`llama-server`、`lmstudio`、`openai-compatible` |
 
 #### 如何获取 API 密钥
 
@@ -399,7 +399,7 @@ octos auth logout --provider openai
 | vLLM | `http://127.0.0.1:8000/v1` | 将 `model` 设为所服务的模型 id |
 | LM Studio | `http://127.0.0.1:1234/v1` | 单模型；`model` 可不设 |
 
-如果服务器启动时设置了 API 密钥（llama.cpp 的 `--api-key`），照常通过 `api_key_env` 提供。`ollama`、`vllm` 家族仍然可用且行为一致——推荐使用与引擎无关的 `local`。
+如果服务器启动时设置了 API 密钥（llama.cpp 的 `--api-key`），照常通过 `api_key_env` 提供。在**共享/多用户机器**上，请务必为服务器设置密钥：未鉴权的 localhost 端点可被任意本地进程抢占绑定，从而截获你的完整对话内容。`ollama`、`vllm` 家族仍然可用且行为一致——推荐使用与引擎无关的 `local`。
 
 **用 `octos doctor` 验证配置。** 对本地家族，doctor 会查询服务器的 `/v1/models` 端点，报告实际加载的模型，并在配置的 `model` 不在列表中或端口无响应时给出警告（并列出常见的本地端点）。
 

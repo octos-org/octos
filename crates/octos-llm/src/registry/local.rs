@@ -7,15 +7,7 @@ use crate::provider::LlmProvider;
 
 use super::{CreateParams, ProviderEntry};
 
-/// Fallback model id when neither config nor catalog names one. Single-model
-/// local servers (llama.cpp, LM Studio, vLLM) ignore the request's `model`
-/// field, so any placeholder works against them.
-const FALLBACK_MODEL: &str = "default";
-
-/// Fallback base URL: llama.cpp's `llama-server` default. Ollama (11434),
-/// vLLM (8000), and LM Studio (1234) users set `base_url` — or use the
-/// `ollama`/`vllm` families, which remain registered with their own defaults.
-const FALLBACK_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+use crate::local_discovery::{DEFAULT_BASE_URL, PLACEHOLDER_MODEL};
 
 /// The unified local family: ONE onboarding choice for every OpenAI-compatible
 /// local server (llama.cpp, Ollama, vLLM, LM Studio, …). The engines differ
@@ -37,7 +29,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     // `create` through the normal resolution chain (llama-server --api-key).
     api_key_env: None,
     key_env_aliases: &[],
-    default_base_url: Some(FALLBACK_BASE_URL),
+    default_base_url: Some(DEFAULT_BASE_URL),
     requires_api_key: false,
     requires_base_url: false,
     requires_model: false,
@@ -55,8 +47,8 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let model = p
         .model
         .or_else(|| ENTRY.default_model().map(str::to_string))
-        .unwrap_or_else(|| FALLBACK_MODEL.into());
-    let url = p.base_url.unwrap_or_else(|| FALLBACK_BASE_URL.into());
+        .unwrap_or_else(|| PLACEHOLDER_MODEL.into());
+    let url = p.base_url.unwrap_or_else(|| DEFAULT_BASE_URL.into());
     let key = p.api_key.unwrap_or_else(|| "no-key".into());
     let mut provider = OpenAIProvider::new(&key, &model)
         .with_provider_label("local")

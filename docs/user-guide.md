@@ -261,7 +261,7 @@ Octos supports 16 LLM provider families out of the box. Cloud providers require 
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
-| `local` | *(none)* | default | OpenAI-compatible | `llamacpp`, `llama.cpp`, `llama-server`, `lmstudio`, `openai-compatible` |
+| `local` | *(none)* | local-default | OpenAI-compatible | `llamacpp`, `llama.cpp`, `llama-server`, `lmstudio`, `openai-compatible` |
 
 #### How to Get API Keys
 
@@ -479,7 +479,7 @@ For other engines, set `base_url` to where the server listens:
 }
 ```
 
-If the server was started with an API key (llama.cpp's `--api-key`), supply it via `api_key_env` as usual. The engine-branded `ollama` and `vllm` families remain available and behave identically — `local` is the recommended, engine-agnostic choice.
+If the server was started with an API key (llama.cpp's `--api-key`), supply it via `api_key_env` as usual. On a **shared or multi-user machine**, do start the server with a key: an unauthenticated localhost endpoint can be bound by any local process, which would then receive your full conversation content. The engine-branded `ollama` and `vllm` families remain available and behave identically — `local` is the recommended, engine-agnostic choice.
 
 **Verify the setup with `octos doctor`.** For local families it queries the server's `/v1/models` endpoint, reports which models are actually loaded, and warns when your configured `model` isn't among them or when nothing answers on the configured port (listing the common local endpoints to check).
 

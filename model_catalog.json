@@ -1870,7 +1870,7 @@
       "max_output": 131072
     },
     {
-      "provider": "local/default",
+      "provider": "local/local-default",
       "type": "strong",
       "default": true,
       "stability": 1.0,

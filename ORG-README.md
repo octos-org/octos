@@ -10,7 +10,7 @@ Connect your LLM API keys and messaging channels. Octos handles conversation rou
 
 | Repo | Description |
 |------|-------------|
-| **[octos](https://github.com/octos-org/octos)** | Core platform — Rust binary, 14 LLM providers, 14 channels, DOT pipeline engine, multi-tenant gateway, web dashboard |
+| **[octos](https://github.com/octos-org/octos)** | Core platform — Rust binary, 16 LLM providers, 14 channels, DOT pipeline engine, multi-tenant gateway, web dashboard |
 | **[octos-hub](https://github.com/octos-org/octos-hub)** | Community skill registry — install and share agent skills |
 | **[octos-web](https://github.com/octos-org/octos-web)** | Admin dashboard — React SPA for profile management, metrics, and fleet control |
 
