@@ -17,6 +17,22 @@ import { test, expect } from '@playwright/test';
  *   - `vite dev` on :5173 serving the dashboard at /admin/, proxying /api
  *     to :8080. Set OCTOS_TEST_URL=http://localhost:5173.
  */
+// Those prerequisites are NOT provided by any CI job: `e2e-live-nightly`
+// starts `octos serve --port 3000` with no `--solo` and no vite dev server,
+// and points the suite at :3000. Solo login is off by default, so
+// `solo-continue` never renders and this spec has failed on every nightly
+// run rather than testing anything. Skipping on an explicit opt-in keeps the
+// reason visible instead of burning it as permanent red — see #2073 for
+// giving CI the prerequisites so it can run for real.
+const SOLO_E2E = process.env.OCTOS_SOLO_E2E === '1';
+
+test.skip(
+  !SOLO_E2E,
+  'needs `octos serve --solo` on a fresh data dir plus a vite dev server ' +
+    'proxying /api to it, with OCTOS_TEST_URL pointed at vite. Set ' +
+    'OCTOS_SOLO_E2E=1 once both are running.',
+);
+
 test('solo no-password login creates a local profile and enters the dashboard', async ({
   page,
 }) => {
