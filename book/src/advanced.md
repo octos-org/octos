@@ -505,6 +505,23 @@ A **goal** is a persistent objective attached to a session. Once set, the agent 
 - Protocol: `session/goal/set`, `session/goal/get`, `session/goal/clear` (notifications `session/goal/updated`, `session/goal/cleared`). Feature flags: **both** `coding.autonomy.v1` **and** `coding.goal_runtime.v1` must be negotiated (advertising only the group flag yields `method_not_supported`).
 - Use it for "keep going until X is done" work. Clearing the goal stops **future** re-fires, but does **not** abort a turn already in flight — call `turn/interrupt` to stop work that's currently running.
 
+#### Where goals are supported
+
+Goals are not uniform across the four runtime modes. The protocol surface above is `serve`; the CLI modes carry a deliberate subset.
+
+| Mode | Goals | State lives in | Task rows in the goal ledger | Autonomous continuation |
+|------|-------|----------------|------------------------------|-------------------------|
+| `octos serve` (WebSocket and `--stdio`) | Full protocol surface | SQLite goal ledger + supervisor store | Yes | Yes |
+| `octos gateway` | Inherited from the shared session runtime | SQLite goal ledger + supervisor store | Yes | Not exercised by the channel adapters |
+| `octos chat --goals` | Opt-in, three tools (`goal_get`, `goal_create`, `goal_update`) | Profile supervisor store only | **No** | No — `serve`-only |
+| `octos mcp-serve` | **None** | — | — | — |
+
+What this means in practice:
+
+- **`octos chat --goals`** carries an objective and a token budget that survive the process: state is written to the profile's supervisor store and rehydrated on the next `octos chat --goals` in the same profile, keyed by a stable per-profile session key. `goal_get` also reads peer findings written by a `serve`-side run when a ledger exists. What it does **not** do is register supervised work as goal-ledger task rows, so a goal's task list and its wall-clock/token accounting stay empty for chat-side work. `--peers` layers peer agents on top and requires `--goals`.
+- **`octos mcp-serve`** wires no goal state at all. Goal tools are not registered and no goal notifications are emitted.
+- The **autonomous continuation loop** — the part that re-fires turns on its own until the goal's policy stops it — is `serve`-only. In the other modes a goal is a durable objective and budget, not a self-driving loop.
+
 ### Loops
 
 A **loop** is a recurring agent run, in one of three modes: **fixed-interval** (fire every N seconds), **self-paced** (the model sets its own next cadence by emitting a `<<loop-next-in: …>>` hint; default 15 minutes when it doesn't), or **maintenance** (runs an upkeep prompt resolved fresh on each fire — a `loop.md` override file if one is found, otherwise a built-in default). A loop keeps firing until paused, deleted, the 10,000-fire cap — **or its 7-day expiry**: every loop is stamped with `expires_at_ms = now + 7 days` and the due-scan skips it once expired, even below the fire cap.
