@@ -6016,6 +6016,7 @@ async fn ui_protocol_connection(
                     &contracts.user_questions,
                     &live_forwarders,
                     connection_profile_id,
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -6787,6 +6788,9 @@ where
                     &contracts.user_questions,
                     &live_forwarders,
                     next_connection_profile_id.as_deref(),
+                    // stdio builds an EMPTY `HeaderMap`, so there is never a
+                    // routed profile to diverge from the session scope.
+                    None,
                     features,
                     id,
                     params,
@@ -16813,6 +16817,12 @@ async fn handle_session_open(
     questions: &PendingQuestionStore,
     live_forwarders: &SharedLiveForwarders,
     connection_profile_id: Option<&str>,
+    // #2067 R3 — the profile this connection is ROUTED to by `Host`
+    // subdomain / `X-Profile-Id` header, which `validate_session_scope`
+    // deliberately does not consult. Needed here only to decide whether the
+    // resolved session scope may be used as a DELIVERY filter; it never
+    // changes what the session resolves to. `None` for stdio (no headers).
+    routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     mut params: SessionOpenParams,
@@ -16838,6 +16848,7 @@ async fn handle_session_open(
         questions,
         ws.connection_id,
         connection_profile_id,
+        routed_profile_id,
         features,
         params,
     )
@@ -16862,7 +16873,7 @@ async fn handle_session_open(
     // session under a different profile. Sharing one mutable cell across
     // forwarders let the second open silently retarget the first session's
     // pump, starving it of every profile-carrying frame.
-    let live_profile_scope = outcome.profile_id.clone();
+    let live_profile_scope = outcome.profile_scope.clone();
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -16904,7 +16915,7 @@ async fn handle_session_open(
     //
     // Reusing the helper keeps replay and live capability behavior in lockstep.
     for event in outcome.replay {
-        if !ledger_event_matches_profile_scope(&event.event, &outcome.profile_id) {
+        if !ledger_event_matches_profile_scope(&event.event, outcome.profile_scope.as_deref()) {
             continue;
         }
         let projected = features
@@ -17059,10 +17070,18 @@ fn ledger_event_matches_topic_scope(
 /// loop, and the live forwarder pump), so a variant it does not recognise
 /// leaks across tenants on every shared/unprofiled wire session key — which is
 /// exactly what `session/goal/updated` and `session/goal/cleared` did — and
-/// what the `loop/*` and `monitor/*` frames beside them did, since all of them
+/// what the `loop/*` and `monitor/*` frames beside them did, since most of them
 /// are appended DURABLY by the same `record_autonomy_rpc_evidence` ->
 /// `send_notification_durable` dispatch and all of them carry tenant text
 /// (goal objective, loop prompt, monitor argv/name).
+///
+/// `MonitorFired` and `BackgroundActivity` are the exceptions to "stamped by
+/// `resolve_autonomy_profile_id`": both are emitted off the continuation drain
+/// from a stored record, and that record's profile is the TURN's
+/// `ProfileRuntime` id whenever the monitor or fleet was created by a model
+/// tool. Filtering them is safe only because
+/// [`connection_filterable_profile_scope`] refuses to filter on a scope that
+/// can disagree with the turn's profile.
 ///
 /// `profile_id` is the connection's RESOLVED scope and is always a concrete
 /// string — [`WsConnection`] seeds [`MAIN_PROFILE_ID`] and `session/open`
@@ -17090,7 +17109,64 @@ fn ledger_event_matches_topic_scope(
 /// `profile_id` entirely (see `AgentOrchestrator::control_loop`) and only the
 /// nested `loop` record names the owner. A fallback can only ever NARROW an
 /// event's audience, never widen it.
-fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id: &str) -> bool {
+/// #2067 R3 — may this connection's resolved session scope be used as a
+/// DELIVERY filter at all?
+///
+/// It may, precisely when the scope provably equals the profile the connection's
+/// own turns run under. Otherwise filtering starves the connection of its own
+/// data, because a turn's `ProfileRuntime` hard-binds its profile onto every
+/// record the model's tools create (`runtime/profile.rs` registers
+/// `MonitorCreateTool::new(profile.id)`, and the tool persists that id), and the
+/// durable frames those records emit carry it.
+///
+/// The two resolutions:
+///   scope = `validate_session_scope(session, params.profile_id, connection)`
+///           `.unwrap_or(_main)`
+///   turn  = `session.profile_id().or(connection.or(routed)).unwrap_or(_main)`,
+///           where the caller passes `routed = header_routed.or(session_open)`
+///           and `session_open` is the scope of the last successful open.
+///
+/// They agree in every case EXCEPT one:
+///   * `connection = Some(P)` — `validate_session_scope` returns `P`, and it
+///     rejects a session key belonging to any other profile, so
+///     `session.profile_id()` is `None` or `P` and the turn is `P` too. Equal.
+///     (A routed profile is authorized against the identity at WS upgrade, so
+///     for an authenticated identity it can only be `P`.)
+///   * `connection = None`, `header_routed = None` — the turn falls through to
+///     `session_open`, which is `params.profile_id.or(session.profile_id())
+///     .unwrap_or(_main)`: the same expression the scope resolves. Equal.
+///   * `connection = None`, `header_routed = Some(P)` — the scope is `_main`
+///     (or an explicitly requested id) while the turn is `P`. NOT equal, and
+///     this is the case we must not filter.
+///
+/// That last case is an admin/unauthenticated connection reached through a
+/// `Host` subdomain or `X-Profile-Id` header. Such a connection is already
+/// explicitly authorized across profiles by the WS upgrade gate, so its session
+/// scope was never a tenant boundary — treating it as one is the category
+/// error. Delivering unfiltered there costs no tenant isolation: the viewer is
+/// an operator already entitled to the data.
+///
+/// KNOWN RESIDUAL: `session_open` is last-writer-wins per connection, so an
+/// unscoped connection that opens several BARE keys under different explicit
+/// `params.profile_id`s runs the earlier sessions' turns under the latest
+/// profile. That is a pre-existing turn-routing defect, not one this filter
+/// creates, and it is tracked with the rest of the divergence in #2081.
+fn connection_filterable_profile_scope(
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+) -> bool {
+    connection_profile_id.is_some() || routed_profile_id.is_none()
+}
+
+fn ledger_event_matches_profile_scope(
+    event: &UiProtocolLedgerEvent,
+    profile_id: Option<&str>,
+) -> bool {
+    // `None` = this connection's scope is not a tenant boundary (see
+    // `connection_filterable_profile_scope`); deliver everything.
+    let Some(profile_id) = profile_id else {
+        return true;
+    };
     let UiProtocolLedgerEvent::Notification(notification) = event else {
         return true;
     };
@@ -17158,10 +17234,19 @@ fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id:
         // fleet summary — and the ledger is its entire delivery mechanism: the
         // sink appends it over a detached connection whose writer is drained to
         // nowhere, so every real client receives it through replay or its own
-        // forwarder. Both production emitters stamp a concrete id that descends
-        // from `resolve_autonomy_profile_id` (the monitor origin carries the
-        // very id `monitor/fired` carries, already filtered above), so this arm
-        // adds no starvation surface that the monitor arm did not already.
+        // forwarder.
+        //
+        // Its profile is NOT resolver-derived. The fleet origin is stamped from
+        // `FleetRecord.profile_id`, and the single production fleet-creation
+        // site is reached only from the model's `goal_plan` tool, so that id is
+        // always the TURN's `ProfileRuntime` id; the monitor origin is likewise
+        // `ProfileRuntime`-derived whenever the monitor came from
+        // `monitor_create` rather than the `monitor/create` RPC. Together with
+        // `MonitorFired` below, these are the only two arms here whose stamp can
+        // come from the turn rather than from `resolve_autonomy_profile_id` —
+        // which is exactly why filtering is gated on
+        // `connection_filterable_profile_scope`, under which the two resolutions
+        // provably agree.
         UiNotification::BackgroundActivity(activity) => {
             optional_profile_scope_matches(activity.profile_id.as_deref(), profile_id)
         }
@@ -17227,7 +17312,7 @@ async fn spawn_live_forwarder(
     // `topic_scope`. Never re-read from the connection: a later
     // `session/open` on the same connection can resolve a different profile,
     // and a shared cell would retarget this pump mid-flight.
-    profile_scope: String,
+    profile_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
 ) {
@@ -17267,7 +17352,7 @@ async fn spawn_live_forwarder(
                     if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
                         continue;
                     }
-                    if !ledger_event_matches_profile_scope(&event.event, &profile_scope) {
+                    if !ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref()) {
                         continue;
                     }
                     // Stage 1 v2 is a wire projection of this existing
@@ -17764,7 +17849,10 @@ struct SessionOpenOutcome {
     /// where an event landing between replay and the session/open append
     /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
     replay_baseline_seq: u64,
-    profile_id: String,
+    /// #2067 R3 — the profile scope this connection may be FILTERED against,
+    /// or `None` when its scope is not a tenant boundary and filtering it
+    /// would starve it. See `connection_filterable_profile_scope`.
+    profile_scope: Option<String>,
 }
 
 // Threading both the approval store and the (UPCR-2026-023) question store
@@ -17778,6 +17866,7 @@ async fn open_session_result(
     questions: &PendingQuestionStore,
     connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     mut params: SessionOpenParams,
 ) -> Result<SessionOpenOutcome, RpcError> {
@@ -17791,6 +17880,9 @@ async fn open_session_result(
     let ledger_profile_id = active_profile_id
         .clone()
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    let profile_scope =
+        connection_filterable_profile_scope(connection_profile_id, routed_profile_id)
+            .then(|| ledger_profile_id.clone());
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
@@ -17997,7 +18089,7 @@ async fn open_session_result(
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
-            && ledger_event_matches_profile_scope(&event.event, &ledger_profile_id)
+            && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
     });
     let replayed_approval_ids = replay
         .iter()
@@ -18106,7 +18198,7 @@ async fn open_session_result(
         pending_questions,
         opened_event,
         replay_baseline_seq,
-        profile_id: ledger_profile_id,
+        profile_scope,
     })
 }
 

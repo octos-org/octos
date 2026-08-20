@@ -5462,6 +5462,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
         &questions,
         &forwarders,
         candidate.as_deref(),
+        None,
         features,
         "open-missing".into(),
         missing_params,
@@ -5517,6 +5518,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
         &questions,
         &forwarders,
         candidate.as_deref(),
+        None,
         features,
         "open-grace".into(),
         grace_params,
@@ -5736,6 +5738,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             &PendingQuestionStore::default(),
             ConnectionId::next(),
             Some(profile_id),
+            None,
             features,
             SessionOpenParams {
                 session_id: session_id.clone(),
@@ -5851,6 +5854,7 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
                 questions,
                 ConnectionId::next(),
                 Some(profile),
+                None,
                 features,
                 SessionOpenParams {
                     session_id,
@@ -12774,8 +12778,14 @@ fn skill_action_job_events_are_visible_only_to_their_profile() {
         },
     ));
 
-    assert!(ledger_event_matches_profile_scope(&event, "profile-a"));
-    assert!(!ledger_event_matches_profile_scope(&event, "profile-b"));
+    assert!(ledger_event_matches_profile_scope(
+        &event,
+        Some("profile-a")
+    ));
+    assert!(!ledger_event_matches_profile_scope(
+        &event,
+        Some("profile-b")
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -12937,6 +12947,7 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("alpha"),
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -12953,7 +12964,7 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
     .await
     .expect("alpha opens the shared session");
 
-    assert_eq!(outcome.profile_id, "alpha");
+    assert_eq!(outcome.profile_scope.as_deref(), Some("alpha"));
     let retained: Vec<&str> = outcome
         .replay
         .iter()
@@ -13025,6 +13036,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
         &questions,
         &forwarders,
         Some("alpha"),
+        None,
         ConnectionUiFeatures::default(),
         "open-alpha".into(),
         SessionOpenParams {
@@ -13132,6 +13144,7 @@ async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled
         &approvals,
         &questions,
         &forwarders,
+        None,
         None,
         ConnectionUiFeatures::default(),
         "open-main".into(),
@@ -13328,6 +13341,7 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
         &questions,
         &forwarders,
         Some("alpha"),
+        None,
         ConnectionUiFeatures::default(),
         "open-alpha-autonomy".into(),
         SessionOpenParams {
@@ -13484,6 +13498,7 @@ async fn should_keep_delivering_first_session_frames_when_a_second_session_opens
             &questions,
             &forwarders,
             None,
+            None,
             ConnectionUiFeatures::default(),
             rpc_id.into(),
             SessionOpenParams {
@@ -13600,6 +13615,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         &questions,
         &forwarders,
         Some("alpha"),
+        None,
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
         SessionOpenParams {
@@ -13716,6 +13732,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         &questions,
         &forwarders,
         Some("alpha"),
+        None,
         features,
         "open-alpha-activity".into(),
         SessionOpenParams {
@@ -13771,6 +13788,141 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         next_frame_within(&mut rx, 250).await.is_none(),
         "beta's live activity must not reach an alpha-scoped connection"
     );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2067 round 3 — the connection's resolved session scope is NOT a tenant
+/// boundary on a routed admin connection, and using it as a delivery filter
+/// starves that connection.
+///
+/// `validate_session_scope` never consults `routed_profile_id`
+/// (`ui_protocol_transport.rs:16694`), but the turn path resolves its runtime
+/// from `connection_profile_id.or(routed_profile_id)`. So an admin connection
+/// (`connection_profile_id == None`) routed to tenant `beta` by `Host`
+/// subdomain or `X-Profile-Id` opens a bare session key that resolves to
+/// `_main`, while its own turns run under `beta`'s `ProfileRuntime` — and the
+/// model tools that runtime registers hard-bind `beta` onto every record they
+/// create (`runtime/profile.rs:1321` -> `goal_tool.rs:1802`). The durable
+/// frames those records later emit are stamped `beta`, so a `_main` filter
+/// drops the connection's OWN data.
+///
+/// `background/activity` is the worst case: its sink appends over a detached
+/// connection whose writer is discarded, so replay and live forwarding are its
+/// only delivery paths — a filter drop there is total.
+#[tokio::test]
+async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_authoritative() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = local_profile_state_with_sessions(temp.path());
+    create_or_get_local_solo_profile(
+        &state,
+        local_profile_params("Beta Owner", "beta", "beta@example.com"),
+    )
+    .expect("create beta profile");
+
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // A BARE key on an admin connection: `validate_session_scope` resolves it
+    // to `_main` even though the turn will run as `beta`.
+    let session_id = SessionKey("web-routed-admin".into());
+    let features = ConnectionUiFeatures {
+        background_activity: true,
+        ..Default::default()
+    };
+
+    let monitor_fired = |monitor_id: &str| {
+        UiNotification::MonitorFired(octos_core::ui_protocol::MonitorFiredEvent {
+            session_id: session_id.clone(),
+            profile_id: Some("beta".to_owned()),
+            monitor_id: monitor_id.to_owned(),
+            name: Some(monitor_id.to_owned()),
+            line_count: Some(1),
+            fired_at_ms: None,
+        })
+    };
+    let activity = |text: &str| {
+        UiNotification::BackgroundActivity(octos_core::ui_protocol::BackgroundActivityEvent {
+            session_id: session_id.clone(),
+            profile_id: Some("beta".to_owned()),
+            origin_kind: "monitor".to_owned(),
+            origin_id: "monitor-model-made".to_owned(),
+            origin_label: Some("ci-tail".to_owned()),
+            text: text.to_owned(),
+            emitted_at_ms: 1_760_000_000_000,
+            dropped_count: None,
+            suppressed: false,
+        })
+    };
+
+    // Durable history produced by THIS connection's own model-created monitor.
+    ledger.append_notification(monitor_fired("monitor-model-made"));
+    ledger.append_notification(activity("replayed log line"));
+    ledger.append_notification(goal_updated_notification(
+        &session_id,
+        Some("beta"),
+        "routed objective",
+    ));
+
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        // admin / unscoped …
+        None,
+        // … but routed to `beta` by subdomain or header.
+        Some("beta"),
+        features,
+        "open-routed-admin".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "a routed admin connection must be able to open");
+
+    let frames = drain_session_open_frames(&mut rx).await;
+    let methods: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| frame.get("method").and_then(Value::as_str))
+        .collect();
+    assert!(
+        methods.contains(&octos_core::ui_protocol::methods::MONITOR_FIRED),
+        "the connection's own routed monitor/fired must be replayed: {methods:?}"
+    );
+    assert!(
+        methods.contains(&octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+        "background/activity has no other delivery path and must be replayed: {methods:?}"
+    );
+    assert!(
+        methods.contains(&octos_core::ui_protocol::methods::SESSION_GOAL_UPDATED),
+        "the connection's own routed goal frame must be replayed: {methods:?}"
+    );
+
+    // Same property on the live forwarder.
+    ledger.append_notification(activity("live log line"));
+    let live = next_frame_within(&mut rx, 2_000)
+        .await
+        .expect("a routed admin connection must keep receiving its own live frames");
+    assert_eq!(
+        live.get("method").and_then(Value::as_str),
+        Some(octos_core::ui_protocol::methods::BACKGROUND_ACTIVITY),
+    );
+    assert_eq!(live["params"]["text"], json!("live log line"));
 
     abort_live_forwarders(&forwarders, &ledger).await;
 }
@@ -14107,6 +14259,7 @@ async fn session_open_replays_notifications_after_cursor_and_returns_ledger_curs
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -14170,6 +14323,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: base_session.clone(),
@@ -14200,6 +14354,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -14240,6 +14395,7 @@ async fn session_open_rejects_after_cursor_from_other_stream() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -14302,6 +14458,7 @@ async fn session_open_rejects_stale_after_cursor() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -14358,6 +14515,7 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -14441,6 +14599,7 @@ async fn session_open_replays_pending_question_for_negotiated_client() {
         &approvals,
         &questions,
         ConnectionId::next(),
+        None,
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
@@ -14776,6 +14935,7 @@ async fn session_open_does_not_duplicate_pending_question_already_in_cursor_repl
         &questions,
         ConnectionId::next(),
         None,
+        None,
         features_with_user_question_v1(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -15014,6 +15174,7 @@ async fn session_open_does_not_duplicate_pending_approval_already_in_cursor_repl
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -15060,6 +15221,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures {
             typed_approvals: false,
@@ -15144,6 +15306,7 @@ async fn session_open_rejects_cwd_without_negotiated_feature() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id,
@@ -15182,6 +15345,7 @@ async fn session_open_result_advertises_full_protocol_when_no_header() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -15255,6 +15419,7 @@ async fn session_open_result_advertises_intersection_when_header_subset() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         features,
         SessionOpenParams {
@@ -18608,6 +18773,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         None,
+        None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -18633,6 +18799,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -20658,6 +20825,7 @@ async fn reconnect_after_decision_replays_decided_event() {
         &approvals,
         &PendingQuestionStore::default(),
         ConnectionId::next(),
+        None,
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
@@ -23472,7 +23640,7 @@ async fn live_forwarder_topic_scope_drops_other_topic_events() {
         ws_alpha.connection_id(),
         ConnectionUiFeatures::default(),
         Some("alpha".into()),
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         alpha_live_rx,
         forwarders_alpha.clone(),
     )
@@ -23487,7 +23655,7 @@ async fn live_forwarder_topic_scope_drops_other_topic_events() {
         ws_beta.connection_id(),
         ConnectionUiFeatures::default(),
         Some("beta".into()),
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         beta_live_rx,
         forwarders_beta.clone(),
     )
@@ -23594,7 +23762,7 @@ async fn live_forwarder_delivers_file_attached_to_topic_scoped_subscriber() {
         ws.connection_id(),
         features_for_file_attached_test(true),
         Some("slides".into()),
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -23647,7 +23815,7 @@ async fn live_forwarder_delivers_tool_and_approval_events_to_topic_scoped_subscr
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         Some("slides".into()),
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -23773,7 +23941,7 @@ async fn live_forwarder_drops_mismatched_topic_for_tool_and_approval_events() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         Some("slides".into()),
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -23867,7 +24035,7 @@ async fn live_forwarder_pushes_v2_assistant_persisted_to_subscribed_ws() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -23912,7 +24080,7 @@ async fn live_forwarder_skips_events_at_or_below_baseline_seq() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -23958,7 +24126,7 @@ async fn live_forwarder_delivers_v2_without_a_capability_flag() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -24308,7 +24476,7 @@ async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
         ws.connection_id(),
         features_for_projection_envelope_v2_test(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
     )
@@ -24486,7 +24654,7 @@ async fn v2_background_child_never_appends_to_parent_after_terminal() {
         ws.connection_id(),
         features_for_projection_envelope_v2_test(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders,
     )
@@ -24578,7 +24746,7 @@ async fn unnegotiated_connection_receives_only_canonical_v2_wire_shape() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -25092,7 +25260,7 @@ async fn live_forwarder_routes_background_child_as_canonical_v2() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -25880,7 +26048,7 @@ async fn live_forwarder_delivers_background_child_without_legacy_fallback() {
         ws.connection_id(),
         ConnectionUiFeatures::default(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -25925,7 +26093,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         ws_a.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         rx_a_live,
         forwarders_a.clone(),
     )
@@ -25939,7 +26107,7 @@ async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
         ws_b.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         rx_b_live,
         forwarders_b.clone(),
     )
@@ -26051,7 +26219,7 @@ async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_instal
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -26098,7 +26266,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -26136,7 +26304,7 @@ async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() 
         ws_other.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx_other,
         forwarders_other.clone(),
     )
@@ -26297,7 +26465,7 @@ async fn live_forwarder_survives_broadcast_lag_and_keeps_pumping() {
         ws.connection_id(),
         features_for_v2_delivery(),
         None,
-        MAIN_PROFILE_ID.to_owned(),
+        Some(MAIN_PROFILE_ID.to_owned()),
         live_rx,
         forwarders.clone(),
     )
@@ -27350,6 +27518,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-custom-cwd"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -27582,6 +27751,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11-session-sandbox"),
+        None,
         features,
         SessionOpenParams {
             session_id: gamma.clone(),
@@ -27605,6 +27775,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11-session-sandbox"),
+        None,
         features,
         SessionOpenParams {
             session_id: delta.clone(),
@@ -27674,6 +27845,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-multi-cwd"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_a.clone(),
@@ -27695,6 +27867,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-multi-cwd"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_b.clone(),
@@ -27845,6 +28018,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-rebind-attempt"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -27865,6 +28039,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-rebind-attempt"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -27941,6 +28116,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
         // No connection identity so the routed id falls to the
         // session-id-embedded "m11e-not-registered".
         None,
+        None,
         features,
         SessionOpenParams {
             session_id,
@@ -28010,6 +28186,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11e-symlink"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_a.clone(),
@@ -28135,6 +28312,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some("m11f-tier2-default"),
+        None,
         features,
         SessionOpenParams {
             session_id: session_id.clone(),
@@ -28228,6 +28406,7 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some(profile_id),
+        None,
         ConnectionUiFeatures {
             session_workspace_cwd: false,
             header_present: true,
@@ -28290,6 +28469,7 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
         &PendingQuestionStore::default(),
         ConnectionId::next(),
         Some(profile_id),
+        None,
         ConnectionUiFeatures {
             session_workspace_cwd: true,
             header_present: true,
