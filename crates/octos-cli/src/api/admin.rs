@@ -1062,6 +1062,20 @@ pub async fn test_provider(
         }));
     }
 
+    // Link-local (cloud metadata) targets are never model servers — refuse
+    // before any outbound request (adversarial review, octos#2097).
+    if req
+        .base_url
+        .as_deref()
+        .is_some_and(base_url_targets_link_local)
+    {
+        return Ok(Json(TestProviderResponse {
+            ok: false,
+            message: String::new(),
+            error: Some("base_url targets a link-local/metadata address — refused".into()),
+        }));
+    }
+
     let provider: Arc<dyn LlmProvider> = {
         let params = octos_llm::registry::CreateParams {
             // Empty means "keyless family" — let the factory apply its own
@@ -1175,6 +1189,18 @@ pub async fn provider_models(
     if api_key.is_empty() && !keyless {
         return Err((StatusCode::BAD_REQUEST, "No API key".into()));
     }
+    // Link-local (cloud metadata) targets are never model servers — refuse
+    // before any outbound request (adversarial review, octos#2097).
+    if req
+        .base_url
+        .as_deref()
+        .is_some_and(base_url_targets_link_local)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_url targets a link-local/metadata address".into(),
+        ));
+    }
     let models = fetch_provider_models(&req.provider, &api_key, req.base_url.as_deref())
         .await
         .unwrap_or_default();
@@ -1182,6 +1208,32 @@ pub async fn provider_models(
 }
 
 /// Fetch available models from a provider's /v1/models endpoint.
+/// Whether a caller-supplied `base_url` targets a LINK-LOCAL address —
+/// 169.254/16 (cloud metadata endpoints like 169.254.169.254), fe80::/10, or
+/// their IPv4-mapped forms. These are never legitimate model-server addresses,
+/// while loopback and RFC1918 ARE (local/ollama/vllm servers), so this is
+/// deliberately narrower than the agent-side `tools/ssrf.rs` checker (which
+/// blocks loopback too and would break the local family). Literal-IP check
+/// only: a hostname passes (the probe endpoints require auth; this closes the
+/// sharpest credential-theft target, not every probe vector).
+fn base_url_targets_link_local(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+        Err(_) => false,
+    }
+}
+
 pub(crate) async fn fetch_provider_models(
     provider: &str,
     api_key: &str,
@@ -1205,7 +1257,9 @@ pub(crate) async fn fetch_provider_models(
         req = req
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01");
-    } else {
+    } else if !api_key.is_empty() {
+        // Keyless families pass an empty key — suppress the header instead of
+        // sending a literal `Bearer ` (mirrors test_provider's factory path).
         req = req.header("Authorization", format!("Bearer {api_key}"));
     }
     let resp = req.send().await.ok()?;
@@ -5445,6 +5499,27 @@ mod register_flow_tests {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// The guard blocks exactly the link-local (metadata) ranges and nothing
+    /// a local model server legitimately uses (loopback, RFC1918, hostnames).
+    #[test]
+    fn should_block_only_link_local_base_urls() {
+        // Metadata endpoints — blocked.
+        assert!(base_url_targets_link_local("http://169.254.169.254/latest"));
+        assert!(base_url_targets_link_local("http://169.254.0.1:8080/v1"));
+        assert!(base_url_targets_link_local("http://[fe80::1]:8080/v1"));
+        assert!(base_url_targets_link_local(
+            "http://[::ffff:169.254.169.254]/v1"
+        ));
+        // Legitimate local model servers — allowed.
+        assert!(!base_url_targets_link_local("http://127.0.0.1:8080/v1"));
+        assert!(!base_url_targets_link_local("http://localhost:11434/v1"));
+        assert!(!base_url_targets_link_local("http://192.168.1.10:11434/v1"));
+        assert!(!base_url_targets_link_local("http://10.0.0.5:8000/v1"));
+        assert!(!base_url_targets_link_local("https://api.openai.com/v1"));
+        // Garbage never panics.
+        assert!(!base_url_targets_link_local("not a url"));
+    }
 
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
