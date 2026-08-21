@@ -1182,8 +1182,8 @@ Clients must use that method list to enable or disable slash commands.
   }
   ```
 
-- request (additive shape, negotiated via the `profile.local_create.requested_id.v1`
-  capability feature):
+- request (additive shape, negotiated via two independent capability
+  features):
 
   ```json
   {
@@ -1194,11 +1194,17 @@ Clients must use that method list to enable or disable slash commands.
   ```
 
 - field notes (matches implementation; audit 2026-08-21):
-  - `requested_id` (optional): meaningful profile id typed during onboarding;
-    normalized (lowercased, non-`[a-z0-9-]` collapsed to `-`) and
-    uniqueness-suffixed server-side (`glm`, `glm-2`, …). Absent → server derives
-    the id from `username` (legacy shape) or generates one
-  - `make_default` (optional): make the created profile the default selection
+  - `requested_id` (optional, gated by `profile.local_create.requested_id.v1`):
+    meaningful profile id typed during onboarding; normalized (lowercased,
+    non-`[a-z0-9-]` collapsed to `-`) and uniqueness-suffixed server-side
+    (`glm`, `glm-2`, …). Absent → server derives the id from `username`
+    (legacy shape) or generates one
+  - `make_default` (optional, gated by the separate
+    `profile.local_create.default.v1` feature): when `true`, the server
+    records this profile as the machine's global default — the profile a
+    bare launch resolves to in a folder with no sticky profile yet.
+    Omitted from the wire when unset so older servers receive an unchanged
+    shape
   - `username` and `email` are optional in the current implementation: a solo
     local profile does not require an owner username or email when
     `requested_id` is supplied
@@ -2361,9 +2367,12 @@ See [OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md](../docs/OCTOS_M8_FIX_FIRST_CHEC
 ## 14. M9-γ Envelope
 
 Status: **additive**, governed by accepted `UPCR-2026-014`. Capability-gated
-behind `projection.envelope.v1`. Legacy `message/delta`, `message/persisted`,
-`tool/*`, and `turn/completed` notifications continue to flow on connections
-that do not negotiate this feature, until `M9-γ-3` deletes them.
+behind `projection.envelope.v1`. Legacy `message/delta`, `tool/*`, and
+`turn/completed` notifications continue to flow on connections
+that do not negotiate this feature, until `M9-γ-3` deletes them. The
+`message/persisted` notification has since been **retired** (see the v2
+note at the end of this section): the ledger skips replaying its records
+and `projection/envelope` is its sole successor.
 
 ADR: [`docs/M9-GAMMA-SERVER-PROJECTION-ADR.md`](../docs/M9-GAMMA-SERVER-PROJECTION-ADR.md).
 
@@ -2412,18 +2421,27 @@ lacking `session_id`/`topic` defaults `session_id` to the empty key and
 `topic` to absent, and falls back to its ambient connection context for
 routing.
 
-**v2 form (additive, negotiated via the `projection.envelope.v2` capability
-feature; audit 2026-08-21):** the same `projection/envelope` method name also
-carries an `EnvelopeV2`-shaped frame. An `EnvelopeV2` flattens
+**v2 form (audit 2026-08-21):** the same `projection/envelope` method name
+also carries an `EnvelopeV2`-shaped frame. An `EnvelopeV2` flattens
 `thread_id`, `seq`, `cursor?`, `turn_id`, `client_message_id?`, `payload`
 with the same routing keys (`session_id`, `topic?`). Key differences from
 v1: an explicit `turn_id` on every envelope (for background child streams
 this is the child stream identity and the payload carries `parent_turn_id`),
-and an optional `cursor` (`UiCursor`). Clients that negotiated
-`projection.envelope.v2` should decode both forms from this method; v1
-remains as documented above. Note: `message/persisted` (UPCR-2026-012) was
-retired — `projection/envelope` (v1 and v2) is its sole successor, and the
-ledger explicitly skips replaying old `message/persisted` records.
+and an optional `cursor` (`UiCursor`).
+
+Delivery semantics:
+
+- canonical v2 envelopes on the live stream are delivered **regardless of
+  negotiation** — the server never capability-filters canonical v2 frames
+- the `projection.envelope.v2` capability primarily controls projection of
+  **historical** (ledger-replayed) records into v2 form
+- a connection that negotiated v2 has the corresponding v1/source events
+  (`message/delta`, `tool/*`, `turn/completed`, legacy `message/persisted`)
+  **filtered out** on that connection — v2 clients do NOT decode both forms
+- `message/persisted` (UPCR-2026-012) is retired as a live notification:
+  the ledger explicitly skips replaying old `message/persisted` records, and
+  `projection/envelope` (v1 or v2 per connection negotiation) is its sole
+  successor
 
 > History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
 > BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
