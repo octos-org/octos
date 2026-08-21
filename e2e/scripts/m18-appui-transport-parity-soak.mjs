@@ -953,6 +953,12 @@ function assertStdioAuthUnavailableDirect(client, method, capture) {
   assert(data.recoverable === true, client.label + ": " + method + " expected recoverable auth error");
 }
 
+// Sentinel: the method is exercised by a dedicated scenario step elsewhere in
+// this soak (requiredScenarioMethods), so the inventory probe pass skips it
+// deliberately. Distinguish from truly unknown methods, which hit the switch
+// default and throw.
+const PROBED_ELSEWHERE = Symbol.for('m18.routeProbe.probedElsewhere');
+
 function routeProbeParams(method) {
   const missingId = `m18-missing-${method.replaceAll('/', '-').replaceAll('.', '-')}-${stamp}`;
   const missingTurnId = crypto.randomUUID();
@@ -977,7 +983,7 @@ function routeProbeParams(method) {
     case 'content/delete':
     case 'router/set_mode':
     case 'router/get_metrics':
-      return null;
+      return PROBED_ELSEWHERE;
     case 'approval/scopes/list':
     case 'permission/profile/list':
     case 'task/list':
@@ -1038,11 +1044,11 @@ function routeProbeParams(method) {
     case 'auth/verify':
       return {};
     case 'auth/logout':
-      return null;
+      return PROBED_ELSEWHERE;
     case 'session/title.set':
       return { session_id: sessionId, title: 'M18 parity route probe' };
     case 'content/bulk_delete':
-      return null;
+      return PROBED_ELSEWHERE;
     case 'profile/llm/list':
     case 'profile/llm/select':
     case 'mcp/status/list':
@@ -1077,14 +1083,9 @@ function routeProbeParams(method) {
 async function captureRouteInventoryProbes(client, routeInventory, probes, uncovered) {
   for (const method of routeInventoryMethods(routeInventory)) {
     const params = routeProbeParams(method);
-    if (params == null) {
-      // Surface coverage gaps instead of silently skipping: every inventory
-      // method must have probe params, otherwise new wire methods ship
-      // unprobed (spec-vs-impl audit 2026-08-21).
-      uncovered.push(method);
-      continue;
-    }
+    if (params === PROBED_ELSEWHERE) continue;
     await captureProbe(client, probes, `route:${method}`, method, params, 5000);
+    uncovered.add(method);
   }
 }
 
@@ -1908,7 +1909,7 @@ async function main() {
   let wsClient;
   let stdioClient;
 
-  const uncoveredRouteMethods = [];
+  const uncoveredRouteMethods = new Set();
   try {
     wsServer = await startWsServer(port);
     await waitForHttp(`${baseUrl}/api/status`);
@@ -1975,12 +1976,12 @@ async function main() {
       },
       allowlistedDifferences: diff.allowlistedDifferences.length,
       unexpectedDifferences: diff.unexpectedDifferences.length,
-      uncoveredRouteMethods,
+      uncoveredRouteMethods: [...uncoveredRouteMethods].sort(),
     }, null, 2));
-    if (uncoveredRouteMethods.length > 0) {
+    if (uncoveredRouteMethods.size > 0) {
       console.error(
         'route inventory methods without probe params (add cases to routeProbeParams): '
-          + uncoveredRouteMethods.join(', '),
+          + [...uncoveredRouteMethods].sort().join(', '),
       );
       process.exitCode = 1;
     }
