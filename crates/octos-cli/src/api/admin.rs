@@ -1034,20 +1034,27 @@ pub async fn test_provider(
     use octos_llm::{ChatConfig, LlmProvider};
 
     // Resolve the API key: prefer raw api_key, fall back to reading from saved profile
-    let api_key = if let Some(ref key) = req.api_key {
+    let keyless = octos_llm::registry::is_keyless(&req.provider);
+    let resolved = if let Some(ref key) = req.api_key {
         if !key.is_empty() && !key.contains("***") {
-            key.clone()
+            Ok(key.clone())
         } else {
-            resolve_saved_key(&state, &identity, &req)?
+            resolve_saved_key(&state, &identity, &req)
         }
     } else {
-        resolve_saved_key(&state, &identity, &req)?
+        resolve_saved_key(&state, &identity, &req)
+    };
+    // Keyless local families (local/ollama/vllm) construct without a key —
+    // both an EMPTY key and an UNRESOLVABLE key (no api_key/api_key_env in
+    // the request at all) are fine for them. Dead-ending here blocked the
+    // keyless onboarding flow entirely (red-team pass + live test).
+    let api_key = match resolved {
+        Ok(key) => key,
+        Err(_) if keyless => String::new(),
+        Err(error) => return Err(error),
     };
 
-    // Keyless local families (local/ollama/vllm) construct without a key —
-    // dead-ending them on "No API key provided" blocked the keyless
-    // onboarding flow entirely (red-team pass).
-    if api_key.is_empty() && !octos_llm::registry::is_keyless(&req.provider) {
+    if api_key.is_empty() && !keyless {
         return Ok(Json(TestProviderResponse {
             ok: false,
             message: String::new(),
@@ -1148,16 +1155,24 @@ pub async fn provider_models(
     identity: Option<axum::Extension<super::router::AuthIdentity>>,
     Json(req): Json<TestProviderRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let api_key = if let Some(ref key) = req.api_key {
+    let keyless = octos_llm::registry::is_keyless(&req.provider);
+    let resolved = if let Some(ref key) = req.api_key {
         if !key.is_empty() && !key.contains("***") {
-            key.clone()
+            Ok(key.clone())
         } else {
-            resolve_saved_key(&state, &identity, &req)?
+            resolve_saved_key(&state, &identity, &req)
         }
     } else {
-        resolve_saved_key(&state, &identity, &req)?
+        resolve_saved_key(&state, &identity, &req)
     };
-    if api_key.is_empty() {
+    // Keyless local families (local/ollama/vllm) list models without a key —
+    // their /v1/models answers unauthenticated (octos#2096 review round).
+    let api_key = match resolved {
+        Ok(key) => key,
+        Err(_) if keyless => String::new(),
+        Err(error) => return Err(error),
+    };
+    if api_key.is_empty() && !keyless {
         return Err((StatusCode::BAD_REQUEST, "No API key".into()));
     }
     let models = fetch_provider_models(&req.provider, &api_key, req.base_url.as_deref())
