@@ -138,8 +138,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `message/delta` | shipped base notification |
 | `message/reasoning_delta` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `tool/started` | shipped base notification |
-| `tool_progress` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `tool_completed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `tool/progress` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `tool/completed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `approval/requested` | shipped base notification, UPCR-2026-001 |
 | `approval/auto_resolved` | shipped durable approval notification |
 | `approval/decided` | shipped durable approval notification |
