@@ -1083,7 +1083,12 @@ function routeProbeParams(method) {
 async function captureRouteInventoryProbes(client, routeInventory, probes, probedMethods) {
   for (const method of routeInventoryMethods(routeInventory)) {
     const params = routeProbeParams(method);
-    if (params === PROBED_ELSEWHERE) continue;
+    if (params === PROBED_ELSEWHERE) {
+      // Covered by a dedicated scenario step elsewhere in this soak; count it
+      // as covered so it is not reported uncovered by inventory - probed.
+      probedMethods.add(method);
+      continue;
+    }
     await captureProbe(client, probes, `route:${method}`, method, params, 5000);
     probedMethods.add(method);
   }
