@@ -1172,7 +1172,7 @@ Clients must use that method list to enable or disable slash commands.
 `profile/local/create`:
 
 - local-only no-OTP solo onboarding command
-- request:
+- request (legacy shape, still fully supported):
 
   ```json
   {
@@ -1181,6 +1181,27 @@ Clients must use that method list to enable or disable slash commands.
     "email": "ada@example.com"
   }
   ```
+
+- request (additive shape, negotiated via the `profile.local_create.requested_id.v1`
+  capability feature):
+
+  ```json
+  {
+    "name": "Ada Lovelace",
+    "requested_id": "glm",
+    "make_default": true
+  }
+  ```
+
+- field notes (matches implementation; audit 2026-08-21):
+  - `requested_id` (optional): meaningful profile id typed during onboarding;
+    normalized (lowercased, non-`[a-z0-9-]` collapsed to `-`) and
+    uniqueness-suffixed server-side (`glm`, `glm-2`, …). Absent → server derives
+    the id from `username` (legacy shape) or generates one
+  - `make_default` (optional): make the created profile the default selection
+  - `username` and `email` are optional in the current implementation: a solo
+    local profile does not require an owner username or email when
+    `requested_id` is supplied
 
 - result:
 
@@ -2390,6 +2411,19 @@ addition is backward-compatible. A decoder that receives an OLD frame
 lacking `session_id`/`topic` defaults `session_id` to the empty key and
 `topic` to absent, and falls back to its ambient connection context for
 routing.
+
+**v2 form (additive, negotiated via the `projection.envelope.v2` capability
+feature; audit 2026-08-21):** the same `projection/envelope` method name also
+carries an `EnvelopeV2`-shaped frame. An `EnvelopeV2` flattens
+`thread_id`, `seq`, `cursor?`, `turn_id`, `client_message_id?`, `payload`
+with the same routing keys (`session_id`, `topic?`). Key differences from
+v1: an explicit `turn_id` on every envelope (for background child streams
+this is the child stream identity and the payload carries `parent_turn_id`),
+and an optional `cursor` (`UiCursor`). Clients that negotiated
+`projection.envelope.v2` should decode both forms from this method; v1
+remains as documented above. Note: `message/persisted` (UPCR-2026-012) was
+retired — `projection/envelope` (v1 and v2) is its sole successor, and the
+ledger explicitly skips replaying old `message/persisted` records.
 
 > History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
 > BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
