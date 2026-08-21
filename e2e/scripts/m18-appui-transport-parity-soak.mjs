@@ -1080,12 +1080,12 @@ function routeProbeParams(method) {
   }
 }
 
-async function captureRouteInventoryProbes(client, routeInventory, probes, uncovered) {
+async function captureRouteInventoryProbes(client, routeInventory, probes, probedMethods) {
   for (const method of routeInventoryMethods(routeInventory)) {
     const params = routeProbeParams(method);
     if (params === PROBED_ELSEWHERE) continue;
     await captureProbe(client, probes, `route:${method}`, method, params, 5000);
-    uncovered.add(method);
+    probedMethods.add(method);
   }
 }
 
@@ -1909,22 +1909,25 @@ async function main() {
   let wsClient;
   let stdioClient;
 
-  const uncoveredRouteMethods = new Set();
+  const probedRouteMethods = new Set();
   try {
     wsServer = await startWsServer(port);
     await waitForHttp(`${baseUrl}/api/status`);
     wsClient = new WsClient(baseUrl);
     await wsClient.connect();
-    const wsResult = await runScenario(wsClient, routeInventory, uncoveredRouteMethods);
+    const wsResult = await runScenario(wsClient, routeInventory, probedRouteMethods);
     wsClient = wsResult.client;
     await wsClient.close();
 
     stdioClient = new StdioClient();
     await stdioClient.waitSpawn();
-    const stdioResult = await runScenario(stdioClient, routeInventory, uncoveredRouteMethods);
+    const stdioResult = await runScenario(stdioClient, routeInventory, probedRouteMethods);
     stdioClient = stdioResult.client;
     await stdioClient.close();
 
+    const uncoveredRouteMethods = routeInventoryMethods(routeInventory)
+      .filter((method) => !probedRouteMethods.has(method))
+      .sort();
     writeJson(runtimePolicyStampPath, {
       websocket: scrub(wsResult.runtimePolicyStamp),
       stdio: scrub(stdioResult.runtimePolicyStamp),
@@ -1976,9 +1979,9 @@ async function main() {
       },
       allowlistedDifferences: diff.allowlistedDifferences.length,
       unexpectedDifferences: diff.unexpectedDifferences.length,
-      uncoveredRouteMethods: [...uncoveredRouteMethods].sort(),
+      uncoveredRouteMethods,
     }, null, 2));
-    if (uncoveredRouteMethods.size > 0) {
+    if (uncoveredRouteMethods.length > 0) {
       console.error(
         'route inventory methods without probe params (add cases to routeProbeParams): '
           + [...uncoveredRouteMethods].sort().join(', '),
