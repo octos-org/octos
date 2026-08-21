@@ -1074,10 +1074,16 @@ function routeProbeParams(method) {
   }
 }
 
-async function captureRouteInventoryProbes(client, routeInventory, probes) {
+async function captureRouteInventoryProbes(client, routeInventory, probes, uncovered) {
   for (const method of routeInventoryMethods(routeInventory)) {
     const params = routeProbeParams(method);
-    if (params == null) continue;
+    if (params == null) {
+      // Surface coverage gaps instead of silently skipping: every inventory
+      // method must have probe params, otherwise new wire methods ship
+      // unprobed (spec-vs-impl audit 2026-08-21).
+      uncovered.push(method);
+      continue;
+    }
     await captureProbe(client, probes, `route:${method}`, method, params, 5000);
   }
 }
@@ -1264,7 +1270,7 @@ function validateNegotiatedCapabilities(label, capabilities, routeInventory) {
   );
 }
 
-async function runScenario(client, routeInventory) {
+async function runScenario(client, routeInventory, uncovered) {
   const probes = {};
   const hello = await client.request('client_hello', {
     transport: client.label === 'ws' ? 'websocket' : 'stdio',
@@ -1342,7 +1348,7 @@ async function runScenario(client, routeInventory) {
   });
   await validateMessagesPageReconnectMode(client, 'messagesPageAfterReconnect', messagesPageAfterReconnect);
   await captureProbe(client, probes, 'sessionSnapshotAfterReconnect', 'session/snapshot', { session_id: sessionId });
-  await captureRouteInventoryProbes(client, routeInventory, probes);
+  await captureRouteInventoryProbes(client, routeInventory, probes, uncovered);
 
   const toolTurn = await runTurn(
     client,
@@ -1902,18 +1908,19 @@ async function main() {
   let wsClient;
   let stdioClient;
 
+  const uncoveredRouteMethods = [];
   try {
     wsServer = await startWsServer(port);
     await waitForHttp(`${baseUrl}/api/status`);
     wsClient = new WsClient(baseUrl);
     await wsClient.connect();
-    const wsResult = await runScenario(wsClient, routeInventory);
+    const wsResult = await runScenario(wsClient, routeInventory, uncoveredRouteMethods);
     wsClient = wsResult.client;
     await wsClient.close();
 
     stdioClient = new StdioClient();
     await stdioClient.waitSpawn();
-    const stdioResult = await runScenario(stdioClient, routeInventory);
+    const stdioResult = await runScenario(stdioClient, routeInventory, uncoveredRouteMethods);
     stdioClient = stdioResult.client;
     await stdioClient.close();
 
@@ -1968,7 +1975,15 @@ async function main() {
       },
       allowlistedDifferences: diff.allowlistedDifferences.length,
       unexpectedDifferences: diff.unexpectedDifferences.length,
+      uncoveredRouteMethods,
     }, null, 2));
+    if (uncoveredRouteMethods.length > 0) {
+      console.error(
+        'route inventory methods without probe params (add cases to routeProbeParams): '
+          + uncoveredRouteMethods.join(', '),
+      );
+      process.exitCode = 1;
+    }
     if (!diff.ok) process.exitCode = 1;
   } catch (error) {
     const failure = {
