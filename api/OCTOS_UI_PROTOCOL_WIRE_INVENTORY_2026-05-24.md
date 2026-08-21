@@ -102,42 +102,63 @@ spec and UPCR documents. The authoritative source remains code:
 
 | Method | Status |
 |---|---|
-| `session/open` | shipped open/resume notification |
-| `turn/started` | shipped base notification |
-| `turn/completed` | shipped base notification |
-| `turn/error` | shipped base notification |
-| `message/delta` | shipped base notification |
-| `tool/started` | shipped base notification |
-| `tool/progress` | shipped base notification |
-| `tool/completed` | shipped base notification |
-| `approval/requested` | shipped base notification, UPCR-2026-001 |
-| `approval/auto_resolved` | shipped durable approval notification |
-| `approval/decided` | shipped durable approval notification |
-| `approval/cancelled` | shipped durable approval notification |
-| `task/updated` | shipped, UPCR-2026-004 |
-| `task/output/delta` | shipped task output notification |
-| `progress/updated` | shipped typed progress notification |
-| `warning` | shipped base notification |
-| `protocol/replay_lossy` | shipped backpressure/replay notification |
-| `message/persisted` | shipped, UPCR-2026-012 |
-| `turn/spawn_complete` | shipped background completion notification |
-| `file/attached` | shipped, UPCR-2026-014 |
-| `session/event` | shipped, UPCR-2026-014 |
-| `router/status` | shipped adaptive-router notification |
-| `router/failover` | shipped adaptive-router notification |
-| `queue/state` | known client-emitted queue notification |
-| `agent/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
-| `agent/output/delta` | shipped, UPCR-2026-019 / UPCR-2026-021 |
-| `agent/artifact/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
-| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 |
-| `session/goal/updated` | shipped, UPCR-2026-021 |
-| `session/goal/cleared` | shipped, UPCR-2026-021 |
-| `loop/updated` | shipped, UPCR-2026-021 |
-| `loop/fired` | shipped, UPCR-2026-021 |
-| `loop/completed` | shipped, UPCR-2026-021 |
-| `context/compaction_completed` | shipped M16 context lifecycle notification |
-| `context/compaction_started` | shipped M16 context lifecycle notification |
-| `context/normalization_reported` | shipped M16 context lifecycle notification |
+| `session/open` | shipped open/resume notification | |
+| `turn/started` | shipped base notification | |
+| `turn/completed` | shipped base notification | |
+| `turn/error` | shipped base notification | |
+| `message/delta` | shipped base notification | |
+| `message/reasoning_delta` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `tool/started` | shipped base notification | |
+| `approval/requested` | shipped base notification, UPCR-2026-001 | |
+| `approval/auto_resolved` | shipped durable approval notification | |
+| `approval/decided` | shipped durable approval notification | |
+| `approval/cancelled` | shipped durable approval notification | |
+| `user_question/requested` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `task/updated` | shipped, UPCR-2026-004 | |
+| `plan/updated` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `task/output/delta` | shipped task output notification | |
+| `progress/updated` | shipped typed progress notification | |
+| `warning` | shipped base notification | |
+| `protocol/replay_lossy` | shipped backpressure/replay notification | |
+| `turn/spawn_complete` | shipped background completion notification | |
+| `file/attached` | shipped, UPCR-2026-014 | |
+| `visual/generating` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `visual/succeeded` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `visual/failed` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `voice/exit` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 | |
+| `voice/audio_chunk` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `projection/envelope` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `session/event` | shipped, UPCR-2026-014 | |
+| `router/status` | shipped adaptive-router notification | |
+| `router/failover` | shipped adaptive-router notification | |
+| `queue/state` | known client-emitted queue notification | |
+| `agent/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 | |
+| `agent/output/delta` | shipped, UPCR-2026-019 / UPCR-2026-021 | |
+| `agent/artifact/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 | |
+| `session/goal/updated` | shipped, UPCR-2026-021 | |
+| `session/goal/cleared` | shipped, UPCR-2026-021 | |
+| `loop/updated` | shipped, UPCR-2026-021 | |
+| `loop/fired` | shipped, UPCR-2026-021 | |
+| `loop/completed` | shipped, UPCR-2026-021 | |
+| `monitor/fired` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/updated` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/expired` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `context/compaction_completed` | shipped M16 context lifecycle notification | |
+| `context/compaction_started` | shipped M16 context lifecycle notification | |
+| `context/normalization_reported` | shipped M16 context lifecycle notification | |
+| `peer/staged` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/closed` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `background/activity` | shipped; missing from prior inventory — backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+
+> **Audit note (2026-08-21, spec-vs-impl review):** this inventory was regenerated from the code
+> constants of truth (`UI_PROTOCOL_COMMAND_METHODS` + `APPUI_EXTRA_METHODS`,
+> `UI_PROTOCOL_NOTIFICATION_METHODS` in `crates/octos-core/src/ui_protocol.rs` and
+> `crates/octos-cli/src/api/ui_protocol_transport.rs`).
+> `message/persisted` (UPCR-2026-012) was **retired**: the ledger explicitly skips it
+> (`ui_protocol_ledger.rs:1001`) and tests assert no new frame carries it; its successor is
+> `projection/envelope` (v2 form). The stale file reference `octos-cli/src/api/ui_protocol.rs`
+> is corrected to `octos-cli/src/api/ui_protocol_transport.rs`.
 
 ## Reconciliation Decisions
 
