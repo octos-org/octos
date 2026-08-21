@@ -35156,3 +35156,64 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
     );
     handle.abort();
 }
+
+/// `session/status/read` used to emit a hardcoded `"usage": {}`, so every
+/// field of octoscode's `SessionUsageStatus` decoded to `None` forever. These
+/// pin the field mapping that replaced it — in particular
+/// `cached_input_tokens`, without which an operator cannot tell whether prompt
+/// caching is working.
+#[test]
+fn should_report_cache_read_tokens_in_session_usage_status() {
+    let totals = UsageTotals {
+        run_count: 2,
+        input_tokens: 105,
+        output_tokens: 20,
+        cache_read_tokens: 95,
+        estimated_cost_usd: 0.25,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["input_tokens"], 105);
+    assert_eq!(usage["output_tokens"], 20);
+    assert_eq!(usage["cached_input_tokens"], 95);
+    assert_eq!(usage["estimated_cost_micros_usd"], 250_000);
+}
+
+#[test]
+fn should_report_empty_usage_when_session_has_no_recorded_runs() {
+    let usage = usage_status_json(&UsageTotals::default());
+    assert_eq!(usage, serde_json::json!({}));
+}
+
+#[test]
+fn should_omit_cost_when_no_run_was_priced() {
+    // Tokens accrue but the model had no catalog pricing: report the tokens,
+    // stay silent on spend rather than claiming a confident $0.0000.
+    let totals = UsageTotals {
+        run_count: 1,
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_read_tokens: 0,
+        estimated_cost_usd: 0.0,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["cached_input_tokens"], 0);
+    assert!(usage.get("estimated_cost_micros_usd").is_none());
+}
+
+/// A cold first turn reports zero cache reads. That is the correct reading,
+/// not a broken one — and it must be reported as an explicit `0` rather than
+/// omitted, because "absent" is what an unimplemented field looks like.
+#[test]
+fn should_report_zero_cache_reads_explicitly_on_a_cold_session() {
+    let totals = UsageTotals {
+        run_count: 1,
+        input_tokens: 13_302,
+        output_tokens: 76,
+        cache_read_tokens: 0,
+        estimated_cost_usd: 0.0,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["cached_input_tokens"], 0);
+    assert!(usage.get("cached_input_tokens").is_some());
+}

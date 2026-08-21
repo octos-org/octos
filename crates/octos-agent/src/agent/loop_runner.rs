@@ -1355,6 +1355,15 @@ impl Agent {
                             response_content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
                             input_tokens = response.usage.input_tokens,
                             output_tokens = response.usage.output_tokens,
+                            // Prompt caching is the largest single cost lever
+                            // and is on by default, but it was unobservable
+                            // from the logs: these two were already parsed and
+                            // handed to `record_usage` below, just never
+                            // printed. `input_tokens` alone is misleading —
+                            // it EXCLUDES the cached portion, so a warm turn
+                            // looks like a tiny prompt rather than a cheap one.
+                            cache_read_tokens = response.usage.cache_read_tokens,
+                            cache_write_tokens = response.usage.cache_write_tokens,
                             "LLM response received"
                         );
                     }
