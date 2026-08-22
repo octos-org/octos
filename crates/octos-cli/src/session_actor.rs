@@ -4654,7 +4654,8 @@ impl SessionActor {
             cost_source,
             self.channel.clone(),
             attribution.map(ToOwned::to_owned),
-        );
+        )
+        .with_cache_read_tokens(u64::from(response.token_usage.cache_read_tokens));
         if let Err(error) = usage_ledger.record(event).await {
             warn!(
                 session = %self.session_key,
@@ -8861,7 +8862,8 @@ impl SessionActor {
                         },
                         channel.clone(),
                         Some("speculative_overflow".to_string()),
-                    );
+                    )
+                    .with_cache_read_tokens(u64::from(conv_response.token_usage.cache_read_tokens));
                     if let Err(error) = ledger.record(event).await {
                         warn!(
                             session = %session_key,
