@@ -1,9 +1,11 @@
 //! Plugin loader: scans directories for plugins and registers their tools.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Result;
+use octos_llm::vertex_auth::{ServiceAccount, TokenSource, VertexTokenProvider};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -837,6 +839,40 @@ impl PluginLoader {
                 }
             }
         };
+        // Build one token cache for the whole loaded plugin. Every tool gets a
+        // clone of this Arc, so classifier/enhancer/lesson calls launched as
+        // separate processes do not each repeat Google's OAuth exchange.
+        // Creating the source does not make a network request; the first tool
+        // that explicitly allowlists VERTEX_ACCESS_TOKEN refreshes it lazily.
+        let vertex_token_source: Option<(Arc<dyn TokenSource>, String)> = manifest
+            .tools
+            .iter()
+            .any(|tool| tool.env.iter().any(|name| name == "VERTEX_ACCESS_TOKEN"))
+            .then(|| {
+                extra_env
+                    .iter()
+                    .find(|(name, _)| name == "VERTEX_SA_JSON")
+                    .map(|(_, value)| value)
+            })
+            .flatten()
+            .and_then(|raw| match ServiceAccount::from_json(raw) {
+                Ok(account) => {
+                    let project_id = account.project_id.clone();
+                    Some((
+                        Arc::new(VertexTokenProvider::from_service_account(account))
+                            as Arc<dyn TokenSource>,
+                        project_id,
+                    ))
+                }
+                Err(error) => {
+                    warn!(
+                        plugin = %manifest.name,
+                        error = %error,
+                        "cannot prepare shared Vertex token cache; plugin fallback remains available"
+                    );
+                    None
+                }
+            });
         let manifest_actions = manifest.actions;
 
         let tools: Vec<LoadedPluginTool> = manifest
@@ -893,6 +929,9 @@ impl PluginLoader {
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
                     .with_timeout(timeout);
+                if let Some((source, project_id)) = vertex_token_source.clone() {
+                    tool = tool.with_vertex_token_source(source, project_id);
+                }
                 // Section C (codex review P2): stash the load-time hash ONLY
                 // when the operator opted into integrity for this plugin —
                 // either the manifest declared `sha256` (the author signaled
