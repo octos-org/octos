@@ -953,6 +953,12 @@ function assertStdioAuthUnavailableDirect(client, method, capture) {
   assert(data.recoverable === true, client.label + ": " + method + " expected recoverable auth error");
 }
 
+// Sentinel: the method is exercised by a dedicated scenario step elsewhere in
+// this soak (requiredScenarioMethods), so the inventory probe pass skips it
+// deliberately. Distinguish from truly unknown methods, which hit the switch
+// default and throw.
+const PROBED_ELSEWHERE = Symbol.for('m18.routeProbe.probedElsewhere');
+
 function routeProbeParams(method) {
   const missingId = `m18-missing-${method.replaceAll('/', '-').replaceAll('.', '-')}-${stamp}`;
   const missingTurnId = crypto.randomUUID();
@@ -977,7 +983,7 @@ function routeProbeParams(method) {
     case 'content/delete':
     case 'router/set_mode':
     case 'router/get_metrics':
-      return null;
+      return PROBED_ELSEWHERE;
     case 'approval/scopes/list':
     case 'permission/profile/list':
     case 'task/list':
@@ -1038,11 +1044,11 @@ function routeProbeParams(method) {
     case 'auth/verify':
       return {};
     case 'auth/logout':
-      return null;
+      return PROBED_ELSEWHERE;
     case 'session/title.set':
       return { session_id: sessionId, title: 'M18 parity route probe' };
     case 'content/bulk_delete':
-      return null;
+      return PROBED_ELSEWHERE;
     case 'profile/llm/list':
     case 'profile/llm/select':
     case 'mcp/status/list':
@@ -1074,11 +1080,17 @@ function routeProbeParams(method) {
   }
 }
 
-async function captureRouteInventoryProbes(client, routeInventory, probes) {
+async function captureRouteInventoryProbes(client, routeInventory, probes, probedMethods) {
   for (const method of routeInventoryMethods(routeInventory)) {
     const params = routeProbeParams(method);
-    if (params == null) continue;
+    if (params === PROBED_ELSEWHERE) {
+      // Covered by a dedicated scenario step elsewhere in this soak; count it
+      // as covered so it is not reported uncovered by inventory - probed.
+      probedMethods.add(method);
+      continue;
+    }
     await captureProbe(client, probes, `route:${method}`, method, params, 5000);
+    probedMethods.add(method);
   }
 }
 
@@ -1264,7 +1276,7 @@ function validateNegotiatedCapabilities(label, capabilities, routeInventory) {
   );
 }
 
-async function runScenario(client, routeInventory) {
+async function runScenario(client, routeInventory, uncovered) {
   const probes = {};
   const hello = await client.request('client_hello', {
     transport: client.label === 'ws' ? 'websocket' : 'stdio',
@@ -1342,7 +1354,7 @@ async function runScenario(client, routeInventory) {
   });
   await validateMessagesPageReconnectMode(client, 'messagesPageAfterReconnect', messagesPageAfterReconnect);
   await captureProbe(client, probes, 'sessionSnapshotAfterReconnect', 'session/snapshot', { session_id: sessionId });
-  await captureRouteInventoryProbes(client, routeInventory, probes);
+  await captureRouteInventoryProbes(client, routeInventory, probes, uncovered);
 
   const toolTurn = await runTurn(
     client,
@@ -1902,21 +1914,25 @@ async function main() {
   let wsClient;
   let stdioClient;
 
+  const probedRouteMethods = new Set();
   try {
     wsServer = await startWsServer(port);
     await waitForHttp(`${baseUrl}/api/status`);
     wsClient = new WsClient(baseUrl);
     await wsClient.connect();
-    const wsResult = await runScenario(wsClient, routeInventory);
+    const wsResult = await runScenario(wsClient, routeInventory, probedRouteMethods);
     wsClient = wsResult.client;
     await wsClient.close();
 
     stdioClient = new StdioClient();
     await stdioClient.waitSpawn();
-    const stdioResult = await runScenario(stdioClient, routeInventory);
+    const stdioResult = await runScenario(stdioClient, routeInventory, probedRouteMethods);
     stdioClient = stdioResult.client;
     await stdioClient.close();
 
+    const uncoveredRouteMethods = routeInventoryMethods(routeInventory)
+      .filter((method) => !probedRouteMethods.has(method))
+      .sort();
     writeJson(runtimePolicyStampPath, {
       websocket: scrub(wsResult.runtimePolicyStamp),
       stdio: scrub(stdioResult.runtimePolicyStamp),
@@ -1968,7 +1984,15 @@ async function main() {
       },
       allowlistedDifferences: diff.allowlistedDifferences.length,
       unexpectedDifferences: diff.unexpectedDifferences.length,
+      uncoveredRouteMethods,
     }, null, 2));
+    if (uncoveredRouteMethods.length > 0) {
+      console.error(
+        'route inventory methods without probe params (add cases to routeProbeParams): '
+          + [...uncoveredRouteMethods].sort().join(', '),
+      );
+      process.exitCode = 1;
+    }
     if (!diff.ok) process.exitCode = 1;
   } catch (error) {
     const failure = {

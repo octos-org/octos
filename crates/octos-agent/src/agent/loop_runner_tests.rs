@@ -885,6 +885,81 @@ impl Tool for CountingEchoTool {
     }
 }
 
+struct TerminalFailureTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for TerminalFailureTool {
+    fn name(&self) -> &str {
+        "lesson_generate"
+    }
+
+    fn description(&self) -> &str {
+        "Generate one complete lesson"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "tutor_context": { "type": "string" } }
+        })
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            output: "lesson generation exhausted its internal attempts".to_string(),
+            success: false,
+            structured_metadata: Some(serde_json::json!({
+                "retryable": false,
+                "do_not_retry_same_turn": true
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+struct TerminalLessonRetryProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for TerminalLessonRetryProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let suffix = if call == 0 { "first" } else { "rewritten" };
+        Ok(ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("call_lesson_{call}"),
+                name: "lesson_generate".to_string(),
+                // The actual incident changed context strings on every retry.
+                // The guard must key on terminal tool identity, not exact args.
+                arguments: serde_json::json!({ "tutor_context": suffix }),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
 struct PodcastGenerateTwiceProvider {
     calls: AtomicUsize,
 }
@@ -1252,6 +1327,42 @@ async fn process_message_blocks_second_podcast_generate_when_session_limit_is_on
             && content.contains("podcast_generate")
             && content.contains("max 1")
     }));
+}
+
+#[tokio::test]
+async fn terminal_tool_failure_blocks_a_rewritten_retry_in_the_same_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(TerminalFailureTool {
+        calls: Arc::clone(&calls),
+    });
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(TerminalLessonRetryProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
+
+    let result = agent
+        .process_message("teach me", &[], vec![])
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        result.content,
+        terminal_tool_retry_message("lesson_generate"),
+    );
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .count(),
+        1,
+        "the rewritten second call must be stopped before it creates another tool result",
+    );
 }
 
 #[tokio::test]
