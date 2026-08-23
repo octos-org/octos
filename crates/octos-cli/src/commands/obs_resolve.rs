@@ -56,24 +56,33 @@ pub(crate) fn resolve_instance_runtime_root(state_home: &Path, cwd: &Path) -> Pa
 }
 
 /// The PROFILE data root the obs commands read
-/// (`{goal-ledgers,peers,inbox}` live here): serve resolves a profile's
-/// data dir as `profile.data_dir` if set, else
-/// `<runtime_root>/profiles/<profile_id>/data`
-/// (`ProfileStore::resolve_data_dir`). We cannot cheaply evaluate the
-/// profile's `data_dir` override without the registry; the default
-/// profile ("octos") virtually never sets it, and an explicit
-/// `--data-dir` flag on the command itself overrides the whole chain —
-/// documented residual for custom `data_dir` profiles (a later slice can
-/// thread the registry lookup).
+/// (`{goal-ledgers,peers,inbox}` live here).
+///
+/// 整改令核心: this does NOT re-assemble the path itself — it opens the
+/// profile registry the same way serve does and delegates to
+/// [`crate::profiles::ProfileStore::resolve_data_dir`], the ONE function
+/// serve uses (honouring a profile's explicit `data_dir` override and
+/// the registry/data split). The registry root is the SHARED state home
+/// (serve's `state_home`: profile `<id>.json` files are config-like and
+/// shared across instances); the data root is the per-instance runtime
+/// root. When the registry has no such profile (e.g. a fresh instance
+/// where the profile file has not been written yet), we fall back to
+/// the same default layout `resolve_data_dir` would produce for a
+/// default profile: `<runtime_root>/profiles/<id>/data`.
 pub(crate) fn resolve_profile_data_root(
     state_home: &Path,
     cwd: &Path,
     profile_id: &str,
 ) -> PathBuf {
-    resolve_instance_runtime_root(state_home, cwd)
-        .join("profiles")
-        .join(profile_id)
-        .join("data")
+    let runtime_root = resolve_instance_runtime_root(state_home, cwd);
+    let fallback = || runtime_root.join("profiles").join(profile_id).join("data");
+    let Ok(store) = crate::profiles::ProfileStore::open(state_home, &runtime_root) else {
+        return fallback();
+    };
+    match store.get(profile_id) {
+        Ok(Some(profile)) => store.resolve_data_dir(&profile),
+        _ => fallback(),
+    }
 }
 
 /// The default profile id the solo/operator flow runs under.
