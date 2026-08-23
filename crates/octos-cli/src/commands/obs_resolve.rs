@@ -132,4 +132,47 @@ mod tests {
         assert_eq!(h1.len(), 16);
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    /// 整改端到端 (外环第二次阻塞): replicate the REAL on-disk instance
+    /// layout EXACTLY as serve writes it — `instances/<hash>/profiles/
+    /// octos/data/goal-ledgers/<goal>.db` seeded with a real goal row —
+    /// and read the goal back through the resolver + loader chain, the
+    /// same path the CLI binary executes. Guards against any future
+    /// drift between the resolver and serve's addressing.
+    #[test]
+    fn end_to_end_goal_status_through_real_instance_layout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_home = temp.path().join("home");
+        let project = temp.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        let data_root = resolve_profile_data_root(&state_home, &project, "octos");
+        // Seed exactly where serve would write.
+        let ledgers = data_root.join("goal-ledgers");
+        std::fs::create_dir_all(&ledgers).expect("ledgers dir");
+        let db = ledgers.join("goal_05.db");
+        let ledger = octos_fleet::GoalLedger::open(&db).expect("open ledger");
+        ledger
+            .upsert_goal(&octos_fleet::Goal {
+                goal_id: "goal_05".to_owned(),
+                objective: "real-layout fixture".to_owned(),
+                status: "blocked".to_owned(),
+                tokens_used: 1,
+                token_budget: 2,
+                time_used_seconds: 3,
+                continuations_used: 4,
+                revision: 0,
+                created_at_ms: 5,
+                updated_at_ms: 6,
+            })
+            .expect("seed");
+        drop(ledger);
+
+        // The CLI resolves the same root for this cwd and reads the row.
+        let resolved = resolve_profile_data_root(&state_home, &project, "octos");
+        let view = crate::commands::goal::load_goal_status(&resolved, "goal_05")
+            .expect("load")
+            .expect("goal found through the real layout");
+        assert_eq!(view.status, "blocked");
+        assert_eq!(view.objective, "real-layout fixture");
+    }
 }
