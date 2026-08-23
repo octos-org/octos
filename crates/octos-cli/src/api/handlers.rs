@@ -1446,6 +1446,10 @@ pub async fn session_workspace_contract(
     Json(statuses).into_response()
 }
 
+// The error is a ready-to-return axum response. Keeping it inline avoids an
+// allocation on every rejected file request and matches the profile resolvers
+// below, whose handlers also return the response directly.
+#[allow(clippy::result_large_err)]
 async fn resolve_file_access_data_dir(
     state: &AppState,
     headers: &HeaderMap,
@@ -2360,6 +2364,10 @@ pub(crate) fn decide_resolved_profile_id(
     }
 }
 
+// The error is a fully-built axum response which callers return directly.
+// Boxing would add allocation and dereference churn without reducing retained
+// response state; use the same targeted exception as the by-id resolver below.
+#[allow(clippy::result_large_err)]
 async fn resolve_profile_data_dir(
     state: &AppState,
     headers: &HeaderMap,
