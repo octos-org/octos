@@ -28,8 +28,8 @@ impl AgentHandle {
     pub async fn send_outbound(
         &self,
         msg: OutboundMessage,
-    ) -> Result<(), mpsc::error::SendError<OutboundMessage>> {
-        self.out_tx.send(msg).await
+    ) -> Result<(), Box<mpsc::error::SendError<OutboundMessage>>> {
+        self.out_tx.send(msg).await.map_err(Box::new)
     }
 
     /// Clone the outbound sender for use by tools (e.g. MessageTool).
@@ -124,6 +124,19 @@ mod tests {
             .unwrap();
         let msg = publisher.recv_outbound().await.unwrap();
         assert_eq!(msg.content, "response");
+    }
+
+    #[tokio::test]
+    async fn failed_outbound_send_preserves_the_unsent_message() {
+        let (agent, publisher) = create_bus();
+        drop(publisher);
+
+        let error = agent
+            .send_outbound(make_outbound("not-delivered"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0.content, "not-delivered");
     }
 
     #[tokio::test]
