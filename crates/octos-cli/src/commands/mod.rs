@@ -13,6 +13,7 @@ mod cron;
 mod docs;
 mod doctor;
 pub mod gateway;
+mod goal;
 mod inbox;
 mod init;
 pub mod mcp;
@@ -50,6 +51,7 @@ pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
+pub use goal::GoalCommand;
 pub use inbox::InboxCommand;
 pub use init::InitCommand;
 pub use mcp::McpCommand;
@@ -140,6 +142,8 @@ pub enum Command {
     Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
     Gateway(GatewayCommand),
+    /// Read-only goal status (direct ledger read; OLP observability).
+    Goal(GoalCommand),
     /// Clean up stale state and cache files.
     Clean(CleanCommand),
     /// Generate shell completions.
@@ -376,6 +380,7 @@ impl Executable for Command {
             Self::Status(cmd) => cmd.execute(),
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
+            Self::Goal(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
             Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
