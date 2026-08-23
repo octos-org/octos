@@ -5248,6 +5248,15 @@ impl InProcessAgentOrchestrator {
             decided_by: decided_by.to_string(),
         };
         let _ = ledger.append_decision(&decision);
+        // OLP L1 (slice 5): goal_transition event, best-effort.
+        crate::obs_events::append_obs_event(
+            profile_data_dir,
+            &crate::obs_events::ObsEvent::new(
+                "goal_transition",
+                &format!("goal transitioned to `{}`", snapshot.status),
+            )
+            .goal_id(Some(&snapshot.goal_id)),
+        );
     }
 
     /// #2064(b) — durably settle a late (post-clear) turn charge into the
@@ -6081,6 +6090,13 @@ impl InProcessAgentOrchestrator {
         ledger
             .append_escalation(&escalation)
             .map_err(|e| format!("failed to append peer escalation: {e}"))?;
+        // OLP L1 (slice 5): structured event, best-effort.
+        crate::obs_events::append_obs_event(
+            profile_data_dir,
+            &crate::obs_events::ObsEvent::new("escalation", &escalation.question)
+                .goal_id(Some(goal_id))
+                .slug(Some(peer_slug)),
+        );
         Ok(escalation_id)
     }
 

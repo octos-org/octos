@@ -1994,6 +1994,28 @@ pub(crate) fn build_peer_handoff_callback(
             request.model.as_deref(),
             &available_lanes,
         );
+        // OLP L1 (slice 5): structured observability event. The lane is
+        // the RESOLVED one (what record_peer_model_lane actually persisted);
+        // an unset/invalid lane resolves to the primary model, which the
+        // contract pins as the literal "primary".
+        {
+            let resolved_lane = read_peer_model_lane(&peers_root, &staged.slug);
+            let lane = resolved_lane.as_deref().unwrap_or("primary");
+            let session_str = originating_session.0.as_str();
+            // events.jsonl lives at the data-dir root = peers_root's parent.
+            let data_dir = peers_root
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| peers_root.clone());
+            crate::obs_events::append_obs_event(
+                &data_dir,
+                &crate::obs_events::ObsEvent::new("peer_staged", "peer staged")
+                    .goal_id(resolved_goal_id.as_deref())
+                    .slug(Some(staged.slug.as_str()))
+                    .session(Some(session_str))
+                    .model_lane(Some(lane)),
+            );
+        }
         // Durable so reconnect replay still delivers the open request; the
         // client dedups by an already-open session for the topic.
         emit_staged(PeerStagedEvent {
