@@ -883,11 +883,7 @@ fn within_recent_claim_window(claimed_at: SystemTime, candidate: SystemTime) -> 
     within_claim_window(claimed_at, candidate, RECENT_CLAIM_GUARD_WINDOW)
 }
 
-fn within_claim_window(
-    claimed_at: SystemTime,
-    candidate: SystemTime,
-    window: Duration,
-) -> bool {
+fn within_claim_window(claimed_at: SystemTime, candidate: SystemTime, window: Duration) -> bool {
     match candidate.duration_since(claimed_at) {
         Ok(elapsed) => elapsed <= window,
         // `candidate` is at or before `claimed_at`: same instant or reordered
@@ -999,25 +995,30 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn child_reclaim_window_collapses_same_transition_refire() {
         // Refs #2102 (Gap 2): a ChildCompleted drained between the legacy and
         // unified terminal enqueues of ONE transition must not re-enqueue
         // within the short reclaim window.
         let mut scheduler = MasterContinuationScheduler::new();
-        let req = request(MasterContinuationReason::ChildCompleted, "c")
-            .with_child_agent_id("child-9");
+        let req =
+            request(MasterContinuationReason::ChildCompleted, "c").with_child_agent_id("child-9");
         let item = queued(scheduler.enqueue_at(req.clone(), ts(20)));
         // simulate a claim: record + remove from pending
-        scheduler.recently_claimed_external.insert(item.dedupe_key.clone(), ts(20));
+        scheduler
+            .recently_claimed_external
+            .insert(item.dedupe_key.clone(), ts(20));
         scheduler.pending_by_key.remove(&item.dedupe_key);
         let dup = scheduler.enqueue_at(req, ts(21)); // 1s later < 2s window
         assert!(dup.is_duplicate(), "same-transition refire must collapse");
         // after the window expires the key is reusable
-        scheduler.recently_claimed_external.insert(item.dedupe_key.clone(), ts(20));
-        let later = scheduler
-            .enqueue_at(request(MasterContinuationReason::ChildCompleted, "c2").with_child_agent_id("child-9"), ts(60));
+        scheduler
+            .recently_claimed_external
+            .insert(item.dedupe_key.clone(), ts(20));
+        let later = scheduler.enqueue_at(
+            request(MasterContinuationReason::ChildCompleted, "c2").with_child_agent_id("child-9"),
+            ts(60),
+        );
         assert!(!later.is_duplicate(), "post-window enqueue must pass");
     }
 
@@ -1028,7 +1029,9 @@ mod tests {
         let mut scheduler = MasterContinuationScheduler::new();
         let req = request(MasterContinuationReason::LoopFire, "lp");
         let item = queued(scheduler.enqueue_at(req.clone(), ts(20)));
-        scheduler.recently_claimed_external.insert(item.dedupe_key.clone(), ts(20));
+        scheduler
+            .recently_claimed_external
+            .insert(item.dedupe_key.clone(), ts(20));
         scheduler.pending_by_key.remove(&item.dedupe_key);
         let again = scheduler.enqueue_at(req, ts(21));
         assert!(!again.is_duplicate(), "loop refire must not be suppressed");

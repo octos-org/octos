@@ -260,5 +260,11 @@
       { "id": "deepseek-ai/deepseek-v4-flash", "input": 0, "output": 0, "max_output": 384000 },
       { "id": "mistralai/Mistral-Small-24B-Instruct-2501", "input": 0, "output": 0, "max_output": 8192 }
     ]
+  },
+  "local": {
+    "env": "",
+    "models": [
+      { "id": "local-default", "input": 0, "output": 0, "max_output": 8192 }
+    ]
   }
 }
