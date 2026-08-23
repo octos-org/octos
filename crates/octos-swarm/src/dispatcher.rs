@@ -977,7 +977,7 @@ async fn dispatch_with_budget(
 ) -> SubtaskOutcome {
     if let Err(outcome) = enforce_or_outcome(policy, backend, contract, prior_attempts).await {
         record_dispatch_gate_metric(backend.backend_label(), &outcome.last_dispatch_outcome);
-        return outcome;
+        return *outcome;
     }
 
     let Some(budget) = budget else {
