@@ -297,6 +297,11 @@ pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input"
 /// finding WITHOUT waiting for the next scheduled goal turn).
 pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 
+/// OLP-CTRL — kind label for the `External(_)` continuation an
+/// `octos steer` enqueues to wake the steered session (same doorbell +
+/// scheduling mechanism as the goal-progress wake).
+pub(crate) const STEER_EXTERNAL_KIND: &str = "steer";
+
 /// #1977 Monitor WAKE — kind label for the `External(_)` master continuation a
 /// [`crate::autonomy::monitor_runtime`] watcher enqueues when its filtered probe
 /// output changes (poll) or a stream batch lands. Rides the SAME hardened
@@ -4188,6 +4193,46 @@ impl InProcessAgentOrchestrator {
         ));
         let mut state = self.state();
         state.continuations.enqueue(request)
+    }
+
+    /// OLP-CTRL (slice 2): wake a steered session. Enqueues an
+    /// `External("steer")` continuation for the target session — the SAME
+    /// mechanism `enqueue_goal_progress_continuation` uses, so a steered
+    /// idle master is scheduled exactly like a goal-progress wake. The
+    /// steer text itself is NOT carried here (it lives in the
+    /// `.reviewer-notes` sidecar the prompt renderer injects); this is
+    /// purely the doorbell + scheduling trigger.
+    pub(crate) fn enqueue_steer_continuation(
+        &self,
+        target_session: &SessionKey,
+        profile_id: &str,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_AWAITING_INPUT_GROUP,
+            target_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_dedupe_key(format!("steer:{}", target_session));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
+    }
+
+    /// Probe for tests: is an `External("steer")` continuation queued for
+    /// `session` under `profile_id`?
+    #[cfg(test)]
+    pub(crate) fn has_pending_steer_continuation_for_test(
+        &self,
+        session: &SessionKey,
+        profile_id: &str,
+    ) -> bool {
+        self.state().continuations.pending_items().any(|item| {
+            matches!(&item.reason, MasterContinuationReason::External(kind)
+                if kind == STEER_EXTERNAL_KIND)
+                && item.session_id.as_str() == session.0.as_str()
+                && item.profile_id.as_str() == profile_id
+        })
     }
 
     /// codex #1 — true when peer `slug` (under `profile_id`) has a

@@ -88,17 +88,16 @@ pub(crate) fn append_reviewer_steer(
         .unwrap_or(0);
     // One steer = one line; control chars stay data.
     let line = format!("{timestamp} {}\n", text.replace('\n', " "));
-    #[allow(unused_imports)]
-    use fs2::FileExt as _;
+    // fs2::FileExt provides the MSRV-1.85-compatible lock_shared/unlock
+    // (std's inherent methods are 1.89+ and would break upstream CI);
+    // fully-qualified calls below keep the trait genuinely used.
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&lock_path)
         .map_err(|e| format!("failed to open reviewer lock {}: {e}", lock_path.display()))?;
-    #[allow(clippy::incompatible_msrv)]
-    lock_file
-        .lock_shared()
+    fs2::FileExt::lock_shared(&lock_file)
         .map_err(|e| format!("failed to lock reviewer notes {}: {e}", lock_path.display()))?;
     let result = (|| {
         use std::io::Write as _;
@@ -112,8 +111,7 @@ pub(crate) fn append_reviewer_steer(
         file.sync_all()
             .map_err(|e| format!("failed to fsync reviewer note: {e}"))
     })();
-    #[allow(clippy::incompatible_msrv)]
-    let _ = lock_file.unlock();
+    let _ = fs2::FileExt::unlock(&lock_file);
     result
 }
 
@@ -150,6 +148,19 @@ impl Executable for SteerCommand {
             Ok(()) => {
                 let (note_path, _) = reviewer_notes_paths(&data_dir, &self.session);
                 println!("steer queued: {}", note_path.display());
+                // OLP-CTRL slice 2: wake the steered session through the
+                // SAME continuation mechanism the goal-progress wake uses.
+                // In-process only: when octos runs the serve/scheduler, the
+                // enqueue lands on the live orchestrator; from a cold CLI
+                // (serve in another process) the durable .reviewer-notes
+                // sidecar is the doorbell and the session's next tick /
+                // turn consumes it — the continuation enqueue is a
+                // best-effort accelerator, never the correctness path.
+                crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                    .enqueue_steer_continuation(
+                        &octos_core::SessionKey(self.session.clone()),
+                        super::obs::DEFAULT_PROFILE_ID,
+                    );
                 Ok(())
             }
             Err(error) => {
@@ -188,6 +199,24 @@ mod tests {
         // reaching it; assert the precondition that drives the refusal.
         let (note_path, _) = reviewer_notes_paths(temp.path(), "unknown-session");
         assert!(!note_path.exists());
+    }
+
+    /// OLP-CTRL slice 2: the steer wake enqueues an External("steer")
+    /// continuation for the target session through the SAME mechanism as
+    /// the goal-progress wake (contract: 唤醒 idle master).
+    #[test]
+    fn olp_ctrl_steer_wakes_and_receipts_enqueue() {
+        let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+        let session = octos_core::SessionKey("steer-test:local:master".into());
+        assert!(
+            !orchestrator.has_pending_steer_continuation_for_test(&session, "octos"),
+            "no steer continuation queued before the wake"
+        );
+        let _ = orchestrator.enqueue_steer_continuation(&session, "octos");
+        assert!(
+            orchestrator.has_pending_steer_continuation_for_test(&session, "octos"),
+            "steer continuation must be queued after the wake"
+        );
     }
 
     /// A session WITH inbox state is steerable and the append lands via
