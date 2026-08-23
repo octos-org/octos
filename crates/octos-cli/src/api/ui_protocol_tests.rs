@@ -25,6 +25,120 @@ fn should_normalize_safe_tool_context_at_protocol_boundary() {
     assert_eq!(normalize_tool_context(Some(&"a".repeat(65))), None);
 }
 
+#[test]
+fn should_make_voice_admission_single_use_and_idempotent_for_same_turn() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-1".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    let retried_issue = store.issue(
+        "request-1".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "第二次 ASR 的漂移结果".to_owned(),
+    );
+    assert_eq!(retried_issue.admission_id, admission.admission_id);
+    assert_eq!(retried_issue.transcript, "你好");
+
+    let claimed = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("first commit should claim the admission");
+    assert_eq!(claimed, VoiceAdmissionClaim::Start("你好".to_owned()));
+
+    store.finalize(&admission.admission_id, &turn_id);
+    let retried = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("same-turn retry should be idempotent");
+    assert_eq!(retried, VoiceAdmissionClaim::AlreadyCommitted);
+}
+
+#[test]
+fn should_reject_voice_admission_when_scope_or_audio_changes() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-2".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    assert!(
+        store
+            .claim(
+                &admission.admission_id,
+                &SessionKey("other:api:voice".to_owned()),
+                &turn_id,
+                &["up/audio.wav".to_owned()],
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .claim(
+                &admission.admission_id,
+                &session_id,
+                &turn_id,
+                &["up/other.wav".to_owned()],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn should_release_voice_admission_claim_after_start_failure() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-3".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    let first = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("claim");
+    assert!(matches!(first, VoiceAdmissionClaim::Start(_)));
+    store.release(&admission.admission_id, &turn_id);
+    let retry = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("released claim should be reusable");
+    assert!(matches!(retry, VoiceAdmissionClaim::Start(_)));
+}
+
 /// The §6 "Envelope Model" catalog in
 /// `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` is a hand-maintained
 /// mirror of the advertised method constants and has historically drifted
@@ -2177,6 +2291,29 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_TURN_STEER => json!({
             "session_id": session_id,
             "input": [{ "kind": "text", "text": "steer probe" }],
+        }),
+        APPUI_METHOD_VOICE_ADMIT => json!({
+            "session_id": session_id,
+            "request_id": "probe-voice-admit",
+            "turn_id": turn_id,
+            "media": [{
+                "path": "up/probe-voice.wav",
+                "mime": "audio/wav",
+                "size_bytes": 0,
+            }],
+        }),
+        APPUI_METHOD_VOICE_COMMIT_ADMISSION => json!({
+            "admission_id": "missing-probe-admission",
+            "turn": {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "voice commit probe" }],
+                "media": [{
+                    "path": "up/probe-voice.wav",
+                    "mime": "audio/wav",
+                    "size_bytes": 0,
+                }],
+            },
         }),
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };
@@ -11007,6 +11144,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
             projection_envelope: false,
@@ -11077,6 +11215,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
             projection_envelope: false,
@@ -11192,6 +11331,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
             projection_envelope: false,
@@ -11262,6 +11402,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
             projection_envelope: false,
@@ -11325,6 +11466,7 @@ fn shell_approval_still_emits_risk_field() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
             projection_envelope: false,
@@ -11431,6 +11573,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
             projection_envelope: false,
@@ -15416,6 +15559,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
             projection_envelope: false,
@@ -19304,6 +19448,100 @@ async fn interrupt_called_twice_returns_same_response() {
     )
     .await;
     assert!(matches!(second, InterruptOutcome::AlreadyInterrupting));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn voice_supersede_waits_for_captured_turn_to_finish_interrupting() {
+    let session_id = SessionKey("local:voice-supersede".into());
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let entry = test_active_turn(turn_id.clone(), handle.abort_handle());
+    let turn_state = entry.state.clone();
+    active_turns.lock().await.insert(session_id.clone(), entry);
+
+    let waiter = tokio::spawn({
+        let active_turns = active_turns.clone();
+        let session_id = session_id.clone();
+        let turn_id = turn_id.clone();
+        async move { await_superseded_turn(&active_turns, &session_id, &turn_id).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(*turn_state.lock().await, TurnState::Interrupting { .. }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("voice supersede captures the active turn");
+    let transition = transition_to_terminal(&turn_state, TerminalReason::Completed)
+        .await
+        .expect("voice supersede captured the active turn");
+    assert_eq!(transition.reason, TerminalReason::Interrupted);
+    transition
+        .ack
+        .expect("captured supersede has an acknowledgement")
+        .send(())
+        .expect("supersede waiter receives acknowledgement");
+
+    waiter
+        .await
+        .expect("waiter task")
+        .expect("supersede succeeds");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn voice_supersede_already_interrupting_polls_until_terminal() {
+    let session_id = SessionKey("local:voice-supersede-retry".into());
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let entry = test_active_turn(turn_id.clone(), handle.abort_handle());
+    let turn_state = entry.state.clone();
+    active_turns.lock().await.insert(session_id.clone(), entry);
+
+    let first = decide_interrupt(
+        &active_turns,
+        &TurnInterruptParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let InterruptOutcome::Captured { ack_rx } = first else {
+        panic!("first interrupt must capture the turn");
+    };
+
+    let waiter = tokio::spawn({
+        let active_turns = active_turns.clone();
+        let session_id = session_id.clone();
+        let turn_id = turn_id.clone();
+        async move { await_superseded_turn(&active_turns, &session_id, &turn_id).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    let transition = transition_to_terminal(&turn_state, TerminalReason::Completed)
+        .await
+        .expect("original interrupt completes");
+    transition
+        .ack
+        .expect("original interrupt owns acknowledgement")
+        .send(())
+        .expect("original waiter still alive");
+    ack_rx
+        .await
+        .expect("original interrupt observes acknowledgement");
+
+    waiter
+        .await
+        .expect("retry waiter task")
+        .expect("retry sees terminal turn");
     handle.abort();
 }
 
@@ -23619,24 +23857,12 @@ fn voice_combine_falls_back_to_transcript_for_pure_voice_turn() {
 }
 
 #[test]
-fn voice_no_speech_short_circuit_ignores_non_audio_media() {
-    // #1555 review finding 1: `asr_media` holds ALL media paths, so a
-    // text+image turn (no audio at all) must NOT take the no-speech early
-    // return — it previously completed the turn without running the agent.
-    // (had_audio_media, had_non_audio_media, had_audio_input, prompt_is_empty)
-    assert!(!should_short_circuit_no_speech(false, true, false, false));
-    assert!(!should_short_circuit_no_speech(false, true, false, true));
-    // No media at all → nothing voice-related to short-circuit on.
-    assert!(!should_short_circuit_no_speech(false, false, false, true));
-    // Silent audio + typed prompt → proceed as a plain text turn.
-    assert!(!should_short_circuit_no_speech(true, false, false, false));
-    // Silent audio + image/file → proceed; the agent still has real input.
-    assert!(!should_short_circuit_no_speech(true, true, false, true));
-    // Audio that produced a transcript → never short-circuit.
-    assert!(!should_short_circuit_no_speech(true, false, true, true));
-    // Only a genuinely empty voice turn (silent audio, nothing else)
-    // takes the friendly "no speech detected" path.
+fn legacy_voice_turn_only_short_circuits_when_no_other_input_remains() {
     assert!(should_short_circuit_no_speech(true, false, false, true));
+    assert!(!should_short_circuit_no_speech(true, false, false, false));
+    assert!(!should_short_circuit_no_speech(true, true, false, true));
+    assert!(!should_short_circuit_no_speech(true, false, true, true));
+    assert!(!should_short_circuit_no_speech(false, false, false, true));
 }
 
 // ========================================================================
@@ -34245,6 +34471,43 @@ fn skill_action_methods_require_their_feature_when_client_negotiates() {
             Some(true)
         );
     }
+}
+
+#[test]
+fn voice_admission_methods_require_explicit_feature_negotiation() {
+    let legacy = ConnectionUiFeatures::default();
+    for method in [
+        APPUI_METHOD_VOICE_ADMIT,
+        APPUI_METHOD_VOICE_COMMIT_ADMISSION,
+    ] {
+        assert_eq!(
+            voice_admission_method_available(method, legacy),
+            Some(false)
+        );
+    }
+
+    let negotiated = ConnectionUiFeatures::from_requested_feature_tokens(
+        [APPUI_FEATURE_VOICE_ASR_ADMISSION_V1],
+        false,
+    );
+    for method in [
+        APPUI_METHOD_VOICE_ADMIT,
+        APPUI_METHOD_VOICE_COMMIT_ADMISSION,
+    ] {
+        assert_eq!(
+            voice_admission_method_available(method, negotiated),
+            Some(true)
+        );
+    }
+
+    let capabilities = negotiated.advertised_capabilities(&AppState::empty_for_tests());
+    assert!(capabilities.supports_feature(APPUI_FEATURE_VOICE_ASR_ADMISSION_V1));
+    assert!(
+        capabilities
+            .supported_methods
+            .iter()
+            .any(|method| method == APPUI_METHOD_VOICE_ADMIT)
+    );
 }
 
 #[test]

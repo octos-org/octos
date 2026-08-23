@@ -104,6 +104,7 @@ use super::ui_protocol_progress::{
 use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, match_key_for};
 use super::ui_protocol_task_output;
+use super::voice_turn::VoiceAsrStatus;
 use super::ws_slash;
 // Phase 3 (goal-in-chat): the contract stores now live outside the `api` gate
 // so `octos chat --peers` shares the identical process-global registry.
@@ -111,6 +112,9 @@ use crate::contracts::approvals::PendingApprovalStore;
 use crate::contracts::diff::PendingDiffPreviewStore;
 use crate::contracts::questions::PendingQuestionStore;
 use crate::contracts::scope::ScopePolicy;
+use crate::contracts::voice_admission::VoiceAdmissionClaim;
+#[cfg(test)]
+use crate::contracts::voice_admission::VoiceAdmissionStore;
 use crate::contracts::{UiProtocolContractStores, contract_stores};
 // Phase 3 (goal-in-chat): the peer staging / addressing / parked-prompt layer
 // moved VERBATIM to the non-`api` `crate::peers` so `octos chat --peers` can
@@ -253,6 +257,9 @@ const APPUI_METHOD_SESSION_COMPACT: &str = "session/compact";
 /// Set the per-session compaction mode (LLM vs heuristic) from the `/context`
 /// menu; overrides the `--llm-compaction` default for auto + manual compaction.
 const APPUI_METHOD_SESSION_COMPACT_MODE_SET: &str = "session/compact/mode/set";
+const APPUI_METHOD_VOICE_ADMIT: &str = "voice/admit";
+const APPUI_METHOD_VOICE_COMMIT_ADMISSION: &str = "voice/commit_admission";
+const APPUI_FEATURE_VOICE_ASR_ADMISSION_V1: &str = "voice.asr_admission.v1";
 const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
 const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
 const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
@@ -399,6 +406,8 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::SESSION_BTW,
     APPUI_METHOD_SESSION_COMPACT,
     APPUI_METHOD_SESSION_COMPACT_MODE_SET,
+    APPUI_METHOD_VOICE_ADMIT,
+    APPUI_METHOD_VOICE_COMMIT_ADMISSION,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -1812,6 +1821,9 @@ struct ConnectionUiFeatures {
     /// progressive MSE playback; otherwise it falls back to whole-file
     /// `file/attached` audio.
     voice_audio: bool,
+    /// Two-phase ASR admission. Strictly opt-in so older clients keep using
+    /// the legacy `turn/start` voice path unchanged.
+    voice_asr_admission_v1: bool,
     /// `plan.todos.v1` negotiated. When set, the server streams the
     /// `update_plan` tool's checklist as `plan/updated` notifications and
     /// replays the latest snapshot on `session/open`. Otherwise the plan rides
@@ -1923,6 +1935,11 @@ impl ConnectionUiFeatures {
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
+            voice_asr_admission_v1: has_ui_feature(
+                headers,
+                query,
+                APPUI_FEATURE_VOICE_ASR_ADMISSION_V1,
+            ),
             plan_todos: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             background_activity: has_ui_feature(
                 headers,
@@ -2006,6 +2023,7 @@ impl ConnectionUiFeatures {
             spawn_complete: true,
             file_attached: true,
             voice_audio: true,
+            voice_asr_admission_v1: true,
             plan_todos: true,
             background_activity: true,
             // Do NOT auto-enable `projection.envelope.v1` for stdio
@@ -2065,6 +2083,7 @@ impl ConnectionUiFeatures {
             spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             file_attached: has(UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1),
             voice_audio: has(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1),
+            voice_asr_admission_v1: has(APPUI_FEATURE_VOICE_ASR_ADMISSION_V1),
             plan_todos: has(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             background_activity: has(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1),
             projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
@@ -2135,6 +2154,9 @@ impl ConnectionUiFeatures {
         }
         if self.voice_audio {
             requested.push(UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1);
+        }
+        if self.voice_asr_admission_v1 {
+            requested.push(APPUI_FEATURE_VOICE_ASR_ADMISSION_V1);
         }
         if self.plan_todos {
             requested.push(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1);
@@ -2261,6 +2283,9 @@ impl ConnectionUiFeatures {
             {
                 continue;
             }
+            if voice_admission_method_available(method, self) == Some(false) {
+                continue;
+            }
             if !capabilities
                 .supported_methods
                 .iter()
@@ -2273,6 +2298,12 @@ impl ConnectionUiFeatures {
             &mut capabilities.supported_features,
             APPUI_FEATURE_PERMISSION_PROFILE_V1,
         );
+        if self.voice_asr_admission_v1 {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_VOICE_ASR_ADMISSION_V1,
+            );
+        }
         push_capability_feature(
             &mut capabilities.supported_features,
             APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1,
@@ -2479,6 +2510,15 @@ fn skill_action_method_available(method: &str, features: ConnectionUiFeatures) -
         }
         APPUI_METHOD_SKILL_ACTION_JOB_LIST | APPUI_METHOD_SKILL_ACTION_JOB_READ => {
             Some(features.skill_action_jobs_available())
+        }
+        _ => None,
+    }
+}
+
+fn voice_admission_method_available(method: &str, features: ConnectionUiFeatures) -> Option<bool> {
+    match method {
+        APPUI_METHOD_VOICE_ADMIT | APPUI_METHOD_VOICE_COMMIT_ADMISSION => {
+            Some(features.voice_asr_admission_v1)
         }
         _ => None,
     }
@@ -3888,17 +3928,9 @@ fn replace_voice_user_message_content(messages: &mut [Message], transcript: Opti
     }
 }
 
-/// Whether a turn should short-circuit as "no speech detected" (#1555 review).
-///
-/// `run_standalone_turn`'s `asr_media` list holds ALL materialized media paths
-/// (images and files as well as audio), so the short-circuit must NOT key off
-/// "any media + no transcript" — that silently completes e.g. a text+image
-/// turn without ever running the agent. Only swallow the turn when there is
-/// literally nothing left to act on: the turn carried audio, ASR produced no
-/// transcript, and there is no typed prompt and no non-audio media (an image
-/// or file alongside silent audio still gives the agent real input).
-///
-/// Pure (no I/O, no task-locals) so it is unit-testable in isolation.
+/// The legacy `turn/start` path only has nothing to process when silent audio
+/// is the request's sole input. The two-phase voice admission path rejects
+/// no-speech before a turn reaches this function.
 fn should_short_circuit_no_speech(
     had_audio_media: bool,
     had_non_audio_media: bool,
@@ -7569,6 +7601,29 @@ struct RawProfileParams {
     profile_id: Option<String>,
     #[serde(default)]
     session_id: Option<SessionKey>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVoiceAdmitParams {
+    session_id: SessionKey,
+    request_id: String,
+    turn_id: TurnId,
+    media: Vec<FileRef>,
+    #[serde(default)]
+    topic: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVoiceCommitAdmissionParams {
+    admission_id: String,
+    #[serde(default)]
+    supersedes_turn_id: Option<TurnId>,
+    turn: TurnStartParams,
+}
+
+#[derive(Debug, Clone)]
+struct PreAdmittedVoice {
+    transcript: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -16110,6 +16165,14 @@ async fn handle_raw_appui_rpc(
         );
         return true;
     }
+    if voice_admission_method_available(request.method.as_str(), features) == Some(false) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::method_not_supported(request.method.as_str()),
+        );
+        return true;
+    }
 
     if request.method == APPUI_METHOD_REVIEW_START {
         handle_review_start(
@@ -16130,6 +16193,28 @@ async fn handle_raw_appui_rpc(
 
     if request.method == APPUI_METHOD_TURN_STEER {
         handle_turn_steer(
+            ws,
+            state,
+            ledger,
+            contracts,
+            active_turns,
+            connection_turns,
+            connection_profile_id,
+            features,
+            id,
+            request,
+        )
+        .await;
+        return true;
+    }
+
+    if request.method == APPUI_METHOD_VOICE_ADMIT {
+        handle_voice_admit(ws, state, contracts, connection_profile_id, id, request).await;
+        return true;
+    }
+
+    if request.method == APPUI_METHOD_VOICE_COMMIT_ADMISSION {
+        handle_voice_commit_admission(
             ws,
             state,
             ledger,
@@ -16656,6 +16741,8 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
             | APPUI_METHOD_SESSION_COMPACT
             | APPUI_METHOD_SESSION_COMPACT_MODE_SET
+            | APPUI_METHOD_VOICE_ADMIT
+            | APPUI_METHOD_VOICE_COMMIT_ADMISSION
     ) {
         return true;
     }
@@ -19646,7 +19733,7 @@ async fn handle_turn_start(
     id: String,
     params: TurnStartParams,
 ) {
-    handle_turn_start_with_accept(
+    let _ = handle_turn_start_with_accept(
         ws,
         state,
         ledger,
@@ -19659,8 +19746,318 @@ async fn handle_turn_start(
         id,
         params,
         json!({ "accepted": true }),
+        None,
     )
     .await;
+}
+
+fn voice_media_paths(media: &[FileRef]) -> Vec<String> {
+    media
+        .iter()
+        .filter(|file| file.mime.starts_with("audio/") || octos_bus::media::is_audio(&file.path))
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+fn voice_session_with_topic(session_id: &SessionKey, topic: Option<&str>) -> SessionKey {
+    string_session_with_optional_topic(&session_id.0, topic)
+}
+
+async fn resolve_voice_admission_runtime(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    connection_profile_id: Option<&str>,
+) -> Result<Arc<crate::runtime::SessionRuntime>, RpcError> {
+    let active_profile_id = session_id.profile_id().or(connection_profile_id);
+    if let Some(profile_id) = active_profile_id {
+        ensure_known_profile(state, profile_id)?;
+    }
+    let profile_runtime = ensure_session_profile_runtime(state, active_profile_id)
+        .await?
+        .ok_or_else(|| {
+            runtime_unavailable_error(profile_runtime_unavailable_message(
+                state,
+                active_profile_id.unwrap_or("<unset>"),
+            ))
+        })?;
+    let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
+    let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
+    let permissions_epoch = state.session_cache.session_generation(session_id);
+    let permissions = effective_permissions_for_session(state, session_id)?;
+    state
+        .session_cache
+        .get_or_init_with_permissions(
+            &profile_runtime,
+            session_id.clone(),
+            hint,
+            permissions,
+            permissions_epoch,
+        )
+        .await
+        .map_err(|error| runtime_unavailable_error(error.to_string()))
+}
+
+async fn handle_voice_admit(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    contracts: &Arc<UiProtocolContractStores>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    request: &RpcRequest<Value>,
+) {
+    let params: RawVoiceAdmitParams = match parse_raw_params(request) {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    if params.request_id.trim().is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("voice/admit requires a non-empty request_id"),
+        );
+        return;
+    }
+    let session_id = voice_session_with_topic(&params.session_id, params.topic.as_deref());
+    if let Err(error) = validate_session_scope(&session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    let audio_paths = voice_media_paths(&params.media);
+    if audio_paths.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("voice/admit requires at least one audio file"),
+        );
+        return;
+    }
+    let session_runtime =
+        match resolve_voice_admission_runtime(state, &session_id, connection_profile_id).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
+    let materialized = octos_bus::file_handle::materialize_turn_uploads(
+        &session_runtime.workspace_root,
+        Some(session_runtime.profile.profile_id.as_str()),
+        &audio_paths,
+    );
+    let asr_media = materialized
+        .iter()
+        .map(|path| {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_string_lossy().into_owned()
+            } else {
+                session_runtime
+                    .workspace_root
+                    .join(path)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    let asr_language = match crate::profiles::effective_profile_asr_language(
+        state.profile_store.as_deref(),
+        Some(&session_runtime.profile.profile_id),
+        session_runtime.profile.voice.asr_language.as_deref(),
+    ) {
+        Ok(language) => language,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), runtime_unavailable_error(error.to_string()));
+            return;
+        }
+    };
+    let outcome =
+        crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
+    match outcome.status() {
+        VoiceAsrStatus::Speech => {
+            let transcript = outcome.accepted_transcripts.join("\n");
+            let issued = contracts.voice_admissions.issue(
+                params.request_id,
+                session_id,
+                params.turn_id.clone(),
+                audio_paths,
+                transcript.clone(),
+            );
+            let _ = send_rpc_result(
+                ws,
+                id,
+                json!({
+                    "status": "speech",
+                    "admission_id": issued.admission_id,
+                    "turn_id": params.turn_id,
+                    "transcript": issued.transcript,
+                }),
+            );
+        }
+        VoiceAsrStatus::NoSpeech => {
+            let _ = send_rpc_result(
+                ws,
+                id,
+                json!({
+                    "status": "no_speech",
+                    "turn_id": params.turn_id,
+                    "reject_reasons": outcome.reject_reasons,
+                }),
+            );
+        }
+        VoiceAsrStatus::Failed | VoiceAsrStatus::NoAudio => {
+            let error = RpcError::internal_error("voice ASR preflight failed").with_data(json!({
+                "kind": "voice_asr_unavailable",
+                "failed_count": outcome.failed_count,
+            }));
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn await_superseded_turn(
+    active_turns: &SharedActiveTurns,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) -> Result<(), RpcError> {
+    let params = TurnInterruptParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    match decide_interrupt(active_turns, &params).await {
+        InterruptOutcome::Unknown | InterruptOutcome::AlreadyTerminal(_) => Ok(()),
+        InterruptOutcome::Mismatch => Err(RpcError::invalid_request(
+            "the superseded turn is not the active turn for this session",
+        )),
+        InterruptOutcome::Captured { ack_rx } => {
+            match tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, ack_rx).await {
+                Ok(Ok(())) => Ok(()),
+                _ => Err(RpcError::internal_error(
+                    "timed out while interrupting the superseded voice turn",
+                )),
+            }
+        }
+        InterruptOutcome::AlreadyInterrupting => {
+            let wait = async {
+                loop {
+                    let terminal = {
+                        let active = active_turns.lock().await;
+                        let Some(active) = active.get(session_id) else {
+                            return;
+                        };
+                        if active.turn_id != *turn_id {
+                            return;
+                        }
+                        matches!(*active.state.lock().await, TurnState::Terminal(_))
+                    };
+                    if terminal {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, wait)
+                .await
+                .map_err(|_| {
+                    RpcError::internal_error(
+                        "timed out while waiting for the superseded voice turn",
+                    )
+                })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_voice_commit_admission(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    request: &RpcRequest<Value>,
+) {
+    let mut params: RawVoiceCommitAdmissionParams = match parse_raw_params(request) {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let session_id =
+        voice_session_with_topic(&params.turn.session_id, params.turn.topic.as_deref());
+    if let Err(error) = validate_session_scope(&session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    let audio_paths = voice_media_paths(&params.turn.media);
+    let claim = match contracts.voice_admissions.claim(
+        &params.admission_id,
+        &session_id,
+        &params.turn.turn_id,
+        &audio_paths,
+    ) {
+        Ok(claim) => claim,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), RpcError::invalid_request(error.message()));
+            return;
+        }
+    };
+    if claim == VoiceAdmissionClaim::AlreadyCommitted {
+        let _ = send_rpc_result(
+            ws,
+            id,
+            json!({
+                "accepted": true,
+                "committed": true,
+                "idempotent": true,
+                "turn_id": params.turn.turn_id,
+            }),
+        );
+        return;
+    }
+    if let Some(superseded) = params.supersedes_turn_id.as_ref() {
+        if let Err(error) = await_superseded_turn(active_turns, &session_id, superseded).await {
+            contracts
+                .voice_admissions
+                .release(&params.admission_id, &params.turn.turn_id);
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    }
+    params.turn.session_id = session_id;
+    params.turn.topic = None;
+    let VoiceAdmissionClaim::Start(transcript) = claim else {
+        unreachable!("already-committed voice admission returned above")
+    };
+    let admission_id = params.admission_id.clone();
+    let turn_id = params.turn.turn_id.clone();
+    let started = handle_turn_start_with_accept(
+        ws,
+        state,
+        ledger,
+        contracts,
+        active_turns,
+        connection_turns,
+        connection_profile_id,
+        None,
+        features,
+        id,
+        params.turn,
+        json!({ "accepted": true, "committed": true, "turn_id": turn_id }),
+        Some(PreAdmittedVoice { transcript }),
+    )
+    .await;
+    if started {
+        contracts.voice_admissions.finalize(&admission_id, &turn_id);
+    } else {
+        contracts.voice_admissions.release(&admission_id, &turn_id);
+    }
 }
 
 /// `handle_turn_start` body with a caller-chosen accept payload.
@@ -19686,7 +20083,8 @@ async fn handle_turn_start_with_accept(
     id: String,
     mut params: TurnStartParams,
     accept_result: Value,
-) {
+    pre_admitted_voice: Option<PreAdmittedVoice>,
+) -> bool {
     // UPCR-2026-015 (M9-β-1): if the client carried a `topic` field
     // alongside the session_id, fold it into the resolved SessionKey
     // BEFORE scope validation. The rest of the turn pipeline keys
@@ -19715,7 +20113,7 @@ async fn handle_turn_start_with_accept(
 
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
-        return;
+        return false;
     }
 
     let prompt = match prompt_text(&params.input) {
@@ -19739,7 +20137,7 @@ async fn handle_turn_start_with_accept(
                     Some(id),
                     RpcError::invalid_params("turn/start requires at least one text input item"),
                 );
-                return;
+                return false;
             }
         }
     };
@@ -19766,7 +20164,7 @@ async fn handle_turn_start_with_accept(
         if let Some(profile_id) = active_profile_id.as_deref() {
             if let Err(error) = ensure_known_profile(state, profile_id) {
                 let _ = send_rpc_error(ws, Some(id), error);
-                return;
+                return false;
             }
         }
         if resolve_session_profile_runtime(state, active_profile_id.as_deref()).is_none() {
@@ -19778,7 +20176,7 @@ async fn handle_turn_start_with_accept(
                     active_profile_id.as_deref().unwrap_or("<unset>"),
                 )),
             );
-            return;
+            return false;
         }
     }
 
@@ -19871,6 +20269,7 @@ async fn handle_turn_start_with_accept(
                 features,
                 params,
                 prompt,
+                pre_admitted_voice,
                 resolved_profile_id,
                 turn_state_for_task,
                 interrupt_rx,
@@ -19934,20 +20333,36 @@ async fn handle_turn_start_with_accept(
             Some(id),
             RpcError::invalid_request("a turn is already running for this session"),
         );
-        return;
+        return false;
     }
 
     connection_turns
         .lock()
         .await
-        .insert(session_id, turn_id.clone());
+        .insert(session_id.clone(), turn_id.clone());
     // Lifecycle reply: if the client cannot receive the accept, abort the
     // freshly-inserted turn — running an unaccepted turn would be a leak.
     if send_rpc_result(ws, id, accept_result).is_err() {
         handle.abort();
-        return;
+        let mut active = active_turns.lock().await;
+        if active
+            .get(&session_id)
+            .is_some_and(|entry| entry.turn_id == turn_id)
+        {
+            active.remove(&session_id);
+        }
+        drop(active);
+        let mut connection = connection_turns.lock().await;
+        if connection
+            .get(&session_id)
+            .is_some_and(|registered| *registered == turn_id)
+        {
+            connection.remove(&session_id);
+        }
+        return false;
     }
     let _ = start_tx.send(());
+    true
 }
 
 /// Outcome of the `turn/steer` registry decision (computed under the
@@ -20111,7 +20526,7 @@ async fn handle_turn_steer(
                 tool_context: None,
                 live_video: false,
             };
-            handle_turn_start_with_accept(
+            let _ = handle_turn_start_with_accept(
                 ws,
                 state,
                 ledger,
@@ -20127,6 +20542,7 @@ async fn handle_turn_steer(
                 id,
                 start_params,
                 json!({ "turn_id": new_turn_id, "steered": false }),
+                None,
             )
             .await;
         }
@@ -20422,6 +20838,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             features,
             params,
             prompt,
+            None,
             routed_profile_id,
             turn_state_for_task,
             interrupt_rx,
@@ -29354,6 +29771,10 @@ async fn run_standalone_turn(
     // Voice (语音轮): made `mut` so the serve/WS turn/start path can merge
     // transcribed audio media into the prompt text before the agent runs.
     mut prompt: String,
+    // Present only after `voice/admit` returned Speech and the matching,
+    // scoped single-use admission was consumed by `voice/commit_admission`.
+    // This prevents the committed turn from running ASR twice.
+    pre_admitted_voice: Option<PreAdmittedVoice>,
     routed_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
@@ -31566,7 +31987,7 @@ async fn run_standalone_turn(
     // the cached SessionRuntime. A Settings save therefore affects the very
     // next utterance without restarting `octos serve`. Do not touch the store
     // for text-only turns; a malformed voice setting must not break chat.
-    let asr_language = if had_audio_media {
+    let asr_language = if had_audio_media && pre_admitted_voice.is_none() {
         match crate::profiles::effective_profile_asr_language(
             state.profile_store.as_deref(),
             Some(&session_runtime.profile.profile_id),
@@ -31598,25 +32019,36 @@ async fn run_standalone_turn(
     } else {
         None
     };
-    tracing::debug!(media = ?asr_media, "voice_turn: STT input media");
-    let voice_transcripts =
-        crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await;
-    let had_audio_input = !voice_transcripts.is_empty();
+    tracing::debug!(media_count = asr_media.len(), "voice_turn: STT input media");
+    let voice_asr = if let Some(admitted) = pre_admitted_voice {
+        crate::api::voice_turn::VoiceAsrOutcome {
+            audio_count: asr_media
+                .iter()
+                .filter(|path| octos_bus::media::is_audio(path))
+                .count(),
+            accepted_transcripts: vec![admitted.transcript],
+            rejected_count: 0,
+            failed_count: 0,
+            reject_reasons: Vec::new(),
+        }
+    } else {
+        crate::api::voice_turn::transcribe_audio_media(&asr_media, asr_language.as_deref()).await
+    };
+    let asr_status = voice_asr.status();
     tracing::debug!(
-        transcripts = voice_transcripts.len(),
-        had_audio_input,
+        transcripts = voice_asr.accepted_transcripts.len(),
+        rejected = voice_asr.rejected_count,
+        failed = voice_asr.failed_count,
+        ?asr_status,
         "voice_turn: STT result"
     );
-    // #1555 review finding 1: `asr_media` is ALL materialized media (images,
-    // files, audio) — gating the no-speech return on `!asr_media.is_empty()`
-    // silently completed any non-audio-media turn (e.g. text+image) without
-    // running the agent. Short-circuit only genuinely empty voice turns:
-    // audio present, no transcript, no typed prompt, no other media.
-    let had_non_audio_media = asr_media.iter().any(|p| !octos_bus::media::is_audio(p));
+    let had_non_audio_media = asr_media
+        .iter()
+        .any(|path| !octos_bus::media::is_audio(path));
     if should_short_circuit_no_speech(
         had_audio_media,
         had_non_audio_media,
-        had_audio_input,
+        !voice_asr.accepted_transcripts.is_empty(),
         prompt.trim().is_empty(),
     ) {
         let mut no_speech_metadata = UiProgressMetadata::new("voice_no_speech");
@@ -31649,6 +32081,40 @@ async fn run_standalone_turn(
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
+    if had_audio_media && asr_status == VoiceAsrStatus::Failed {
+        let error_message = "语音识别暂时不可用，请重试";
+        let mut error_metadata = UiProgressMetadata::new("voice_asr_error");
+        error_metadata.message = Some(error_message.to_owned());
+        error_metadata.extra.insert(
+            "client_message_id".to_owned(),
+            Value::String(turn_id.0.to_string()),
+        );
+        let _ = send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::ProgressUpdated(UiProgressEvent::new(
+                session_id.clone(),
+                Some(turn_id.clone()),
+                error_metadata,
+            )),
+        );
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("voice_asr_unavailable", error_message)),
+            None,
+            None,
+        )
+        .await;
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
+    let voice_transcripts = voice_asr.accepted_transcripts;
+    let had_audio_input = !voice_transcripts.is_empty();
     // #1555 review finding 2: content persisted as the voice turn's user
     // message. Captured below as the COMBINED user-visible content (typed
     // prompt + transcript, exactly as merged into the LLM prompt) BEFORE the

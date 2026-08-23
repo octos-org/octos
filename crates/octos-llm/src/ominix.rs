@@ -12,6 +12,55 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// Structured ASR result. `rejected` is authoritative even when an upstream
+/// service accidentally includes non-empty text alongside the rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrTranscription {
+    pub text: String,
+    pub rejected: bool,
+    pub reject_reason: Option<String>,
+}
+
+fn parse_transcription_response(json: &serde_json::Value) -> Result<AsrTranscription> {
+    let rejected = match json.get("rejected") {
+        None => None,
+        Some(serde_json::Value::Bool(value)) => Some(*value),
+        Some(_) => eyre::bail!("invalid rejected field in transcription response"),
+    };
+
+    if rejected == Some(true) {
+        let reject_reason = json
+            .get("reject_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("upstream_rejected")
+            .to_owned();
+        return Ok(AsrTranscription {
+            text: String::new(),
+            rejected: true,
+            reject_reason: Some(reject_reason),
+        });
+    }
+
+    let text = json
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre::eyre!("no text field in transcription response"))?
+        .trim();
+    if text.is_empty() {
+        return Ok(AsrTranscription {
+            text: String::new(),
+            rejected: true,
+            reject_reason: Some("no_speech".to_owned()),
+        });
+    }
+
+    Ok(AsrTranscription {
+        text: text.to_owned(),
+        rejected: false,
+        reject_reason: None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Platform model allowlist — ~/.octos/platform-models.json
 // ---------------------------------------------------------------------------
@@ -425,8 +474,9 @@ impl OminixClient {
         Ok(filtered)
     }
 
-    /// Transcribe an audio file to text.
-    pub async fn transcribe(&self, audio_path: &Path) -> Result<String> {
+    /// Transcribe an audio file while preserving the upstream no-speech
+    /// contract instead of collapsing it into an empty string.
+    pub async fn transcribe(&self, audio_path: &Path) -> Result<AsrTranscription> {
         let meta = tokio::fs::metadata(audio_path)
             .await
             .wrap_err_with(|| format!("failed to stat audio: {}", audio_path.display()))?;
@@ -470,13 +520,14 @@ impl OminixClient {
             .await
             .wrap_err("invalid transcription response")?;
 
-        let text = json
-            .get("text")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre::eyre!("no text field in transcription response"))?;
+        let result = parse_transcription_response(&json)?;
 
-        debug!(chars = text.len(), "audio transcribed via ASR service");
-        Ok(text.to_string())
+        debug!(
+            chars = result.text.len(),
+            rejected = result.rejected,
+            "audio transcribed via ASR service"
+        );
+        Ok(result)
     }
 
     /// Synthesize text to speech, returning raw WAV bytes.
@@ -557,7 +608,8 @@ impl OminixClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{OminixClient, tts_endpoint};
+    use super::{OminixClient, parse_transcription_response, tts_endpoint};
+    use serde_json::json;
 
     #[test]
     fn sovits_is_the_default_endpoint() {
@@ -572,6 +624,74 @@ mod tests {
     #[test]
     fn unknown_engine_falls_back_to_sovits() {
         assert_eq!(tts_endpoint("nonsense"), "/v1/audio/tts/sovits");
+    }
+
+    #[test]
+    fn should_reject_when_upstream_explicitly_rejects_nonempty_text() {
+        let result = parse_transcription_response(&json!({
+            "text": "hallucinated words",
+            "rejected": true,
+            "reject_reason": "no_speech"
+        }))
+        .expect("explicit rejection is a valid ASR response");
+
+        assert!(result.rejected);
+        assert_eq!(result.text, "");
+        assert_eq!(result.reject_reason.as_deref(), Some("no_speech"));
+    }
+
+    #[test]
+    fn should_reject_when_upstream_rejects_without_text() {
+        let result = parse_transcription_response(&json!({
+            "rejected": true
+        }))
+        .expect("explicit rejection does not require text");
+
+        assert!(result.rejected);
+        assert_eq!(result.text, "");
+        assert_eq!(result.reject_reason.as_deref(), Some("upstream_rejected"));
+    }
+
+    #[test]
+    fn should_reject_blank_text_from_legacy_asr() {
+        let result = parse_transcription_response(&json!({ "text": "  \n" }))
+            .expect("legacy blank response is valid no-speech");
+
+        assert!(result.rejected);
+        assert_eq!(result.text, "");
+        assert_eq!(result.reject_reason.as_deref(), Some("no_speech"));
+    }
+
+    #[test]
+    fn should_accept_nonempty_text_when_not_rejected() {
+        let result = parse_transcription_response(&json!({
+            "text": " 正常中文 ",
+            "rejected": false
+        }))
+        .expect("valid speech response");
+
+        assert!(!result.rejected);
+        assert_eq!(result.text, "正常中文");
+        assert_eq!(result.reject_reason, None);
+    }
+
+    #[test]
+    fn should_fail_when_rejected_has_wrong_type() {
+        let error = parse_transcription_response(&json!({
+            "text": "不可信文本",
+            "rejected": "true"
+        }))
+        .expect_err("invalid rejected type must fail closed");
+
+        assert!(error.to_string().contains("rejected"));
+    }
+
+    #[test]
+    fn should_fail_when_non_rejected_response_has_no_text() {
+        let error = parse_transcription_response(&json!({ "rejected": false }))
+            .expect_err("accepted response requires text");
+
+        assert!(error.to_string().contains("text"));
     }
 
     #[tokio::test]

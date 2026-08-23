@@ -396,6 +396,14 @@ Session, turn, and approval core:
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
+- `voice/admit` (advertised by `voice.asr_admission.v1`; ASR-only preflight for uploaded
+  audio. Returns `status: speech` with a 120-second, session/turn/audio-scoped
+  single-use `admission_id`, or `status: no_speech`. It never starts an LLM
+  turn and sibling text/image inputs cannot override `no_speech`.)
+- `voice/commit_admission` (advertised by `voice.asr_admission.v1`; atomically consumes a
+  speech admission, optionally interrupts `supersedes_turn_id`, and starts the
+  admitted turn without repeating ASR. Same-turn retries are idempotent;
+  changing the session, turn id, or audio references is rejected.)
 - `turn/steer` (mid-turn prompt injection into the ACTIVE turn, codex
   app-server parity. Params `{session_id, expected_turn_id?, input}`,
   result `{turn_id, steered}`. With a live turn the text input items are

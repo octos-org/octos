@@ -11,6 +11,37 @@ use octos_llm::ominix::OminixClient;
 
 use crate::config::CloudTtsConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceAsrStatus {
+    NoAudio,
+    Speech,
+    NoSpeech,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct VoiceAsrOutcome {
+    pub(crate) audio_count: usize,
+    pub(crate) accepted_transcripts: Vec<String>,
+    pub(crate) rejected_count: usize,
+    pub(crate) failed_count: usize,
+    pub(crate) reject_reasons: Vec<String>,
+}
+
+impl VoiceAsrOutcome {
+    pub(crate) fn status(&self) -> VoiceAsrStatus {
+        if !self.accepted_transcripts.is_empty() {
+            VoiceAsrStatus::Speech
+        } else if self.audio_count == 0 {
+            VoiceAsrStatus::NoAudio
+        } else if self.failed_count > 0 {
+            VoiceAsrStatus::Failed
+        } else {
+            VoiceAsrStatus::NoSpeech
+        }
+    }
+}
+
 /// 解析批量 ASR 服务基址。`ASR_API_URL` 指向独立 ASR 时优先；未设置时回退到
 /// OminiX，保留既有部署行为。
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
@@ -36,14 +67,13 @@ pub(crate) fn audio_paths(media: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 转写 turn 内全部音频媒体。无音频时返回空 vec（调用方据此判定是否"语音轮"）。
-/// 单条转写失败只记日志并跳过，不让整轮失败。
+/// 转写 turn 内全部音频媒体，并保留拒绝/失败的轮次级状态。
 // TODO(later-tasks): remove dead_code allow once callers are wired up.
 #[allow(dead_code)]
 pub(crate) async fn transcribe_audio_media(
     media: &[String],
     language: Option<&str>,
-) -> Vec<String> {
+) -> VoiceAsrOutcome {
     transcribe_audio_media_with_base_url(media, language, &asr_base_url()).await
 }
 
@@ -51,19 +81,31 @@ async fn transcribe_audio_media_with_base_url(
     media: &[String],
     language: Option<&str>,
     base_url: &str,
-) -> Vec<String> {
+) -> VoiceAsrOutcome {
     let audios = audio_paths(media);
     if audios.is_empty() {
-        return Vec::new();
+        return VoiceAsrOutcome::default();
     }
     let client = OminixClient::new(base_url).with_language(language.map(|s| s.to_string()));
     let asr_t = std::time::Instant::now();
-    let mut out = Vec::new();
-    for path in audios {
+    let mut outcome = VoiceAsrOutcome {
+        audio_count: audios.len(),
+        ..VoiceAsrOutcome::default()
+    };
+    for (audio_index, path) in audios.into_iter().enumerate() {
         match client.transcribe(Path::new(&path)).await {
-            Ok(text) if !text.trim().is_empty() => out.push(text),
-            Ok(_) => tracing::warn!(audio = %path, "voice_turn: empty transcript, skipping"),
-            Err(e) => tracing::warn!(audio = %path, error = %e, "voice_turn: transcription failed"),
+            Ok(transcription) if transcription.rejected => {
+                outcome.rejected_count += 1;
+                if let Some(reason) = transcription.reject_reason {
+                    outcome.reject_reasons.push(reason);
+                }
+                tracing::debug!(audio_index, "voice_turn: ASR rejected audio");
+            }
+            Ok(transcription) => outcome.accepted_transcripts.push(transcription.text),
+            Err(error) => {
+                outcome.failed_count += 1;
+                tracing::warn!(audio_index, %error, "voice_turn: transcription failed");
+            }
         }
     }
     eprintln!(
@@ -71,7 +113,7 @@ async fn transcribe_audio_media_with_base_url(
         asr_t.elapsed().as_millis(),
         now_ms()
     );
-    out
+    outcome
 }
 
 /// Whether a char is safe to hand to TTS: letters/digits (incl. CJK),
@@ -1324,6 +1366,50 @@ mod tests {
     use crate::config::CloudTtsConfig;
 
     #[test]
+    fn should_classify_no_speech_when_all_audio_is_rejected() {
+        let outcome = VoiceAsrOutcome {
+            audio_count: 2,
+            accepted_transcripts: Vec::new(),
+            rejected_count: 2,
+            failed_count: 0,
+            reject_reasons: vec!["no_speech".into(), "no_speech".into()],
+        };
+
+        assert_eq!(outcome.status(), VoiceAsrStatus::NoSpeech);
+    }
+
+    #[test]
+    fn should_classify_failed_when_no_speech_and_any_asr_call_failed() {
+        let outcome = VoiceAsrOutcome {
+            audio_count: 2,
+            accepted_transcripts: Vec::new(),
+            rejected_count: 1,
+            failed_count: 1,
+            reject_reasons: vec!["no_speech".into()],
+        };
+
+        assert_eq!(outcome.status(), VoiceAsrStatus::Failed);
+    }
+
+    #[test]
+    fn should_classify_speech_when_any_audio_has_valid_transcript() {
+        let outcome = VoiceAsrOutcome {
+            audio_count: 3,
+            accepted_transcripts: vec!["有效中文".into()],
+            rejected_count: 1,
+            failed_count: 1,
+            reject_reasons: vec!["no_speech".into()],
+        };
+
+        assert_eq!(outcome.status(), VoiceAsrStatus::Speech);
+    }
+
+    #[test]
+    fn should_classify_no_audio_without_conflating_it_with_no_speech() {
+        assert_eq!(VoiceAsrOutcome::default().status(), VoiceAsrStatus::NoAudio);
+    }
+
+    #[test]
     fn should_want_cloud_for_auto_cloud_and_legacy_volcano() {
         for p in ["auto", "cloud", "volcano"] {
             assert!(wants_cloud(p), "{p} should want cloud");
@@ -1585,14 +1671,15 @@ mod tests {
                 .unwrap();
         let audio_path = dir.path().join("utterance.wav");
         std::fs::write(&audio_path, b"RIFF-test-audio").unwrap();
-        let transcripts = transcribe_audio_media_with_base_url(
+        let outcome = transcribe_audio_media_with_base_url(
             &[audio_path.to_string_lossy().into_owned()],
             language.as_deref(),
             &format!("http://{addr}"),
         )
         .await;
 
-        assert_eq!(transcripts, vec!["bonjour"]);
+        assert_eq!(outcome.status(), VoiceAsrStatus::Speech);
+        assert_eq!(outcome.accepted_transcripts, vec!["bonjour"]);
         let (request_line, request) = request_rx.await.unwrap();
         assert_eq!(request_line, "POST /v1/audio/transcriptions HTTP/1.1");
         assert_eq!(request["language"], "French");
