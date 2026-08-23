@@ -13,6 +13,7 @@ mod cron;
 mod docs;
 mod doctor;
 pub mod gateway;
+mod inbox;
 mod init;
 pub mod mcp;
 pub mod mcp_serve;
@@ -49,6 +50,7 @@ pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
+pub use inbox::InboxCommand;
 pub use init::InitCommand;
 pub use mcp::McpCommand;
 pub use mcp_serve::McpServeCommand;
@@ -117,6 +119,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Query inbox notes file paths (read-only; OLP observability).
+    Inbox(InboxCommand),
     /// Manage OAuth-authenticated MCP servers (`login`/`logout`).
     Mcp(McpCommand),
     /// Inspect and drive the memory-refresh pipeline.
@@ -163,6 +167,8 @@ pub enum Command {
 pub fn reserve_stdout(command: &Command) -> bool {
     match command {
         Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) => true,
+        // `inbox path` prints a single path meant for $(...) capture.
+        Command::Inbox(_) => true,
         Command::Chat(cmd) => cmd.json,
         Command::Doctor(cmd) => cmd.json,
         _ => false,
@@ -360,6 +366,7 @@ impl Executable for Command {
             Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::Inbox(cmd) => cmd.execute(),
             Self::Mcp(cmd) => cmd.execute(),
             Self::Profile(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),
