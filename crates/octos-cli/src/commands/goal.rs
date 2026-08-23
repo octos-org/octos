@@ -145,7 +145,15 @@ impl Executable for GoalCommand {
     fn execute(self) -> Result<()> {
         match self.action {
             GoalAction::Status(args) => {
-                let data_dir = super::resolve_data_dir(args.data_dir.clone())?;
+                // 整改: resolve via the shared helper — the per-instance
+                // profile data root serve actually uses (state home alone
+                // misses instances/<cwd-hash>/profiles/<profile>/data).
+                let data_dir = super::obs::resolve_profile_data_root(
+                    &super::resolve_data_dir(None)?,
+                    &std::env::current_dir()?,
+                    super::obs::DEFAULT_PROFILE_ID,
+                );
+                let data_dir = args.data_dir.clone().unwrap_or(data_dir);
                 let Some(goal_id) = args.goal.clone() else {
                     emit_error(
                         args.json,
@@ -165,7 +173,10 @@ impl Executable for GoalCommand {
                     Ok(None) => emit_error(
                         args.json,
                         Some(&goal_id),
-                        &format!("unknown goal id `{goal_id}` (no ledger row)"),
+                        &format!(
+                            "unknown goal id `{goal_id}` (no ledger row at {})",
+                            goal_ledger_db_path(&data_dir, &goal_id).display()
+                        ),
                     ),
                     Err(error) => emit_error(
                         args.json,

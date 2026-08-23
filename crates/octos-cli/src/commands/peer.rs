@@ -120,7 +120,32 @@ impl Executable for PeerCommand {
     fn execute(self) -> Result<()> {
         match self.action {
             PeerAction::List(args) => {
-                let data_dir = super::resolve_data_dir(args.data_dir)?;
+                // 整改: shared per-instance profile data root (see goal.rs).
+                let data_dir = super::obs::resolve_profile_data_root(
+                    &super::resolve_data_dir(None)?,
+                    &std::env::current_dir()?,
+                    super::obs::DEFAULT_PROFILE_ID,
+                );
+                let data_dir = args.data_dir.unwrap_or(data_dir);
+                // 整改要求 2: a missing peers dir is an ERROR with the
+                // resolved path (never a silent empty list).
+                let peers_root = data_dir.join("peers");
+                if !peers_root.is_dir() {
+                    let message = format!(
+                        "no peers directory at {} (resolved data root: {})",
+                        peers_root.display(),
+                        data_dir.display()
+                    );
+                    if args.json {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"error": message, "path": peers_root})
+                        );
+                    } else {
+                        eprintln!("error: {message}");
+                    }
+                    std::process::exit(1);
+                }
                 let rows = list_peers(&data_dir);
                 if args.json {
                     println!("{}", serde_json::to_string(&rows).expect("peers json"));

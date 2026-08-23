@@ -84,12 +84,12 @@ pub(crate) fn load_ledger_tail(
 ) -> Result<LedgerTailView> {
     let db_path = goal_ledger_db_path(data_dir, goal_id);
     if !db_path.exists() {
-        return Ok(LedgerTailView {
-            goal_id: goal_id.to_owned(),
-            findings: Vec::new(),
-            escalations: Vec::new(),
-            decisions: Vec::new(),
-        });
+        // 整改要求 2: never silently empty — report the resolved path.
+        return Err(eyre::eyre!(
+            "no goal ledger at {} (resolved data root: {})",
+            db_path.display(),
+            data_dir.display()
+        ));
     }
     let ledger = octos_fleet::GoalLedger::open(&db_path)?;
     let findings = tail_vec(ledger.list_findings_since(goal_id, 0)?, limit);
@@ -126,7 +126,13 @@ impl Executable for LedgerCommand {
     fn execute(self) -> Result<()> {
         match self.action {
             LedgerAction::Tail(args) => {
-                let data_dir = super::resolve_data_dir(args.data_dir.clone())?;
+                // 整改: shared per-instance profile data root (see goal.rs).
+                let data_dir = super::obs::resolve_profile_data_root(
+                    &super::resolve_data_dir(None)?,
+                    &std::env::current_dir()?,
+                    super::obs::DEFAULT_PROFILE_ID,
+                );
+                let data_dir = args.data_dir.clone().unwrap_or(data_dir);
                 let view = load_ledger_tail(&data_dir, &args.goal_id, args.limit)?;
                 if args.json {
                     println!("{}", serde_json::to_string(&view).expect("tail json"));
@@ -203,13 +209,23 @@ mod tests {
         assert_eq!(json["decisions"], serde_json::json!([]));
     }
 
-    /// Absent ledger FILE (goal never seen) is also an empty tail, not an
-    /// error — the contract's 空数组 shape covers both.
+    /// 整改: absent ledger FILE errors WITH the resolved path (silent
+    /// empty was the 片 2/3/4 defect); only an EXISTING-but-empty ledger
+    /// yields empty arrays (contract scenario "ledger tail 对空账本输出
+    /// 空数组", covered above).
     #[test]
-    fn olp_obs_ledger_tail_absent_file_is_empty() {
+    fn olp_obs_ledger_tail_absent_file_errors_with_path() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let view = load_ledger_tail(temp.path(), "goal_never", 20).expect("tail");
-        assert!(view.findings.is_empty());
+        let err = load_ledger_tail(temp.path(), "goal_never", 20).expect_err("must error");
+        let message = format!("{err}");
+        assert!(
+            message.contains("goal_never"),
+            "error names the goal: {message}"
+        );
+        assert!(
+            message.contains(&temp.path().display().to_string()),
+            "error carries the resolved path: {message}"
+        );
     }
 
     /// Findings recorded in the ledger show up in the tail.
