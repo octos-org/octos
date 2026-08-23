@@ -16,6 +16,7 @@ pub mod gateway;
 mod goal;
 mod inbox;
 mod init;
+mod ledger;
 pub mod mcp;
 pub mod mcp_serve;
 mod memory;
@@ -55,6 +56,7 @@ pub use gateway::GatewayCommand;
 pub use goal::GoalCommand;
 pub use inbox::InboxCommand;
 pub use init::InitCommand;
+pub use ledger::LedgerCommand;
 pub use mcp::McpCommand;
 pub use mcp_serve::McpServeCommand;
 pub use memory::MemoryCommand;
@@ -146,6 +148,8 @@ pub enum Command {
     Gateway(GatewayCommand),
     /// Read-only goal status (direct ledger read; OLP observability).
     Goal(GoalCommand),
+    /// Read-only goal-ledger tail (findings/escalations/decisions; OLP).
+    Ledger(LedgerCommand),
     /// Clean up stale state and cache files.
     Clean(CleanCommand),
     /// Generate shell completions.
@@ -385,6 +389,7 @@ impl Executable for Command {
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Goal(cmd) => cmd.execute(),
+            Self::Ledger(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
             Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
