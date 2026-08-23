@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mcp_serve;
 mod memory;
 mod office;
+mod peer;
 mod profile;
 #[cfg(feature = "api")]
 mod serve;
@@ -58,6 +59,7 @@ pub use mcp::McpCommand;
 pub use mcp_serve::McpServeCommand;
 pub use memory::MemoryCommand;
 pub use office::OfficeCommand;
+pub use peer::PeerCommand;
 pub use profile::ProfileCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
@@ -150,6 +152,8 @@ pub enum Command {
     Completions(CompletionsCommand),
     /// Office file manipulation (extract, unpack, pack, clean, add-slide, validate).
     Office(OfficeCommand),
+    /// Read-only peer listing (direct peers/ dir read; OLP observability).
+    Peer(PeerCommand),
 }
 
 /// Whether `command` emits machine-readable output on stdout and therefore
@@ -385,6 +389,7 @@ impl Executable for Command {
             Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
+            Self::Peer(cmd) => cmd.execute(),
         }
     }
 }
