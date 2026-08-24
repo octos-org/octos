@@ -150,6 +150,14 @@ pub(crate) fn append_reviewer_steer(
             .map_err(|e| format!("failed to fsync reviewer note: {e}"))
     })();
     let _ = fs2::FileExt::unlock(&lock_file);
+    // Cross-process wake (外环 首航第二回合 整改): the inbox hash is
+    // one-way, so the serve-side sweep cannot recover the session id from
+    // the filename. Drop a tiny `<hash>.reviewer-session` sibling holding
+    // the RAW session id (best-effort; the notes line is the payload).
+    if result.is_ok() {
+        let session_marker = note_path.with_extension("reviewer-session");
+        let _ = std::fs::write(&session_marker, session_id);
+    }
     result
 }
 
@@ -288,9 +296,38 @@ mod tests {
         );
     }
 
-    /// OLP-CTRL slice 2: the steer wake enqueues an External("steer")
-    /// continuation for the target session through the SAME mechanism as
-    /// the goal-progress wake (contract: 唤醒 idle master).
+    /// OLP-CTRL 首航第二回合 整改 (cross-process wake equivalence): the
+    /// CLI writes ONLY files (notes + session marker); the serve-side
+    /// `steer_inbox_sweep` must turn that on-disk state into a queued
+    /// `External("steer")` continuation — the exact cross-process contract
+    /// (CLI process ≠ serve process). Idempotence: a second sweep with an
+    /// unchanged file must NOT double-enqueue.
+    #[test]
+    fn olp_ctrl_steer_cross_process_sweep_enqueues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "octos:local:tui#coding";
+        // CLI side: queue a steer (writes notes + marker, like the binary).
+        append_reviewer_steer(temp.path(), session, "读黑板第 7 条").expect("queue steer");
+        // Serve side: the sweep picks it up into a continuation.
+        let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+        let key = octos_core::SessionKey(session.to_owned());
+        let before = orchestrator.pending_steer_continuation_count_for_test(&key, "octos");
+        orchestrator.steer_inbox_sweep(temp.path(), "octos");
+        let after = orchestrator.pending_steer_continuation_count_for_test(&key, "octos");
+        assert_eq!(
+            after,
+            before + 1,
+            "sweep must enqueue exactly one steer continuation for the on-disk batch"
+        );
+        // Idempotence: sweeping again WITHOUT a new append (same file
+        // mtime → same dedupe key) must not enqueue a duplicate.
+        orchestrator.steer_inbox_sweep(temp.path(), "octos");
+        let after_second = orchestrator.pending_steer_continuation_count_for_test(&key, "octos");
+        assert_eq!(
+            after_second, after,
+            "an unchanged sidecar must not double-enqueue"
+        );
+    }
     #[test]
     fn olp_ctrl_steer_wakes_and_receipts_enqueue() {
         let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();

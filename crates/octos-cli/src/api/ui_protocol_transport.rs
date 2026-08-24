@@ -21462,6 +21462,19 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     .reconcile(desired, sink);
             }
 
+            // OLP-CTRL 首航第二回合 整改 (cross-process steer wake): sweep
+            // the instance inbox for unconsumed `.reviewer-notes` sidecars
+            // and enqueue a steer continuation for each addressed session —
+            // the `octos steer` CLI only writes FILES (its own in-process
+            // continuation enqueue never reaches this serve), so this sweep
+            // is what makes a cross-process steer actually schedule. The
+            // inbox lives under the sessions data dir (same root as the
+            // event ledger); MAIN_PROFILE_ID matches the CLI's profile.
+            if let Some(sessions) = &state.sessions {
+                let sweep_data_dir = sessions.lock().await.data_dir();
+                default_agent_orchestrator().steer_inbox_sweep(&sweep_data_dir, MAIN_PROFILE_ID);
+            }
+
             // #1967 — resolve expired open escalations across every profile's
             // goal ledgers. Ledger-truth + master-visibility only: a live
             // parked peer is NOT un-parked (see `sweep_escalation_timeouts`

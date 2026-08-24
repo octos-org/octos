@@ -641,6 +641,9 @@ pub(crate) fn read_and_clear_reviewer_notes(
     }
     let body = String::from_utf8_lossy(&buf).into_owned();
     let _ = std::fs::remove_file(&archive_path);
+    // Consumed: remove the cross-process wake marker too, so the drain
+    // sweep stops re-arming this batch (外环 首航第二回合 整改).
+    let _ = std::fs::remove_file(note_path.with_extension("reviewer-session"));
     if body.trim().is_empty() {
         return None;
     }

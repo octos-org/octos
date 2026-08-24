@@ -4195,6 +4195,64 @@ impl InProcessAgentOrchestrator {
         state.continuations.enqueue(request)
     }
 
+    /// OLP-CTRL 首航第二回合 整改 (cross-process steer wake): the drain
+    /// loop calls this every tick with the instance data dir. For every
+    /// unconsumed `inbox/*.reviewer-notes` sidecar whose companion
+    /// `<hash>.reviewer-session` marker names a session, enqueue an
+    /// `External("steer")` continuation so the steered session is
+    /// scheduled — the CLI only ever WRITES files (its in-process
+    /// continuation enqueue never reaches a running serve), so this sweep
+    /// is what makes the cross-process wake real. Idempotent: the dedupe
+    /// key pins the notes file's (session, mtime), so an already-queued
+    /// batch is not re-enqueued every tick, and a NEW append (mtime
+    /// bumps) re-arms exactly once. The notes file itself is consumed
+    /// (read+cleared) by the turn-start injection, which also removes the
+    /// marker — so a consumed batch stops matching here.
+    pub(crate) fn steer_inbox_sweep(&self, data_dir: &std::path::Path, profile_id: &str) {
+        let inbox = data_dir.join("inbox");
+        let Ok(entries) = std::fs::read_dir(&inbox) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".reviewer-notes") {
+                continue;
+            }
+            let notes_path = entry.path();
+            let marker_path = notes_path.with_extension("reviewer-session");
+            let Ok(session_id) = std::fs::read_to_string(&marker_path) else {
+                continue; // legacy steer without a marker: no way to address it
+            };
+            let session_id = session_id.trim();
+            if session_id.is_empty() {
+                continue;
+            }
+            let mtime_ms = std::fs::metadata(&notes_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            // Skip empty files (already drained but not yet unlinked).
+            let is_nonempty = std::fs::metadata(&notes_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            if !is_nonempty {
+                continue;
+            }
+            let request = MasterContinuationRequest::new(
+                PEER_AWAITING_INPUT_GROUP,
+                session_id.to_owned(),
+                profile_id.to_owned(),
+                MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
+                SystemTime::now(),
+            )
+            .with_dedupe_key(format!("steer-file:{session_id}:{mtime_ms}"));
+            let mut state = self.state();
+            let _ = state.continuations.enqueue(request);
+        }
+    }
+
     /// OLP-CTRL (slice 2): wake a steered session. Enqueues an
     /// `External("steer")` continuation for the target session — the SAME
     /// mechanism `enqueue_goal_progress_continuation` uses, so a steered
@@ -4233,6 +4291,27 @@ impl InProcessAgentOrchestrator {
                 && item.session_id.as_str() == session.0.as_str()
                 && item.profile_id.as_str() == profile_id
         })
+    }
+
+    /// Probe for tests: count pending `External("steer")` continuations
+    /// for `session` (any dedupe key — the direct wake AND the
+    /// file-sweep's mtime-pinned key).
+    #[cfg(test)]
+    pub(crate) fn pending_steer_continuation_count_for_test(
+        &self,
+        session: &SessionKey,
+        profile_id: &str,
+    ) -> usize {
+        self.state()
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                matches!(&item.reason, MasterContinuationReason::External(kind)
+                    if kind == STEER_EXTERNAL_KIND)
+                    && item.session_id.as_str() == session.0.as_str()
+                    && item.profile_id.as_str() == profile_id
+            })
+            .count()
     }
 
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
