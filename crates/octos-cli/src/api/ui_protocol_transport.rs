@@ -31806,6 +31806,30 @@ async fn run_standalone_turn(
             prompt.push_str("\n\n");
             prompt.push_str(&notes);
         }
+        // OLP-CTRL steer injection: read and CLEAR pending reviewer steers
+        // for THIS session, rendered as an `### External reviewer` section
+        // at USER-MESSAGE data level (trust = data, never instructions).
+        // Consumption emits a `steer_consumed` receipt per enqueue
+        // timestamp, carrying the consuming turn id (contract:
+        // 机器可读回执).
+        if let Some(steer) = crate::autonomy::monitor_runtime::read_and_clear_reviewer_notes(
+            &session_runtime.profile.data_dir,
+            &session_id.to_string(),
+        ) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&steer.rendered);
+            let session_str = session_id.to_string();
+            for ts in &steer.enqueued_at_secs {
+                crate::obs_events::append_obs_event(
+                    &session_runtime.profile.data_dir,
+                    &crate::obs_events::ObsEvent::new(
+                        "steer_consumed",
+                        &format!("steer enqueued_at={ts} consumed by turn {}", turn_id.0),
+                    )
+                    .session(Some(session_str.as_str())),
+                );
+            }
+        }
         prompt
     })
     .with_session_usage_base(session_usage_base.clone())

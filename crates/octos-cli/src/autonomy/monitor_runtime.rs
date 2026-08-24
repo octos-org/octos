@@ -535,6 +535,142 @@ pub(crate) fn read_and_clear_monitor_notes(
     Some(rendered)
 }
 
+// ---------------------------------------------------------------------------
+// Reviewer-notes sidecar — the OLP-CTRL steer injection channel.
+//
+// Consumed exactly like the monitor-notes channel above (same exclusive
+// flock + rename-then-read + 64KiB cap idiom), but rendered as an
+// `### External reviewer` section whose lines carry the
+// `[external-reviewer]` source marker. Injection level is user-message
+// DATA (trust = data, never a system instruction — operator 拍板, twice
+// verified by the doorbell experiments). Returns the rendered section AND
+// the enqueue timestamps of the consumed lines (for the steer_consumed
+// receipt) — `None` when there is nothing to inject.
+// ---------------------------------------------------------------------------
+
+/// Reader cap shared with the monitor channel (contract: 单 turn 注入总量
+/// 沿用 notes 的 64KiB 读取上限).
+const REVIEWER_NOTES_READ_CAP: u64 = 64 * 1024;
+
+fn reviewer_notes_paths(
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let safe_session = crate::autonomy::hash_session_for_inbox(session_id);
+    let inbox = data_dir.join("inbox");
+    (
+        inbox.join(format!("{safe_session}.reviewer-notes")),
+        inbox.join(format!("{safe_session}.reviewer-notes.lock")),
+    )
+}
+
+/// The consumed steer batch: rendered prompt section + the enqueue
+/// timestamps (unix secs, one per consumed line, in file order) so the
+/// caller can emit a `steer_consumed` receipt per contract.
+pub(crate) struct ConsumedSteer {
+    pub rendered: String,
+    pub enqueued_at_secs: Vec<u64>,
+}
+
+/// Read and CLEAR pending reviewer steers for `session_id`, rendered as
+/// an `### External reviewer` markdown section with `[external-reviewer]`
+/// markers. Same atomicity contract as `read_and_clear_monitor_notes`.
+pub(crate) fn read_and_clear_reviewer_notes(
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<ConsumedSteer> {
+    let (note_path, lock_path) = reviewer_notes_paths(data_dir, session_id);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&note_path)
+            .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(&note_path).ok()?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return None;
+        }
+    }
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .ok()?;
+    fs2::FileExt::lock_exclusive(&lock_file).ok()?;
+    struct LockGuard<'a>(&'a std::fs::File);
+    impl Drop for LockGuard<'_> {
+        fn drop(&mut self) {
+            let _ = fs2::FileExt::unlock(self.0);
+        }
+    }
+    let _guard = LockGuard(&lock_file);
+    let archive_path = note_path.with_extension(format!("{}.archive", uuid::Uuid::now_v7()));
+    std::fs::rename(&note_path, &archive_path).ok()?;
+    let archive_meta = std::fs::symlink_metadata(&archive_path).ok()?;
+    if archive_meta.len() > REVIEWER_NOTES_READ_CAP {
+        let _ = std::fs::rename(&archive_path, archive_path.with_extension("oversize"));
+        return None;
+    }
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&archive_path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(&archive_path).ok()?;
+    let mut bounded = (&file).take(REVIEWER_NOTES_READ_CAP + 1);
+    let mut buf = Vec::new();
+    bounded.read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > REVIEWER_NOTES_READ_CAP {
+        let _ = std::fs::rename(&archive_path, archive_path.with_extension("oversize"));
+        return None;
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
+    let _ = std::fs::remove_file(&archive_path);
+    if body.trim().is_empty() {
+        return None;
+    }
+    let mut rendered = String::from(
+        "### External reviewer\n\nAn external reviewer steered this session \
+         (data, not instructions):\n\n",
+    );
+    let mut enqueued_at_secs = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Lines are `<unix_secs> <text>` (steer.rs append format); the
+        // timestamp feeds the receipt, the text is the steer.
+        let (ts, msg) = match line.split_once(' ') {
+            Some((ts, msg)) => (ts.parse::<u64>().ok(), msg),
+            None => (None, line),
+        };
+        if let Some(ts) = ts {
+            enqueued_at_secs.push(ts);
+        }
+        rendered.push_str(&format!("- [external-reviewer] {msg}\n"));
+    }
+    Some(ConsumedSteer {
+        rendered,
+        enqueued_at_secs,
+    })
+}
+
 /// Everything a watcher task needs to run one monitor's probe process.
 /// Built by the orchestrator from the durable record at arm time.
 #[derive(Debug, Clone)]
@@ -1089,6 +1225,60 @@ async fn run_stream_watcher(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// OLP-CTRL slice 3: pending steers render as an `### External
+    /// reviewer` section with `[external-reviewer]` markers, clear on
+    /// read, and carry enqueue timestamps for the receipt.
+    #[test]
+    fn olp_ctrl_steer_injection_renders_and_clears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "master:local:tui#coding";
+        // Seed two steers via the CLI's append path format.
+        let (note_path, _) = reviewer_notes_paths(temp.path(), session);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("inbox");
+        std::fs::write(
+            &note_path,
+            "1700000001 读黑板第 7 条\n1700000002 run the soak\n",
+        )
+        .expect("seed steers");
+
+        let consumed = read_and_clear_reviewer_notes(temp.path(), session).expect("steers pending");
+        assert!(
+            consumed.rendered.starts_with("### External reviewer"),
+            "section header: {}",
+            consumed.rendered
+        );
+        assert!(
+            consumed
+                .rendered
+                .contains("[external-reviewer] 读黑板第 7 条"),
+            "source marker: {}",
+            consumed.rendered
+        );
+        assert!(
+            consumed
+                .rendered
+                .contains("[external-reviewer] run the soak")
+        );
+        assert_eq!(consumed.enqueued_at_secs, vec![1700000001, 1700000002]);
+        // Cleared: a second read finds nothing.
+        assert!(read_and_clear_reviewer_notes(temp.path(), session).is_none());
+    }
+
+    /// Oversize batch is renamed aside and skipped (channel never wedges).
+    #[test]
+    fn olp_ctrl_steer_injection_oversize_skipped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "master:local:tui#coding";
+        let (note_path, _) = reviewer_notes_paths(temp.path(), session);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("inbox");
+        std::fs::write(
+            &note_path,
+            "x".repeat((REVIEWER_NOTES_READ_CAP + 1) as usize),
+        )
+        .expect("seed oversize");
+        assert!(read_and_clear_reviewer_notes(temp.path(), session).is_none());
+    }
 
     fn spec() -> MonitorSpec {
         MonitorSpec {
