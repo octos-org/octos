@@ -296,6 +296,38 @@ mod tests {
         );
     }
 
+    /// OLP-CTRL 回合 5 (收官, 调用门): the production call gate sweeps
+    /// EVERY profile in `state.profiles` — a lookup keyed on
+    /// `MAIN_PROFILE_ID` ("_main") was a dead door because the runtime
+    /// bootstrap registers "octos". This test pins the sweep to the
+    /// PRODUCTION profile id: the CLI resolves under "octos" (same as
+    /// the bootstrap), so a sweep addressed at "octos" must find the
+    /// queued steer — no test-injected profile name.
+    #[test]
+    fn olp_ctrl_steer_sweep_uses_production_profile_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "xproc:local:tui#coding";
+        // CLI-side queue (writes notes + marker under the instance inbox).
+        append_reviewer_steer(temp.path(), session, "读黑板第 7 条").expect("queue");
+        let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+        let key = octos_core::SessionKey(session.to_owned());
+        // The PRODUCTION profile id is "octos" (NOT MAIN_PROFILE_ID
+        // "_main") — sweeping under it must enqueue.
+        assert_ne!(
+            "octos",
+            octos_core::MAIN_PROFILE_ID,
+            "regression guard: the dead door was MAIN_PROFILE_ID != runtime profile"
+        );
+        let before = orchestrator.pending_steer_continuation_count_for_test(&key, "octos");
+        orchestrator.steer_inbox_sweep(temp.path(), "octos");
+        let after = orchestrator.pending_steer_continuation_count_for_test(&key, "octos");
+        assert_eq!(
+            after,
+            before + 1,
+            "sweep under the production profile enqueues"
+        );
+    }
+
     /// OLP-CTRL 回合 4 (真子进程集成): drive the REAL `octos` CLI binary
     /// as a SUBPROCESS to queue a steer (writes notes + marker to the
     /// instance inbox), then run the serve-side `steer_inbox_sweep`
@@ -309,7 +341,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("cwd");
         // Seed a REAL session transcript so the CLI's existence check
         // passes (round-2 整改 layout).
-        let session = "octos:local:tui#coding";
+        let session = "prod:local:tui#coding";
         let root = crate::runtime::session::project_sessions_root(&cwd, "octos");
         let key = octos_core::SessionKey(session.to_owned());
         let transcript = root

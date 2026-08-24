@@ -21487,9 +21487,32 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
             // made read_dir fail silently for 5 minutes). The sweep logs
             // a throttled trace every pass (even 0 sidecars) and WARNs on
             // a read_dir failure — silence here was the blind spot.
-            if let Some(profile_runtime) = state.profiles.get(MAIN_PROFILE_ID) {
+            // 回合 5 (收官): sweep EVERY profile's data_dir — a steer may
+            // target any profile's session, and gating on
+            // `profiles.get(MAIN_PROFILE_ID)` was a dead door
+            // (MAIN_PROFILE_ID is "_main" while the runtime profile is
+            // "octos", so the sweep was never invoked). An EMPTY profiles
+            // table is itself a trace-worthy condition (throttled WARN) —
+            // the r4 no-silence rule applies to the call gate too.
+            if state.profiles.is_empty() {
+                use std::sync::atomic::{AtomicI64, Ordering};
+                static LAST_EMPTY_WARN_MS: AtomicI64 = AtomicI64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let last = LAST_EMPTY_WARN_MS.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= 60_000 {
+                    LAST_EMPTY_WARN_MS.store(now, Ordering::Relaxed);
+                    tracing::warn!(
+                        "steer inbox sweep: AppState has NO profiles registered; \
+                         steer wake cannot run for any session"
+                    );
+                }
+            }
+            for (profile_id, profile_runtime) in &state.profiles {
                 let sweep_data_dir = profile_runtime.data_dir.clone();
-                default_agent_orchestrator().steer_inbox_sweep(&sweep_data_dir, MAIN_PROFILE_ID);
+                default_agent_orchestrator().steer_inbox_sweep(&sweep_data_dir, profile_id);
             }
 
             // #1967 — resolve expired open escalations across every profile's
