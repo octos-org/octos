@@ -302,6 +302,11 @@ pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 /// scheduling mechanism as the goal-progress wake).
 pub(crate) const STEER_EXTERNAL_KIND: &str = "steer";
 
+/// OLP-CTRL — metadata key carrying the steer text on a steer
+/// continuation, so the continuation turn's user message IS the steer
+/// (回合 3 整改: standalone user message body, never a prompt appendix).
+pub(crate) const STEER_META_TEXT: &str = "steer_text";
+
 /// #1977 Monitor WAKE — kind label for the `External(_)` master continuation a
 /// [`crate::autonomy::monitor_runtime`] watcher enqueues when its filtered probe
 /// output changes (poll) or a stream batch lands. Rides the SAME hardened
@@ -4240,6 +4245,24 @@ impl InProcessAgentOrchestrator {
             if !is_nonempty {
                 continue;
             }
+            // Carry the steer text in the continuation metadata so the
+            // continuation turn's USER MESSAGE is the steer itself
+            // (回合 3 整改: 独立 user message 本体, NOT a prompt
+            // appendix). Bounded by the same 64KiB cap the channel
+            // enforces; the turn-start injection still read-and-clears
+            // the sidecar for the receipt.
+            let steer_text = std::fs::read_to_string(&notes_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        return None;
+                    }
+                    Some(line.split_once(' ').map(|x| x.1).unwrap_or(line).to_owned())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             let request = MasterContinuationRequest::new(
                 PEER_AWAITING_INPUT_GROUP,
                 session_id.to_owned(),
@@ -4247,6 +4270,7 @@ impl InProcessAgentOrchestrator {
                 MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
                 SystemTime::now(),
             )
+            .with_metadata(STEER_META_TEXT.to_owned(), steer_text)
             .with_dedupe_key(format!("steer-file:{session_id}:{mtime_ms}"));
             let mut state = self.state();
             let _ = state.continuations.enqueue(request);
@@ -14296,6 +14320,22 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .get(PEER_SEND_INPUT_META_MESSAGE)
                 .cloned()
                 .unwrap_or_default()
+        }
+        // OLP-CTRL 回合 3 整改: a steer continuation's prompt IS the steer
+        // — a STANDALONE user message body (verbatim, like the
+        // peer_send_input arm above), carrying only the
+        // `[external-reviewer]` source marker to preserve the
+        // trust=data boundary. NEVER a `### External reviewer` appendix
+        // glued onto another prompt (the doorbell experiments killed that
+        // pattern twice: read-not-act), and never merged with a loop
+        // prompt (a steer is its own turn; no priority competition).
+        MasterContinuationReason::External(kind) if kind == STEER_EXTERNAL_KIND => {
+            let text = continuation
+                .metadata
+                .get(STEER_META_TEXT)
+                .cloned()
+                .unwrap_or_default();
+            format!("[external-reviewer] {text}")
         }
         // Peer-fleet auto-synthesis — every peer this master handed off has
         // completed. Direct an autonomous gather + consolidate turn. This is a

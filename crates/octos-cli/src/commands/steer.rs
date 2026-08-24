@@ -296,6 +296,60 @@ mod tests {
         );
     }
 
+    /// OLP-CTRL 回合 3 整改 (契约红线): a steer continuation's prompt is
+    /// the STANDALONE user message body — verbatim steer text with only
+    /// the `[external-reviewer]` source marker. It must NOT be wrapped in
+    /// a `[system-internal]` envelope, must NOT contain a
+    /// `### External reviewer` appendix header, and must NOT be glued to
+    /// any loop/goal prompt.
+    #[test]
+    fn olp_ctrl_steer_prompt_is_standalone_user_message() {
+        use crate::autonomy::master_continuation_scheduler::{
+            MasterContinuationReason, MasterContinuationRequest, MasterContinuationScheduler,
+        };
+        let request = MasterContinuationRequest::new(
+            "g",
+            "octos:local:tui#coding",
+            "octos",
+            MasterContinuationReason::External(
+                crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND.to_owned(),
+            ),
+            std::time::SystemTime::now(),
+        )
+        .with_metadata(
+            crate::autonomy::agent_orchestrator::STEER_META_TEXT,
+            "在黑板追加一行: 金丝雀",
+        );
+        // Build the queued item through the real scheduler (field-private
+        // struct — never hand-construct it).
+        let mut scheduler = MasterContinuationScheduler::new();
+        scheduler.enqueue(request);
+        let queued = scheduler
+            .pop_ready(crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle())
+            .expect("one queued continuation");
+        let prompt = crate::autonomy::agent_orchestrator::master_continuation_prompt(&queued);
+        assert!(
+            prompt.starts_with("[external-reviewer]"),
+            "steer prompt carries the source marker: {prompt}"
+        );
+        assert!(
+            prompt.contains("在黑板追加一行: 金丝雀"),
+            "steer text is the message body: {prompt}"
+        );
+        assert!(
+            !prompt.contains("[system-internal]"),
+            "steer is NOT a system-internal envelope: {prompt}"
+        );
+        assert!(
+            !prompt.contains("### External reviewer"),
+            "no appendix header (that pattern is dead): {prompt}"
+        );
+        assert!(
+            !prompt.contains("/loop") && !prompt.contains("Advance the goal"),
+            "steer is never merged with a loop/goal prompt: {prompt}"
+        );
+    }
+
     /// OLP-CTRL 首航第二回合 整改 (cross-process wake equivalence): the
     /// CLI writes ONLY files (notes + session marker); the serve-side
     /// `steer_inbox_sweep` must turn that on-disk state into a queued

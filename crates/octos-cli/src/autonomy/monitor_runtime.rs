@@ -568,6 +568,10 @@ fn reviewer_notes_paths(
 /// timestamps (unix secs, one per consumed line, in file order) so the
 /// caller can emit a `steer_consumed` receipt per contract.
 pub(crate) struct ConsumedSteer {
+    /// The rendered prompt section. 回合 3 后生产路径只消费回执
+    /// (enqueued_at_secs) — the section is no longer appended to any
+    /// prompt — but the injection tests still assert its shape.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub rendered: String,
     pub enqueued_at_secs: Vec<u64>,
 }

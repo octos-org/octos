@@ -20936,11 +20936,15 @@ async fn maybe_spawn_appui_master_continuation_runner(
     };
     // #436 — a `peer_send_input` continuation's prompt is a real user turn:
     // persist it as a `UserMessage` (transcript + durable history) rather than
-    // skipping it like a system-internal continuation.
+    // skipping it like a system-internal continuation. OLP-CTRL 回合 3: a
+    // STEER continuation is likewise a real user turn (its prompt IS the
+    // steer, a standalone role=user message body) — persist it the same way
+    // so the steer lands as a UserMessage, never a prompt appendix.
     let persist_peer_input_prompt = matches!(
         &continuation.reason,
         MasterContinuationReason::External(kind)
             if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
+                || kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
     );
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
@@ -31819,18 +31823,17 @@ async fn run_standalone_turn(
             prompt.push_str("\n\n");
             prompt.push_str(&notes);
         }
-        // OLP-CTRL steer injection: read and CLEAR pending reviewer steers
-        // for THIS session, rendered as an `### External reviewer` section
-        // at USER-MESSAGE data level (trust = data, never instructions).
-        // Consumption emits a `steer_consumed` receipt per enqueue
-        // timestamp, carrying the consuming turn id (contract:
-        // 机器可读回执).
+        // OLP-CTRL 回合 3 整改: steer is NO LONGER injected as a prompt
+        // appendix here (that read-not-act pattern is dead). The steer
+        // rides its OWN continuation turn whose user message IS the steer
+        // (see master_continuation_prompt's steer arm). This block only
+        // consumes the sidecar for the RECEIPT: read-and-clear the batch
+        // and emit `steer_consumed` (enqueue ts + consuming turn id) —
+        // the steer text itself never enters this prompt.
         if let Some(steer) = crate::autonomy::monitor_runtime::read_and_clear_reviewer_notes(
             &session_runtime.profile.data_dir,
             &session_id.to_string(),
         ) {
-            prompt.push_str("\n\n");
-            prompt.push_str(&steer.rendered);
             let session_str = session_id.to_string();
             for ts in &steer.enqueued_at_secs {
                 crate::obs_events::append_obs_event(
