@@ -6219,6 +6219,20 @@ impl InProcessAgentOrchestrator {
                 .goal_id(Some(goal_id))
                 .slug(Some(peer_slug)),
         );
+        // OLP-CTRL (slice 4): operator notification for the escalation.
+        // When the profile has a notification channel configured, emit an
+        // `escalation_notify` event row carrying the channel target so the
+        // gateway's outbound path (the same sender cron Notify mode uses)
+        // delivers a verbatim notice containing the slug and goal_id.
+        // UNCONFIGURED → silent skip (no failure, no warn spam), per
+        // contract.
+        crate::autonomy::escalation_notify::maybe_notify_escalation(
+            profile_data_dir,
+            profile_id,
+            goal_id,
+            peer_slug,
+            &escalation.question,
+        );
         Ok(escalation_id)
     }
 
