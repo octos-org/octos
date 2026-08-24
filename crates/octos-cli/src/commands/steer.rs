@@ -46,15 +46,58 @@ pub(crate) fn reviewer_notes_paths(data_dir: &Path, session_id: &str) -> (PathBu
 }
 
 /// Whether a session has ANY persistent state we can steer into. The
-/// contract's "session 不存在" check: without an existing inbox dir
-/// entry (notes/lock of ANY channel) or a session record, a steer would
-/// queue into the void — refuse instead (never create a queue file for
-/// an unknown session). v1 heuristic: the inbox dir must already exist
-/// with at least one file naming this session's hash, OR the sessions
-/// dir must name it. Kept conservative and side-effect-free (read-only).
-pub(crate) fn session_has_persistent_state(data_dir: &Path, session_id: &str) -> bool {
+/// contract's "session 不存在" check uses the RUNTIME's real session
+/// store (外环整改: NOT the instance `data/sessions/` dir, which is
+/// empty in real deployments): the per-project store at
+/// `<cwd>/.octos/<profile>/sessions/…` that the running session actually
+/// writes (jsonl transcripts). Resolved through the SAME path helpers
+/// the runtime uses (`runtime::session::project_sessions_root` +
+/// `octos_bus::session::encode_path_component`) — never a hand-built
+/// encoding. Also accepts inbox state (a session that has notes/locks
+/// from goal or monitor activity is equally real).
+pub(crate) fn session_has_persistent_state(
+    instance_data_dir: &Path,
+    cwd: &Path,
+    profile_id: &str,
+    session_id: &str,
+) -> bool {
+    // Primary source: the runtime session store (jsonl transcripts).
+    let sessions_root = crate::runtime::session::project_sessions_root(cwd, profile_id);
+    let key = octos_core::SessionKey(session_id.to_owned());
+    let base_key = key.base_key();
+    let encoded_base = octos_bus::session::encode_path_component(base_key);
+    let topic = key.topic().unwrap_or("default");
+    let encoded_topic = octos_bus::session::encode_path_component(topic);
+    // Flat layout: <root>/sessions/<key>.jsonl
+    let flat = sessions_root.join("sessions").join(format!(
+        "{}.jsonl",
+        octos_bus::session::encode_path_component(session_id)
+    ));
+    if flat.exists() {
+        return true;
+    }
+    // Per-user layout: <root>/users/<base>/sessions/<topic>.jsonl AND the
+    // observed real layout <root>/sessions/<base>/sessions/<topic>.jsonl
+    // (project store nests per-user under sessions/).
+    let per_user_a = sessions_root
+        .join("users")
+        .join(&encoded_base)
+        .join("sessions")
+        .join(format!("{encoded_topic}.jsonl"));
+    if per_user_a.exists() {
+        return true;
+    }
+    let per_user_b = sessions_root
+        .join("sessions")
+        .join(&encoded_base)
+        .join("sessions")
+        .join(format!("{encoded_topic}.jsonl"));
+    if per_user_b.exists() {
+        return true;
+    }
+    // Fallback: inbox state (goal/monitor notes for this session).
     let safe_session = crate::autonomy::hash_session_for_inbox(session_id);
-    let inbox = data_dir.join("inbox");
+    let inbox = instance_data_dir.join("inbox");
     if let Ok(entries) = std::fs::read_dir(&inbox) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -63,11 +106,6 @@ pub(crate) fn session_has_persistent_state(data_dir: &Path, session_id: &str) ->
             }
         }
     }
-    // Session store fallback: ui-protocol ledger dirs are hashed with a
-    // DIFFERENT (percent-encoding) scheme, so we can only check the
-    // monitor/goal inbox naming here. A session with no inbox state at
-    // all is treated as unknown — the master we steer always has SOME
-    // inbox file (its own .notes/.lock from boot/goal activity).
     false
 }
 
@@ -135,12 +173,21 @@ impl Executable for SteerCommand {
             super::obs::DEFAULT_PROFILE_ID,
         );
         // Contract scenario "steer 目标 session 不存在时报错": refuse and
-        // create NOTHING.
-        if !session_has_persistent_state(&data_dir, &self.session) {
+        // create NOTHING. Failure semantics keep the resolved path visible
+        // (整改: now the runtime session store root, not the empty
+        // instance data/sessions/).
+        let sessions_root =
+            crate::runtime::session::project_sessions_root(&cwd, super::obs::DEFAULT_PROFILE_ID);
+        if !session_has_persistent_state(
+            &data_dir,
+            &cwd,
+            super::obs::DEFAULT_PROFILE_ID,
+            &self.session,
+        ) {
             eprintln!(
-                "error: unknown session `{}` (no persistent state under {})",
+                "error: unknown session `{}` (no session transcript under {})",
                 self.session,
-                data_dir.display()
+                sessions_root.display()
             );
             std::process::exit(1);
         }
@@ -186,19 +233,59 @@ mod tests {
         assert_eq!(STEER_MAX_BYTES, 64 * 1024);
     }
 
-    /// Contract scenario "steer 目标 session 不存在时报错": an unknown
-    /// session has no persistent state and must NOT get a queue file.
+    /// Contract scenario "steer 目标 session 不存在时报错" (整改 e2e,
+    /// REAL layout): an unknown session has no transcript in the runtime
+    /// session store and must NOT get a queue file.
     #[test]
     fn olp_ctrl_steer_unknown_session_errors() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let instance = temp.path().join("instance-data");
+        std::fs::create_dir_all(&instance).expect("instance");
         assert!(!session_has_persistent_state(
-            temp.path(),
+            &instance,
+            &cwd,
+            "octos",
             "unknown-session"
         ));
-        // append would create the file — but execute() refuses before
-        // reaching it; assert the precondition that drives the refusal.
-        let (note_path, _) = reviewer_notes_paths(temp.path(), "unknown-session");
+        let (note_path, _) = reviewer_notes_paths(&instance, "unknown-session");
         assert!(!note_path.exists());
+    }
+
+    /// 整改金丝雀 (e2e, REAL layout): a session with a transcript in the
+    /// project-local store (.octos/<profile>/sessions/<base>/sessions/
+    /// <topic>.jsonl — what the runtime actually writes) passes the check;
+    /// a non-existent one fails it.
+    #[test]
+    fn olp_ctrl_steer_canary_real_session_store_layout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let instance = temp.path().join("instance-data");
+        std::fs::create_dir_all(&instance).expect("instance");
+        let session = "octos:local:tui#coding";
+        // Reproduce the runtime's real write path through the SAME helpers.
+        let root = crate::runtime::session::project_sessions_root(&cwd, "octos");
+        let key = octos_core::SessionKey(session.to_owned());
+        let transcript = root
+            .join("sessions")
+            .join(octos_bus::session::encode_path_component(key.base_key()))
+            .join("sessions")
+            .join(format!(
+                "{}.jsonl",
+                octos_bus::session::encode_path_component(key.topic().unwrap_or("default"))
+            ));
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&transcript, "{}\n").expect("seed transcript");
+        assert!(
+            session_has_persistent_state(&instance, &cwd, "octos", session),
+            "live session with a real transcript must pass"
+        );
+        assert!(
+            !session_has_persistent_state(&instance, &cwd, "octos", "ghost-session"),
+            "non-existent session must fail"
+        );
     }
 
     /// OLP-CTRL slice 2: the steer wake enqueues an External("steer")
@@ -230,7 +317,14 @@ mod tests {
         let inbox = temp.path().join("inbox");
         std::fs::create_dir_all(&inbox).expect("inbox");
         std::fs::write(inbox.join(format!("{safe}.notes")), "x").expect("seed");
-        assert!(session_has_persistent_state(temp.path(), session));
+        let cwd = temp.path().join("proj");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        assert!(session_has_persistent_state(
+            temp.path(),
+            &cwd,
+            "octos",
+            session
+        ));
         append_reviewer_steer(temp.path(), session, "读黑板第 7 条").expect("append");
         let (note_path, _) = reviewer_notes_paths(temp.path(), session);
         let content = std::fs::read_to_string(note_path).expect("read");
