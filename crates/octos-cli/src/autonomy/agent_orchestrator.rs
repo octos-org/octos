@@ -4215,14 +4215,27 @@ impl InProcessAgentOrchestrator {
     /// marker — so a consumed batch stops matching here.
     pub(crate) fn steer_inbox_sweep(&self, data_dir: &std::path::Path, profile_id: &str) {
         let inbox = data_dir.join("inbox");
-        let Ok(entries) = std::fs::read_dir(&inbox) else {
-            return;
+        let entries = match std::fs::read_dir(&inbox) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // 回合 4 整改: a failed inbox read MUST be loud — a
+                // silent return here was the r4 5-minute blind spot.
+                tracing::warn!(
+                    ?error,
+                    inbox = %inbox.display(),
+                    "steer inbox sweep: failed to read inbox dir"
+                );
+                return;
+            }
         };
+        let mut sidecars = 0usize;
+        let mut enqueued = 0usize;
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.ends_with(".reviewer-notes") {
                 continue;
             }
+            sidecars += 1;
             let notes_path = entry.path();
             let marker_path = notes_path.with_extension("reviewer-session");
             let Ok(session_id) = std::fs::read_to_string(&marker_path) else {
@@ -4273,7 +4286,37 @@ impl InProcessAgentOrchestrator {
             .with_metadata(STEER_META_TEXT.to_owned(), steer_text)
             .with_dedupe_key(format!("steer-file:{session_id}:{mtime_ms}"));
             let mut state = self.state();
-            let _ = state.continuations.enqueue(request);
+            if matches!(
+                state.continuations.enqueue(request),
+                MasterContinuationEnqueueOutcome::Queued(_)
+            ) {
+                enqueued += 1;
+            }
+        }
+        // 回合 4 整改: sweep MUST leave a trace — a throttled (once per
+        // minute) line even for 0 sidecars, so a silent drift between the
+        // CLI's inbox root and this sweep's root can never again hide for
+        // minutes. Cheap: a process-global last-log timestamp.
+        {
+            use std::sync::atomic::{AtomicI64, Ordering};
+            static LAST_LOG_MS: AtomicI64 = AtomicI64::new(0);
+            let now = now_ms();
+            let last = LAST_LOG_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60_000 {
+                LAST_LOG_MS.store(now, Ordering::Relaxed);
+                tracing::info!(
+                    inbox = %inbox.display(),
+                    sidecars,
+                    enqueued,
+                    "steer inbox sweep tick"
+                );
+            } else if enqueued > 0 {
+                tracing::info!(
+                    sidecars,
+                    enqueued,
+                    "steer inbox sweep enqueued continuation(s)"
+                );
+            }
         }
     }
 
