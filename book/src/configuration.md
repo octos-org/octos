@@ -115,6 +115,13 @@ The complete configuration structure with all available fields:
       "provider": "deepseek",
       "model": "deepseek-chat",
       "description": "Fast model for simple tasks"
+    },
+    // Z.AI GLM lane — api_key_env omitted, defaults to ZAI_API_KEY
+    {
+      "key": "zai",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "description": "Z.AI GLM 5.2 lane (1M context)"
     }
   ],
 
