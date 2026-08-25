@@ -678,6 +678,59 @@ pub(crate) fn read_and_clear_reviewer_notes(
     })
 }
 
+/// #8c ② — consume ONE steer line (by its exact `<ts> <text>` content)
+/// from the sidecar, leaving every other line queued. Exactly-once
+/// delivery requires per-line consumption: clearing the whole file would
+/// drop steers the sweep enqueued but no turn has run yet. Rewrites the
+/// file without the consumed line under the exclusive lock; deletes the
+/// file + marker when it becomes empty. Returns the consumed line's
+/// enqueue timestamp for the receipt, or None when the line is absent.
+pub(crate) fn consume_reviewer_line(
+    data_dir: &std::path::Path,
+    session_id: &str,
+    ts: &str,
+    text: &str,
+) -> Option<u64> {
+    let (note_path, lock_path) = reviewer_notes_paths(data_dir, session_id);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .ok()?;
+    fs2::FileExt::lock_exclusive(&lock_file).ok()?;
+    struct LockGuard<'a>(&'a std::fs::File);
+    impl Drop for LockGuard<'_> {
+        fn drop(&mut self) {
+            let _ = fs2::FileExt::unlock(self.0);
+        }
+    }
+    let _guard = LockGuard(&lock_file);
+    let body = std::fs::read_to_string(&note_path).ok()?;
+    let target = format!("{ts} {text}");
+    let mut consumed_ts = None;
+    let mut kept = Vec::new();
+    for line in body.lines() {
+        if consumed_ts.is_none() && line.trim_end() == target.trim_end() {
+            consumed_ts = ts.parse::<u64>().ok();
+            continue; // drop exactly one occurrence
+        }
+        kept.push(line);
+    }
+    consumed_ts?;
+    if kept.is_empty() {
+        let _ = std::fs::remove_file(&note_path);
+        let _ = std::fs::remove_file(note_path.with_extension("reviewer-session"));
+    } else {
+        let mut out = kept.join("\n");
+        out.push('\n');
+        let tmp = note_path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
+        std::fs::write(&tmp, out).ok()?;
+        std::fs::rename(&tmp, &note_path).ok()?;
+    }
+    consumed_ts
+}
+
 /// Everything a watcher task needs to run one monitor's probe process.
 /// Built by the orchestrator from the durable record at arm time.
 #[derive(Debug, Clone)]
@@ -1285,6 +1338,51 @@ mod tests {
         )
         .expect("seed oversize");
         assert!(read_and_clear_reviewer_notes(temp.path(), session).is_none());
+    }
+
+    /// #8c ② — per-line consumption is exactly-once: only the named line
+    /// is removed, siblings stay queued, the receipt ts is returned, and
+    /// the file + marker vanish when the last line is consumed.
+    #[test]
+    fn olp_ctrl_consume_reviewer_line_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "master:local:tui#coding";
+        let (note_path, _) = reviewer_notes_paths(temp.path(), session);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("inbox");
+        std::fs::write(
+            &note_path,
+            "1700000001 first\n1700000002 second\n1700000003 third\n",
+        )
+        .expect("seed");
+        std::fs::write(note_path.with_extension("reviewer-session"), session).expect("marker");
+
+        // Consume the middle line: it returns its ts; the others stay.
+        let ts = consume_reviewer_line(temp.path(), session, "1700000002", "second");
+        assert_eq!(ts, Some(1700000002));
+        let body = std::fs::read_to_string(&note_path).expect("notes remain");
+        assert!(body.contains("first") && body.contains("third"));
+        assert!(!body.contains("second"));
+
+        // Consuming the same line again is a no-op (already gone).
+        assert_eq!(
+            consume_reviewer_line(temp.path(), session, "1700000002", "second"),
+            None
+        );
+
+        // Consume the rest: file + marker are removed when empty.
+        assert_eq!(
+            consume_reviewer_line(temp.path(), session, "1700000001", "first"),
+            Some(1700000001)
+        );
+        assert_eq!(
+            consume_reviewer_line(temp.path(), session, "1700000003", "third"),
+            Some(1700000003)
+        );
+        assert!(!note_path.exists(), "empty sidecar removed");
+        assert!(
+            !note_path.with_extension("reviewer-session").exists(),
+            "marker removed with the last line"
+        );
     }
 
     fn spec() -> MonitorSpec {

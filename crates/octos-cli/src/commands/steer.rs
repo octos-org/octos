@@ -126,16 +126,18 @@ pub(crate) fn append_reviewer_steer(
         .unwrap_or(0);
     // One steer = one line; control chars stay data.
     let line = format!("{timestamp} {}\n", text.replace('\n', " "));
-    // fs2::FileExt provides the MSRV-1.85-compatible lock_shared/unlock
-    // (std's inherent methods are 1.89+ and would break upstream CI);
-    // fully-qualified calls below keep the trait genuinely used.
+    // fs2::FileExt provides the MSRV-1.85-compatible lock/unlock (std's
+    // inherent methods are 1.89+). #8c ③: an EXCLUSIVE lock — a shared
+    // lock lets two concurrent `octos steer` processes interleave appends
+    // (torn lines), which the per-line content-hash dedupe cannot
+    // reconstruct; the exclusive lock serializes writers.
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&lock_path)
         .map_err(|e| format!("failed to open reviewer lock {}: {e}", lock_path.display()))?;
-    fs2::FileExt::lock_shared(&lock_file)
+    fs2::FileExt::lock_exclusive(&lock_file)
         .map_err(|e| format!("failed to lock reviewer notes {}: {e}", lock_path.display()))?;
     let result = (|| {
         use std::io::Write as _;
@@ -150,13 +152,19 @@ pub(crate) fn append_reviewer_steer(
             .map_err(|e| format!("failed to fsync reviewer note: {e}"))
     })();
     let _ = fs2::FileExt::unlock(&lock_file);
-    // Cross-process wake (外环 首航第二回合 整改): the inbox hash is
-    // one-way, so the serve-side sweep cannot recover the session id from
-    // the filename. Drop a tiny `<hash>.reviewer-session` sibling holding
-    // the RAW session id (best-effort; the notes line is the payload).
+    // #8c ④: the session marker is NOT best-effort — the cross-process
+    // wake is unaddressable without it, so a write failure must FAIL the
+    // CLI (non-zero exit) instead of reporting `queued` for a steer no
+    // sweep can ever route.
     if result.is_ok() {
         let session_marker = note_path.with_extension("reviewer-session");
-        let _ = std::fs::write(&session_marker, session_id);
+        if let Err(error) = std::fs::write(&session_marker, session_id) {
+            return Err(format!(
+                "steer notes written but the session marker {} failed: {error} — \
+                 the steer is NOT addressable; refusing to report queued",
+                session_marker.display()
+            ));
+        }
     }
     result
 }
@@ -296,7 +304,45 @@ mod tests {
         );
     }
 
-    /// OLP-CTRL 回合 5 (收官, 调用门): the production call gate sweeps
+    /// OLP-CTRL #8c ① — FAILING-STATE reproductions for the consecutive-
+    /// delivery hole. (a) Two steers appended in the SAME millisecond:
+    /// the mtime-dedupe key is identical, so the second is swallowed.
+    /// (b) Two steers appended in DIFFERENT milliseconds: the second
+    /// continuation carries the FULL file (old+new), so the old steer
+    /// would re-execute. Both are fixed in ② by per-line content-hash
+    /// dedupe + per-line consumption (exactly-once).
+    #[test]
+    fn olp_ctrl_steer_consecutive_delivery_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "seq:local:tui#coding";
+        let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+        let key = octos_core::SessionKey(session.to_owned());
+
+        // Append TWO steers back-to-back (same file, likely same mtime
+        // granularity).
+        append_reviewer_steer(temp.path(), session, "first-canary").expect("s1");
+        append_reviewer_steer(temp.path(), session, "second-canary").expect("s2");
+        orchestrator.steer_inbox_sweep(temp.path(), "octos");
+        let after_first_sweep =
+            orchestrator.pending_steer_continuation_count_for_test(&key, "octos");
+        // exactly-once: BOTH steers must be queued as their own
+        // continuations (per-line), never one swallowed, never one
+        // carrying stale text.
+        assert_eq!(
+            after_first_sweep, 2,
+            "each steer must enqueue exactly once (two lines → two continuations)"
+        );
+        // Re-sweep after the batch is consumed (sidecar cleared): nothing
+        // re-enqueues.
+        let _ =
+            crate::autonomy::monitor_runtime::read_and_clear_reviewer_notes(temp.path(), session);
+        orchestrator.steer_inbox_sweep(temp.path(), "octos");
+        assert_eq!(
+            orchestrator.pending_steer_continuation_count_for_test(&key, "octos"),
+            2,
+            "consumed batch must not re-enqueue"
+        );
+    }
     /// EVERY profile in `state.profiles` — a lookup keyed on
     /// `MAIN_PROFILE_ID` ("_main") was a dead door because the runtime
     /// bootstrap registers "octos". This test pins the sweep to the

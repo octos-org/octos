@@ -307,6 +307,14 @@ pub(crate) const STEER_EXTERNAL_KIND: &str = "steer";
 /// (回合 3 整改: standalone user message body, never a prompt appendix).
 pub(crate) const STEER_META_TEXT: &str = "steer_text";
 
+/// OLP-CTRL #8c — the steer line's enqueue timestamp (unix secs string),
+/// carried so the steer_consumed receipt names WHEN it was queued.
+pub(crate) const STEER_META_ENQUEUED_TS: &str = "steer_enqueued_ts";
+
+/// OLP-CTRL #8c — the content hash of (session, ts, text) that gives each
+/// steer line its exactly-once identity (dedupe key + receipt join).
+pub(crate) const STEER_META_LINE_HASH: &str = "steer_line_hash";
+
 /// #1977 Monitor WAKE — kind label for the `External(_)` master continuation a
 /// [`crate::autonomy::monitor_runtime`] watcher enqueues when its filtered probe
 /// output changes (poll) or a stream batch lands. Rides the SAME hardened
@@ -4245,12 +4253,6 @@ impl InProcessAgentOrchestrator {
             if session_id.is_empty() {
                 continue;
             }
-            let mtime_ms = std::fs::metadata(&notes_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
             // Skip empty files (already drained but not yet unlinked).
             let is_nonempty = std::fs::metadata(&notes_path)
                 .map(|m| m.len() > 0)
@@ -4258,39 +4260,52 @@ impl InProcessAgentOrchestrator {
             if !is_nonempty {
                 continue;
             }
-            // Carry the steer text in the continuation metadata so the
-            // continuation turn's USER MESSAGE is the steer itself
-            // (回合 3 整改: 独立 user message 本体, NOT a prompt
-            // appendix). Bounded by the same 64KiB cap the channel
-            // enforces; the turn-start injection still read-and-clears
-            // the sidecar for the receipt.
-            let steer_text = std::fs::read_to_string(&notes_path)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        return None;
-                    }
-                    Some(line.split_once(' ').map(|x| x.1).unwrap_or(line).to_owned())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let request = MasterContinuationRequest::new(
-                PEER_AWAITING_INPUT_GROUP,
-                session_id.to_owned(),
-                profile_id.to_owned(),
-                MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
-                SystemTime::now(),
-            )
-            .with_metadata(STEER_META_TEXT.to_owned(), steer_text)
-            .with_dedupe_key(format!("steer-file:{session_id}:{mtime_ms}"));
-            let mut state = self.state();
-            if matches!(
-                state.continuations.enqueue(request),
-                MasterContinuationEnqueueOutcome::Queued(_)
-            ) {
-                enqueued += 1;
+            // #8c ② — exactly-once delivery: enqueue ONE continuation PER
+            // STEER LINE (not one per file), deduped by a content hash of
+            // (session, enqueued_ts, text). The mtime-keyed per-file
+            // dedupe both SWALLOWED a same-millisecond second append and
+            // RE-EXECUTED stale lines on a later append (the file's full
+            // text rode every continuation). Per-line enqueue with a
+            // content hash gives each steer its own exactly-once identity.
+            let body = std::fs::read_to_string(&notes_path).unwrap_or_default();
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (ts_str, text) = match line.split_once(' ') {
+                    Some((ts, text)) => (ts, text),
+                    None => ("0", line),
+                };
+                let steer_text = text.to_owned();
+                // Content hash over the full line identity (ts + text):
+                // two appends of the same text at different times are two
+                // steers; the SAME line re-swept (file unchanged) hashes
+                // identically and dedupes.
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                session_id.hash(&mut hasher);
+                ts_str.hash(&mut hasher);
+                steer_text.hash(&mut hasher);
+                let content_hash = format!("{:016x}", hasher.finish());
+                let request = MasterContinuationRequest::new(
+                    PEER_AWAITING_INPUT_GROUP,
+                    session_id.to_owned(),
+                    profile_id.to_owned(),
+                    MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
+                    SystemTime::now(),
+                )
+                .with_metadata(STEER_META_TEXT.to_owned(), steer_text)
+                .with_metadata(STEER_META_ENQUEUED_TS.to_owned(), ts_str.to_owned())
+                .with_metadata(STEER_META_LINE_HASH.to_owned(), content_hash.clone())
+                .with_dedupe_key(format!("steer-line:{session_id}:{content_hash}"));
+                let mut state = self.state();
+                if matches!(
+                    state.continuations.enqueue(request),
+                    MasterContinuationEnqueueOutcome::Queued(_)
+                ) {
+                    enqueued += 1;
+                }
             }
         }
         // 回合 4 整改: sweep MUST leave a trace — a throttled (once per

@@ -20474,6 +20474,7 @@ async fn handle_turn_start_with_accept(
                 // OLP-CTRL 回合 4 — an interactive turn is never a steer
                 // continuation turn; it must not consume reviewer-notes.
                 false,
+                None,
             )
             .await;
         }
@@ -21050,6 +21051,26 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 MasterContinuationReason::External(kind)
                     if kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
             ),
+            // #8c ② — thread the exact steer line for per-line consumption.
+            if matches!(
+                &continuation.reason,
+                MasterContinuationReason::External(kind)
+                    if kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
+            ) {
+                let ts = continuation
+                    .metadata
+                    .get(crate::autonomy::agent_orchestrator::STEER_META_ENQUEUED_TS)
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_owned());
+                let text = continuation
+                    .metadata
+                    .get(crate::autonomy::agent_orchestrator::STEER_META_TEXT)
+                    .cloned()
+                    .unwrap_or_default();
+                Some((ts, text))
+            } else {
+                None
+            },
         )
         .await;
         // #436 P1 #2 — keep an undelivered peer injection durable; every other
@@ -30069,6 +30090,11 @@ async fn run_standalone_turn(
     // other turn (interactive, loop, goal) must NOT swallow a steer
     // (round-2's coincidental consume was exactly that leak).
     is_steer_continuation_turn: bool,
+    // OLP-CTRL #8c ② — when this is a steer continuation turn, the exact
+    // steer LINE it must consume (enqueue_ts, text) from the sidecar, so
+    // consumption is per-line (exactly-once), never a whole-file clear
+    // that would drop sibling steers enqueued but not yet run.
+    steer_line_to_consume: Option<(String, String)>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -31873,21 +31899,36 @@ async fn run_standalone_turn(
         // any other turn must leave the batch alone so it can't be
         // swallowed and evaporate (round-2's coincidental consume).
         if is_steer_continuation_turn {
-            if let Some(steer) = crate::autonomy::monitor_runtime::read_and_clear_reviewer_notes(
-                &session_runtime.profile.data_dir,
-                &session_id.to_string(),
-            ) {
-                let session_str = session_id.to_string();
-                for ts in &steer.enqueued_at_secs {
-                    crate::obs_events::append_obs_event(
-                        &session_runtime.profile.data_dir,
-                        &crate::obs_events::ObsEvent::new(
-                            "steer_consumed",
-                            &format!("steer enqueued_at={ts} consumed by turn {}", turn_id.0),
-                        )
-                        .session(Some(session_str.as_str())),
-                    );
-                }
+            // #8c ② — consume ONLY this turn's steer line (per-line,
+            // exactly-once). When the caller didn't thread the exact line
+            // (legacy path), fall back to clearing the whole batch so the
+            // receipt still fires once.
+            let receipt: Vec<u64> = match &steer_line_to_consume {
+                Some((ts, text)) => crate::autonomy::monitor_runtime::consume_reviewer_line(
+                    &session_runtime.profile.data_dir,
+                    &session_id.to_string(),
+                    ts,
+                    text,
+                )
+                .into_iter()
+                .collect(),
+                None => crate::autonomy::monitor_runtime::read_and_clear_reviewer_notes(
+                    &session_runtime.profile.data_dir,
+                    &session_id.to_string(),
+                )
+                .map(|s| s.enqueued_at_secs)
+                .unwrap_or_default(),
+            };
+            let session_str = session_id.to_string();
+            for ts in &receipt {
+                crate::obs_events::append_obs_event(
+                    &session_runtime.profile.data_dir,
+                    &crate::obs_events::ObsEvent::new(
+                        "steer_consumed",
+                        &format!("steer enqueued_at={ts} consumed by turn {}", turn_id.0),
+                    )
+                    .session(Some(session_str.as_str())),
+                );
             }
         }
         prompt
