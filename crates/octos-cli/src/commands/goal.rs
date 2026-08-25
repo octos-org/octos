@@ -254,10 +254,13 @@ mod tests {
     /// would make the CLI read a different file than serve writes.
     #[test]
     fn goal_status_db_path_matches_orchestrator_layout() {
-        let data_dir = Path::new("/tmp/x");
+        // 8e: platform-absolute fixture root (same hardcoded-/tmp class as
+        // the inbox test — join-based equality holds only if both sides
+        // share the root, which a platform temp dir guarantees).
+        let data_dir = std::env::temp_dir().join("olp-goal-x");
         assert_eq!(
-            goal_ledger_db_path(data_dir, "goal_01"),
-            PathBuf::from("/tmp/x/goal-ledgers/goal_01.db")
+            goal_ledger_db_path(&data_dir, "goal_01"),
+            data_dir.join("goal-ledgers").join("goal_01.db")
         );
         // Sanitization parity: odd ids map the same way on both sides.
         assert_eq!(sanitize_goal_id_for_file("a/b c"), "a_b_c");

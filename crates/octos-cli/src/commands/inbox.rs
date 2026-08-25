@@ -77,7 +77,10 @@ mod tests {
     /// so a future hash-algorithm change breaks BOTH sides' tests at once.
     #[test]
     fn olp_obs_inbox_path_matches_serve() {
-        let data_dir = PathBuf::from("/tmp/olp-obs-test");
+        // 8e: std::env::temp_dir() is absolute on every platform (a bare
+        // "/tmp/..." is not — Windows has no drive root, so is_absolute()
+        // failed there and took check-windows red).
+        let data_dir = std::env::temp_dir().join("olp-obs-test");
         let session = "octos:local:tui#coding";
         let via_command = inbox_notes_path(&data_dir, session);
         // Reproduce serve's write path EXACTLY as in
