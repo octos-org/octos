@@ -42,7 +42,7 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, PeerStagedEvent, RpcError,
     UserQuestionRespondParams,
 };
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 use tracing::warn;
 
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
@@ -162,19 +162,19 @@ pub(crate) fn peer_wire_registry() -> &'static PeerWireRegistry {
 /// staging, dropped by `take` on the close path. Holding it anywhere shorter
 /// (the staging closure, the turn's supervisor) would put it out of scope
 /// while the peer is still working, which is the defect.
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 pub(crate) struct PeerTaskBinding {
     task_id: String,
     _liveness: octos_agent::TaskLivenessLease,
 }
 
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 #[derive(Default)]
 pub(crate) struct PeerTaskRegistry {
     pub(crate) by_key: std::sync::Mutex<HashMap<String, PeerTaskBinding>>,
 }
 
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 impl PeerTaskRegistry {
     /// Bind `key` to a supervisor task id and take a liveness lease on it. A
     /// re-stage under the same key overwrites, mirroring
@@ -221,7 +221,7 @@ impl PeerTaskRegistry {
     }
 }
 
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
     static PEER_TASK_REGISTRY: OnceLock<PeerTaskRegistry> = OnceLock::new();
     PEER_TASK_REGISTRY.get_or_init(PeerTaskRegistry::default)
@@ -237,7 +237,7 @@ pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
 /// signals that with an EMPTY-STRING sentinel, and binding it would make the
 /// close path try to retire a task that never existed. The peer then runs
 /// UNSUPERVISED (no task row, no cancel token); callers should say so loudly.
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 pub(crate) fn bind_peer_supervised_task(
     supervisor: &octos_agent::TaskSupervisor,
     registry_key: String,
@@ -260,7 +260,7 @@ pub(crate) fn bind_peer_supervised_task(
 /// Retirement is exactly-once — `take` removes the binding, so a second close
 /// finds nothing rather than re-marking a terminal task (or, worse, a task id
 /// later reused). Returns the retired task id.
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", test))]
 pub(crate) fn retire_peer_supervised_task(
     supervisor: &octos_agent::TaskSupervisor,
     profile_id: &str,
