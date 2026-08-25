@@ -1,6 +1,7 @@
 //! Agent implementation.
 
 mod activity;
+mod append_only_audit;
 mod budget;
 mod compaction;
 mod detection;
@@ -377,6 +378,13 @@ pub struct Agent {
     /// [`crate::compaction::CompactionRunner`] wrapped as a
     /// [`crate::compaction_tiered::FullCompactor`].
     pub(super) tiered_compaction: Option<Arc<crate::compaction_tiered::TieredCompactionRunner>>,
+    /// Measurement only (`OCTOS_APPEND_ONLY_AUDIT=1`). Held here rather than
+    /// on the per-turn state because the rewrite path we know about —
+    /// `truncate_old_tool_results` — only collapses tool results BEFORE the
+    /// last user message, so it fires ACROSS turns and a per-turn auditor
+    /// would never observe it.
+    pub(super) append_only_audit:
+        std::sync::Mutex<crate::agent::append_only_audit::AppendOnlyAudit>,
     /// M8.7 sub-agent output router. When configured, the spawn_only
     /// background branch in `execution.rs` calls
     /// [`crate::SubAgentOutputRouter::mark_terminal`] when a task ends so
@@ -556,6 +564,7 @@ impl Agent {
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
+            append_only_audit: Default::default(),
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,
@@ -637,6 +646,7 @@ impl Agent {
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
+            append_only_audit: Default::default(),
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,

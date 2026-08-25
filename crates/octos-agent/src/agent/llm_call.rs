@@ -35,6 +35,36 @@ impl Agent {
         // so callers must record it instead of re-pricing the merged total at
         // the winner's rate (codex #1632 P2). `None` = no attempt was priced.
     ) -> Result<(ChatResponse, bool, Option<f64>)> {
+        // Measurement only (#pi/dsh append-only study): report whether this
+        // turn's request history is still a prefix-extension of the last one.
+        // Off unless OCTOS_APPEND_ONLY_AUDIT=1, and never alters the request —
+        // a rewrite here means the sent history stopped being reconstructable
+        // from what came before, which is the drift that makes a resumed
+        // session differ from the one the model actually had.
+        if crate::agent::append_only_audit::enabled() {
+            let rewrites = {
+                let mut audit = self
+                    .append_only_audit
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                audit.observe(messages)
+            };
+            for rewrite in rewrites {
+                let description = rewrite.describe();
+                warn!(
+                    iteration,
+                    model = %self.llm.model_id(),
+                    "append-only audit: {description}"
+                );
+                // Also recorded out-of-band under test: a `tracing` line with
+                // no subscriber installed is not a measurement you can verify.
+                #[cfg(test)]
+                crate::agent::append_only_audit::record_finding(format!(
+                    "iteration {iteration}: {description}"
+                ));
+            }
+        }
+
         let ctx = self.hook_ctx();
         if let Some(ref hooks) = self.hooks {
             let payload = HookPayload::before_llm(

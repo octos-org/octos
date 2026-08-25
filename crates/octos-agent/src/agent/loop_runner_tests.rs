@@ -6190,3 +6190,65 @@ fn repeated_identical_failing_command_still_trips_the_retry_limit() {
         recover_shell_retry(&messages, 4).expect("the same command failing repeatedly is a spiral");
     assert!(matches!(recovery.kind, ShellRetryRecoveryKind::RetryLimit));
 }
+
+/// Append-only measurement, end to end through the real loop.
+///
+/// The point of the audit is to answer one question with evidence rather than
+/// argument: does octos already rewrite request history in place? This drives
+/// two real turns on one agent — the second carrying the first's oversized
+/// tool result as history — which is the shape `truncate_old_tool_results`
+/// acts on, and asserts the audit both RAN and reported it.
+///
+/// The `RAN` half matters as much as the finding. An earlier version of this
+/// measurement reported nothing, and the nothing meant only that octos-agent's
+/// lib tests install no `tracing` subscriber, so every `warn!` went nowhere.
+/// A measurement whose silence cannot be distinguished from absence is not a
+/// measurement, so findings are recorded out-of-band and asserted here.
+#[tokio::test]
+async fn append_only_audit_observes_the_in_place_truncation_across_turns() {
+    crate::agent::append_only_audit::arm_for_test();
+    let _ = crate::agent::append_only_audit::drain_findings();
+    let before = crate::agent::append_only_audit::finding_count();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    // Comfortably past the 800-char collapse threshold.
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: BIG_TOOL_OUTPUT,
+    });
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(MultiToolThenEndProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("append-only-audit"), provider, tools, memory);
+
+    let first = agent.process_message("do work", &[], vec![]).await.unwrap();
+    // Second turn carries the first turn's tool results as history, which is
+    // what puts them BEFORE the newest user message.
+    let _second = agent
+        .process_message("and now the next thing", &first.messages, vec![])
+        .await
+        .unwrap();
+
+    let after = crate::agent::append_only_audit::finding_count();
+    let findings = crate::agent::append_only_audit::drain_findings();
+    crate::agent::append_only_audit::disarm_for_test();
+
+    assert!(
+        after > before,
+        "the audit must have RUN; a silent result here means the wiring is dead, \
+         not that octos is append-only (findings: {findings:?})"
+    );
+    assert!(
+        findings.iter().any(|f| f.contains("rewritten in place")),
+        "expected an in-place rewrite across turns; got {findings:?}"
+    );
+}
+
+/// Large enough that `truncate_old_tool_results` collapses it.
+const BIG_TOOL_OUTPUT: &str = concat!(
+    "BEGIN-LARGE-TOOL-RESULT ",
+    include_str!("append_only_audit.rs"),
+);
