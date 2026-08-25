@@ -18280,6 +18280,67 @@ fn runtime_unavailable_errors_are_typed_for_protocol_clients() {
 }
 
 #[test]
+fn held_data_dir_lock_yields_a_clear_actionable_error() {
+    // A `session/open` bootstrap that fails because another octos process
+    // already owns the profile's redb must be recognized structurally
+    // (through the eyre wrap chain that `ProfileRuntime::bootstrap` adds) and
+    // rendered with both remedies. Previously this reached the client as
+    // "failed to bootstrap ProfileRuntime for profile 'alan': failed to open
+    // episode store for profile 'alan'" — the cause, the path, and every hint
+    // about what to do were dropped by the `{error}` (non-alternate) format.
+    let report = eyre::Report::new(octos_memory::EpisodeStoreLocked {
+        path: std::path::PathBuf::from("/Users/dev/.octos/profiles/alan/data/episodes.redb"),
+    })
+    .wrap_err("failed to open episode store for profile 'alan'");
+    assert!(
+        octos_memory::is_episode_store_locked(&report),
+        "lock contention must be detected through the eyre wrap chain"
+    );
+
+    let error = data_dir_locked_error("alan", &report);
+    assert_eq!(
+        error.code,
+        octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
+    );
+    assert_eq!(
+        error.data.as_ref().and_then(|d| d.get("kind")),
+        Some(&json!("data_dir_locked")),
+        "clients branch on `kind`; this must not be the generic runtime_unavailable"
+    );
+    let message = error
+        .data
+        .as_ref()
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("alan"),
+        "message must name the profile: {message}"
+    );
+    assert!(
+        message.contains("--instance-data-dir"),
+        "message must offer the private-storage remedy: {message}"
+    );
+    assert!(
+        message.contains("episodes.redb"),
+        "message must carry the underlying cause, including the contended path: {message}"
+    );
+}
+
+#[test]
+fn non_lock_bootstrap_error_is_not_misclassified_as_data_dir_locked() {
+    // Guards the detector against over-matching: a missing provider is not a
+    // lock problem and has no `--instance-data-dir` remedy, so it must keep
+    // falling through to the generic `runtime_unavailable` kind.
+    let report = eyre::eyre!("No LLM provider configured")
+        .wrap_err("failed to bootstrap ProfileRuntime for profile 'alan'");
+    assert!(
+        !octos_memory::is_episode_store_locked(&report),
+        "an unrelated bootstrap failure must not be reported as lock contention"
+    );
+}
+
+#[test]
 fn permission_denied_workspace_yields_a_clear_actionable_error() {
     // A session/open bootstrap failure caused by a non-writable workspace
     // folder must be recognized structurally (through the eyre wrap chain)

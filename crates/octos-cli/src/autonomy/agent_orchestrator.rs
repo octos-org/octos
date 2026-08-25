@@ -2169,6 +2169,30 @@ impl InProcessAgentOrchestrator {
             .get(&upsert.agent_id)
             .map(|agent| agent.status.clone());
         let (agent, payload, transitioned_terminal) = {
+            // Refs #2102 (Gap 3): live spawn admission. A NEW agent record
+            // entering an ALREADY-JOINED group bumps the join epoch BEFORE
+            // the entry is created, under the same state lock — the crash
+            // window is empty and the bump is single-writer.
+            let existing = state.agents.contains_key(&upsert.agent_id);
+            if !existing {
+                let group = format!(
+                    "agent-group:{}:{}:{}",
+                    upsert.profile_id,
+                    upsert.session_id,
+                    upsert.parent_agent_id.as_deref().unwrap_or("master")
+                );
+                let already_joined = state
+                    .scatter_join_state
+                    .get(&group)
+                    .is_some_and(|s| s.last_joined_key.is_some());
+                if already_joined {
+                    state
+                        .scatter_join_state
+                        .entry(group)
+                        .or_default()
+                        .join_epoch += 1;
+                }
+            }
             let entry = state
                 .agents
                 .entry(upsert.agent_id.clone())
@@ -11047,6 +11071,14 @@ pub(crate) fn clear_default_agent_orchestrator_for_test() {
 #[derive(Debug, Default)]
 struct AutonomyRuntimeState {
     agents: HashMap<String, AutonomyAgentRecord>,
+    /// Refs #2102 (Gap 3) — per-group scatter-join bookkeeping. `join_epoch`
+    /// increments when a child is admitted into an already-joined group
+    /// (spawn-admission path, under the state lock, BEFORE insertion);
+    /// `last_joined_key` records the explicit dedupe key of the last
+    /// ScatterJoinComplete actually enqueued, so the all-terminal edge can
+    /// skip an already-joined epoch even across a restart. Defaults are
+    /// additive — legacy persisted state deserializes with epoch 0 / None.
+    scatter_join_state: HashMap<String, ScatterJoinState>,
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
     /// #1977 — durable monitor records (specs + wake accounting). The live
@@ -11164,6 +11196,13 @@ struct AutonomyRuntimeState {
     /// `monitor/resume` landing in the unlocked gap (defect 2). Per-instance.
     #[cfg(test)]
     reset_window_before_accounting: bool,
+}
+
+/// Refs #2102 (Gap 3): join bookkeeping for one scatter-join group.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+struct ScatterJoinState {
+    join_epoch: u64,
+    last_joined_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -12614,13 +12653,33 @@ fn enqueue_agent_terminal_continuations(
     {
         return;
     }
-    // NOTE: the `ScatterJoinComplete` continuation deliberately keeps the
-    // auto-derived `stable_dedupe_key` (which folds in the
-    // `terminal_children` count). The join only enqueues on the
-    // all-siblings-terminal edge, and a re-expanded group that finishes
-    // again SHOULD be able to re-join — so an identity-only key would be a
-    // behavior change here. Only the per-child `ChildCompleted` gets the
-    // explicit Gap-1 step-3 key.
+    // Refs #2102 (Gap 3): the auto-derived `stable_dedupe_key` folds every
+    // metadata pair into the key — including `terminal_children` — so a
+    // group that re-reaches all-terminal with a different child count
+    // enqueued a NEW join continuation and the master re-emitted the joined
+    // answer (duplicate output). Replaced by an EXPLICIT key
+    // `scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}`:
+    // same epoch joins exactly once (persisted `last_joined_key` equality
+    // check skips re-observation, restart-safe); a genuinely re-expanded
+    // group gets a new epoch at spawn admission and joins again.
+    let join_group_key = agent_continuation_group_id(agent);
+    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
+    let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
+    let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
+    let join_key = format!(
+        "scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}",
+        group = group_id.as_str(),
+        session = agent.session_id.0,
+        profile = agent.profile_id,
+        cwd_hash = cwd_hash,
+        epoch = join_state.join_epoch,
+    );
+    if join_state.last_joined_key.as_deref() == Some(join_key.as_str()) {
+        // This epoch already joined — skip enqueue entirely (also covers the
+        // re-marked-terminal-with-no-new-child case and restart replay).
+        return;
+    }
     let scatter = MasterContinuationRequest::new(
         group_id,
         agent.session_id.to_string(),
@@ -12628,6 +12687,7 @@ fn enqueue_agent_terminal_continuations(
         MasterContinuationReason::ScatterJoinComplete,
         SystemTime::now(),
     )
+    .with_dedupe_key(join_key.clone())
     .with_metadata(
         "parent_agent_id",
         agent
@@ -12642,6 +12702,9 @@ fn enqueue_agent_terminal_continuations(
         None => scatter,
     };
     enqueue_and_persist_continuation(state, scatter);
+    let join_group_key = agent_continuation_group_id(agent);
+    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
+    join_state.last_joined_key = Some(join_key);
 }
 
 /// Gap-1 step 3: explicit `ChildCompleted` dedupe key, symmetric to the
@@ -13366,6 +13429,24 @@ fn restore_agents_from_supervisor_state(
             context_contract: None,
             restored: true,
         };
+        // Refs #2102 (Gap 3): spawn admission into an ALREADY-JOINED group
+        // bumps the join epoch BEFORE insertion, under the same state lock —
+        // a crash can never land between admission and the increment. The
+        // child's group comes from the supervisor record (`child.group_id`).
+        {
+            let group = child.group_id.clone();
+            let already_joined = state
+                .scatter_join_state
+                .get(&group)
+                .is_some_and(|s| s.last_joined_key.is_some());
+            if already_joined {
+                state
+                    .scatter_join_state
+                    .entry(group)
+                    .or_default()
+                    .join_epoch += 1;
+            }
+        }
         state.agents.insert(agent.agent_id.clone(), agent);
     }
 }

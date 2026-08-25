@@ -19075,9 +19075,20 @@ async fn ensure_session_profile_runtime(
     )
     .await
     .map_err(|error| {
-        runtime_unavailable_error(format!(
-            "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error}"
-        ))
+        // Lock contention is a config mistake with a concrete fix, so it gets
+        // its own typed kind and a sentence the operator can act on. Anything
+        // else stays `runtime_unavailable` — but formatted with `{error:#}`
+        // so the eyre chain survives to the client. Plain `{error}` prints
+        // only the outermost context, which is how "failed to open episode
+        // store for profile 'x'" used to reach the TUI with its actual cause
+        // (and its remedy) silently dropped.
+        if octos_memory::is_episode_store_locked(&error) {
+            data_dir_locked_error(profile_id, &error)
+        } else {
+            runtime_unavailable_error(format!(
+                "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error:#}"
+            ))
+        }
     })?;
     let mut runtimes = dynamic_profile_runtimes()
         .write()
@@ -35135,6 +35146,30 @@ fn workspace_not_writable_error(workspace: Option<&str>) -> RpcError {
     RpcError::internal_error(sentence.clone()).with_data(json!({
         "kind": "workspace_not_writable",
         "workspace": workspace,
+        "message": sentence,
+    }))
+}
+
+/// Clear, actionable RPC error for "another octos process already owns this
+/// profile's data directory" — redb is single-writer-single-process, so a
+/// second `octos serve` against the same data dir can never open the episode
+/// store.
+///
+/// This is a deployment mistake with two concrete fixes, not an internal
+/// fault, so it gets its own `kind` (clients can render a remedy instead of a
+/// stack-shaped string) and the sentence names both ways out. `data.message`
+/// is rendered verbatim by clients, matching [`workspace_not_writable_error`].
+fn data_dir_locked_error(profile_id: &str, error: &eyre::Report) -> RpcError {
+    let sentence = format!(
+        "Can't start a session for profile '{profile_id}' — another octos process already \
+         owns this profile's data directory, and its storage allows only one writer. \
+         Stop the other `octos serve` (if it is supervised, e.g. by launchd, stop the \
+         service rather than the process — it will be restarted otherwise), or give this \
+         instance its own storage with `--instance-data-dir <dir>`. Details: {error:#}"
+    );
+    RpcError::internal_error(sentence.clone()).with_data(json!({
+        "kind": "data_dir_locked",
+        "profile_id": profile_id,
         "message": sentence,
     }))
 }

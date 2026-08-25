@@ -1,6 +1,6 @@
 //! Episode store: persistent storage for episodes using redb (pure Rust).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use eyre::{Result, WrapErr};
@@ -28,6 +28,53 @@ const EMBEDDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("emb
 /// in-process EmbeddingGemma at 768, since Matryoshka only truncates downward —
 /// must instead size the index itself via [`EpisodeStore::open_with_dimension`].
 pub const DEFAULT_DIMENSION: usize = 1536;
+
+/// Typed cause for "the redb episode store at `path` is already owned by
+/// another process".
+///
+/// redb is single-writer-single-process, so a second `octos serve` against the
+/// same data dir can never open it. That is a deployment/config mistake with a
+/// concrete fix, not an internal fault — but the strict opener used to report
+/// it as an untyped string, so every caller upstack could only re-wrap prose.
+/// Carrying a typed cause lets a caller *recognise* the condition
+/// ([`is_episode_store_locked`]) and render its own actionable message, the
+/// same way the API layer already downcasts to [`std::io::Error`] for
+/// permission-denied workspaces.
+#[derive(Debug, Clone)]
+pub struct EpisodeStoreLocked {
+    /// The `episodes.redb` path whose lock is held elsewhere.
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for EpisodeStoreLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the redb wording ("Database already open. Cannot acquire
+        // lock.") — operators grep for it and it is what redb itself prints.
+        write!(
+            f,
+            "failed to open redb database at {}: Database already open. \
+             Cannot acquire lock. Another octos process (typically an `octos \
+             serve` daemon) already owns this data directory. Stop it, or \
+             start this instance against its own storage with \
+             `--instance-data-dir <dir>`.",
+            self.path.display(),
+        )
+    }
+}
+
+impl std::error::Error for EpisodeStoreLocked {}
+
+/// True when `error` carries an [`EpisodeStoreLocked`] anywhere in its eyre
+/// chain — i.e. the failure is redb lock contention rather than corruption,
+/// I/O, or a permission problem.
+///
+/// Structural (downcast), not string matching, so wrapping the error with
+/// extra context upstack cannot break the check.
+pub fn is_episode_store_locked(error: &eyre::Report) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<EpisodeStoreLocked>().is_some())
+}
 
 /// Parse a cwd-index JSON array of episode IDs. On corrupt JSON, salvage any
 /// quoted strings that look like episode IDs instead of silently replacing
@@ -281,14 +328,23 @@ impl EpisodeStore {
                     index: RwLock::new(HybridIndex::new(dimension)),
                 })
             }
-            None => Err(eyre::eyre!(
-                "failed to open redb database at {}: \
-                 Database already open. Cannot acquire lock. \
-                 (Strict `EpisodeStore::open` was used — if this is the \
-                 `octos gateway` subprocess, call `open_or_degraded` \
-                 instead.)",
-                db_path_for_log.display(),
-            )),
+            // Typed and UNWRAPPED, so callers upstack can both recognise the
+            // condition (`is_episode_store_locked`) and forward a message
+            // that already names the path and the remedy. The
+            // developer-facing "wrong opener?" hint is a log line rather than
+            // error context: it is noise for the operator who sees this on a
+            // session/open, and burying the actionable sentence one level
+            // deeper is exactly what made this error unreadable in clients.
+            None => {
+                debug!(
+                    path = %db_path_for_log.display(),
+                    "strict `EpisodeStore::open` failed on a held lock — if this is the \
+                     `octos gateway` subprocess, call `open_or_degraded` instead"
+                );
+                Err(eyre::Report::new(EpisodeStoreLocked {
+                    path: db_path_for_log.clone(),
+                }))
+            }
         }
     }
 
@@ -1808,6 +1864,77 @@ mod tests {
         assert!(
             msg.contains("Database already open") || msg.contains("Cannot acquire lock"),
             "strict open error must surface the lock contention; got: {err:?}",
+        );
+    }
+
+    /// The strict-open failure must be *recognisable* and *actionable*, not
+    /// just non-empty prose.
+    ///
+    /// Recognisable: callers upstack (the ui-protocol `session/open` handler)
+    /// decide whether to render a "another process owns this data dir"
+    /// remedy or a generic internal error, and they must not do that by
+    /// string-matching an error whose wording is free to change.
+    ///
+    /// Actionable: the operator sees this through a client, so the sentence
+    /// itself has to name the path and both ways out. Before this, the
+    /// message reached the TUI as a bare "failed to open episode store for
+    /// profile 'x'" with the cause dropped entirely.
+    #[tokio::test]
+    async fn strict_open_lock_error_is_typed_and_names_the_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let _owner = EpisodeStore::open(dir.path()).await.unwrap();
+
+        let err = EpisodeStore::open(dir.path())
+            .await
+            .err()
+            .expect("strict open must error when lock is held");
+
+        assert!(
+            is_episode_store_locked(&err),
+            "lock contention must be structurally detectable; got: {err:?}",
+        );
+
+        // Survives re-wrapping: `ProfileRuntime::bootstrap` adds its own
+        // context before the API layer inspects the error.
+        let wrapped = Err::<(), _>(err)
+            .wrap_err("failed to open episode store for profile 'alan'")
+            .unwrap_err();
+        assert!(
+            is_episode_store_locked(&wrapped),
+            "detection must survive eyre context wrapping; got: {wrapped:?}",
+        );
+
+        let rendered = format!("{wrapped:#}");
+        assert!(
+            rendered.contains("episodes.redb"),
+            "message must name the contended file; got: {rendered}",
+        );
+        assert!(
+            rendered.contains("--instance-data-dir"),
+            "message must name the remedy; got: {rendered}",
+        );
+    }
+
+    /// Corruption / I/O failures must NOT be mistaken for lock contention —
+    /// they have no `--instance-data-dir` remedy and need a different
+    /// message. Guards the typed detector against over-matching.
+    #[tokio::test]
+    async fn non_lock_open_failures_are_not_flagged_as_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("episodes.redb");
+        // Not a redb file at all: open must fail as a format/corruption
+        // error, which is a distinct condition from a held lock.
+        tokio::fs::write(&db_path, b"this is not a redb database")
+            .await
+            .unwrap();
+
+        let err = EpisodeStore::open(dir.path())
+            .await
+            .err()
+            .expect("opening a corrupt file must error");
+        assert!(
+            !is_episode_store_locked(&err),
+            "corruption must not be reported as lock contention; got: {err:?}",
         );
     }
 }

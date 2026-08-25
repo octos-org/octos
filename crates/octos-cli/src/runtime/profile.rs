@@ -1940,6 +1940,15 @@ mod tests {
             msg.contains("Database already open") || msg.contains("Cannot acquire lock"),
             "error must surface the redb lock contention; got: {err:?}",
         );
+
+        // Failing loudly is only half the contract: the API layer branches on
+        // this to render an actionable remedy, and it must be able to tell
+        // lock contention from corruption without string matching.
+        assert!(
+            octos_memory::is_episode_store_locked(&err),
+            "bootstrap must preserve the typed lock cause through its own \
+             wrap_err context; got: {err:?}",
+        );
     }
 
     /// Build a minimal profile that bootstraps successfully against a
