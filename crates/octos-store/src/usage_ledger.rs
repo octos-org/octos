@@ -57,6 +57,21 @@ pub struct UsageEvent {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Prompt tokens served from the provider's cache (Anthropic
+    /// `cache_read_input_tokens`, OpenAI/DeepSeek automatic
+    /// `prompt_tokens_details.cached_tokens`).
+    ///
+    /// Disjoint from `input_tokens` — providers report the cached portion
+    /// INSIDE their prompt total, but `TokenUsage` subtracts it at the
+    /// provider boundary, so the full prompt is `input_tokens +
+    /// cache_read_tokens`. Recorded so cache effectiveness is answerable
+    /// after the fact instead of only from a live API probe.
+    ///
+    /// `#[serde(default)]`: ledger records written before this field
+    /// existed decode as 0, which is indistinguishable from a genuinely
+    /// uncached run and needs no migration.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     #[serde(default)]
@@ -95,11 +110,23 @@ impl UsageEvent {
             base_url,
             input_tokens,
             output_tokens,
+            cache_read_tokens: 0,
             estimated_cost_usd,
             cost_source,
             channel: channel.into(),
             attribution,
         }
+    }
+
+    /// Record the cache-served portion of this run's prompt.
+    ///
+    /// A builder rather than a 13th positional argument: [`Self::completed_run`]
+    /// is already `#[allow(clippy::too_many_arguments)]`, and most call sites
+    /// have no cache figure to contribute. Those keep the default of 0.
+    #[must_use]
+    pub fn with_cache_read_tokens(mut self, cache_read_tokens: u64) -> Self {
+        self.cache_read_tokens = cache_read_tokens;
+        self
     }
 }
 
@@ -116,6 +143,11 @@ pub struct UsageTotals {
     pub run_count: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache-served prompt tokens, disjoint from `input_tokens` (see
+    /// [`UsageEvent::cache_read_tokens`]). Zero across a whole session
+    /// means every round paid full price for its prefix.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
     pub estimated_cost_usd: f64,
 }
 
@@ -124,6 +156,9 @@ impl UsageTotals {
         self.run_count = self.run_count.saturating_add(1);
         self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(event.cache_read_tokens);
         if let Some(cost) = event.estimated_cost_usd {
             self.estimated_cost_usd += cost;
         }
@@ -133,6 +168,9 @@ impl UsageTotals {
         self.run_count = self.run_count.saturating_add(other.run_count);
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
         self.estimated_cost_usd += other.estimated_cost_usd;
     }
 }
@@ -498,6 +536,71 @@ fn event_matches_query(event: &UsageEvent, query: &UsageQuery) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_event(input_tokens: u64, cache_read_tokens: u64) -> UsageEvent {
+        UsageEvent::completed_run(
+            "p",
+            "s",
+            "r",
+            None,
+            None,
+            None,
+            input_tokens,
+            10,
+            None,
+            UsageCostSource::Unavailable,
+            "test",
+            None,
+        )
+        .with_cache_read_tokens(cache_read_tokens)
+    }
+
+    #[test]
+    fn should_default_cache_read_tokens_to_zero_when_not_set() {
+        let event = cache_event(100, 0);
+        assert_eq!(event.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn should_accumulate_cache_read_tokens_across_events() {
+        let mut totals = UsageTotals::default();
+        totals.add_event(&cache_event(100, 0)); // cold: whole prefix billed
+        totals.add_event(&cache_event(5, 95)); // warm: prefix served from cache
+        assert_eq!(totals.input_tokens, 105);
+        assert_eq!(totals.cache_read_tokens, 95);
+    }
+
+    #[test]
+    fn should_carry_cache_read_tokens_through_merge() {
+        let mut left = UsageTotals::default();
+        left.add_event(&cache_event(10, 40));
+        let mut right = UsageTotals::default();
+        right.add_event(&cache_event(20, 60));
+        left.merge(&right);
+        assert_eq!(left.cache_read_tokens, 100);
+    }
+
+    /// Records written before `cache_read_tokens` existed must keep decoding.
+    /// `#[serde(default)]` is what makes this a no-migration change, so it is
+    /// worth pinning rather than trusting.
+    #[test]
+    fn should_decode_pre_cache_field_records_as_zero() {
+        let legacy = serde_json::json!({
+            "schema_version": USAGE_EVENT_SCHEMA_VERSION,
+            "event_id": "e1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "profile_id": "p",
+            "session_id": "s",
+            "run_id": "r",
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cost_source": "unavailable",
+            "channel": "test"
+        });
+        let decoded: UsageEvent = serde_json::from_value(legacy).expect("legacy record decodes");
+        assert_eq!(decoded.cache_read_tokens, 0);
+        assert_eq!(decoded.input_tokens, 100);
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn event(

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use std::{collections::HashMap, collections::VecDeque};
+use std::{collections::HashMap, collections::HashSet, collections::VecDeque};
 
 use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
@@ -996,6 +996,12 @@ impl Agent {
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
+                // Tools may report that they have already exhausted all
+                // meaningful retries for this user turn. Keep that fact in
+                // the host, not in the model: a later call with rewritten
+                // arguments is still the same terminal operation and must
+                // not execute again.
+                let mut terminal_tools_for_turn = HashSet::new();
                 let mut turn_ledger = self.new_turn_ledger();
                 // #1691 (codex gap G6): fire the in-band budget reminder once,
                 // when the run first crosses ~80% of its iteration cap.
@@ -1349,6 +1355,15 @@ impl Agent {
                             response_content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
                             input_tokens = response.usage.input_tokens,
                             output_tokens = response.usage.output_tokens,
+                            // Prompt caching is the largest single cost lever
+                            // and is on by default, but it was unobservable
+                            // from the logs: these two were already parsed and
+                            // handed to `record_usage` below, just never
+                            // printed. `input_tokens` alone is misleading —
+                            // it EXCLUDES the cached portion, so a warm turn
+                            // looks like a tiny prompt rather than a cheap one.
+                            cache_read_tokens = response.usage.cache_read_tokens,
+                            cache_write_tokens = response.usage.cache_write_tokens,
                             "LLM response received"
                         );
                     }
@@ -1427,6 +1442,27 @@ impl Agent {
                         StopReason::ToolUse => {
                             // Check for loop detection before executing
                             for tc in &response.tool_calls {
+                                if terminal_tools_for_turn.contains(&tc.name) {
+                                    self.emit_cost_update(&turn, &response, attributed_cost);
+                                    warn!(
+                                        tool = %tc.name,
+                                        "terminal tool retried in the same turn; stopping before execution"
+                                    );
+                                    return Ok(ConversationResponse {
+                                        content: terminal_tool_retry_message(&tc.name),
+                                        reasoning_content: None,
+                                        provider_metadata: None,
+                                        token_usage: turn.total_usage().clone(),
+                                        estimated_spend_usd: turn.priced_spend(),
+                                        files_modified,
+                                        files_to_send,
+                                        streamed,
+                                        messages: turn_output_log.clone(),
+                                        tool_results: tool_structured_metadata.clone(),
+                                        synthesized_from_spawn_only: false,
+                                        pending_approval: None,
+                                    });
+                                }
                                 // #1765 doom-loop guard: 3+ CONSECUTIVE
                                 // identical tool calls (same name + identical
                                 // arguments JSON) abort the turn before the
@@ -1692,6 +1728,7 @@ impl Agent {
                                     Some(&mut turn_output_log),
                                     &mut loop_detector,
                                     turn_ledger.as_mut(),
+                                    Some(&mut terminal_tools_for_turn),
                                     Some(&mut iter_pending_approval),
                                 )
                                 .await
@@ -2421,6 +2458,7 @@ impl Agent {
                                 None,
                                 &mut loop_detector,
                                 turn_ledger.as_mut(),
+                                None,
                                 // Background task loop: no resume host —
                                 // rule-matched tools are denied, not
                                 // suspended (see handle_tool_use doc).
@@ -2610,6 +2648,11 @@ impl Agent {
         // conversation continues.
         loop_detector: &mut LoopDetector,
         turn_ledger: Option<&mut TurnLedger>,
+        // A failed tool can set structured_metadata.do_not_retry_same_turn.
+        // The conversation loop stores the tool name here and rejects any
+        // later call before execution, even when the model changes arguments.
+        // Background task loops pass None because they have no user turn.
+        terminal_tools_for_turn: Option<&mut HashSet<String>>,
         // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): out-parameter
         // for the suspend-and-resume human-approval flow. When a tool call
         // matches a configured `human_approval_rules` rule:
@@ -2819,6 +2862,24 @@ impl Agent {
             tool_tokens.cache_write_tokens += batch_tokens.cache_write_tokens;
             tool_metadata.extend(batch_metadata);
             tool_success.extend(batch_success);
+        }
+        if let Some(terminal_tools) = terminal_tools_for_turn {
+            let tool_name_by_id: HashMap<&str, &str> = limited_response
+                .tool_calls
+                .iter()
+                .map(|call| (call.id.as_str(), call.name.as_str()))
+                .collect();
+            for (tool_call_id, metadata) in &tool_metadata {
+                if metadata
+                    .get("do_not_retry_same_turn")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    if let Some(tool_name) = tool_name_by_id.get(tool_call_id.as_str()) {
+                        terminal_tools.insert((*tool_name).to_string());
+                    }
+                }
+            }
         }
         if let Some(sink) = tool_structured_metadata {
             sink.extend(tool_metadata);
@@ -3584,6 +3645,18 @@ fn doom_loop_terminal_message(tool_name: &str, streak: usize) -> String {
          call. Repeating the exact same call cannot produce a different result. Try a \
          different approach — vary the arguments, use a different tool, or rephrase the \
          request."
+    )
+}
+
+/// A tool that has already exhausted its own retries can mark the failure as
+/// terminal for the current user turn. If the model asks for it again, stop
+/// before execution even when it rewrites the arguments. This message is
+/// intentionally free of internal error details: the first tool result
+/// already carries those details in the transcript and the user only needs
+/// to know that the repeated wait was prevented.
+fn terminal_tool_retry_message(tool_name: &str) -> String {
+    format!(
+        "The requested operation already exhausted its internal retries. I stopped a repeated '{tool_name}' call in this turn so you do not have to wait for the same work again. Please send a new message if you want to retry."
     )
 }
 

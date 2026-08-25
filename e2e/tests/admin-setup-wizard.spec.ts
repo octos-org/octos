@@ -175,7 +175,13 @@ async function walkWizardAndAssertSmtpGating(page: Page, baseURL: string) {
       response.request().method() === 'POST' &&
       response.status() === 204,
   );
-  await page.getByLabel('Tenant').check();
+  // NOT `getByLabel('Tenant')`: Playwright matches label text as a
+  // case-insensitive SUBSTRING, and the Cloud option's description reads
+  // "terminates tunnels from tenants and issues subdomains" — so 'Tenant'
+  // resolves to BOTH radios and `.check()` fails with a strict mode
+  // violation. That is a prose edit breaking a test, not a UI change; target
+  // the radio by value, exactly as the assertion two lines down already does.
+  await page.locator('input[name="deployment-mode"][value="tenant"]').check();
   await modeSave;
   await expect(page.locator('input[name="deployment-mode"][value="tenant"]')).toBeChecked();
   await page.getByRole('button', { name: 'Back' }).click();

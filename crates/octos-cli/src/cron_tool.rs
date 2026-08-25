@@ -9,7 +9,7 @@ use chrono::{Local, Utc};
 use eyre::{Result, WrapErr};
 use iana_time_zone::get_timezone;
 use octos_agent::tools::{Tool, ToolResult};
-use octos_bus::{CronPayload, CronSchedule, CronService};
+use octos_bus::{CronMode, CronOrigin, CronPayload, CronSchedule, CronService};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -17,6 +17,11 @@ pub struct CronTool {
     service: Arc<CronService>,
     default_channel: std::sync::Mutex<String>,
     default_chat_id: std::sync::Mutex<String>,
+    /// What to stamp on jobs this tool creates. Set per turn by the session
+    /// actor, the same way `default_channel`/`default_chat_id` are — a job
+    /// created during a loop's turn records that loop, so deleting the loop can
+    /// find it again.
+    default_origin: std::sync::Mutex<CronOrigin>,
 }
 
 impl CronTool {
@@ -25,6 +30,7 @@ impl CronTool {
             service,
             default_channel: std::sync::Mutex::new(String::new()),
             default_chat_id: std::sync::Mutex::new(String::new()),
+            default_origin: std::sync::Mutex::new(CronOrigin::default()),
         }
     }
 
@@ -38,6 +44,7 @@ impl CronTool {
             service,
             default_channel: std::sync::Mutex::new(channel.into()),
             default_chat_id: std::sync::Mutex::new(chat_id.into()),
+            default_origin: std::sync::Mutex::new(CronOrigin::default()),
         }
     }
 
@@ -51,6 +58,26 @@ impl CronTool {
             .default_chat_id
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = chat_id.to_string();
+    }
+
+    /// Set what jobs created from here on record as their origin.
+    ///
+    /// MUST be called on every turn, including with an empty origin: leaving a
+    /// previous turn's value in place would stamp a user's own job with a loop
+    /// id it has nothing to do with, and `loop/delete` would then reap a job the
+    /// user created deliberately.
+    pub fn set_origin(&self, origin: CronOrigin) {
+        *self
+            .default_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = origin;
+    }
+
+    fn current_origin(&self) -> CronOrigin {
+        self.default_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Create a schedule from a natural-language request, bound to a
@@ -88,6 +115,8 @@ impl CronTool {
             deliver: true,
             channel: Some(channel.to_string()),
             chat_id: Some(chat_id.to_string()),
+            // Matrix /schedule has no way to say "notify"; unchanged behaviour.
+            mode: CronMode::Agent,
         };
 
         let job =
@@ -573,6 +602,10 @@ fn job_matches_context(job: &octos_bus::CronJob, channel: &str, chat_id: &str) -
 #[derive(Deserialize)]
 struct Input {
     action: String,
+    /// "agent" (default) runs a model turn on each fire; "notify" just
+    /// delivers `message` and costs nothing.
+    #[serde(default)]
+    mode: Option<String>,
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
@@ -629,6 +662,11 @@ impl Tool for CronTool {
                     "type": "string",
                     "enum": ["add", "list", "remove", "enable", "disable"],
                     "description": "The action to perform"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["agent", "notify"],
+                    "description": "How the job fires. 'agent' (default) hands `message` to you as a task and costs one model turn per fire. 'notify' delivers `message` verbatim and costs nothing — use it whenever the job only has to say a fixed thing on a schedule, e.g. a reminder whose full text you already know now."
                 },
                 "message": {
                     "type": "string",
@@ -783,17 +821,29 @@ impl CronTool {
             }
         });
 
+        // Unknown values fall back to Agent rather than erroring: a model that
+        // invents a mode gets today's behaviour, not a failed tool call.
+        let mode = match input.mode.as_deref() {
+            Some("notify") => CronMode::Notify,
+            _ => CronMode::Agent,
+        };
+
         let payload = CronPayload {
             message,
             deliver: channel.is_some(),
             channel,
             chat_id,
+            mode,
         };
 
         let name = input.name.unwrap_or_else(|| "unnamed".into());
-        let job = self
-            .service
-            .add_job_with_tz(name, schedule, payload, input.timezone)?;
+        let job = self.service.add_job_with_origin(
+            name,
+            schedule,
+            payload,
+            input.timezone,
+            self.current_origin(),
+        )?;
 
         Ok(ToolResult {
             output: format!("Created job '{}' (id: {}), {desc}.", job.name, job.id),
@@ -1276,6 +1326,7 @@ mod tests {
                     deliver: true,
                     channel: Some("matrix".into()),
                     chat_id: Some("!room-a:localhost".into()),
+                    mode: CronMode::Agent,
                 },
             )
             .unwrap();
@@ -1288,6 +1339,7 @@ mod tests {
                     deliver: true,
                     channel: Some("matrix".into()),
                     chat_id: Some("!room-b:localhost".into()),
+                    mode: CronMode::Agent,
                 },
             )
             .unwrap();
@@ -1313,6 +1365,7 @@ mod tests {
                     deliver: true,
                     channel: Some("matrix".into()),
                     chat_id: Some("!room-b:localhost".into()),
+                    mode: CronMode::Agent,
                 },
             )
             .unwrap();

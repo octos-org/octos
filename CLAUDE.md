@@ -79,7 +79,7 @@ Token-aware message compaction: estimates tokens, strips tool arguments, summari
 
 ### LLM Providers (`octos-llm/src/`)
 
-`LlmProvider` trait with `chat()` method. Four native providers: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenRouterProvider`. 8 OpenAI-compatible via `with_base_url()`. 3-layer failover: `RetryProvider` (exponential backoff on 429/5xx) → `ProviderChain` → `AdaptiveRouter` (hedge racing, lane scoring, circuit breakers).
+`LlmProvider` trait with `chat()` method. Four native providers: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenRouterProvider`. OpenAI-compatible families via `with_base_url()`, registered in `registry/` (one module per family + one line in `ALL`; `model_catalog.json` is the SSOT for model names/defaults and gates onboarding visibility). The unified `local` family (aliases: llamacpp/llama.cpp/llama-server/lmstudio/openai-compatible) covers any local OpenAI-compatible server — keyless, zero-config default `http://127.0.0.1:8080/v1`; `local_discovery.rs` holds candidate ports + `/v1/models` parsing, used by `octos doctor`. 3-layer failover: `RetryProvider` (exponential backoff on 429/5xx) → `ProviderChain` → `AdaptiveRouter` (hedge racing, lane scoring, circuit breakers).
 
 ### Plugin System (`octos-agent/src/plugins/`, `octos-plugin/`)
 

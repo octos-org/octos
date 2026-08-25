@@ -693,7 +693,7 @@ fn build_gemini_tools(tools: &[ToolSpec]) -> Option<Vec<GeminiTool>> {
         .iter()
         .filter_map(|tool| {
             let mut parameters = tool.input_schema.clone();
-            sanitize_schema_for_gemini(&mut parameters);
+            sanitize_tool_schema_for_gemini(&mut parameters);
             if contains_underspecified_array(&parameters, 0) {
                 tracing::warn!(
                     tool = %tool.name,
@@ -747,6 +747,69 @@ fn contains_underspecified_array(value: &serde_json::Value, depth: usize) -> boo
 /// - `$schema`, `$ref`, `$id`
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
     sanitize_schema_recursive(value, 0);
+}
+
+/// Project a host JSON Schema onto the subset documented for Gemini function
+/// declarations. Octos retains the original [`ToolSpec`], while only this
+/// cloned projection is sent to Gemini. Removing provider-unsupported
+/// constraints here therefore changes model-side guidance without mutating the
+/// canonical tool contract used by the host and the tool implementation.
+///
+/// Keep this separate from structured-response sanitization: the two Gemini
+/// API fields accept different schema subsets. In particular, the function
+/// declaration protobuf rejects standard JSON Schema keywords such as
+/// `exclusiveMinimum` with an HTTP 400 before the model sees the request.
+fn sanitize_tool_schema_for_gemini(value: &mut serde_json::Value) {
+    sanitize_schema_for_gemini(value);
+    project_gemini_tool_schema(value, 0);
+}
+
+fn project_gemini_tool_schema(value: &mut serde_json::Value, depth: usize) {
+    if depth > MAX_SCHEMA_DEPTH {
+        return;
+    }
+    let Some(schema) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(|item| item.as_object_mut())
+    {
+        // Property names belong to the tool, not to JSON Schema. Preserve them
+        // verbatim and sanitize only each property's schema value.
+        for property_schema in properties.values_mut() {
+            project_gemini_tool_schema(property_schema, depth + 1);
+        }
+    }
+    if let Some(items) = schema.get_mut("items") {
+        project_gemini_tool_schema(items, depth + 1);
+    }
+    if let Some(branches) = schema.get_mut("anyOf").and_then(|item| item.as_array_mut()) {
+        for branch in branches {
+            project_gemini_tool_schema(branch, depth + 1);
+        }
+    }
+
+    // Vertex's FunctionDeclaration Schema documents this finite OpenAPI
+    // subset. AI Studio uses the same generateContent declaration shape. Do
+    // not forward every keyword accepted by Octos's Draft-07 validator: an
+    // unknown field invalidates the entire request and every otherwise-valid
+    // tool declaration in it.
+    schema.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "type"
+                | "nullable"
+                | "required"
+                | "format"
+                | "description"
+                | "properties"
+                | "items"
+                | "enum"
+                | "anyOf"
+        )
+    });
 }
 
 fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
@@ -1233,6 +1296,82 @@ mod tests {
         assert_eq!(
             declarations[0].parameters["properties"]["values"]["items"]["type"],
             "object"
+        );
+    }
+
+    #[test]
+    fn tool_schema_projection_removes_unsupported_constraints_recursively() {
+        let original = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "value": {
+                    "type": "number",
+                    "description": "A positive value",
+                    "exclusiveMinimum": 0,
+                    "maximum": 10,
+                    "default": 1
+                },
+                "samples": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "minimum": {
+                                "type": "number",
+                                "exclusiveMaximum": 5
+                            }
+                        },
+                        "required": ["minimum"]
+                    }
+                }
+            },
+            "required": ["value"]
+        });
+        let tools = vec![ToolSpec {
+            name: "bounded_value".into(),
+            description: "Accept a locally validated bounded value".into(),
+            input_schema: original.clone(),
+        }];
+
+        let gemini_tools = build_gemini_tools(&tools).expect("valid tool remains");
+        let parameters = &gemini_tools[0].function_declarations[0].parameters;
+        let wire_json = serde_json::to_value(&gemini_tools).expect("tools serialize");
+
+        assert_eq!(
+            tools[0].input_schema, original,
+            "provider projection must not mutate the host contract"
+        );
+        assert_eq!(parameters["properties"]["value"]["type"], "number");
+        assert_eq!(
+            parameters["properties"]["value"]["description"],
+            "A positive value"
+        );
+        assert!(
+            parameters["properties"]["value"]
+                .get("exclusiveMinimum")
+                .is_none()
+        );
+        assert!(parameters["properties"]["value"].get("maximum").is_none());
+        assert!(parameters["properties"]["value"].get("default").is_none());
+        assert!(
+            parameters["properties"]["samples"]
+                .get("minItems")
+                .is_none()
+        );
+        assert_eq!(
+            parameters["properties"]["samples"]["items"]["properties"]["minimum"]["type"], "number",
+            "a tool property named like a Schema keyword must be preserved",
+        );
+        assert!(
+            parameters["properties"]["samples"]["items"]["properties"]["minimum"]
+                .get("exclusiveMaximum")
+                .is_none()
+        );
+        assert!(
+            !wire_json.to_string().contains("exclusiveMinimum"),
+            "the unsupported keyword must not reach the request body"
         );
     }
 

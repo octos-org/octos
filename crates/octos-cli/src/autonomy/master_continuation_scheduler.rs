@@ -36,6 +36,17 @@ use std::time::{Duration, SystemTime};
 /// must stay reusable, so they are never guarded.
 pub(crate) const RECENT_CLAIM_GUARD_WINDOW: Duration = Duration::from_secs(30);
 
+/// Refs #2102 (Gap 2): shorter reclaim window for `ChildCompleted` /
+/// `ScatterJoinComplete` keys. These reasons have the same
+/// drain-between-two-enqueues TOCTOU window the External guard defends
+/// against (legacy + unified terminal callbacks firing sequentially inside
+/// one terminal transition), but their keys must stay reusable across drain
+/// ticks — 2s collapses only a same-transition double-fire and is far below
+/// the ~30s AppUI drain tick, so per-tick reuse is unaffected. A straggler
+/// continuation carrying corrected metadata produces a different
+/// `stable_dedupe_key` (metadata folds into the key) and is NOT suppressed.
+const CHILD_SCATTER_RECLAIM_WINDOW: Duration = Duration::from_secs(2);
+
 /// #436 follow-up — max times a popped-but-UNDISPATCHED continuation may be
 /// re-inserted for a live re-delivery attempt before it is dropped from the
 /// in-memory queue. Without this bound a permanently-undeliverable injection
@@ -540,9 +551,17 @@ impl MasterContinuationScheduler {
         // map stays bounded by the live churn rate. Scoped to External so
         // recurring loop/goal/child keys stay reusable across ticks.
         self.prune_recently_claimed(enqueued_at);
-        if matches!(request.reason, MasterContinuationReason::External(_))
+        let reclaim_window = match request.reason {
+            MasterContinuationReason::External(_) => Some(RECENT_CLAIM_GUARD_WINDOW),
+            MasterContinuationReason::ChildCompleted
+            | MasterContinuationReason::ScatterJoinComplete => Some(CHILD_SCATTER_RECLAIM_WINDOW),
+            // LoopFire / GoalContinue: recurrence across ticks is the
+            // feature — no reclaim guard.
+            _ => None,
+        };
+        if let Some(window) = reclaim_window
             && let Some(claimed_at) = self.recently_claimed_external.get(&dedupe_key)
-            && within_recent_claim_window(*claimed_at, enqueued_at)
+            && within_claim_window(*claimed_at, enqueued_at, window)
         {
             return MasterContinuationEnqueueOutcome::Duplicate {
                 dedupe_key,
@@ -783,7 +802,17 @@ impl MasterContinuationScheduler {
     /// explicit timestamps) and matches wall-clock `now()` in production
     /// (where both enqueue and drain use `SystemTime::now()`).
     fn record_external_claim(&mut self, item: &QueuedMasterContinuation) {
-        if matches!(item.reason, MasterContinuationReason::External(_)) {
+        // Refs #2102 (Gap 2): Child/Scatter claims are recorded too, gated at
+        // enqueue time by the shorter CHILD_SCATTER_RECLAIM_WINDOW (see
+        // enqueue_at). LoopFire / GoalContinue are never recorded — their
+        // recurrence across ticks is legitimate.
+        let guardable = matches!(
+            item.reason,
+            MasterContinuationReason::External(_)
+                | MasterContinuationReason::ChildCompleted
+                | MasterContinuationReason::ScatterJoinComplete
+        );
+        if guardable {
             self.recently_claimed_external
                 .insert(item.dedupe_key.clone(), item.enqueued_at);
         }
@@ -851,8 +880,12 @@ impl MasterContinuationScheduler {
 /// because production `External` keys are one-shot (see field doc); revisit
 /// with a monotonic/injected clock if that ever changes.
 fn within_recent_claim_window(claimed_at: SystemTime, candidate: SystemTime) -> bool {
+    within_claim_window(claimed_at, candidate, RECENT_CLAIM_GUARD_WINDOW)
+}
+
+fn within_claim_window(claimed_at: SystemTime, candidate: SystemTime, window: Duration) -> bool {
     match candidate.duration_since(claimed_at) {
-        Ok(elapsed) => elapsed <= RECENT_CLAIM_GUARD_WINDOW,
+        Ok(elapsed) => elapsed <= window,
         // `candidate` is at or before `claimed_at`: same instant or reordered
         // sampling within one transition — always in-window.
         Err(_) => true,
@@ -960,6 +993,48 @@ mod tests {
                 existing_id
             } if dedupe_key == first_item.dedupe_key && existing_id == first_item.id
         ));
+    }
+
+    #[test]
+    fn child_reclaim_window_collapses_same_transition_refire() {
+        // Refs #2102 (Gap 2): a ChildCompleted drained between the legacy and
+        // unified terminal enqueues of ONE transition must not re-enqueue
+        // within the short reclaim window.
+        let mut scheduler = MasterContinuationScheduler::new();
+        let req =
+            request(MasterContinuationReason::ChildCompleted, "c").with_child_agent_id("child-9");
+        let item = queued(scheduler.enqueue_at(req.clone(), ts(20)));
+        // simulate a claim: record + remove from pending
+        scheduler
+            .recently_claimed_external
+            .insert(item.dedupe_key.clone(), ts(20));
+        scheduler.pending_by_key.remove(&item.dedupe_key);
+        let dup = scheduler.enqueue_at(req, ts(21)); // 1s later < 2s window
+        assert!(dup.is_duplicate(), "same-transition refire must collapse");
+        // after the window expires the key is reusable
+        scheduler
+            .recently_claimed_external
+            .insert(item.dedupe_key.clone(), ts(20));
+        let later = scheduler.enqueue_at(
+            request(MasterContinuationReason::ChildCompleted, "c2").with_child_agent_id("child-9"),
+            ts(60),
+        );
+        assert!(!later.is_duplicate(), "post-window enqueue must pass");
+    }
+
+    #[test]
+    fn loop_fire_is_never_reclaim_guarded() {
+        // LoopFire recurrence is the feature — a re-enqueue right after a
+        // claim must go through.
+        let mut scheduler = MasterContinuationScheduler::new();
+        let req = request(MasterContinuationReason::LoopFire, "lp");
+        let item = queued(scheduler.enqueue_at(req.clone(), ts(20)));
+        scheduler
+            .recently_claimed_external
+            .insert(item.dedupe_key.clone(), ts(20));
+        scheduler.pending_by_key.remove(&item.dedupe_key);
+        let again = scheduler.enqueue_at(req, ts(21));
+        assert!(!again.is_duplicate(), "loop refire must not be suppressed");
     }
 
     #[test]

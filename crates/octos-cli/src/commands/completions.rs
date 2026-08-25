@@ -74,6 +74,7 @@ fn print_dynamic(category: DynamicCategory) {
             "zhipu",
             "ollama",
             "vllm",
+            "local",
         ],
         DynamicCategory::Sessions => {
             print_session_names();

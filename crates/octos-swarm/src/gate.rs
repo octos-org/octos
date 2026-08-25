@@ -27,7 +27,7 @@ pub(crate) async fn enforce_or_outcome(
     backend: &dyn McpAgentBackend,
     contract: &ContractSpec,
     prior_attempts: u32,
-) -> std::result::Result<(), SubtaskOutcome> {
+) -> std::result::Result<(), Box<SubtaskOutcome>> {
     let target = DispatchTarget {
         dispatch_id: &contract.contract_id,
         tool_name: &contract.tool_name,
@@ -35,7 +35,7 @@ pub(crate) async fn enforce_or_outcome(
     };
     match enforce_dispatch_gates(policy, backend, target).await {
         Ok(()) => Ok(()),
-        Err(denial) => Err(SubtaskOutcome {
+        Err(denial) => Err(Box::new(SubtaskOutcome {
             contract_id: contract.contract_id.clone(),
             label: contract.label.clone(),
             status: SubtaskStatus::TerminalFailed,
@@ -44,7 +44,7 @@ pub(crate) async fn enforce_or_outcome(
             output: denial.reason.clone(),
             files_to_send: Vec::new(),
             error: Some(denial.reason),
-        }),
+        })),
     }
 }
 

@@ -157,11 +157,28 @@ pub(crate) fn with_skill_action_result(task: &BackgroundTask, result: Value) -> 
 /// performs the supervisor's orphan sweep, so queued/running work from a
 /// prior process is projected as `abandoned` rather than being mutated by a
 /// second job-specific recovery store.
+///
+/// #2056 round 3 (R4) — this is the runtime-unavailable fallback of the job
+/// view: it builds a THROWAWAY supervisor, restores into it, projects, and
+/// drops it. That restore is a real one — its orphan sweep marks abandoned
+/// work `Failed` and appends those transitions to the durable JSONL — so
+/// without the goal-task-row observers it would move the supervisor's side of
+/// the world while leaving the goal ledger's rows stale, and the missed-restore
+/// mark it left behind would die with the supervisor, unconsumable. Wiring the
+/// shared observer pair BEFORE the enable makes this path reconcile like every
+/// other restore. `profile_id` is threaded in for exactly that.
 pub(crate) fn load_skill_action_jobs(
     data_dir: &Path,
+    profile_id: &str,
     session_id: &SessionKey,
 ) -> std::io::Result<Vec<SkillActionJobRecord>> {
     let supervisor = TaskSupervisor::new();
+    crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+        &supervisor,
+        session_id,
+        profile_id,
+        data_dir,
+    );
     supervisor.enable_persistence(task_state_path(data_dir, session_id))?;
     Ok(project_skill_action_jobs(
         supervisor.get_tasks_for_session(&session_id.0),
@@ -280,7 +297,7 @@ mod tests {
         supervisor.mark_running(&orphan);
         drop(supervisor);
 
-        let jobs = load_skill_action_jobs(dir.path(), &session_id).unwrap();
+        let jobs = load_skill_action_jobs(dir.path(), "tenant-skill-jobs", &session_id).unwrap();
         assert_eq!(
             jobs.iter()
                 .find(|job| job.job_id == cancelled)

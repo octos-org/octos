@@ -121,6 +121,11 @@ test_a2.md
 !workstreams/M11-runtime-unification.md
 !workstreams/M11-SOAK-TESTS.md
 !workstreams/robrix-integration.md
+# #2073 — e2e/tests/m15-agent-orchestrator-contract.spec.ts reads this
+# contract doc with fs.readFileSync. It was never on this allow-list, so
+# CI could not see it and both specs died with ENOENT while looking like
+# contract coverage.
+!workstreams/M15-agent-goal-loop-autonomy.md
 # Canonical product/engineering spec docs under api/. The UI Protocol v1
 # spec (api/OCTOS_UI_PROTOCOL_V1_SPEC_*.md) was tracked manually before
 # this rule existed; the server/app/tui feature-requirement specs added

@@ -84,6 +84,15 @@ fn with_timeout_sets_custom() {
 }
 
 #[test]
+fn should_expose_manifest_timeout_with_cleanup_grace_to_dispatcher() {
+    let def = make_tool_def("lesson_generate", "Generate a lesson");
+    let tool = PluginTool::new("learning-coach".into(), def, PathBuf::from("/bin/true"))
+        .with_timeout(Duration::from_secs(300));
+
+    assert_eq!(tool.execution_timeout_secs(), Some(305));
+}
+
+#[test]
 fn trait_methods_delegate_to_tool_def() {
     let def = make_tool_def("my_tool", "A fine tool");
     let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
@@ -2282,6 +2291,68 @@ async fn strict_env_allowlist_drops_non_listed_extra_env() {
     );
 }
 
+struct FixedVertexTokenSource;
+
+#[async_trait]
+impl octos_llm::vertex_auth::TokenSource for FixedVertexTokenSource {
+    async fn token(&self) -> eyre::Result<String> {
+        Ok("cached-host-token".to_string())
+    }
+}
+
+/// A plugin receives the host-minted short-lived token only after explicitly
+/// declaring it in the manifest allowlist. This keeps the long-lived service
+/// account compatible while avoiding one OAuth exchange per plugin process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn vertex_access_token_is_injected_from_host_cache_when_allowlisted() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nread INPUT || true\nTOKEN=${VERTEX_ACCESS_TOKEN:-missing}\nPROJECT=${GOOGLE_CLOUD_PROJECT:-missing}\nSA=${VERTEX_SA_JSON:-missing}\necho '{\"output\":\"token='\"$TOKEN\"';project='\"$PROJECT\"';sa='\"$SA\"'\",\"success\":true}'\n",
+    );
+
+    let mut def = make_tool_def("vertex_tool", "prints the short-lived token");
+    def.env.push("VERTEX_ACCESS_TOKEN".into());
+    def.env.push("GOOGLE_CLOUD_PROJECT".into());
+    def.env.push("VERTEX_SA_JSON".into());
+    let tool = PluginTool::new("p".into(), def, script_path)
+        .with_extra_env(vec![(
+            "VERTEX_SA_JSON".into(),
+            "long-lived-service-account".into(),
+        )])
+        .with_vertex_token_source(Arc::new(FixedVertexTokenSource), "test-project".into())
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+
+    let result = tool.execute(&json!({})).await.expect("should succeed");
+    assert!(result.success);
+    assert_eq!(
+        result.output,
+        "token=cached-host-token;project=test-project;sa=missing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn vertex_access_token_is_not_injected_without_manifest_permission() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nread INPUT || true\nVALUE=${VERTEX_ACCESS_TOKEN:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+    );
+
+    let def = make_tool_def("vertex_tool", "prints the short-lived token");
+    let tool = PluginTool::new("p".into(), def, script_path)
+        .with_vertex_token_source(Arc::new(FixedVertexTokenSource), "test-project".into())
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+
+    let result = tool.execute(&json!({})).await.expect("should succeed");
+    assert!(result.success);
+    assert_eq!(result.output, "missing");
+}
+
 /// When the manifest declares an empty `env` list, legacy semantics
 /// apply: non-secret extra_env entries pass through unfiltered. This
 /// pins the no-regression contract: skills that don't declare `env`
@@ -3073,6 +3144,78 @@ async fn plugin_uses_scope_workspace_when_present() {
         actual, expected,
         "plugin CWD must equal scope.workspace() when self.work_dir is None"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn plugin_exposes_session_workspace_separately_from_skill_output_cwd() {
+    let data = tempfile::tempdir().expect("data dir");
+    let scope = multi_tenant_scope_at(data.path(), "dspfac", "web-session-workspace", vec![]);
+    let session_workspace = scope.workspace().to_path_buf();
+    let skill_output = session_workspace.join("skill-output");
+    std::fs::create_dir_all(&skill_output).expect("skill output dir");
+
+    let bin_dir = tempfile::tempdir().expect("bin dir");
+    let script_path = bin_dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nprintf '{\"output\":\"%s|%s\",\"success\":true}' \"$OCTOS_WORK_DIR\" \"$OCTOS_SESSION_WORKSPACE\"\n",
+    );
+
+    let mut def = make_tool_def("workspace_env", "echo workspace env");
+    def.env.push("OCTOS_SESSION_WORKSPACE".into());
+    let tool = PluginTool::new("plug".into(), def, script_path)
+        .with_work_dir(skill_output.clone())
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+
+    let ctx = ctx_with_scope(scope);
+    let result = crate::tools::TOOL_CTX
+        .scope(ctx, tool.execute(&json!({})))
+        .await
+        .expect("execute should succeed");
+
+    assert!(result.success, "workspace environment probe should succeed");
+    let (actual_work_dir, actual_session_workspace) = result
+        .output
+        .trim()
+        .split_once('|')
+        .expect("plugin should echo both workspace paths");
+    assert_eq!(
+        std::fs::canonicalize(actual_work_dir).expect("work dir should resolve"),
+        std::fs::canonicalize(skill_output).expect("skill output should resolve"),
+    );
+    assert_eq!(
+        std::fs::canonicalize(actual_session_workspace).expect("session workspace should resolve"),
+        std::fs::canonicalize(session_workspace).expect("workspace should resolve"),
+        "plugins must be able to read workspace-relative action inputs without treating skill-output as the workspace root",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn plugin_does_not_receive_session_workspace_without_manifest_permission() {
+    let data = tempfile::tempdir().expect("data dir");
+    let scope = multi_tenant_scope_at(data.path(), "dspfac", "web-session-workspace", vec![]);
+    let skill_output = scope.workspace().join("skill-output");
+    std::fs::create_dir_all(&skill_output).expect("skill output dir");
+
+    let bin_dir = tempfile::tempdir().expect("bin dir");
+    let script_path = bin_dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nprintf '{\"output\":\"%s\",\"success\":true}' \"${OCTOS_SESSION_WORKSPACE:-missing}\"\n",
+    );
+
+    let def = make_tool_def("workspace_env", "echo workspace env");
+    let tool = PluginTool::new("plug".into(), def, script_path)
+        .with_work_dir(skill_output)
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let result = crate::tools::TOOL_CTX
+        .scope(ctx_with_scope(scope), tool.execute(&json!({})))
+        .await
+        .expect("execute should succeed");
+
+    assert_eq!(result.output.trim(), "missing");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

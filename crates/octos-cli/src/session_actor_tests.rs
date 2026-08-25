@@ -7,6 +7,28 @@ use async_trait::async_trait;
 /// nothing, and a broken run (hook never fires) still fails — just later.
 /// Mirrors `octos_agent`'s `spawn_tests::BACKGROUND_DEADLINE`.
 const HOOK_DEADLINE: Duration = Duration::from_secs(60);
+
+/// #2053 — scale a test's WAITING budget on Windows, where the runners
+/// routinely miss fixed-duration waits that pass everywhere else
+/// (`test_speculative_overflow_concurrent` failed `check-windows` while the
+/// diff under test could not affect it; a plain re-run went green).
+///
+/// Apply this to DEADLINES only — the upper bound on how long a test is
+/// willing to wait. Never apply it to a duration that drives behaviour (a
+/// mock's response delay, a sleep sized against a production patience
+/// window): scaling a stimulus changes what the test proves, while scaling a
+/// deadline costs a passing run nothing and still fails a broken one, just
+/// later.
+fn waiting_budget(base: Duration) -> Duration {
+    #[cfg(windows)]
+    {
+        base * 4
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
 #[cfg(unix)]
 use octos_agent::{HookConfig, HookEvent};
 use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
@@ -3501,7 +3523,7 @@ async fn test_speculative_overflow_concurrent() {
     for i in 0..5 {
         tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
         // Wait for response
-        let resp = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let resp = tokio::time::timeout(waiting_budget(Duration::from_secs(5)), rx.recv())
             .await
             .expect("warmup response timeout")
             .expect("channel closed");
@@ -3524,7 +3546,7 @@ async fn test_speculative_overflow_concurrent() {
     // user-message session_result emission added by #616 fix carries
     // routing metadata in `_session_result` but no body).
     let mut responses = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + waiting_budget(Duration::from_secs(15));
     while responses.len() < 2 {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(msg)) => {
@@ -3596,7 +3618,7 @@ async fn test_speculative_overflow_concurrent() {
 
     // Clean shutdown
     drop(tx);
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    let _ = tokio::time::timeout(waiting_budget(Duration::from_secs(5)), handle).await;
 }
 
 /// FA-11 defect B regression: the overflow assistant reply MUST carry
@@ -5742,6 +5764,32 @@ async fn test_auto_escalation_single_provider_flips_queue_mode() {
 async fn setup_dispatch_registry(
     dir: &tempfile::TempDir,
 ) -> (ActorRegistry, mpsc::Receiver<OutboundMessage>) {
+    let (factory, out_tx, out_rx) =
+        build_minimal_actor_factory(dir, SessionTaskQueryStore::default(), None).await;
+
+    let registry = ActorRegistry::new(
+        factory,
+        Arc::new(Semaphore::new(10)),
+        out_tx,
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+
+    (registry, out_rx)
+}
+
+/// Helper: a minimal but REAL [`ActorFactory`], plus its outbound channel
+/// halves. Callers supply the [`SessionTaskQueryStore`] so they can keep a
+/// handle on the supervisors `ActorFactory::spawn` registers, and the profile
+/// id so the per-profile wiring branches are exercised.
+async fn build_minimal_actor_factory(
+    dir: &tempfile::TempDir,
+    task_query_store: SessionTaskQueryStore,
+    profile_id: Option<String>,
+) -> (
+    ActorFactory,
+    mpsc::Sender<OutboundMessage>,
+    mpsc::Receiver<OutboundMessage>,
+) {
     let provider: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
         "test",
         (0..20)
@@ -5802,24 +5850,17 @@ async fn setup_dispatch_registry(
         adaptive_router: None,
         lane_routing: None,
         memory_store: None,
-        profile_id: None,
+        profile_id,
         plugin_dirs: Vec::new(),
         plugin_extra_env: Vec::new(),
         plugin_require_signed: false,
-        task_query_store: SessionTaskQueryStore::default(),
+        task_query_store,
         subagent_output_router: Arc::new(octos_agent::SubAgentOutputRouter::new(
             dir.path().join("subagent-outputs"),
         )),
     };
 
-    let registry = ActorRegistry::new(
-        factory,
-        Arc::new(Semaphore::new(10)),
-        out_tx,
-        Arc::new(Mutex::new(HashMap::new())),
-    );
-
-    (registry, out_rx)
+    (factory, out_tx, out_rx)
 }
 
 #[tokio::test]
@@ -9614,5 +9655,123 @@ async fn should_reject_approval_response_when_sender_unauthorized() {
         denied.content
     );
 
+    handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// #2056 — WIRING PRESENCE for the goal-task-row observers.
+//
+// #2059 shipped with a stated hole: every production site and every effect
+// test share ONE installer, so behaviour cannot drift — but DELETING an
+// installer call from a production site was caught by nothing. This test
+// closes that hole for the gateway site by driving the real
+// `ActorFactory::spawn` (the function that contains the call at
+// `session_actor.rs`'s supervisor-wiring block) and asserting on the EFFECT:
+// the supervisor `spawn` registered must create and settle a goal-ledger task
+// row. It is deliberately not a source grep and not a direct call to the
+// installer — either would keep passing with the call site deleted.
+// ---------------------------------------------------------------------------
+
+/// Poll a goal ledger until `probe` accepts the row, or fail after ~5s. The
+/// production observers offload every write to the blocking pool, so under a
+/// tokio runtime the effect is asynchronous.
+async fn await_goal_task_row(
+    ledger_path: &std::path::Path,
+    task_id: &str,
+    probe: impl Fn(&octos_fleet::Task) -> bool,
+    what: &str,
+) -> octos_fleet::Task {
+    for _ in 0..250 {
+        if ledger_path.exists()
+            && let Ok(ledger) = octos_fleet::GoalLedger::open(ledger_path)
+            && let Ok(Some(row)) = ledger.get_task(task_id)
+            && probe(&row)
+        {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {what} on {} (task {task_id})",
+        ledger_path.display()
+    );
+}
+
+#[tokio::test]
+async fn should_wire_goal_task_row_observers_when_gateway_actor_is_spawned() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator, GoalSetRequest, InProcessAgentOrchestrator, default_agent_orchestrator,
+    };
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let profile = "tenant-2056-gateway-wiring";
+    let session_key = SessionKey::with_profile(profile, "api", "goal-task-rows-gateway");
+
+    let orchestrator = default_agent_orchestrator();
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: session_key.clone(),
+            profile_id: profile.to_owned(),
+            objective: "ship the thing".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: Some(1_000_000),
+            transition_actor: None,
+        })
+        .expect("set goal");
+    let goal_id = orchestrator
+        .goal_id_for_test(&session_key)
+        .expect("goal id");
+    let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(dir.path(), &goal_id);
+
+    // Drive the REAL gateway wiring. Everything the observers need — the
+    // goal binding resolver, the profile data dir — is derived inside
+    // `ActorFactory::spawn`, not supplied by this test.
+    let store = SessionTaskQueryStore::default();
+    let (factory, _out_tx, _out_rx) =
+        build_minimal_actor_factory(&dir, store.clone(), Some(profile.to_owned())).await;
+    let (tx, handle) = factory.spawn(SpawnParams {
+        session_key: session_key.clone(),
+        channel: "api",
+        chat_id: "goal-task-rows-gateway",
+        semaphore: Arc::new(Semaphore::new(1)),
+        status_indicator: None,
+        system_prompt_override: None,
+        sender_user_id: None,
+        tenant_id: Some(profile.to_owned()),
+    });
+
+    let (supervisor, _supervisor_data_dir) = store
+        .live_entries_for_session(&session_key.to_string())
+        .into_iter()
+        .next()
+        .expect("ActorFactory::spawn must register the session supervisor");
+
+    // on_register half (#2055): registering creates the `running` row.
+    let task_id = supervisor.register(
+        "web_probe",
+        "call-2056-gateway",
+        Some(&session_key.to_string()),
+    );
+    let row = await_goal_task_row(
+        &ledger_path,
+        &task_id,
+        |row| row.status == "running",
+        "the registration observer's `running` row",
+    )
+    .await;
+    assert_eq!(row.goal_id, goal_id);
+
+    // settle half (#2054): the terminal flips it.
+    supervisor.mark_running(&task_id);
+    supervisor.mark_completed(&task_id, vec![]);
+    await_goal_task_row(
+        &ledger_path,
+        &task_id,
+        |row| row.status == "complete",
+        "the settle listener's `complete` row",
+    )
+    .await;
+
+    drop(tx);
     handle.abort();
 }

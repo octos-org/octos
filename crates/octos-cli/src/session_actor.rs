@@ -4654,7 +4654,8 @@ impl SessionActor {
             cost_source,
             self.channel.clone(),
             attribution.map(ToOwned::to_owned),
-        );
+        )
+        .with_cache_read_tokens(u64::from(response.token_usage.cache_read_tokens));
         if let Err(error) = usage_ledger.record(event).await {
             warn!(
                 session = %self.session_key,
@@ -5145,9 +5146,26 @@ impl SessionActor {
             } else {
                 None
             };
+            // Stamp the loop onto anything the cron tool creates during this
+            // turn, so deleting the loop can find those jobs again. Set right
+            // before the turn and cleared right after: a stale value would tag a
+            // user's own job with a loop it has nothing to do with, and the reap
+            // would then delete a schedule the user asked for.
+            if let Some(ref cron) = self.cron_tool {
+                cron.set_origin(octos_bus::CronOrigin {
+                    session_id: Some(self.session_key.to_string()),
+                    loop_id: loop_id_for_self_paced.clone(),
+                    // The actor carries no profile id; `loop_id` is the key the
+                    // reap matches on, so this stays None rather than guessing.
+                    profile_id: None,
+                });
+            }
             let synthetic = self.synthetic_master_continuation_inbound(&continuation);
             self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
                 .await;
+            if let Some(ref cron) = self.cron_tool {
+                cron.set_origin(octos_bus::CronOrigin::default());
+            }
             // If this fire was a self-paced or maintenance loop, peek at
             // the model's reply and re-schedule via the orchestrator.
             // `apply_self_paced_response` no-ops for fixed_interval mode,
@@ -5211,8 +5229,19 @@ impl SessionActor {
                 Some("processed_by_session_actor".to_owned()),
             );
             if is_goal_turn {
-                self.maybe_advance_goal_runtime_after_turn(&profile_id, goal_turn_start)
-                    .await;
+                // #2066 round 2 (codex R1c) — thread the continuation's bound
+                // goal identity into the accountant so a post-clear charge is
+                // goal-id-bound (settles the cleared goal's tombstone, never a
+                // replacement goal).
+                self.maybe_advance_goal_runtime_after_turn(
+                    &profile_id,
+                    continuation
+                        .goal_id
+                        .as_ref()
+                        .map(|goal_id| goal_id.as_str()),
+                    goal_turn_start,
+                )
+                .await;
             }
         }
         drained
@@ -5234,6 +5263,7 @@ impl SessionActor {
     async fn maybe_advance_goal_runtime_after_turn(
         &mut self,
         profile_id: &str,
+        bound_goal_id: Option<&str>,
         goal_turn_start: Instant,
     ) {
         let elapsed_seconds = goal_turn_start.elapsed().as_secs();
@@ -5242,6 +5272,7 @@ impl SessionActor {
         if let Some(snapshot) = orchestrator.record_goal_turn(
             &self.session_key,
             profile_id,
+            bound_goal_id,
             tokens_consumed,
             elapsed_seconds,
         ) {
@@ -5758,6 +5789,13 @@ impl SessionActor {
                                 if !self.channel.is_empty() && !self.chat_id.is_empty() {
                                     cron.set_context(&self.channel, &self.chat_id);
                                 }
+                                // A real inbound message is not a loop fire, so
+                                // clear any loop attribution left by one.
+                                cron.set_origin(octos_bus::CronOrigin {
+                                    session_id: Some(self.session_key.to_string()),
+                                    loop_id: None,
+                                    profile_id: None,
+                                });
                             }
 
                             // Check for abort trigger before processing
@@ -8824,7 +8862,8 @@ impl SessionActor {
                         },
                         channel.clone(),
                         Some("speculative_overflow".to_string()),
-                    );
+                    )
+                    .with_cache_read_tokens(u64::from(conv_response.token_usage.cache_read_tokens));
                     if let Err(error) = ledger.record(event).await {
                         warn!(
                             session = %session_key,

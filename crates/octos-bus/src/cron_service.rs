@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
+use crate::cron_types::{CronJob, CronMode, CronOrigin, CronPayload, CronSchedule, CronStore};
 
 /// Service that manages and executes cron jobs.
 pub struct CronService {
@@ -31,6 +31,19 @@ pub struct CronService {
     /// when that happens, the notify wakes the sleeper on its next
     /// poll and the Arc releases without a delay_ms-long tail.
     shutdown_notify: tokio::sync::Notify,
+}
+
+/// Terse by design: the orchestrator holds an `Arc<CronService>` inside a
+/// `#[derive(Debug)]` struct, and dumping the whole job store — every scheduled
+/// message, channel and chat id — into a state dump is not something a debug
+/// print should do. The store path is enough to identify which service this is.
+impl std::fmt::Debug for CronService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CronService")
+            .field("store_path", &self.store_path)
+            .field("running", &self.running.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl CronService {
@@ -152,6 +165,23 @@ impl CronService {
         payload: CronPayload,
         timezone: Option<String>,
     ) -> Result<CronJob> {
+        self.add_job_with_origin(name, schedule, payload, timezone, CronOrigin::default())
+    }
+
+    /// Add a job that records what created it.
+    ///
+    /// The origin is what lets `loop/delete` find this job later. Callers that
+    /// have no originating context pass [`CronOrigin::default`] and the field is
+    /// omitted from the stored JSON entirely — a hand-made job looks exactly as
+    /// it did before this existed.
+    pub fn add_job_with_origin(
+        self: &std::sync::Arc<Self>,
+        name: String,
+        schedule: CronSchedule,
+        payload: CronPayload,
+        timezone: Option<String>,
+        origin: CronOrigin,
+    ) -> Result<CronJob> {
         let now_ms = Utc::now().timestamp_millis();
         let id = short_id();
 
@@ -167,6 +197,7 @@ impl CronService {
             created_at_ms: now_ms,
             delete_after_run,
             timezone,
+            origin,
         };
         job.compute_next_run(now_ms);
 
@@ -220,6 +251,51 @@ impl CronService {
         if removed {
             self.arm_timer();
             debug!(id = %id, "removed cron job");
+        }
+
+        removed
+    }
+
+    /// Remove every job created by `loop_id`. Returns the ids removed.
+    ///
+    /// Called when a loop is deleted. A job whose origin names the loop has
+    /// nothing left that wants it: the loop is gone, and before jobs recorded an
+    /// origin there was no way to find them at all — they simply kept firing.
+    ///
+    /// Matches on the recorded origin only, never on `name`. Job names are
+    /// derived from message text, so reaping by name would delete a job merely
+    /// because a user mentioned the loop in a message.
+    ///
+    /// Mutate + persist under one lock hold, and roll the whole batch back on a
+    /// failed write, so memory never diverges from the file — the same
+    /// persistence invariant `remove_job` keeps.
+    pub fn remove_jobs_for_loop(self: &std::sync::Arc<Self>, loop_id: &str) -> Vec<String> {
+        let removed = {
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut extracted = Vec::new();
+            let mut kept = Vec::with_capacity(store.jobs.len());
+            for job in store.jobs.drain(..) {
+                if job.belongs_to_loop(loop_id) {
+                    extracted.push(job);
+                } else {
+                    kept.push(job);
+                }
+            }
+            store.jobs = kept;
+            if extracted.is_empty() {
+                Vec::new()
+            } else if let Err(e) = persist_store_locked(&self.store_path, &store) {
+                store.jobs.extend(extracted);
+                tracing::warn!(loop_id = %loop_id, "failed to save cron store: {e}");
+                Vec::new()
+            } else {
+                extracted.into_iter().map(|j| j.id).collect()
+            }
+        };
+
+        if !removed.is_empty() {
+            self.arm_timer();
+            debug!(loop_id = %loop_id, count = removed.len(), "reaped cron jobs for deleted loop");
         }
 
         removed
@@ -557,7 +633,21 @@ impl CronService {
 
     /// Fire a single job by sending an InboundMessage into the bus.
     async fn execute_job(&self, job: &CronJob) {
-        info!(job_id = %job.id, name = %job.name, "executing cron job");
+        info!(job_id = %job.id, name = %job.name, mode = ?job.payload.mode, "executing cron job");
+
+        // Notify jobs never reach the bus. The bus is what turns a cron fire
+        // into an `InboundMessage` the gateway answers with a model turn, so
+        // sending one here would spend a turn restating text the job already
+        // holds. Returning before the send is the whole saving: a 60s notify job
+        // costs 1440 deliveries a day and zero tokens.
+        if job.payload.mode == CronMode::Notify {
+            debug!(
+                job_id = %job.id,
+                channel = ?job.payload.channel,
+                "cron notify: delivering message verbatim, no model turn"
+            );
+            return;
+        }
 
         let msg = InboundMessage {
             channel: "system".into(),
@@ -816,6 +906,102 @@ mod tests {
         (service, rx)
     }
 
+    fn payload(message: &str, mode: CronMode) -> CronPayload {
+        CronPayload {
+            message: message.into(),
+            deliver: false,
+            channel: None,
+            chat_id: None,
+            mode,
+        }
+    }
+
+    #[test]
+    fn reaping_a_loop_removes_only_that_loops_jobs() {
+        // The whole point of recording an origin: a deleted loop's jobs go with
+        // it, and nothing else moves. A user's own schedule sitting in the same
+        // file must survive, which is why the match is on the recorded loop_id
+        // and never on the job name.
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _rx) = make_service(dir.path());
+
+        let from_loop = service
+            .add_job_with_origin(
+                "loop-made".into(),
+                CronSchedule::Every { every_ms: 5_000 },
+                payload("tick", CronMode::Agent),
+                None,
+                CronOrigin {
+                    loop_id: Some("loop_03".into()),
+                    session_id: Some("alan:local:tui#coding".into()),
+                    profile_id: None,
+                },
+            )
+            .expect("add loop job");
+        let other_loop = service
+            .add_job_with_origin(
+                "other-loop".into(),
+                CronSchedule::Every { every_ms: 5_000 },
+                payload("tick", CronMode::Agent),
+                None,
+                CronOrigin {
+                    loop_id: Some("loop_04".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("add other loop job");
+        // Named after the loop but NOT created by it — the exact trap that
+        // reaping on `name` would fall into.
+        let user_made = service
+            .add_job(
+                "loop_03_hi".into(),
+                CronSchedule::Every { every_ms: 60_000 },
+                payload("hi", CronMode::Agent),
+            )
+            .expect("add user job");
+
+        let reaped = service.remove_jobs_for_loop("loop_03");
+        assert_eq!(reaped, vec![from_loop.id.clone()]);
+
+        let left: Vec<String> = service.list_all_jobs().into_iter().map(|j| j.id).collect();
+        assert!(!left.contains(&from_loop.id), "loop_03's job must be gone");
+        assert!(left.contains(&other_loop.id), "loop_04's job must survive");
+        assert!(
+            left.contains(&user_made.id),
+            "a job merely NAMED loop_03_hi must survive"
+        );
+
+        // Reaping a loop with no jobs is a no-op, not an error.
+        assert!(service.remove_jobs_for_loop("loop_99").is_empty());
+    }
+
+    #[test]
+    fn origin_and_mode_round_trip_and_default_for_legacy_jobs() {
+        // Both fields must be invisible to a cron.json written before they
+        // existed: it has to load, and every job in it has to keep behaving
+        // exactly as it did — agent mode, no origin, nothing reapable.
+        let legacy = r#"{"version":1,"jobs":[{
+            "id":"414efd80","name":"println-hello","enabled":true,
+            "schedule":{"kind":"Every","every_ms":60000},
+            "payload":{"message":"println hello","deliver":true,
+                       "channel":"api","chat_id":null},
+            "state":{"next_run_at_ms":null,"last_run_at_ms":null,"last_status":null},
+            "created_at_ms":1787036822813,"delete_after_run":false}]}"#;
+        let store: CronStore = serde_json::from_str(legacy).expect("legacy cron.json must load");
+        let job = &store.jobs[0];
+        assert_eq!(job.payload.mode, CronMode::Agent, "legacy jobs stay agent");
+        assert!(job.origin.is_empty(), "legacy jobs have no origin");
+        assert!(!job.belongs_to_loop("loop_03"));
+
+        // And an empty origin is omitted entirely when written back, so the
+        // file shape is unchanged for jobs that have nothing to record.
+        let round = serde_json::to_string(&store).expect("serialize");
+        assert!(
+            !round.contains("origin"),
+            "empty origin must not be written"
+        );
+    }
+
     #[test]
     fn concurrent_adds_and_reconciling_toggles_lose_nothing() {
         // codex #1612 r3: every mutation persists before releasing the
@@ -835,6 +1021,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -851,6 +1039,8 @@ mod tests {
                         deliver: false,
                         channel: None,
                         chat_id: None,
+
+                        mode: Default::default(),
                     },
                 )
                 .unwrap();
@@ -901,6 +1091,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -927,6 +1119,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -954,6 +1148,8 @@ mod tests {
                         deliver: false,
                         channel: None,
                         chat_id: None,
+
+                        mode: Default::default(),
                     },
                 )
                 .unwrap();
@@ -983,6 +1179,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
                 Some("America/New_York".into()),
             )
@@ -1012,6 +1210,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
                 None,
             )
@@ -1035,6 +1235,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -1082,6 +1284,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -1095,6 +1299,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -1124,6 +1330,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -1137,6 +1345,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -1163,6 +1373,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -1177,6 +1389,8 @@ mod tests {
                     deliver: false,
                     channel: None,
                     chat_id: None,
+
+                    mode: Default::default(),
                 },
             )
             .unwrap();
@@ -1225,6 +1439,8 @@ mod tests {
             deliver: false,
             channel: None,
             chat_id: None,
+
+            mode: Default::default(),
         };
 
         // Added while stopped, so arm_timer no-ops until start().
@@ -1364,6 +1580,8 @@ mod tests {
             deliver: false,
             channel: None,
             chat_id: None,
+
+            mode: Default::default(),
         };
 
         // Fill the channel BEFORE the timer can fire: the tick's send

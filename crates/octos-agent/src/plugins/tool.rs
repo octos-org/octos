@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use octos_core::{PathClassification, SessionScope};
+use octos_llm::vertex_auth::TokenSource;
 
 use crate::harness_errors::HarnessError;
 use crate::harness_events::{
@@ -88,6 +89,15 @@ pub struct PluginTool {
     /// Extra environment variables to inject into the plugin's environment.
     /// Secret-like names require the tool manifest's explicit env allowlist.
     extra_env: Vec<(String, String)>,
+    /// Host-owned, cached Vertex token source shared by plugin tools. The
+    /// short-lived token is injected only when the manifest explicitly
+    /// allowlists `VERTEX_ACCESS_TOKEN`; the service-account JSON remains the
+    /// backwards-compatible fallback inside the plugin.
+    vertex_token_source: Option<Arc<dyn TokenSource>>,
+    /// Project paired with `vertex_token_source`; injected alongside the
+    /// short-lived token so the plugin does not need the service-account JSON
+    /// merely to discover its Vertex project.
+    vertex_project_id: Option<String>,
     /// Working directory for plugin execution (created on first use).
     work_dir: Option<PathBuf>,
     /// Execution timeout.
@@ -147,6 +157,8 @@ impl PluginTool {
             executable,
             blocked_env: vec![],
             extra_env: vec![],
+            vertex_token_source: None,
+            vertex_project_id: None,
             work_dir: None,
             timeout: Self::DEFAULT_TIMEOUT,
             synthesis_config: None,
@@ -216,6 +228,19 @@ impl PluginTool {
     /// Set extra environment variables to inject into plugin execution.
     pub fn with_extra_env(mut self, env: Vec<(String, String)>) -> Self {
         self.extra_env = env;
+        self
+    }
+
+    /// Attach a host-owned Vertex token source. Multiple tools should receive
+    /// clones of the same `Arc` so separate plugin processes reuse one OAuth
+    /// token instead of exchanging the service-account key on every call.
+    pub fn with_vertex_token_source(
+        mut self,
+        source: Arc<dyn TokenSource>,
+        project_id: String,
+    ) -> Self {
+        self.vertex_token_source = Some(source);
+        self.vertex_project_id = Some(project_id);
         self
     }
 
@@ -392,6 +417,8 @@ impl PluginTool {
             executable: self.executable.clone(),
             blocked_env: self.blocked_env.clone(),
             extra_env: self.extra_env.clone(),
+            vertex_token_source: self.vertex_token_source.clone(),
+            vertex_project_id: self.vertex_project_id.clone(),
             work_dir: Some(work_dir),
             timeout: self.timeout,
             synthesis_config: self.synthesis_config.clone(),
@@ -421,6 +448,8 @@ impl PluginTool {
             executable: self.executable.clone(),
             blocked_env: self.blocked_env.clone(),
             extra_env: self.extra_env.clone(),
+            vertex_token_source: self.vertex_token_source.clone(),
+            vertex_project_id: self.vertex_project_id.clone(),
             work_dir: self.work_dir.clone(),
             timeout: self.timeout,
             synthesis_config: self.synthesis_config.clone(),
@@ -2378,6 +2407,20 @@ impl Tool for PluginTool {
         }
     }
 
+    fn execution_timeout_secs(&self) -> Option<u64> {
+        // `self.timeout` is the plugin process's own deadline. Give that
+        // inner layer a short window to emit its typed timeout result and
+        // reap the process group before either the registry or the agent's
+        // outer dispatcher applies its last-resort cancellation.
+        const CLEANUP_GRACE_SECS: u64 = 5;
+        Some(
+            self.timeout
+                .as_secs()
+                .max(1)
+                .saturating_add(CLEANUP_GRACE_SECS),
+        )
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         let mut schema = self.tool_def.input_schema.clone();
         // Inject `timeout_secs` so the LLM can request longer timeouts for
@@ -2654,8 +2697,48 @@ impl Tool for PluginTool {
         // also keeps approval-prompt cwd and runtime cwd in lockstep.
         let ctx = ctx_snapshot;
 
+        // Prepare the short-lived token before forwarding static env. If this
+        // succeeds, suppress the long-lived service-account JSON and provide
+        // only the token plus project. If it fails, keep the old JSON path as
+        // a backwards-compatible fallback.
+        let prepared_vertex_token = if let (Some(source), Some(project_id)) =
+            (&self.vertex_token_source, &self.vertex_project_id)
+        {
+            let token_permitted = if strict_env_gate {
+                should_forward_env_name_strict("VERTEX_ACCESS_TOKEN", &env_allowlist)
+            } else {
+                should_forward_env_name("VERTEX_ACCESS_TOKEN", &env_allowlist)
+            };
+            let project_permitted = if strict_env_gate {
+                should_forward_env_name_strict("GOOGLE_CLOUD_PROJECT", &env_allowlist)
+            } else {
+                should_forward_env_name("GOOGLE_CLOUD_PROJECT", &env_allowlist)
+            };
+            if token_permitted && project_permitted {
+                match source.token().await {
+                    Ok(token) => Some((token, project_id.clone())),
+                    Err(error) => {
+                        tracing::warn!(
+                            plugin = %self.plugin_name,
+                            tool = %self.tool_def.name,
+                            error = %error,
+                            "failed to prepare cached Vertex token; plugin fallback remains available"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
+            if key == "VERTEX_SA_JSON" && prepared_vertex_token.is_some() {
+                continue;
+            }
             let permitted = if strict_env_gate {
                 should_forward_env_name_strict(key, &env_allowlist)
             } else {
@@ -2671,6 +2754,11 @@ impl Tool for PluginTool {
                 "skipping non-allowlisted environment variable for plugin tool"
                 );
             }
+        }
+
+        if let Some((token, project_id)) = prepared_vertex_token {
+            cmd.env("VERTEX_ACCESS_TOKEN", token);
+            cmd.env("GOOGLE_CLOUD_PROJECT", project_id);
         }
 
         if let Some(sink) = ctx
@@ -2714,6 +2802,24 @@ impl Tool for PluginTool {
             }
             cmd.current_dir(dir);
             cmd.env("OCTOS_WORK_DIR", dir);
+        }
+
+        // A plugin's output CWD is commonly `<session workspace>/skill-output`,
+        // while file_each skill actions materialize their inputs under
+        // `<session workspace>/uploads`. Keep those two roots explicit: a
+        // plugin must not have to infer the session root from its output CWD,
+        // and it must never treat a caller-supplied path as that root.
+        if self
+            .tool_def
+            .env
+            .iter()
+            .any(|name| name == "OCTOS_SESSION_WORKSPACE")
+        {
+            if let Some(session_workspace) = self.workspace_root_for_host_injection(
+                ctx.as_ref().and_then(|ctx| ctx.session_scope.as_deref()),
+            ) {
+                cmd.env("OCTOS_SESSION_WORKSPACE", session_workspace);
+            }
         }
 
         // Codex round-3 BLOCKER fix (PR #1186 review): when

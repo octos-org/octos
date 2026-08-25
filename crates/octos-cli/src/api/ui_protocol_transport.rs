@@ -144,7 +144,9 @@ use crate::context_manager::{
     PromptFrame, load_or_rebuild_context_manager, persist_context_manager_snapshot,
 };
 use crate::peers::*;
-use crate::usage_ledger::{PersistentUsageLedger, USAGE_LEDGER_FILE, UsageCostSource, UsageEvent};
+use crate::usage_ledger::{
+    PersistentUsageLedger, USAGE_LEDGER_FILE, UsageCostSource, UsageEvent, UsageTotals,
+};
 use crate::user_store::UserRole;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
@@ -556,7 +558,6 @@ pub(crate) struct WsConnection {
     /// [`update_live_features`]). Reads are far more frequent than
     /// writes, so `RwLock` is the right fit.
     live_features: Arc<std::sync::RwLock<ConnectionUiFeatures>>,
-    live_profile_id: Arc<std::sync::RwLock<String>>,
 }
 
 impl WsConnection {
@@ -569,7 +570,6 @@ impl WsConnection {
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
-            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -585,7 +585,6 @@ impl WsConnection {
             live_features: Arc::new(std::sync::RwLock::new(
                 ConnectionUiFeatures::stdio_defaults(),
             )),
-            live_profile_id: Arc::new(std::sync::RwLock::new(MAIN_PROFILE_ID.to_owned())),
         }
     }
 
@@ -610,21 +609,6 @@ impl WsConnection {
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = features;
-    }
-
-    fn snapshot_live_profile_id(&self) -> String {
-        match self.live_profile_id.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
-    fn update_live_profile_id(&self, profile_id: String) {
-        let mut guard = match self.live_profile_id.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = profile_id;
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -4438,6 +4422,12 @@ impl Drop for AbortOnDrop {
 /// (`tick % 8 == 0`) so the cadence feels identical across surfaces.
 const STATUS_WORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// #2066 round 4 (codex fix 2) — cadence of the AppUI goal-turn in-flight
+/// heartbeat, mirroring the session actor's `IN_FLIGHT_HEARTBEAT_INTERVAL`
+/// (#2003): well under the 30-minute staleness horizon, coarse enough to be
+/// free.
+const APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// CJK code-point check shared with `status_indicator::has_cjk` — kept
 /// inline here to avoid pulling the channel-aware status_indicator
 /// module into the WS turn path.
@@ -6086,6 +6076,9 @@ async fn ui_protocol_connection(
                     &contracts.user_questions,
                     &live_forwarders,
                     connection_profile_id,
+                    // Frozen at WS upgrade (and at session-ingress upgrade),
+                    // never rebound for the life of this connection.
+                    connection_profile_id,
                     features,
                     id,
                     params,
@@ -6857,6 +6850,11 @@ where
                     &contracts.user_questions,
                     &live_forwarders,
                     next_connection_profile_id.as_deref(),
+                    // NOT pinned: stdio rebinds `connection_profile_id_owned`
+                    // after every successful open, so a later open under
+                    // another profile retargets this session's turns exactly
+                    // as `session_open_profile_id` does on the WS path.
+                    None,
                     features,
                     id,
                     params,
@@ -9736,6 +9734,84 @@ fn raw_catalog_result(_state: &AppState, _profile_id: Option<&str>) -> Result<Va
     Ok(json!({ "families": Value::Object(families) }))
 }
 
+/// Cumulative token usage for one session, for the `usage` field of
+/// `session/status/read`.
+///
+/// This used to be a hardcoded `{}`, so every field of octoscode's
+/// `SessionUsageStatus` decoded to `None` on every read — the whole usage
+/// readout was dead, and `cached_input_tokens` in particular meant operators
+/// had no way to tell whether prompt caching (the largest cost lever, on by
+/// default) was working at all.
+///
+/// Sourced from the persistent usage ledger so the figures survive runtime
+/// rebuilds and restarts, matching the REST endpoints in `api::usage`. Reads
+/// are best-effort: a missing or unreadable ledger yields `{}` exactly as
+/// before rather than failing the whole status read, which also keeps
+/// deployments with no ledger configured working unchanged.
+///
+/// `session/status/read` is event-driven and deduped client-side
+/// (`enqueue_session_status_probe`), not interval-polled, so opening the
+/// ledger here costs roughly what the existing `/api/usage` handlers already
+/// pay per request.
+async fn session_usage_status(state: &Arc<AppState>, profile_id: &str, session_id: &str) -> Value {
+    let Some(store) = state.profile_store.as_ref() else {
+        return json!({});
+    };
+    let Ok(Some(profile)) = store.get(profile_id) else {
+        return json!({});
+    };
+    let data_dir = store.resolve_data_dir(&profile);
+    let ledger = match PersistentUsageLedger::open(&data_dir).await {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            debug!(
+                data_dir = %data_dir.display(),
+                error = %error,
+                "usage ledger unavailable for session status; reporting empty usage"
+            );
+            return json!({});
+        }
+    };
+    let totals = match ledger.session_totals(session_id).await {
+        Ok(totals) => totals,
+        Err(error) => {
+            debug!(
+                session = %session_id,
+                error = %error,
+                "failed to read session usage totals; reporting empty usage"
+            );
+            return json!({});
+        }
+    };
+    usage_status_json(&totals)
+}
+
+/// Shape [`UsageTotals`] into the `usage` object octoscode's
+/// `SessionUsageStatus` decodes. Split out from [`session_usage_status`] so
+/// the field mapping is testable without standing up an `AppState`.
+fn usage_status_json(totals: &UsageTotals) -> Value {
+    // A session with no recorded runs reports `{}` rather than a row of
+    // zeroes: octoscode renders each field only when present, and zeroes
+    // would claim "0 tokens used" for a session whose usage simply has not
+    // been written yet.
+    if totals.run_count == 0 {
+        return json!({});
+    }
+    let mut usage = json!({
+        "input_tokens": totals.input_tokens,
+        "output_tokens": totals.output_tokens,
+        "cached_input_tokens": totals.cache_read_tokens,
+    });
+    // Only emit a cost when the ledger actually priced something. A session
+    // whose model has no catalog pricing accumulates tokens but no spend, and
+    // reporting a confident `$0.0000` there is worse than reporting nothing.
+    if totals.estimated_cost_usd > 0.0 {
+        usage["estimated_cost_micros_usd"] =
+            json!((totals.estimated_cost_usd * 1_000_000.0).round() as u64);
+    }
+    usage
+}
+
 async fn raw_session_status_result(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
@@ -9797,7 +9873,10 @@ async fn raw_session_status_result(
         "health": { "status": "ok" },
         "mcp_summary": { "connected": 0, "connecting": 0, "failed": 0, "disabled": 0 },
         "tool_summary": { "visible": 0, "enabled": 0, "denied": 0, "policy_id": "profile" },
-        "usage": {},
+        // The ledger keys sessions by the `SessionKey`'s string form (see
+        // `SessionActor::record_usage_event`); match it exactly or every
+        // lookup silently returns zero totals.
+        "usage": session_usage_status(state, &profile_id, &session_id.to_string()).await,
         "cursor": { "healthy": true, "replay_supported": true },
         "capabilities": features.advertised_capabilities(state),
     });
@@ -11198,6 +11277,21 @@ async fn load_skill_action_job_view(
         Ok(runtime) => {
             let profile_id = runtime.profile.profile_id.clone();
             let supervisor = runtime.tools.supervisor();
+            // #2056 round 2 (H2a) — wire the goal-task-row pair BEFORE this
+            // path's `enable_persistence`. This request can be the FIRST thing
+            // to touch the cached session supervisor after boot; a later
+            // wiring re-enables the same ledger path and returns at
+            // `enable_persistence`'s idempotence guard, so the restore would
+            // otherwise be observed by nobody. (`set_on_restore` also delivers
+            // an already-missed restore, which covers any future site that
+            // enables first — this keeps the observers present from the very
+            // first touch so registrations in between are recorded too.)
+            wire_goal_task_row_observers_for_cached_supervisor(
+                &supervisor,
+                session_id,
+                &profile_id,
+                &runtime.profile.data_dir,
+            );
             install_skill_action_job_projection_listener(
                 &supervisor,
                 &profile_id,
@@ -11221,9 +11315,15 @@ async fn load_skill_action_job_view(
         }
         Err(_) => {
             let (profile_id, store_root) = skill_action_profile_data_dir(state, active_profile_id)?;
-            let jobs = load_skill_action_jobs(&store_root, session_id).map_err(|error| {
-                RpcError::internal_error(format!("failed to restore skill action tasks: {error}"))
-            })?;
+            // #2056 round 3 (R4) — `store_root` IS the profile data dir, so the
+            // throwaway supervisor inside can wire the goal-task-row observers
+            // and reconcile like every other restore path.
+            let jobs =
+                load_skill_action_jobs(&store_root, &profile_id, session_id).map_err(|error| {
+                    RpcError::internal_error(format!(
+                        "failed to restore skill action tasks: {error}"
+                    ))
+                })?;
             Ok((profile_id, jobs))
         }
     }
@@ -11792,8 +11892,7 @@ fn raw_profile_llm_delete(
         ));
     };
 
-    let applied: bool;
-    if llm
+    let applied = if llm
         .primary
         .as_ref()
         .is_some_and(|primary| same_llm_selection_address(primary, &target))
@@ -11805,13 +11904,13 @@ fn raw_profile_llm_delete(
         if !llm.fallbacks.is_empty() {
             llm.primary = Some(llm.fallbacks.remove(0));
         }
-        applied = true;
+        true
     } else {
         let before = llm.fallbacks.len();
         llm.fallbacks
             .retain(|fallback| !same_llm_selection_address(fallback, &target));
-        applied = llm.fallbacks.len() != before;
-    }
+        llm.fallbacks.len() != before
+    };
     profile.config.llm = Some(llm);
 
     if !applied {
@@ -12002,22 +12101,30 @@ async fn raw_profile_llm_test(
         api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
     };
 
-    let Some(api_key) = secret_from_value(params.api_key).or_else(|| {
+    let resolved_key = secret_from_value(params.api_key).or_else(|| {
         route.api_key_env.as_ref().and_then(|env_name| {
             // Resolve a keychain marker to the real secret (e.g. a scoped Vertex
             // SA JSON); plain values pass through unchanged.
             let raw = profile.as_ref()?.config.env_vars.get(env_name)?;
             crate::auth::keychain::resolve_value(env_name, raw)
         })
-    }) else {
-        return Ok(profile_llm_test_result(
-            state,
-            &profile_id,
-            profile.as_ref(),
-            false,
-            "Provider connection failed",
-            Some("No API key provided".into()),
-        ));
+    });
+    let api_key = match resolved_key {
+        Some(key) => key,
+        // Keyless local families (local/ollama/vllm) construct without a
+        // key — dead-ending them on "No API key provided" blocked the
+        // keyless onboarding test entirely (red-team pass).
+        None if octos_llm::registry::is_keyless(&family_id) => String::new(),
+        None => {
+            return Ok(profile_llm_test_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                false,
+                "Provider connection failed",
+                Some("No API key provided".into()),
+            ));
+        }
     };
 
     let provider =
@@ -12136,13 +12243,19 @@ async fn raw_profile_llm_fetch_models(
         })
     });
 
-    let Some(api_key) = api_key else {
-        return Ok(json!({
-            "profile_id": profile_id,
-            "family_id": family_id,
-            "models": [],
-            "reason": "no_api_key",
-        }));
+    let api_key = match api_key {
+        Some(key) => key,
+        // Keyless local families still get model listing — their /v1/models
+        // answers without auth (red-team pass).
+        None if octos_llm::registry::is_keyless(&family_id) => String::new(),
+        None => {
+            return Ok(json!({
+                "profile_id": profile_id,
+                "family_id": family_id,
+                "models": [],
+                "reason": "no_api_key",
+            }));
+        }
     };
 
     let models =
@@ -12172,7 +12285,9 @@ fn build_test_llm_provider(
     api_key: &str,
 ) -> Result<Arc<dyn octos_llm::LlmProvider>, String> {
     let params = octos_llm::registry::CreateParams {
-        api_key: Some(api_key.to_owned()),
+        // Empty means "keyless family" — let the factory apply its own
+        // fallback instead of sending an empty Bearer token.
+        api_key: (!api_key.is_empty()).then(|| api_key.to_owned()),
         model: Some(model_id.to_owned()),
         base_url: base_url.clone(),
         model_hints: None,
@@ -16883,6 +16998,11 @@ async fn handle_session_open(
     questions: &PendingQuestionStore,
     live_forwarders: &SharedLiveForwarders,
     connection_profile_id: Option<&str>,
+    // #2067 — the profile this connection is FROZEN to for its whole lifetime,
+    // or `None` when the transport has no such pin. Used only to decide whether
+    // the session scope may serve as a DELIVERY filter; it never changes what
+    // the session resolves to. See `ledger_event_matches_profile_scope`.
+    pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     mut params: SessionOpenParams,
@@ -16937,6 +17057,7 @@ async fn handle_session_open(
         questions,
         ws.connection_id,
         connection_profile_id,
+        pinned_profile_id,
         features,
         params,
     )
@@ -16954,7 +17075,14 @@ async fn handle_session_open(
             return false;
         }
     };
-    ws.update_live_profile_id(outcome.profile_id.clone());
+    // #2067 (H2) — this session's resolved profile, captured for the live
+    // forwarder installed at the end of this function. It is deliberately a
+    // per-forwarder value and NOT connection-wide state: a connection keeps one
+    // forwarder PER SESSION, and an unscoped connection may open a second
+    // session under a different profile. Sharing one mutable cell across
+    // forwarders let the second open silently retarget the first session's
+    // pump, starving it of every profile-carrying frame.
+    let live_profile_scope = outcome.profile_scope.clone();
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -16996,7 +17124,7 @@ async fn handle_session_open(
     //
     // Reusing the helper keeps replay and live capability behavior in lockstep.
     for event in outcome.replay {
-        if !ledger_event_matches_profile_scope(&event.event, &outcome.profile_id) {
+        if !ledger_event_matches_profile_scope(&event.event, outcome.profile_scope.as_deref()) {
             continue;
         }
         let projected = features
@@ -17093,6 +17221,7 @@ async fn handle_session_open(
         ws.connection_id,
         features,
         topic_scope,
+        live_profile_scope,
         live_rx,
         live_forwarders.clone(),
     )
@@ -17144,13 +17273,211 @@ fn ledger_event_matches_topic_scope(
     }
 }
 
-fn ledger_event_matches_profile_scope(event: &UiProtocolLedgerEvent, profile_id: &str) -> bool {
-    match event {
-        UiProtocolLedgerEvent::Notification(UiNotification::SkillActionJobUpdated(update)) => {
-            update.profile_id == profile_id
+/// #2067 — a durable event that names a profile must reach ONLY connections
+/// resolved to that profile. This filter runs at all three delivery boundaries
+/// (the `replay.retain` in `open_session_result`, the session/open replay send
+/// loop, and the live forwarder pump), so a variant it does not recognise
+/// leaks across tenants on every shared/unprofiled wire session key — which is
+/// exactly what `session/goal/updated` and `session/goal/cleared` did — and
+/// what the `loop/*` and `monitor/*` frames beside them did, since most of them
+/// are appended DURABLY by the same `record_autonomy_rpc_evidence` ->
+/// `send_notification_durable` dispatch and all of them carry tenant text
+/// (goal objective, loop prompt, monitor argv/name).
+///
+/// `MonitorFired` and `BackgroundActivity` are the exceptions to "stamped by
+/// `resolve_autonomy_profile_id`": both are emitted off the continuation drain
+/// from a stored record, and that record's profile is the TURN's
+/// `ProfileRuntime` id whenever the monitor or fleet was created by a model
+/// tool. Filtering them is safe only because
+/// [`connection_filterable_profile_scope`] refuses to filter on a scope that
+/// can disagree with the turn's profile.
+///
+/// `profile_id` is the connection's RESOLVED scope and is always a concrete
+/// string — [`WsConnection`] seeds [`MAIN_PROFILE_ID`] and `session/open`
+/// overwrites it with `open_session_result`'s
+/// `active_profile_id.unwrap_or(MAIN_PROFILE_ID)`. `_main` is therefore a real
+/// scope on both sides of the wire, NOT a wildcard: the emitters normalize the
+/// same way (`resolve_autonomy_profile_id` returns `_main` for an unprofiled
+/// deployment), and treating an unscoped connection as "authorized for any
+/// profile" is deployment-dependent — see the KNOWN LIMITATION on the
+/// interactive goal-charge binding.
+///
+/// NOT filtered, deliberately: `AgentUpdated`, `PeerStaged` and `PeerClosed`.
+/// All three are durable and all three leak, but they are stamped from the
+/// TURN's `ProfileRuntime` rather than from `validate_session_scope`, and those
+/// two resolutions diverge when an unscoped connection carries a routed profile
+/// (`connection_profile_id.or(routed_profile_id)` — `validate_session_scope`
+/// never consults the routed id). Filtering them before that divergence is
+/// closed would starve exactly the reconnect-replay path they exist for. See
+/// issue #2081. `LoopCompleted` / `MonitorExpired` have no producer at all
+/// (issue #2080).
+///
+/// Every arm below prefers the event's top-level stamp and falls back to the
+/// profile on the record it carries. The fallback is not cosmetic: the
+/// `loop/pause`, `loop/resume` and `loop/delete` results omit the top-level
+/// `profile_id` entirely (see `AgentOrchestrator::control_loop`) and only the
+/// nested `loop` record names the owner. A fallback can only ever NARROW an
+/// event's audience, never widen it.
+/// #2067 — the profile scope a connection may be FILTERED against, or `None`
+/// when it has none and every delivery must pass.
+///
+/// Filtering is sound only when the scope a forwarder captured at
+/// `session/open` provably equals the profile that session's TURNS run under,
+/// for the whole life of the forwarder. That matters because a turn's
+/// `ProfileRuntime` hard-binds its profile onto every record the model's tools
+/// create (`runtime/profile.rs` registers `MonitorCreateTool::new(profile.id)`,
+/// and the tool persists that id), and the durable frames those records emit
+/// carry it. Filter against a scope the turn does not share and the connection
+/// is starved of its OWN data — fatally so for `background/activity`, whose
+/// sink appends over a detached connection and therefore has no delivery path
+/// except replay and live fan-out.
+///
+/// The turn resolves
+/// `session.profile_id().or(connection.or(routed.or(session_open)))`, and both
+/// `routed` and `session_open` are per-CONNECTION mutable state: `session_open`
+/// is a single cell that every successful open overwrites, so opening a second
+/// bare session under another profile retargets the turns of the FIRST one.
+/// A per-session captured scope can never track that.
+///
+/// The one binding that cannot drift is an authenticated connection profile:
+/// it is frozen at WS upgrade, and `validate_authenticated_session_scope`
+/// forces every session opened on that connection to it or rejects the open
+/// outright. So the whole connection has exactly one profile, every forwarder
+/// captures it, and `connection.or(..)` short-circuits onto it for every turn.
+/// That is the only case this filter may act on, and it is exactly the case
+/// #2067 reports: a tenant is an authenticated user.
+///
+/// A routed profile cannot break this even when it names a DIFFERENT profile —
+/// which it legitimately can, since an admin-role user is authorized for every
+/// profile and a parent user for its owned subaccounts, and both still present
+/// an authenticated `connection_profile_id`. `connection.or(routed)` never
+/// reaches `routed` while the connection profile is set, and a session key
+/// belonging to another profile is rejected before any turn starts.
+///
+/// Callers pass `None` for a transport whose binding is NOT frozen — stdio
+/// rebinds `connection_profile_id_owned` after every successful open, so it
+/// drifts exactly as `session_open` does and must not be filtered. Declining to
+/// filter costs no tenant isolation: an unscoped WS connection is an
+/// admin/operator authorized for every profile (or auth is disabled and every
+/// route is deliberately open), and stdio is a single local user.
+fn ledger_event_matches_profile_scope(
+    event: &UiProtocolLedgerEvent,
+    profile_id: Option<&str>,
+) -> bool {
+    // `None` = this connection's scope is not a tenant boundary (see
+    // `connection_filterable_profile_scope`); deliver everything.
+    let Some(profile_id) = profile_id else {
+        return true;
+    };
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return true;
+    };
+    match notification {
+        UiNotification::SkillActionJobUpdated(update) => update.profile_id == profile_id,
+        // The goal chip's reducers are session-keyed and apply `updated`
+        // unconditionally, so a foreign profile's objective/budget would paint
+        // straight into this connection's chip.
+        UiNotification::SessionGoalUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.goal.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::SessionGoalCleared(cleared) => optional_profile_scope_matches(
+            cleared.profile_id.as_deref().or_else(|| {
+                cleared
+                    .goal
+                    .as_ref()
+                    .and_then(|goal| goal.profile_id.as_deref())
+            }),
+            profile_id,
+        ),
+        UiNotification::LoopUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.loop_state.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::LoopFired(fired) => optional_profile_scope_matches(
+            fired.profile_id.as_deref().or_else(|| {
+                fired
+                    .loop_state
+                    .as_ref()
+                    .and_then(|loop_state| loop_state.profile_id.as_deref())
+            }),
+            profile_id,
+        ),
+        UiNotification::MonitorUpdated(update) => optional_profile_scope_matches(
+            update
+                .profile_id
+                .as_deref()
+                .or(update.monitor_state.profile_id.as_deref()),
+            profile_id,
+        ),
+        UiNotification::MonitorFired(fired) => {
+            optional_profile_scope_matches(fired.profile_id.as_deref(), profile_id)
+        }
+        // `session/open` is appended for BROADCAST — the emit site tags it with
+        // the opening connection id specifically so OTHER connections observe
+        // it — and it carries `workspace_root`, the context snapshot and pane
+        // snapshots, i.e. another tenant's paths and buffers on a shared key.
+        // Filtering it cannot starve its own opener: that connection's
+        // forwarder skips the broadcast copy via `from_connection`, and its own
+        // frame arrives through the UNFILTERED `send_ledger_event_durable`
+        // direct send in `handle_session_open`. The scopes also agree by
+        // construction — `ledger_profile_id` IS `active_profile_id
+        // .unwrap_or(MAIN_PROFILE_ID)`, which is exactly this normalization.
+        UiNotification::SessionOpened(opened) => {
+            optional_profile_scope_matches(opened.active_profile_id.as_deref(), profile_id)
+        }
+        // `background/activity` is raw OBSERVED text — a monitor's stdout, a
+        // fleet summary — and the ledger is its entire delivery mechanism: the
+        // sink appends it over a detached connection whose writer is drained to
+        // nowhere, so every real client receives it through replay or its own
+        // forwarder.
+        //
+        // Its profile is NOT resolver-derived. The fleet origin is stamped from
+        // `FleetRecord.profile_id`, and the single production fleet-creation
+        // site is reached only from the model's `goal_plan` tool, so that id is
+        // always the TURN's `ProfileRuntime` id; the monitor origin is likewise
+        // `ProfileRuntime`-derived whenever the monitor came from
+        // `monitor_create` rather than the `monitor/create` RPC. Together with
+        // `MonitorFired` below, these are the only two arms here whose stamp can
+        // come from the turn rather than from `resolve_autonomy_profile_id` —
+        // which is exactly why filtering is gated on
+        // `connection_filterable_profile_scope`, under which the two resolutions
+        // provably agree.
+        UiNotification::BackgroundActivity(activity) => {
+            optional_profile_scope_matches(activity.profile_id.as_deref(), profile_id)
         }
         _ => true,
     }
+}
+
+/// #2067 — compare an OPTIONAL wire profile id against a connection's resolved
+/// scope.
+///
+/// `event_profile_id` is the result of the caller's top-level-then-nested
+/// fallback, so a `None` here means the frame names no profile ANYWHERE. That
+/// is a LEGACY row: the field is `skip_serializing_if = "Option::is_none"`, and
+/// every current producer stamps a concrete id somewhere on the frame
+/// (`resolve_autonomy_profile_id` never returns an empty or absent id, and the
+/// stored `AutonomyGoalRecord` / `AutonomyLoopRecord` / `AutonomyMonitorRecord`
+/// hold a non-optional `profile_id`), so a fully unstamped frame can only have
+/// been persisted by a backend that predates the stamp. Only an
+/// unprofiled/single-tenant deployment could have produced one, and every
+/// connection there resolves to `_main` — so normalizing `None` to `_main` is
+/// lossless exactly where such rows exist, while still refusing to hand a
+/// legacy row to a real tenant. An empty/whitespace id normalizes the same way
+/// rather than becoming an accidental wildcard.
+fn optional_profile_scope_matches(event_profile_id: Option<&str>, profile_id: &str) -> bool {
+    event_profile_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(MAIN_PROFILE_ID)
+        == profile_id
 }
 
 fn stdio_session_open_candidate_profile(
@@ -17189,6 +17516,11 @@ async fn forward_live_ledger_event(
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     topic_scope: Option<&str>,
+    // The profile this SESSION resolved to at `session/open`, captured by
+    // the caller for the forwarder's lifetime (see `spawn_live_forwarder`).
+    // `None` = this connection's scope is not a tenant boundary — deliver
+    // everything (see `connection_filterable_profile_scope`).
+    profile_scope: Option<&str>,
 ) -> Result<(), SendError> {
     if event.cursor.seq <= baseline_seq {
         return Ok(());
@@ -17199,7 +17531,7 @@ async fn forward_live_ledger_event(
     if !ledger_event_matches_topic_scope(&event.event, topic_scope) {
         return Ok(());
     }
-    if !ledger_event_matches_profile_scope(&event.event, &ws.snapshot_live_profile_id()) {
+    if !ledger_event_matches_profile_scope(&event.event, profile_scope) {
         return Ok(());
     }
     let projected = features
@@ -17263,6 +17595,12 @@ async fn spawn_live_forwarder(
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     topic_scope: Option<String>,
+    // #2067 (H2) — the profile this SESSION resolved to at `session/open`,
+    // captured immutably for the lifetime of this forwarder exactly like
+    // `topic_scope`. Never re-read from the connection: a later
+    // `session/open` on the same connection can resolve a different profile,
+    // and a shared cell would retarget this pump mid-flight.
+    profile_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
 ) {
@@ -17311,6 +17649,7 @@ async fn spawn_live_forwarder(
                             self_connection_id,
                             features,
                             topic_scope.as_deref(),
+                            profile_scope.as_deref(),
                         )
                         .await,
                         // #924 BLOCK 2: a closed writer OR a latched failure
@@ -17786,7 +18125,10 @@ struct SessionOpenOutcome {
     /// where an event landing between replay and the session/open append
     /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
     replay_baseline_seq: u64,
-    profile_id: String,
+    /// #2067 R3 — the profile scope this connection may be FILTERED against,
+    /// or `None` when its scope is not a tenant boundary and filtering it
+    /// would starve it. See `connection_filterable_profile_scope`.
+    profile_scope: Option<String>,
 }
 
 // Threading both the approval store and the (UPCR-2026-023) question store
@@ -17800,6 +18142,7 @@ async fn open_session_result(
     questions: &PendingQuestionStore,
     connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
+    pinned_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     mut params: SessionOpenParams,
 ) -> Result<SessionOpenOutcome, RpcError> {
@@ -17813,6 +18156,11 @@ async fn open_session_result(
     let ledger_profile_id = active_profile_id
         .clone()
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    // #2067 — see `ledger_event_matches_profile_scope`. `validate_session_scope`
+    // returns the connection profile verbatim when there is one, so this equals
+    // `ledger_profile_id` in that case; naming the pin directly keeps the
+    // invariant (scope == the turn's profile) visible at the resolution site.
+    let profile_scope = pinned_profile_id.map(ToOwned::to_owned);
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
@@ -18019,7 +18367,7 @@ async fn open_session_result(
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
-            && ledger_event_matches_profile_scope(&event.event, &ledger_profile_id)
+            && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
     });
     let replayed_approval_ids = replay
         .iter()
@@ -18128,7 +18476,7 @@ async fn open_session_result(
         pending_questions,
         opened_event,
         replay_baseline_seq,
-        profile_id: ledger_profile_id,
+        profile_scope,
     })
 }
 
@@ -19978,27 +20326,33 @@ async fn maybe_spawn_appui_master_continuation_runner(
     if occupied {
         return false;
     }
-    // Cross-subsystem occupancy (#1529): a session actor draining a
-    // continuation turn for this session marks it in-flight but has no entry
-    // in this connection's `active_turns` map. Without this check the serve
-    // tick would drain + spawn a SECOND concurrent turn on the same session
-    // while the actor's turn runs. The actor clears the marker (RAII guard)
-    // when its turn ends, so the next tick re-dispatches normally.
-    if default_agent_orchestrator().is_goal_dispatch_in_flight(&goal_storage_key) {
-        return false;
-    }
-
     let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
         !contracts
             .approvals
             .pending_for_session(&session_id)
             .is_empty(),
     );
-    let Some(continuation) = default_agent_orchestrator()
-        .drain_ready_continuations_for_session(&goal_storage_key, &profile_id, runtime_state, 1)
-        .into_iter()
-        .next()
-    else {
+    // #2066 round 3 (codex fix 2) — ATOMIC drain-and-claim, the same
+    // primitive the session actor uses: the in-flight claim and the pop
+    // happen under ONE state lock, so this path can never pop a one-shot it
+    // does not own. The round-2 shape (separate occupancy check → pop →
+    // claim inside the spawned task) could pop an item, lose the claim race
+    // to another dispatcher, and complete the popped item UNEXECUTED — for a
+    // latched GoalWrapUp that meant permanently dropping the wrap-up
+    // (`wrap_up_emitted` never re-mints on a budget_limited goal). A held
+    // marker now drains NOTHING here (cross-subsystem occupancy, #1529,
+    // subsumed: the claim check is inside the same lock as the pop), and the
+    // returned guard travels into the spawned turn, released on every exit.
+    let (mut drained, claim_guard) = default_agent_orchestrator()
+        .drain_and_claim_ready_continuation_for_session(
+            &goal_storage_key,
+            &profile_id,
+            runtime_state,
+            1,
+        );
+    let Some(continuation) = drained.pop() else {
+        // Nothing owned: nothing was popped, nothing to complete. The guard
+        // (if any) drops here and releases immediately.
         return false;
     };
 
@@ -20133,6 +20487,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 // enqueued under; the post-turn accountant must charge THAT
                 // record, not the plain wire id.
                 goal_session_key: SessionKey(continuation.session_id.as_str().to_owned()),
+                bound_goal_id: continuation
+                    .goal_id
+                    .as_ref()
+                    .map(|goal_id| goal_id.as_str().to_owned()),
+                claim_generation: claim_guard.as_ref().map(|guard| guard.generation()),
             })
         }
         _ => None,
@@ -20164,30 +20523,52 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // post-turn `record_goal_turn` call below (which runs with
         // real token usage).
         //
-        // #1140 codex P2 re-review #3: mark the goal session as
-        // in-flight so `due_loop_targets`'s goal sweep + the
-        // `enqueue_due_goal_continuations` enqueue path both skip
-        // it until the post-turn accountant clears it. The
-        // timestamp alone isn't enough for goal turns > 30s.
+        // #1140 codex P2 re-review #3/#4: the in-flight claim keeps
+        // `due_loop_targets`'s goal sweep + the enqueue paths off this
+        // session until the post-turn accountant finishes, and the RAII
+        // guard clears it on every exit (abort, early terminal, panic).
         //
-        // #1140 codex P1 re-review #4: use the RAII drop-guard shape
-        // so the marker is cleared even if the spawned turn task is
-        // aborted (e.g. `abort_connection_turns` on connection close)
-        // or returns through an early terminal path. The Drop becomes
-        // the single canonical clear-point (codex P2 re-review #5).
+        // #2066 round 3 (codex fix 2) — the claim is no longer taken here:
+        // it was taken ATOMICALLY WITH THE POP by
+        // `drain_and_claim_ready_continuation_for_session` and travels into
+        // this task. Claim-failure therefore pops nothing and completes
+        // nothing (the round-2 try-claim-in-task shape popped first and
+        // completed the item UNEXECUTED on claim failure — permanently
+        // dropping a latched GoalWrapUp). Held for EVERY continuation
+        // reason, matching the session actor's claim semantics.
         //
-        // GoalWrapUp doesn't go through this guard because the
-        // goal is already `budget_limited` — `due_loop_targets`'s
-        // goal sweep already excludes non-active goals, and the
-        // pending-queue sweep handles wrap-up via #1141's path.
-        let _in_flight_guard = if let Some(ref ctx) = goal_context_for_appui {
+        // The post-claim goal RECHECK stays: with the claim held, a
+        // gone/mismatched goal is genuinely cleared/replaced (not a racing
+        // dispatcher), so completing the popped item is correct — launching
+        // the drained prompt would run a turn for a deleted goal. The abort
+        // stamps the internal turn slot Terminal (no wire event was emitted
+        // for this turn yet — the client never saw it) so the session's
+        // `active_turns` slot frees for the next dispatch.
+        let _in_flight_guard = claim_guard;
+        if let Some(ref ctx) = goal_context_for_appui {
             let session_key = SessionKey(continuation.session_id.as_str().to_owned());
+            if !default_agent_orchestrator().goal_dispatch_target_matches(
+                &session_key,
+                &ctx.profile_id,
+                ctx.bound_goal_id.as_deref(),
+            ) {
+                info!(
+                    session = %params.session_id,
+                    continuation_id = continuation.id.as_u64(),
+                    "goal was cleared/replaced between drain and launch; \
+                     aborting this turn"
+                );
+                *turn_state_for_task.lock().await = TurnState::Terminal(TerminalReason::Completed);
+                default_agent_orchestrator().mark_continuation_completed(
+                    &continuation,
+                    Some("goal_removed_before_launch".to_owned()),
+                );
+                // The claim guard drops here, releasing the slot.
+                return;
+            }
             default_agent_orchestrator()
                 .record_goal_dispatch_timestamp_only(&session_key, &ctx.profile_id);
-            Some(default_agent_orchestrator().goal_dispatch_in_flight_guard(session_key))
-        } else {
-            None
-        };
+        }
         // #436 P1 #2 — for a peer_send_input injection, track whether the turn
         // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
         // failed `TurnStarted`) is NOT marked completed and stays durable for
@@ -23312,7 +23693,8 @@ async fn handle_session_btw(
                         cost_source,
                         "appui_btw",
                         None,
-                    );
+                    )
+                    .with_cache_read_tokens(u64::from(response.usage.cache_read_tokens));
                     if let Err(error) = usage_ledger.record(event).await {
                         warn!(
                             session = %session_id.0,
@@ -28753,6 +29135,19 @@ struct GoalContinuationContext {
     /// A goal turn would charge nothing (the wire key finds no scoped goal) and
     /// recur forever without ever hitting its budget.
     goal_session_key: SessionKey,
+    /// #2066 round 2 (codex R1c/R2) — the goal identity this continuation was
+    /// enqueued under (`QueuedMasterContinuation::goal_id`). Used twice: the
+    /// post-claim dispatch recheck refuses to launch when the live goal is no
+    /// longer this incarnation, and the post-turn accountant charges
+    /// goal-id-bound so a mid-turn clear(+recreate) settles the cleared
+    /// goal's tombstone instead of the replacement. `None` for legacy
+    /// persisted continuations without a stamped goal id.
+    bound_goal_id: Option<String>,
+    /// #2066 round 5 (codex fix 1) — the marker incarnation the atomic
+    /// drain-and-claim took for THIS turn. The in-flight heartbeat refreshes
+    /// generation-matched so a stale predecessor turn resuming production
+    /// can never keep a replacement turn's marker alive.
+    claim_generation: Option<u64>,
 }
 
 /// #1134 — pick the LAST non-empty assistant row after `pre` from a
@@ -29909,6 +30304,26 @@ async fn run_standalone_turn(
                     .clone()
                     .map(|goal_id| (goal_id, goal_charge_profile.clone()))
             });
+        // #2056 round 2 (H2b) — the RECONCILE binding is resolved separately
+        // and WITHOUT the active-only filter above. Registration is right to
+        // refuse a non-active goal (no new work should be recorded against
+        // one); reconciliation is not — a paused or budget-limited goal keeps
+        // its ledger, and its stranded rows are still wrong. Resolved at
+        // callback time, on the same keys, so a goal that leaves `active`
+        // mid-turn is still reconciled at the next restore. The profile falls
+        // back exactly like `terminal_profile_id` below, because
+        // `goal_charge_profile` degrades to `_main` on a goal-less turn.
+        let restore_goal_key = goal_context.as_ref().map(|goal_ctx| {
+            (
+                goal_ctx.goal_session_key.clone(),
+                goal_ctx.profile_id.clone(),
+            )
+        });
+        let restore_wire_key = session_id.clone();
+        let restore_wire_profile = active_profile_id
+            .clone()
+            .or_else(|| routed_profile_id.clone())
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         // Round 3 — the SHARED installer wires both halves (recorder +
         // change-feed settle listener), with THIS turn's dispatch-time
         // binding snapshot as the resolver. The settle rides the change
@@ -29920,6 +30335,18 @@ async fn run_standalone_turn(
             &task_supervisor,
             &session_runtime.profile.data_dir,
             move || register_goal_binding.clone(),
+            move || {
+                let orchestrator = default_agent_orchestrator();
+                if let Some((goal_key, profile)) = restore_goal_key.as_ref()
+                    && let Some(goal_id) =
+                        orchestrator.bound_goal_id_under_goal_key(goal_key, profile)
+                {
+                    return Some((goal_id, profile.clone()));
+                }
+                orchestrator
+                    .bound_goal_id(&restore_wire_key, &restore_wire_profile)
+                    .map(|goal_id| (goal_id, restore_wire_profile.clone()))
+            },
         );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
         // (ChildCompleted) AND failure (recovery) re-entry through ONE
@@ -31538,6 +31965,44 @@ async fn run_standalone_turn(
     // task future is dropped.
     let token_tracker = std::sync::Arc::new(octos_agent::TokenTracker::new());
     let token_tracker_task = std::sync::Arc::clone(&token_tracker);
+    // #2066 round 4 (codex fix 2) — the AppUI twin of the session actor's
+    // #2003 in-flight heartbeat: keep this goal turn's dispatch marker fresh
+    // WHILE the turn is genuinely producing. AppUI had NO refresh at all, so
+    // a legitimately long (>30min) goal turn's marker read stale — its settle
+    // tombstone purged before the late charge arrived, and a concurrent
+    // `/goal clear` could claim the "free" slot without parking a tombstone.
+    // Progress-gated exactly like the actor's: the refresh fires only when
+    // the shared TokenTracker has ADVANCED since the last tick, so a wedged
+    // turn stops being refreshed and ages out normally (#2003's contract).
+    // Touches the SCOPED goal store key — the key the drain claimed the
+    // marker under — not the wire session id. #2066 round 5 (codex fix 1):
+    // GENERATION-MATCHED — the refresh names the marker incarnation THIS
+    // turn's drain-and-claim took, so a stale predecessor that resumes
+    // producing after eviction can never keep a replacement turn's marker
+    // alive (no generation ⇒ no claim was taken ⇒ no heartbeat). Aborted on
+    // every exit with the turn (AbortOnDrop).
+    let _in_flight_heartbeat = goal_context.as_ref().and_then(|ctx| {
+        let claim_generation = ctx.claim_generation?;
+        let tracker = std::sync::Arc::clone(&token_tracker);
+        let marker_key = ctx.goal_session_key.clone();
+        let heartbeat = tokio::spawn(async move {
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let mut last = 0_u64;
+            loop {
+                tokio::time::sleep(APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL).await;
+                let seen = u64::from(tracker.input_tokens.load(AtomicOrdering::Relaxed))
+                    + u64::from(tracker.output_tokens.load(AtomicOrdering::Relaxed));
+                if seen > last {
+                    last = seen;
+                    default_agent_orchestrator()
+                        .touch_goal_dispatch_in_flight_generation(&marker_key, claim_generation);
+                }
+            }
+        });
+        Some(AbortOnDrop {
+            abort: heartbeat.abort_handle(),
+        })
+    });
     // task-turn-interrupt-steer-correlation-logs: every agent-side log line
     // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
     // `session`/`turn` from this span (postfix `.instrument` keeps the block
@@ -32161,7 +32626,8 @@ async fn run_standalone_turn(
                         cost_source,
                         "appui",
                         None,
-                    );
+                    )
+                    .with_cache_read_tokens(u64::from(response.token_usage.cache_read_tokens));
                     if let Err(error) = usage_ledger.record(event).await {
                         warn!(
                             session = %usage_session_id_for_result,
@@ -33617,6 +34083,10 @@ async fn run_standalone_turn(
         if let Some(snapshot) = orchestrator.record_goal_turn(
             goal_key,
             &goal_ctx.profile_id,
+            // #2066 round 2 (codex R1c) — goal-id-bound charge: a mid-turn
+            // clear(+recreate) settles the cleared goal's tombstone, never
+            // the replacement goal.
+            goal_ctx.bound_goal_id.as_deref(),
             final_tokens_consumed,
             elapsed_seconds,
         ) {
@@ -35100,77 +35570,135 @@ fn preview_oversized_frame(text: String) -> String {
         return text;
     };
 
-    // Paths already rewritten by string truncation; skipped on later passes so
-    // each string is previewed at most once (idempotence by PATH, not by
-    // sniffing field content — see `largest_truncatable_string`).
-    let mut previewed_string_paths: HashSet<Vec<PathSeg>> = HashSet::new();
+    // Single-pass design (黑板第 2 条 2c, replacing the O(payload × rounds)
+    // truncate-one/re-serialize loop that cost ~10s on multi-MB hydrate
+    // replies):
+    //   1. measure the serialized length ONCE;
+    //   2. one walk collects every truncatable string (path, escaped len,
+    //      raw len), sorted largest-first;
+    //   3. compute each field's escaped budget against a running overhead
+    //      (current length minus everything already truncated), preview it
+    //      head+tail WITHOUT re-serializing, and subtract the savings —
+    //      until the running estimate fits the target;
+    //   4. serialize ONCE to verify; if the estimate was optimistic (rare:
+    //      escape-factor drift), run ONE structural fallback round
+    //      (array-shrink loop) — so the whole function performs at most 2
+    //      full serializations.
+    let initial_len = match serde_json::to_string(&value) {
+        Ok(s) => s.len(),
+        Err(_) => return text,
+    };
+    if initial_len <= TRUNCATED_FRAME_TARGET_BYTES {
+        return serde_json::to_string(&value).unwrap_or(text);
+    }
 
-    // Iterate: truncate the largest string field, re-measure, repeat; when no
-    // string can be shrunk further, drop elements from the largest array. The
-    // bound is (number of string fields) + (total array elements), each pass
-    // either previews one string path or removes >= 1 array element, so this
-    // terminates.
-    loop {
-        let serialized_len = match serde_json::to_string(&value) {
-            Ok(s) => s.len(),
-            // Re-serialization cannot realistically fail for a Value parsed
-            // from text, but if it ever did, fall back to the original.
-            Err(_) => return text,
+    // Pass 1: collect all truncatable strings, largest first.
+    let mut candidates: Vec<(Vec<PathSeg>, usize, usize)> = Vec::new();
+    let mut path: Vec<PathSeg> = Vec::new();
+    collect_truncatable_strings(&value, &mut path, &mut candidates);
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+
+    let mut running_len = initial_len;
+    for (path, field_escaped_len, field_raw_len) in &candidates {
+        if running_len <= TRUNCATED_FRAME_TARGET_BYTES {
+            break;
+        }
+        // Overhead = current frame minus this field's escaped contribution
+        // (escaped bytes + two surrounding quote bytes).
+        let overhead = running_len.saturating_sub(field_escaped_len + 2);
+        let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
+            .saturating_sub(overhead)
+            .saturating_sub(2);
+        let preview = match build_head_tail_preview(
+            field_at_path(&value, path)
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            *field_raw_len,
+            field_escaped_budget,
+        ) {
+            Some(preview) => preview,
+            None => UNPREVIEWABLE_STUB.to_owned(),
         };
-        if serialized_len <= TRUNCATED_FRAME_TARGET_BYTES {
-            // Provably under target (< MAX_TEXT_FRAME_BYTES). Emit the rewrite
-            // if we changed anything; otherwise the original under-cap text.
+        // Running estimate: new field escaped length is at most the budget
+        // we handed out (marker reserve included); estimate conservatively
+        // with the actual preview's escaped length instead — one cheap
+        // scan, no serialization.
+        let new_escaped = json_escaped_len_bytes(preview.as_bytes());
+        if !set_field_at_path(&mut value, path, Value::String(preview)) {
+            return text;
+        }
+        running_len = overhead + 2 + new_escaped;
+    }
+
+    // Structural fallback: strings alone could not fit (or did, and this
+    // verifies it). Serialize ONCE to verify the estimate.
+    let mut serialized = match serde_json::to_string(&value) {
+        Ok(s) => s,
+        Err(_) => return text,
+    };
+    if serialized.len() <= TRUNCATED_FRAME_TARGET_BYTES {
+        return serialized;
+    }
+
+    // Still over target -> structural case (many huge sibling strings each
+    // stubbed, or giant non-string payload). Fall back to the array-shrink
+    // loop, reusing the original helpers. Bounded: each round removes >= 1
+    // element and there are finitely many.
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        debug_assert!(
+            rounds <= 64,
+            "preview_oversized_frame structural fallback exceeded round bound"
+        );
+        if rounds > 64 {
+            return serialized;
+        }
+        if !shrink_largest_array(&mut value) {
             return serde_json::to_string(&value).unwrap_or(text);
         }
+        serialized = match serde_json::to_string(&value) {
+            Ok(s) => s,
+            Err(_) => return text,
+        };
+        if serialized.len() <= TRUNCATED_FRAME_TARGET_BYTES {
+            return serialized;
+        }
+    }
+}
 
-        // Find the largest not-yet-previewed string field.
-        if let Some((path, field_escaped_len, field_raw_len)) =
-            largest_truncatable_string(&value, &previewed_string_paths)
-        {
-            // Frame overhead = serialized frame minus this field's escaped
-            // contribution (escaped bytes + the two surrounding quote bytes).
-            // The new frame length is `overhead + 2 + new_field_escaped_len`,
-            // so to hit the target the field's escaped budget is:
-            //     budget = TARGET - overhead - 2
-            let overhead = serialized_len.saturating_sub(field_escaped_len + 2);
-            let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
-                .saturating_sub(overhead)
-                .saturating_sub(2);
-
-            let preview = match build_head_tail_preview(
-                field_at_path(&value, &path)
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                field_raw_len,
-                field_escaped_budget,
-            ) {
-                Some(preview) => preview,
-                // Even an empty preview can't fit the budget (overhead alone
-                // exceeds target — only possible with many huge sibling
-                // fields, which the iteration handles, or a pathological
-                // envelope). Mark this field as a minimal stub and continue.
-                None => UNPREVIEWABLE_STUB.to_owned(),
-            };
-            if !set_field_at_path(&mut value, &path, Value::String(preview)) {
-                // Path vanished (should not happen) -> bail to original.
-                return text;
+/// Single-walk collection of every truncatable string field: same
+/// eligibility rules as `collect_truncatable_strings` (large enough to be
+/// worth truncating, not already carrying the full truncation-marker
+/// sentinel) but gathers ALL candidates (path, escaped len, raw len) in
+/// one pass instead of re-walking per truncation round.
+fn collect_truncatable_strings(
+    value: &Value,
+    path: &mut Vec<PathSeg>,
+    out: &mut Vec<(Vec<PathSeg>, usize, usize)>,
+) {
+    match value {
+        Value::String(s) => {
+            let escaped = json_escaped_len_bytes(s.as_bytes());
+            if escaped > MARKER_ESCAPED_RESERVE_BYTES && !contains_full_truncation_marker(s) {
+                out.push((path.clone(), escaped, s.len()));
             }
-            // Record the path so this string is not re-selected next pass.
-            previewed_string_paths.insert(path);
-            continue;
         }
-
-        // No string field can be further truncated, but we are still over
-        // target -> STRUCTURAL case. Drop middle/trailing elements from the
-        // largest array (keeping valid JSON) and re-measure.
-        if shrink_largest_array(&mut value) {
-            continue;
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(idx));
+                collect_truncatable_strings(item, path, out);
+                path.pop();
+            }
         }
-
-        // Nothing left to shrink (no truncatable string, no shrinkable array)
-        // -> pathological. Return the best-effort body unchanged; the caller
-        // observes it is still over cap and drops it (returns `None`).
-        return serde_json::to_string(&value).unwrap_or(text);
+        Value::Object(map) => {
+            for (key, item) in map {
+                path.push(PathSeg::Key(key.clone()));
+                collect_truncatable_strings(item, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -35393,87 +35921,10 @@ enum PathSeg {
     Index(usize),
 }
 
-/// Find the largest truncatable string field by JSON-escaped length, returning
-/// its path, escaped length, and raw byte length. A string is "truncatable"
-/// only if shrinking it could meaningfully reduce the frame — we skip strings
-/// that are already shorter than a marker would be (no gain) and any field PATH
-/// already previewed on a prior pass (idempotence by path, recorded in
-/// `previewed_paths` by the caller — NOT by sniffing field content, so a
-/// legitimate >1 MiB payload that merely contains a phrase like "bytes
-/// truncated" is still truncated rather than wrongly skipped).
-fn largest_truncatable_string(
-    value: &Value,
-    previewed_paths: &HashSet<Vec<PathSeg>>,
-) -> Option<(Vec<PathSeg>, usize, usize)> {
-    let mut best: Option<(Vec<PathSeg>, usize, usize)> = None;
-    let mut path: Vec<PathSeg> = Vec::new();
-    walk_for_largest_string(value, &mut path, previewed_paths, &mut best);
-    best
-}
-
-fn walk_for_largest_string(
-    value: &Value,
-    path: &mut Vec<PathSeg>,
-    previewed_paths: &HashSet<Vec<PathSeg>>,
-    best: &mut Option<(Vec<PathSeg>, usize, usize)>,
-) {
-    match value {
-        Value::String(s) => {
-            // Only consider strings large enough that truncating them yields a
-            // net reduction (must exceed the marker reserve + a small head/tail
-            // floor, else there is no point), and that we have not already
-            // previewed on a prior pass.
-            //
-            // Idempotence is primarily by PATH (`previewed_paths`). The
-            // secondary guard below — "this string ALREADY carries the exact
-            // full truncation-marker sentinel" — is belt-and-suspenders for the
-            // one case the path set can't track: array shrinking (later in the
-            // outer loop) removes elements, so surviving elements' index-paths
-            // SHIFT and the recorded paths go stale. A re-truncated already-
-            // previewed string can't reopen the over-cap bug (a head+tail
-            // preview is no longer the largest, so it isn't re-selected), but
-            // matching the precise sentinel keeps the "each semantic string
-            // truncated once" invariant clean regardless of index drift. We
-            // match the FULL marker scaffold (`\n…… [<N> bytes truncated] ……\n`),
-            // NOT the bare phrase `bytes truncated`, so a payload that merely
-            // contains that phrase is still truncated (see
-            // `payload_containing_marker_phrase_is_still_truncated`).
-            let escaped = json_escaped_len_bytes(s.as_bytes());
-            if escaped > MARKER_ESCAPED_RESERVE_BYTES + 32
-                && !previewed_paths.contains(path)
-                && !contains_full_truncation_marker(s)
-            {
-                let is_better = match best {
-                    Some((_, best_escaped, _)) => escaped > *best_escaped,
-                    None => true,
-                };
-                if is_better {
-                    *best = Some((path.clone(), escaped, s.len()));
-                }
-            }
-        }
-        Value::Array(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                path.push(PathSeg::Index(idx));
-                walk_for_largest_string(item, path, previewed_paths, best);
-                path.pop();
-            }
-        }
-        Value::Object(map) => {
-            for (key, item) in map {
-                path.push(PathSeg::Key(key.clone()));
-                walk_for_largest_string(item, path, previewed_paths, best);
-                path.pop();
-            }
-        }
-        _ => {}
-    }
-}
-
 /// True iff `s` already contains the EXACT full head+tail truncation-marker
 /// scaffold produced by [`build_head_tail_preview`]:
 /// `\n…… [<N> bytes truncated] ……\n` (N a decimal byte count). Used as a
-/// secondary "already previewed" guard in [`walk_for_largest_string`] that is
+/// secondary "already previewed" guard in [`collect_truncatable_strings`] that is
 /// robust to array-shrink index drift (path-set staleness).
 ///
 /// This matches the COMPLETE scaffold — the leading `\n…… [` prefix and the
