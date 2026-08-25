@@ -603,13 +603,34 @@ pub(crate) fn read_and_clear_reviewer_notes(
             return None;
         }
     }
-    let lock_file = std::fs::OpenOptions::new()
+    let lock_file = match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&lock_path)
-        .ok()?;
-    fs2::FileExt::lock_exclusive(&lock_file).ok()?;
+    {
+        Ok(f) => f,
+        Err(error) => {
+            // 8c-r1: a lock-file open failure is NOT the same as "no notes"
+            // (a legit idempotent no-op) — leave a trace so a consume-side
+            // lock failure (which would leave the line consumed-but-resident)
+            // is diagnosable instead of silently folded into None.
+            tracing::warn!(
+                ?error,
+                path = %lock_path.display(),
+                "reviewer-notes: failed to open lock file for read-and-clear"
+            );
+            return None;
+        }
+    };
+    if let Err(error) = fs2::FileExt::lock_exclusive(&lock_file) {
+        tracing::warn!(
+            ?error,
+            path = %lock_path.display(),
+            "reviewer-notes: failed to take exclusive lock for read-and-clear"
+        );
+        return None;
+    }
     struct LockGuard<'a>(&'a std::fs::File);
     impl Drop for LockGuard<'_> {
         fn drop(&mut self) {
@@ -618,7 +639,15 @@ pub(crate) fn read_and_clear_reviewer_notes(
     }
     let _guard = LockGuard(&lock_file);
     let archive_path = note_path.with_extension(format!("{}.archive", uuid::Uuid::now_v7()));
-    std::fs::rename(&note_path, &archive_path).ok()?;
+    if let Err(error) = std::fs::rename(&note_path, &archive_path) {
+        tracing::warn!(
+            ?error,
+            from = %note_path.display(),
+            to = %archive_path.display(),
+            "reviewer-notes: failed to archive notes for read-and-clear"
+        );
+        return None;
+    }
     let archive_meta = std::fs::symlink_metadata(&archive_path).ok()?;
     if archive_meta.len() > REVIEWER_NOTES_READ_CAP {
         let _ = std::fs::rename(&archive_path, archive_path.with_extension("oversize"));
@@ -692,13 +721,34 @@ pub(crate) fn consume_reviewer_line(
     text: &str,
 ) -> Option<u64> {
     let (note_path, lock_path) = reviewer_notes_paths(data_dir, session_id);
-    let lock_file = std::fs::OpenOptions::new()
+    let lock_file = match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&lock_path)
-        .ok()?;
-    fs2::FileExt::lock_exclusive(&lock_file).ok()?;
+    {
+        Ok(f) => f,
+        Err(error) => {
+            // 8c-r1: distinguish a lock-file open failure from "line
+            // absent" (a legit idempotent no-op) — a consume-side lock
+            // failure leaves the line resident while its continuation
+            // already consumed it (revive-and-re-execute in the extreme).
+            tracing::warn!(
+                ?error,
+                path = %lock_path.display(),
+                "consume_reviewer_line: failed to open lock file"
+            );
+            return None;
+        }
+    };
+    if let Err(error) = fs2::FileExt::lock_exclusive(&lock_file) {
+        tracing::warn!(
+            ?error,
+            path = %lock_path.display(),
+            "consume_reviewer_line: failed to take exclusive lock"
+        );
+        return None;
+    }
     struct LockGuard<'a>(&'a std::fs::File);
     impl Drop for LockGuard<'_> {
         fn drop(&mut self) {
@@ -706,7 +756,18 @@ pub(crate) fn consume_reviewer_line(
         }
     }
     let _guard = LockGuard(&lock_file);
-    let body = std::fs::read_to_string(&note_path).ok()?;
+    let body = match std::fs::read_to_string(&note_path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None, // legit no-op
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                path = %note_path.display(),
+                "consume_reviewer_line: failed to read notes"
+            );
+            return None;
+        }
+    };
     let target = format!("{ts} {text}");
     let mut consumed_ts = None;
     let mut kept = Vec::new();
