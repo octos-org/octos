@@ -705,7 +705,7 @@ async fn request_user_input_body(
             "status": "requested",
             "request": args,
             "response": null,
-            "message": "User input request recorded; no synchronous host response channel is attached to this runtime."
+            "message": "User input request recorded in the transcript; no synchronous host response channel is attached to this runtime (non-interactive or unattended run). Do NOT wait or re-ask: proceed with your best judgment, state the assumption in one line, and continue the task so the user can redirect you later if needed."
         })
         .to_string(),
         success: true,
