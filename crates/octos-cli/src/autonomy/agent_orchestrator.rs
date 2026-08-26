@@ -118,6 +118,8 @@ pub(crate) fn xml_escape_untrusted(text: &str) -> String {
 /// codex blocks on the FIRST terminal turn error; three tolerates a
 /// transient provider blip without letting a permanently failing goal
 /// loop forever.
+/// #26b — autonomous-continuation no-progress cap.
+const GOAL_NO_PROGRESS_TURN_LIMIT: u32 = 3;
 const GOAL_MAX_CONSECUTIVE_FAILED_TURNS: u32 = 3;
 const MAX_LOOP_PROMPT_BYTES: usize = 8_192;
 const MAX_LOOPS_PER_SESSION: usize = 16;
@@ -3565,6 +3567,10 @@ impl InProcessAgentOrchestrator {
             .goals
             .get_mut(session_id)
             .expect("live_chargeable checked the record exists under this lock");
+        // #26b — capture the revision BEFORE the turn's accounting so the
+        // turn-end hook can tell "the model acted" (revision bumped by a
+        // goal_update / status change) from an inert re-read.
+        let prior_revision = goal.revision;
         let wrap_up = record_goal_turn_internal(goal, tokens_consumed, elapsed_seconds, now);
         let goal_snapshot = goal.clone();
         persist_goal_state(&state, session_id, &goal_snapshot, false);
@@ -3577,6 +3583,59 @@ impl InProcessAgentOrchestrator {
             // the wrap-up cannot collide with the normal-continuation
             // key shape.
             enqueue_goal_wrap_up(&mut state, session_id, &goal_snapshot, prompt, now_system);
+        }
+        // #26b — the turn-end continuation hook: while the goal is still
+        // LIVE (active, budget unspent, not terminal), the session keeps
+        // work queued (an active goal means unfinished business), so
+        // re-arm a ZERO-DELAY continuation immediately instead of waiting
+        // for an external driver. Guards (all three = the #26b 防呆):
+        // ①progress gate — a turn that neither spent tokens nor bumped the
+        //   revision made no observable progress; after
+        //   GOAL_NO_PROGRESS_TURN_LIMIT such turns in a row the hook parks
+        //   the goal `blocked` (user-resumable) instead of spinning.
+        // ②budget gate — an exhausted goal already flipped
+        //   budget_limited above; the policy layer would refuse anyway.
+        // ③status-link gate — only an `active` goal of THIS profile
+        //   re-arms (terminal / cleared / foreign goals never do).
+        if goal_snapshot.status == "active"
+            && goal_snapshot.token_budget > 0
+            && goal_snapshot.tokens_used < goal_snapshot.token_budget
+        {
+            let progressed = tokens_consumed > 0 || goal_snapshot.revision != prior_revision;
+            {
+                let live = state
+                    .goals
+                    .get_mut(session_id)
+                    .expect("goal_snapshot was just cloned from this slot");
+                if progressed {
+                    live.no_progress_turns = 0;
+                } else {
+                    live.no_progress_turns = live.no_progress_turns.saturating_add(1);
+                    if live.no_progress_turns >= GOAL_NO_PROGRESS_TURN_LIMIT {
+                        live.revision = live.revision.wrapping_add(1);
+                        live.status = "blocked".to_owned();
+                        tracing::warn!(
+                            goal_id = %live.goal_id,
+                            limit = GOAL_NO_PROGRESS_TURN_LIMIT,
+                            "goal parked: turn-end hook saw no progress — resuming requires the user path"
+                        );
+                        let parked = live.clone();
+                        persist_goal_state(&state, session_id, &parked, false);
+                        return Some(parked);
+                    }
+                }
+            }
+            let live = state
+                .goals
+                .get(session_id)
+                .cloned()
+                .expect("goal re-read under the same lock");
+            if enqueue_goal_continuation(&mut state, session_id, profile_id, &live).is_some() {
+                tracing::info!(
+                    goal_id = %goal_snapshot.goal_id,
+                    "goal turn-end hook re-armed a zero-delay continuation (#26b)"
+                );
+            }
         }
         if matches!(goal_snapshot.status.as_str(), "complete" | "blocked") {
             Some(goal_snapshot)
@@ -8470,6 +8529,7 @@ impl InProcessAgentOrchestrator {
                 rate_window_count: 0,
                 wrap_up_emitted: false,
                 consecutive_failed_turns: 0,
+                no_progress_turns: 0,
                 fleet_id: Some(fleet_id.to_owned()),
                 controller_workspace_root: None,
                 controller_workspace_has_runtime_hint: None,
@@ -9383,8 +9443,10 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 // the re-budgeted goal can never wrap up again.
                 goal.wrap_up_generation = goal.wrap_up_generation.wrapping_add(1);
                 // Re-activation forgives the failure streak (#1693) —
-                // the user explicitly asked for another attempt.
+                // the user explicitly asked for another attempt. The #26b
+                // no-progress streak forgives with it (same rationale).
                 goal.consecutive_failed_turns = 0;
+                goal.no_progress_turns = 0;
                 if goal.tokens_used < goal.token_budget {
                     // user-driven re-activation also restarts the
                     // sliding rate-limit window so the prior burst
@@ -9454,6 +9516,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 rate_window_count: 0,
                 wrap_up_emitted: false,
                 consecutive_failed_turns: 0,
+                no_progress_turns: 0,
                 // PR 5a — no fleet/root until a live goal turn stashes the root
                 // and the keeper's `goal_plan` decomposes onto a fleet.
                 fleet_id: None,
@@ -11273,6 +11336,16 @@ pub(crate) struct AutonomyGoalRecord {
     /// `blocked` (user-resumable). Reset by any token-consuming turn
     /// and by user re-activation.
     consecutive_failed_turns: u32,
+    /// #26b — consecutive autonomous continuation turns that made NO
+    /// observable progress (goal revision unchanged AND zero tokens charged
+    /// AND no new ledger finding). Distinct from `consecutive_failed_turns`
+    /// (which only tracks zero-token turns): a turn can SPEND tokens and
+    /// still be inert (the model re-reading without acting). At
+    /// [`GOAL_NO_PROGRESS_TURN_LIMIT`] the turn-end hook stops re-arming
+    /// itself and parks the goal `blocked` (user-resumable), so a spinning
+    /// session cannot burn the budget forever. Any revision bump (a real
+    /// goal_update / status change) or any token spend resets it.
+    no_progress_turns: u32,
     /// #1857 PR 5a — the durable fleet this goal drives, once `goal_plan`
     /// has created it (`<goal_id>`). `None` before the keeper decomposes the
     /// objective onto a fleet; set once and treated as idempotent (a second
@@ -13271,6 +13344,7 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
     let goal = AutonomyGoalRecord {
         profile_id: profile_id.to_owned(),
         goal_id: goal_id.to_owned(),
+        no_progress_turns: 0,
         objective: supervisor_metadata_str(&group.metadata, "objective")
             .unwrap_or_default()
             .to_owned(),
@@ -13609,6 +13683,7 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         rate_window_count: 0,
         wrap_up_emitted: false,
         consecutive_failed_turns: 0,
+        no_progress_turns: 0,
         // PR 5a — a cleared goal drives no fleet.
         fleet_id: None,
         controller_workspace_root: None,
@@ -24270,6 +24345,7 @@ mod tests {
             rate_window_count: 0,
             wrap_up_emitted: false,
             consecutive_failed_turns: 0,
+            no_progress_turns: 0,
             fleet_id: None,
             controller_workspace_root: None,
             controller_workspace_has_runtime_hint: None,
@@ -25236,9 +25312,109 @@ mod tests {
         );
     }
 
-    /// #1693 — three consecutive zero-token continuation turns (a
-    /// permanently failing goal charges nothing, so the budget never
-    /// stops it) flip the goal to `blocked`; one token-consuming turn
+    /// #26b — the turn-end hook: while a goal is ACTIVE with budget left,
+    /// `record_goal_turn` re-arms a zero-delay continuation (drain finds it
+    /// ready). Guard: `complete`/`blocked` goals and an exhausted budget
+    /// never re-arm; three consecutive NO-PROGRESS turns (tokens spent but
+    /// revision unchanged, or vice versa) park the goal `blocked`.
+    #[tokio::test]
+    async fn turn_end_hook_rearms_active_goal_and_parks_inert_spins() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-hook");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "ship the hook".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // A PROGRESSING turn (tokens spent) re-arms: the drain finds a
+        // zero-delay continuation for this session.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 10_000, 5);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !drained.is_empty(),
+            "an active goal with budget must re-arm a continuation after a spent turn"
+        );
+
+        // Two more INERT turns (zero tokens, no revision bump) — allowed…
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 0, 1);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 0, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "two inert turns do not yet park the goal"
+        );
+        // …the THIRD parks it (防呆 progress gate).
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 0, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("blocked"),
+            "three consecutive no-progress turns park the goal (#26b)"
+        );
+        // A parked goal re-arms nothing.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "a blocked goal must not re-arm continuations"
+        );
+    }
+
+    /// #26b — budget gate: a turn that exhausts the budget flips the goal
+    /// `budget_limited` (existing accountant) and the hook does NOT re-arm.
+    #[tokio::test]
+    async fn turn_end_hook_respects_budget_gate() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "spend it all".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 1_000, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "exhausting the budget flips the goal budget_limited"
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // The budget flip enqueues a one-shot WRAP-UP continuation (existing
+        // #1131 behavior) — the #26b budget gate only forbids the
+        // GoalContinue re-arm. Assert no GoalContinue among the drained.
+        let re_armed = drained
+            .iter()
+            .any(|req| matches!(req.reason, MasterContinuationReason::GoalContinue));
+        assert!(
+            !re_armed,
+            "an exhausted goal must not re-arm a GoalContinue (#26b budget gate) — got {:?}",
+            drained.iter().map(|r| &r.reason).collect::<Vec<_>>()
+        );
+    }
+
     /// resets the streak; user re-activation forgives it.
     #[test]
     fn goal_blocks_after_consecutive_failed_turns_and_resume_forgives() {
@@ -30755,6 +30931,7 @@ mod tests {
             rate_window_count: 0,
             wrap_up_emitted: false,
             consecutive_failed_turns: 0,
+            no_progress_turns: 0,
             fleet_id: None,
             controller_workspace_root: None,
             controller_workspace_has_runtime_hint: None,
