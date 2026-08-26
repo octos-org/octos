@@ -46,13 +46,13 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
         provider = provider.with_http_timeout(t, c);
     }
     // Same class of local server as the `local` family: the catalog's
-    // context_window is a guess, the running server knows — probe it (see
-    // `local_context_probe`). Ollama has no `--api-key`; anonymous GETs
-    // are what its own CLI sends.
-    Ok(LocalContextProbe::new(
+    // context_window is a guess, the running server knows. Ollama serves
+    // neither /props nor context metadata on /v1/models — its allocated
+    // window lives on the native GET /api/ps, so the probe uses that
+    // (#2135 review, P2).
+    Ok(LocalContextProbe::new_ollama(
         Arc::new(provider),
         &url,
-        None,
         http_timeout,
     ))
 }

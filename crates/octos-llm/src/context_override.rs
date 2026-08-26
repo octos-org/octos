@@ -44,6 +44,10 @@ impl LlmProvider for ContextWindowOverride {
         self.inner.chat_stream(messages, tools, config).await
     }
 
+    async fn ensure_ready(&self) {
+        self.inner.ensure_ready().await;
+    }
+
     fn context_window(&self) -> u32 {
         self.window
     }

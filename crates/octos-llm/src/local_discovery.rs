@@ -82,11 +82,16 @@ pub fn parse_props_context_window(body: &str) -> Option<u32> {
 /// 4. else `None`: guessing a window across models is worse than the
 ///    catalog fallback.
 ///
-/// Within the chosen entry, every known spelling is checked, runtime values
-/// before trained maxima: llama.cpp `meta.n_ctx` / `meta.n_ctx_train`,
-/// vLLM `max_model_len`, LM Studio `loaded_context_length` /
-/// `max_context_length`. `None` means the chosen entry carried no plausible
-/// window — callers should fall back to the catalog, not error.
+/// Within the chosen entry, only RUNTIME/allocated spellings are accepted:
+/// llama.cpp `meta.n_ctx` (the launched `-c`), LM Studio
+/// `loaded_context_length`, vLLM `max_model_len` (the serving limit).
+/// Trained maxima (`meta.n_ctx_train`, `max_context_length`,
+/// `context_length`) are deliberately NOT candidates: a model trained for
+/// 256K but launched at 32K would be pinned as 256K — an over-estimate
+/// that lets the transcript grow past the server's real window until
+/// requests fail (#2135 review, P2). `None` means the chosen entry carried
+/// no plausible runtime window — callers should fall back to the catalog,
+/// not error.
 pub fn parse_models_context_window(body: &str, model_id: &str) -> Option<u32> {
     let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
     let data = value.get("data")?.as_array()?;
@@ -96,9 +101,6 @@ pub fn parse_models_context_window(body: &str, model_id: &str) -> Option<u32> {
             meta.and_then(|m| m.get("n_ctx")),
             model.get("loaded_context_length"),
             model.get("max_model_len"),
-            model.get("context_length"),
-            model.get("max_context_length"),
-            meta.and_then(|m| m.get("n_ctx_train")),
         ];
         candidates
             .into_iter()
@@ -133,6 +135,61 @@ pub fn parse_models_context_window(body: &str, model_id: &str) -> Option<u32> {
     // the placeholder id means the config never named a model at all.
     if data.len() == 1 || model_id == PLACEHOLDER_MODEL {
         return data.first().and_then(window_of);
+    }
+    None
+}
+
+/// Context window from an Ollama-native `GET /api/ps` response body, for
+/// the running model matching `model_id`.
+///
+/// Ollama serves no `/props`, and its OpenAI-compatible `/v1/models` list
+/// carries no context length — the generic probe resolves to "no window"
+/// on every Ollama deployment (#2135 review, P2). `/api/ps` lists the
+/// RUNNING models with their allocated `context_length` (the num_ctx the
+/// model is actually loaded with), which is exactly the number a session
+/// budget must respect. Matching mirrors [`parse_models_context_window`]:
+/// exact id (`name` or `model`, with and without the `:latest` suffix),
+/// then substring, then the sole running model. `None` (older Ollama
+/// without the field, model not loaded yet) falls back to the catalog.
+pub fn parse_ollama_ps_context_window(body: &str, model_id: &str) -> Option<u32> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let models = value.get("models")?.as_array()?;
+    let window_of = |entry: &serde_json::Value| -> Option<u32> {
+        entry
+            .get("context_length")
+            .and_then(|v| v.as_u64())
+            .and_then(sane_context_window)
+    };
+    let ids_of = |entry: &serde_json::Value| -> Vec<String> {
+        ["name", "model"]
+            .iter()
+            .filter_map(|k| entry.get(*k).and_then(|v| v.as_str()))
+            .map(str::to_owned)
+            .collect()
+    };
+    let normalized = model_id.trim_end_matches(":latest").to_lowercase();
+    // Pass 1: exact (suffix-insensitive) id.
+    if let Some(entry) = models.iter().find(|m| {
+        ids_of(m)
+            .iter()
+            .any(|id| id.trim_end_matches(":latest").to_lowercase() == normalized)
+    }) {
+        return window_of(entry);
+    }
+    // Pass 2: substring either direction.
+    if model_id != PLACEHOLDER_MODEL {
+        if let Some(entry) = models.iter().find(|m| {
+            ids_of(m).iter().any(|id| {
+                let id = id.to_lowercase();
+                id.contains(&normalized) || normalized.contains(&id)
+            })
+        }) {
+            return window_of(entry);
+        }
+    }
+    // Pass 3: exactly one running model serves whatever was configured.
+    if models.len() == 1 || model_id == PLACEHOLDER_MODEL {
+        return models.first().and_then(window_of);
     }
     None
 }
@@ -235,9 +292,10 @@ mod tests {
     fn should_prefer_runtime_n_ctx_over_trained_maximum() {
         let body = r#"{"data":[{"id":"qwen","meta":{"n_ctx":65536,"n_ctx_train":262144}}]}"#;
         assert_eq!(parse_models_context_window(body, "qwen"), Some(65_536));
-        // Only the trained maximum present: better than nothing.
+        // Trained maxima are NOT runtime capacity: a model trained for 256K
+        // but launched smaller must not be pinned at 256K (#2135 review P2).
         let body = r#"{"data":[{"id":"qwen","meta":{"n_ctx_train":262144}}]}"#;
-        assert_eq!(parse_models_context_window(body, "qwen"), Some(262_144));
+        assert_eq!(parse_models_context_window(body, "qwen"), None);
     }
 
     /// vLLM (`max_model_len`) and LM Studio (`max_context_length`) spellings.
@@ -248,6 +306,9 @@ mod tests {
         let body =
             r#"{"data":[{"id":"m","max_context_length":32768,"loaded_context_length":8192}]}"#;
         assert_eq!(parse_models_context_window(body, "m"), Some(8_192));
+        // The trained-maximum spelling alone is not accepted (#2135 P2).
+        let body = r#"{"data":[{"id":"m","max_context_length":32768}]}"#;
+        assert_eq!(parse_models_context_window(body, "m"), None);
     }
 
     /// No known field → None (catalog fallback), not a guess.
@@ -302,5 +363,36 @@ mod tests {
     fn should_keep_placeholder_namespaced() {
         assert_ne!(PLACEHOLDER_MODEL, "default");
         assert!(PLACEHOLDER_MODEL.contains('-'));
+    }
+
+    /// Ollama `/api/ps`: allocated context of the RUNNING model, matched
+    /// suffix-insensitively (`qwen3:latest` vs `qwen3`); a missing
+    /// `context_length` (older Ollama) or an empty list yields None so the
+    /// catalog stands and the probe retries once the model loads.
+    #[test]
+    fn should_read_allocated_context_from_ollama_ps() {
+        let body = r#"{"models":[
+            {"name":"embed:latest","model":"embed:latest","context_length":8192},
+            {"name":"qwen3:latest","model":"qwen3:latest","context_length":131072}
+        ]}"#;
+        assert_eq!(parse_ollama_ps_context_window(body, "qwen3"), Some(131_072));
+        assert_eq!(parse_ollama_ps_context_window(body, "embed"), Some(8_192));
+        // Sole running model serves whatever id was configured.
+        let sole = r#"{"models":[{"name":"anything","context_length":65536}]}"#;
+        assert_eq!(
+            parse_ollama_ps_context_window(sole, "my-alias"),
+            Some(65_536)
+        );
+        // Older Ollama without the field / nothing running: catalog stands.
+        let old = r#"{"models":[{"name":"qwen3:latest","size":123}]}"#;
+        assert_eq!(parse_ollama_ps_context_window(old, "qwen3"), None);
+        assert_eq!(
+            parse_ollama_ps_context_window(r#"{"models":[]}"#, "qwen3"),
+            None
+        );
+        assert_eq!(
+            parse_ollama_ps_context_window("<html></html>", "qwen3"),
+            None
+        );
     }
 }

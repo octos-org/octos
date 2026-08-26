@@ -400,6 +400,22 @@ impl LlmProvider for RetryProvider {
         eyre::bail!("retry loop exited unexpectedly")
     }
 
+    // #2135 review P1: without these delegations the trait defaults re-read
+    // the static catalog by model id, silently discarding a probed or
+    // overridden window on the standard runtime path (every session wraps
+    // the base provider in RetryProvider).
+    fn context_window(&self) -> u32 {
+        self.inner.context_window()
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.inner.max_output_tokens()
+    }
+
+    async fn ensure_ready(&self) {
+        self.inner.ensure_ready().await;
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

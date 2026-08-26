@@ -2459,6 +2459,24 @@ impl LlmProvider for AdaptiveRouter {
         }
     }
 
+    // #2135 review P1: same slot selection as model_id — the router must
+    // report the window of the provider it would actually route to, not
+    // the static catalog default.
+    fn context_window(&self) -> u32 {
+        let (idx, _) = self.select_provider();
+        self.slots[idx].provider.context_window()
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        let (idx, _) = self.select_provider();
+        self.slots[idx].provider.max_output_tokens()
+    }
+
+    async fn ensure_ready(&self) {
+        let (idx, _) = self.select_provider();
+        self.slots[idx].provider.ensure_ready().await;
+    }
+
     fn model_id(&self) -> &str {
         let (idx, _) = self.select_provider();
         self.slots[idx].provider.model_id()

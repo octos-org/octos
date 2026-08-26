@@ -96,6 +96,12 @@ impl LlmProvider for SwappableProvider {
         self.inner.read().unwrap().context_window()
     }
 
+    async fn ensure_ready(&self) {
+        // Clone out of the guard: the await must not hold the lock.
+        let provider = self.inner.read().unwrap().clone();
+        provider.ensure_ready().await;
+    }
+
     fn model_id(&self) -> &str {
         // &'static str is Copy — reading it from the guard yields a value
         // that doesn't depend on the guard's lifetime.

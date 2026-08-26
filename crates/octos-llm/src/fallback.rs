@@ -170,6 +170,10 @@ impl LlmProvider for FallbackProvider {
         self.primary.context_window()
     }
 
+    async fn ensure_ready(&self) {
+        self.primary.ensure_ready().await;
+    }
+
     fn max_output_tokens(&self) -> u32 {
         self.primary.max_output_tokens()
     }

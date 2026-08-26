@@ -30517,6 +30517,12 @@ async fn run_standalone_turn(
         let session = sessions.get_or_create(&session_id).await;
         session.get_history(50).to_vec()
     };
+    // #2135 review P1: resolve a lazily-probed context window BEFORE the
+    // threshold compaction inside appui_context_history_for_agent reads it —
+    // a resumed transcript compacted against the stale catalog value is
+    // exactly the failure the probe exists to prevent. Immediate no-op for
+    // non-probing providers and once resolved.
+    session_runtime.llm.ensure_ready().await;
     let (history, context_manager, context_lifecycle_notifications) =
         appui_context_history_for_agent(
             // Root the context ledger at the session's TRANSCRIPT root, not the

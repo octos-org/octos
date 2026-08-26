@@ -53,6 +53,17 @@ pub trait LlmProvider: Send + Sync {
         context::context_window_tokens(self.model_id())
     }
 
+    /// Complete any asynchronous initialization that feeds the SYNC
+    /// accessors (notably [`Self::context_window`]). Default: no-op.
+    ///
+    /// The agent loop and the prompt-context bridges await this before
+    /// their first window-dependent decision of a turn, so a provider that
+    /// learns its true window asynchronously — the local context probe —
+    /// resolves BEFORE compaction reads the window, not after the first
+    /// chat. Implementations must return immediately once resolved and be
+    /// bounded (a few seconds at most) when not. Wrappers delegate.
+    async fn ensure_ready(&self) {}
+
     /// Get the maximum output tokens this model supports per call.
     fn max_output_tokens(&self) -> u32 {
         context::max_output_tokens(self.model_id())

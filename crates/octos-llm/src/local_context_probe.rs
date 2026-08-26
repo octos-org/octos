@@ -42,7 +42,9 @@ use eyre::Result;
 use octos_core::Message;
 
 use crate::config::ChatConfig;
-use crate::local_discovery::{parse_models_context_window, parse_props_context_window};
+use crate::local_discovery::{
+    parse_models_context_window, parse_ollama_ps_context_window, parse_props_context_window,
+};
 use crate::provider::{LlmProvider, build_http_client};
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, ToolSpec};
 
@@ -73,6 +75,13 @@ fn models_url(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
 }
 
+/// Ollama's native process-status endpoint, at the server root.
+fn ollama_ps_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{root}/api/ps")
+}
+
 /// What one probe GET established — the distinction the retry logic runs on.
 enum FetchOutcome {
     /// The server answered decisively: 2xx with a body, or a definitive
@@ -83,12 +92,26 @@ enum FetchOutcome {
     Transient,
 }
 
+/// Which endpoints the probe asks — the engines disagree (#2135 review:
+/// Ollama serves no `/props`, and its OpenAI-compatible model list carries
+/// no context length; its allocated window lives on the native `/api/ps`).
+enum ProbeEndpoints {
+    /// llama.cpp / vLLM / LM Studio: `/props` (authoritative) then
+    /// `{base}/models`.
+    OpenAiCompatible {
+        props_url: String,
+        models_url: String,
+    },
+    /// Ollama: `GET /api/ps` — the RUNNING models with their allocated
+    /// `context_length`.
+    OllamaNative { ps_url: String },
+}
+
 /// Wraps a local-family provider; overrides `context_window()` with the
 /// server-reported value once the probe has resolved.
 pub struct LocalContextProbe {
     inner: Arc<dyn LlmProvider>,
-    props_url: String,
-    models_url: String,
+    endpoints: ProbeEndpoints,
     api_key: Option<String>,
     timeouts: (u64, u64),
     /// Set ONLY on a definitive outcome: `Some(w)` = the server named its
@@ -117,10 +140,49 @@ impl LocalContextProbe {
                 DEFAULT_PROBE_TIMEOUT_SECS,
                 DEFAULT_PROBE_CONNECT_TIMEOUT_SECS,
             ));
+        Self::with_endpoints(
+            inner,
+            ProbeEndpoints::OpenAiCompatible {
+                props_url: props_url(base_url),
+                models_url: models_url(base_url),
+            },
+            api_key,
+            timeouts,
+        )
+    }
+
+    /// Ollama-native probing: `GET /api/ps` (allocated context of the
+    /// running models). Ollama takes no API key.
+    pub fn new_ollama(
+        inner: Arc<dyn LlmProvider>,
+        base_url: &str,
+        http_timeout: Option<(u64, u64)>,
+    ) -> Arc<Self> {
+        let timeouts = http_timeout
+            .map(|(t, c)| (t.min(MAX_PROBE_TIMEOUT_SECS), c))
+            .unwrap_or((
+                DEFAULT_PROBE_TIMEOUT_SECS,
+                DEFAULT_PROBE_CONNECT_TIMEOUT_SECS,
+            ));
+        Self::with_endpoints(
+            inner,
+            ProbeEndpoints::OllamaNative {
+                ps_url: ollama_ps_url(base_url),
+            },
+            None,
+            timeouts,
+        )
+    }
+
+    fn with_endpoints(
+        inner: Arc<dyn LlmProvider>,
+        endpoints: ProbeEndpoints,
+        api_key: Option<String>,
+        timeouts: (u64, u64),
+    ) -> Arc<Self> {
         let probe = Arc::new(Self {
             inner,
-            props_url: props_url(base_url),
-            models_url: models_url(base_url),
+            endpoints,
             api_key: api_key.filter(|k| !k.is_empty() && k != "no-key"),
             timeouts,
             window: OnceLock::new(),
@@ -156,28 +218,51 @@ impl LocalContextProbe {
         }
 
         let client = build_http_client(self.timeouts.0, self.timeouts.1);
-        // Both GETs concurrently — the probe may be riding in front of a
-        // user-visible request, so the failure worst-case must be one
-        // timeout, not two in sequence.
-        let (props, models) = tokio::join!(
-            fetch(&client, &self.props_url, self.api_key.as_deref()),
-            fetch(&client, &self.models_url, self.api_key.as_deref()),
-        );
-
-        // `/props` wins when it names a window: it reports the value the
-        // server was LAUNCHED with, which caps whatever the per-model
-        // metadata claims (a model trained for 256K served with -c 32768
-        // really has 32K).
-        let window = match (&props, &models) {
-            (FetchOutcome::Answered(Some(body)), _)
-                if parse_props_context_window(body).is_some() =>
-            {
-                parse_props_context_window(body)
+        let (window, all_answered) = match &self.endpoints {
+            ProbeEndpoints::OpenAiCompatible {
+                props_url,
+                models_url,
+            } => {
+                // Both GETs concurrently — the probe may be riding in front
+                // of a user-visible request, so the failure worst-case must
+                // be one timeout, not two in sequence.
+                let (props, models) = tokio::join!(
+                    fetch(&client, props_url, self.api_key.as_deref()),
+                    fetch(&client, models_url, self.api_key.as_deref()),
+                );
+                // `/props` wins when it names a window: it reports the value
+                // the server was LAUNCHED with, which caps whatever the
+                // per-model metadata claims (a model trained for 256K served
+                // with -c 32768 really has 32K).
+                let window = match (&props, &models) {
+                    (FetchOutcome::Answered(Some(body)), _)
+                        if parse_props_context_window(body).is_some() =>
+                    {
+                        parse_props_context_window(body)
+                    }
+                    (_, FetchOutcome::Answered(Some(body))) => {
+                        parse_models_context_window(body, self.inner.model_id())
+                    }
+                    _ => None,
+                };
+                let all_answered = matches!(props, FetchOutcome::Answered(_))
+                    && matches!(models, FetchOutcome::Answered(_));
+                (window, all_answered)
             }
-            (_, FetchOutcome::Answered(Some(body))) => {
-                parse_models_context_window(body, self.inner.model_id())
+            ProbeEndpoints::OllamaNative { ps_url } => {
+                let ps = fetch(&client, ps_url, None).await;
+                let window = match &ps {
+                    FetchOutcome::Answered(Some(body)) => {
+                        parse_ollama_ps_context_window(body, self.inner.model_id())
+                    }
+                    _ => None,
+                };
+                // A model not yet loaded answers with an empty models list;
+                // treat as transient so a later request retries once the
+                // model is running.
+                let answered_with_window_chance = matches!(&ps, FetchOutcome::Answered(Some(_)));
+                (window, answered_with_window_chance && window.is_some())
             }
-            _ => None,
         };
 
         match window {
@@ -194,15 +279,13 @@ impl LocalContextProbe {
                 let _ = self.window.set(Some(w));
             }
             None => {
-                let both_answered = matches!(props, FetchOutcome::Answered(_))
-                    && matches!(models, FetchOutcome::Answered(_));
-                if both_answered {
+                if all_answered {
                     // Definitive: the server is up and simply does not name
                     // a window. Asking again will not change that.
-                    tracing::debug!(
-                        props_url = %self.props_url,
-                        models_url = %self.models_url,
-                        "local server answered but named no context window; keeping catalog value"
+                    tracing::info!(
+                        catalog = self.inner.context_window(),
+                        model = self.inner.model_id(),
+                        "local server answered but named no context window; catalog value stands"
                     );
                     let _ = self.window.set(None);
                 } else {
@@ -268,6 +351,14 @@ impl LlmProvider for LocalContextProbe {
     ) -> Result<ChatStream> {
         self.probe_if_unresolved().await;
         self.inner.chat_stream(messages, tools, config).await
+    }
+
+    async fn ensure_ready(&self) {
+        // Bounded: one probe attempt (a few seconds worst case) while
+        // unresolved and attempts remain; immediate once pinned. This is
+        // the hook that lets a RESUMED session get the corrected window
+        // before its first compaction pass instead of after its first chat.
+        self.probe_if_unresolved().await;
     }
 
     fn context_window(&self) -> u32 {
@@ -375,6 +466,34 @@ mod tests {
             props_url("http://gpu-box:9000"),
             "http://gpu-box:9000/props"
         );
+        assert_eq!(
+            ollama_ps_url("http://localhost:11434/v1"),
+            "http://localhost:11434/api/ps"
+        );
+    }
+
+    /// #2135 review P1 regression: the probed window must survive the
+    /// STANDARD runtime wrapper (every session wraps the base provider in
+    /// RetryProvider) — the trait default would re-read the static catalog
+    /// and discard the probe.
+    #[test]
+    fn should_keep_probed_window_through_retry_wrapper() {
+        let probe = unprobed("http://127.0.0.1:8080/v1");
+        probe.window.set(Some(262_144)).unwrap();
+        let wrapped = crate::RetryProvider::new(probe);
+        assert_eq!(wrapped.context_window(), 262_144);
+    }
+
+    /// ensure_ready delegates through wrappers and drives the probe: on an
+    /// unreachable server it performs a bounded attempt (leaving the window
+    /// unresolved for retry), never hanging or panicking.
+    #[tokio::test]
+    async fn should_drive_probe_through_wrapper_ensure_ready() {
+        let probe = unprobed("http://127.0.0.1:9/v1");
+        let wrapped = crate::RetryProvider::new(probe.clone());
+        wrapped.ensure_ready().await;
+        assert!(probe.attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert!(probe.window.get().is_none(), "transient must not pin");
     }
 
     /// Before the probe resolves, the wrapper reports the inner (catalog)
