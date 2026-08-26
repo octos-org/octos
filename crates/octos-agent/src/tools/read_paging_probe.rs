@@ -66,6 +66,49 @@ static UNPAGEABLE_LONG_LINE: AtomicUsize = AtomicUsize::new(0);
 /// Per-path record of the most recent read, for the overwrite alarm.
 static LAST_READ: Mutex<Option<HashMap<String, ReadShape>>> = Mutex::new(None);
 
+/// Per-path counts, so a test can assert on the file IT created.
+///
+/// The aggregate counters above are process-global, and the suite runs ~2,600
+/// tests in parallel — several of which call `read_file` while an armed probe
+/// is counting. Asserting an exact global total is therefore a race that
+/// passes on one platform and fails on another (it did: macOS 1, Windows 2).
+/// Tests assert here instead; operators still read the aggregates.
+#[cfg(test)]
+static PER_PATH: Mutex<Option<HashMap<String, PathCounts>>> = Mutex::new(None);
+
+/// What one specific path saw.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PathCounts {
+    pub(crate) unbounded_reads: usize,
+    pub(crate) unbounded_reads_that_would_page: usize,
+    pub(crate) continuation_reads: usize,
+    pub(crate) partial_read_then_overwrite: usize,
+    pub(crate) unpageable_long_line: usize,
+}
+
+/// Counts recorded for one path.
+#[cfg(test)]
+pub(crate) fn counts_for(path: &str) -> PathCounts {
+    PER_PATH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(path).copied())
+        .unwrap_or_default()
+}
+
+/// Mutate one path's counts.
+#[cfg(test)]
+fn bump_path(path: &str, apply: impl FnOnce(&mut PathCounts)) {
+    let mut guard = PER_PATH.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = guard
+        .get_or_insert_with(HashMap::new)
+        .entry(path.to_string())
+        .or_default();
+    apply(entry);
+}
+
 /// Test-only arming, so no test has to mutate the environment (`set_var` is
 /// `unsafe` under edition 2024 and this workspace denies unsafe).
 #[cfg(test)]
@@ -115,6 +158,7 @@ pub(crate) fn reset() {
         counter.store(0, Ordering::Relaxed);
     }
     *LAST_READ.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *PER_PATH.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 /// Observe one `read_file` call.
@@ -133,6 +177,23 @@ pub(crate) fn record_read(
         return;
     }
     let would_page = total_lines > CANARY_MAX_LINES || total_bytes > CANARY_MAX_BYTES;
+
+    #[cfg(test)]
+    bump_path(path, |counts| {
+        if max_line_bytes > CANARY_MAX_BYTES {
+            counts.unpageable_long_line += 1;
+        }
+        if bounded {
+            if explicit_start.is_some_and(|start| start > 1) {
+                counts.continuation_reads += 1;
+            }
+        } else {
+            counts.unbounded_reads += 1;
+            if would_page {
+                counts.unbounded_reads_that_would_page += 1;
+            }
+        }
+    });
 
     if max_line_bytes > CANARY_MAX_BYTES {
         // A single line larger than the whole window: line offsets cannot make
@@ -176,6 +237,8 @@ pub(crate) fn record_overwrite(path: &str) -> bool {
         .is_some_and(|shape| shape.would_page);
     if tripped {
         PARTIAL_READ_THEN_OVERWRITE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        bump_path(path, |counts| counts.partial_read_then_overwrite += 1);
     }
     tripped
 }
@@ -277,7 +340,7 @@ mod tests {
             .await
             .unwrap();
 
-        let f = findings();
+        let f = counts_for(&dir.path().join("big.txt").to_string_lossy());
         disarm_for_test();
         assert_eq!(f.unbounded_reads, 1, "the read must be observed: {f:?}");
         assert_eq!(
@@ -298,7 +361,7 @@ mod tests {
             .await
             .unwrap();
 
-        let f = findings();
+        let f = counts_for(&dir.path().join("big.txt").to_string_lossy());
         disarm_for_test();
         assert_eq!(
             f.continuation_reads, 1,
@@ -332,7 +395,7 @@ mod tests {
             .await
             .unwrap();
 
-        let f = findings();
+        let f = counts_for(&dir.path().join("script.js").to_string_lossy());
         disarm_for_test();
         assert_eq!(
             f.partial_read_then_overwrite, 1,
@@ -356,7 +419,7 @@ mod tests {
             .await
             .unwrap();
 
-        let f = findings();
+        let f = counts_for(&dir.path().join("small.txt").to_string_lossy());
         disarm_for_test();
         assert_eq!(
             f.partial_read_then_overwrite, 0,
@@ -382,14 +445,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            findings(),
-            Findings {
-                unbounded_reads: 0,
-                unbounded_reads_that_would_page: 0,
-                continuation_reads: 0,
-                partial_read_then_overwrite: 0,
-                unpageable_long_line: 0,
-            },
+            counts_for(&dir.path().join("big.txt").to_string_lossy()),
+            PathCounts::default(),
             "a disarmed probe must record nothing, so an armed zero is evidence"
         );
     }
@@ -406,7 +463,7 @@ mod tests {
             CANARY_MAX_BYTES * 2,
             CANARY_MAX_BYTES * 2,
         );
-        let f = findings();
+        let f = counts_for("huge-line.min.js");
         disarm_for_test();
         assert_eq!(
             f.unpageable_long_line, 1,
