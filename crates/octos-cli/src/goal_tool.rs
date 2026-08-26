@@ -1997,9 +1997,11 @@ mod tests {
     async fn capture_live_verifier_call() {
         let key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY required");
         // Build the LIVE main-lane provider exactly as the profile does.
-        let mut config = crate::config::Config::default();
-        config.provider = Some("moonshot-coding".to_owned());
-        config.api_key_env = Some("KIMI_API_KEY".to_owned());
+        let mut config = crate::config::Config {
+            provider: Some("moonshot-coding".to_owned()),
+            api_key_env: Some("KIMI_API_KEY".to_owned()),
+            ..Default::default()
+        };
         config.env_vars.insert("KIMI_API_KEY".to_owned(), key);
         let provider = crate::commands::chat::create_provider_with_api_type(
             "moonshot-coding",
@@ -2047,9 +2049,11 @@ mod tests {
     #[ignore = "real k3 network call; run explicitly with KIMI_API_KEY in env"]
     async fn capture_live_verifier_call_long_evidence() {
         let key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY required");
-        let mut config = crate::config::Config::default();
-        config.provider = Some("moonshot-coding".to_owned());
-        config.api_key_env = Some("KIMI_API_KEY".to_owned());
+        let mut config = crate::config::Config {
+            provider: Some("moonshot-coding".to_owned()),
+            api_key_env: Some("KIMI_API_KEY".to_owned()),
+            ..Default::default()
+        };
         config.env_vars.insert("KIMI_API_KEY".to_owned(), key);
         let provider = crate::commands::chat::create_provider_with_api_type(
             "moonshot-coding",
