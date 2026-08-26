@@ -32395,7 +32395,9 @@ mod tests {
         let orchestrator = default_agent_orchestrator();
         orchestrator.claim_main_tree_owner(&profile_data_dir, "goal_02");
         assert_eq!(
-            orchestrator.scan_main_tree_owner(&profile_data_dir).as_deref(),
+            orchestrator
+                .scan_main_tree_owner(&profile_data_dir)
+                .as_deref(),
             Some("goal_01"),
             "multi-ledger scan finds the first-writer-wins owner"
         );

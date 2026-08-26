@@ -31958,7 +31958,9 @@ fn dual_goal_peer_fenced_and_cross_goal_checkout_refused() {
     let profile_data_dir = tmp.path().join("profile-data");
     orchestrator.claim_main_tree_owner(&profile_data_dir, "goal_01");
     assert_eq!(
-        orchestrator.scan_main_tree_owner(&profile_data_dir).as_deref(),
+        orchestrator
+            .scan_main_tree_owner(&profile_data_dir)
+            .as_deref(),
         Some("goal_01"),
         "goal_01's claim is discoverable by enumeration (goal_02 never reads it directly)"
     );
@@ -31984,8 +31986,9 @@ fn dual_goal_peer_fenced_and_cross_goal_checkout_refused() {
         owner_goal_id: orchestrator.scan_main_tree_owner(&profile_data_dir),
         caller_goal_id: Some("goal_02".to_owned()),
     };
-    let denial = tree_sovereignty_denial("git checkout feat/goal-02-stream", &workspace, &goal_02_ctx)
-        .expect("cross-goal checkout must be refused");
+    let denial =
+        tree_sovereignty_denial("git checkout feat/goal-02-stream", &workspace, &goal_02_ctx)
+            .expect("cross-goal checkout must be refused");
     assert!(
         denial.contains("owned by goal 'goal_01'"),
         "names the owner: {denial}"
@@ -32014,7 +32017,7 @@ fn dual_goal_peer_fenced_and_cross_goal_checkout_refused() {
             std::path::Path::new(&staged.cwd),
             &goal_02_ctx,
         )
-            .is_none(),
+        .is_none(),
         "checkouts inside a fenced peer clone pass through"
     );
 }
