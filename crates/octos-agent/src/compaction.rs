@@ -946,8 +946,6 @@ pub fn repo_label_from_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// System prompt for LLM context compaction (codex-style handoff summary).
-
 /// Cap on the preserved-plan block: the plan is a checklist, not a
 /// transcript — anything longer is a model mis-using update_plan, and the
 /// preservation must not eat the summary budget it rides on.
@@ -1018,6 +1016,7 @@ resume from the first unchecked item)\n{plan}\n\n{summary}"
     }
 }
 
+/// System prompt for LLM context compaction (codex-style handoff summary).
 const LLM_COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a long conversation so it fits the model's \
 context window. Produce a CONTEXT CHECKPOINT: a concise handoff summary another LLM can use to seamlessly \
 continue the task. Include the current goal, key decisions made, progress completed and what remains, and \
