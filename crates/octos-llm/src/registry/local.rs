@@ -50,6 +50,10 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
         .or_else(|| ENTRY.default_model().map(str::to_string))
         .unwrap_or_else(|| PLACEHOLDER_MODEL.into());
     let url = p.base_url.unwrap_or_else(|| DEFAULT_BASE_URL.into());
+    // The probe must authenticate exactly like the provider (llama-server
+    // --api-key deployments 401 anonymous GETs), so capture the real key
+    // before the placeholder default.
+    let probe_key = p.api_key.clone();
     let key = p.api_key.unwrap_or_else(|| "no-key".into());
     let mut provider = OpenAIProvider::new(&key, &model)
         .with_provider_label("local")
@@ -62,10 +66,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     }
     // The catalog row for this family is a guess (the operator's server was
     // not running at registration time); the running server knows its real
-    // window. The probe wrapper asks it once, on the first request, and
-    // corrects the budget — see `local_context_probe` for why budgeting a
-    // 256K server as 32K is not a safe under-estimate.
-    Ok(Arc::new(LocalContextProbe::new(Arc::new(provider), &url)))
+    // window. The probe wrapper asks it and corrects the budget — see
+    // `local_context_probe` for why budgeting a 256K server as 32K is not
+    // a safe under-estimate.
+    Ok(LocalContextProbe::new(
+        Arc::new(provider),
+        &url,
+        probe_key,
+        http_timeout,
+    ))
 }
 
 #[cfg(test)]

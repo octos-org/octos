@@ -60,7 +60,6 @@ pub use content_classifier::{
     RoutingConfig,
 };
 pub use context_override::ContextWindowOverride;
-pub use local_context_probe::LocalContextProbe;
 pub use credential_pool::{
     CREDENTIAL_POOL_SCHEMA_VERSION, Credential, CredentialPool, CredentialRotationEvent,
     CredentialState, DEFAULT_COOLDOWN_US, DEFAULT_CREDENTIAL_POOL_DB_FILENAME, ErrorId,
@@ -77,6 +76,7 @@ pub use lane::{
     LANE_CONTEXT, Lane, LaneContext, LaneRoutingConfig, current_lane_context,
     default_lane_candidates, resolve_lane_for_topic, topic_prefix, with_lane_context,
 };
+pub use local_context_probe::LocalContextProbe;
 pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use crate::local_context_probe::LocalContextProbe;
 use crate::openai::OpenAIProvider;
 use crate::provider::LlmProvider;
 
@@ -44,5 +45,14 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
-    Ok(Arc::new(provider))
+    // Same class of local server as the `local` family: the catalog's
+    // context_window is a guess, the running server knows — probe it (see
+    // `local_context_probe`). Ollama has no `--api-key`; anonymous GETs
+    // are what its own CLI sends.
+    Ok(LocalContextProbe::new(
+        Arc::new(provider),
+        &url,
+        None,
+        http_timeout,
+    ))
 }

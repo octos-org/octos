@@ -41,7 +41,9 @@ pub const CANDIDATE_BASE_URLS: &[&str] = &[
 /// byte count or a typo'd value into the compaction budget, where an
 /// absurd window would disable compaction entirely.
 fn sane_context_window(value: u64) -> Option<u32> {
-    (1_024..=16_777_216).contains(&value).then_some(value as u32)
+    (1_024..=16_777_216)
+        .contains(&value)
+        .then_some(value as u32)
 }
 
 /// Context window from a llama.cpp `GET /props` response body.
@@ -61,20 +63,34 @@ pub fn parse_props_context_window(body: &str) -> Option<u32> {
     sane_context_window(n_ctx)
 }
 
-/// Context window from an OpenAI-compatible `GET /v1/models` response body.
+/// Context window from an OpenAI-compatible `GET /v1/models` response body,
+/// for the entry that IS `model_id` — never another model's.
 ///
-/// The engines disagree on where they put it, so this checks every known
-/// spelling on each model entry and takes the first plausible value:
-/// llama.cpp exposes `meta.n_ctx` (runtime) and `meta.n_ctx_train`
-/// (model's trained maximum), vLLM exposes `max_model_len`, LM Studio
-/// exposes `max_context_length` / `loaded_context_length`. Runtime values
-/// are preferred over trained maxima within an entry. `None` means no
-/// entry carried a plausible window — callers should fall back to the
-/// catalog, not error.
-pub fn parse_models_context_window(body: &str) -> Option<u32> {
+/// A multi-model server (LM Studio, llama.cpp router mode, a LiteLLM
+/// proxy) lists every loaded model; taking "the first entry with a window"
+/// would budget the session against whatever happens to be listed first —
+/// an embedding model's 8K, say. Entry selection therefore mirrors how
+/// these servers themselves resolve the request's `model` field:
+///
+/// 1. the entry whose id equals `model_id`;
+/// 2. else a case-insensitive substring match in either direction (llama.cpp
+///    reports GGUF paths as ids, so the configured short name is usually a
+///    substring of the served id);
+/// 3. else, when the list has exactly ONE entry or `model_id` is the
+///    [`PLACEHOLDER_MODEL`], that sole/first entry — single-model servers
+///    ignore the `model` field entirely;
+/// 4. else `None`: guessing a window across models is worse than the
+///    catalog fallback.
+///
+/// Within the chosen entry, every known spelling is checked, runtime values
+/// before trained maxima: llama.cpp `meta.n_ctx` / `meta.n_ctx_train`,
+/// vLLM `max_model_len`, LM Studio `loaded_context_length` /
+/// `max_context_length`. `None` means the chosen entry carried no plausible
+/// window — callers should fall back to the catalog, not error.
+pub fn parse_models_context_window(body: &str, model_id: &str) -> Option<u32> {
     let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
     let data = value.get("data")?.as_array()?;
-    for model in data {
+    let window_of = |model: &serde_json::Value| -> Option<u32> {
         let meta = model.get("meta");
         let candidates = [
             meta.and_then(|m| m.get("n_ctx")),
@@ -84,11 +100,39 @@ pub fn parse_models_context_window(body: &str) -> Option<u32> {
             model.get("max_context_length"),
             meta.and_then(|m| m.get("n_ctx_train")),
         ];
-        for candidate in candidates.into_iter().flatten() {
-            if let Some(window) = candidate.as_u64().and_then(sane_context_window) {
-                return Some(window);
-            }
+        candidates
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| candidate.as_u64().and_then(sane_context_window))
+    };
+    let id_of = |model: &serde_json::Value| -> Option<String> {
+        model
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::to_owned)
+    };
+    // Pass 1: exact id.
+    if let Some(entry) = data.iter().find(|m| id_of(m).as_deref() == Some(model_id)) {
+        return window_of(entry);
+    }
+    // Pass 2: substring either direction, case-insensitive (skipped for the
+    // placeholder — it is not a real id and "default" would collide).
+    if model_id != PLACEHOLDER_MODEL {
+        let needle = model_id.to_lowercase();
+        if let Some(entry) = data.iter().find(|m| {
+            id_of(m).is_some_and(|id| {
+                let id = id.to_lowercase();
+                id.contains(&needle) || needle.contains(&id)
+            })
+        }) {
+            return window_of(entry);
         }
+    }
+    // Pass 3: a single-model server ignores the `model` field, so its sole
+    // entry is the one serving this session regardless of configured id;
+    // the placeholder id means the config never named a model at all.
+    if data.len() == 1 || model_id == PLACEHOLDER_MODEL {
+        return data.first().and_then(window_of);
     }
     None
 }
@@ -168,7 +212,8 @@ mod tests {
     /// window.
     #[test]
     fn should_read_n_ctx_from_props_shape() {
-        let body = r#"{"default_generation_settings":{"n_ctx":262144,"n_predict":-1},"total_slots":1}"#;
+        let body =
+            r#"{"default_generation_settings":{"n_ctx":262144,"n_predict":-1},"total_slots":1}"#;
         assert_eq!(parse_props_context_window(body), Some(262_144));
     }
 
@@ -189,27 +234,66 @@ mod tests {
     #[test]
     fn should_prefer_runtime_n_ctx_over_trained_maximum() {
         let body = r#"{"data":[{"id":"qwen","meta":{"n_ctx":65536,"n_ctx_train":262144}}]}"#;
-        assert_eq!(parse_models_context_window(body), Some(65_536));
+        assert_eq!(parse_models_context_window(body, "qwen"), Some(65_536));
         // Only the trained maximum present: better than nothing.
         let body = r#"{"data":[{"id":"qwen","meta":{"n_ctx_train":262144}}]}"#;
-        assert_eq!(parse_models_context_window(body), Some(262_144));
+        assert_eq!(parse_models_context_window(body, "qwen"), Some(262_144));
     }
 
     /// vLLM (`max_model_len`) and LM Studio (`max_context_length`) spellings.
     #[test]
     fn should_read_vllm_and_lmstudio_spellings() {
         let body = r#"{"data":[{"id":"m","max_model_len":131072}]}"#;
-        assert_eq!(parse_models_context_window(body), Some(131_072));
-        let body = r#"{"data":[{"id":"m","max_context_length":32768,"loaded_context_length":8192}]}"#;
-        assert_eq!(parse_models_context_window(body), Some(8_192));
+        assert_eq!(parse_models_context_window(body, "m"), Some(131_072));
+        let body =
+            r#"{"data":[{"id":"m","max_context_length":32768,"loaded_context_length":8192}]}"#;
+        assert_eq!(parse_models_context_window(body, "m"), Some(8_192));
     }
 
     /// No known field → None (catalog fallback), not a guess.
     #[test]
     fn should_return_none_when_models_carry_no_window() {
-        assert_eq!(parse_models_context_window(r#"{"data":[{"id":"m"}]}"#), None);
-        assert_eq!(parse_models_context_window(r#"{"data":[]}"#), None);
-        assert_eq!(parse_models_context_window("<html></html>"), None);
+        assert_eq!(
+            parse_models_context_window(r#"{"data":[{"id":"m"}]}"#, "m"),
+            None
+        );
+        assert_eq!(parse_models_context_window(r#"{"data":[]}"#, "m"), None);
+        assert_eq!(parse_models_context_window("<html></html>", "m"), None);
+    }
+
+    /// Multi-model servers: the window must come from the CONFIGURED
+    /// model's entry, never whichever model is listed first. Exact id wins;
+    /// substring matches llama.cpp's GGUF-path ids; the placeholder (or a
+    /// single-entry list) falls back to the sole/first entry; an unmatched
+    /// id on a multi-model list yields None rather than a guess.
+    #[test]
+    fn should_match_configured_model_in_multi_model_list() {
+        let body = r#"{"data":[
+            {"id":"small-embed","meta":{"n_ctx":8192}},
+            {"id":"/models/Qwen3-Coder-Q8.gguf","meta":{"n_ctx":131072}}
+        ]}"#;
+        assert_eq!(
+            parse_models_context_window(body, "small-embed"),
+            Some(8_192)
+        );
+        // Substring, either direction, case-insensitive.
+        assert_eq!(
+            parse_models_context_window(body, "qwen3-coder-q8"),
+            Some(131_072)
+        );
+        // Placeholder: first entry (single-model-server assumption).
+        assert_eq!(
+            parse_models_context_window(body, PLACEHOLDER_MODEL),
+            Some(8_192)
+        );
+        // Unmatched real id against a multi-model list: no guess.
+        assert_eq!(parse_models_context_window(body, "unrelated-model"), None);
+        // Single-entry list serves whatever was configured.
+        let single = r#"{"data":[{"id":"whatever","meta":{"n_ctx":65536}}]}"#;
+        assert_eq!(
+            parse_models_context_window(single, "my-alias"),
+            Some(65_536)
+        );
     }
 
     /// The placeholder stays namespaced — a generic id would become a broad
