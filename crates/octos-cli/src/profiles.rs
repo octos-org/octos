@@ -192,6 +192,13 @@ pub struct ProfileConfig {
     /// coding provider, unchanged behavior).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sub_providers: Vec<crate::config::SubProviderConfig>,
+    /// MCP servers to attach to this profile's agent (e.g. the OLP-MCP
+    /// outer-loop server). Loaded into the runtime `Config.mcp_servers` by
+    /// `config_from_profile` — before OLP #29 S2b the field was missing here
+    /// and the runtime field was hard-zeroed, so a profile-level
+    /// `[[mcp_servers]]` block silently never registered any tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<octos_agent::McpServerConfig>,
     /// Per-tenant reply-voice (TTS timbre) choice. Voice route/ASR settings stay
     /// platform-level on the serve config; only the chosen timbre is per-user.
     /// Applied at profile bootstrap over the shared `VoiceConfig.default_voice`
@@ -2740,7 +2747,10 @@ pub(crate) fn config_from_profile(
         // Fields not configured through profiles — use defaults
         version: None,
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
-        mcp_servers: vec![],
+        // OLP #29 S2b: thread the profile's [[mcp_servers]] into the runtime
+        // config so the gateway actually spawns them and registers their
+        // tools (was hard-zeroed: profile-level MCP config never took effect).
+        mcp_servers: profile.config.mcp_servers.clone(),
         sandbox: profile.config.sandbox.clone(),
         // (serve-side wiring lands with the UI/RPC follow-up).
         // #1768: thread the profile's snapshot opt-in so serve sessions
