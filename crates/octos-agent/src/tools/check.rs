@@ -364,10 +364,18 @@ fn plural(n: usize, noun: &str) -> String {
 /// was a session that shipped 15 uncompiled files because "no parseable
 /// diagnostics" told it nothing was actionable.
 fn classify_failure(raw: &str) -> Option<&'static str> {
-    if raw.contains("Operation not permitted") {
+    // All three kernel spellings of a sandbox denial: EPERM (macOS
+    // seatbelt), EACCES (Landlock), EROFS (bwrap/Docker read-only). The
+    // note about "not recognized" ordering below matters: this arm runs
+    // FIRST because a denial often cascades into secondary errors that
+    // would otherwise match the later arms.
+    if raw.contains("Operation not permitted")
+        || raw.contains("Permission denied")
+        || raw.contains("Read-only file system")
+    {
         return Some(
             "the environment denied a file access (on a sandboxed run this is usually the \
-             sandbox — toolchain caches like ~/.rustup and ~/.cargo need \
+             sandbox — on macOS, toolchain caches like ~/.rustup and ~/.cargo need \
              `sandbox.allow_toolchains`), not a defect in the project's code",
         );
     }
