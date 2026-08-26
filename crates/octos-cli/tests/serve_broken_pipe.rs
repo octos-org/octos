@@ -6,6 +6,13 @@
 //! 2. serve_shutdown_broken_pipe_cleanup_marker_observed
 //! 3. serve_shutdown_order_preserved
 //! 4. serve_startup_broken_pipe_no_panic
+//!
+//! The `serve` subcommand only exists under the `api` feature. Without it the
+//! whole harness compiles to zero tests (feature gate, NOT `#[ignore]`), so
+//! feature-less invocations — including agent-spec lifecycle's plain
+//! `cargo test -p octos-cli --test serve_broken_pipe` — report ok/0 rather
+//! than fail. The real run is the dedicated serial CI step:
+//! `cargo test -p octos-cli --features api --test serve_broken_pipe -- --test-threads=1`
 
 // Process-control tests require libc pipe/kill/setsid — unsafe is inherent.
 #[allow(unsafe_code)]
@@ -18,9 +25,36 @@ mod imp {
     /// (model catalog, profile store) — serialize them.
     static SERIAL: Mutex<()> = Mutex::new(());
 
-    /// Path to the octos binary built by Cargo for this compilation unit.
+    /// Path to a real octos binary that includes the `serve` subcommand.
+    ///
+    /// When this harness itself is compiled WITH the `api` feature, Cargo
+    /// already built `CARGO_BIN_EXE_octos` with `serve` — reuse it directly.
+    /// When compiled WITHOUT `api` (e.g. agent-spec lifecycle's plain
+    /// `cargo test -p octos-cli --test serve_broken_pipe`), that binary has
+    /// no `serve` subcommand, so we bootstrap one: `cargo build` an api
+    /// binary into a dedicated target dir next to the manifest. Either way
+    /// the spawned process is the REAL octos binary with production code.
     fn octos_binary() -> std::path::PathBuf {
-        env!("CARGO_BIN_EXE_octos").into()
+        if cfg!(feature = "api") {
+            return env!("CARGO_BIN_EXE_octos").into();
+        }
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let target_dir = std::path::Path::new(manifest_dir).join("../../target/serve-bp-probe");
+        let bin = target_dir.join("debug/octos");
+        if !bin.exists() {
+            let out = std::process::Command::new("cargo")
+                .args(["build", "-p", "octos-cli", "--features", "api"])
+                .current_dir(std::path::Path::new(manifest_dir).join("../.."))
+                .env("CARGO_TARGET_DIR", &target_dir)
+                .output()
+                .expect("failed to bootstrap api-enabled octos binary");
+            assert!(
+                out.status.success(),
+                "bootstrap cargo build failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        bin
     }
 
     /// Build a serve Command with a private instance data dir.
