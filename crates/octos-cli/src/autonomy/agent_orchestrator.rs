@@ -3602,6 +3602,21 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// #20a (smart worktree fencing) — the count of this profile's goals
+    /// whose status is `active`, across ALL store keys. Pure in-memory map
+    /// scan (one MutexGuard, no I/O) — cheap enough to evaluate on the
+    /// `peer_handoff` staging path only. Used by the collision predicate:
+    /// more than one active goal in the instance means concurrent work
+    /// streams, so an unspecified peer worktree auto-fences.
+    pub(crate) fn profile_active_goal_count(&self, profile_id: &str) -> usize {
+        let state = self.state();
+        state
+            .goals
+            .values()
+            .filter(|goal| goal.profile_id == profile_id && goal.status == "active")
+            .count()
+    }
+
     /// #2056 round 2 (H2b) — the goal BOUND to this session, whatever its
     /// status. [`Self::active_goal_id`] additionally requires `active`, which
     /// is right for recording NEW work and wrong for reconciling work that has

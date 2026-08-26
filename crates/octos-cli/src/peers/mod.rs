@@ -1925,6 +1925,106 @@ pub(crate) fn peer_handoff_allowed_for_session(session_id: &SessionKey) -> bool 
         .is_some_and(|topic| topic.starts_with("peer-"))
 }
 
+/// #20a (smart worktree fencing) — a collision risk REASON. When the model
+/// left `worktree` unspecified, any hit flips the auto-default to FENCED;
+/// when the model explicitly said `worktree=false`, each hit becomes a
+/// warning in the staged `model_note`. Zero hits keeps the legacy default
+/// (unfenced) — the single-goal / single-branch path pays nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FenceCollisionReason {
+    /// ① More than one ACTIVE goal exists for this profile in this instance.
+    MultipleActiveGoals,
+    /// ② The master's tree is not on `main`/`master` — this run already
+    /// branched away from trunk, so an unfenced peer would share it.
+    MainTreeOnNonDefaultBranch,
+    /// ③ Another peer is staged, not closed, has no result yet (in-flight)
+    /// AND was not fenced.
+    UnfencedPeerInFlight,
+}
+
+impl FenceCollisionReason {
+    fn note(self) -> &'static str {
+        match self {
+            Self::MultipleActiveGoals => "multiple active goals in this instance",
+            Self::MainTreeOnNonDefaultBranch => "the master's tree is on a non-default branch",
+            Self::UnfencedPeerInFlight => "an unfenced peer is already in flight",
+        }
+    }
+}
+
+/// Evaluate the #20a collision predicate. Input cost is exactly one in-memory
+/// goal-map scan plus a bounded peers-dir read; the expensive checks
+/// (a `git` subprocess for the current branch, the peer scan) only run when
+/// no cheaper reason already fired, and NONE of them run when the caller
+/// passed an explicit `worktree=true` (see the callback).
+fn fence_collision_reasons(
+    peers_root: &Path,
+    workspace_root: &Path,
+    profile_id: &str,
+) -> Vec<FenceCollisionReason> {
+    let mut reasons = Vec::new();
+    // ① Active-goal count: pure in-memory map scan.
+    if default_agent_orchestrator().profile_active_goal_count(profile_id) > 1 {
+        reasons.push(FenceCollisionReason::MultipleActiveGoals);
+        return reasons;
+    }
+    // ② Master's current branch (the workspace root passed in IS the master's
+    // tree — peers fence as CLONES, so a fenced master's root still reads its
+    // own branch here). Detached HEAD / non-git / git failure all read as
+    // "unknown" and do NOT trigger.
+    let branch = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    match branch.as_deref() {
+        Some("main") | Some("master") | None | Some("") => {}
+        Some(_) => {
+            reasons.push(FenceCollisionReason::MainTreeOnNonDefaultBranch);
+            return reasons;
+        }
+    }
+    // ③ Scan the blackboard for a staged peer that is STILL IN FLIGHT (no
+    // result, not closed) and was NOT fenced.
+    if read_peer_blackboard(peers_root, None)
+        .iter()
+        .any(|row| row.result.is_none() && !row.closed && !row.has_worktree)
+    {
+        reasons.push(FenceCollisionReason::UnfencedPeerInFlight);
+    }
+    reasons
+}
+
+/// #20a — fold the caller's `worktree` preference and the collision predicate
+/// into the EFFECTIVE fence decision plus an optional model-visible warning.
+/// Explicit `true` short-circuits (fenced, zero predicate cost); explicit
+/// `false` wins but warns on a predicate hit; omitted takes the predicate.
+pub(crate) fn resolve_peer_worktree(
+    request_worktree: Option<bool>,
+    reasons: &[FenceCollisionReason],
+) -> (bool, Option<String>) {
+    match request_worktree {
+        Some(true) => (true, None),
+        Some(false) => {
+            let warning = (!reasons.is_empty()).then(|| {
+                let why = reasons
+                    .iter()
+                    .map(|reason| reason.note())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "warning: you passed worktree=false, but collision risk was detected ({why}) —                      staging this peer UNFENCED as requested; it may collide with concurrent work                      in the shared tree. Omit the worktree argument to auto-fence in this situation."
+                )
+            });
+            (false, warning)
+        }
+        None => (!reasons.is_empty(), None),
+    }
+}
+
 /// #1801 v3: build the `peer_handoff` staging callback for ONE turn of the
 /// serve/WS path. Turn-scoped state is baked in at wiring time: the
 /// profile's `peers/` root, the session's workspace root, the ORIGINATING
@@ -1971,6 +2071,18 @@ pub(crate) fn build_peer_handoff_callback(
         let resolved_goal_id: Option<String> = request.goal_id.clone().or_else(|| {
             default_agent_orchestrator().active_goal_id(&originating_session, &profile_id)
         });
+        // #20a — smart fencing default. An explicit `worktree=true` fences
+        // with NO predicate evaluation (no syscalls added for the caller who
+        // already said "fence"); an explicit/absent value evaluates the
+        // collision predicate, and `Some(false)` is still honored — with a
+        // model-visible warning recorded in `model_note`.
+        let fence_reasons = if request.worktree == Some(true) {
+            Vec::new()
+        } else {
+            fence_collision_reasons(&peers_root, &workspace_root, &profile_id)
+        };
+        let (effective_worktree, fence_warning) =
+            resolve_peer_worktree(request.worktree, &fence_reasons);
         let staged = stage_peer(
             &peers_root,
             &workspace_root,
@@ -1978,7 +2090,7 @@ pub(crate) fn build_peer_handoff_callback(
             Some(&request.name),
             Some(originator.as_str()),
             &request.brief,
-            request.worktree,
+            effective_worktree,
             // Explicit goal_id wins; else the master's active goal (auto-bind).
             resolved_goal_id.as_deref(),
             request.task_id.as_deref(),
@@ -1988,12 +2100,21 @@ pub(crate) fn build_peer_handoff_callback(
         // under the re-validated staged dir; an unknown lane (or a failed
         // record) is a truthful warning (the peer runs on the primary model),
         // never a staging failure.
-        let model_note = record_peer_model_lane(
+        let mut model_note = record_peer_model_lane(
             &peers_root,
             &staged.slug,
             request.model.as_deref(),
             &available_lanes,
         );
+        // #20a — surface an explicit-false override warning alongside any
+        // model-lane note in the SAME `model_note` field the tool already
+        // appends to its success output.
+        if let Some(warning) = fence_warning {
+            model_note = Some(match model_note {
+                Some(note) => format!("{note} {warning}"),
+                None => warning,
+            });
+        }
         // Durable so reconnect replay still delivers the open request; the
         // client dedups by an already-open session for the topic.
         emit_staged(PeerStagedEvent {
