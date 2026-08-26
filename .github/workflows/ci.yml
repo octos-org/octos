@@ -420,8 +420,17 @@ jobs:
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
 
-      - name: Test octos-cli (integration)
-        run: cargo test -p octos-cli --tests
+      - name: Test octos-cli (integration, excluding serve process e2e)
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe
+
+      # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe). These
+      # spawn real `octos serve` children that contend for model catalog /
+      # profile store resources with other test binaries; under the default
+      # thread-per-core parallelism the children starve and the 15s port
+      # barrier times out. Dedicated serial step per the #21 outer-loop
+      # ruling (2026-08-27): layer at the CI command level, never #[ignore].
+      - name: serve BrokenPipe process e2e (serial)
+        run: cargo test -p octos-cli --features api --test serve_broken_pipe -- --test-threads=1
 
       # Co-located here so they reuse this job's warm octos-cli build cache.
       - name: API feature tests

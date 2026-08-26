@@ -42,12 +42,11 @@ pub fn write_panic_report(w: &mut impl std::io::Write, msg: &str) {
     }
 }
 
-fn main() -> Result<()> {
-    // Initialize error handling with a BrokenPipe-safe panic hook.
-    // The default color-eyre panic hook uses `eprintln!` which panics on
-    // EPIPE (observer closed stderr), causing a double-panic → abort.
-    // We install the EyreHook normally, then override the PanicHook's
-    // stderr write to use fallible I/O that swallows BrokenPipe.
+/// Install the production error hooks: color-eyre EyreHook plus a panic
+/// hook whose stderr write goes through [`write_panic_report`] (fallible,
+/// BrokenPipe-swallowing). Shared by `main` and the `--test-panic` harness
+/// entry so integration tests exercise the REAL production hook path.
+pub fn install_error_hooks() -> color_eyre::Result<()> {
     let (panic_hook, eyre_hook) = color_eyre::config::HookBuilder::default().into_hooks();
     eyre_hook.install()?;
     std::panic::set_hook(Box::new(move |pi| {
@@ -56,6 +55,20 @@ fn main() -> Result<()> {
         let mut err = std::io::stderr().lock();
         write_panic_report(&mut err, &msg);
     }));
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    install_error_hooks()?;
+
+    // Hidden chaos-test switch (outer-loop blueprint step ②): when
+    // OCTOS_TEST_PANIC_AFTER_BOOT=1, panic immediately AFTER the production
+    // hooks are installed. Integration tests use this to drive the REAL
+    // production panic-hook path under a broken-pipe stderr and assert no
+    // second panic / no SIGABRT. Never set in normal operation.
+    if std::env::var("OCTOS_TEST_PANIC_AFTER_BOOT").as_deref() == Ok("1") {
+        panic!("__test_panic__: intentional panic for production hook verification");
+    }
 
     // Parse into ArgMatches first (this preserves clap's --help/--version/error
     // handling exactly as `Args::parse()` did), materialize the typed Args, then

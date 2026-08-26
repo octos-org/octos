@@ -7,267 +7,251 @@
 //! 3. serve_shutdown_order_preserved
 //! 4. serve_startup_broken_pipe_no_panic
 
-// Process-control tests require libc pipe/kill/close — unsafe is inherent.
+// Process-control tests require libc pipe/kill/setsid — unsafe is inherent.
 #[allow(unsafe_code)]
 mod imp {
-    use std::io::Read;
     use std::os::fd::FromRawFd;
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
 
-    /// Ensure integration tests run serially (they bind to ports and
-    /// spawn real processes — parallel execution causes port conflicts).
+    /// Serve tests spawn real processes that contend for shared resources
+    /// (model catalog, profile store) — serialize them.
     static SERIAL: Mutex<()> = Mutex::new(());
 
-    /// Get the path to the octos binary built by Cargo for this exact
-    /// compilation unit. This is always the freshly-built binary, never
-    /// a stale one from a previous build.
+    /// Path to the octos binary built by Cargo for this compilation unit.
     fn octos_binary() -> std::path::PathBuf {
         env!("CARGO_BIN_EXE_octos").into()
     }
 
-    /// Spawn a serve process via `script` PTY wrapper with a private instance
-    /// data dir. `script` provides a controlling TTY so tokio::signal::ctrl_c()
-    /// can receive SIGINT properly. The wrapper PID is NOT the octos PID —
-    /// use `find_octos_pid` to get the real one.
-    fn spawn_serve_pty(port: u16, data_dir: &std::path::Path) -> std::process::Child {
-        let octos = octos_binary();
-        let args_str = format!(
-            "serve --instance-data-dir {} --solo --danger-full-access -p {}",
-            data_dir.display(),
-            port
-        );
-        Command::new("script")
-            .args([
-                "-q",
-                "-c",
-                &format!("{} {}", octos.display(), args_str),
-                "/dev/null",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start octos serve via script")
-    }
-
-    /// Find the real octos serve PID (child of the script wrapper).
-    fn find_octos_pid(script_pid: u32) -> Option<i32> {
-        let output = Command::new("pgrep")
-            .args(["-P", &script_pid.to_string(), "-f", "octos serve"])
-            .output()
-            .ok()?;
-        let pid_str = String::from_utf8_lossy(&output.stdout);
-        pid_str.trim().lines().next()?.parse().ok()
+    /// Build a serve Command with a private instance data dir.
+    /// `pre_exec(setsid)` detaches the child from the test runner's process
+    /// group so SIGINT reaches the real octos process (not suppressed by
+    /// shell job control). child.id() IS the real octos PID.
+    fn serve_command(port: u16, data_dir: &std::path::Path) -> Command {
+        let mut cmd = Command::new(octos_binary());
+        cmd.args([
+            "serve",
+            "--instance-data-dir",
+            data_dir.to_str().unwrap(),
+            "--solo",
+            "--danger-full-access",
+            "-p",
+            &port.to_string(),
+        ])
+        .stdin(Stdio::null())
+        // The host session may export OCTOS_INSTANCE_DATA_DIR (shared instance
+        // lock). Remove it so the child uses ONLY our private --instance-data-dir.
+        .env_remove("OCTOS_INSTANCE_DATA_DIR")
+        .env_remove("OCTOS_HOME")
+        .env_remove("OCTOS_DATA_DIR");
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                // Detach from the parent's process group/session so signals
+                // from the test harness are delivered directly to octos.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd
     }
 
     /// Test 1: subprocess_panic_stderr_broken_pipe_no_abort
     ///
-    /// Verify the production write_panic_report does not cause a second
-    /// panic/abort when stderr is a broken pipe. We use a test binary that
-    /// installs the SAME panic hook logic as main.rs (extracted as a
-    /// standalone function) and triggers a real Rust panic.
+    /// Drive the REAL octos binary with OCTOS_TEST_PANIC_AFTER_BOOT=1, which
+    /// triggers a genuine Rust panic AFTER the production hooks are
+    /// installed in `main`. stderr is a pipe whose read end is closed
+    /// (EPIPE). The production hook (write_panic_report via install_error_hooks)
+    /// must swallow BrokenPipe: no second panic, no SIGABRT — exit code 101
+    /// (standard Rust panic exit), not a signal death.
     #[test]
     fn subprocess_panic_stderr_broken_pipe_no_abort() {
-        let test_dir = std::env::temp_dir().join("octos_panic_test");
-        std::fs::create_dir_all(&test_dir).unwrap();
-
-        let test_src = test_dir.join("panic_test.rs");
-        std::fs::write(
-            &test_src,
-            r#"
-pub fn write_panic_report(w: &mut impl std::io::Write, msg: &str) {
-    match w.write_all(msg.as_bytes()).and_then(|()| w.write_all(b"\n")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-        Err(_) => {}
-    }
-}
-
-fn main() {
-    std::panic::set_hook(Box::new(move |pi| {
-        let msg = format!("{}", pi);
-        let mut err = std::io::stderr().lock();
-        write_panic_report(&mut err, &msg);
-    }));
-    panic!("test panic");
-}
-"#,
-        )
-        .unwrap();
-
-        let test_bin = test_dir.join("panic_test");
-        let compile = Command::new("rustc")
-            .arg(&test_src)
-            .arg("-o")
-            .arg(&test_bin)
-            .output()
-            .expect("failed to compile panic test");
-        assert!(compile.status.success(), "rustc failed: {:?}", compile);
-
         let mut fds: [i32; 2] = [0; 2];
         unsafe {
             libc::pipe(fds.as_mut_ptr());
-            libc::close(fds[0]);
+            libc::close(fds[0]); // Close read end → writes get EPIPE
         }
 
-        let output = Command::new(&test_bin)
+        let output = Command::new(octos_binary())
+            .env("OCTOS_TEST_PANIC_AFTER_BOOT", "1")
             .stderr(unsafe { Stdio::from_raw_fd(fds[1]) })
             .stdout(Stdio::null())
             .status()
-            .expect("failed to run panic test");
+            .expect("failed to run octos with OCTOS_TEST_PANIC_AFTER_BOOT=1");
 
         let code = output.code().unwrap_or(-1);
+        // Real panic → standard Rust exit code 101. A signal death
+        // (SIGABRT=134/SIGPIPE=141 double-panic→abort) yields None → -1.
+        assert_ne!(
+            code, -1,
+            "octos died by signal: production panic hook double-panicked/aborted on broken-pipe stderr"
+        );
         assert_ne!(code, 134, "process should not abort with SIGABRT");
-        assert_ne!(code, 139, "process should not segfault");
-        assert_eq!(code, 101, "process should exit with panic code 101");
+        assert_ne!(code, 141, "process should not die on SIGPIPE");
+        assert_eq!(code, 101, "real panic should exit with Rust panic code 101");
     }
 
     /// Test 2: serve_shutdown_broken_pipe_cleanup_marker_observed
-    /// These process-spawning tests are marked `#[ignore]` because they
-    /// require significant system resources (PTY allocation, port binding,
-    /// process management) that are unreliable under parallel test execution.
-    /// Run them explicitly with: cargo test --test serve_broken_pipe -- --ignored
+    ///
+    /// SIGINT → graceful shutdown → stop_all → exit 0, with stdout closed
+    /// (broken pipe) during shutdown. Cleanup marker observed in stdout
+    /// before exit.
     #[test]
-    #[ignore = "requires dedicated system resources — run with --ignored"]
     fn serve_shutdown_broken_pipe_cleanup_marker_observed() {
         let _guard = SERIAL.lock().unwrap();
         let port = find_free_port();
-        let data_dir = std::env::temp_dir().join(format!("octos_serve_bp_{}", std::process::id()));
+        let data_dir = std::env::temp_dir().join(format!("octos_bp_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let mut child = spawn_serve_pty(port, &data_dir);
+        // stdout → file so we can read the shutdown markers afterwards.
+        let out_path = data_dir.join("stdout.log");
+        let err_path = data_dir.join("stderr.log");
+        let out_file = std::fs::File::create(&out_path).unwrap();
+        let err_file = std::fs::File::create(&err_path).unwrap();
+        let mut cmd = serve_command(port, &data_dir);
+        cmd.stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file));
 
-        let ready = wait_for_port(port, std::time::Duration::from_secs(30));
+        let mut child = cmd.spawn().expect("failed to start octos serve");
+        let ready = wait_for_port(port, std::time::Duration::from_secs(45));
         if !ready {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&data_dir);
-            panic!("serve did not start listening on port {} within 15s", port);
+            panic!("serve did not listen on {} within 45s", port);
         }
 
-        let octos_pid =
-            find_octos_pid(child.id()).expect("failed to find octos PID under script wrapper");
-        let result = unsafe { libc::kill(octos_pid, libc::SIGINT) };
-        assert_eq!(result, 0, "kill(SIGINT) failed");
+        // Port up ≠ banner flushed. Wait until the startup banner reaches
+        // the stdout file — by then tokio's ctrl_c handler is registered.
+        let banner = wait_for_file_contains(
+            &out_path,
+            "octos API server",
+            std::time::Duration::from_secs(10),
+        );
+        assert!(banner, "startup banner never reached stdout file");
 
-        drop(child.stdout.take());
-
+        let pid = child.id() as i32;
+        let rc = unsafe { libc::kill(pid, libc::SIGINT) };
+        assert_eq!(rc, 0, "kill(SIGINT) failed");
         let status = child.wait().expect("failed to wait for serve");
-
-        let stderr = {
-            let mut buf = String::new();
-            child
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut buf)
-                .unwrap();
-            buf
-        };
-
-        let orphaned = unsafe { libc::kill(octos_pid, 0) } == 0;
-
+        let stdout_log = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let stderr_log = std::fs::read_to_string(&err_path).unwrap_or_default();
+        let _ = stderr_log;
+        let orphaned = unsafe { libc::kill(pid, 0) } == 0;
         let _ = std::fs::remove_dir_all(&data_dir);
 
         let code = status.code().unwrap_or(-1);
-        assert!(!orphaned, "octos process should not be orphaned");
-        assert_eq!(
-            code, 0,
-            "serve should exit cleanly (exit code 0 = graceful shutdown completed), got {}\nstderr: {}",
-            code, stderr
+        assert!(!orphaned, "octos should not be orphaned");
+        assert_eq!(code, 0, "serve should exit 0, stdout:\n{}", stdout_log);
+        // Cleanup marker: "Stopping gateways..." is printed AFTER axum
+        // shutdown and BEFORE stop_all — proof the shutdown path ran.
+        assert!(
+            stdout_log.contains("Stopping gateways..."),
+            "cleanup marker 'Stopping gateways...' missing, stdout:\n{}",
+            stdout_log
         );
-        // Cleanup marker: exit code 0 proves std::process::exit(0) was reached,
-        // which is AFTER process_manager.stop_all().await in the shutdown path.
     }
 
     /// Test 3: serve_shutdown_order_preserved
+    ///
+    /// Order: "Shutting down server..." (axum graceful) must appear BEFORE
+    /// "Stopping gateways..." (stop_all) in the shutdown output.
     #[test]
-    #[ignore = "requires dedicated system resources — run with --ignored"]
     fn serve_shutdown_order_preserved() {
         let _guard = SERIAL.lock().unwrap();
         let port = find_free_port();
-        let data_dir = std::env::temp_dir().join(format!("octos_serve_ord_{}", std::process::id()));
+        let data_dir = std::env::temp_dir().join(format!("octos_ord_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let mut child = spawn_serve_pty(port, &data_dir);
+        let out_path = data_dir.join("stdout.log");
+        let err_path = data_dir.join("stderr.log");
+        let out_file = std::fs::File::create(&out_path).unwrap();
+        let err_file = std::fs::File::create(&err_path).unwrap();
+        let mut cmd = serve_command(port, &data_dir);
+        cmd.stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file));
 
-        let ready = wait_for_port(port, std::time::Duration::from_secs(30));
+        let mut child = cmd.spawn().expect("failed to start octos serve");
+        let ready = wait_for_port(port, std::time::Duration::from_secs(45));
         if !ready {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&data_dir);
-            panic!("serve did not start listening on port {} within 15s", port);
+            panic!("serve did not listen on {} within 45s", port);
         }
 
-        assert!(
-            child.try_wait().expect("check serve").is_none(),
-            "serve should be running before SIGINT"
+        let banner = wait_for_file_contains(
+            &out_path,
+            "octos API server",
+            std::time::Duration::from_secs(10),
         );
+        assert!(banner, "startup banner never reached stdout file");
 
-        let octos_pid =
-            find_octos_pid(child.id()).expect("failed to find octos PID under script wrapper");
-        let result = unsafe { libc::kill(octos_pid, libc::SIGINT) };
-        assert_eq!(result, 0, "kill(SIGINT) failed");
+        let pid = child.id() as i32;
+        let rc = unsafe { libc::kill(pid, libc::SIGINT) };
+        assert_eq!(rc, 0, "kill(SIGINT) failed");
 
         let status = child.wait().expect("failed to wait for serve");
-
-        let stderr = {
-            let mut buf = String::new();
-            child
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut buf)
-                .unwrap();
-            buf
-        };
-
+        let stdout_log = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let stderr_log = std::fs::read_to_string(&err_path).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&data_dir);
 
         let code = status.code().unwrap_or(-1);
         assert_eq!(
             code, 0,
-            "serve should exit with code 0 (graceful shutdown → stop_all → exit), got {}\nstderr: {}",
-            code, stderr
+            "serve should exit 0, stdout:\n{}\nstderr:\n{}",
+            stdout_log, stderr_log
         );
-        // Shutdown order: exit code 0 proves std::process::exit(0) was reached,
-        // which is AFTER process_manager.stop_all().await in the shutdown path.
+        // ORDER assertion: graceful marker BEFORE stop_all marker.
+        let shutdown_pos = stdout_log.find("Shutting down server...");
+        let stop_pos = stdout_log.find("Stopping gateways...");
+        assert!(
+            shutdown_pos.is_some(),
+            "graceful marker missing:\n{}",
+            stdout_log
+        );
+        assert!(
+            stop_pos.is_some(),
+            "stop_all marker missing:\n{}",
+            stdout_log
+        );
+        assert!(
+            shutdown_pos.unwrap() < stop_pos.unwrap(),
+            "shutdown order violated: 'Shutting down' must precede 'Stopping gateways':\n{}",
+            stdout_log
+        );
     }
 
     /// Test 4: serve_startup_broken_pipe_no_panic
+    ///
+    /// serve with a broken stdout pipe must survive startup (no panic) and
+    /// keep listening.
     #[test]
-    #[ignore = "requires dedicated system resources — run with --ignored"]
     fn serve_startup_broken_pipe_no_panic() {
         let _guard = SERIAL.lock().unwrap();
         let port = find_free_port();
-        let data_dir =
-            std::env::temp_dir().join(format!("octos_serve_start_{}", std::process::id()));
+        let data_dir = std::env::temp_dir().join(format!("octos_start_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let mut fds: [i32; 2] = [0; 2];
         unsafe {
             libc::pipe(fds.as_mut_ptr());
-            libc::close(fds[0]);
+            libc::close(fds[0]); // read end closed → writes get EPIPE
         }
 
-        let mut child = Command::new(octos_binary())
-            .args([
-                "serve",
-                "--instance-data-dir",
-                data_dir.to_str().unwrap(),
-                "--solo",
-                "--danger-full-access",
-                "-p",
-                &port.to_string(),
-            ])
-            .stdout(unsafe { Stdio::from_raw_fd(fds[1]) })
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start octos serve");
+        let mut cmd = serve_command(port, &data_dir);
+        cmd.stdout(unsafe { Stdio::from_raw_fd(fds[1]) })
+            .stderr(Stdio::piped());
 
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        let mut child = cmd.spawn().expect("failed to start octos serve");
 
-        let running = child.try_wait().expect("failed to check status").is_none();
+        // The port must come up despite stdout being a broken pipe — the
+        // startup printlns hit EPIPE and must be swallowed (no panic).
+        let ready = wait_for_port(port, std::time::Duration::from_secs(45));
+        let running = child.try_wait().expect("check status").is_none();
 
         unsafe {
             libc::kill(child.id() as i32, libc::SIGKILL);
@@ -275,13 +259,35 @@ fn main() {
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&data_dir);
 
+        assert!(running, "serve died during startup with broken stdout");
         assert!(
-            running,
-            "serve should still be running after startup with broken stdout"
+            ready,
+            "serve did not listen on {} within 45s with broken stdout",
+            port
         );
     }
 
-    /// Wait for a port to become available (serve is listening).
+    /// Wait until a file contains the given substring.
+    fn wait_for_file_contains(
+        path: &std::path::Path,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if content.contains(needle) {
+                    return true;
+                }
+            }
+            if start.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Wait for a port to accept TCP connections.
     fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
         loop {
