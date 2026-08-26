@@ -17,6 +17,7 @@ pub mod embedding;
 mod failover;
 mod fallback;
 pub mod lane;
+mod local_context_probe;
 pub mod local_discovery;
 pub mod pricing;
 mod provider;
@@ -59,6 +60,7 @@ pub use content_classifier::{
     RoutingConfig,
 };
 pub use context_override::ContextWindowOverride;
+pub use local_context_probe::LocalContextProbe;
 pub use credential_pool::{
     CREDENTIAL_POOL_SCHEMA_VERSION, Credential, CredentialPool, CredentialRotationEvent,
     CredentialState, DEFAULT_COOLDOWN_US, DEFAULT_CREDENTIAL_POOL_DB_FILENAME, ErrorId,

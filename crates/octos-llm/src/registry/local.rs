@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use crate::local_context_probe::LocalContextProbe;
 use crate::openai::OpenAIProvider;
 use crate::provider::LlmProvider;
 
@@ -59,7 +60,12 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
-    Ok(Arc::new(provider))
+    // The catalog row for this family is a guess (the operator's server was
+    // not running at registration time); the running server knows its real
+    // window. The probe wrapper asks it once, on the first request, and
+    // corrects the budget — see `local_context_probe` for why budgeting a
+    // 256K server as 32K is not a safe under-estimate.
+    Ok(Arc::new(LocalContextProbe::new(Arc::new(provider), &url)))
 }
 
 #[cfg(test)]
