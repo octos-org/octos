@@ -647,8 +647,33 @@ impl SessionRuntime {
         // `before_tool_call` / `after_tool_call` / `before_llm_call` /
         // `after_llm_call` hook configured for the profile, breaking
         // parity with `octos gateway`.
-        if let Some(hooks) = profile.hook_executor.clone() {
-            agent = agent.with_hooks(hooks);
+        // Audit Gap-1 wiring (#2129), second half: merge the coding default
+        // hooks (`cargo check` / `eslint` / `ruff` after edits) for coding
+        // workspaces. The defaults were authored for hosts to merge at
+        // bootstrap ("chat.rs / gateway.rs / serve.rs call this on
+        // bootstrap") but no host ever did. Defaults run FIRST, operator
+        // hooks after — per the contract on `coding_default_hooks`. The
+        // executor gets the workspace root as cwd so the checkers check the
+        // project the agent is editing, not the daemon's start directory.
+        let coding_defaults =
+            match octos_agent::workspace_policy::detect_workspace_policy_kind(&workspace_root) {
+                octos_agent::workspace_policy::WorkspacePolicyKind::Coding => {
+                    octos_agent::workspace_policy::coding_default_hooks()
+                }
+                _ => Vec::new(),
+            };
+        if coding_defaults.is_empty() {
+            if let Some(hooks) = profile.hook_executor.clone() {
+                agent = agent.with_hooks(hooks);
+            }
+        } else {
+            let mut configs = coding_defaults;
+            if let Some(hooks) = &profile.hook_executor {
+                configs.extend(hooks.configs().iter().cloned());
+            }
+            agent = agent.with_hooks(Arc::new(
+                octos_agent::HookExecutor::new(configs).with_cwd(&workspace_root),
+            ));
         }
 
         // RFC-1 (issue #1290): same pattern for the `mofa_make`
@@ -913,7 +938,17 @@ context_ledgers/
 /// `write_workspace_policy` (no semantic change to the legacy
 /// function).
 fn bootstrap_session_policy(workspace_root: &Path) -> Result<()> {
-    write_workspace_policy_if_absent(workspace_root, &WorkspacePolicy::for_session())
+    // Audit Gap-1 wiring (#2129): `detect_workspace_policy_kind` and
+    // `WorkspacePolicy::for_coding` were authored for exactly this call
+    // site but never called — every session workspace was bootstrapped as
+    // the generic `for_session()` policy, so a repo full of Rust got the
+    // same contract as a podcast workspace. The detector keys on observable
+    // manifests (Cargo.toml / package.json / pyproject.toml), not LLM input.
+    let policy = match octos_agent::workspace_policy::detect_workspace_policy_kind(workspace_root) {
+        octos_agent::workspace_policy::WorkspacePolicyKind::Coding => WorkspacePolicy::for_coding(),
+        _ => WorkspacePolicy::for_session(),
+    };
+    write_workspace_policy_if_absent(workspace_root, &policy)
         .wrap_err("failed to bootstrap session workspace policy")
 }
 

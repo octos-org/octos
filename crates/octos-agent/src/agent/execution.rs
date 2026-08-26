@@ -526,7 +526,7 @@ impl Agent {
         // default delegation), so every field above was reaching only
         // task-local (`TOOL_CTX`) readers. TOOL_CTX stays scoped for plugin
         // tools that read the task-local.
-        let result = TOOL_APPROVAL_CTX
+        let mut result = TOOL_APPROVAL_CTX
             .scope(
                 approver,
                 TOOL_CTX.scope(
@@ -549,7 +549,14 @@ impl Agent {
                 tool_start.elapsed().as_millis() as u64,
                 self.hook_ctx().as_ref(),
             );
-            let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+            // A failing after-hook carries checker output the model must
+            // see (the coding defaults run `cargo check` after edits) —
+            // discarding it here silenced the whole feedback loop.
+            if let HookResult::Error(feedback) = hooks.run(HookEvent::AfterToolCall, &payload).await
+            {
+                result.output.push_str("\n\n[hook] ");
+                result.output.push_str(&feedback);
+            }
         }
 
         Ok(result)
@@ -2345,7 +2352,11 @@ impl Agent {
                 }
             };
 
-            // After-tool hook (fire-and-forget)
+            // After-tool hooks. A failing hook carries checker output the
+            // model must see (the coding defaults run `cargo check` after
+            // edits); it is appended to the tool message below AFTER
+            // truncation so the feedback survives the output cap.
+            let mut hook_feedback: Option<String> = None;
             if let Some(ref hooks) = hooks {
                 let payload = HookPayload::after_tool(
                     &tc_name,
@@ -2355,7 +2366,11 @@ impl Agent {
                     duration.as_millis() as u64,
                     hook_ctx.as_ref(),
                 );
-                let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+                if let HookResult::Error(feedback) =
+                    hooks.run(HookEvent::AfterToolCall, &payload).await
+                {
+                    hook_feedback = Some(feedback);
+                }
             }
 
             // Per-tool output truncation with head/tail split.
@@ -2384,7 +2399,12 @@ impl Agent {
                 }
             }
             let content = content;
-            let content = crate::sanitize::sanitize_tool_output(&content);
+            let mut content = crate::sanitize::sanitize_tool_output(&content);
+            if let Some(feedback) = hook_feedback {
+                content.push_str("\n\n[hook] ");
+                content.push_str(&feedback);
+            }
+            let content = content;
 
             // Pair the structured side-channel with the originating tool's
             // call id so the session actor (which keys cost rows by

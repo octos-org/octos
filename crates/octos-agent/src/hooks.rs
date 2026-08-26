@@ -678,6 +678,11 @@ pub struct HookExecutor {
     failure_threshold: u32,
     /// Optional domain-data enricher applied to payloads before serialization.
     enricher: Option<Arc<dyn HookPayloadEnricher>>,
+    /// Working directory for hook child processes. Project-scoped hooks
+    /// (the coding defaults run `cargo check` / `eslint` / `ruff`) are
+    /// meaningless outside the workspace they check — without this they
+    /// would run in whatever directory the daemon happened to start in.
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl HookExecutor {
@@ -697,6 +702,7 @@ impl HookExecutor {
             failures,
             failure_threshold,
             enricher: None,
+            cwd: None,
         }
     }
 
@@ -705,6 +711,22 @@ impl HookExecutor {
     pub fn with_enricher(mut self, enricher: Arc<dyn HookPayloadEnricher>) -> Self {
         self.enricher = Some(enricher);
         self
+    }
+
+    /// Run hook child processes with this working directory. Session hosts
+    /// set it to the workspace root so project-scoped hooks (`cargo check`,
+    /// `eslint`, `ruff`) check the project the agent is editing.
+    pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// The hook configurations this executor runs, in run order. Lets a
+    /// host MERGE executors (e.g. coding defaults + operator hooks) without
+    /// forking the runner: rebuild via `HookExecutor::new` from the
+    /// concatenated lists.
+    pub fn configs(&self) -> &[HookConfig] {
+        &self.hooks
     }
 
     /// Run all matching hooks for the given event sequentially.
@@ -821,7 +843,7 @@ impl HookExecutor {
             }
 
             match self.execute_hook(hook, &payload_json).await {
-                Ok((0, stdout)) => {
+                Ok((0, stdout, _stderr)) => {
                     self.failures[i].store(0, Ordering::Relaxed);
                     // Context injection (user_prompt_submit): a hook that exits
                     // 0 and prints to stdout contributes that text as extra
@@ -830,7 +852,7 @@ impl HookExecutor {
                         injected_contexts.push(stdout);
                     }
                 }
-                Ok((1, stdout)) => {
+                Ok((1, stdout, stderr)) => {
                     if matches!(
                         event,
                         HookEvent::UserPromptSubmit
@@ -841,16 +863,35 @@ impl HookExecutor {
                         self.failures[i].store(0, Ordering::Relaxed);
                         return HookResult::Deny(stdout);
                     }
-                    // Exit 1 on after-hooks is an error (deny is meaningless for after-events)
+                    // Exit 1 on after-hooks is an error (deny is meaningless
+                    // for after-events) — but an error that CARRIES the
+                    // hook's output. The coding defaults exist to feed
+                    // checker diagnostics back to the model; a message that
+                    // says only "exited with code 1" feeds back nothing.
                     let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
-                    let msg = format!(
-                        "hook {:?} exited with code 1 on after-event ({}/{})",
-                        hook.command, new_count, self.failure_threshold
-                    );
+                    let mut output = if stderr.is_empty() {
+                        stdout
+                    } else if stdout.is_empty() {
+                        stderr
+                    } else {
+                        format!("{stdout}\n{stderr}")
+                    };
+                    octos_core::truncate_utf8(&mut output, 2000, "\n... (hook output truncated)");
+                    let msg = if output.trim().is_empty() {
+                        format!(
+                            "hook {:?} exited with code 1 on after-event ({}/{})",
+                            hook.command, new_count, self.failure_threshold
+                        )
+                    } else {
+                        format!(
+                            "hook {:?} failed ({}/{}):\n{}",
+                            hook.command, new_count, self.failure_threshold, output
+                        )
+                    };
                     warn!("{}", msg);
                     last_error = Some(msg);
                 }
-                Ok((2, stdout)) => {
+                Ok((2, stdout, _stderr)) => {
                     // Exit 2 = modified input (before-hooks only).
                     // Stdout contains the replacement JSON payload.
                     if matches!(
@@ -887,7 +928,7 @@ impl HookExecutor {
                         last_error = Some(msg);
                     }
                 }
-                Ok((code, _stdout)) => {
+                Ok((code, _stdout, _stderr)) => {
                     let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
                     let msg = format!(
                         "hook {:?} exited with code {} ({}/{})",
@@ -917,12 +958,12 @@ impl HookExecutor {
         }
     }
 
-    /// Execute a single hook process. Returns (exit_code, stdout).
+    /// Execute a single hook process. Returns (exit_code, stdout, stderr).
     async fn execute_hook(
         &self,
         hook: &HookConfig,
         payload_json: &str,
-    ) -> eyre::Result<(i32, String)> {
+    ) -> eyre::Result<(i32, String, String)> {
         let (program, args) = hook
             .command
             .split_first()
@@ -934,6 +975,9 @@ impl HookExecutor {
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&expanded_args);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -967,19 +1011,24 @@ impl HookExecutor {
                 } else {
                     String::new()
                 };
-                // Log stderr from the hook process (diagnostic output)
-                if let Some(mut handle) = stderr_handle {
+                // Capture stderr too: checkers put their diagnostics there
+                // (`cargo check --message-format=short` writes every
+                // diagnostic to stderr), and the after-event failure path
+                // surfaces them to the model. Still logged for operators.
+                let stderr = if let Some(mut handle) = stderr_handle {
                     let mut buf = Vec::new();
                     let _ = handle.read_to_end(&mut buf).await;
-                    let stderr = String::from_utf8_lossy(&buf);
-                    for line in stderr.lines() {
-                        let line = line.trim();
-                        if !line.is_empty() {
-                            tracing::info!(
-                                hook = ?hook.command,
-                                "{line}"
-                            );
-                        }
+                    String::from_utf8_lossy(&buf).trim().to_string()
+                } else {
+                    String::new()
+                };
+                for line in stderr.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        tracing::info!(
+                            hook = ?hook.command,
+                            "{line}"
+                        );
                     }
                 }
                 let code = status.code().unwrap_or(2);
@@ -989,7 +1038,7 @@ impl HookExecutor {
                     stdout_len = stdout.len(),
                     "hook executed"
                 );
-                Ok((code, stdout))
+                Ok((code, stdout, stderr))
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
@@ -2163,5 +2212,63 @@ mod tests {
         let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
         let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
         assert_eq!(result, HookResult::Allow);
+    }
+
+    /// A failing AFTER-hook must carry its child's output — stdout and
+    /// stderr both, since checkers (`cargo check --message-format=short`)
+    /// write diagnostics to stderr. The pre-#2129 message ("exited with
+    /// code 1 on after-event") fed the model nothing actionable.
+    #[tokio::test]
+    async fn after_hook_failure_carries_child_output() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo out-line; echo err-line >&2; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        let payload = HookPayload::after_tool("edit_file", "id", "out".to_string(), true, 5, None);
+        match executor.run(HookEvent::AfterToolCall, &payload).await {
+            HookResult::Error(msg) => {
+                assert!(msg.contains("out-line"), "stdout must surface: {msg}");
+                assert!(msg.contains("err-line"), "stderr must surface: {msg}");
+            }
+            other => panic!("expected Error carrying output, got {other:?}"),
+        }
+    }
+
+    /// `with_cwd` runs the hook child in the given directory — a
+    /// project-scoped checker is meaningless in the daemon's start dir.
+    #[tokio::test]
+    async fn hook_child_runs_in_configured_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected = tmp.path().canonicalize().unwrap();
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "pwd; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]).with_cwd(tmp.path());
+        let payload = HookPayload::after_tool("edit_file", "id", "out".to_string(), true, 5, None);
+        match executor.run(HookEvent::AfterToolCall, &payload).await {
+            HookResult::Error(msg) => assert!(
+                msg.contains(&expected.to_string_lossy().to_string()),
+                "child must run in the configured cwd; got: {msg}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 }

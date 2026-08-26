@@ -3127,4 +3127,29 @@ ignore = []
         let reread = read_workspace_policy(&project_root).unwrap().unwrap();
         assert_eq!(reread, upgraded);
     }
+
+    /// #2129: the session bootstrap path routes a detected coding workspace
+    /// to `for_coding()`. This pins the two halves the wiring depends on:
+    /// detection keys on the manifest, and the coding policy carries the
+    /// Coding kind marker while inheriting the session contracts.
+    #[test]
+    fn coding_bootstrap_pieces_compose() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(
+            detect_workspace_policy_kind(tmp.path()),
+            WorkspacePolicyKind::Coding
+        );
+        let policy = WorkspacePolicy::for_coding();
+        assert_eq!(policy.workspace.kind, WorkspacePolicyKind::Coding);
+        // The defaults the session merges for that kind include the Rust
+        // checker, gated on the binary being present.
+        let hooks = coding_default_hooks();
+        assert!(
+            hooks
+                .iter()
+                .any(|h| h.command.first().map(String::as_str) == Some("cargo")),
+            "coding defaults must include the cargo hook"
+        );
+    }
 }
