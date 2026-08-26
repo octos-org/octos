@@ -1792,8 +1792,7 @@ impl ServeCommand {
         }
         let _ = serve_console::print_stdout("");
 
-        // Run the server; capture any axum error so we can still clean up.
-        let serve_result = axum::serve(
+        axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
@@ -1802,21 +1801,15 @@ impl ServeCommand {
             let _ = serve_console::print_stdout("");
             let _ = serve_console::print_stdout(&format!("{}", "Shutting down server...".yellow()));
         })
-        .await;
+        .await?;
 
-        // Stop all gateway child processes before exiting — this MUST run
-        // even if axum returned an error (e.g. BrokenPipe on console output).
+        // Stop all gateway child processes before exiting
         tracing::info!("stopping all gateway child processes");
         let _ = serve_console::print_stdout(&format!("{}", "Stopping gateways...".yellow()));
         let stopped = process_manager.stop_all().await;
         if stopped > 0 {
             tracing::info!(count = stopped, "gateways stopped");
             let _ = serve_console::print_stdout(&format!("  stopped {} gateway(s)", stopped));
-        }
-
-        // Log any axum serve error but don't let it prevent clean exit.
-        if let Err(ref e) = serve_result {
-            tracing::warn!(error = %e, "axum serve returned error during shutdown");
         }
 
         // Force exit — background tokio tasks (profile watcher, auth cleanup,
