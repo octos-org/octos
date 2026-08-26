@@ -71,12 +71,18 @@ fn attempt_deadline_secs(request_timeout_secs: u64) -> u64 {
     (request_timeout_secs * 2).clamp(4, 20)
 }
 
-/// Safe fallback window pinned PROVISIONALLY when a cold Ollama model
-/// cannot finish loading inside the attempt budget (#2135 round-4 P1):
-/// Ollama's stock allocation is 4K (FAQ), so compacting against 4096 is
-/// conservative in the only direction that cannot overflow the server. A
-/// later resolved probe replaces it with the real allocation.
-const OLLAMA_PROVISIONAL_WINDOW: u32 = 4096;
+/// Conservative window in force PROVISIONALLY while a cold Ollama model's
+/// real allocation is unknown (#2135 round-4/5 P1): 2048 — the smallest
+/// window Ollama's scheduler treats as practically usable (its documented
+/// vision minimum; the stock allocation is 4096 and configured contexts
+/// are usually larger). Smaller is safer here: over-budgeting a small
+/// allocation truncates server-side, under-budgeting only compacts more
+/// aggressively. Explicitly configured sub-2048 `num_ctx` values are out
+/// of scope for the floor (no non-trivial constant is safe against
+/// `num_ctx 4`); the floor is replaced by the REAL allocation as soon as
+/// any attempt reads it from /api/ps — including cheap post-cap refreshes,
+/// see `run_probe_attempt`.
+const OLLAMA_PROVISIONAL_WINDOW: u32 = 2048;
 
 /// llama.cpp serves `/props` at the server root, not under `/v1`.
 /// Single-suffix strip: a proxy mounting the API under `/v1/v1` keeps its
@@ -158,6 +164,9 @@ pub struct LocalContextProbe {
     /// window; `None` = the server answered but names none (or the attempt
     /// cap was spent) — the catalog value stands either way.
     window: OnceLock<Option<u32>>,
+    /// One preload per probe lifetime: the detached /api/generate task is
+    /// spawned at most once, however many readiness attempts run.
+    preload_started: std::sync::atomic::AtomicBool,
     /// Non-zero = a SAFE conservative window in force while the real one is
     /// still unknown (cold Ollama model that could not finish loading
     /// inside the attempt budget). Consulted by `context_window()` after
@@ -234,6 +243,7 @@ impl LocalContextProbe {
             api_key: api_key.filter(|k| !k.is_empty() && k != "no-key"),
             timeouts,
             window: OnceLock::new(),
+            preload_started: std::sync::atomic::AtomicBool::new(false),
             provisional: AtomicU32::new(0),
             attempts: AtomicU32::new(0),
             in_flight: tokio::sync::Mutex::new(()),
@@ -263,6 +273,30 @@ impl LocalContextProbe {
         self.run_probe_attempt(&guard, false).await;
     }
 
+    /// Spawn the one-and-only detached preload for this probe: an empty
+    /// `POST /api/generate`, Ollama's official load trigger. Detached and
+    /// LONG-timeout on purpose (#2135 round-5 P1): the load is tied to the
+    /// request's lifetime server-side, so neither the attempt deadline nor
+    /// the probe's short per-request timeout may own this future. Bounded
+    /// by its own generous timeout; fire-and-forget outcome (the /api/ps
+    /// polls observe the result).
+    fn start_preload_once(&self, generate_url: &str, model: &str) {
+        if self
+            .preload_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        const PRELOAD_TIMEOUT_SECS: u64 = 900;
+        let client = build_http_client(PRELOAD_TIMEOUT_SECS, self.timeouts.1);
+        let url = generate_url.to_string();
+        let body = serde_json::json!({ "model": model });
+        tracing::info!(model, "preloading cold Ollama model (detached)");
+        tokio::spawn(async move {
+            let _ = fetch_post_json(&client, &url, &body).await;
+        });
+    }
+
     /// Readiness: unlike the request path above, AWAIT an active probe
     /// (lock, don't try_lock) so a caller that is about to make a
     /// window-dependent decision sees the outcome of the in-flight attempt
@@ -279,12 +313,19 @@ impl LocalContextProbe {
             // the one caller allowed to PRELOAD (the route is about to be
             // used; the first chat would trigger the same load).
             Ok(guard) => self.run_probe_attempt(&guard, true).await,
-            // An attempt is ACTIVE: await its completion and take its
-            // outcome — do NOT stack a second attempt on top. The readiness
-            // bound is ONE attempt's requests (#2135 round-3 P2); if the
-            // active attempt resolves transient, the next request retries.
+            // An attempt is ACTIVE: await its completion. If it resolved
+            // the window, done. If not, that attempt may have been the
+            // constructor's PASSIVE probe — which never preloads — so
+            // returning here would leave readiness stuck on the floor
+            // (#2135 round-5 P1). Run one ACTIVE attempt of our own.
+            // Readiness is therefore bounded by at most TWO attempt
+            // budgets (the awaited one plus ours), each capped by
+            // `attempt_deadline_secs`.
             Err(_) => {
-                let _guard = self.in_flight.lock().await;
+                let guard = self.in_flight.lock().await;
+                if self.window.get().is_none() {
+                    self.run_probe_attempt(&guard, true).await;
+                }
             }
         }
     }
@@ -302,9 +343,16 @@ impl LocalContextProbe {
             return;
         }
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-        if attempt > MAX_PROBE_ATTEMPTS {
+        if attempt > MAX_PROBE_ATTEMPTS && self.provisional.load(Ordering::SeqCst) == 0 {
             // Spent: stop paying failed GETs on every request. Pinning "no
             // window" keeps the catalog value without further probing.
+            //
+            // EXCEPT while a provisional floor is in force (#2135 round-5
+            // P2): pinning would freeze the floor forever even after the
+            // real chat loads the model. Post-cap attempts continue in the
+            // Ollama branch as ONE cheap /api/ps read each (the floor
+            // being set skips the show/preload path), so the real
+            // allocation is adopted whenever the model comes up.
             let _ = self.window.set(None);
             return;
         }
@@ -374,69 +422,58 @@ impl LocalContextProbe {
                 // configuration — safe to pin now.
                 let server_up = matches!(&ps, FetchOutcome::Answered(Some(_)));
                 if window.is_none() && server_up {
-                    let body = serde_json::json!({ "model": model });
-                    if let FetchOutcome::Answered(Some(show)) =
-                        fetch_post_json(&client, show_url, &body).await
-                    {
-                        window = parse_ollama_show_num_ctx(&show);
-                        // No Modelfile num_ctx: the effective window is
-                        // decided at LOAD time (OLLAMA_CONTEXT_LENGTH /
-                        // server default). Put the SAFE conservative floor
-                        // in force IMMEDIATELY — before any preload — so
-                        // that whatever happens next (passive probe stops
-                        // here; a preload outlives the attempt deadline and
-                        // is cancelled mid-poll, routine for large models),
-                        // the first turn compacts against a window the
-                        // server cannot overflow instead of catalog maxima
-                        // (#2135 round-4 P1). Replaced by the real
-                        // allocation the moment any attempt reads it.
-                        if window.is_none() {
-                            self.provisional
-                                .store(OLLAMA_PROVISIONAL_WINDOW, Ordering::SeqCst);
-                            tracing::info!(
-                                model,
-                                provisional = OLLAMA_PROVISIONAL_WINDOW,
-                                "cold Ollama model: conservative provisional window in \
-                                 force until the load reports its allocation"
-                            );
+                    // Once the floor is in force, later attempts skip the
+                    // show/preload path entirely: each is ONE cheap /api/ps
+                    // read (this is what keeps post-cap refreshes nearly
+                    // free — see the attempt-cap comment).
+                    if self.provisional.load(Ordering::SeqCst) == 0 {
+                        let body = serde_json::json!({ "model": model });
+                        if let FetchOutcome::Answered(Some(show)) =
+                            fetch_post_json(&client, show_url, &body).await
+                        {
+                            window = parse_ollama_show_num_ctx(&show);
+                            // No Modelfile num_ctx: the effective window is
+                            // decided at LOAD time. Put the conservative
+                            // floor in force IMMEDIATELY — before any
+                            // preload — so whatever happens next (passive
+                            // probe stops here; a slow load outlives the
+                            // attempt deadline), the first turn compacts
+                            // against a window the server is very unlikely
+                            // to undercut, instead of catalog maxima
+                            // (#2135 round-4/5 P1).
+                            if window.is_none() {
+                                self.provisional
+                                    .store(OLLAMA_PROVISIONAL_WINDOW, Ordering::SeqCst);
+                                tracing::info!(
+                                    model,
+                                    provisional = OLLAMA_PROVISIONAL_WINDOW,
+                                    "cold Ollama model: conservative provisional window in \
+                                     force until the load reports its allocation"
+                                );
+                            }
                         }
-                        // PRELOAD — Ollama's official empty /api/generate
-                        // request — ONLY when readiness granted it (#2135
-                        // round-4 P1: a passive background probe must never
-                        // load models on lanes the user did not select).
-                        // The generate future and a 1s poll interval are
-                        // driven together; the outer attempt deadline
-                        // cancels the whole body if the load is slow.
-                        if window.is_none() && allow_preload {
-                            let preload = fetch_post_json(&client, generate_url, &body);
-                            tokio::pin!(preload);
-                            let mut preload_done = false;
-                            loop {
-                                // Drive the preload and the poll interval
-                                // together (never re-polling the completed
-                                // preload future); either way, re-read the
-                                // allocation each second. The OUTER attempt
-                                // deadline cancels this whole body when the
-                                // load is slow — the provisional floor set
-                                // above is already in force for that case.
-                                if preload_done {
-                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                } else {
-                                    tokio::select! {
-                                        _ = &mut preload => preload_done = true,
-                                        _ = tokio::time::sleep(
-                                            std::time::Duration::from_secs(1),
-                                        ) => {}
-                                    }
-                                }
-                                if let FetchOutcome::Answered(Some(ps_after)) =
-                                    fetch(&client, ps_url, None).await
-                                {
-                                    window = parse_ollama_ps_context_window(&ps_after, model);
-                                }
-                                if window.is_some() {
-                                    break;
-                                }
+                    }
+                    // PRELOAD — Ollama's official empty /api/generate
+                    // request — ONLY when readiness granted it (#2135
+                    // round-4 P1: passive probes must never load models on
+                    // lanes the user did not select). The request runs as a
+                    // DETACHED task with a long-timeout client (#2135
+                    // round-5 P1): Ollama ties scheduling of the load to
+                    // the live request context, so the attempt deadline
+                    // cancelling the request could abandon the load and
+                    // loop the model cold forever. The deadline cancels
+                    // only the POLLING below; the load itself runs on.
+                    if window.is_none() && allow_preload {
+                        self.start_preload_once(generate_url, model);
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            if let FetchOutcome::Answered(Some(ps_after)) =
+                                fetch(&client, ps_url, None).await
+                            {
+                                window = parse_ollama_ps_context_window(&ps_after, model);
+                            }
+                            if window.is_some() {
+                                break;
                             }
                         }
                     }
@@ -718,12 +755,17 @@ mod tests {
     /// num_ctx), and /api/generate (sets "loaded" after `generate_delay`).
     async fn spawn_ollama_stub(
         generate_delay: std::time::Duration,
-    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let hits: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let loaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded_out = loaded.clone();
         let hits_srv = hits.clone();
         tokio::spawn(async move {
             loop {
@@ -765,7 +807,7 @@ mod tests {
                 });
             }
         });
-        (base, hits)
+        (base, hits, loaded_out)
     }
 
     /// #2135 round-4 P1 regression: construction and the request path are
@@ -774,7 +816,7 @@ mod tests {
     /// put the conservative provisional floor in force for a cold model.
     #[tokio::test]
     async fn should_not_preload_from_construction_or_request_path() {
-        let (base, hits) = spawn_ollama_stub(std::time::Duration::ZERO).await;
+        let (base, hits, _loaded) = spawn_ollama_stub(std::time::Duration::ZERO).await;
         let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((2, 1)));
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         probe.probe_if_unresolved().await;
@@ -797,7 +839,7 @@ mod tests {
     /// once the (slow) load completes within the attempt budget.
     #[tokio::test]
     async fn should_preload_and_adopt_allocation_on_readiness() {
-        let (base, hits) = spawn_ollama_stub(std::time::Duration::from_millis(300)).await;
+        let (base, hits, _loaded) = spawn_ollama_stub(std::time::Duration::from_millis(300)).await;
         let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((2, 1)));
         probe.ensure_ready().await;
         assert_eq!(probe.window.get(), Some(&Some(32_768)));
@@ -821,7 +863,7 @@ mod tests {
     /// per-request multiple) with the provisional floor in force.
     #[tokio::test]
     async fn should_bound_readiness_and_keep_floor_when_load_outlives_deadline() {
-        let (base, _hits) = spawn_ollama_stub(std::time::Duration::from_secs(60)).await;
+        let (base, _hits, _loaded) = spawn_ollama_stub(std::time::Duration::from_secs(60)).await;
         let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((1, 1)));
         let start = std::time::Instant::now();
         probe.ensure_ready().await;
@@ -835,6 +877,77 @@ mod tests {
             probe.context_window(),
             OLLAMA_PROVISIONAL_WINDOW,
             "floor stays in force while the load continues server-side"
+        );
+    }
+
+    /// #2135 round-5 P1 regression: when readiness had to WAIT for an
+    /// in-flight PASSIVE attempt that left the window unresolved, it must
+    /// run one ACTIVE attempt of its own — returning at the floor without
+    /// ever preloading was the bug.
+    #[tokio::test]
+    async fn should_run_active_attempt_when_awaited_passive_left_unresolved() {
+        let (base, hits, _loaded) = spawn_ollama_stub(std::time::Duration::from_millis(200)).await;
+        let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((2, 1)));
+        // Simulate the constructor's passive probe holding the lock and
+        // finishing WITHOUT resolving (it never preloads).
+        let guard = probe.in_flight.lock().await;
+        let waiter = {
+            let probe = probe.clone();
+            tokio::spawn(async move {
+                probe.ensure_ready().await;
+                probe.context_window()
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        drop(guard); // passive attempt "completed", window still unresolved
+        assert_eq!(
+            waiter.await.unwrap(),
+            32_768,
+            "readiness must preload itself"
+        );
+        assert!(
+            hits.lock().unwrap().iter().any(|p| p == "/api/generate"),
+            "the active readiness attempt must have preloaded"
+        );
+    }
+
+    /// #2135 round-5 P1+P2 regression: the detached preload survives the
+    /// attempt deadline (the deadline cancels only the polling), and the
+    /// real allocation is adopted EVEN AFTER the retry cap — a provisional
+    /// floor must never be frozen by the cap.
+    #[tokio::test]
+    async fn should_adopt_allocation_after_deadline_and_after_retry_cap() {
+        // Load takes 6s; timeouts (1,1) give a 4s attempt deadline.
+        let (base, _hits, loaded) = spawn_ollama_stub(std::time::Duration::from_secs(6)).await;
+        let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((1, 1)));
+        probe.ensure_ready().await;
+        assert!(probe.window.get().is_none(), "load outlives the deadline");
+        assert_eq!(probe.context_window(), OLLAMA_PROVISIONAL_WINDOW);
+
+        // Burn past the retry cap while the model is still loading: with a
+        // floor in force the cap must NOT pin None.
+        for _ in 0..(MAX_PROBE_ATTEMPTS + 2) {
+            probe.probe_if_unresolved().await;
+        }
+        assert!(
+            probe.window.get().is_none(),
+            "cap must not pin over a floor"
+        );
+
+        // The DETACHED preload finishes server-side (it was not cancelled
+        // with the attempt); the next cheap refresh adopts the allocation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "stub never loaded");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        probe.probe_if_unresolved().await;
+        assert_eq!(probe.window.get(), Some(&Some(32_768)));
+        assert_eq!(probe.context_window(), 32_768);
+        assert_eq!(
+            probe.provisional.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "floor cleared once the real allocation pins"
         );
     }
 
