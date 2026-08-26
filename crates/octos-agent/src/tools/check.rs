@@ -63,7 +63,10 @@ const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Tail of raw checker output surfaced when the checker fails without any
 /// parseable diagnostics (e.g. a broken `Cargo.toml` manifest).
-const RAW_TAIL_CHARS: usize = 2000;
+// 4000 chars ≈ the last ~50 lines: enough to carry a full cargo hard
+// failure (manifest error + notes) without re-truncating the part that
+// names the cause.
+const RAW_TAIL_CHARS: usize = 4000;
 
 /// Resolver from checker binary name (+ project root) to an executable
 /// path. Injectable so tests can simulate a missing or fake checker.
@@ -350,6 +353,47 @@ fn plural(n: usize, noun: &str) -> String {
     }
 }
 
+/// Name the LAYER a non-diagnostic failure happened in, when the raw output
+/// makes it recognizable.
+///
+/// "Exit code 1, no parseable diagnostics" reads as "the code is somehow
+/// unverifiable" — but every observed instance of that message was the
+/// environment, not the project: a sandbox denying rustup's settings lock,
+/// a missing toolchain, a dead registry. The model (and the user) act on
+/// the failing layer only if the report names it; the observed alternative
+/// was a session that shipped 15 uncompiled files because "no parseable
+/// diagnostics" told it nothing was actionable.
+fn classify_failure(raw: &str) -> Option<&'static str> {
+    if raw.contains("Operation not permitted") {
+        return Some(
+            "the environment denied a file access (on a sandboxed run this is usually the \
+             sandbox — toolchain caches like ~/.rustup and ~/.cargo need \
+             `sandbox.allow_toolchains`), not a defect in the project's code",
+        );
+    }
+    if raw.contains("could not find `Cargo.toml`")
+        || raw.contains("no `tsconfig.json`")
+        || raw.contains("go.mod file not found")
+    {
+        return Some("the checker found no project manifest here — likely the wrong directory");
+    }
+    if raw.contains("command not found")
+        || raw.contains("No such file or directory")
+        || raw.contains("not recognized as an internal or external command")
+    {
+        return Some("the checker binary or toolchain itself is missing from this environment");
+    }
+    if raw.contains("failed to download")
+        || raw.contains("Connection refused")
+        || raw.contains("could not resolve host")
+        || raw.contains("network failure")
+        || raw.contains("failed to fetch")
+    {
+        return Some("the registry/network is unreachable, not a defect in the project's code");
+    }
+    None
+}
+
 /// Render the compact report: header with counts, up to [`MAX_DIAGNOSTICS`]
 /// lines, `... and N more diagnostics` trailer. Falls back to `raw_tail`
 /// when the checker failed without parseable diagnostics.
@@ -366,14 +410,18 @@ fn render_report(
         }
         // Checker failed without a single parseable diagnostic (e.g. broken
         // manifest / bad tsconfig): surface the raw output tail so the model
-        // still sees WHY.
+        // still sees WHY, and name the failing layer when it is
+        // recognizable.
         let code = exit_code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
         let tail = raw_tail.map(str::trim).unwrap_or("");
         if tail.is_empty() {
             return format!("{label}: exit code {code}, no diagnostics reported");
         }
+        let layer = classify_failure(tail)
+            .map(|hint| format!(" — {hint}"))
+            .unwrap_or_default();
         return format!(
-            "{label}: exit code {code}, no parseable diagnostics. Output tail:\n{tail}"
+            "{label}: exit code {code}, no parseable diagnostics{layer}. Output tail:\n{tail}"
         );
     }
 
@@ -1308,5 +1356,59 @@ vet: helper.go:4:6: undefined: missingFn
         let tool = CheckTool::new("/tmp");
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
         assert_eq!(tool.name(), "check");
+    }
+
+    /// A non-diagnostic failure names the failing LAYER when recognizable:
+    /// sandbox denial, missing manifest, missing toolchain, dead registry.
+    /// The observed cost of the bare message was a session that treated
+    /// "no parseable diagnostics" as "nothing actionable" while every
+    /// cargo run was dying on a sandbox-denied rustup lock.
+    #[test]
+    fn should_name_failure_layer_when_recognizable() {
+        let cases = [
+            (
+                "error: could not read settings file: '/Users/u/.rustup/settings.toml': Operation not permitted (os error 1)",
+                "sandbox",
+            ),
+            (
+                "error: could not find `Cargo.toml` in `/tmp` or any parent",
+                "manifest",
+            ),
+            (
+                "sh: cargo: command not found",
+                "toolchain itself is missing",
+            ),
+            (
+                "error: failed to download from `https://crates.io/...`",
+                "registry/network",
+            ),
+        ];
+        for (raw, expect) in cases {
+            let report = render_report(
+                "cargo check",
+                &ParsedDiagnostics::default(),
+                Some(1),
+                Some(raw),
+            );
+            assert!(
+                report.contains(expect),
+                "expected layer '{expect}' named in: {report}"
+            );
+            assert!(
+                report.contains(raw.trim()),
+                "raw tail must still be present"
+            );
+        }
+        // Unrecognized failures keep the plain message — no invented cause.
+        let report = render_report(
+            "cargo check",
+            &ParsedDiagnostics::default(),
+            Some(101),
+            Some("thread panicked at ..."),
+        );
+        assert!(
+            report.contains("no parseable diagnostics."),
+            "no invented layer: {report}"
+        );
     }
 }
