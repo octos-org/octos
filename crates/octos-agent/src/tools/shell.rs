@@ -429,19 +429,23 @@ pub struct MainTreeSovereigntyContext {
     pub caller_goal_id: Option<String>,
 }
 
+/// #20b — the boxed sovereignty-provider closure type, extracted so neither
+/// the `static` slot nor the setter signature trips `clippy::type_complexity`.
+/// Called once per shell execution with the calling session's goal id;
+/// returns `None` to disable the guard.
+pub type MainTreeSovereigntyProvider =
+    Arc<dyn Fn(Option<&str>) -> Option<MainTreeSovereigntyContext> + Send + Sync>;
+
 /// Host-wired provider for the #20b guard. Called once per shell execution
 /// with the calling session's goal id; returns `None` to disable the guard
 /// entirely (default). Wired by the serve/runtime layer (octos-cli) where the
 /// profile data dir and workspace root are known; process-global because tool
 /// construction sites vastly outnumber the single boot that knows both paths.
-static MAIN_TREE_SOVEREIGNTY_PROVIDER: std::sync::RwLock<
-    Option<Arc<dyn Fn(Option<&str>) -> Option<MainTreeSovereigntyContext> + Send + Sync>>,
-> = std::sync::RwLock::new(None);
+static MAIN_TREE_SOVEREIGNTY_PROVIDER: std::sync::RwLock<Option<MainTreeSovereigntyProvider>> =
+    std::sync::RwLock::new(None);
 
 /// Install (or clear, with `None`) the #20b main-tree sovereignty provider.
-pub fn set_main_tree_sovereignty_provider(
-    provider: Option<Arc<dyn Fn(Option<&str>) -> Option<MainTreeSovereigntyContext> + Send + Sync>>,
-) {
+pub fn set_main_tree_sovereignty_provider(provider: Option<MainTreeSovereigntyProvider>) {
     let mut slot = MAIN_TREE_SOVEREIGNTY_PROVIDER
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
