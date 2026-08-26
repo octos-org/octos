@@ -86,6 +86,13 @@ fn ollama_show_url(base_url: &str) -> String {
     format!("{}/api/show", ollama_root(base_url))
 }
 
+/// Ollama's native generate endpoint — an empty request is the OFFICIAL
+/// preload mechanism (Ollama FAQ): it loads the model and returns, after
+/// which `/api/ps` reports the real allocation.
+fn ollama_generate_url(base_url: &str) -> String {
+    format!("{}/api/generate", ollama_root(base_url))
+}
+
 fn ollama_root(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
@@ -112,9 +119,15 @@ enum ProbeEndpoints {
         models_url: String,
     },
     /// Ollama: `GET /api/ps` (running models' allocated context), with
-    /// `POST /api/show` as the COLD-model fallback (Modelfile num_ctx —
-    /// runtime configuration, safe to pin before the model loads).
-    OllamaNative { ps_url: String, show_url: String },
+    /// `POST /api/show` (Modelfile num_ctx) and — when neither answers —
+    /// an official empty-request PRELOAD via `POST /api/generate`, after
+    /// which `/api/ps` reports the real allocation. Sequential by nature;
+    /// one attempt is bounded by a few request timeouts.
+    OllamaNative {
+        ps_url: String,
+        show_url: String,
+        generate_url: String,
+    },
 }
 
 /// Wraps a local-family provider; overrides `context_window()` with the
@@ -179,6 +192,7 @@ impl LocalContextProbe {
             ProbeEndpoints::OllamaNative {
                 ps_url: ollama_ps_url(base_url),
                 show_url: ollama_show_url(base_url),
+                generate_url: ollama_generate_url(base_url),
             },
             None,
             timeouts,
@@ -231,8 +245,17 @@ impl LocalContextProbe {
         if self.window.get().is_some() {
             return;
         }
-        let guard = self.in_flight.lock().await;
-        self.run_probe_attempt(&guard).await;
+        match self.in_flight.try_lock() {
+            // No attempt active: run exactly one ourselves.
+            Ok(guard) => self.run_probe_attempt(&guard).await,
+            // An attempt is ACTIVE: await its completion and take its
+            // outcome — do NOT stack a second attempt on top. The readiness
+            // bound is ONE attempt's requests (#2135 round-3 P2); if the
+            // active attempt resolves transient, the next request retries.
+            Err(_) => {
+                let _guard = self.in_flight.lock().await;
+            }
+        }
     }
 
     /// One probe attempt. Caller holds the `in_flight` guard.
@@ -280,11 +303,16 @@ impl LocalContextProbe {
                     && matches!(models, FetchOutcome::Answered(_));
                 (window, all_answered)
             }
-            ProbeEndpoints::OllamaNative { ps_url, show_url } => {
+            ProbeEndpoints::OllamaNative {
+                ps_url,
+                show_url,
+                generate_url,
+            } => {
+                let model = self.inner.model_id();
                 let ps = fetch(&client, ps_url, None).await;
                 let mut window = match &ps {
                     FetchOutcome::Answered(Some(body)) => {
-                        parse_ollama_ps_context_window(body, self.inner.model_id())
+                        parse_ollama_ps_context_window(body, model)
                     }
                     _ => None,
                 };
@@ -293,16 +321,35 @@ impl LocalContextProbe {
                 // prompt from the catalog. /api/show answers from the
                 // registry, and a Modelfile num_ctx is runtime
                 // configuration — safe to pin now.
-                if window.is_none() && matches!(&ps, FetchOutcome::Answered(Some(_))) {
-                    let body = serde_json::json!({ "model": self.inner.model_id() });
+                let server_up = matches!(&ps, FetchOutcome::Answered(Some(_)));
+                if window.is_none() && server_up {
+                    let body = serde_json::json!({ "model": model });
                     if let FetchOutcome::Answered(Some(show)) =
                         fetch_post_json(&client, show_url, &body).await
                     {
                         window = parse_ollama_show_num_ctx(&show);
+                        // No Modelfile num_ctx either (#2135 round-3 P2):
+                        // the effective window is decided at LOAD time
+                        // (OLLAMA_CONTEXT_LENGTH / server default — often
+                        // 4K, far from catalog maxima). Use Ollama's
+                        // OFFICIAL preload — an empty /api/generate request
+                        // — then re-read /api/ps for the real allocation. A
+                        // big model that cannot load within the probe
+                        // timeout keeps loading server-side and the next
+                        // attempt reads the allocation; the first chat was
+                        // going to trigger this exact load anyway.
+                        if window.is_none() {
+                            let _ = fetch_post_json(&client, generate_url, &body).await;
+                            if let FetchOutcome::Answered(Some(ps_after)) =
+                                fetch(&client, ps_url, None).await
+                            {
+                                window = parse_ollama_ps_context_window(&ps_after, model);
+                            }
+                        }
                     }
                 }
-                // Still unknown (model cold with no Modelfile num_ctx, or
-                // server unreachable): stay unresolved so a later request
+                // Still unknown (server unreachable, or the preload is
+                // still loading): stay unresolved so a later request
                 // retries once the model is running.
                 let resolved = window.is_some();
                 (window, resolved)
@@ -349,8 +396,18 @@ impl LocalContextProbe {
     }
 }
 
-/// One best-effort POST with a JSON body (Ollama /api/show). Same outcome
-/// semantics as [`fetch`].
+/// Whether a failed HTTP status is worth retrying later. 5xx (server not
+/// ready), 408 (request timeout), 425 (too early), and 429 (rate limited)
+/// are TRANSIENT — pinning "no window" on a rate-limited probe would
+/// permanently keep the catalog value with no recovery (#2135 round-3
+/// P2). Other client errors (401, 403, 404) are decisive: re-asking will
+/// not change them.
+fn status_is_transient(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429)
+}
+
+/// One best-effort POST with a JSON body (Ollama /api/show, /api/generate).
+/// Same outcome semantics as [`fetch`].
 async fn fetch_post_json(
     client: &reqwest::Client,
     url: &str,
@@ -364,7 +421,7 @@ async fn fetch_post_json(
                     Ok(text) => FetchOutcome::Answered(Some(text)),
                     Err(_) => FetchOutcome::Transient,
                 }
-            } else if status.is_server_error() {
+            } else if status_is_transient(status) {
                 FetchOutcome::Transient
             } else {
                 FetchOutcome::Answered(None)
@@ -374,9 +431,10 @@ async fn fetch_post_json(
     }
 }
 
-/// One best-effort GET. Statuses below 500 are decisive answers (2xx carries
-/// a body; 401/404 tell us re-asking is pointless); 5xx and transport
-/// failures are transient. The probe must never fail a chat request.
+/// One best-effort GET. 2xx carries a body; retryable statuses (see
+/// [`status_is_transient`]) and transport failures are transient; other
+/// client errors (401/404) are decisive answers. The probe must never fail
+/// a chat request.
 async fn fetch(client: &reqwest::Client, url: &str, api_key: Option<&str>) -> FetchOutcome {
     let mut request = client.get(url);
     if let Some(key) = api_key {
@@ -390,7 +448,7 @@ async fn fetch(client: &reqwest::Client, url: &str, api_key: Option<&str>) -> Fe
                     Ok(body) => FetchOutcome::Answered(Some(body)),
                     Err(_) => FetchOutcome::Transient,
                 }
-            } else if status.is_server_error() {
+            } else if status_is_transient(status) {
                 FetchOutcome::Transient
             } else {
                 FetchOutcome::Answered(None)
@@ -552,6 +610,27 @@ mod tests {
         probe.window.set(Some(262_144)).unwrap();
         let wrapped = crate::RetryProvider::new(probe);
         assert_eq!(wrapped.context_window(), 262_144);
+    }
+
+    /// #2135 round-3 P2: retryable client statuses must classify as
+    /// transient — the reviewer's scenario was /props 404 (decisive) plus
+    /// /models 429 (rate limited): with 429 marked decisive, all_answered
+    /// pinned "no window" permanently and later recovery was impossible.
+    #[test]
+    fn should_treat_retryable_statuses_as_transient() {
+        use reqwest::StatusCode;
+        for code in [408u16, 425, 429, 500, 502, 503] {
+            assert!(
+                status_is_transient(StatusCode::from_u16(code).unwrap()),
+                "{code} must be transient"
+            );
+        }
+        for code in [400u16, 401, 403, 404, 410] {
+            assert!(
+                !status_is_transient(StatusCode::from_u16(code).unwrap()),
+                "{code} is decisive"
+            );
+        }
     }
 
     /// #2135 re-review P1 regression (delayed server): ensure_ready must

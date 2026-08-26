@@ -7473,6 +7473,11 @@ impl SessionActor {
         // M16-D2: capture ContextManager-derived prompt history before
         // persisting this turn's user message, because the agent appends the
         // current user message internally.
+        // #2135 round-3 P1: resolve a lazily-probed context window before
+        // the ContextManager threshold below reads it — a resumed gateway
+        // session must not PERSIST a compaction sized by the stale catalog
+        // value. Immediate no-op for non-probing providers, once resolved.
+        self.agent.llm_provider().ensure_ready().await;
         let history_for_agent: Vec<Message> =
             self.context_history_for_agent("pre_turn_speculative");
 
@@ -9297,6 +9302,9 @@ impl SessionActor {
         // ContextManager. If the active context is over threshold this installs
         // a compacted generation before the model call; raw session history
         // remains durable and unchanged.
+        // #2135 round-3 P1: same readiness requirement as the speculative
+        // path above — the threshold derives from context_window().
+        self.agent.llm_provider().ensure_ready().await;
         let history: Vec<Message> = self.context_history_for_agent("pre_turn");
 
         // Token tracker for status indicator

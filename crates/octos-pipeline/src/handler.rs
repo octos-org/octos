@@ -954,7 +954,7 @@ impl Handler for CodergenHandler {
         }
 
         let instruction =
-            compact_pipeline_instruction(&ctx.input, Some(provider.context_window()), max_tokens);
+            sized_pipeline_instruction(provider.as_ref(), &ctx.input, max_tokens).await;
         let task = Task::new(
             TaskKind::Code {
                 instruction,
@@ -1426,6 +1426,20 @@ impl Handler for WaitHandler {
             files_modified: vec![],
         })
     }
+}
+
+/// #2135 round-3 P1: the pipeline instruction is truncated ONCE, before
+/// the task starts — the later run_task readiness hook cannot restore an
+/// omitted middle. Readiness therefore resolves HERE, before the window is
+/// read to size the cut; a lazily-probed local provider otherwise truncates
+/// against the stale catalog value.
+async fn sized_pipeline_instruction(
+    provider: &dyn LlmProvider,
+    input: &str,
+    max_output_tokens: Option<u32>,
+) -> String {
+    provider.ensure_ready().await;
+    compact_pipeline_instruction(input, Some(provider.context_window()), max_output_tokens)
 }
 
 fn compact_pipeline_instruction(
@@ -2054,6 +2068,63 @@ mod tests {
             e,
             ProgressEvent::ToolProgress { name, .. } if name == "run_pipeline"
         )));
+    }
+
+    /// #2135 round-3 P1 regression (delayed probe): the instruction cut
+    /// must be sized AFTER provider readiness. A probing provider whose
+    /// window resolves from a stale small value to the server's real one
+    /// must not lose the middle of a long instruction; drop the
+    /// ensure_ready call inside sized_pipeline_instruction and this fails.
+    #[tokio::test]
+    async fn sized_instruction_waits_for_probed_window() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct DelayedProbeProvider {
+            window: AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for DelayedProbeProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                unreachable!("sizing must not chat");
+            }
+
+            fn model_id(&self) -> &str {
+                "delayed-probe"
+            }
+
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+
+            fn context_window(&self) -> u32 {
+                self.window.load(Ordering::SeqCst)
+            }
+
+            async fn ensure_ready(&self) {
+                // The probe resolves the REAL window (like a llama-server
+                // reporting 262144 after the catalog guessed 1024).
+                self.window.store(1_048_576, Ordering::SeqCst);
+            }
+        }
+
+        let input = format!("HEAD:{}:TAIL", " middle".repeat(2_000));
+        let provider = DelayedProbeProvider {
+            window: AtomicU32::new(1_024),
+        };
+        // Un-ready sizing WOULD truncate this input (proves the test
+        // discriminates):
+        assert!(
+            super::compact_pipeline_instruction(&input, Some(1_024), Some(256)).len() < input.len()
+        );
+        // The seam resolves readiness first, so nothing is lost:
+        let sized = super::sized_pipeline_instruction(&provider, &input, Some(256)).await;
+        assert_eq!(sized, input, "instruction must be sized post-readiness");
     }
 
     #[test]
