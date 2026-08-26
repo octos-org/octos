@@ -30520,9 +30520,10 @@ async fn run_standalone_turn(
     // #2135 review P1: resolve a lazily-probed context window BEFORE the
     // threshold compaction inside appui_context_history_for_agent reads it —
     // a resumed transcript compacted against the stale catalog value is
-    // exactly the failure the probe exists to prevent. Immediate no-op for
-    // non-probing providers and once resolved.
-    session_runtime.llm.ensure_ready().await;
+    // exactly the failure the probe exists to prevent. Uses the turn's
+    // already-selected provider (peer-lane routing preserved). Immediate
+    // no-op for non-probing providers and once resolved.
+    llm_provider.ensure_ready().await;
     let (history, context_manager, context_lifecycle_notifications) =
         appui_context_history_for_agent(
             // Root the context ledger at the session's TRANSCRIPT root, not the

@@ -43,7 +43,8 @@ use octos_core::Message;
 
 use crate::config::ChatConfig;
 use crate::local_discovery::{
-    parse_models_context_window, parse_ollama_ps_context_window, parse_props_context_window,
+    parse_models_context_window, parse_ollama_ps_context_window, parse_ollama_show_num_ctx,
+    parse_props_context_window,
 };
 use crate::provider::{LlmProvider, build_http_client};
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, ToolSpec};
@@ -77,9 +78,17 @@ fn models_url(base_url: &str) -> String {
 
 /// Ollama's native process-status endpoint, at the server root.
 fn ollama_ps_url(base_url: &str) -> String {
+    format!("{}/api/ps", ollama_root(base_url))
+}
+
+/// Ollama's native model-metadata endpoint, at the server root.
+fn ollama_show_url(base_url: &str) -> String {
+    format!("{}/api/show", ollama_root(base_url))
+}
+
+fn ollama_root(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
-    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
-    format!("{root}/api/ps")
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
 
 /// What one probe GET established — the distinction the retry logic runs on.
@@ -102,9 +111,10 @@ enum ProbeEndpoints {
         props_url: String,
         models_url: String,
     },
-    /// Ollama: `GET /api/ps` — the RUNNING models with their allocated
-    /// `context_length`.
-    OllamaNative { ps_url: String },
+    /// Ollama: `GET /api/ps` (running models' allocated context), with
+    /// `POST /api/show` as the COLD-model fallback (Modelfile num_ctx —
+    /// runtime configuration, safe to pin before the model loads).
+    OllamaNative { ps_url: String, show_url: String },
 }
 
 /// Wraps a local-family provider; overrides `context_window()` with the
@@ -168,6 +178,7 @@ impl LocalContextProbe {
             inner,
             ProbeEndpoints::OllamaNative {
                 ps_url: ollama_ps_url(base_url),
+                show_url: ollama_show_url(base_url),
             },
             None,
             timeouts,
@@ -203,9 +214,29 @@ impl LocalContextProbe {
         if self.window.get().is_some() {
             return;
         }
-        let Ok(_guard) = self.in_flight.try_lock() else {
+        let Ok(guard) = self.in_flight.try_lock() else {
             return;
         };
+        self.run_probe_attempt(&guard).await;
+    }
+
+    /// Readiness: unlike the request path above, AWAIT an active probe
+    /// (lock, don't try_lock) so a caller that is about to make a
+    /// window-dependent decision sees the outcome of the in-flight attempt
+    /// rather than racing past it (#2135 re-review, P1) — construction
+    /// spawns the probe in the background, and returning while it is still
+    /// running would hand compaction the stale catalog value one more time.
+    /// Still bounded: one attempt's timeouts at most, immediate once pinned.
+    async fn await_readiness(&self) {
+        if self.window.get().is_some() {
+            return;
+        }
+        let guard = self.in_flight.lock().await;
+        self.run_probe_attempt(&guard).await;
+    }
+
+    /// One probe attempt. Caller holds the `in_flight` guard.
+    async fn run_probe_attempt(&self, _guard: &tokio::sync::MutexGuard<'_, ()>) {
         if self.window.get().is_some() {
             return;
         }
@@ -249,19 +280,32 @@ impl LocalContextProbe {
                     && matches!(models, FetchOutcome::Answered(_));
                 (window, all_answered)
             }
-            ProbeEndpoints::OllamaNative { ps_url } => {
+            ProbeEndpoints::OllamaNative { ps_url, show_url } => {
                 let ps = fetch(&client, ps_url, None).await;
-                let window = match &ps {
+                let mut window = match &ps {
                     FetchOutcome::Answered(Some(body)) => {
                         parse_ollama_ps_context_window(body, self.inner.model_id())
                     }
                     _ => None,
                 };
-                // A model not yet loaded answers with an empty models list;
-                // treat as transient so a later request retries once the
-                // model is running.
-                let answered_with_window_chance = matches!(&ps, FetchOutcome::Answered(Some(_)));
-                (window, answered_with_window_chance && window.is_some())
+                // COLD model (#2135 re-review, P2): before the model loads,
+                // /api/ps lists nothing and the FIRST turn would size its
+                // prompt from the catalog. /api/show answers from the
+                // registry, and a Modelfile num_ctx is runtime
+                // configuration — safe to pin now.
+                if window.is_none() && matches!(&ps, FetchOutcome::Answered(Some(_))) {
+                    let body = serde_json::json!({ "model": self.inner.model_id() });
+                    if let FetchOutcome::Answered(Some(show)) =
+                        fetch_post_json(&client, show_url, &body).await
+                    {
+                        window = parse_ollama_show_num_ctx(&show);
+                    }
+                }
+                // Still unknown (model cold with no Modelfile num_ctx, or
+                // server unreachable): stay unresolved so a later request
+                // retries once the model is running.
+                let resolved = window.is_some();
+                (window, resolved)
             }
         };
 
@@ -302,6 +346,31 @@ impl LocalContextProbe {
                 }
             }
         }
+    }
+}
+
+/// One best-effort POST with a JSON body (Ollama /api/show). Same outcome
+/// semantics as [`fetch`].
+async fn fetch_post_json(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> FetchOutcome {
+    match client.post(url).json(body).send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                match response.text().await {
+                    Ok(text) => FetchOutcome::Answered(Some(text)),
+                    Err(_) => FetchOutcome::Transient,
+                }
+            } else if status.is_server_error() {
+                FetchOutcome::Transient
+            } else {
+                FetchOutcome::Answered(None)
+            }
+        }
+        Err(_) => FetchOutcome::Transient,
     }
 }
 
@@ -354,11 +423,12 @@ impl LlmProvider for LocalContextProbe {
     }
 
     async fn ensure_ready(&self) {
-        // Bounded: one probe attempt (a few seconds worst case) while
-        // unresolved and attempts remain; immediate once pinned. This is
-        // the hook that lets a RESUMED session get the corrected window
-        // before its first compaction pass instead of after its first chat.
-        self.probe_if_unresolved().await;
+        // Bounded: waits for an ACTIVE probe to finish (or runs one
+        // attempt itself), a few seconds worst case; immediate once
+        // pinned. This is the hook that lets a RESUMED session get the
+        // corrected window before its first compaction pass instead of
+        // after its first chat.
+        self.await_readiness().await;
     }
 
     fn context_window(&self) -> u32 {
@@ -482,6 +552,33 @@ mod tests {
         probe.window.set(Some(262_144)).unwrap();
         let wrapped = crate::RetryProvider::new(probe);
         assert_eq!(wrapped.context_window(), 262_144);
+    }
+
+    /// #2135 re-review P1 regression (delayed server): ensure_ready must
+    /// AWAIT an active probe, not race past it — a background attempt still
+    /// in flight used to make readiness return with the window unknown, and
+    /// compaction read the catalog value anyway.
+    #[tokio::test]
+    async fn should_await_active_probe_completion_in_ensure_ready() {
+        let probe = unprobed("http://127.0.0.1:9/v1");
+        // Simulate a slow background probe: hold the in-flight guard.
+        let guard = probe.in_flight.lock().await;
+        let waiter = {
+            let probe = probe.clone();
+            tokio::spawn(async move {
+                probe.ensure_ready().await;
+                probe.context_window()
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "readiness must block while a probe attempt is active"
+        );
+        // The "background probe" resolves, then releases the guard.
+        probe.window.set(Some(262_144)).unwrap();
+        drop(guard);
+        assert_eq!(waiter.await.unwrap(), 262_144);
     }
 
     /// ensure_ready delegates through wrappers and drives the probe: on an

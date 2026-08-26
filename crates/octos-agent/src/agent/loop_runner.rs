@@ -2215,6 +2215,10 @@ impl Agent {
                 // benefit from the same cheap shrinkage before their LLM call.
                 let protected_ids = collect_protected_tool_call_ids(&messages);
                 self.run_tier1_compaction(&mut messages, &protected_ids, tier1_pass(iteration));
+                // #2135 re-review P1: task mode (delegated workers, MCP task
+                // runs) sizes its prompt here too — resolve a lazily-probed
+                // window before the trim reads context_window().
+                self.llm.ensure_ready().await;
                 prepare_task_messages(self, &mut messages, &mut turn);
                 self.prepare_prompt_with_context_manager(
                     &mut messages,

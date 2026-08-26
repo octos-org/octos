@@ -194,6 +194,36 @@ pub fn parse_ollama_ps_context_window(body: &str, model_id: &str) -> Option<u32>
     None
 }
 
+/// Runtime-configured context from an Ollama-native `POST /api/show`
+/// response body: the Modelfile `parameters` text block, line
+/// `num_ctx <n>`.
+///
+/// This is the COLD-model fallback (#2135 re-review, P2): before a model
+/// is loaded, `/api/ps` lists nothing, but `/api/show` answers from the
+/// registry — and `num_ctx` there is a runtime CONFIGURATION (what the
+/// model will be loaded with), not a trained maximum, so it is safe to
+/// pin. The trained `context_length` under `model_info` is deliberately
+/// ignored. Models whose Modelfile sets no num_ctx yield `None` — the
+/// catalog stands for the first turn and `/api/ps` corrects on the next
+/// probe once the model is running.
+pub fn parse_ollama_show_num_ctx(body: &str) -> Option<u32> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let parameters = value.get("parameters")?.as_str()?;
+    for line in parameters.lines() {
+        let mut tokens = line.split_whitespace();
+        if tokens.next() == Some("num_ctx") {
+            if let Some(window) = tokens
+                .next()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .and_then(sane_context_window)
+            {
+                return Some(window);
+            }
+        }
+    }
+    None
+}
+
 /// Model ids from an OpenAI-compatible `GET /v1/models` response body.
 ///
 /// `None` means the body is not the list-models shape at all (HTML from an
@@ -394,5 +424,18 @@ mod tests {
             parse_ollama_ps_context_window("<html></html>", "qwen3"),
             None
         );
+    }
+
+    /// Ollama `/api/show`: the Modelfile-configured `num_ctx` is a runtime
+    /// setting and may be pinned; trained `context_length` under model_info
+    /// is ignored; no num_ctx line yields None.
+    #[test]
+    fn should_read_configured_num_ctx_from_ollama_show() {
+        let body = r#"{"parameters":"num_ctx                        32768\nstop                           \"<|im_end|>\"","model_info":{"qwen3.context_length":262144}}"#;
+        assert_eq!(parse_ollama_show_num_ctx(body), Some(32_768));
+        let no_ctx =
+            r#"{"parameters":"stop \"<|im_end|>\"","model_info":{"qwen3.context_length":262144}}"#;
+        assert_eq!(parse_ollama_show_num_ctx(no_ctx), None);
+        assert_eq!(parse_ollama_show_num_ctx("{}"), None);
     }
 }
