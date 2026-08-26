@@ -12545,7 +12545,16 @@ asserted, it is NOT done.\n\nAnswer with EXACTLY one line:\n`DONE` if the \
 objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     );
     let config = octos_llm::ChatConfig {
-        max_tokens: Some(200),
+        // #23 — 200 was enough for a one-line DONE/NOT_DONE on a NON-reasoning
+        // model, but reasoning models (k3, o-series) spend thinking tokens from
+        // the SAME budget: with max_tokens=200 the model burned all 200 on
+        // reasoning and left ZERO for the visible answer, so the verifier
+        // returned Ok with EMPTY content and goal_update surfaced a bare
+        // "verifier returned: " (the #23 empty-return). 2048 gives reasoning
+        // ample headroom while leaving room for the one-line verdict; for a
+        // non-reasoning model 2048 is just an upper bound, not a target, so
+        // this is regression-free.
+        max_tokens: Some(2048),
         temperature: Some(0.0),
         tool_choice: Default::default(),
         stop_sequences: Vec::new(),
