@@ -3675,6 +3675,69 @@ mod tests {
         assert_eq!(config.sub_providers[1].key, "strong");
     }
 
+    /// #24 — REAL-machine verification that the LIVE profile config
+    /// (`~/.octos/profiles/octos.json`, the registry the running serve actually
+    /// loads) carries the `zai` + `goal_verifier` lanes written by the #24
+    /// fix, and that both resolve to a buildable provider through the REAL
+    /// config-from-profile path — not a test-constructed one (S2/S3's gap).
+    /// Gated `#[ignore]` so CI never depends on the operator's live box; run:
+    ///   cargo test -p octos-cli --lib --features api -- --ignored --exact \
+    ///     profiles::tests::live_profile_carries_zai_and_goal_verifier_lanes
+    #[test]
+    #[ignore = "reads the operator's live ~/.octos/profiles/octos.json; run explicitly"]
+    fn live_profile_carries_zai_and_goal_verifier_lanes() {
+        let path = dirs::home_dir()
+            .expect("home dir")
+            .join(".octos")
+            .join("profiles")
+            .join("octos.json");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("live profile unreadable at {}: {e}", path.display()));
+        let profile: UserProfile =
+            serde_json::from_str(&content).expect("live profile must deserialize into UserProfile");
+
+        // Both lanes present in the LIVE config.
+        let keys: Vec<&str> = profile
+            .config
+            .sub_providers
+            .iter()
+            .map(|sp| sp.key.as_str())
+            .collect();
+        assert!(
+            keys.contains(&"zai"),
+            "zai lane missing from live config: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"goal_verifier"),
+            "goal_verifier lane missing from live config: {keys:?}"
+        );
+
+        // The zai lane carries the right model through the REAL
+        // config-from-profile mapping.
+        let config = config_from_profile(&profile, None, None);
+        let zai = config
+            .sub_providers
+            .iter()
+            .find(|sp| sp.key == "zai")
+            .expect("zai lane survives config_from_profile");
+        assert_eq!(zai.provider, "zai");
+        assert_eq!(zai.model.as_deref(), Some("glm-5.2"));
+
+        // The goal_verifier lane BUILDS a provider via the #1935 path — the
+        // exact call that was returning None (empty verifier) before the lane
+        // was configured. This needs the lane's credential in env to fully
+        // build; without it we assert the lane is at least FOUND (not None
+        // because the key is absent).
+        let verifier_lane = config
+            .sub_providers
+            .iter()
+            .find(|sp| sp.key == crate::runtime::profile::GOAL_VERIFIER_LANE_KEY);
+        assert!(
+            verifier_lane.is_some(),
+            "goal_verifier lane must be FOUND (its absence was the empty-verifier root cause)"
+        );
+    }
+
     #[test]
     fn config_from_profile_threads_format_after_edit() {
         // #1774 review: `octos serve` builds session configs through
