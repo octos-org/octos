@@ -119,6 +119,36 @@ impl Tool for GrepTool {
         })
     }
 
+    /// `grep` does not paginate, so the recovery is to NARROW, and the advice
+    /// says which lever is still unused rather than offering a generic hint.
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let mut levers = Vec::new();
+        if args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            levers.push("scope it with path");
+        }
+        if args
+            .get("file_pattern")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            levers.push("filter files with file_pattern (for example \"*.rs\")");
+        }
+        levers.push("tighten the pattern");
+        levers.push("lower limit and re-run");
+        Some(format!(
+            "[{omitted_bytes} bytes omitted] Too many matches to return. Narrow the search: {}.",
+            levers.join(", ")
+        ))
+    }
+
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         // PR-B: legacy entry point routes through the typed path with a
         // zero-value context so out-of-band callers still get the same
@@ -849,5 +879,35 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello"));
+    }
+
+    /// grep cannot paginate, so its recovery is narrowing — and the advice
+    /// should name the levers still UNUSED rather than listing all of them.
+    #[test]
+    fn should_offer_the_unused_narrowing_levers_when_matches_overflow() {
+        let tool = GrepTool::new(std::path::Path::new("."));
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "pattern": "fn " }), 9_000)
+            .expect("grep always has narrowing available");
+        assert!(advice.contains("9000 bytes omitted"), "{advice}");
+        assert!(
+            advice.contains("path"),
+            "unused path filter should be offered: {advice}"
+        );
+        assert!(
+            advice.contains("file_pattern"),
+            "unused file_pattern filter should be offered: {advice}"
+        );
+
+        let already_scoped = tool
+            .truncation_recovery(
+                &serde_json::json!({ "pattern": "fn ", "path": "crates", "file_pattern": "*.rs" }),
+                9_000,
+            )
+            .expect("still recoverable by tightening the pattern");
+        assert!(
+            !already_scoped.contains("scope it with path"),
+            "a lever already in use must not be suggested again: {already_scoped}"
+        );
     }
 }

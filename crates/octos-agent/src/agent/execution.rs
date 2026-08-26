@@ -2358,9 +2358,32 @@ impl Agent {
                 let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
             }
 
-            // Per-tool output truncation with head/tail split
+            // Per-tool output truncation with head/tail split.
+            //
+            // The cut is a BACKSTOP: it is the one point every tool's output
+            // funnels through, which is also the point that knows the least —
+            // `truncate_head_tail` receives a string and a number. On its own it
+            // leaves the model with `... [N bytes omitted] ...` and no way to
+            // reach what it lost, so the only recovery is re-running the call,
+            // which returns the same output cut the same way and spends the
+            // tokens the cap was meant to save.
+            //
+            // `Tool::truncation_recovery` is the missing half: the tool still
+            // knows its own arguments and whether it paginates, so it can name a
+            // concrete next call. Tools with no resume path return None and get
+            // no invented advice.
             let limit = octos_core::tool_output_limit(&tc_name);
-            let content = octos_core::truncate_head_tail(&content, limit, 0.7);
+            let untruncated_len = content.len();
+            let mut content = octos_core::truncate_head_tail(&content, limit, 0.7);
+            if content.len() < untruncated_len {
+                if let Some(recovery) = tools.get(&tc_name).and_then(|tool| {
+                    tool.truncation_recovery(&effective_args, untruncated_len - content.len())
+                }) {
+                    content.push('\n');
+                    content.push_str(&recovery);
+                }
+            }
+            let content = content;
             let content = crate::sanitize::sanitize_tool_output(&content);
 
             // Pair the structured side-channel with the originating tool's

@@ -118,6 +118,41 @@ impl Tool for ReadFileTool {
         })
     }
 
+    /// `read_file` paginates, so a truncated read has a real next call.
+    ///
+    /// The advice names `offset`/`limit` explicitly and echoes the range that
+    /// was just read, because "output was truncated" alone leaves the model
+    /// re-issuing the identical call.
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let start = args
+            .get("offset")
+            .or_else(|| args.get("start_line"))
+            .and_then(serde_json::Value::as_u64);
+        let limit = args.get("limit").and_then(serde_json::Value::as_u64);
+        Some(match (start, limit) {
+            (Some(start), Some(limit)) => format!(
+                "[{omitted_bytes} bytes omitted] This read started at line {start} with limit \
+                 {limit}. Continue with offset: {} to read on, or lower limit to read less per \
+                 call.",
+                start + limit
+            ),
+            (Some(start), None) => format!(
+                "[{omitted_bytes} bytes omitted] This read started at line {start}. Re-read a \
+                 bounded range with offset and limit (for example limit: 200) instead of the \
+                 whole file."
+            ),
+            _ => format!(
+                "[{omitted_bytes} bytes omitted] Read a bounded range instead: pass offset \
+                 (1-indexed start line) and limit (for example offset: 1, limit: 200), then page \
+                 forward."
+            ),
+        })
+    }
+
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         // M8.1: legacy entry point routes through the typed path with a
         // zero-value context so out-of-band callers still exercise the same
@@ -1134,5 +1169,33 @@ mod tests {
             second.output
         );
         assert!(second.output.contains("line 7"));
+    }
+
+    /// A truncated read must name the call that continues it.
+    ///
+    /// Without this the model sees only "N bytes omitted" and its sole
+    /// recovery is re-issuing the identical call, which returns the identical
+    /// truncation — spending the tokens the cap existed to save.
+    #[test]
+    fn should_name_the_next_offset_when_a_bounded_read_is_truncated() {
+        let tool = ReadFileTool::new(std::path::Path::new("."));
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "offset": 1, "limit": 200 }), 47_000)
+            .expect("read_file paginates, so it always has a resume path");
+        assert!(advice.contains("47000 bytes omitted"), "{advice}");
+        assert!(
+            advice.contains("offset: 201"),
+            "the advice must name the CONCRETE next call, not just mention offset: {advice}"
+        );
+    }
+
+    #[test]
+    fn should_suggest_bounding_the_read_when_no_range_was_given() {
+        let tool = ReadFileTool::new(std::path::Path::new("."));
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "path": "big.txt" }), 12_345)
+            .expect("still recoverable: the tool takes offset/limit");
+        assert!(advice.contains("offset"), "{advice}");
+        assert!(advice.contains("limit"), "{advice}");
     }
 }

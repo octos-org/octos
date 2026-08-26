@@ -6252,3 +6252,134 @@ const BIG_TOOL_OUTPUT: &str = concat!(
     "BEGIN-LARGE-TOOL-RESULT ",
     include_str!("append_only_audit.rs"),
 );
+
+/// A tool whose output overflows the cap and which knows how to resume.
+struct OverflowingPagedTool;
+
+#[async_trait]
+impl Tool for OverflowingPagedTool {
+    fn name(&self) -> &str {
+        "overflowing_paged"
+    }
+
+    fn description(&self) -> &str {
+        "Return more output than the per-tool cap allows"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        Ok(ToolResult {
+            // Comfortably past the 50_000-byte default cap.
+            output: "y".repeat(120_000),
+            success: true,
+            ..Default::default()
+        })
+    }
+
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let page = args
+            .get("page")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        Some(format!(
+            "[{omitted_bytes} bytes omitted] Continue with page: {}.",
+            page + 1
+        ))
+    }
+}
+
+struct CallsOverflowingToolThenEnds {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for CallsOverflowingToolThenEnds {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_overflow".to_string(),
+                    name: "overflowing_paged".to_string(),
+                    arguments: serde_json::json!({ "page": 0 }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        } else {
+            ChatResponse {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+}
+
+/// The wiring test: a truncated tool result must reach the model carrying its
+/// recovery advice.
+///
+/// The unit tests prove `truncation_recovery` returns good text. They prove
+/// nothing about whether the execution loop ever CALLS it — and an unwired
+/// hook that returns perfect advice into the void is the failure mode this
+/// whole change exists to remove. So this drives the real loop and inspects
+/// the tool message the model actually received.
+#[tokio::test]
+async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(OverflowingPagedTool);
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(CallsOverflowingToolThenEnds {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("truncation-recovery"), provider, tools, memory);
+
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+
+    let tool_message = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("the turn must contain the tool result");
+
+    assert!(
+        tool_message.content.len() < 120_000,
+        "the cap must still apply: got {} bytes",
+        tool_message.content.len()
+    );
+    assert!(
+        tool_message.content.contains("Continue with page: 1."),
+        "the truncated result must carry the tool's recovery advice, otherwise the model is \
+         left at a dead end and can only re-run the same call; tail was: {:?}",
+        &tool_message.content[tool_message.content.len().saturating_sub(200)..]
+    );
+}
