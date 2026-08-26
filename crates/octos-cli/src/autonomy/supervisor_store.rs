@@ -792,6 +792,53 @@ impl SupervisorStore {
         Ok(state)
     }
 
+    /// #26a — goal-scoped view of the stream, folded BY GOAL ID.
+    ///
+    /// `load_state`'s `state.groups` map is keyed by GROUP id, and every goal
+    /// of one session scope shares the SAME `autonomy-goal:<scope>` group — so
+    /// the folded map holds only the NEWEST goal of each scope and a
+    /// superseded goal (goal_01 replaced by goal_02…) vanishes from
+    /// `octos goal list` even though its rows are still in the stream. The
+    /// zombie-cleanup path needs to SEE those superseded goals, so this view
+    /// scans the raw rows directly (snapshot + ledger tail, same read order
+    /// as `load_state`) and folds the LATEST `group_registered` carrying each
+    /// `goal_id`. Rows that fail to parse are already skipped by the tolerant
+    /// replay (#26a).
+    pub fn load_goal_groups_by_id(
+        &self,
+    ) -> io::Result<std::collections::HashMap<String, SupervisedGroupRecord>> {
+        let rows = self.read_ledger_rows()?;
+        let snapshot = self.load_snapshot()?;
+        let snapshot_last_sequence = snapshot.as_ref().map_or(0, |s| s.last_sequence);
+        // Fold the snapshot's groups first (they carry sequence context via
+        // `last_sequence`), then overlay newer ledger rows.
+        let mut by_goal: std::collections::HashMap<String, SupervisedGroupRecord> =
+            std::collections::HashMap::new();
+        let mut order: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        if let Some(snapshot) = snapshot.as_ref() {
+            for group in snapshot.state.groups.values() {
+                if let Some(goal_id) = group.metadata.get("goal_id").and_then(|v| v.as_str()) {
+                    by_goal.insert(goal_id.to_owned(), group.clone());
+                }
+            }
+        }
+        for row in rows {
+            if row.sequence <= snapshot_last_sequence {
+                continue;
+            }
+            if let SupervisorEvent::GroupRegistered { group } = &row.event {
+                if let Some(goal_id) = group.metadata.get("goal_id").and_then(|v| v.as_str()) {
+                    let slot = order.entry(goal_id.to_owned()).or_insert(0);
+                    if row.sequence >= *slot {
+                        *slot = row.sequence;
+                        by_goal.insert(goal_id.to_owned(), group.clone());
+                    }
+                }
+            }
+        }
+        Ok(by_goal)
+    }
+
     /// Load the snapshot, refusing one written by a NEWER binary: a
     /// `schema_version` above what this build knows means fields we would
     /// silently drop or misread, and a snapshot is the authoritative record
@@ -1378,22 +1425,42 @@ impl SupervisorStore {
         };
         let reader = BufReader::new(file);
         let mut rows = Vec::new();
+        // #26a — tolerant replay: a SINGLE malformed line (a torn write from a
+        // crash, a hand-appended row with a subtly wrong shape, an upgraded
+        // schema's legacy row) must not poison the WHOLE stream — the goals a
+        // CLI/orchestrator can see would silently drop to whatever fallback
+        // path loads (observed live: `octos goal list` on a stream with one
+        // bad row showed only the newest goal). Skip the bad line with a warn
+        // naming its index; a stream whose rows are ALL bad still yields an
+        // empty replay, which callers already handle.
+        let mut skipped = 0usize;
         for (idx, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let row = serde_json::from_str(&line).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "failed to parse {} line {}: {err}",
-                        self.events_path.display(),
-                        idx + 1
-                    ),
-                )
-            })?;
-            rows.push(row);
+            match serde_json::from_str(&line) {
+                Ok(row) => rows.push(row),
+                Err(err) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        target: "octos::supervisor",
+                        path = %self.events_path.display(),
+                        line = idx + 1,
+                        error = %err,
+                        "skipping malformed supervisor event row (#26a tolerant replay)"
+                    );
+                }
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                target: "octos::supervisor",
+                path = %self.events_path.display(),
+                skipped,
+                loaded = rows.len(),
+                "supervisor event stream replay skipped malformed rows"
+            );
         }
         Ok(rows)
     }
@@ -1562,8 +1629,127 @@ mod tests {
 
     impl Drop for TestDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = fs::remove_dir_all(self.path.parent().unwrap());
         }
+    }
+
+    /// #26a — tolerant replay: a malformed row (torn write, unknown variant
+    /// from an older/newer schema) must be SKIPPED with a warn, never abort
+    /// the whole stream load. Live evidence: the a9c4 instance stream carried
+    /// 3 legacy `goal_state` rows and `octos goal list` was unusable before.
+    #[test]
+    fn malformed_rows_are_skipped_not_fatal() {
+        let dir = TestDir::new("tolerant");
+        let store = SupervisorStore::new(&dir.path);
+
+        let mut group = SupervisedGroupRecord::new("group-1", 100);
+        group.objective = Some("tolerant replay".to_string());
+        group.metadata.insert(
+            "autonomy_record_kind".to_string(),
+            serde_json::json!("goal"),
+        );
+        group
+            .metadata
+            .insert("goal_id".to_string(), serde_json::json!("goal_01"));
+        group
+            .metadata
+            .insert("status".to_string(), serde_json::json!("active"));
+        store.record_group_registered(group).unwrap();
+
+        // Corrupt the stream: one unknown-variant row and one torn JSON line.
+        let mut raw = std::fs::read_to_string(&store.events_path).unwrap();
+        raw.push_str("{\"event\":{\"type\":\"goal_state\",\"payload\":{}}}\n");
+        raw.push_str("{\"torn json…\n");
+        std::fs::write(&store.events_path, raw).unwrap();
+
+        // The good row still loads (malformed rows skipped, not fatal).
+        let state = store.load_state().unwrap();
+        assert!(
+            state.groups.contains_key("group-1"),
+            "the well-formed row must survive malformed siblings"
+        );
+        // The goal-scoped view survives too.
+        let by_goal = store.load_goal_groups_by_id().unwrap();
+        assert_eq!(
+            by_goal.get("goal_01").map(|g| g.metadata.get("status")),
+            Some(Some(&serde_json::json!("active")))
+        );
+    }
+
+    /// #26a — the goal-scoped view folds BY GOAL ID, so a superseded goal
+    /// (an earlier goal_NN sharing the newest goal's session-scope group)
+    /// stays visible for zombie cleanup where the group-folded `load_state`
+    /// map would only hold the newest one.
+    #[test]
+    fn goal_scoped_view_keeps_superseded_goals_visible() {
+        let dir = TestDir::new("goal-scoped");
+        let store = SupervisorStore::new(&dir.path);
+
+        let goal_row = |goal_id: &str, status: &str, seq: u64| {
+            let mut group = SupervisedGroupRecord::new("autonomy-goal:scope-1", seq);
+            group.objective = Some(format!("objective {goal_id}"));
+            group.metadata.insert(
+                "autonomy_record_kind".to_string(),
+                serde_json::json!("goal"),
+            );
+            group
+                .metadata
+                .insert("goal_id".to_string(), serde_json::json!(goal_id));
+            group
+                .metadata
+                .insert("profile_id".to_string(), serde_json::json!("octos"));
+            group.metadata.insert(
+                "session_id".to_string(),
+                serde_json::json!("octos:local:tui#coding"),
+            );
+            group
+                .metadata
+                .insert("status".to_string(), serde_json::json!(status));
+            group
+        };
+        // Three goals of the SAME scope group, newest last.
+        store
+            .record_group_registered(goal_row("goal_01", "active", 1))
+            .unwrap();
+        store
+            .record_group_registered(goal_row("goal_02", "complete", 2))
+            .unwrap();
+        store
+            .record_group_registered(goal_row("goal_03", "complete", 3))
+            .unwrap();
+
+        // The group-folded state collapses re-registrations of the SAME
+        // group id (the `group_registered:<group_id>` event id dedupes), so
+        // replay may hold whichever registration survived — exactly why the
+        // goal-scoped view exists. We only assert the group exists here.
+        let state = store.load_state().unwrap();
+        assert!(
+            state.groups.contains_key("autonomy-goal:scope-1"),
+            "the scope group exists in the folded state"
+        );
+
+        // The goal-scoped view keeps ALL THREE visible, each with its own
+        // latest status — the zombie-cleanup requirement.
+        let by_goal = store.load_goal_groups_by_id().unwrap();
+        assert_eq!(by_goal.len(), 3, "all goals stay visible");
+        assert_eq!(
+            by_goal
+                .get("goal_01")
+                .and_then(|g| g.metadata.get("status")),
+            Some(&serde_json::json!("active"))
+        );
+        assert_eq!(
+            by_goal
+                .get("goal_02")
+                .and_then(|g| g.metadata.get("status")),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            by_goal
+                .get("goal_03")
+                .and_then(|g| g.metadata.get("status")),
+            Some(&serde_json::json!("complete"))
+        );
     }
 
     #[test]
