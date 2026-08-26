@@ -947,6 +947,77 @@ pub fn repo_label_from_path(path: &Path) -> String {
 }
 
 /// System prompt for LLM context compaction (codex-style handoff summary).
+
+/// Cap on the preserved-plan block: the plan is a checklist, not a
+/// transcript — anything longer is a model mis-using update_plan, and the
+/// preservation must not eat the summary budget it rides on.
+const PLAN_SNAPSHOT_MAX_CHARS: usize = 1500;
+
+/// The newest `update_plan` state in `messages`, rendered as a checklist —
+/// or `None` when the conversation never declared a plan.
+///
+/// Compaction destroys transcript state, and the plan IS transcript state:
+/// the observed failure was a long task whose model, after a compaction
+/// pass, no longer knew what it was doing and fell back to summarizing the
+/// repo (`specs/task-compaction-instruction-priority.spec.md` records the
+/// same class of drift). The plan is the one piece of working state the
+/// model explicitly externalized — preserve it VERBATIM, newest wins.
+pub fn latest_plan_snapshot(messages: &[Message]) -> Option<String> {
+    let args = messages.iter().rev().find_map(|message| {
+        message
+            .tool_calls
+            .as_ref()?
+            .iter()
+            .rev()
+            .find_map(|call| (call.name == "update_plan").then(|| call.arguments.clone()))
+    })?;
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(items) = args
+        .get("plan")
+        .or_else(|| args.get("items"))
+        .and_then(|v| v.as_array())
+    {
+        for item in items {
+            let title = ["step", "title", "content", "text"]
+                .iter()
+                .find_map(|k| item.get(*k).and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            if title.is_empty() {
+                continue;
+            }
+            let marker = match item.get("status").and_then(|v| v.as_str()) {
+                Some("completed" | "complete" | "done") => "[x]",
+                Some("in_progress" | "in-progress" | "active" | "running") => "[>]",
+                _ => "[ ]",
+            };
+            lines.push(format!("- {marker} {title}"));
+        }
+    }
+    let mut body = if lines.is_empty() {
+        // Unrecognized shape: keep the raw arguments rather than nothing —
+        // verbatim state beats a lossy guess.
+        serde_json::to_string(&args).ok()?
+    } else {
+        lines.join("\n")
+    };
+    octos_core::truncate_utf8(&mut body, PLAN_SNAPSHOT_MAX_CHARS, "\n... (plan truncated)");
+    Some(body)
+}
+
+/// Prepend the newest declared plan to a compaction `summary`, so the one
+/// piece of working state the model explicitly externalized survives the
+/// pass verbatim — regardless of what the summarizer (LLM or heuristic)
+/// chose to keep. No plan, no change.
+pub fn with_plan_preserved(summary: String, messages: &[Message]) -> String {
+    match latest_plan_snapshot(messages) {
+        Some(plan) => format!(
+            "## Active task plan (preserved verbatim across compaction; \
+resume from the first unchecked item)\n{plan}\n\n{summary}"
+        ),
+        None => summary,
+    }
+}
+
 const LLM_COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a long conversation so it fits the model's \
 context window. Produce a CONTEXT CHECKPOINT: a concise handoff summary another LLM can use to seamlessly \
 continue the task. Include the current goal, key decisions made, progress completed and what remains, and \
@@ -1568,5 +1639,47 @@ mod tests {
         assert!(matches_artifact("wrote to output/deck.pptx earlier", &art2));
         let art3 = PreservedArtifact::new("other", "never/mentioned.txt");
         assert!(!matches_artifact("no mention here", &art3));
+    }
+
+    /// #2132: the NEWEST update_plan wins, statuses render as checklist
+    /// markers, and a plan-free conversation changes nothing.
+    #[test]
+    fn plan_snapshot_takes_newest_plan_and_renders_checklist() {
+        use octos_core::{Message, MessageRole, ToolCall};
+        let plan_call = |steps: serde_json::Value| ToolCall {
+            id: "c1".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({ "plan": steps }),
+            metadata: None,
+        };
+        let mut old = Message::assistant("");
+        old.tool_calls = Some(vec![plan_call(serde_json::json!([
+            {"step": "old step", "status": "pending"}
+        ]))]);
+        let mut new = Message::assistant("");
+        new.tool_calls = Some(vec![plan_call(serde_json::json!([
+            {"step": "convert dataloader", "status": "completed"},
+            {"step": "convert attention", "status": "in_progress"},
+            {"step": "port test harness", "status": "pending"}
+        ]))]);
+        let messages = vec![old, new];
+
+        let snapshot = latest_plan_snapshot(&messages).expect("plan present");
+        assert!(snapshot.contains("- [x] convert dataloader"), "{snapshot}");
+        assert!(snapshot.contains("- [>] convert attention"), "{snapshot}");
+        assert!(snapshot.contains("- [ ] port test harness"), "{snapshot}");
+        assert!(
+            !snapshot.contains("old step"),
+            "newest plan wins: {snapshot}"
+        );
+
+        let summary = with_plan_preserved("history summary".into(), &messages);
+        assert!(summary.starts_with("## Active task plan"), "{summary}");
+        assert!(summary.ends_with("history summary"), "{summary}");
+
+        // No plan: summary passes through untouched.
+        let plain = vec![Message::user("hi")];
+        assert_eq!(with_plan_preserved("s".into(), &plain), "s");
+        assert_eq!(latest_plan_snapshot(&plain), None);
     }
 }
