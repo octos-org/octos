@@ -622,7 +622,7 @@ macro_rules! simple_codex_tool {
 /// typed [`UiPlanRecord`]. Accepts item text under `step` / `title` / `content`
 /// and tolerates a few status spellings; assigns a stable 1-based `id` when the
 /// caller doesn't supply one so downstream clients can re-render in place.
-fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanRecord {
+pub(crate) fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanRecord {
     use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
     let items = args
         .get("plan")

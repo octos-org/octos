@@ -3221,10 +3221,6 @@ fn appui_compact_context_if_over_threshold(
     } else {
         octos_agent::compaction::compact_messages(&before.messages, summary_budget)
     };
-    // #2132: the newest update_plan state rides on top of the summary
-    // VERBATIM — compaction must not erase the one piece of working state
-    // the model explicitly externalized.
-    let summary = octos_agent::compaction::with_plan_preserved(summary, &before.messages);
     let record = manager.compact_context(
         summary,
         CompactContextPolicy {
@@ -3400,10 +3396,6 @@ fn appui_force_compact_context(
     } else {
         octos_agent::compaction::compact_messages(&before.messages, summary_budget)
     };
-    // #2132: the newest update_plan state rides on top of the summary
-    // VERBATIM — compaction must not erase the one piece of working state
-    // the model explicitly externalized.
-    let summary = octos_agent::compaction::with_plan_preserved(summary, &before.messages);
     let record = manager.compact_context(
         summary,
         CompactContextPolicy {
@@ -3812,8 +3804,6 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 }
                 None => octos_agent::compaction::compact_messages(&before.messages, summary_budget),
             };
-            // #2132: preserve the newest update_plan state verbatim.
-            let summary = octos_agent::compaction::with_plan_preserved(summary, &before.messages);
             let record = scratch.manager.compact_context(
                 summary,
                 CompactContextPolicy {
