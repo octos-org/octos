@@ -452,6 +452,18 @@ pub fn set_main_tree_sovereignty_provider(provider: Option<MainTreeSovereigntyPr
     *slot = provider;
 }
 
+/// Snapshot the currently-installed #20b sovereignty provider, if any. The
+/// shell tool itself reads the slot on the execution path; this accessor
+/// exists for host-side wiring tests (octos-cli #20c) that must invoke the
+/// INSTALLED provider — not a re-implemented closure — to prove the
+/// scan/claim/deny wiring end to end.
+pub fn main_tree_sovereignty_provider() -> Option<MainTreeSovereigntyProvider> {
+    MAIN_TREE_SOVEREIGNTY_PROVIDER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// The HEAD-moving target of a `git checkout` / `git switch` segment:
 /// `Some(Some(branch))` switches to / creates `branch`, `Some(None)` is a
 /// HEAD-moving form with no branch target we can name (treated as
@@ -547,7 +559,10 @@ fn git_head_move_target(segment: &[String], cwd: &Path) -> Option<Option<String>
 }
 
 /// Pure #20b decision: `Some(denial)` when this command must be refused.
-fn tree_sovereignty_denial(
+/// `pub` so the octos-cli #20c dual-goal fixture can exercise the real
+/// decision against a real provider-shaped context (cross-goal checkout
+/// refused, owner goal passes through) instead of a re-implemented copy.
+pub fn tree_sovereignty_denial(
     command: &str,
     effective_cwd: &Path,
     ctx: &MainTreeSovereigntyContext,
