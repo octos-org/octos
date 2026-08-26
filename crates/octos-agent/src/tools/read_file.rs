@@ -277,6 +277,25 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
+        // Observe-only (#read-paging probe): record what a FORCED window would
+        // have done here. Forcing pages is not a token win — if the model
+        // consumes the whole file anyway, more calls cost more, because each
+        // re-sends the conversation prefix. It wins only when models stop after
+        // page one, and that rate is the number this records. Nothing below
+        // changes; the read returns exactly what it always did.
+        if super::read_paging_probe::enabled() {
+            let bounded = start_line.is_some() || end_line.is_some();
+            let max_line_bytes = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+            super::read_paging_probe::record_read(
+                &path.to_string_lossy(),
+                bounded,
+                start_line,
+                total_lines,
+                content.len(),
+                max_line_bytes,
+            );
+        }
+
         // Apply line range
         let start = start_line.unwrap_or(1).saturating_sub(1);
         let end = end_line.unwrap_or(total_lines).min(total_lines);
