@@ -15206,6 +15206,65 @@ mod tests {
         }
     }
 
+    /// #23 — a mock that captures the `max_tokens` the verifier passes, so the
+    /// reasoning-headroom budget (2048, not the old 200) is pinned by test.
+    struct MaxTokensCapturingProvider {
+        seen_max_tokens: std::sync::Mutex<Option<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MaxTokensCapturingProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            *self.seen_max_tokens.lock().unwrap() = config.max_tokens;
+            Ok(octos_llm::ChatResponse {
+                content: Some("DONE".to_owned()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "max-tokens-mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// #23 — pin the verifier's token budget: reasoning models (k3/o-series)
+    /// share one max_tokens budget between thinking and the visible answer, so
+    /// the old 200 let reasoning burn the whole budget and leave an EMPTY
+    /// verdict (the #23 empty-return). The verifier must now request 2048.
+    #[tokio::test]
+    async fn goal_completion_verifier_uses_reasoning_headroom_max_tokens() {
+        let provider = std::sync::Arc::new(MaxTokensCapturingProvider {
+            seen_max_tokens: std::sync::Mutex::new(None),
+        });
+        let (verdict, _usage) =
+            run_goal_completion_verifier_with_usage(provider.clone(), "objective", "evidence")
+                .await;
+        assert!(verdict.is_done(), "mock returns DONE");
+        let seen = *provider.seen_max_tokens.lock().unwrap();
+        assert_eq!(
+            seen,
+            Some(2048),
+            "verifier must request 2048 max_tokens (reasoning headroom), got {seen:?}"
+        );
+    }
+
     // ---- PR 5a: goal keeper drives a fleet (dispatch backbone) -------------
 
     /// A non-no-op sandbox test double: runs commands directly (like NoSandbox)
