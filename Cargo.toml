@@ -81,6 +81,9 @@ codex-linux-sandbox = { git = "https://github.com/openai/codex", path = "codex-r
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
+# Signal handling (works in background/setsid processes where tokio::signal may not)
+signal-hook = "0.3"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -11,6 +11,7 @@ name = "octos"
 path = "src/main.rs"
 
 [dependencies]
+signal-hook = { workspace = true }
 # In-process llama.cpp GGUF embedding provider. Deliberately NOT target-gated:
 # unlike octos-embed-mlx this builds on macOS, Linux and Windows, ARM and x86,
 # which is the entire reason it exists. Optional, so it costs nothing until
