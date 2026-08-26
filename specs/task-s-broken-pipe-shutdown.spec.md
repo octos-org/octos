@@ -44,6 +44,10 @@ stderr 写入，确保 `BrokenPipe`（观察者离开）不阻断
 - crates/octos-cli/src/commands/serve_console.rs
 - crates/octos-cli/src/commands/mod.rs
 - crates/octos-cli/src/main.rs
+- crates/octos-cli/tests/serve_broken_pipe.rs
+- crates/octos-cli/Cargo.toml
+- Cargo.toml
+- Cargo.lock
 - specs/task-s-broken-pipe-shutdown.spec.md
 - docs/requirements/REQ-SERVE-BP-001.md
 
