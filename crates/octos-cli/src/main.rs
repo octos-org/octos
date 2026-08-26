@@ -23,9 +23,39 @@ fn should_enable_console_logs(has_rolling_file_logs: bool, interactive: bool) ->
     !has_rolling_file_logs || interactive
 }
 
+/// Write a panic report to any `io::Write` without panicking on BrokenPipe.
+///
+/// Extracted as a standalone function so unit tests can inject writers that
+/// return `ErrorKind::BrokenPipe` or other I/O errors.
+pub fn write_panic_report(w: &mut impl std::io::Write, msg: &str) {
+    match w
+        .write_all(msg.as_bytes())
+        .and_then(|()| w.write_all(b"\n"))
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            // Observer left — nothing to report to, just continue.
+        }
+        Err(_) => {
+            // Other I/O error — nothing more we can do.
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    // Initialize error handling
-    color_eyre::install()?;
+    // Initialize error handling with a BrokenPipe-safe panic hook.
+    // The default color-eyre panic hook uses `eprintln!` which panics on
+    // EPIPE (observer closed stderr), causing a double-panic → abort.
+    // We install the EyreHook normally, then override the PanicHook's
+    // stderr write to use fallible I/O that swallows BrokenPipe.
+    let (panic_hook, eyre_hook) = color_eyre::config::HookBuilder::default().into_hooks();
+    eyre_hook.install()?;
+    std::panic::set_hook(Box::new(move |pi| {
+        let report = panic_hook.panic_report(pi);
+        let msg = format!("{report}");
+        let mut err = std::io::stderr().lock();
+        write_panic_report(&mut err, &msg);
+    }));
 
     // Parse into ArgMatches first (this preserves clap's --help/--version/error
     // handling exactly as `Args::parse()` did), materialize the typed Args, then
@@ -172,7 +202,36 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::should_enable_console_logs;
+    use super::*;
+
+    struct BrokenPipeWriter;
+
+    impl std::io::Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pipe closed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_panic_report_broken_pipe_no_panic() {
+        let mut w = BrokenPipeWriter;
+        write_panic_report(&mut w, "panic message");
+        // If we reach here, no panic occurred — test passes.
+    }
+
+    #[test]
+    fn write_panic_report_normal_writer_outputs() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_panic_report(&mut buf, "panic message");
+        assert!(!buf.is_empty());
+        assert!(buf.ends_with(b"\n"));
+    }
 
     #[test]
     fn interactive_tty_with_file_logs_still_gets_console() {

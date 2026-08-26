@@ -21,6 +21,7 @@ mod office;
 mod profile;
 #[cfg(feature = "api")]
 mod serve;
+pub mod serve_console;
 pub mod skills;
 mod status;
 mod update;
