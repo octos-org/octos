@@ -12566,6 +12566,15 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {
         Ok(response) => (response.content.unwrap_or_default(), response.usage),
         Err(error) => {
+            // #24 — log the failing provider + error so an empty verdict can be
+            // attributed to a layer (call failure vs empty content) instead of
+            // surfacing as a bare "verifier returned: " with no reason.
+            tracing::warn!(
+                provider = %provider.provider_name(),
+                model = %provider.model_id(),
+                error = %error,
+                "goal completion verifier call failed"
+            );
             return (
                 GoalCompletionVerdict::NotDone {
                     reason: format!("verifier call failed: {error}"),
@@ -12579,6 +12588,19 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     // Strip backticks first: the prompt says "`DONE`" (with backticks), so a
     // literally-compliant model returns `DONE` → we must accept that.
     let trimmed = verdict_text.trim().trim_matches('`');
+    // #24 — log the raw verdict so an EMPTY reason (the #23 symptom) is
+    // attributable: a healthy model returns non-empty text; an empty trimmed
+    // verdict here means the provider returned Ok with empty/whitespace
+    // content, which is a different layer than a call error.
+    if trimmed.is_empty() {
+        tracing::warn!(
+            provider = %provider.provider_name(),
+            model = %provider.model_id(),
+            usage_in = usage.input_tokens,
+            usage_out = usage.output_tokens,
+            "goal completion verifier returned EMPTY content (Ok but no text)"
+        );
+    }
     let first_token = trimmed
         .split(|c: char| c.is_whitespace() || c == ':')
         .next()
