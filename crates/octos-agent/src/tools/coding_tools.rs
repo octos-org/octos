@@ -27,7 +27,7 @@ use super::{
     ToolContext, ToolResult,
 };
 use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, FileAccessMode, FilesystemScope};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{NoSandbox, Sandbox, detect_sandbox_denials};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::{RelaunchOpts, TaskRelaunchError, TaskStatus};
 
@@ -235,6 +235,34 @@ pub struct ExecCommandTool {
     sandbox: Arc<dyn Sandbox>,
 }
 
+/// How many denied paths an escalation prompt lists before it stops. A command
+/// that trips the sandbox on a dozen paths is the same decision as one that
+/// trips on three, and the dialog has to stay readable in a terminal.
+const MAX_REPORTED_DENIALS: usize = 5;
+
+/// Outcome of a single attempt at a command.
+///
+/// `completed` distinguishes "the child ran and exited" from a spawn failure or
+/// a timeout. Only the former can be a sandbox denial worth escalating — the
+/// other two are not policy decisions and re-running unconfined would not fix
+/// them.
+struct ExecRun {
+    text: String,
+    success: bool,
+    completed: bool,
+}
+
+impl ExecRun {
+    /// An attempt that never produced a process exit status.
+    fn failed(text: String) -> Self {
+        Self {
+            text,
+            success: false,
+            completed: false,
+        }
+    }
+}
+
 impl ExecCommandTool {
     pub fn new(base_dir: impl Into<PathBuf>, sandbox: Arc<dyn Sandbox>) -> Self {
         Self {
@@ -350,7 +378,129 @@ impl ExecCommandTool {
             .timeout_secs
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
-        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
+        let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
+
+        let run = Self::run_once(self.sandbox.as_ref(), &command, &cwd, timeout_secs).await;
+
+        // A confined run that *completed* can still have been refused a path
+        // partway through while the wrapper shell exited 0. Offer the user the
+        // escalation now, rather than handing the model an error it can only
+        // narrate back. A spawn failure or a timeout is not a policy decision,
+        // so neither is escalated.
+        if run.completed {
+            if let Some(escalated) = self
+                .escalate_if_denied(&command, &cwd, timeout_secs, max, &run)
+                .await
+            {
+                return Ok(escalated);
+            }
+        }
+
+        Ok(ToolResult {
+            output: truncate_output(run.text, max),
+            success: run.success,
+            ..Default::default()
+        })
+    }
+
+    /// Ask the user whether to re-run a sandbox-denied command unconfined, and
+    /// do it if they agree.
+    ///
+    /// `None` means there was nothing to escalate — no confinement in force, no
+    /// denial in the output, or no interactive client attached to ask — and the
+    /// caller should report the original run unchanged.
+    async fn escalate_if_denied(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout_secs: u64,
+        max: usize,
+        run: &ExecRun,
+    ) -> Option<ToolResult> {
+        // Without a real backend an EPERM is a genuine filesystem error rather
+        // than a policy decision, and re-running would change nothing.
+        if self.sandbox.is_noop() {
+            return None;
+        }
+
+        let denials = detect_sandbox_denials(&run.text, MAX_REPORTED_DENIALS);
+        if denials.is_empty() {
+            return None;
+        }
+
+        // Non-interactive callers (cron fires, headless runs) have nobody to
+        // ask; they keep today's behaviour.
+        let requester = TOOL_APPROVAL_CTX.try_with(Arc::clone).ok()?;
+        let tool_id = TOOL_CTX
+            .try_with(|inner| inner.tool_id.clone())
+            .unwrap_or_default();
+
+        let blocked = denials
+            .iter()
+            .map(|denial| format!("  {}", denial.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let decision = requester
+            .request_approval(ToolApprovalRequest {
+                tool_id,
+                tool_name: self.name().to_owned(),
+                title: "Allow command to run outside the sandbox?".to_owned(),
+                body: format!(
+                    "The sandbox refused part of this command:\n{blocked}\n\n\
+                     Approving re-runs the whole command with no confinement, so it can \
+                     read and write anything this account can. Denying keeps the output above.",
+                ),
+                command: Some(command.to_owned()),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+            })
+            .await;
+
+        if matches!(decision, ToolApprovalDecision::Deny) {
+            tracing::info!(command = %command, "sandbox escalation denied by user");
+            // Keep the original exit status: the command ran, and the user
+            // declining the retry does not retroactively change how it ended.
+            return Some(ToolResult {
+                output: truncate_output(
+                    format!(
+                        "{}\n\n[sandbox] The user declined to re-run this command outside \
+                         the sandbox. The paths above stay unreadable for this session — \
+                         do not retry the same command expecting a different result.",
+                        run.text
+                    ),
+                    max,
+                ),
+                success: run.success,
+                ..Default::default()
+            });
+        }
+
+        tracing::warn!(
+            command = %command,
+            "re-running command outside the sandbox after user approval",
+        );
+        let rerun = Self::run_once(&NoSandbox, command, cwd, timeout_secs).await;
+        Some(ToolResult {
+            output: truncate_output(
+                format!(
+                    "[sandbox] Re-ran outside the sandbox with the user's approval.\n\n{}",
+                    rerun.text
+                ),
+                max,
+            ),
+            success: rerun.success,
+            ..Default::default()
+        })
+    }
+
+    /// Run `command` to completion under `sandbox`, capturing merged output.
+    async fn run_once(
+        sandbox: &dyn Sandbox,
+        command: &str,
+        cwd: &Path,
+        timeout_secs: u64,
+    ) -> ExecRun {
+        let mut cmd = sandbox.wrap_command(command, cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Put the child in its own process group so the timeout path can
         // signal the WHOLE tree (wrapper shell + grandchildren) with a
@@ -364,11 +514,7 @@ impl ExecCommandTool {
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return Ok(ToolResult {
-                    output: format!("Failed to execute command: {error}"),
-                    success: false,
-                    ..Default::default()
-                });
+                return ExecRun::failed(format!("Failed to execute command: {error}"));
             }
         };
         // Capture the pid BEFORE `wait_with_output` consumes the child — the
@@ -397,18 +543,13 @@ impl ExecCommandTool {
                     "\n\nExit code: {}",
                     output.status.code().unwrap_or(-1)
                 ));
-                let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
-                Ok(ToolResult {
-                    output: truncate_output(text, max),
+                ExecRun {
+                    text,
                     success: output.status.success(),
-                    ..Default::default()
-                })
+                    completed: true,
+                }
             }
-            Ok(Err(error)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {error}"),
-                success: false,
-                ..Default::default()
-            }),
+            Ok(Err(error)) => ExecRun::failed(format!("Failed to execute command: {error}")),
             Err(_) => {
                 // Dropping the wait future does NOT kill a tokio child, so
                 // the wrapper shell and any grandchildren keep running. Kill
@@ -416,11 +557,7 @@ impl ExecCommandTool {
                 // SIGKILL on Unix, `taskkill /F /T` on Windows) — the same
                 // helper the `bash` tool uses.
                 kill_timed_out_child(child_pid).await;
-                Ok(ToolResult {
-                    output: format!("Command timed out after {timeout_secs} seconds"),
-                    success: false,
-                    ..Default::default()
-                })
+                ExecRun::failed(format!("Command timed out after {timeout_secs} seconds"))
             }
         }
     }
