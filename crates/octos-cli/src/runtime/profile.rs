@@ -710,13 +710,20 @@ impl ProfileRuntime {
         }
         let system_prompt = prompt_parts.joined();
 
-        let mut all_hooks = reload.host_hooks.clone();
+        // #2129: the coding default hooks (cargo check / eslint / ruff after
+        // edits) merge at THIS shared assembly point so every host —
+        // bootstrap sessions, WS per-turn rebuilds, chat, gateway — gets
+        // them, not just one consumer. They are SELF-GATING: each declares a
+        // path_filter (fires only on matching source edits) and requires_bin
+        // (skips when the checker is absent), so a podcast workspace never
+        // runs cargo. Defaults first, operator hooks after, per the
+        // coding_default_hooks contract. The hook child's working directory
+        // comes from the per-turn payload cwd (the workspace root), not the
+        // executor, so one profile-level executor serves every session.
+        let mut all_hooks = octos_agent::workspace_policy::coding_default_hooks();
+        all_hooks.extend(reload.host_hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
-        let hook_executor = if all_hooks.is_empty() {
-            None
-        } else {
-            Some(Arc::new(HookExecutor::new(all_hooks)))
-        };
+        let hook_executor = Some(Arc::new(HookExecutor::new(all_hooks)));
         let skills_dir_candidate = self.data_dir.join("skills");
 
         Ok(Arc::new(Self {
@@ -1409,13 +1416,20 @@ impl ProfileRuntime {
         // `Option<Arc<HookExecutor>>` preserves the pre-M11-F default
         // when neither source carries any hooks (the agent's
         // `hooks: None` field remains untouched).
-        let mut all_hooks = config.hooks.clone();
+        // #2129: the coding default hooks (cargo check / eslint / ruff after
+        // edits) merge at THIS shared assembly point so every host —
+        // bootstrap sessions, WS per-turn rebuilds, chat, gateway — gets
+        // them, not just one consumer. They are SELF-GATING: each declares a
+        // path_filter (fires only on matching source edits) and requires_bin
+        // (skips when the checker is absent), so a podcast workspace never
+        // runs cargo. Defaults first, operator hooks after, per the
+        // coding_default_hooks contract. The hook child's working directory
+        // comes from the per-turn payload cwd (the workspace root), not the
+        // executor, so one profile-level executor serves every session.
+        let mut all_hooks = octos_agent::workspace_policy::coding_default_hooks();
+        all_hooks.extend(config.hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
-        let hook_executor = if all_hooks.is_empty() {
-            None
-        } else {
-            Some(Arc::new(HookExecutor::new(all_hooks)))
-        };
+        let hook_executor = Some(Arc::new(HookExecutor::new(all_hooks)));
 
         info!(
             profile_id = %profile.id,
@@ -2524,11 +2538,18 @@ mod tests {
             .await
             .expect("bootstrap should succeed");
 
-        // With no config-side hooks and no plugin-side hooks the field
-        // must be None so the agent's default `hooks: None` is kept.
-        assert!(
-            rt.hook_executor.is_none(),
-            "hook_executor must be None when neither config nor plugins supply hooks",
+        // #2129: the coding defaults (cargo check / eslint / ruff) merge at
+        // this shared assembly point unconditionally (they are self-gating
+        // via path_filter + requires_bin), so the executor is always Some —
+        // with EXACTLY the defaults when neither config nor plugins add any.
+        let executor = rt
+            .hook_executor
+            .as_ref()
+            .expect("hook_executor must carry the coding defaults");
+        assert_eq!(
+            executor.configs().len(),
+            octos_agent::workspace_policy::coding_default_hooks().len(),
+            "no config/plugin hooks: executor must hold exactly the coding defaults",
         );
     }
 

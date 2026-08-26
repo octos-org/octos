@@ -647,33 +647,8 @@ impl SessionRuntime {
         // `before_tool_call` / `after_tool_call` / `before_llm_call` /
         // `after_llm_call` hook configured for the profile, breaking
         // parity with `octos gateway`.
-        // Audit Gap-1 wiring (#2129), second half: merge the coding default
-        // hooks (`cargo check` / `eslint` / `ruff` after edits) for coding
-        // workspaces. The defaults were authored for hosts to merge at
-        // bootstrap ("chat.rs / gateway.rs / serve.rs call this on
-        // bootstrap") but no host ever did. Defaults run FIRST, operator
-        // hooks after — per the contract on `coding_default_hooks`. The
-        // executor gets the workspace root as cwd so the checkers check the
-        // project the agent is editing, not the daemon's start directory.
-        let coding_defaults =
-            match octos_agent::workspace_policy::detect_workspace_policy_kind(&workspace_root) {
-                octos_agent::workspace_policy::WorkspacePolicyKind::Coding => {
-                    octos_agent::workspace_policy::coding_default_hooks()
-                }
-                _ => Vec::new(),
-            };
-        if coding_defaults.is_empty() {
-            if let Some(hooks) = profile.hook_executor.clone() {
-                agent = agent.with_hooks(hooks);
-            }
-        } else {
-            let mut configs = coding_defaults;
-            if let Some(hooks) = &profile.hook_executor {
-                configs.extend(hooks.configs().iter().cloned());
-            }
-            agent = agent.with_hooks(Arc::new(
-                octos_agent::HookExecutor::new(configs).with_cwd(&workspace_root),
-            ));
+        if let Some(hooks) = profile.hook_executor.clone() {
+            agent = agent.with_hooks(hooks);
         }
 
         // RFC-1 (issue #1290): same pattern for the `mofa_make`

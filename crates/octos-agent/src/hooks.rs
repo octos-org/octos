@@ -406,22 +406,34 @@ impl HookPayload {
     ///
     /// Result is sanitized: sensitive tools are redacted, others truncated
     /// to 1 KB to prevent secrets from leaking to hook processes.
+    #[allow(clippy::too_many_arguments)]
     pub fn after_tool(
         name: &str,
         tool_id: &str,
         result: String,
         success: bool,
         duration_ms: u64,
+        arguments: Option<&serde_json::Value>,
+        cwd: Option<&std::path::Path>,
         ctx: Option<&HookContext>,
     ) -> Self {
-        let (_, sanitized_result) = sanitize_payload(Some(name), None, Some(result));
+        // `arguments` is not decoration: the path-filter matcher reads
+        // `arguments.path` and SKIPS any path_filter-bearing hook when it is
+        // absent — an after_tool payload without arguments silently disables
+        // every path-filtered after-hook (#2129 review, finding 1). `cwd` is
+        // where the hook child runs; project-scoped checkers are meaningless
+        // in the daemon's start directory.
+        let (sanitized_args, sanitized_result) =
+            sanitize_payload(Some(name), arguments.cloned(), Some(result));
         let mut p = Self {
             event: HookEvent::AfterToolCall,
             tool_name: Some(name.to_string()),
             tool_id: Some(tool_id.to_string()),
+            arguments: sanitized_args,
             result: sanitized_result,
             success: Some(success),
             duration_ms: Some(duration_ms),
+            cwd: cwd.map(|c| c.to_string_lossy().into_owned()),
             ..Self::empty(HookEvent::AfterToolCall)
         };
         p.apply_context(ctx);
@@ -662,6 +674,14 @@ pub enum HookResult {
     Context(Vec<String>),
     /// A hook encountered an error (does not block).
     Error(String),
+    /// One or more AFTER-hooks exited 1 WITH output — the feedback channel
+    /// working as designed (a checker reporting diagnostics), distinct from
+    /// [`Self::Error`] infrastructure failures (missing binary, timeout,
+    /// exit >= 2) which must NOT be injected into the model conversation.
+    /// One entry per failing hook, in configuration order, so a failing
+    /// operator after-hook cannot overwrite the coding defaults' compile
+    /// errors (#2129 review, findings 8 and 9).
+    Feedback(Vec<String>),
 }
 
 /// Executes hooks with circuit breaker protection.
@@ -678,11 +698,6 @@ pub struct HookExecutor {
     failure_threshold: u32,
     /// Optional domain-data enricher applied to payloads before serialization.
     enricher: Option<Arc<dyn HookPayloadEnricher>>,
-    /// Working directory for hook child processes. Project-scoped hooks
-    /// (the coding defaults run `cargo check` / `eslint` / `ruff`) are
-    /// meaningless outside the workspace they check — without this they
-    /// would run in whatever directory the daemon happened to start in.
-    cwd: Option<std::path::PathBuf>,
 }
 
 impl HookExecutor {
@@ -702,7 +717,6 @@ impl HookExecutor {
             failures,
             failure_threshold,
             enricher: None,
-            cwd: None,
         }
     }
 
@@ -710,14 +724,6 @@ impl HookExecutor {
     /// not register an enricher see no payload change.
     pub fn with_enricher(mut self, enricher: Arc<dyn HookPayloadEnricher>) -> Self {
         self.enricher = Some(enricher);
-        self
-    }
-
-    /// Run hook child processes with this working directory. Session hosts
-    /// set it to the workspace root so project-scoped hooks (`cargo check`,
-    /// `eslint`, `ruff`) check the project the agent is editing.
-    pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
         self
     }
 
@@ -768,6 +774,7 @@ impl HookExecutor {
         // matching hooks and returned as `HookResult::Context` at the end so
         // the caller can inject it into the turn before the first LLM call.
         let mut injected_contexts: Vec<String> = Vec::new();
+        let mut feedback: Vec<String> = Vec::new();
 
         for (i, hook) in self.hooks.iter().enumerate() {
             if hook.event != event {
@@ -842,7 +849,8 @@ impl HookExecutor {
                 continue;
             }
 
-            match self.execute_hook(hook, &payload_json).await {
+            let hook_cwd = payload_ref.cwd.as_deref().map(std::path::Path::new);
+            match self.execute_hook(hook, &payload_json, hook_cwd).await {
                 Ok((0, stdout, _stderr)) => {
                     self.failures[i].store(0, Ordering::Relaxed);
                     // Context injection (user_prompt_submit): a hook that exits
@@ -863,12 +871,13 @@ impl HookExecutor {
                         self.failures[i].store(0, Ordering::Relaxed);
                         return HookResult::Deny(stdout);
                     }
-                    // Exit 1 on after-hooks is an error (deny is meaningless
-                    // for after-events) — but an error that CARRIES the
-                    // hook's output. The coding defaults exist to feed
-                    // checker diagnostics back to the model; a message that
-                    // says only "exited with code 1" feeds back nothing.
-                    let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                    // Exit 1 WITH output on an after-hook is the feedback
+                    // channel WORKING — a checker reporting diagnostics.
+                    // It does NOT count toward the circuit breaker: a model
+                    // iterating on compile errors legitimately fails the
+                    // check many times in a row, and disabling the hook at
+                    // the third failure would kill the feedback loop exactly
+                    // when it is most needed (#2129 review, finding 2).
                     let mut output = if stderr.is_empty() {
                         stdout
                     } else if stdout.is_empty() {
@@ -877,19 +886,20 @@ impl HookExecutor {
                         format!("{stdout}\n{stderr}")
                     };
                     octos_core::truncate_utf8(&mut output, 2000, "\n... (hook output truncated)");
-                    let msg = if output.trim().is_empty() {
-                        format!(
+                    if output.trim().is_empty() {
+                        // Exit 1 with NOTHING to say is indistinguishable
+                        // from a broken hook: infrastructure error, counted.
+                        let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                        let msg = format!(
                             "hook {:?} exited with code 1 on after-event ({}/{})",
                             hook.command, new_count, self.failure_threshold
-                        )
+                        );
+                        warn!("{}", msg);
+                        last_error = Some(msg);
                     } else {
-                        format!(
-                            "hook {:?} failed ({}/{}):\n{}",
-                            hook.command, new_count, self.failure_threshold, output
-                        )
-                    };
-                    warn!("{}", msg);
-                    last_error = Some(msg);
+                        self.failures[i].store(0, Ordering::Relaxed);
+                        feedback.push(format!("{:?}:\n{}", hook.command, output));
+                    }
                 }
                 Ok((2, stdout, _stderr)) => {
                     // Exit 2 = modified input (before-hooks only).
@@ -949,7 +959,11 @@ impl HookExecutor {
             }
         }
 
-        if let Some(err) = last_error {
+        if !feedback.is_empty() {
+            // Feedback outranks infra errors: diagnostics are actionable,
+            // and infra errors are logged above either way.
+            HookResult::Feedback(feedback)
+        } else if let Some(err) = last_error {
             HookResult::Error(err)
         } else if !injected_contexts.is_empty() {
             HookResult::Context(injected_contexts)
@@ -958,11 +972,13 @@ impl HookExecutor {
         }
     }
 
-    /// Execute a single hook process. Returns (exit_code, stdout, stderr).
+    /// Execute a single hook process in `cwd` (when given — the payload's
+    /// workspace root). Returns (exit_code, stdout, stderr).
     async fn execute_hook(
         &self,
         hook: &HookConfig,
         payload_json: &str,
+        cwd: Option<&std::path::Path>,
     ) -> eyre::Result<(i32, String, String)> {
         let (program, args) = hook
             .command
@@ -975,7 +991,7 @@ impl HookExecutor {
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&expanded_args);
-        if let Some(cwd) = &self.cwd {
+        if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
         cmd.stdin(std::process::Stdio::piped());
@@ -996,32 +1012,40 @@ impl HookExecutor {
             let _ = stdin.shutdown().await;
         }
 
-        // Take stdout/stderr handles so we can read them after wait
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        // Take stdout/stderr handles and read them CONCURRENTLY with the
+        // wait: reading only after wait() returns deadlocks the moment the
+        // child emits more than the pipe buffer (~64KB) — the child blocks
+        // on write, the parent blocks in wait, and the timeout kills the
+        // exact heavy-diagnostics run the feedback loop exists for (#2129
+        // review, finding 3).
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
+        let drain = async {
+            let mut out_buf = Vec::new();
+            let mut err_buf = Vec::new();
+            let stdout_read = async {
+                if let Some(handle) = stdout_handle.as_mut() {
+                    let _ = handle.read_to_end(&mut out_buf).await;
+                }
+            };
+            let stderr_read = async {
+                if let Some(handle) = stderr_handle.as_mut() {
+                    let _ = handle.read_to_end(&mut err_buf).await;
+                }
+            };
+            let (status, _, _) = tokio::join!(child.wait(), stdout_read, stderr_read);
+            status.map(|status| (status, out_buf, err_buf))
+        };
 
-        // Wait with timeout (use wait() instead of wait_with_output() so child isn't consumed)
         let timeout = Duration::from_millis(hook.timeout_ms);
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                let stdout = if let Some(mut handle) = stdout_handle {
-                    let mut buf = Vec::new();
-                    let _ = handle.read_to_end(&mut buf).await;
-                    String::from_utf8_lossy(&buf).trim().to_string()
-                } else {
-                    String::new()
-                };
-                // Capture stderr too: checkers put their diagnostics there
-                // (`cargo check --message-format=short` writes every
-                // diagnostic to stderr), and the after-event failure path
-                // surfaces them to the model. Still logged for operators.
-                let stderr = if let Some(mut handle) = stderr_handle {
-                    let mut buf = Vec::new();
-                    let _ = handle.read_to_end(&mut buf).await;
-                    String::from_utf8_lossy(&buf).trim().to_string()
-                } else {
-                    String::new()
-                };
+        match tokio::time::timeout(timeout, drain).await {
+            Ok(Ok((status, out_buf, err_buf))) => {
+                let stdout = String::from_utf8_lossy(&out_buf).trim().to_string();
+                // Checkers put their diagnostics on stderr (`cargo check
+                // --message-format=short` writes every diagnostic there);
+                // the after-event feedback path surfaces them to the model.
+                // Still logged for operators.
+                let stderr = String::from_utf8_lossy(&err_buf).trim().to_string();
                 for line in stderr.lines() {
                     let line = line.trim();
                     if !line.is_empty() {
@@ -1188,7 +1212,7 @@ mod tests {
     fn should_stamp_current_schema_version_on_every_constructor() {
         let payloads = vec![
             HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None),
-            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None),
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None),
             HookPayload::before_llm("gpt-4", 0, 1, None),
             HookPayload::on_resume(None),
             HookPayload::on_turn_end("done", None),
@@ -1257,7 +1281,8 @@ mod tests {
         assert_eq!(after_llm.session_cost, Some(0.05));
         assert_eq!(after_llm.response_cost, Some(0.01));
 
-        let after_tool = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 42, None);
+        let after_tool =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 42, None, None, None);
         assert_eq!(after_tool.event, HookEvent::AfterToolCall);
         assert_eq!(after_tool.success, Some(true));
         assert_eq!(after_tool.duration_ms, Some(42));
@@ -1613,7 +1638,8 @@ mod tests {
             }],
             3,
         );
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None);
 
         // First two failures: hook still runs (returns Error, not Allow)
         let r1 = executor.run(HookEvent::AfterToolCall, &payload).await;
@@ -1637,7 +1663,8 @@ mod tests {
             }],
             3,
         );
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None);
 
         // Trigger 3 failures to hit threshold
         for _ in 0..3 {
@@ -1668,7 +1695,8 @@ mod tests {
         executor.failures[0].store(2, Ordering::Relaxed);
 
         // Success resets counter
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None);
         let r = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert_eq!(r, HookResult::Allow);
         assert_eq!(executor.failures[0].load(Ordering::Relaxed), 0);
@@ -1717,6 +1745,8 @@ mod tests {
             "SECRET_KEY=hunter2\nDB_PASS=abc".into(),
             true,
             10,
+            None,
+            None,
             None,
         );
         let json = serde_json::to_string(&payload).unwrap();
@@ -1770,7 +1800,8 @@ mod tests {
             vec!["**/*.rs"],
         )]);
         // edit_file on a Python path — `**/*.rs` glob should NOT match.
-        let payload = HookPayload::after_tool("edit_file", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("edit_file", "tc1", "ok".into(), true, 10, None, None, None);
         let mut payload = payload;
         payload.arguments = Some(serde_json::json!({"path": "scripts/build.py"}));
         let result = executor.run(HookEvent::AfterToolCall, &payload).await;
@@ -2233,20 +2264,122 @@ mod tests {
             requires_bin: None,
         };
         let executor = HookExecutor::new(vec![hook]);
-        let payload = HookPayload::after_tool("edit_file", "id", "out".to_string(), true, 5, None);
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "out".to_string(),
+            true,
+            5,
+            None,
+            None,
+            None,
+        );
         match executor.run(HookEvent::AfterToolCall, &payload).await {
-            HookResult::Error(msg) => {
+            HookResult::Feedback(entries) => {
+                let msg = entries.join("\n");
                 assert!(msg.contains("out-line"), "stdout must surface: {msg}");
                 assert!(msg.contains("err-line"), "stderr must surface: {msg}");
             }
-            other => panic!("expected Error carrying output, got {other:?}"),
+            other => panic!("expected Feedback carrying output, got {other:?}"),
         }
     }
 
-    /// `with_cwd` runs the hook child in the given directory — a
-    /// project-scoped checker is meaningless in the daemon's start dir.
+    /// #2129 review finding 1: the after_tool payload must carry the tool
+    /// ARGUMENTS — the path-filter matcher reads `arguments.path` and skips
+    /// path_filtered hooks without it. Regression test for the
+    /// dead-on-arrival wiring.
     #[tokio::test]
-    async fn hook_child_runs_in_configured_cwd() {
+    async fn path_filtered_after_hook_fires_when_arguments_carry_the_path() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo diagnostics; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec!["edit_file".to_string()],
+            path_filter: vec!["**/*.rs".to_string()],
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "ok".to_string(),
+            true,
+            5,
+            Some(&args),
+            None,
+            None,
+        );
+        assert!(matches!(
+            executor.run(HookEvent::AfterToolCall, &payload).await,
+            HookResult::Feedback(_)
+        ));
+        let args = serde_json::json!({"path": "README.md"});
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "ok".to_string(),
+            true,
+            5,
+            Some(&args),
+            None,
+            None,
+        );
+        assert!(matches!(
+            executor.run(HookEvent::AfterToolCall, &payload).await,
+            HookResult::Allow
+        ));
+    }
+
+    /// #2129 review finding 2: repeated exit-1-with-output must NOT trip
+    /// the circuit breaker — a model iterating on compile errors fails the
+    /// check many times in a row, and that is the channel working.
+    #[tokio::test]
+    async fn repeated_check_failures_do_not_trip_the_breaker() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo still-broken; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        for i in 0..5 {
+            let payload = HookPayload::after_tool(
+                "edit_file",
+                "id",
+                "ok".to_string(),
+                true,
+                5,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                matches!(
+                    executor.run(HookEvent::AfterToolCall, &payload).await,
+                    HookResult::Feedback(_)
+                ),
+                "attempt {i} must still deliver feedback (breaker must not trip)"
+            );
+        }
+    }
+
+    /// The hook child runs in the payload's cwd (the workspace root) — a
+    /// project-scoped checker is meaningless in the daemon's start dir, and
+    /// carrying cwd on the payload lets ONE profile-level executor serve
+    /// every session (#2129 review, findings 4 and 7).
+    #[tokio::test]
+    async fn hook_child_runs_in_payload_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let expected = tmp.path().canonicalize().unwrap();
         let hook = HookConfig {
@@ -2261,14 +2394,25 @@ mod tests {
             path_filter: Vec::new(),
             requires_bin: None,
         };
-        let executor = HookExecutor::new(vec![hook]).with_cwd(tmp.path());
-        let payload = HookPayload::after_tool("edit_file", "id", "out".to_string(), true, 5, None);
+        let executor = HookExecutor::new(vec![hook]);
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "out".to_string(),
+            true,
+            5,
+            None,
+            Some(tmp.path()),
+            None,
+        );
         match executor.run(HookEvent::AfterToolCall, &payload).await {
-            HookResult::Error(msg) => assert!(
-                msg.contains(&expected.to_string_lossy().to_string()),
-                "child must run in the configured cwd; got: {msg}"
+            HookResult::Feedback(entries) => assert!(
+                entries
+                    .join("\n")
+                    .contains(&expected.to_string_lossy().to_string()),
+                "child must run in the payload cwd; got: {entries:?}"
             ),
-            other => panic!("expected Error, got {other:?}"),
+            other => panic!("expected Feedback, got {other:?}"),
         }
     }
 }

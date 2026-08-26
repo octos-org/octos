@@ -1477,7 +1477,15 @@ pub fn coding_default_hooks() -> Vec<crate::hooks::HookConfig> {
             command: vec!["eslint".into(), "--max-warnings".into(), "0".into()],
             timeout_ms: 60_000,
             tool_filter: edit_tools.clone(),
-            path_filter: vec!["**/*.{js,ts,tsx,jsx}".into()],
+            // Four explicit patterns: the `glob` crate treats braces as
+            // LITERALS, so "**/*.{js,ts,tsx,jsx}" matches no real file
+            // (#2129 review, finding 10 — verified empirically).
+            path_filter: vec![
+                "**/*.js".into(),
+                "**/*.ts".into(),
+                "**/*.tsx".into(),
+                "**/*.jsx".into(),
+            ],
             requires_bin: Some("eslint".into()),
         },
         // Python: `ruff check` on `.py` edits.
@@ -3017,12 +3025,15 @@ ignore = []
         // ESLint hook must be opt-out friendly via requires_bin — operators
         // without eslint on PATH must NOT see hook failures every edit.
         assert_eq!(eslint.requires_bin.as_deref(), Some("eslint"));
-        assert!(
-            eslint
-                .path_filter
-                .iter()
-                .any(|p| p.ends_with(".{js,ts,tsx,jsx}"))
-        );
+        // Four explicit patterns — the glob crate treats braces as literals
+        // (#2129 review, finding 10).
+        for ext in ["js", "ts", "tsx", "jsx"] {
+            let pattern = format!("**/*.{ext}");
+            assert!(
+                eslint.path_filter.iter().any(|p| p == &pattern),
+                "missing {pattern}"
+            );
+        }
     }
 
     #[test]

@@ -441,6 +441,8 @@ impl Agent {
                         Err("tool arguments changed since approval request was created".to_string())
                     }
                 }
+                // Feedback is an after-event-only outcome; never arises here.
+                HookResult::Feedback(_) => Ok(()),
                 // Context injection is a `user_prompt_submit`-only outcome and
                 // never arises for a before-tool re-validation; allow the call.
                 HookResult::Context(_) => Ok(()),
@@ -547,13 +549,19 @@ impl Agent {
                 octos_core::truncated_utf8(&result.output, 500, "..."),
                 result.success,
                 tool_start.elapsed().as_millis() as u64,
+                Some(&pending.tool_args),
+                self.tools.workspace_root(),
                 self.hook_ctx().as_ref(),
             );
-            // A failing after-hook carries checker output the model must
-            // see (the coding defaults run `cargo check` after edits) —
-            // discarding it here silenced the whole feedback loop.
-            if let HookResult::Error(feedback) = hooks.run(HookEvent::AfterToolCall, &payload).await
+            // Feedback (a checker reporting diagnostics) reaches the model;
+            // infra errors (missing binary, timeout) stay log-only — see
+            // HookResult::Feedback. Sanitized like every other model-facing
+            // tool output: checkers quote source lines, and source lines
+            // carry secrets.
+            if let HookResult::Feedback(entries) =
+                hooks.run(HookEvent::AfterToolCall, &payload).await
             {
+                let feedback = crate::sanitize::sanitize_tool_output(&entries.join("\n\n"));
                 result.output.push_str("\n\n[hook] ");
                 result.output.push_str(&feedback);
             }
@@ -2352,10 +2360,11 @@ impl Agent {
                 }
             };
 
-            // After-tool hooks. A failing hook carries checker output the
-            // model must see (the coding defaults run `cargo check` after
-            // edits); it is appended to the tool message below AFTER
-            // truncation so the feedback survives the output cap.
+            // After-tool hooks. Hook FEEDBACK (a checker reporting
+            // diagnostics — see HookResult::Feedback) reaches the model:
+            // appended to the tool message below AFTER truncation so it
+            // survives the output cap, and sanitized because checkers quote
+            // source lines. Infra errors stay log-only.
             let mut hook_feedback: Option<String> = None;
             if let Some(ref hooks) = hooks {
                 let payload = HookPayload::after_tool(
@@ -2364,12 +2373,15 @@ impl Agent {
                     octos_core::truncated_utf8(&content, 500, "..."),
                     tool_success,
                     duration.as_millis() as u64,
+                    Some(&effective_args),
+                    tools.workspace_root(),
                     hook_ctx.as_ref(),
                 );
-                if let HookResult::Error(feedback) =
+                if let HookResult::Feedback(entries) =
                     hooks.run(HookEvent::AfterToolCall, &payload).await
                 {
-                    hook_feedback = Some(feedback);
+                    hook_feedback =
+                        Some(crate::sanitize::sanitize_tool_output(&entries.join("\n\n")));
                 }
             }
 
