@@ -165,6 +165,19 @@ impl ProviderChain {
                 continue;
             }
 
+            // #2135 round-7 P1: an ALTERNATE lane receives the unchanged
+            // request, so resolve its readiness and skip it when the prompt
+            // cannot plausibly fit its (possibly just-resolved) window — an
+            // oversized send would truncate or be rejected server-side.
+            if offset > 0 && !crate::context::route_fits_request(&slot.provider, messages).await {
+                tracing::warn!(
+                    provider = slot.provider.provider_name(),
+                    window = slot.provider.context_window(),
+                    "skipping failover lane: prompt does not fit its context window"
+                );
+                continue;
+            }
+
             let result = self
                 .with_lane_timeout(
                     slot.provider.provider_name(),
@@ -249,6 +262,19 @@ impl LlmProvider for ProviderChain {
             let slot = &self.slots[idx];
 
             if offset > 0 && slot.failures.load(Ordering::Relaxed) >= self.failure_threshold {
+                continue;
+            }
+
+            // #2135 round-7 P1: an ALTERNATE lane receives the unchanged
+            // request, so resolve its readiness and skip it when the prompt
+            // cannot plausibly fit its (possibly just-resolved) window — an
+            // oversized send would truncate or be rejected server-side.
+            if offset > 0 && !crate::context::route_fits_request(&slot.provider, messages).await {
+                tracing::warn!(
+                    provider = slot.provider.provider_name(),
+                    window = slot.provider.context_window(),
+                    "skipping failover lane: prompt does not fit its context window"
+                );
                 continue;
             }
 

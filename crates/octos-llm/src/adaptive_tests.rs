@@ -2500,4 +2500,10 @@ async fn test_sizing_is_min_across_slots_and_identity_is_deterministic() {
             "identity must not flip stochastically"
         );
     }
+    // #2135 round-7 P1: the deterministic selection must pick the BEST
+    // slot (ascending score, same rules as routing) — an earlier cut used
+    // max_by over a lower-is-better score and preferred the worst lane.
+    // With identical cold providers, priority ordering makes the PRIMARY
+    // the correct choice.
+    assert_eq!(first, "m1", "cold identical slots must select the primary");
 }

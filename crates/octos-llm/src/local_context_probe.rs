@@ -89,6 +89,11 @@ const OLLAMA_PROVISIONAL_WINDOW: u32 = 1024;
 const PRELOAD_IDLE: u32 = 0;
 const PRELOAD_RUNNING: u32 = 1;
 const PRELOAD_ANSWERED: u32 = 2;
+/// Definitive client-error answer (404/401...) from /api/generate: the
+/// load will never start this way — no retry, no polling (#2135 round-7
+/// P1: mapping these to ANSWERED made every future readiness call poll a
+/// full deadline for a load that never existed).
+const PRELOAD_FAILED: u32 = 3;
 
 /// llama.cpp serves `/props` at the server root, not under `/v1`.
 /// Single-suffix strip: a proxy mounting the API under `/v1/v1` keeps its
@@ -312,8 +317,13 @@ impl LocalContextProbe {
         tracing::info!(model, "preloading cold Ollama model (detached)");
         tokio::spawn(async move {
             match fetch_post_json(&client, &url, &body).await {
-                FetchOutcome::Answered(_) => {
+                FetchOutcome::Answered(Some(_)) => {
                     state.store(PRELOAD_ANSWERED, Ordering::SeqCst);
+                }
+                FetchOutcome::Answered(None) => {
+                    // Definitive 4xx: the load will never start this way.
+                    tracing::warn!(model, "cold-model preload rejected definitively");
+                    state.store(PRELOAD_FAILED, Ordering::SeqCst);
                 }
                 FetchOutcome::Transient => {
                     // 429/503/transport: reset so a later readiness attempt
@@ -496,15 +506,39 @@ impl LocalContextProbe {
                         self.start_preload(generate_url, model);
                         // Poll only while a load is actually in flight or
                         // reached the server; a transient preload failure
-                        // resets the state to idle and this loop stops
-                        // instead of burning the attempt deadline
-                        // (#2135 round-6 P1).
-                        while self.preload_state.load(Ordering::SeqCst) != PRELOAD_IDLE {
+                        // resets to idle and a definitive one parks at
+                        // FAILED — either way this loop stops instead of
+                        // burning the attempt deadline (#2135 rounds 6-7).
+                        loop {
+                            let state = self.preload_state.load(Ordering::SeqCst);
+                            if state != PRELOAD_RUNNING && state != PRELOAD_ANSWERED {
+                                break;
+                            }
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             if let FetchOutcome::Answered(Some(ps_after)) =
                                 fetch(&client, ps_url, None).await
                             {
                                 window = parse_ollama_ps_context_window(&ps_after, model);
+                                // Load COMPLETE (generate answered) and the
+                                // server's process view still names no
+                                // usable window — an old Ollama without
+                                // context_length, or an entry we cannot
+                                // match. That view will not improve: pin
+                                // "no window" so later turns stop paying a
+                                // poll deadline; the conservative floor
+                                // stays in force permanently (#2135
+                                // round-7 P1).
+                                if window.is_none()
+                                    && self.preload_state.load(Ordering::SeqCst) == PRELOAD_ANSWERED
+                                {
+                                    tracing::info!(
+                                        model,
+                                        "loaded model reports no usable allocation; \
+                                         keeping the conservative floor permanently"
+                                    );
+                                    let _ = self.window.set(None);
+                                    break;
+                                }
                             }
                             if window.is_some() {
                                 break;
@@ -544,12 +578,14 @@ impl LocalContextProbe {
                         "local server answered but named no context window; catalog value stands"
                     );
                     let _ = self.window.set(None);
-                } else {
+                } else if self.window.get().is_none() {
                     // Transient (refused / timeout / 5xx — e.g. the model is
                     // still loading): leave unresolved so a later request
                     // retries. THIS is the session that needs the correction
                     // most — pinning the failure would reproduce the exact
-                    // phantom-32K bug this module exists to fix.
+                    // phantom-32K bug this module exists to fix. (Already-
+                    // pinned outcomes — e.g. the loaded-but-unreadable
+                    // Ollama case pinned inside the poll loop — skip this.)
                     tracing::debug!(
                         attempt,
                         max = MAX_PROBE_ATTEMPTS,
@@ -807,6 +843,22 @@ mod tests {
         Arc<std::sync::Mutex<Vec<String>>>,
         Arc<std::sync::atomic::AtomicBool>,
     ) {
+        spawn_ollama_stub_configured(generate_delay, generate_failures, true, false).await
+    }
+
+    /// Full-fidelity stub: `ps_with_context` = whether /api/ps includes
+    /// context_length once loaded (old Ollama does not);
+    /// `generate_definitive_fail` = answer every /api/generate with 404.
+    async fn spawn_ollama_stub_configured(
+        generate_delay: std::time::Duration,
+        generate_failures: u32,
+        ps_with_context: bool,
+        generate_definitive_fail: bool,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -824,6 +876,8 @@ mod tests {
                 let loaded = loaded.clone();
                 let failures_left = failures_left.clone();
                 let delay = generate_delay;
+                let ps_with_context = ps_with_context;
+                let generate_definitive_fail = generate_definitive_fail;
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -833,14 +887,24 @@ mod tests {
                     let body = match path.as_str() {
                         "/api/ps" => {
                             if loaded.load(std::sync::atomic::Ordering::SeqCst) {
-                                r#"{"models":[{"name":"local-default","context_length":32768}]}"#
-                                    .to_string()
+                                if ps_with_context {
+                                    r#"{"models":[{"name":"local-default","context_length":32768}]}"#
+                                        .to_string()
+                                } else {
+                                    // Old Ollama: process entry without the field.
+                                    r#"{"models":[{"name":"local-default"}]}"#.to_string()
+                                }
                             } else {
                                 r#"{"models":[]}"#.to_string()
                             }
                         }
                         "/api/show" => r#"{"parameters":"stop "x""}"#.to_string(),
                         "/api/generate" => {
+                            if generate_definitive_fail {
+                                let response = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                return;
+                            }
                             if failures_left
                                 .fetch_update(
                                     std::sync::atomic::Ordering::SeqCst,
@@ -1042,6 +1106,72 @@ mod tests {
             .filter(|p| p.as_str() == "/api/generate")
             .count();
         assert_eq!(generates, 2, "one failed + one successful preload");
+    }
+
+    /// #2135 round-7 P1 regression (old Ollama): once the load completes
+    /// but /api/ps names no usable allocation, the outcome pins as "no
+    /// window" — the floor stays permanently and LATER readiness calls
+    /// return immediately instead of polling a full deadline every turn.
+    #[tokio::test]
+    async fn should_pin_and_stop_polling_when_loaded_model_reports_no_allocation() {
+        let (base, hits, _loaded) = spawn_ollama_stub_configured(
+            std::time::Duration::from_millis(100),
+            0,
+            false, // old Ollama: no context_length on /api/ps
+            false,
+        )
+        .await;
+        let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((2, 1)));
+        probe.ensure_ready().await;
+        assert_eq!(probe.window.get(), Some(&None), "definitively pinned");
+        assert_eq!(probe.context_window(), OLLAMA_PROVISIONAL_WINDOW);
+        let start = std::time::Instant::now();
+        probe.ensure_ready().await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "pinned outcome must return immediately"
+        );
+        let generates = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == "/api/generate")
+            .count();
+        assert_eq!(generates, 1);
+    }
+
+    /// #2135 round-7 P1 regression (definitive preload failure): a 404 on
+    /// /api/generate parks the preload at FAILED — no polling, no retry,
+    /// readiness returns fast on every call with the floor in force.
+    #[tokio::test]
+    async fn should_not_poll_after_definitive_preload_failure() {
+        let (base, hits, _loaded) = spawn_ollama_stub_configured(
+            std::time::Duration::ZERO,
+            0,
+            true,
+            true, // /api/generate always 404
+        )
+        .await;
+        let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((2, 1)));
+        for _ in 0..2 {
+            let start = std::time::Instant::now();
+            probe.ensure_ready().await;
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "failed preload must not burn poll deadlines"
+            );
+        }
+        assert_eq!(probe.context_window(), OLLAMA_PROVISIONAL_WINDOW);
+        let generates = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == "/api/generate")
+            .count();
+        assert_eq!(
+            generates, 1,
+            "definitive failure must not retry the preload"
+        );
     }
 
     /// #2135 round-3 P2: retryable client statuses must classify as

@@ -1704,22 +1704,6 @@ impl AdaptiveRouter {
         }
     }
 
-    /// The slot the router would pick with NO stochastic exploration: the
-    /// best-scored non-circuit-open slot, falling back to slot 0. Used by
-    /// the identity/readiness accessors (#2135 round-6 P1) so metadata and
-    /// preloading are stable across calls, while `select_provider` keeps
-    /// its exploration for actual request routing.
-    fn preferred_slot_index(&self) -> usize {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.metrics.is_circuit_open(self.config.failure_threshold))
-            .map(|(i, s)| (i, self.score(s)))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    }
-
     /// Score a provider. Lower is better.
     ///
     /// Four factors:
@@ -1882,7 +1866,12 @@ impl AdaptiveRouter {
         Some(matched)
     }
 
-    /// Select provider index and whether this is a probe request.
+    /// The DETERMINISTIC selection — everything `select_provider` does
+    /// except the stochastic probe redirect (#2135 round-7 P1: the
+    /// identity/readiness accessors need the same mode/lane rules and the
+    /// same ASCENDING score order as real routing, not a parallel
+    /// reimplementation; an earlier cut used max_by against a
+    /// lower-is-better score and preferred the worst lane).
     ///
     /// - Off / Hedge: priority order, skip circuit-broken only.
     ///   (Hedge mode uses this to pick the primary for racing.)
@@ -1893,7 +1882,7 @@ impl AdaptiveRouter {
     /// in the lane's candidate list. When the lane filter yields
     /// zero matches we fall through to the full slot list so the
     /// router never starves (see [`Self::lane_filtered_slot_indices`]).
-    fn select_provider(&self) -> (usize, bool) {
+    fn select_provider_deterministic(&self) -> usize {
         let mode = self.mode();
         // RFC-3: lane-filtered eligible set, if any. None ⇒ no
         // filter; behave identically to pre-RFC-3.
@@ -1923,7 +1912,7 @@ impl AdaptiveRouter {
                                 "provider failover (lane filter, lane changing disabled)"
                             );
                         }
-                        return (i, false);
+                        return i;
                     }
                 }
                 // All lane candidates circuit-broken → fall through
@@ -1943,7 +1932,7 @@ impl AdaptiveRouter {
                             "provider failover (circuit breaker, lane changing disabled)"
                         );
                     }
-                    return (i, false);
+                    return i;
                 }
             }
             // All circuit-broken — fall through to least-failed logic below
@@ -1996,19 +1985,42 @@ impl AdaptiveRouter {
                 "all providers circuit-broken, using least-failed"
             );
             self.last_selected.store(best as u32, Ordering::Relaxed);
-            return (best, false);
+            return best;
         }
 
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let best_idx = scored[0].0;
 
+        // Detect lane change. (This now runs before any probe redirect in
+        // `select_provider` — a probe is a measurement detour, not a lane
+        // change, so logging the deterministic selection is the accurate
+        // record.)
+        let prev = self.last_selected.swap(best_idx as u32, Ordering::Relaxed);
+        if prev != best_idx as u32 && prev < self.slots.len() as u32 {
+            info!(
+                from = self.slots[prev as usize].provider.provider_name(),
+                to = self.slots[best_idx].provider.provider_name(),
+                from_score = format!("{:.3}", self.score(&self.slots[prev as usize])),
+                to_score = format!("{:.3}", self.score(&self.slots[best_idx])),
+                "adaptive lane change"
+            );
+        }
+
+        best_idx
+    }
+
+    /// Select provider index and whether this is a probe request: the
+    /// deterministic selection above, plus the stochastic stale-provider
+    /// probe redirect used for actual request routing only.
+    fn select_provider(&self) -> (usize, bool) {
+        let best_idx = self.select_provider_deterministic();
         // Probe: with some probability, redirect to a stale non-primary provider.
         // RFC-3 (#1292) — codex P2: when a lane filter is active,
         // restrict probe targets to the lane's eligible slots so a
         // probe under `slides:*`/`code:*` can never route the user
         // turn to an out-of-lane model.
         if self.slots.len() > 1 && self.should_probe() {
-            // Find a stale provider that isn't the best
+            let lane_eligible = self.lane_filtered_slot_indices();
             for (i, slot) in self.slots.iter().enumerate() {
                 if i != best_idx
                     && slot.metrics.is_stale(self.config.probe_interval_secs)
@@ -2027,19 +2039,6 @@ impl AdaptiveRouter {
                 }
             }
         }
-
-        // Detect lane change
-        let prev = self.last_selected.swap(best_idx as u32, Ordering::Relaxed);
-        if prev != best_idx as u32 && prev < self.slots.len() as u32 {
-            info!(
-                from = self.slots[prev as usize].provider.provider_name(),
-                to = self.slots[best_idx].provider.provider_name(),
-                from_score = format!("{:.3}", self.score(&self.slots[prev as usize])),
-                to_score = format!("{:.3}", self.score(&self.slots[best_idx])),
-                "adaptive lane change"
-            );
-        }
-
         (best_idx, false)
     }
 
@@ -2503,22 +2502,24 @@ impl LlmProvider for AdaptiveRouter {
         // prefer (best score, no stochastic exploration — #2135 round-6
         // P1): readiness may preload, and a coin-flipped lane must not
         // decide which model gets loaded into memory.
-        let idx = self.preferred_slot_index();
+        let idx = self.select_provider_deterministic();
         self.slots[idx].provider.ensure_ready().await;
     }
 
     fn model_id(&self) -> &str {
-        self.slots[self.preferred_slot_index()].provider.model_id()
+        self.slots[self.select_provider_deterministic()]
+            .provider
+            .model_id()
     }
 
     fn provider_name(&self) -> &str {
-        self.slots[self.preferred_slot_index()]
+        self.slots[self.select_provider_deterministic()]
             .provider
             .provider_name()
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
-        self.slots[self.preferred_slot_index()]
+        self.slots[self.select_provider_deterministic()]
             .provider
             .provider_metadata()
     }
