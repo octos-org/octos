@@ -217,7 +217,6 @@ pub fn estimate_message_tokens(msg: &Message) -> u32 {
     tokens + 4
 }
 
-#[cfg(test)]
 /// Route-fit guard for failover/fallback dispatch (#2135 round-7 P1):
 /// before re-sending an UNCHANGED request to an alternate route, resolve
 /// that route's readiness (a lazily-probed local provider may still be
@@ -239,6 +238,7 @@ pub(crate) async fn route_fits_request(
     estimated <= window.saturating_sub(margin)
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
