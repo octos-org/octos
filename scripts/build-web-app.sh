@@ -8,6 +8,11 @@
 # `BASE_URL=/app/` then copy `dist/` into `crates/octos-cli/static/web/`, which
 # `static_files.rs` embeds via rust-embed (`#[folder = "static/"]`).
 #
+# Package manager: octos-web migrated to pnpm (package.json
+# `packageManager: pnpm@…`, pnpm-lock.yaml, NO package-lock.json — 2026-08,
+# #2108), so this script installs with `pnpm install --frozen-lockfile`.
+# Requires corepack or a standalone pnpm on PATH; Node 22+ images have both.
+#
 # Mirrors scripts/build-dashboard.sh (admin SPA) and the swarm-app pattern.
 set -euo pipefail
 
@@ -22,15 +27,26 @@ if [ ! -d "$WEB_DIR" ] || [ ! -f "$WEB_DIR/package.json" ]; then
     exit 1
 fi
 
-if ! command -v npm >/dev/null 2>&1; then
-    echo "error: npm not found — install Node.js (https://nodejs.org) to build octos-web" >&2
+if ! command -v node >/dev/null 2>&1; then
+    echo "error: node not found — install Node.js (https://nodejs.org) to build octos-web" >&2
     exit 1
+fi
+if ! command -v pnpm >/dev/null 2>&1; then
+    # Corepack ships with Node >=16.10 and reads `packageManager` from
+    # package.json, so this also pins the exact pnpm version the lockfile needs.
+    if command -v corepack >/dev/null 2>&1; then
+        corepack enable pnpm
+        corepack prepare
+    else
+        echo "error: pnpm not found — octos-web is a pnpm workspace (no package-lock.json). Install pnpm or run 'corepack enable'." >&2
+        exit 1
+    fi
 fi
 
 cd "$WEB_DIR"
 if [ ! -d node_modules ]; then
-    echo "Installing octos-web dependencies (npm ci)…"
-    npm ci
+    echo "Installing octos-web dependencies (pnpm install --frozen-lockfile)…"
+    pnpm install --frozen-lockfile
 fi
 
 echo "Building octos-web (BASE_URL=$BASE_PATH) → $OUT_DIR"
