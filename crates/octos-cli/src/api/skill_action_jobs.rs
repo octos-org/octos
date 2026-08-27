@@ -119,6 +119,10 @@ fn projected_status(task: &BackgroundTask) -> SkillActionJobStatus {
         TaskStatus::Running => SkillActionJobStatus::Running,
         TaskStatus::Completed => SkillActionJobStatus::Succeeded,
         TaskStatus::Cancelled => SkillActionJobStatus::Cancelled,
+        // #27c — a PARKED task awaits client re-attachment (peer orphan);
+        // project it as the same recoverable "abandoned" view the orphaned
+        // error already maps to, not a hard failure.
+        TaskStatus::Parked => SkillActionJobStatus::Abandoned,
         TaskStatus::Failed if task.error.as_deref() == Some(ORPHANED_ACROSS_RESTART) => {
             SkillActionJobStatus::Abandoned
         }

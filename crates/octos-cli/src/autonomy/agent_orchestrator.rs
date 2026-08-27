@@ -1288,6 +1288,9 @@ fn terminal_settle_authority(
             Some((octos_fleet::TaskSettleAuthority::FinalFailure, true))
         }
         octos_agent::TaskStatus::Spawned | octos_agent::TaskStatus::Running => None,
+        // #27c — a PARKED task carries no settle verdict (it awaits client
+        // re-attachment); rank it with the non-verdict statuses.
+        octos_agent::TaskStatus::Parked => None,
     }
 }
 
@@ -12775,6 +12778,8 @@ fn background_task_agent_status(task: &octos_agent::BackgroundTask) -> String {
         octos_agent::TaskStatus::Completed => "completed",
         octos_agent::TaskStatus::Failed => "failed",
         octos_agent::TaskStatus::Cancelled => "interrupted",
+        // #27c — awaiting client re-attach (peer orphan); not a verdict.
+        octos_agent::TaskStatus::Parked => "parked",
     }
     .to_owned()
 }
