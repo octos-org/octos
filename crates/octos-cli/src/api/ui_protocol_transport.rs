@@ -12945,6 +12945,9 @@ fn peer_lane_provider_for(
 enum PeerAwaitingWakeOutcome {
     /// A wake continuation was newly enqueued on the master (originator).
     Woke,
+    /// #27g/#1967 — the peer was CLOSED before this park landed: both the
+    /// wake AND the escalation row are suppressed at the gate.
+    PeerClosed,
     /// The wake collapsed onto an already-queued wake for the SAME park (same
     /// pending id) — the master is already scheduled to handle it.
     AlreadyQueued,
@@ -13097,9 +13100,9 @@ fn wake_master_and_record_park_escalation(
     pending_id: &str,
     park_kind: PeerPendingKind,
     prompt: &str,
-) {
+) -> PeerAwaitingWakeOutcome {
     let Some((profile_id, slug)) = peer_slug_and_profile(peer_session) else {
-        return;
+        return PeerAwaitingWakeOutcome::NotPeer;
     };
     let peers_root = data_dir.join("peers");
     // #1967 codex round — a park must never wake the master for a CLOSED peer:
@@ -13116,9 +13119,11 @@ fn wake_master_and_record_park_escalation(
             kind = park_kind.as_str(),
             "peer parked after close — suppressing master wake and escalation row"
         );
-        return;
+        // #27g — the caller (and the #1967 test) observes WHY: a closed
+        // peer's park is suppressed at the gate, before any wake/escalation.
+        return PeerAwaitingWakeOutcome::PeerClosed;
     }
-    let _ =
+    let wake_outcome =
         enqueue_peer_awaiting_input_wake(&peers_root, peer_session, pending_id, park_kind, prompt);
 
     // Peer-agent-based goal: when the peer that is parking carries a goal
@@ -13133,25 +13138,25 @@ fn wake_master_and_record_park_escalation(
     // escalation). The ledger is the long-term history; the wake is the
     // immediate signal.
     let Some(peer_dir) = staged_peer_dir(&peers_root, slug) else {
-        return;
+        return wake_outcome;
     };
     let Some(goal_body) =
         peer_io::read_peer_file(&peer_dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
     else {
-        return;
+        return wake_outcome;
     };
     let mut lines = goal_body.lines();
     let goal_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
     let task_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
     let Some(goal_id) = goal_id else {
-        return;
+        return wake_outcome;
     };
     let Some(originator) =
         peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
     else {
-        return;
+        return wake_outcome;
     };
     let kind_str = match park_kind {
         PeerPendingKind::Approval => "approval",
@@ -13183,6 +13188,7 @@ fn wake_master_and_record_park_escalation(
             "peer-goal: recorded escalation to goal ledger"
         );
     }
+    wake_outcome
 }
 
 #[cfg(test)]
@@ -13358,12 +13364,10 @@ mod peer_awaiting_wake_tests {
             .goal_id_for_session(&SessionKey(master.to_owned()))
             .expect("goal id");
         let ledger_path = data_dir.join("goal-ledgers").join(format!("{goal_id}.db"));
-        // `set_goal` enqueues the initial GoalContinue on the master, so the
-        // wake assertions below are DELTAS against this baseline.
-        let baseline = orchestrator.pending_continuation_count_for_session_for_test(
-            &SessionKey(master.to_owned()),
-            profile,
-        );
+        // #27g — the wake assertions are SEMANTIC (outcome-based), not
+        // count-deltas: the global orchestrator's pending queue is shared
+        // with every parallel test in the process, and a concurrent drain
+        // made the delta form flake (0 != baseline+1) in the full suite.
 
         // The CLOSED peer: staged + goal-bound, with the durable marker.
         stage_peer_with_originator(&peers_root, "retired", Some(master));
@@ -13373,20 +13377,25 @@ mod peer_awaiting_wake_tests {
         )
         .unwrap();
         std::fs::write(peers_root.join("retired").join("closed"), "closer\n1\n").unwrap();
-        wake_master_and_record_park_escalation(
+        let closed_outcome = wake_master_and_record_park_escalation(
             data_dir,
             &peer_session(profile, "retired-wire", "retired"),
             "approval-closed-1",
             PeerPendingKind::Approval,
             "run the migration?",
         );
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(
-                &SessionKey(master.to_owned()),
-                profile,
-            ),
-            baseline,
-            "a closed peer's park must not wake the master"
+        // #27g — semantic assertions on the OUTCOME (immune to the global
+        // orchestrator's queue being drained by PARALLEL tests, which made
+        // the count-delta form flake in the full concurrent suite): a closed
+        // peer is suppressed at the gate.
+        assert!(
+            matches!(closed_outcome, PeerAwaitingWakeOutcome::PeerClosed),
+            "a closed peer's park is suppressed at the gate, got {closed_outcome:?}"
+        );
+        assert!(
+            !ledger_path.exists(),
+            "a closed peer's park must not write an escalation row (ledger created at {})",
+            ledger_path.display()
         );
         assert!(
             !ledger_path.exists(),
@@ -13401,20 +13410,18 @@ mod peer_awaiting_wake_tests {
             format!("{goal_id}\n"),
         )
         .unwrap();
-        wake_master_and_record_park_escalation(
+        let open_outcome = wake_master_and_record_park_escalation(
             data_dir,
             &peer_session(profile, "active-wire", "active"),
             "approval-open-1",
             PeerPendingKind::Approval,
             "run the migration?",
         );
-        assert_eq!(
-            orchestrator.pending_continuation_count_for_session_for_test(
-                &SessionKey(master.to_owned()),
-                profile,
-            ),
-            baseline + 1,
-            "an open peer's park wakes the master"
+        // #27g — the open peer's park DID wake (the durable escalation row
+        // below is the independent file-system proof).
+        assert!(
+            matches!(open_outcome, PeerAwaitingWakeOutcome::Woke),
+            "an open peer's park wakes the master, got {open_outcome:?}"
         );
         let ledger = octos_fleet::GoalLedger::open(&ledger_path).expect("ledger exists");
         let open = ledger.list_open_escalations(&goal_id).unwrap();
