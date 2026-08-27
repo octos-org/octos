@@ -73,17 +73,20 @@ impl Executable for GoalCommand {
         // events/snapshot files inside that root).
         let store_root = data_dir.join("supervisor");
         let store = SupervisorStore::new(&store_root);
-        let state = store.load_state().map_err(|error| {
-            eyre!("failed to load supervisor state from {store_root:?}: {error}")
+        // #26a — goal-scoped view: folded BY GOAL ID so superseded goals (the
+        // same session scope's earlier goal_NN rows) remain visible for
+        // zombie cleanup, instead of vanishing under the newest goal's group.
+        let goals_by_id = store.load_goal_groups_by_id().map_err(|error| {
+            eyre!("failed to load goal-scoped view from {store_root:?}: {error}")
         })?;
 
         match self.subcommand {
-            GoalSubcommand::List => cmd_list(&state),
+            GoalSubcommand::List => cmd_list(&goals_by_id),
             GoalSubcommand::Reopen { goal_id } => {
-                cmd_transition(&store, &state, &self.profile, &goal_id, "reopen")
+                cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "reopen")
             }
             GoalSubcommand::Archive { goal_id } => {
-                cmd_transition(&store, &state, &self.profile, &goal_id, "archive")
+                cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "archive")
             }
         }
     }
@@ -95,12 +98,11 @@ impl Executable for GoalCommand {
 /// have minted the same `goal_NN` id, so ambiguity is reported, never
 /// silently guessed.
 fn locate_goal(
-    state: &crate::autonomy::supervisor_store::SupervisorState,
+    goals_by_id: &std::collections::HashMap<String, SupervisedGroupRecord>,
     profile: &str,
     goal_id: &str,
 ) -> Result<LocatedGoal> {
-    let mut matches: Vec<LocatedGoal> = state
-        .groups
+    let mut matches: Vec<LocatedGoal> = goals_by_id
         .values()
         .filter(|group| {
             metadata_str(group, "autonomy_record_kind") == Some("goal")
@@ -132,9 +134,8 @@ fn locate_goal(
     }
 }
 
-fn cmd_list(state: &crate::autonomy::supervisor_store::SupervisorState) -> Result<()> {
-    let mut rows: Vec<(String, String, String, String)> = state
-        .groups
+fn cmd_list(goals_by_id: &std::collections::HashMap<String, SupervisedGroupRecord>) -> Result<()> {
+    let mut rows: Vec<(String, String, String, String)> = goals_by_id
         .values()
         .filter(|group| metadata_str(group, "autonomy_record_kind") == Some("goal"))
         .map(|group| {
@@ -169,12 +170,12 @@ fn cmd_list(state: &crate::autonomy::supervisor_store::SupervisorState) -> Resul
 
 fn cmd_transition(
     store: &SupervisorStore,
-    state: &crate::autonomy::supervisor_store::SupervisorState,
+    goals_by_id: &std::collections::HashMap<String, SupervisedGroupRecord>,
     profile: &str,
     goal_id: &str,
     action: &str,
 ) -> Result<()> {
-    let located = locate_goal(state, profile, goal_id)?;
+    let located = locate_goal(goals_by_id, profile, goal_id)?;
     let prior_status = metadata_str(&located.group, "status")
         .unwrap_or("<unknown>")
         .to_owned();
@@ -313,9 +314,9 @@ mod tests {
             .record_group_registered(goal_group("api:s1", "octos", "goal_01", "blocked"))
             .unwrap();
 
-        let state = store.load_state().unwrap();
         // blocked -> active via the command's transition path.
-        let located = locate_goal(&state, "octos", "goal_01").unwrap();
+        let located =
+            locate_goal(&store.load_goal_groups_by_id().unwrap(), "octos", "goal_01").unwrap();
         let mut group = located.group.clone();
         group.updated_at_ms = group.updated_at_ms.saturating_add(1);
         group.status = GroupStatus::Running;
@@ -327,8 +328,8 @@ mod tests {
             )
             .unwrap();
 
-        let replayed = store.load_state().unwrap();
-        let restored = locate_goal(&replayed, "octos", "goal_01").unwrap();
+        let restored =
+            locate_goal(&store.load_goal_groups_by_id().unwrap(), "octos", "goal_01").unwrap();
         assert_eq!(metadata_str(&restored.group, "status"), Some("active"));
     }
 
@@ -342,8 +343,8 @@ mod tests {
             .record_group_registered(goal_group("api:s1", "octos", "goal_02", "blocked"))
             .unwrap();
 
-        let state = store.load_state().unwrap();
-        let located = locate_goal(&state, "octos", "goal_02").unwrap();
+        let located =
+            locate_goal(&store.load_goal_groups_by_id().unwrap(), "octos", "goal_02").unwrap();
         let mut group = located.group.clone();
         group.updated_at_ms = group.updated_at_ms.saturating_add(1);
         group.status = GroupStatus::Completed;
@@ -355,12 +356,18 @@ mod tests {
             )
             .unwrap();
 
-        let replayed = store.load_state().unwrap();
-        let restored = locate_goal(&replayed, "octos", "goal_02").unwrap();
+        let restored =
+            locate_goal(&store.load_goal_groups_by_id().unwrap(), "octos", "goal_02").unwrap();
         assert_eq!(metadata_str(&restored.group, "status"), Some("archived"));
 
         // A second archive against the archived record must fail.
-        let result = cmd_transition(&store, &replayed, "octos", "goal_02", "archive");
+        let result = cmd_transition(
+            &store,
+            &store.load_goal_groups_by_id().unwrap(),
+            "octos",
+            "goal_02",
+            "archive",
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already archived"));
     }
@@ -373,8 +380,13 @@ mod tests {
         store
             .record_group_registered(goal_group("api:s1", "octos", "goal_03", "complete"))
             .unwrap();
-        let state = store.load_state().unwrap();
-        let result = cmd_transition(&store, &state, "octos", "goal_03", "reopen");
+        let result = cmd_transition(
+            &store,
+            &store.load_goal_groups_by_id().unwrap(),
+            "octos",
+            "goal_03",
+            "reopen",
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("terminal status"));
     }
@@ -389,8 +401,13 @@ mod tests {
         group.metadata.insert("token_budget".into(), json!(100u64));
         group.metadata.insert("tokens_used".into(), json!(100u64));
         store.record_group_registered(group).unwrap();
-        let state = store.load_state().unwrap();
-        let result = cmd_transition(&store, &state, "octos", "goal_04", "reopen");
+        let result = cmd_transition(
+            &store,
+            &store.load_goal_groups_by_id().unwrap(),
+            "octos",
+            "goal_04",
+            "reopen",
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -411,8 +428,7 @@ mod tests {
         store
             .record_group_registered(goal_group("api:s2", "octos", "goal_05", "paused"))
             .unwrap();
-        let state = store.load_state().unwrap();
-        let result = locate_goal(&state, "octos", "goal_05");
+        let result = locate_goal(&store.load_goal_groups_by_id().unwrap(), "octos", "goal_05");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ambiguous"));
     }
