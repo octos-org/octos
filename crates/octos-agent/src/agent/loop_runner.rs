@@ -29,6 +29,10 @@ use crate::session::SessionLimits;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
+/// #27d (R4) — per-TURN budget for feeding a malformed-tool-call diagnostic
+/// back to the model as a user message (self-correction buffer). Cumulative
+/// across tools (same defect, not per-tool); resets at the next turn.
+const MALFORMED_TOOLCALL_FEEDBACK_LIMIT: u32 = 3;
 const MAX_TOKENS_CONTINUATION_LIMIT: usize = 2;
 const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your output was truncated at the token limit. Continue directly from where you stopped. Do not repeat or summarize what you already wrote.";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
@@ -996,6 +1000,8 @@ impl Agent {
                 let mut retry_state =
                     PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
+                // #27d — turn-local malformed-tool-call feedback counter.
+                let mut malformed_feedback_used: u32 = 0;
                 // Tools may report that they have already exhausted all
                 // meaningful retries for this user turn. Keep that fact in
                 // the host, not in the model: a later call with rewritten
@@ -1259,6 +1265,22 @@ impl Agent {
                     // providers ignore `context_management` via
                     // `skip_serializing_if`.
                     let call_config = with_tier2_context_management(&config, self);
+                    // #27d (R4) — malformed tool-call FEEDBACK buffer. A
+                    // `StreamError::MalformedArgs` (the model emitted a tool
+                    // call whose JSON arguments failed to parse) stays
+                    // NON-retryable at the stream layer (#1355 invariant,
+                    // detection.rs pinned tests untouched) — but the TURN no
+                    // longer dies on the first one. Instead the diagnostic is
+                    // fed back to the model as a TOOL RESULT so it can see
+                    // exactly where the JSON broke and re-emit a valid call.
+                    // Budget: at most MALFORMED_TOOLCALL_FEEDBACK_LIMIT (3)
+                    // feed-backs per TURN (turn-wide cumulative — a model
+                    // that keeps producing broken JSON across DIFFERENT
+                    // tools is the same defect, so per-tool reset would let
+                    // it spin N×tools times; the counter resets naturally at
+                    // the next turn). On exhaustion the error flows to the
+                    // pre-existing terminal path (the pinned current
+                    // behavior).
                     let (mut response, streamed, attributed_cost) = match self
                         .call_llm_with_hooks(
                             &messages,
@@ -1323,6 +1345,64 @@ impl Agent {
                             }
                         }
                         Err(e) => {
+                            // #27d (R4) — malformed tool-call FEEDBACK buffer.
+                            // A `StreamError::MalformedArgs` (the model emitted
+                            // a tool call whose JSON arguments failed to
+                            // parse) stays NON-retryable at the stream layer
+                            // (#1355 invariant; detection.rs pinned tests
+                            // untouched) — but the TURN no longer dies on the
+                            // first one. The diagnostic is fed back as a user
+                            // message so the model sees exactly where the JSON
+                            // broke and can re-emit a valid call. Budget: at
+                            // most MALFORMED_TOOLCALL_FEEDBACK_LIMIT (3)
+                            // feed-backs per TURN, cumulative ACROSS tools — a
+                            // model that keeps producing broken JSON for
+                            // different tools is the same defect, so a
+                            // per-tool reset would multiply the budget by the
+                            // tool count. The counter is a turn-local
+                            // variable, so the next turn starts fresh. On
+                            // exhaustion the error flows to the pre-existing
+                            // terminal path (the pinned current behavior).
+                            let malformed = e
+                                .chain()
+                                .any(|cause| {
+                                    cause
+                                        .downcast_ref::<octos_llm::StreamError>()
+                                        .is_some_and(|se| {
+                                            matches!(
+                                                se,
+                                                octos_llm::StreamError::MalformedArgs { .. }
+                                            )
+                                        })
+                                });
+                            if malformed {
+                                malformed_feedback_used += 1;
+                                if malformed_feedback_used
+                                    <= MALFORMED_TOOLCALL_FEEDBACK_LIMIT
+                                {
+                                    let diagnostic = format!(
+                                        "Your previous tool call was REJECTED because its \\
+                                         arguments could not be parsed. Fix the JSON and call \\
+                                         the tool again. Diagnostic (attempt \\
+                                         {malformed_feedback_used}/{MALFORMED_TOOLCALL_FEEDBACK_LIMIT}): {e:#}"
+                                    );
+                                    messages.push(Message::user(diagnostic));
+                                    turn.record_retry(LoopRetryReason::ProviderFailover {
+                                        reason: "malformed tool-call feedback".to_string(),
+                                    });
+                                    tracing::warn!(
+                                        attempt = malformed_feedback_used,
+                                        limit = MALFORMED_TOOLCALL_FEEDBACK_LIMIT,
+                                        error = %e,
+                                        "malformed tool call — feeding diagnostic back to the model (#27d)"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    attempts = malformed_feedback_used,
+                                    "malformed tool-call feedback budget exhausted — terminating turn (#27d)"
+                                );
+                            }
                             if self.failfast_llm_bail(&e) {
                                 return Err(attach_partial_usage(e, turn.total_usage().clone()));
                             }

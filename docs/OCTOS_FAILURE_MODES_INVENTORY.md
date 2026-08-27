@@ -41,3 +41,4 @@ When a new class is discovered:
 
 This file is the canonical surface area for failure-mode reviews. Skip
 no rows — silent partial coverage is what M8.9 was created to close.
+| Malformed tool-call arguments (model emitted un-parseable JSON args) | `StreamError::MalformedArgs` from the stream layer (streaming.rs:396) | #27d (R4): loop_runner feeds the diagnostic back to the model as a user message (budget 3 per TURN, cumulative across tools — same defect); the stream layer keeps MalformedArgs NON-retryable (#1355 invariant, detection.rs pinned tests untouched). On budget exhaustion the pre-existing terminal path fires. Was: first MalformedArgs killed the whole turn instantly (instant death for a background task with no next turn). | `loop_runner_tests::malformed_toolcall_feedback_lets_model_self_correct_and_survive`, `malformed_toolcall_feedback_exhausts_and_terminates` | #27d (R4) |
