@@ -5,7 +5,7 @@
 // where master/PM/peers run as independent processes sharing the same ledger.
 
 use eyre::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -393,6 +393,18 @@ impl GoalLedger {
             CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at_ms);
             CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status, created_at_ms);
             CREATE INDEX IF NOT EXISTS idx_decisions_goal ON decisions(goal_id, decided_at_ms);
+
+            -- #20b (main-tree sovereignty): a generic key/value sidecar for
+            -- small instance-scoped facts that must ride the goal-ledger and
+            -- survive a restart. The first (and currently only) key is
+            -- `main_tree_owner`, recording the goal id that first landed a
+            -- non-default branch on the main tree; the shell guard consults
+            -- it to refuse cross-branch checkouts from other goals.
+            CREATE TABLE IF NOT EXISTS ledger_kv (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             ",
         )?;
         // #2055 review round 4: NO column migration here. `create_tables`
@@ -1342,6 +1354,72 @@ impl GoalLedger {
         Ok(version)
     }
 
+    /// #20b (main-tree sovereignty) — the ledger key under which the
+    /// main-tree owner goal id is stored.
+    pub const MAIN_TREE_OWNER_KEY: &'static str = "main_tree_owner";
+
+    /// Read a value from the `ledger_kv` sidecar; `Ok(None)` when the key was
+    /// never written. Backed by `CREATE TABLE IF NOT EXISTS` in `open`, so
+    /// every generation of the ledger file answers this read.
+    pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT value FROM ledger_kv WHERE key = ?1")?;
+        let value = stmt
+            .query_row(params![key], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Write a value into the `ledger_kv` sidecar, first-writer-wins when
+    /// `overwrite` is false: a pre-existing row is left untouched and the
+    /// EXISTING value is returned, so a racing second claimant observes the
+    /// true owner rather than silently overwriting it. Returns the value now
+    /// stored under `key` (the caller's on a fresh write, the incumbent's on
+    /// a lost race / `overwrite = false`).
+    pub fn kv_put(
+        &self,
+        key: &str,
+        value: &str,
+        overwrite: bool,
+        updated_at_ms: i64,
+    ) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        if overwrite {
+            conn.execute(
+                "INSERT INTO ledger_kv (key, value, updated_at_ms) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms",
+                params![key, value, updated_at_ms],
+            )?;
+            return Ok(value.to_owned());
+        }
+        // INSERT OR IGNORE, then read back the winner — one connection mutex
+        // holds both statements, so the read-back always observes the row the
+        // claim resolved to.
+        conn.execute(
+            "INSERT OR IGNORE INTO ledger_kv (key, value, updated_at_ms) VALUES (?1, ?2, ?3)",
+            params![key, value, updated_at_ms],
+        )?;
+        let stored: String = conn.query_row(
+            "SELECT value FROM ledger_kv WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )?;
+        Ok(stored)
+    }
+
+    /// #20b — convenience readers for the main-tree owner goal. `None` until
+    /// a goal claims the tree; persists across restarts with the ledger file.
+    pub fn main_tree_owner_goal(&self) -> Result<Option<String>> {
+        self.kv_get(Self::MAIN_TREE_OWNER_KEY)
+    }
+
+    /// #20b — claim main-tree ownership for `goal_id`, first-writer-wins.
+    /// Returns the goal id that actually owns the tree after the call (the
+    /// incumbent's id when the tree was already claimed by another goal).
+    pub fn claim_main_tree_owner(&self, goal_id: &str, updated_at_ms: i64) -> Result<String> {
+        self.kv_put(Self::MAIN_TREE_OWNER_KEY, goal_id, false, updated_at_ms)
+    }
+
     /// Update goal status.
     /// Update goal status with optimistic concurrency control (CAS).
     ///
@@ -2102,6 +2180,66 @@ impl GoalLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #20b — the `ledger_kv` sidecar persists the main-tree owner across a
+    /// close/reopen (restart) and `claim_main_tree_owner` is first-writer-wins:
+    /// a second claimant never silently overwrites the true owner.
+    #[test]
+    fn ledger_kv_main_tree_owner_persists_and_is_first_writer_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+
+        // Fresh ledger: no owner yet.
+        {
+            let ledger = GoalLedger::open(&path).unwrap();
+            assert_eq!(ledger.main_tree_owner_goal().unwrap(), None);
+            // First claim wins.
+            let winner = ledger.claim_main_tree_owner("goal_01", 1000).unwrap();
+            assert_eq!(winner, "goal_01");
+            assert_eq!(
+                ledger.main_tree_owner_goal().unwrap().as_deref(),
+                Some("goal_01")
+            );
+            // A racing second claimant observes the incumbent, never overwrites.
+            let incumbent = ledger.claim_main_tree_owner("goal_02", 2000).unwrap();
+            assert_eq!(
+                incumbent, "goal_01",
+                "first-writer-wins keeps the true owner"
+            );
+            assert_eq!(
+                ledger.main_tree_owner_goal().unwrap().as_deref(),
+                Some("goal_01")
+            );
+        }
+
+        // Reopen (restart): the owner rides the ledger file and survives.
+        {
+            let ledger = GoalLedger::open(&path).unwrap();
+            assert_eq!(
+                ledger.main_tree_owner_goal().unwrap().as_deref(),
+                Some("goal_01"),
+                "owner must persist across a close/reopen"
+            );
+        }
+    }
+
+    /// #20b — `kv_put` with `overwrite = true` DOES replace, so a deliberate
+    /// owner handoff is expressible; the default claim path never uses it.
+    #[test]
+    fn ledger_kv_overwrite_replaces_when_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = GoalLedger::open(&path).unwrap();
+        ledger.claim_main_tree_owner("goal_01", 1000).unwrap();
+        let replaced = ledger
+            .kv_put(GoalLedger::MAIN_TREE_OWNER_KEY, "goal_09", true, 3000)
+            .unwrap();
+        assert_eq!(replaced, "goal_09");
+        assert_eq!(
+            ledger.main_tree_owner_goal().unwrap().as_deref(),
+            Some("goal_09")
+        );
+    }
 
     #[test]
     fn sqlite_ledger_multi_process_access() {

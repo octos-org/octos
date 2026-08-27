@@ -42,7 +42,13 @@ pub struct PeerHandoffRequest {
     /// (case-insensitive) rather than auto-suffixing.
     pub name: String,
     /// Whether the host should fence the peer in its own git worktree.
-    pub worktree: bool,
+    /// `None` = the caller did NOT say (the tool argument was omitted) — the
+    /// host then decides from its collision predicate (#20a smart fencing:
+    /// multi-goal / branch-diverged / unfenced-in-flight ⇒ fence).
+    /// `Some(true)`/`Some(false)` are explicit and always respected (an
+    /// explicit `false` that contradicts the predicate is honored with a
+    /// warning in `PeerHandoffStaged.model_note`).
+    pub worktree: Option<bool>,
     /// Optional model LANE for this peer: the KEY of a `sub_provider`
     /// configured in the master's profile (e.g. `"cheap"`, `"strong"`).
     /// `None` (or an empty/whitespace value, normalized to `None` by
@@ -105,7 +111,7 @@ struct Input {
     brief: String,
     name: String,
     #[serde(default)]
-    worktree: bool,
+    worktree: Option<bool>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -176,7 +182,7 @@ impl Tool for PeerHandoffTool {
                 },
                 "worktree": {
                     "type": "boolean",
-                    "description": "Fence the peer in its own git worktree on branch peer/<slug> (default false). Use for code changes that must not collide with this session's working tree."
+                    "description": "Fence the peer in its own git worktree on branch peer/<slug>. Omit for the host's collision-aware default (auto-fences when the run could collide with another goal/peer). Pass true for code changes that must not collide with this session's working tree; pass false to force sharing (a warning is noted when that contradicts the collision check)."
                 },
                 "model": {
                     "type": "string",
@@ -285,7 +291,10 @@ mod tests {
                 topic: "peer-ci-fix".to_owned(),
                 brief_path: "/data/peers/ci-fix/brief.md".to_owned(),
                 cwd: "/work/peers/ci-fix/wt".to_owned(),
-                worktree_branch: request.worktree.then(|| "peer/ci-fix".to_owned()),
+                worktree_branch: request
+                    .worktree
+                    .unwrap_or(false)
+                    .then(|| "peer/ci-fix".to_owned()),
                 model_note: None,
             })
         }));
@@ -443,7 +452,7 @@ mod tests {
             PeerHandoffRequest {
                 brief: "Fix the flaky bus test; repro in crates/octos-bus.".to_owned(),
                 name: "CI Fix".to_owned(),
-                worktree: true,
+                worktree: Some(true),
                 model: None,
                 goal_id: None,
                 task_id: None,
@@ -508,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_default_worktree_when_omitted() {
+    async fn should_leave_worktree_unspecified_when_omitted() {
         let (tool, seen) = tool_with_recorder();
 
         let result = tool
@@ -523,7 +532,9 @@ mod tests {
             PeerHandoffRequest {
                 brief: "Just the brief.".to_owned(),
                 name: "Solo".to_owned(),
-                worktree: false,
+                // #20a — omitted stays UNSPECIFIED so the host applies its
+                // collision-aware default; the tool never invents a value.
+                worktree: None,
                 model: None,
                 goal_id: None,
                 task_id: None,

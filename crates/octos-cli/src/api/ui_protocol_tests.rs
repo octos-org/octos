@@ -30848,7 +30848,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
             brief: format!("Lane {n}: fix the flaky bus test."),
             // Unique per iteration — named peers reject duplicates.
             name: format!("Lane {n}"),
-            worktree: false,
+            worktree: Some(false),
             model: None,
             goal_id: None,
             task_id: None,
@@ -30865,7 +30865,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
     let err = callback(octos_agent::PeerHandoffRequest {
         brief: "One too many.".to_owned(),
         name: "One too many".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
@@ -31994,7 +31994,7 @@ fn peer_originator_recorded_by_handoff_callback() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Fix the flaky bus test.".to_owned(),
         name: "CI Fix".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
@@ -32003,6 +32003,372 @@ fn peer_originator_recorded_by_handoff_callback() {
     let originator =
         std::fs::read_to_string(peers_root.join(&staged.slug).join("originator")).unwrap();
     assert_eq!(originator, originating.to_string());
+}
+
+// ----------------------------------------------------------------------------
+// #20a — smart worktree fencing: when `peer_handoff` leaves `worktree`
+// UNSPECIFIED, the host auto-fences on a collision predicate hit (① >1 active
+// goal, ② master's tree on a non-default branch, ③ an unfenced peer already
+// in flight). An explicit `worktree=false` is still honored — with a
+// model-visible warning in `model_note` — and an explicit `true` fences
+// WITHOUT touching the predicate (zero-cost short-circuit).
+// ----------------------------------------------------------------------------
+
+fn handoff_request(name: &str, worktree: Option<bool>) -> octos_agent::PeerHandoffRequest {
+    octos_agent::PeerHandoffRequest {
+        brief: format!("Task for {name}."),
+        name: name.to_owned(),
+        worktree,
+        model: None,
+        goal_id: None,
+        task_id: None,
+    }
+}
+
+/// #20a — make `workspace` a real git repo with one commit so the auto-fence
+/// path's `git clone` (stage_peer) can materialize a fenced worktree. Tests
+/// that trigger the collision predicate (and thus a fence) need this; the
+/// no-collision tests deliberately keep a non-git workspace so predicate ②
+/// reads "unknown" and stays silent.
+fn init_git_workspace(workspace: &std::path::Path) {
+    let run = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(workspace)
+                .args(args)
+                .status()
+                .unwrap_or_else(|_| panic!("git {args:?}"))
+                .success(),
+            "git {args:?} failed"
+        );
+    };
+    run(&["init"]);
+    run(&["config", "user.name", "octos-test"]);
+    run(&["config", "user.email", "octos-test@example.invalid"]);
+    std::fs::write(workspace.join("seed.txt"), "seed\n").expect("seed file");
+    run(&["add", "."]);
+    run(&["commit", "-m", "init"]);
+}
+
+fn handoff_callback_for(
+    peers_root: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+    profile_id: &str,
+) -> octos_agent::PeerHandoffCallback {
+    build_peer_handoff_callback(
+        peers_root,
+        workspace,
+        octos_core::SessionKey::with_profile_topic(profile_id, "local", "tui", "coding"),
+        profile_id.to_owned(),
+        Vec::new(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    )
+}
+
+/// Single goal / single branch / no in-flight peers: an UNSPECIFIED worktree
+/// stays unfenced (zero-cost no-regression), and no warning is emitted.
+/// (The non-git workspace makes predicate ② read "unknown" → no hit.)
+#[test]
+fn smart_fence_default_unfenced_when_no_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Unique profile id: the active-goal predicate scans by profile, and the
+    // process-global orchestrator is shared with sibling tests.
+    let profile = "test-smart-fence-none";
+    let callback = handoff_callback_for(peers_root, workspace, profile);
+
+    let staged = callback(handoff_request("Solo", None)).expect("stage");
+    assert_eq!(staged.worktree_branch, None, "no collision → unfenced");
+    assert_eq!(staged.model_note, None, "no warning without an override");
+}
+
+/// Predicate ③: an in-flight peer (brief, no result, not closed) WITHOUT a
+/// fence flips an unspecified worktree to FENCED.
+#[test]
+fn smart_fence_auto_fences_when_unfenced_peer_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The auto-fence path `git clone`s the master's tree — it must be a repo.
+    init_git_workspace(&workspace);
+    // Stage the in-flight UNFENCED peer by hand: brief.md is the staging
+    // contract; no result.md = still running; no `wt/` = unfenced.
+    let running = peers_root.join("running-peer");
+    std::fs::create_dir_all(&running).unwrap();
+    std::fs::write(running.join("brief.md"), "in flight").unwrap();
+
+    let callback = handoff_callback_for(peers_root, workspace, "test-smart-fence-peer");
+    let staged = callback(handoff_request("Fenced Peer", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/fenced-peer"),
+        "in-flight unfenced peer → auto-fence"
+    );
+}
+
+/// Predicate ①: more than one ACTIVE goal in this profile flips an
+/// unspecified worktree to FENCED.
+#[test]
+fn smart_fence_auto_fences_when_multiple_active_goals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The auto-fence path `git clone`s the master's tree — it must be a repo.
+    init_git_workspace(&workspace);
+    let profile = "test-smart-fence-goals";
+    // Two active goals under a UNIQUE profile, so sibling tests' goals (on
+    // other profiles) are invisible to the count. The goals persist in the
+    // process-global orchestrator after this test — harmless: later peers
+    // under this same profile are expected to auto-fence anyway.
+    let orchestrator = default_agent_orchestrator();
+    for key in [
+        format!("web:{profile}#goal-a"),
+        format!("web:{profile}#goal-b"),
+    ] {
+        orchestrator
+            .model_create_goal(&SessionKey(key), profile, "concurrent stream", None)
+            .expect("goal created");
+    }
+
+    let callback = handoff_callback_for(peers_root, workspace, profile);
+    let staged = callback(handoff_request("Multi Goal", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/multi-goal"),
+        ">1 active goal → auto-fence"
+    );
+}
+
+/// Explicit `worktree=false` WINS over a predicate hit, but the staged result
+/// carries a model-visible warning in `model_note`.
+#[test]
+fn smart_fence_explicit_false_overrides_with_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let running = peers_root.join("running-peer");
+    std::fs::create_dir_all(&running).unwrap();
+    std::fs::write(running.join("brief.md"), "in flight").unwrap();
+
+    let callback = handoff_callback_for(peers_root, workspace, "test-smart-fence-override");
+    let staged = callback(handoff_request("Shared Tree", Some(false))).expect("stage");
+    assert_eq!(
+        staged.worktree_branch, None,
+        "explicit false is honored even on a predicate hit"
+    );
+    let note = staged.model_note.expect("override warning recorded");
+    assert!(
+        note.contains("worktree=false"),
+        "names the override: {note}"
+    );
+    assert!(
+        note.contains("unfenced peer is already in flight"),
+        "names the collision reason: {note}"
+    );
+}
+
+/// Explicit `worktree=true` fences unconditionally — the predicate is never
+/// consulted (zero syscalls/git invocations on that path).
+#[test]
+fn smart_fence_explicit_true_fences_without_predicate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Explicit `true` fences via `git clone` too — the workspace must be a repo.
+    init_git_workspace(&workspace);
+
+    let callback = handoff_callback_for(peers_root, workspace, "test-smart-fence-true");
+    let staged = callback(handoff_request("Fenced Explicit", Some(true))).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/fenced-explicit")
+    );
+    assert_eq!(staged.model_note, None, "no warning for an explicit fence");
+}
+
+/// `resolve_peer_worktree` unit truth table, pure (no FS/git): unspecified
+/// takes the predicate; explicit false warns ONLY on a hit; explicit true
+/// never warns.
+#[test]
+fn resolve_peer_worktree_truth_table() {
+    use crate::peers::{FenceCollisionReason::*, resolve_peer_worktree};
+    let hit = [UnfencedPeerInFlight];
+    let miss: [crate::peers::FenceCollisionReason; 0] = [];
+
+    assert_eq!(resolve_peer_worktree(None, &miss), (false, None));
+    assert_eq!(resolve_peer_worktree(None, &hit), (true, None));
+    assert_eq!(resolve_peer_worktree(Some(true), &miss), (true, None));
+    assert_eq!(resolve_peer_worktree(Some(true), &hit), (true, None));
+    assert_eq!(resolve_peer_worktree(Some(false), &miss), (false, None));
+    let (fenced, warning) = resolve_peer_worktree(Some(false), &hit);
+    assert!(!fenced);
+    assert!(warning.is_some(), "explicit false + hit → warning");
+    let (fenced, warning) = resolve_peer_worktree(
+        Some(false),
+        &[MultipleActiveGoals, MainTreeOnNonDefaultBranch],
+    );
+    assert!(!fenced);
+    assert!(
+        warning.unwrap().contains("multiple active goals"),
+        "each hit reason is surfaced"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #20c — concurrent dual-goal fixtures: the JOINT #20a + #20b behaviour with
+// TWO active goals live in the same profile. 20a's single-predicate tests
+// prove the predicate fires; these fixtures prove the end-to-end story a
+// real campaign hits: goal_02's UNSPECIFIED peer_handoff auto-fences with no
+// human steer and no warning, and — with goal_01 owning the main tree — a
+// cross-goal `git checkout` on the shared tree is refused while the owner
+// goal itself passes through.
+// ----------------------------------------------------------------------------
+
+/// #20c fixture ① — with TWO active goals in the profile, the SECOND goal's
+/// peer handoff that leaves `worktree` unspecified auto-fences onto
+/// `peer/<slug>` (predicate ①, no human steer), and — unlike an explicit
+/// `worktree=false` override — records NO `model_note` warning: the default
+/// auto-fence is the sanctioned path, not an override.
+#[test]
+fn dual_goal_second_goal_peer_auto_fences_without_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The auto-fence path `git clone`s the master's tree — it must be a repo.
+    init_git_workspace(&workspace);
+    let profile = "test-20c-dual-goal-fence";
+    // Both goals ACTIVE concurrently under a UNIQUE profile — the campaign
+    // state 20c is about. (Goals persist in the process-global orchestrator;
+    // the unique profile keeps sibling tests' goals invisible to the count.)
+    let orchestrator = default_agent_orchestrator();
+    for (key, objective) in [
+        (format!("web:{profile}#goal-01"), "stream one"),
+        (format!("web:{profile}#goal-02"), "stream two"),
+    ] {
+        orchestrator
+            .model_create_goal(&SessionKey(key), profile, objective, None)
+            .expect("goal created");
+    }
+
+    // goal_02's session hands a peer off WITHOUT a worktree decision — the
+    // host must fence it on its own.
+    let callback = handoff_callback_for(peers_root, workspace, profile);
+    let staged = callback(handoff_request("Second Goal Peer", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/second-goal-peer"),
+        "second active goal's unspecified worktree → auto-fence"
+    );
+    assert_eq!(
+        staged.model_note, None,
+        "default auto-fence is not an override → no warning"
+    );
+}
+
+/// #20c fixture ② — dual-goal joint #20a/#20b: goal_01 claims the main tree
+/// (20b ledger claim, as the orchestrator does when its branch lands on the
+/// tree), then goal_02's peer handoff auto-fences (20a) AND a goal_02
+/// `git checkout <other-branch>` against the SHARED main tree is refused by
+/// `tree_sovereignty_denial` with the fence-yourself hint — while goal_01's
+/// own checkout of a different branch passes through. This is the campaign's
+/// "second goal can NEVER hijack the main tree" guarantee exercised through
+/// the real fencing callback plus the real denial predicate on the real
+/// provider-shaped context.
+#[test]
+fn dual_goal_peer_fenced_and_cross_goal_checkout_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    init_git_workspace(&workspace);
+    let profile = "test-20c-dual-goal-sovereignty";
+    let orchestrator = default_agent_orchestrator();
+    for (key, objective) in [
+        (format!("web:{profile}#goal-01"), "stream one"),
+        (format!("web:{profile}#goal-02"), "stream two"),
+    ] {
+        orchestrator
+            .model_create_goal(&SessionKey(key), profile, objective, None)
+            .expect("goal created");
+    }
+
+    // goal_01 owns the main tree (first goal to land a non-default branch
+    // there). The ledger dir starts empty — `claim_main_tree_owner` creates
+    // it best-effort, exactly like the production caller.
+    let profile_data_dir = tmp.path().join("profile-data");
+    orchestrator.claim_main_tree_owner(&profile_data_dir, "goal_01");
+    assert_eq!(
+        orchestrator
+            .scan_main_tree_owner(&profile_data_dir)
+            .as_deref(),
+        Some("goal_01"),
+        "goal_01's claim is discoverable by enumeration (goal_02 never reads it directly)"
+    );
+
+    // goal_02 stages a peer with no worktree decision → 20a auto-fence.
+    let callback = handoff_callback_for(peers_root, workspace.clone(), profile);
+    let staged = callback(handoff_request("Goal Two Peer", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/goal-two-peer"),
+        "goal_02's peer auto-fences off the shared tree"
+    );
+    assert_eq!(staged.model_note, None, "auto-fence is not an override");
+
+    // goal_02 then tries to move the SHARED main tree onto another branch —
+    // refused. The context mirrors what `install_main_tree_sovereignty`'s
+    // provider closure hands the shell tool: the same tree root, a live
+    // non-default branch read, the scanned owner, the caller's goal.
+    use octos_agent::tools::shell::{MainTreeSovereigntyContext, tree_sovereignty_denial};
+    let goal_02_ctx = MainTreeSovereigntyContext {
+        main_tree_root: workspace.clone(),
+        main_tree_branch: Some("feat/goal-01-stream".to_owned()),
+        owner_goal_id: orchestrator.scan_main_tree_owner(&profile_data_dir),
+        caller_goal_id: Some("goal_02".to_owned()),
+    };
+    let denial =
+        tree_sovereignty_denial("git checkout feat/goal-02-stream", &workspace, &goal_02_ctx)
+            .expect("cross-goal checkout must be refused");
+    assert!(
+        denial.contains("owned by goal 'goal_01'"),
+        "names the owner: {denial}"
+    );
+    assert!(
+        denial.contains("fence yourself"),
+        "carries the fence-yourself hint: {denial}"
+    );
+
+    // goal_01 — the OWNER — moves the same tree freely (same branch target).
+    let goal_01_ctx = MainTreeSovereigntyContext {
+        caller_goal_id: Some("goal_01".to_owned()),
+        ..goal_02_ctx.clone()
+    };
+    assert!(
+        tree_sovereignty_denial("git checkout feat/goal-02-stream", &workspace, &goal_01_ctx)
+            .is_none(),
+        "the owner goal is never blocked on its own tree"
+    );
+
+    // And goal_02's checkout INSIDE its fenced peer clone is out of the
+    // guard's scope entirely (a different directory than the main tree).
+    assert!(
+        tree_sovereignty_denial(
+            "git checkout feat/goal-02-stream",
+            std::path::Path::new(&staged.cwd),
+            &goal_02_ctx,
+        )
+        .is_none(),
+        "checkouts inside a fenced peer clone pass through"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -32119,7 +32485,7 @@ fn stage_and_open_peer(
     let slug = callback(octos_agent::PeerHandoffRequest {
         brief: "do the work".to_owned(),
         name: name.to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
@@ -32649,7 +33015,7 @@ fn peer_respond_errors_when_peer_not_open() {
     let slug = cb(octos_agent::PeerHandoffRequest {
         brief: "x".to_owned(),
         name: "notopen".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
@@ -32788,7 +33154,7 @@ fn peer_handoff_callback_records_valid_model_lane() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Synthesize the peers' findings.".to_owned(),
         name: "Synth".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: Some("strong".to_owned()),
         goal_id: None,
         task_id: None,
@@ -32830,7 +33196,7 @@ fn peer_handoff_callback_notes_unknown_model_lane_but_still_stages() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Grind the grunt work.".to_owned(),
         name: "Grunt".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: Some("gpt-mega".to_owned()),
         goal_id: None,
         task_id: None,

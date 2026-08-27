@@ -392,6 +392,215 @@ fn contains_git_invocation(command: &str) -> bool {
         .any(|segment| segment_invokes_git(segment))
 }
 
+// ---------------------------------------------------------------------------
+// #20b — main-tree sovereignty (树主权) checkout guard.
+//
+// The git TOOL is read-only; a branch switch on the MAIN TREE can only arrive
+// through this shell tool. When the main tree (the session's workspace root)
+// is owned by a goal — the first goal to land a non-default branch on it,
+// recorded durably in that goal's ledger by the host via the provider below —
+// a `git checkout` / `git switch` that would move the main tree's HEAD to a
+// DIFFERENT branch, issued by any session that does not belong to the owner
+// goal, is REFUSED with a "fence yourself" hint instead of silently switching.
+//
+// Scope discipline:
+//   - Only fires when the command's effective cwd IS the main tree root —
+//     checkouts inside a fenced peer clone (`peers/<slug>/wt`) pass through.
+//   - Read-only git invocations (status/diff/log/…), plain `git init`, and
+//     pathspec restores (`git checkout -- file`, `git checkout <file-that-
+//     exists>`) never match the HEAD-moving detector.
+//   - Fail-open: no provider wired (solo CLI, tests, hosts that never opted
+//     in), unknown current branch (non-git dir, detached HEAD read failure),
+//     or no recorded owner → the guard stays out of the way.
+// ---------------------------------------------------------------------------
+
+/// Snapshot the host hands the shell tool for the #20b sovereignty decision.
+#[derive(Debug, Clone)]
+pub struct MainTreeSovereigntyContext {
+    /// Canonical main-tree (workspace) root the guard protects.
+    pub main_tree_root: PathBuf,
+    /// The main tree's CURRENT branch; `None` = unknown (non-git / detached /
+    /// read failure) → fail open.
+    pub main_tree_branch: Option<String>,
+    /// Goal that owns the main tree (first goal to branch it off trunk);
+    /// `None` = no owner → never block.
+    pub owner_goal_id: Option<String>,
+    /// Goal the CALLING session belongs to (`ToolContext::goal_id`).
+    pub caller_goal_id: Option<String>,
+}
+
+/// #20b — the boxed sovereignty-provider closure type, extracted so neither
+/// the `static` slot nor the setter signature trips `clippy::type_complexity`.
+/// Called once per shell execution with the calling session's goal id;
+/// returns `None` to disable the guard.
+pub type MainTreeSovereigntyProvider =
+    Arc<dyn Fn(Option<&str>) -> Option<MainTreeSovereigntyContext> + Send + Sync>;
+
+/// Host-wired provider for the #20b guard. Called once per shell execution
+/// with the calling session's goal id; returns `None` to disable the guard
+/// entirely (default). Wired by the serve/runtime layer (octos-cli) where the
+/// profile data dir and workspace root are known; process-global because tool
+/// construction sites vastly outnumber the single boot that knows both paths.
+static MAIN_TREE_SOVEREIGNTY_PROVIDER: std::sync::RwLock<Option<MainTreeSovereigntyProvider>> =
+    std::sync::RwLock::new(None);
+
+/// Install (or clear, with `None`) the #20b main-tree sovereignty provider.
+pub fn set_main_tree_sovereignty_provider(provider: Option<MainTreeSovereigntyProvider>) {
+    let mut slot = MAIN_TREE_SOVEREIGNTY_PROVIDER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = provider;
+}
+
+/// Snapshot the currently-installed #20b sovereignty provider, if any. The
+/// shell tool itself reads the slot on the execution path; this accessor
+/// exists for host-side wiring tests (octos-cli #20c) that must invoke the
+/// INSTALLED provider — not a re-implemented closure — to prove the
+/// scan/claim/deny wiring end to end.
+pub fn main_tree_sovereignty_provider() -> Option<MainTreeSovereigntyProvider> {
+    MAIN_TREE_SOVEREIGNTY_PROVIDER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// The HEAD-moving target of a `git checkout` / `git switch` segment:
+/// `Some(Some(branch))` switches to / creates `branch`, `Some(None)` is a
+/// HEAD-moving form with no branch target we can name (treated as
+/// switching), and `None` is anything else (read-only, pathspec restore,
+/// non-checkout git). Reused segment tokenizer honours quotes/`;`/`&&`/`|`.
+fn git_head_move_target(segment: &[String], cwd: &Path) -> Option<Option<String>> {
+    let mut i = 0;
+    // Walk to the `git` token, skipping env assignments and wrappers exactly
+    // like `segment_invokes_git`.
+    loop {
+        let token = segment.get(i)?;
+        if token_invokes_git(token) {
+            i += 1;
+            break;
+        }
+        if looks_like_env_assignment(token) {
+            i += 1;
+            continue;
+        }
+        if is_git_invocation_wrapper(token) {
+            i += 1;
+            while segment
+                .get(i)
+                .is_some_and(|w| w.starts_with('-') || looks_like_env_assignment(w))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        return None;
+    }
+    // Skip git global options; `-C <path>` / `-c <kv>` consume a value.
+    while let Some(token) = segment.get(i) {
+        match token.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" => i += 2,
+            _ if token.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    let sub = segment.get(i)?;
+    let is_checkout = sub.eq_ignore_ascii_case("checkout");
+    let is_switch = sub.eq_ignore_ascii_case("switch");
+    if !is_checkout && !is_switch {
+        return None;
+    }
+    i += 1;
+    let mut positional: Option<&str> = None;
+    let mut after_ddash = false;
+    while let Some(token) = segment.get(i) {
+        if after_ddash {
+            // Everything after `--` is pathspec — restoring files, never a
+            // HEAD move (for the forms we intercept).
+            return None;
+        }
+        match token.as_str() {
+            "--" => after_ddash = true,
+            // Branch-creating forms: HEAD moves to the NEW branch.
+            "-b" | "-B" | "-c" | "-C" | "--orphan" => {
+                let name = segment.get(i + 1);
+                return Some(name.map(|s| s.to_owned()).or(Some(String::new())));
+            }
+            // Value-taking options we must skip over.
+            "--conflict" | "--pathspec-from-file" | "-m" | "--merge" => i += 2,
+            "-d" | "--detach" => {
+                // Detached HEAD: moves HEAD off any branch. The next token is
+                // the ref; a bare detach of the current commit is harmless,
+                // but conservatively treat as a HEAD move with unknown target.
+                return Some(
+                    segment
+                        .get(i + 1)
+                        .map(|s| s.to_owned())
+                        .or(Some(String::new())),
+                );
+            }
+            _ if token.starts_with('-') => i += 1,
+            _ => {
+                positional = Some(token.as_str());
+                break;
+            }
+        }
+        i += 1;
+    }
+    let target = positional?;
+    // `git checkout <path>` (no `--`) is a pathspec restore when the target
+    // exists as a filesystem entry under cwd — git itself prefers the branch
+    // reading, but refusing a file restore would be a false positive on the
+    // common `git checkout some_file` idiom, so only treat as a switch when
+    // no such path exists.
+    if cwd.join(target).exists() {
+        return None;
+    }
+    Some(Some(target.to_owned()))
+}
+
+/// Pure #20b decision: `Some(denial)` when this command must be refused.
+/// `pub` so the octos-cli #20c dual-goal fixture can exercise the real
+/// decision against a real provider-shaped context (cross-goal checkout
+/// refused, owner goal passes through) instead of a re-implemented copy.
+pub fn tree_sovereignty_denial(
+    command: &str,
+    effective_cwd: &Path,
+    ctx: &MainTreeSovereigntyContext,
+) -> Option<String> {
+    // Main-tree scope only: a fenced peer's clone is a DIFFERENT directory.
+    let cwd = octos_core::session_scope::canonicalize_lossy(effective_cwd);
+    let root = octos_core::session_scope::canonicalize_lossy(&ctx.main_tree_root);
+    if cwd != root {
+        return None;
+    }
+    let branch = ctx.main_tree_branch.as_deref()?;
+    let owner = ctx.owner_goal_id.as_deref()?;
+    if ctx.caller_goal_id.as_deref() == Some(owner) {
+        return None;
+    }
+    for segment in shell_command_segments(command) {
+        let Some(target) = git_head_move_target(&segment, effective_cwd) else {
+            continue;
+        };
+        // Switching TO the current branch (or `checkout -b` naming it) is a
+        // no-op on tree state — allow.
+        if target.as_deref() == Some(branch) {
+            continue;
+        }
+        let target_label = target.as_deref().unwrap_or("(detached/unknown)");
+        let caller = ctx.caller_goal_id.as_deref().unwrap_or("(no goal)");
+        return Some(format!(
+            "Command refused by main-tree sovereignty (#20b): the main tree is owned by goal \
+             '{owner}' and currently on branch '{branch}', but this session (goal: {caller}) tried \
+             to switch it to '{target_label}'. The tree was NOT switched. To work on another \
+             branch, fence yourself instead: ask the master to stage a peer (peer_handoff auto-\
+             fences onto a worktree clone under peers/<slug>/wt), or run this work inside your own \
+             worktree — never `git checkout` the shared main tree across branches."
+        ));
+    }
+    None
+}
+
 fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
     let mut segments = Vec::new();
     let mut segment = Vec::new();
@@ -699,6 +908,29 @@ impl Tool for ShellTool {
             _ => &self.cwd,
         };
 
+        // #20b — main-tree sovereignty: refuse a cross-branch `git checkout`
+        // / `git switch` on the owned main tree BEFORE policy, approval, or
+        // any execution path (foreground or background). Fail-open when no
+        // provider is wired, no owner is recorded, or the branch is unknown.
+        if let Some(provider) = MAIN_TREE_SOVEREIGNTY_PROVIDER
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            if let Some(sovereignty) = provider(ctx.goal_id.as_deref()) {
+                if let Some(denial) =
+                    tree_sovereignty_denial(&input.command, effective_cwd, &sovereignty)
+                {
+                    tracing::warn!(command = %input.command, "command refused by main-tree sovereignty");
+                    return Ok(ToolResult {
+                        output: format!("{denial}\n\nCommand: {}", input.command),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
         // Check policy first
         let decision = self.policy.check(&input.command, effective_cwd);
         match decision {
@@ -972,6 +1204,120 @@ mod tests {
         // should never race with a parallel read_file on the same path.
         let tool = ShellTool::new(std::env::temp_dir());
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
+
+    // ---------------------------------------------------------------------
+    // #20b — main-tree sovereignty checkout guard. `tree_sovereignty_denial`
+    // is the pure decision function; these cover every branch of its rule:
+    // scope (main tree only), fail-open (no branch / no owner), the owner
+    // itself, no-op same-branch checkouts, and the cross-branch refusal with
+    // the fence-yourself hint. Read-only git and pathspec restores must never
+    // be refused.
+    // ---------------------------------------------------------------------
+
+    fn sovereignty_ctx(
+        branch: Option<&str>,
+        owner: Option<&str>,
+        caller: Option<&str>,
+    ) -> MainTreeSovereigntyContext {
+        MainTreeSovereigntyContext {
+            main_tree_root: std::env::temp_dir(),
+            main_tree_branch: branch.map(str::to_owned),
+            owner_goal_id: owner.map(str::to_owned),
+            caller_goal_id: caller.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn sovereignty_refuses_cross_branch_checkout_from_other_goal() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        let denial = tree_sovereignty_denial("git checkout feat/b", &cwd, &ctx)
+            .expect("cross-branch checkout by a non-owner goal must be refused");
+        assert!(denial.contains("goal_01"), "names the owner: {denial}");
+        assert!(denial.contains("goal_02"), "names the caller: {denial}");
+        assert!(
+            denial.contains("NOT switched"),
+            "states no switch: {denial}"
+        );
+        assert!(
+            denial.contains("fence"),
+            "points at the fence mechanism: {denial}"
+        );
+    }
+
+    #[test]
+    fn sovereignty_allows_owner_goal_its_own_checkout() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_01"));
+        let cwd = std::env::temp_dir();
+        assert!(
+            tree_sovereignty_denial("git checkout feat/b", &cwd, &ctx).is_none(),
+            "the owner goal may move its own tree"
+        );
+    }
+
+    #[test]
+    fn sovereignty_fail_open_without_owner_or_branch() {
+        let cwd = std::env::temp_dir();
+        // No owner recorded → never block.
+        let no_owner = sovereignty_ctx(Some("feat/a"), None, Some("goal_02"));
+        assert!(tree_sovereignty_denial("git checkout feat/b", &cwd, &no_owner).is_none());
+        // Unknown current branch (detached / non-git) → fail open.
+        let no_branch = sovereignty_ctx(None, Some("goal_01"), Some("goal_02"));
+        assert!(tree_sovereignty_denial("git checkout feat/b", &cwd, &no_branch).is_none());
+    }
+
+    #[test]
+    fn sovereignty_allows_same_branch_noop_checkout() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        assert!(
+            tree_sovereignty_denial("git checkout feat/a", &cwd, &ctx).is_none(),
+            "switching TO the current branch is a no-op — allow"
+        );
+    }
+
+    #[test]
+    fn sovereignty_ignores_read_only_and_pathspec_restore() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        for cmd in [
+            "git status",
+            "git log --oneline -1",
+            "git diff HEAD",
+            "git checkout -- src/lib.rs",
+            "git restore src/lib.rs",
+            "echo hello",
+        ] {
+            assert!(
+                tree_sovereignty_denial(cmd, &cwd, &ctx).is_none(),
+                "read-only / restore must never be refused: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn sovereignty_only_guards_the_main_tree_root() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        // A fenced peer clone lives under a DIFFERENT directory → pass through.
+        let fenced = std::env::temp_dir()
+            .join("peers")
+            .join("some-peer")
+            .join("wt");
+        assert!(
+            tree_sovereignty_denial("git checkout feat/b", &fenced, &ctx).is_none(),
+            "checkouts inside a fenced clone must not be guarded"
+        );
+    }
+
+    #[test]
+    fn sovereignty_switch_command_also_guarded() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        assert!(
+            tree_sovereignty_denial("git switch feat/b", &cwd, &ctx).is_some(),
+            "git switch is also a HEAD move and must be guarded"
+        );
     }
 
     #[tokio::test]

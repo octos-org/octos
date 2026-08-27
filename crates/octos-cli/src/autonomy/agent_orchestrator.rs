@@ -3646,6 +3646,162 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// #20a (smart worktree fencing) — the count of this profile's goals
+    /// whose status is `active`, across ALL store keys. Pure in-memory map
+    /// scan (one MutexGuard, no I/O) — cheap enough to evaluate on the
+    /// `peer_handoff` staging path only. Used by the collision predicate:
+    /// more than one active goal in the instance means concurrent work
+    /// streams, so an unspecified peer worktree auto-fences.
+    pub(crate) fn profile_active_goal_count(&self, profile_id: &str) -> usize {
+        let state = self.state();
+        state
+            .goals
+            .values()
+            .filter(|goal| goal.profile_id == profile_id && goal.status == "active")
+            .count()
+    }
+
+    /// #20b (main-tree sovereignty) — the goal id recorded as the main
+    /// tree's OWNER, persisted in the goal's ledger (`ledger_kv` sidecar,
+    /// key `main_tree_owner`) so it survives a restart. `None` when no goal
+    /// has claimed the tree yet (or the ledger is unavailable — reads are
+    /// best-effort and fail-open to "no owner", matching the guard's
+    /// fail-open-on-missing-DB rule).
+    pub(crate) fn main_tree_owner_goal(
+        &self,
+        profile_data_dir: &std::path::Path,
+        goal_id: &str,
+    ) -> Option<String> {
+        let ledger_path = Self::goal_ledger_path(profile_data_dir, goal_id);
+        if !ledger_path.is_file() {
+            return None;
+        }
+        let ledger = octos_fleet::GoalLedger::open(&ledger_path).ok()?;
+        ledger.main_tree_owner_goal().ok().flatten()
+    }
+
+    /// #20b — scan `goal-ledgers/` for ANY recorded main-tree owner. The owner
+    /// goal records sovereignty in its OWN ledger, but the shell guard runs for
+    /// whichever goal issued the command — usually NOT the owner — so the owner
+    /// must be discovered by enumeration, not by reading the caller's ledger.
+    /// Returns the first owner found. Best-effort and fail-open: a missing dir,
+    /// an unreadable/corrupt ledger, or no claim anywhere yields `None`, which
+    /// the guard treats as "no owner → never block". This runs only on the shell
+    /// path (one bounded dir scan per command), never a hot loop.
+    pub(crate) fn scan_main_tree_owner(
+        &self,
+        profile_data_dir: &std::path::Path,
+    ) -> Option<String> {
+        let dir = Self::goal_ledger_dir(profile_data_dir);
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                continue;
+            }
+            if let Ok(ledger) = octos_fleet::GoalLedger::open(&path) {
+                if let Ok(Some(owner)) = ledger.main_tree_owner_goal() {
+                    return Some(owner);
+                }
+            }
+        }
+        None
+    }
+
+    /// #20b — record `goal_id` as the first goal to land a non-default
+    /// branch on the main tree. First-writer-wins: when the tree already has
+    /// an owner the incumbent's id is kept (and logged), so a second goal
+    /// branching the main tree later cannot silently take sovereignty. The
+    /// claim is persisted through the goal's own ledger, so it is recovered
+    /// by any process that reopens the ledger after a restart.
+    pub(crate) fn claim_main_tree_owner(&self, profile_data_dir: &std::path::Path, goal_id: &str) {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        if let Err(error) = std::fs::create_dir_all(&ledger_dir) {
+            tracing::warn!(%error, "main-tree owner claim: ledger dir create failed (best-effort)");
+            return;
+        }
+        let ledger_path = Self::goal_ledger_path(profile_data_dir, goal_id);
+        let ledger = match octos_fleet::GoalLedger::open(&ledger_path) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(%error, ledger = %ledger_path.display(),
+                    "main-tree owner claim: ledger open failed (best-effort)");
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match ledger.claim_main_tree_owner(goal_id, now) {
+            Ok(owner) if owner != goal_id => tracing::info!(
+                owner = %owner,
+                claimant = %goal_id,
+                "main tree already owned — claim ignored (first-writer-wins)"
+            ),
+            Ok(_) => tracing::info!(owner = %goal_id, "main-tree owner recorded"),
+            Err(error) => tracing::warn!(%error, "main-tree owner claim failed (best-effort)"),
+        }
+    }
+
+    /// #20b — wire the shell tool's main-tree sovereignty provider for this
+    /// profile. Installed once per profile runtime; the closure is
+    /// process-global (the shell tool consults one provider) so it re-reads
+    /// the main-tree branch and the caller-bound goal's ledger on EVERY shell
+    /// execution, never caching a stale owner or branch. When the main tree
+    /// sits on a non-default branch and the bound goal is not yet the owner,
+    /// this also best-effort CLAIMS the owner for that goal — the "first goal
+    /// to land a branch on the main tree" rule.
+    ///
+    /// `main_tree_root` is the session workspace root (the shared main tree).
+    /// Fail-open throughout: a non-git tree, an unreadable branch, or a
+    /// missing ledger simply yields no owner, and the guard stays out of the
+    /// way — exactly the solo-CLI / single-goal default.
+    pub(crate) fn install_main_tree_sovereignty(
+        profile_data_dir: std::path::PathBuf,
+        main_tree_root: std::path::PathBuf,
+    ) {
+        let profile_data_dir_for_closure = profile_data_dir.clone();
+        octos_agent::tools::shell::set_main_tree_sovereignty_provider(Some(std::sync::Arc::new(
+            move |caller_goal_id: Option<&str>| {
+                let root = main_tree_root.clone();
+                // Read the main tree's CURRENT branch (fail-open on any error).
+                let branch = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                    .filter(|b| !b.is_empty());
+                let orchestrator = default_agent_orchestrator();
+                // If the tree is on a non-default branch and the CALLER's goal
+                // is bound, that goal is the one working the tree — claim it
+                // (first-writer-wins) so later cross-goal checkouts are refused.
+                if let (Some(b), Some(goal)) = (branch.as_deref(), caller_goal_id) {
+                    if b != "main" && b != "master" {
+                        orchestrator.claim_main_tree_owner(&profile_data_dir_for_closure, goal);
+                    }
+                }
+                // The owner is recorded in SOME goal's ledger (whichever goal
+                // first branched the tree) — the caller is usually a DIFFERENT
+                // goal, so reading only the caller's ledger would miss it. Scan
+                // the goal-ledgers dir for any recorded owner (first found
+                // wins; ledger_kv is first-writer-wins per-ledger, and a single
+                // tree has one true owner, so any hit is authoritative).
+                let owner_goal_id =
+                    orchestrator.scan_main_tree_owner(&profile_data_dir_for_closure);
+                Some(octos_agent::tools::shell::MainTreeSovereigntyContext {
+                    main_tree_root: root,
+                    main_tree_branch: branch,
+                    owner_goal_id,
+                    caller_goal_id: caller_goal_id.map(str::to_owned),
+                })
+            },
+        )));
+    }
+
     /// #2056 round 2 (H2b) — the goal BOUND to this session, whatever its
     /// status. [`Self::active_goal_id`] additionally requires `active`, which
     /// is right for recording NEW work and wrong for reconciling work that has
@@ -32307,6 +32463,177 @@ mod tests {
         assert!(
             notes.contains("EXPIRED"),
             "note explains the expiry: {notes}"
+        );
+    }
+
+    // ---- #20c — dual-goal main-tree sovereignty install/scan wiring --------
+    //
+    // 20b's shell-side unit tests (octos-agent) prove `tree_sovereignty_denial`
+    // on a HAND-BUILT context; these tests prove the octos-cli side: the
+    // provider installed by `install_main_tree_sovereignty` READS the real
+    // ledger state — `scan_main_tree_owner` enumerates MULTIPLE goals'
+    // ledgers to find the owner, the owner claim rides the branch read, and
+    // the denied/allowed decision falls out of the INSTALLED provider, not a
+    // fixture-shaped stand-in.
+    //
+    // The provider slot is process-global and shared with a running profile
+    // runtime, so each install-test holds this lock for its whole body and
+    // clears the slot on drop (poisoning-safe, like the cwd lock above).
+    static SOVEREIGNTY_PROVIDER_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn sovereignty_provider_guard() -> std::sync::MutexGuard<'static, ()> {
+        SOVEREIGNTY_PROVIDER_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    struct SovereigntyProviderCleanup;
+    impl Drop for SovereigntyProviderCleanup {
+        fn drop(&mut self) {
+            octos_agent::tools::shell::set_main_tree_sovereignty_provider(None);
+        }
+    }
+
+    /// #20c — a real git repo with its HEAD moved to a non-default branch, so
+    /// the installed provider's branch read reports `feat/goal-01-stream`.
+    fn init_repo_on_branch(root: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(root)
+                    .args(args)
+                    .status()
+                    .unwrap_or_else(|_| panic!("git {args:?}"))
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "octos-test"]);
+        run(&["config", "user.email", "octos-test@example.invalid"]);
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        run(&["checkout", "-q", "-b", branch]);
+    }
+
+    /// #20c — the installed provider scans MULTIPLE goals' ledgers for the
+    /// owner (goal_01's claim is recorded in goal_01's OWN ledger; goal_02's
+    /// ledger must not hide it), claims first-writer-wins for the caller when
+    /// the tree sits on a non-default branch, and — through the REAL denial
+    /// predicate fed by the INSTALLED provider — refuses goal_02's cross-goal
+    /// checkout while goal_01 (the owner) passes through.
+    #[test]
+    fn dual_goal_sovereignty_provider_scan_claim_and_denial() {
+        let _serial = sovereignty_provider_guard();
+        let _cleanup = SovereigntyProviderCleanup;
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let main_tree = tmp.path().join("main-tree");
+        init_repo_on_branch(&main_tree, "feat/goal-01-stream");
+        std::fs::create_dir_all(&profile_data_dir).unwrap();
+
+        InProcessAgentOrchestrator::install_main_tree_sovereignty(
+            profile_data_dir.clone(),
+            main_tree.clone(),
+        );
+
+        // goal_01 — bound caller on a non-default branch — is CLAIMED as the
+        // owner by the provider itself (the "first goal to branch the tree"
+        // rule), and sees that claim echoed in its context.
+        let provider = octos_agent::tools::shell::main_tree_sovereignty_provider()
+            .expect("provider installed");
+        let goal_01_ctx = provider(Some("goal_01")).expect("context returned");
+        assert_eq!(
+            goal_01_ctx.main_tree_branch.as_deref(),
+            Some("feat/goal-01-stream"),
+            "live branch read of the main tree"
+        );
+        assert_eq!(goal_01_ctx.main_tree_root, main_tree);
+        assert_eq!(
+            goal_01_ctx.owner_goal_id.as_deref(),
+            Some("goal_01"),
+            "provider claims the bound caller on a non-default branch"
+        );
+        assert_eq!(goal_01_ctx.caller_goal_id.as_deref(), Some("goal_01"));
+
+        // goal_02's ledger ALSO exists (a second active goal with its own
+        // ledger file): the owner scan must enumerate PAST it to goal_01's
+        // ledger and still find goal_01 — goal_02's claim attempt is ignored
+        // first-writer-wins, and goal_02's context names goal_01 as owner.
+        let orchestrator = default_agent_orchestrator();
+        orchestrator.claim_main_tree_owner(&profile_data_dir, "goal_02");
+        assert_eq!(
+            orchestrator
+                .scan_main_tree_owner(&profile_data_dir)
+                .as_deref(),
+            Some("goal_01"),
+            "multi-ledger scan finds the first-writer-wins owner"
+        );
+        let goal_02_ctx = provider(Some("goal_02")).expect("context returned");
+        assert_eq!(goal_02_ctx.owner_goal_id.as_deref(), Some("goal_01"));
+        assert_eq!(goal_02_ctx.caller_goal_id.as_deref(), Some("goal_02"));
+
+        // The REAL denial predicate on the INSTALLED provider's contexts:
+        // goal_02's cross-goal checkout is refused with the fence hint…
+        let denial = octos_agent::tools::shell::tree_sovereignty_denial(
+            "git checkout feat/goal-02-stream",
+            &main_tree,
+            &goal_02_ctx,
+        )
+        .expect("cross-goal checkout refused");
+        assert!(
+            denial.contains("owned by goal 'goal_01'") && denial.contains("fence yourself"),
+            "denial names the owner and the hint: {denial}"
+        );
+        // …while goal_01's own checkout of the same target passes through.
+        assert!(
+            octos_agent::tools::shell::tree_sovereignty_denial(
+                "git checkout feat/goal-02-stream",
+                &main_tree,
+                &goal_01_ctx,
+            )
+            .is_none(),
+            "the owner goal is never blocked on its own tree"
+        );
+    }
+
+    /// #20c — fail-open solo path through the INSTALLED provider: a main
+    /// tree on the DEFAULT branch with no recorded owner yields a context
+    /// with `owner_goal_id: None`, and the denial predicate never blocks —
+    //  the single-goal / solo-CLI default 20b must not regress.
+    #[test]
+    fn sovereignty_provider_fail_open_when_unowned_default_branch() {
+        let _serial = sovereignty_provider_guard();
+        let _cleanup = SovereigntyProviderCleanup;
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let main_tree = tmp.path().join("main-tree");
+        init_repo_on_branch(&main_tree, "main");
+        std::fs::create_dir_all(&profile_data_dir).unwrap();
+
+        InProcessAgentOrchestrator::install_main_tree_sovereignty(
+            profile_data_dir.clone(),
+            main_tree.clone(),
+        );
+        let provider = octos_agent::tools::shell::main_tree_sovereignty_provider()
+            .expect("provider installed");
+        let ctx = provider(Some("goal_01")).expect("context returned");
+        assert_eq!(ctx.main_tree_branch.as_deref(), Some("main"));
+        assert_eq!(
+            ctx.owner_goal_id, None,
+            "no non-default branch → no claim → no owner"
+        );
+        assert!(
+            octos_agent::tools::shell::tree_sovereignty_denial(
+                "git checkout feat/anything",
+                &main_tree,
+                &ctx,
+            )
+            .is_none(),
+            "no owner → never block, even for a branch switch"
         );
     }
 }
