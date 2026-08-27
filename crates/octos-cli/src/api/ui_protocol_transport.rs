@@ -13806,7 +13806,33 @@ fn write_peer_result_if_peer_session(
     // Backward-compatible latest copy — peer_gather reads this path. Written
     // through the fd-anchored atomic writer (openat/renameat under the pinned
     // peer dir fd) so a parent swap cannot redirect it (#1824).
-    if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "result.md", &text) {
+    //
+    // #27f (R3) — SINGLE-WRITER ownership: if the PEER has already written
+    // its own final `result.md` (it marks ownership with a
+    // `.result-owner: peer` sidecar leaf), the runtime MUST NOT overwrite
+    // it. Live case (s2-zai-lane, 2026-08-26): the peer's completed
+    // hand-written result was clobbered by this runtime frontmatter copy.
+    // The versioned `result-{turn}.md` below still records this turn's
+    // view, so no history is lost — only the "latest" pointer keeps the
+    // peer's authoritative final word. Ownership scheme chosen over flock:
+    // the peer side writes via plain shell tools (no portable advisory-lock
+    // handshake), while a sidecar leaf is a one-line `touch` that the peer
+    // guidance already encourages; fail-open (sidecar absent ⇒ runtime
+    // writes, preserving the pre-27f behavior for peers that don't opt in).
+    let peer_owns_result = peer_io::read_peer_file(
+        &peer_dir,
+        ".result-owner",
+        peer_io::PEER_FILE_READ_CAP_SMALL,
+    )
+    .map(|owner| owner.trim() == "peer")
+    .unwrap_or(false);
+    if peer_owns_result {
+        tracing::info!(
+            slug,
+            turn = turn_count,
+            "peer owns result.md — runtime keeps the peer's final version (#27f); this turn is recorded in the versioned copy only"
+        );
+    } else if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "result.md", &text) {
         tracing::warn!(?err, slug, "failed to write peer result");
     }
 
