@@ -2161,6 +2161,148 @@ impl InProcessAgentOrchestrator {
         paused
     }
 
+    /// #25 — OPERATOR-owned goal transitions: `reopen` (→ `active`) and
+    /// `archive` (→ `archived`, an irreversible terminal state). This is the
+    /// escape hatch for the blocked/paused deadlock: `MODEL_ALLOWED_TRANSITIONS`
+    /// (goal_tool.rs) deliberately admits only `complete`/`blocked`, and the
+    /// completion gate accepts only `active|budget_limited`, so a `blocked`
+    /// or `paused` goal previously had NO model-reachable way back out —
+    /// and an orphaned goal whose session scope was taken over by a
+    /// replacement had no closing path at all. Only the operator (CLI /
+    /// outer loop) may call this; the model NEVER can (the tool schema does
+    /// not expose these statuses, and this method is not routed through the
+    /// model-actor paths).
+    ///
+    /// Transition rules (enforced under the state lock, before mutation):
+    /// - `reopen`: `blocked|paused|budget_limited` → `active`. Refuses from
+    ///   `complete`/`archived` (terminal) and from an already-`active` goal.
+    ///   A reopen must not resurrect an over-budget goal as `active` (that
+    ///   silently reverts `budget_limited` while still over cap) — raise the
+    ///   budget via `set_goal` first.
+    /// - `archive`: any status → `archived`. Refuses only from `archived`
+    ///   itself (idempotence guard).
+    /// - `archived` is TERMINAL: once archived there is no transition back —
+    ///   neither through this method nor through `set_goal`'s status field
+    ///   (its validation enum does not admit `archived`, so even the user
+    ///   wire path cannot forge it; archiving is only ever produced here).
+    ///
+    /// `session_id` is the session the goal is addressed under (the CLI
+    /// resolves the goal's persisted `session_id` from the supervisor event
+    /// stream); `scoped_goal_key` maps it to the storage key exactly like
+    /// every other goal path. On success the mutation is persisted to the
+    /// supervisor event stream (the AUTHORITATIVE goal-state layer that
+    /// `restore_goal_from_group` replays at boot) and — when
+    /// `ledger_data_dir` is `Some` — synced into the goal-ledger SQLite
+    /// row + decisions (best-effort, outside the state lock).
+    ///
+    /// Returns the post-transition goal JSON snapshot.
+    pub(crate) fn operator_transition_goal(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        action: &str,
+        reason: &str,
+        ledger_data_dir: Option<&Path>,
+    ) -> Result<Value, String> {
+        let target_status = match action {
+            "reopen" => "active",
+            "archive" => "archived",
+            other => {
+                return Err(format!(
+                    "unknown operator goal action `{other}` (use `reopen` or `archive`)"
+                ));
+            }
+        };
+        let key = self.scoped_goal_key(session_id);
+        let snapshot = {
+            let mut state = self.state();
+            let Some(goal) = state.goals.get_mut(&key) else {
+                return Err(format!(
+                    "no goal is set for session `{session_id}` (check the session id, or pass \
+                     the session under whose scope the goal was created)"
+                ));
+            };
+            if goal.profile_id != profile_id {
+                return Err(format!(
+                    "goal `{}` belongs to profile `{}`, not `{profile_id}`",
+                    goal.goal_id, goal.profile_id
+                ));
+            }
+            let prior_status = goal.status.clone();
+            match action {
+                "reopen" => {
+                    match prior_status.as_str() {
+                        "blocked" | "paused" | "budget_limited" => {}
+                        "active" => {
+                            return Err(format!(
+                                "goal `{}` is already active; nothing to reopen",
+                                goal.goal_id
+                            ));
+                        }
+                        other => {
+                            return Err(format!(
+                                "cannot reopen goal `{gid}` from terminal status `{other}` \
+                                 (reopen is only allowed from blocked|paused|budget_limited)",
+                                gid = goal.goal_id
+                            ));
+                        }
+                    }
+                    // Same over-budget guard as `set_goal`'s reactivation
+                    // guard: never leave an over-budget goal `active`.
+                    if goal.token_budget > 0 && goal.tokens_used >= goal.token_budget {
+                        return Err(format!(
+                            "cannot reopen goal `{}`: it has exhausted its token budget \
+                             ({} >= {}); raise the budget above the tokens already used first",
+                            goal.goal_id, goal.tokens_used, goal.token_budget
+                        ));
+                    }
+                    // Mirror `set_goal`'s reactivation bookkeeping: a fresh
+                    // wrap-up window, forgiven failure streak, restarted
+                    // rate-limit window.
+                    goal.wrap_up_emitted = false;
+                    goal.wrap_up_generation = goal.wrap_up_generation.wrapping_add(1);
+                    goal.consecutive_failed_turns = 0;
+                    let now = now_ms();
+                    goal.rate_window_start_ms = now;
+                    goal.rate_window_count = 0;
+                }
+                "archive" => {
+                    if prior_status == "archived" {
+                        return Err(format!(
+                            "goal `{}` is already archived (terminal)",
+                            goal.goal_id
+                        ));
+                    }
+                }
+                _ => unreachable!("action validated above"),
+            }
+            // Operator-path mutation bumps the ABA revision exactly like the
+            // user wire path, so a verifier snapshot taken before the
+            // operator acted can never be honored after it.
+            goal.revision = goal.revision.wrapping_add(1);
+            goal.status = target_status.to_owned();
+            goal.updated_at_ms = now_ms();
+            let snapshot = goal.clone();
+            if snapshot.status == "active" {
+                enqueue_goal_continuation(&mut state, &key, &snapshot.profile_id, &snapshot);
+            }
+            persist_goal_state(&state, &key, &snapshot, false);
+            snapshot
+        };
+        tracing::info!(
+            session = %key,
+            goal_id = %snapshot.goal_id,
+            action = %action,
+            status = %snapshot.status,
+            reason = %reason,
+            "operator transitioned goal (#25 reopen/archive exit)"
+        );
+        if let Some(data_dir) = ledger_data_dir {
+            self.sync_transition_to_ledger_blocking(data_dir, &snapshot, reason, &key, true, false);
+        }
+        Ok(autonomy_goal_json(&snapshot))
+    }
+
     pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Value {
         let now = now_ms();
         let mut state = self.state();
@@ -9357,6 +9499,11 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             ));
         }
         let requested_status = request.status.as_deref();
+        // #25 — `archived` is deliberately NOT in this enum: it is a
+        // TERMINAL, operator-only status reachable exclusively through
+        // [`Self::operator_transition_goal`] (the `goal archive` exit), so
+        // neither the model NOR the user wire path can forge an archive (or
+        // un-archive). Every other status is settable here.
         if requested_status.is_some_and(|status| {
             !matches!(
                 status,
@@ -13772,6 +13919,10 @@ fn group_status_for_goal(status: &str) -> GroupStatus {
         "blocked" => GroupStatus::Blocked,
         "budget_limited" => GroupStatus::BudgetLimited,
         "paused" => GroupStatus::Paused,
+        // #25 — `archived` is a TERMINAL goal status (operator-driven,
+        // irreversible); the roster must render it as a clean stop, never
+        // as a failure or a cancellation.
+        "archived" => GroupStatus::Completed,
         // Anything unrecognised is treated conservatively as a stopped,
         // non-running state rather than Running.
         _ => GroupStatus::Cancelled,
@@ -23429,6 +23580,9 @@ mod tests {
             GroupStatus::BudgetLimited
         );
         assert_eq!(group_status_for_goal("paused"), GroupStatus::Paused);
+        // #25 — `archived` is a terminal stop, rendered as a clean
+        // `Completed` (never Running, never a failure/cancellation).
+        assert_eq!(group_status_for_goal("archived"), GroupStatus::Completed);
         // The core regression across every non-active state: NOT Running.
         for stopped in ["budget_limited", "paused", "blocked"] {
             assert_ne!(
@@ -23444,6 +23598,166 @@ mod tests {
         // Unknown states fall back conservatively to a stopped, non-running
         // status.
         assert_eq!(group_status_for_goal("wat"), GroupStatus::Cancelled);
+    }
+
+    /// #25 — the operator reopen exit: a BLOCKED goal (no model-reachable
+    /// way out, since `MODEL_ALLOWED_TRANSITIONS` only admits
+    /// complete/blocked and the complete gate refuses a blocked goal) is
+    /// reopened to `active` via [`Self::operator_transition_goal`], and can
+    /// then be closed through the normal `goal_update` (model complete)
+    /// path — the state machine has a full blocked → active → complete loop.
+    #[tokio::test]
+    async fn operator_reopen_unblocks_goal_then_model_completes() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-reopen");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        // The model blocks the goal (a model-allowed transition).
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "blocked", "stuck", None)
+            .await
+            .expect("block");
+        // A blocked goal has no model exit: goal_update to complete is gated.
+        // The OPERATOR reopens it.
+        let reopened = orchestrator
+            .operator_transition_goal(&session_id, "tenant-a", "reopen", "operator reopened", None)
+            .expect("operator reopen");
+        assert_eq!(reopened["status"], json!("active"));
+        // After reopen the model can close the goal via goal_update.
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect("complete after reopen");
+        let goal = orchestrator
+            .get_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("get goal");
+        assert_eq!(goal["goal"]["status"], json!("complete"));
+    }
+
+    /// #25 — `archived` is a TERMINAL state: once archived, neither reopen
+    /// nor any further operator/model transition can move the goal.
+    #[test]
+    fn operator_archive_is_terminal_and_irreversible() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-archive");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        let archived = orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                "archive",
+                "operator archived",
+                None,
+            )
+            .expect("archive");
+        assert_eq!(archived["status"], json!("archived"));
+        // Reopen from archived is refused.
+        let reopen =
+            orchestrator.operator_transition_goal(&session_id, "tenant-a", "reopen", "nope", None);
+        assert!(reopen.is_err());
+        // A second archive is refused (idempotence guard).
+        let again = orchestrator.operator_transition_goal(
+            &session_id,
+            "tenant-a",
+            "archive",
+            "again",
+            None,
+        );
+        assert!(again.is_err());
+    }
+
+    /// #25 — reopen refuses the TERMINAL states (`complete`/`archived`) and
+    /// an already-active goal, and never resurrects an over-budget goal as
+    /// `active`.
+    #[test]
+    fn operator_reopen_refuses_terminal_active_and_over_budget() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-refuse");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        // Already active -> nothing to reopen.
+        assert!(
+            orchestrator
+                .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+                .is_err()
+        );
+        // Complete -> reopen refused.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "ship the thing".into(),
+                status: Some("complete".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("complete");
+        assert!(
+            orchestrator
+                .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+                .is_err()
+        );
+        // Over-budget reopen refused: burn the budget, block, then reopen.
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "tiny budget".into(),
+                status: Some("active".into()),
+                token_budget: Some(2_000),
+                transition_actor: None,
+            })
+            .expect("set tiny-budget goal");
+        // Force the record over budget, then block it.
+        {
+            let mut state = orchestrator.state();
+            let key = orchestrator.scoped_goal_key(&session_id);
+            let goal = state.goals.get_mut(&key).unwrap();
+            goal.tokens_used = 2_000;
+            goal.status = "blocked".into();
+        }
+        let err = orchestrator
+            .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+            .unwrap_err();
+        assert!(err.contains("exhausted its token budget"), "{err}");
+    }
+
+    /// #25 钉住实证 — the orchestrator restores goal state from the
+    /// SUPERVISOR EVENT STREAM (`group_registered` metadata.status), NOT from
+    /// the goal-ledger sqlite `goals` table: a blocked goal, persisted, is
+    /// restored as `blocked` on a fresh boot via `configure_supervisor_store`.
+    #[test]
+    fn goal_status_restores_from_supervisor_event_stream() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-restore");
+        // Boot 1: set + block a goal (persisted to the event stream).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("configure store");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        orchestrator
+            .operator_transition_goal(&session_id, "tenant-a", "archive", "archive it", None)
+            .expect("archive");
+        // Boot 2: a FRESH orchestrator loading the same store restores the
+        // archived status from the event stream.
+        let restored = InProcessAgentOrchestrator::default();
+        restored
+            .configure_supervisor_store(dir.path())
+            .expect("reload store");
+        let goal = restored
+            .get_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("get restored goal");
+        assert_eq!(
+            goal["goal"]["status"],
+            json!("archived"),
+            "boot replays the supervisor event stream's metadata.status"
+        );
     }
 
     /// Task 2 (mini5 seq-454 over-budget re-activation): a goal that has
