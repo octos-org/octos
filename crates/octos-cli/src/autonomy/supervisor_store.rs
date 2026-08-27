@@ -792,7 +792,7 @@ impl SupervisorStore {
         Ok(state)
     }
 
-    /// #26a — goal-scoped view of the stream, folded BY GOAL ID.
+    /// #26a — goal-scoped view of the stream, folded BY (session, goal) KEY.
     ///
     /// `load_state`'s `state.groups` map is keyed by GROUP id, and every goal
     /// of one session scope shares the SAME `autonomy-goal:<scope>` group — so
@@ -801,8 +801,23 @@ impl SupervisorStore {
     /// `octos goal list` even though its rows are still in the stream. The
     /// zombie-cleanup path needs to SEE those superseded goals, so this view
     /// scans the raw rows directly (snapshot + ledger tail, same read order
-    /// as `load_state`) and folds the LATEST `group_registered` carrying each
-    /// `goal_id`. Rows that fail to parse are already skipped by the tolerant
+    /// as `load_state`) and folds the LATEST `group_registered` for each
+    /// (session_id, goal_id) pair.
+    ///
+    /// #26a-r1 — the fold key is COMPOSITE: `(session_id, goal_id)`, not the
+    /// bare `goal_id`. #25's contract says duplicate goal ids across sessions
+    /// are REPORTED, never guessed; a single-key fold let a later session's
+    /// registration silently overwrite the earlier one, so `locate_goal`'s
+    /// ambiguity scan could never see two. Folding per (session, goal) keeps
+    /// both registrations in the map, and `locate_goal`'s values() scan then
+    /// counts both and refuses with `ambiguous` as designed. The 26a
+    /// zombie-cleanup semantics are unchanged (a superseded goal of the SAME
+    /// session still has its own key — the view is only MORE complete).
+    ///
+    /// The map key ENCODES the pair as `"<session_id>\u{1}<goal_id>"` (unit
+    /// separator, impossible in either id) so existing `HashMap<String, _>`
+    /// call sites keep compiling; value semantics are per-(session, goal).
+    /// Rows that fail to parse are already skipped by the tolerant
     /// replay (#26a).
     pub fn load_goal_groups_by_id(
         &self,
@@ -811,14 +826,26 @@ impl SupervisorStore {
         let snapshot = self.load_snapshot()?;
         let snapshot_last_sequence = snapshot.as_ref().map_or(0, |s| s.last_sequence);
         // Fold the snapshot's groups first (they carry sequence context via
-        // `last_sequence`), then overlay newer ledger rows.
+        // `last_sequence`), then overlay newer ledger rows. Key is the
+        // composite (session_id, goal_id) — see the doc comment above for
+        // why the bare goal_id must NOT be the key (#26a-r1).
+        let composite_key = |group: &SupervisedGroupRecord| -> Option<String> {
+            let goal_id = group.metadata.get("goal_id")?.as_str()?;
+            let session_id = group
+                .metadata
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Some(format!("{session_id}\u{1}{goal_id}"))
+        };
         let mut by_goal: std::collections::HashMap<String, SupervisedGroupRecord> =
             std::collections::HashMap::new();
         let mut order: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         if let Some(snapshot) = snapshot.as_ref() {
             for group in snapshot.state.groups.values() {
-                if let Some(goal_id) = group.metadata.get("goal_id").and_then(|v| v.as_str()) {
-                    by_goal.insert(goal_id.to_owned(), group.clone());
+                if let Some(key) = composite_key(group) {
+                    order.insert(key.clone(), snapshot_last_sequence);
+                    by_goal.insert(key, group.clone());
                 }
             }
         }
@@ -827,11 +854,11 @@ impl SupervisorStore {
                 continue;
             }
             if let SupervisorEvent::GroupRegistered { group } = &row.event {
-                if let Some(goal_id) = group.metadata.get("goal_id").and_then(|v| v.as_str()) {
-                    let slot = order.entry(goal_id.to_owned()).or_insert(0);
+                if let Some(key) = composite_key(group) {
+                    let slot = order.entry(key.clone()).or_insert(0);
                     if row.sequence >= *slot {
                         *slot = row.sequence;
-                        by_goal.insert(goal_id.to_owned(), group.clone());
+                        by_goal.insert(key, group.clone());
                     }
                 }
             }
@@ -1668,10 +1695,13 @@ mod tests {
             state.groups.contains_key("group-1"),
             "the well-formed row must survive malformed siblings"
         );
-        // The goal-scoped view survives too.
+        // The goal-scoped view survives too (no session_id metadata in this
+        // fixture, so the composite key degenerates to "\u{1}goal_01").
         let by_goal = store.load_goal_groups_by_id().unwrap();
         assert_eq!(
-            by_goal.get("goal_01").map(|g| g.metadata.get("status")),
+            by_goal
+                .get("\u{1}goal_01")
+                .map(|g| g.metadata.get("status")),
             Some(Some(&serde_json::json!("active")))
         );
     }
@@ -1729,24 +1759,29 @@ mod tests {
         );
 
         // The goal-scoped view keeps ALL THREE visible, each with its own
-        // latest status — the zombie-cleanup requirement.
+        // latest status — the zombie-cleanup requirement. Keys are the
+        // composite (session, goal) since #26a-r1; the three goals share
+        // one session, so the count and statuses are unchanged.
+        let session = "octos:local:tui#coding";
+        let sep = char::from_u32(1).expect("unit separator");
+        let key = |goal_id: &str| format!("{session}{sep}{goal_id}");
         let by_goal = store.load_goal_groups_by_id().unwrap();
         assert_eq!(by_goal.len(), 3, "all goals stay visible");
         assert_eq!(
             by_goal
-                .get("goal_01")
+                .get(&key("goal_01"))
                 .and_then(|g| g.metadata.get("status")),
             Some(&serde_json::json!("active"))
         );
         assert_eq!(
             by_goal
-                .get("goal_02")
+                .get(&key("goal_02"))
                 .and_then(|g| g.metadata.get("status")),
             Some(&serde_json::json!("complete"))
         );
         assert_eq!(
             by_goal
-                .get("goal_03")
+                .get(&key("goal_03"))
                 .and_then(|g| g.metadata.get("status")),
             Some(&serde_json::json!("complete"))
         );

@@ -2201,6 +2201,7 @@ impl InProcessAgentOrchestrator {
     /// row + decisions (best-effort, outside the state lock).
     ///
     /// Returns the post-transition goal JSON snapshot.
+    #[cfg_attr(not(test), allow(dead_code))] // tests exercise it; prod call sites land with the goal UI follow-up
     pub(crate) fn operator_transition_goal(
         &self,
         session_id: &SessionKey,
