@@ -249,7 +249,11 @@ impl Tool for PeerHandoffTool {
                     "Staged peer '{name}' (slug {slug}, brief at {brief_path}, cwd {cwd}). \
                      Address it later by name with peer_send_input / peer_close. The user's \
                      client opens it in the background; its result lands on the blackboard \
-                     at peers/{slug}/result.md. Do not wait for it — and do not \
+                     at peers/{slug}/result.md (#27f: when the peer session itself writes \
+                     the final result.md it must ALSO write a one-line sidecar file \
+                     `.result-owner` containing `peer` next to it — that claims \
+                     single-writer ownership and stops the runtime's turn-summary \
+                     copy from clobbering the peer's final version). Do not wait for it — and do not \
                      stop here: if you still have work of your own, continue it \
                      now in this same turn. Only finish if the peer took over \
                      everything that was left.",
