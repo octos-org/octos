@@ -2440,7 +2440,7 @@ impl ChangeReceipt {
 /// index refresh beyond what status itself does; no new dependencies).
 /// `None` when the dir is not a git work tree (receipt silently omitted —
 /// acceptance ④) or git is unavailable (fail-open).
-fn snapshot_dirty_paths(cwd: &Path) -> Option<Vec<String>> {
+pub(crate) fn snapshot_dirty_paths(cwd: &Path) -> Option<Vec<String>> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -2467,9 +2467,12 @@ fn snapshot_dirty_paths(cwd: &Path) -> Option<Vec<String>> {
     )
 }
 
-const CHANGE_RECEIPT_MAX_LISTED: usize = 20;
+pub(crate) const CHANGE_RECEIPT_MAX_LISTED: usize = 20;
 
-fn diff_to_receipt(before: Option<Vec<String>>, after: Option<Vec<String>>) -> Option<String> {
+pub(crate) fn diff_to_receipt(
+    before: Option<Vec<String>>,
+    after: Option<Vec<String>>,
+) -> Option<String> {
     // Either side missing the snapshot ⇒ non-git or fail-open: no receipt.
     let (before, after) = (before?, after?);
     let before_set: std::collections::HashSet<&String> = before.iter().collect();
