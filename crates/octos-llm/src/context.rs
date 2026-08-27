@@ -218,6 +218,27 @@ pub fn estimate_message_tokens(msg: &Message) -> u32 {
 }
 
 #[cfg(test)]
+/// Route-fit guard for failover/fallback dispatch (#2135 round-7 P1):
+/// before re-sending an UNCHANGED request to an alternate route, resolve
+/// that route's readiness (a lazily-probed local provider may still be
+/// reporting its catalog guess) and check the prompt plausibly fits its
+/// window. The min-across-routes sizing accessors bound the envelope at
+/// PROMPT-BUILD time with whatever was resolved then; this guard is the
+/// dispatch-time recheck for routes that resolved smaller afterwards. A
+/// route that cannot fit is SKIPPED like a failed route — an oversized
+/// request would be truncated or rejected server-side anyway, with worse
+/// failure modes than trying the next lane.
+pub(crate) async fn route_fits_request(
+    provider: &std::sync::Arc<dyn crate::provider::LlmProvider>,
+    messages: &[octos_core::Message],
+) -> bool {
+    provider.ensure_ready().await;
+    let window = provider.context_window();
+    let estimated: u32 = messages.iter().map(estimate_message_tokens).sum();
+    let margin = (window / 8).clamp(64, 1024);
+    estimated <= window.saturating_sub(margin)
+}
+
 mod tests {
     use super::*;
 
@@ -482,25 +503,4 @@ mod tests {
         let tokens = estimate_message_tokens(&msg);
         assert_eq!(tokens, estimate_tokens("Hello, how are you today?") + 4);
     }
-}
-
-/// Route-fit guard for failover/fallback dispatch (#2135 round-7 P1):
-/// before re-sending an UNCHANGED request to an alternate route, resolve
-/// that route's readiness (a lazily-probed local provider may still be
-/// reporting its catalog guess) and check the prompt plausibly fits its
-/// window. The min-across-routes sizing accessors bound the envelope at
-/// PROMPT-BUILD time with whatever was resolved then; this guard is the
-/// dispatch-time recheck for routes that resolved smaller afterwards. A
-/// route that cannot fit is SKIPPED like a failed route — an oversized
-/// request would be truncated or rejected server-side anyway, with worse
-/// failure modes than trying the next lane.
-pub(crate) async fn route_fits_request(
-    provider: &std::sync::Arc<dyn crate::provider::LlmProvider>,
-    messages: &[octos_core::Message],
-) -> bool {
-    provider.ensure_ready().await;
-    let window = provider.context_window();
-    let estimated: u32 = messages.iter().map(estimate_message_tokens).sum();
-    let margin = (window / 8).clamp(64, 1024);
-    estimated <= window.saturating_sub(margin)
 }
