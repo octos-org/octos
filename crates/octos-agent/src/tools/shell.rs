@@ -18,6 +18,7 @@ use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::TaskSupervisor;
+use crate::tools::policy::BashFileWrites;
 
 /// Monotonic sequence used to synthesise a `tool_call_id` for background shell
 /// tasks when the caller did not thread one through `ToolContext` (e.g. the
@@ -33,6 +34,8 @@ pub struct ShellTool {
     cwd: std::path::PathBuf,
     /// Policy for command approval.
     policy: Arc<dyn CommandPolicy>,
+    /// #28b — loaded ONCE at construction (never re-read per call).
+    bash_file_writes: crate::tools::policy::BashFileWrites,
     /// Runtime approval behavior for commands that request approval.
     approval_policy: ApprovalPolicy,
     /// Sandbox for command isolation.
@@ -73,6 +76,7 @@ impl ShellTool {
             timeout: Duration::from_secs(120),
             cwd: cwd.into(),
             policy: Arc::new(SafePolicy::default()),
+            bash_file_writes: BashFileWrites::default(),
             approval_policy: ApprovalPolicy::Ask,
             sandbox: Arc::new(NoSandbox),
             task_supervisor: None,
@@ -115,6 +119,12 @@ impl ShellTool {
     }
 
     /// Set a custom command policy.
+    /// #28b — set the bash file-writes knob (defaults to `Allow`).
+    pub fn with_bash_file_writes(mut self, mode: crate::tools::policy::BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
+    }
+
     pub fn with_policy(mut self, policy: Arc<dyn CommandPolicy>) -> Self {
         self.policy = policy;
         self
@@ -907,6 +917,25 @@ impl Tool for ShellTool {
             Some(scope) if scope.workspace() == self.cwd.as_path() => scope.workspace(),
             _ => &self.cwd,
         };
+        // #28b — deny knob: heuristic pre-screen of the command TEXT for
+        // write-shaped shell usage. False negatives are tolerated (the 28a
+        // receipt still shows what actually changed); false positives
+        // escape via a trailing `# octos:allow-write` comment on the
+        // command line (documented escape hatch). The knob was loaded at
+        // construction — no per-call I/O.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !command_allows_write_explicitly(&input.command)
+            && command_looks_like_file_write(&input.command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a file-writing shell command). Use the edit_file / diff_edit tools for code changes instead. If this refusal is a false positive, append the comment `# octos:allow-write` to the command line to run it explicitly. Command: ".to_owned() + &input.command,
+                success: false,
+                ..Default::default()
+            });
+        }
+        // #28a — BEFORE snapshot for the file-change receipt (git-status
+        // level; None on non-git/fail-open omits the receipt entirely).
+        let dirty_before = snapshot_dirty_paths(effective_cwd);
 
         // #20b — main-tree sovereignty: refuse a cross-branch `git checkout`
         // / `git switch` on the owned main tree BEFORE policy, approval, or
@@ -1112,6 +1141,25 @@ impl Tool for ShellTool {
 
                 result_text.push_str(&exit_suffix);
 
+                // #28a — file-change receipt: AFTER snapshot + diff,
+                // appended ONCE to THIS result's tail (never the system
+                // prompt, never a history rewrite — prompt-cache stable).
+                let receipt = diff_to_receipt(dirty_before, snapshot_dirty_paths(effective_cwd));
+                if let Some(receipt) = receipt.as_deref() {
+                    result_text.push_str(receipt);
+                    // #28b — warn knob: nudge ONLY when files actually
+                    // changed (files_changed > 0), sharing the receipt's
+                    // AFTER snapshot (no second git-status scan). Zero
+                    // behavior change under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        result_text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
+                }
+
                 Ok(ToolResult {
                     output: result_text,
                     success: output.status.success(),
@@ -1197,6 +1245,208 @@ mod tests {
     /// run nothing, and a genuinely broken run still fails — just later.
     /// Mirrors `spawn_tests::BACKGROUND_DEADLINE`.
     const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // -----------------------------------------------------------------------
+    // #28b — bash_file_writes knob: three positions, escape hatch, and the
+    // zero-difference-under-default guarantee.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bash_file_writes_default_is_allow_and_serializes_round_trip() {
+        // Config round-trip: absent key deserializes to `allow` (zero-diff
+        // default for existing profiles), and all three values survive.
+        #[derive(serde::Deserialize)]
+        struct Cfg {
+            #[serde(default)]
+            bash_file_writes: crate::tools::policy::BashFileWrites,
+        }
+        let absent: Cfg = serde_json::from_str("{}").expect("absent key");
+        assert_eq!(
+            absent.bash_file_writes,
+            crate::tools::policy::BashFileWrites::Allow
+        );
+        for (raw, want) in [
+            ("allow", crate::tools::policy::BashFileWrites::Allow),
+            ("warn", crate::tools::policy::BashFileWrites::Warn),
+            ("deny", crate::tools::policy::BashFileWrites::Deny),
+        ] {
+            let got: Cfg =
+                serde_json::from_str(&format!("{{\"bash_file_writes\": \"{raw}\"}}")).expect(raw);
+            assert_eq!(got.bash_file_writes, want, "value {raw}");
+        }
+    }
+
+    #[test]
+    fn bash_file_writes_heuristic_matches_write_shapes_only() {
+        for cmd in [
+            "echo hi > /tmp/f",
+            "echo hi >> /tmi/f",
+            "cmd 2> /tmp/f",
+            "cmd &> /tmp/f",
+            "cat <<EOF > f\nhi\nEOF",
+            "printf x | tee /tmp/f",
+            "sed -i s/a/b/ file",
+            "cp a b",
+            "mv a b",
+            "rm file",
+            "mkdir d",
+            "touch f",
+            "truncate -s 0 f",
+            "ln -s a b",
+            "python3 -c 'open(\"f\",\"w\")'",
+            "node -e 'fs.writeFileSync(\"f\",1)'",
+            "dd if=/dev/zero of=f",
+            "git apply p.patch",
+        ] {
+            assert!(command_looks_like_file_write(cmd), "should match: {cmd}");
+        }
+        for cmd in [
+            "ls -la",
+            "cat /etc/hosts",
+            "grep -rn foo crates/",
+            "git status",
+            "git diff --stat",
+            "cargo build -p octos-agent",
+            "cargo test -p octos-agent --lib",
+            "echo hello",
+            "rg --files | head",
+            "sed -n 1,3p file",
+            "python3 --version",
+            "ps aux | grep octos",
+        ] {
+            assert!(
+                !command_looks_like_file_write(cmd),
+                "should NOT match: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_file_writes_escape_hatch_allows_explicit_write() {
+        assert!(command_allows_write_explicitly(
+            "sed -i s/a/b/ file # octos:allow-write"
+        ));
+        assert!(command_allows_write_explicitly(
+            "echo x > /tmp/f # octos:allow-write"
+        ));
+        // Only the LAST line's comment counts as the hatch.
+        assert!(!command_allows_write_explicitly(
+            "# octos:allow-write\nsed -i s/a/b/ file"
+        ));
+        assert!(!command_allows_write_explicitly("sed -i s/a/b/ file"));
+    }
+
+    #[test]
+    fn bash_file_writes_deny_refuses_write_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({
+                "command": "echo hi > /tmp/never-created-28b",
+            })))
+            .expect("execute");
+        assert!(!out.success);
+        assert!(out.output.contains("tool_policy.bash_file_writes=deny"));
+        assert!(out.output.contains("edit_file / diff_edit"));
+        assert!(out.output.contains("# octos:allow-write"));
+        assert!(!std::path::Path::new("/tmp/never-created-28b").exists());
+        std::fs::remove_file("/tmp/never-created-28b").ok();
+    }
+
+    #[test]
+    fn bash_file_writes_deny_lets_readonly_command_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": "echo hello" })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("hello"));
+        assert!(!out.output.contains("bash_file_writes"));
+    }
+
+    #[test]
+    fn bash_file_writes_escape_hatch_runs_under_deny() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("hatch.txt");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let cmd = format!("echo hatch > {:?} # octos:allow-write", target);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": cmd })))
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(target.exists(), "escape hatch must run the write");
+        std::fs::remove_file(&target).ok();
+    }
+
+    #[test]
+    fn bash_file_writes_allow_is_zero_difference() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path());
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({
+                "command": "echo zero-diff",
+            })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("zero-diff"));
+        // No warn nudge, no deny text, no policy mention at all.
+        assert!(!out.output.contains("bash_file_writes"));
+        assert!(!out.output.contains("edit_file / diff_edit"));
+    }
+
+    #[test]
+    fn bash_file_writes_warn_nudges_only_when_files_changed() {
+        // The 28a receipt requires a git repo (fail-open elsewhere), so run
+        // inside an initialized temp repo.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        let tool = super::ShellTool::new(cwd)
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Warn);
+        // Read-only: no nudge (receipt may report files_changed: 0).
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": "echo no-change" })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(
+            !out.output.contains("bash_file_writes=warn"),
+            "output: {}",
+            out.output
+        );
+
+        // Write: receipt present (28a) + nudge appended once.
+        let target = cwd.join("warned.txt");
+        let cmd = format!("echo data > {:?}", target);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": cmd })))
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "receipt should be present: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("bash_file_writes=warn"),
+            "nudge missing: {}",
+            out.output
+        );
+        std::fs::remove_file(&target).ok();
+    }
 
     #[test]
     fn shell_tool_is_exclusive() {
@@ -2068,5 +2318,330 @@ mod tests {
             "expected deny, got: {}",
             result.output
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #28b — bash file-writes knob helpers.
+// ---------------------------------------------------------------------------
+
+/// #28b — escape hatch: a trailing `# octos:allow-write` comment on the
+/// command line explicitly authorizes a write-shaped command under `deny`.
+fn command_allows_write_explicitly(command: &str) -> bool {
+    command
+        .lines()
+        .last()
+        .is_some_and(|last| last.contains("# octos:allow-write"))
+}
+
+/// #28b — heuristic: does this command LOOK like it writes files? A
+/// curated WHITELIST of shapes (documented; false negatives tolerated —
+/// the 28a receipt still reports what actually changed):
+///   * shell redirection to a file: `> file`, `>> file`, `2> file`, `&> file`
+///   * `tee file` / `tee -a file`
+///   * in-place editors: `sed -i`, `gawk -i`, `perl -pi`, `ruby -pi`
+///   * `cp`/`mv`/`rm`/`mkdir`/`touch`/`truncate`/`ln` with a non-flag arg
+///   * heredocs: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`
+///   * `python -c`/`python3 -c`/`node -e` whose payload mentions
+///     open(...,"w") / fs.write — the two dominant scripted-write shapes
+///   * `dd of=`, `install`, `patch <`, `git apply`, `unzip -o`, `tar -x`
+fn command_looks_like_file_write(command: &str) -> bool {
+    // Redirections (single-line scan; quotes rarely wrap the target).
+    for token_hint in [">>", " 2> ", "&> ", "> ", ">/"] {
+        if command.contains(token_hint) {
+            return true;
+        }
+    }
+    if command.contains("<<") {
+        return true; // heredoc (covers <<- / <<' / <<" variants).
+    }
+    let lowered = command.to_ascii_lowercase();
+    for kw in [
+        " tee ",
+        "tee -a",
+        "sed -i",
+        "sed --in-place",
+        "gawk -i",
+        "perl -pi",
+        "perl -i",
+        "ruby -pi",
+        "dd of=",
+        " of=",
+        " install ",
+        "patch <",
+        "git apply",
+        "unzip -o",
+        "tar -x",
+    ] {
+        if lowered.contains(kw) {
+            return true;
+        }
+    }
+    // Mutating coreutils with a non-flag argument (flags skipped so
+    // `truncate -s 0 f` matches, while `grep -rn foo` style stays clean —
+    // the keyword list itself disambiguates).
+    for kw in ["cp ", "mv ", "rm ", "mkdir ", "touch ", "truncate ", "ln "] {
+        if let Some((_, rest)) = lowered.split_once(kw) {
+            let has_operand = rest.split_whitespace().any(|w| !w.starts_with('-'));
+            if has_operand {
+                return true;
+            }
+        }
+    }
+    // Scripted writes via `python -c` / `node -e`.
+    if (lowered.contains("python -c")
+        || lowered.contains("python3 -c")
+        || lowered.contains("node -e"))
+        && ((lowered.contains("open(") && lowered.contains("\"w"))
+            || lowered.contains("fs.write")
+            || lowered.contains("writefilesync"))
+    {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// #28a — file-change receipt: a `git status`-level dirty-diff taken before
+// and after the command, appended ONCE to THIS tool result's tail.
+// ---------------------------------------------------------------------------
+
+/// #28a — one entry of the working-tree dirty set (`git status --porcelain`
+/// line, path made repo-relative). No timestamps, no timings, no absolute
+/// paths — the receipt must stay noise-free for the model and for prompt-
+/// cache stability (it lives only in the tool result, never in the system
+/// prompt and never rewriting history).
+#[derive(Debug, Clone)]
+struct ChangeReceipt {
+    files_changed: usize,
+    listed: Vec<String>,
+    truncated: bool,
+}
+
+impl ChangeReceipt {
+    fn render(&self) -> String {
+        let mut out = format!("\nfiles_changed: {}", self.files_changed);
+        for path in &self.listed {
+            out.push_str("\n  ");
+            out.push_str(path);
+        }
+        if self.truncated {
+            out.push_str(&format!(
+                "\n  (+{} more; not listed)",
+                self.files_changed - self.listed.len()
+            ));
+        }
+        out
+    }
+}
+
+/// #28a — snapshot the repo-relative dirty paths (modified + untracked,
+/// i.e. `git status --porcelain` lines) at `git status` cost (ms-scale, no
+/// index refresh beyond what status itself does; no new dependencies).
+/// `None` when the dir is not a git work tree (receipt silently omitted —
+/// acceptance ④) or git is unavailable (fail-open).
+fn snapshot_dirty_paths(cwd: &Path) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // not a git work tree (or git absent) — omit silently.
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Keep the RAW porcelain line ("XY PATH") so the diff can compare status
+    // flips; strip only a rename's "ORIG -> " to keep the destination side.
+    Some(
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let path = line.get(3..).unwrap_or("").trim();
+                match path.split_once(" -> ") {
+                    Some((_, dst)) => format!("{} {}", &line[..2], dst),
+                    None => line.to_owned(),
+                }
+            })
+            .collect(),
+    )
+}
+
+const CHANGE_RECEIPT_MAX_LISTED: usize = 20;
+
+fn diff_to_receipt(before: Option<Vec<String>>, after: Option<Vec<String>>) -> Option<String> {
+    // Either side missing the snapshot ⇒ non-git or fail-open: no receipt.
+    let (before, after) = (before?, after?);
+    let before_set: std::collections::HashSet<&String> = before.iter().collect();
+    // CHANGED = after-line not present verbatim in before (new file OR a
+    // status flip on the same path — both are real tree changes).
+    let mut changed: Vec<String> = after
+        .iter()
+        .filter(|line| !before_set.contains(*line))
+        .map(|line| line.get(3..).unwrap_or(line.as_str()).trim().to_owned())
+        .collect();
+    if changed.is_empty() {
+        return Some("\nfiles_changed: 0".to_owned());
+    }
+    let total = changed.len();
+    changed.sort();
+    changed.dedup();
+    let truncated = total > CHANGE_RECEIPT_MAX_LISTED;
+    let listed: Vec<String> = changed
+        .into_iter()
+        .take(CHANGE_RECEIPT_MAX_LISTED)
+        .collect();
+    Some(
+        ChangeReceipt {
+            files_changed: total,
+            listed,
+            truncated,
+        }
+        .render(),
+    )
+}
+
+#[cfg(test)]
+mod change_receipt_tests {
+    use super::*;
+
+    fn init_repo(dir: &std::path::Path) {
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        // seed + commit so status has a baseline tree.
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["commit", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// ① real edit → receipt lists exactly that file (repo-relative).
+    #[test]
+    fn real_edit_lists_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert!(receipt.contains("files_changed: 1"), "receipt: {receipt}");
+        assert!(
+            receipt.contains("src/lib.rs"),
+            "lists the relative path: {receipt}"
+        );
+        // noise-free: no timestamps/durations/absolute tmp paths.
+        assert!(!receipt.contains(&dir.path().display().to_string()));
+    }
+
+    /// ② phantom edit (zero-match replace) → files_changed: 0.
+    #[test]
+    fn phantom_edit_reports_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        // zero-match replace — touches nothing (no file is read or written).
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert_eq!(receipt.trim(), "files_changed: 0");
+    }
+
+    /// ③ a `target/` build artifact never appears — .gitignore filters it.
+    #[test]
+    fn gitignored_paths_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", ".gitignore"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["commit", "-m", "ignore"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/artifact.bin"), b"x").unwrap();
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert_eq!(
+            receipt.trim(),
+            "files_changed: 0",
+            "target/ excluded: {receipt}"
+        );
+    }
+
+    /// ④ non-git dir → no receipt, no error (snapshot None ⇒ omitted).
+    #[test]
+    fn non_git_dir_omits_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(snapshot_dirty_paths(dir.path()).is_none());
+        assert!(diff_to_receipt(None, None).is_none());
+    }
+
+    /// ⑤ cap: >20 changed files list 20 + "(+N more; not listed)".
+    #[test]
+    fn listing_caps_at_twenty_with_total() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("many")).unwrap();
+        for i in 0..25 {
+            std::fs::write(dir.path().join(format!("many/f{i}.txt")), "x\n").unwrap();
+        }
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert!(
+            receipt.contains("files_changed: 25"),
+            "total counted: {receipt}"
+        );
+        assert!(
+            receipt.contains("more; not listed"),
+            "truncation marker: {receipt}"
+        );
+        let listed_count = receipt
+            .lines()
+            .filter(|l| l.trim_start().starts_with("many/"))
+            .count();
+        assert_eq!(listed_count, 20, "exactly 20 listed (cap): {receipt}");
     }
 }

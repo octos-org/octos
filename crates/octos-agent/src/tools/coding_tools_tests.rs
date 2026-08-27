@@ -2203,6 +2203,7 @@ fn bash_is_filtered_when_policy_denies_runtime_group() {
         allow: vec![],
         deny: vec!["group:runtime".into()],
         require_tags: vec![],
+        bash_file_writes: Default::default(),
     };
     registry.apply_policy(&policy);
     assert!(
@@ -2229,6 +2230,7 @@ fn delegate_is_filtered_when_policy_denies_sessions_group() {
         allow: vec![],
         deny: vec!["group:sessions".into()],
         require_tags: vec![],
+        bash_file_writes: Default::default(),
     };
     registry.apply_policy(&policy);
     assert!(
