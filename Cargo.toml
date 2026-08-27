@@ -40,7 +40,6 @@ members = [
     "crates/octos-wasm",
     "crates/octos-pyo3",
 ]
-
 [workspace.package]
 version = "2.0.3-rc.9"
 edition = "2024"
@@ -48,10 +47,8 @@ rust-version = "1.85.0"
 authors = ["octos team"]
 license = "Apache-2.0"
 repository = "https://github.com/octos-org/octos"
-
 [workspace.lints.rust]
 unsafe_code = "deny"
-
 [workspace.dependencies]
 # Internal crates
 octos-core = { path = "crates/octos-core" }
@@ -70,24 +67,20 @@ octos-swarm = { path = "crates/octos-swarm" }
 octos-fleet = { path = "crates/octos-fleet" }
 octos-fleet-worker = { path = "crates/octos-fleet-worker" }
 octos-embed-llama = { path = "crates/octos-embed-llama" }
-
 # codex-rs crates (reused)
 codex-execpolicy = { git = "https://github.com/openai/codex", path = "codex-rs/execpolicy" }
 codex-state = { git = "https://github.com/openai/codex", path = "codex-rs/state" }
 codex-file-search = { git = "https://github.com/openai/codex", path = "codex-rs/file-search" }
 codex-linux-sandbox = { git = "https://github.com/openai/codex", path = "codex-rs/linux-sandbox" }
-
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
-
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
 toml = "0.8"
 base64 = "0.22"
-
 # Crypto
 md-5 = "0.10"
 sha2 = "0.10"
@@ -100,11 +93,9 @@ subtle = "2"
 # JWT signing for Google service-account (Vertex AI) auth. Uses `ring`
 # (already in tree via rustls) for RS256 — no OpenSSL.
 jsonwebtoken = "9"
-
 # Error handling (dora-rs pattern)
 eyre = "0.6"
 color-eyre = "0.6"
-
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -112,43 +103,33 @@ colored = "2"
 dirs = "5"
 rustyline = "15"
 open = "5"
-
 # Keychain (platform-native secure credential storage)
 keyring = { version = "3", default-features = false }
-
 # HTTP client (using rustls for pure Rust, no OpenSSL)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "multipart"] }
 htmd = "0.5"
-
 # Database (pure Rust)
 redb = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 bincode = "1"
-
 # Vector search
 hnsw_rs = "0.3"
-
 # Git (native, feature-gated)
 gix = { version = "0.79", default-features = false, features = ["max-performance-safe", "revision", "blob-diff"] }
-
 # AST parsing (feature-gated)
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
-
 # Diff
 similar = "2"
-
 # Office file manipulation (DOCX/PPTX/XLSX are ZIP+XML)
 zip = "2"
 quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-
 # PDF text extraction (pure Rust; read_file auto-detects %PDF- magic)
 pdf-extract = "0.9"
-
 # Audio decoding (pure Rust)
 # WAV: always-on (small dep, used by AudioNonSilent validator on .wav files).
 # MP3: gated behind the `audio_mp3` feature on octos-agent so non-audio
@@ -157,7 +138,6 @@ pdf-extract = "0.9"
 # rather than silently passing.
 hound = "3"
 symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
-
 # Unix-specific (O_NOFOLLOW for symlink-safe file I/O)
 libc = "0.2"
 # Safe openat/mkdirat for the #1976 write-grant component-wise confined walk
@@ -165,37 +145,29 @@ libc = "0.2"
 # lint — rustix wraps the raw syscalls in a safe API). Already vendored
 # transitively; pinned here as a direct dep of octos-agent.
 rustix = { version = "1", features = ["fs"] }
-
 # LRU cache
 lru = "0.16"
-
 # File search
 glob = "0.3"
 globset = "0.4"
 regex = "1"
 ignore = "0.4"
-
 # Cron expressions
 cron = "0.15"
-
 # Time and IDs
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-
 # Async utilities
 futures = "0.3"
-
 # Browser automation
 chromiumoxide = "0.9"
 which = "7"
-
 # Channel integrations (optional, pulled in via feature flags)
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 serenity = { version = "0.12", default-features = false, features = ["rustls_backend", "gateway", "client", "http", "model"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
-
 # Email channel (optional)
 async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
 tokio-rustls = { version = "0.26", default-features = false }
@@ -204,37 +176,30 @@ rustls-native-certs = "0.8"
 webpki-roots = "0.26"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 mailparse = "0.16"
-
 # Web API (optional)
 axum = { version = "0.8", features = ["multipart", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rust-embed = "8"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
-
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-
 # Archive extraction
 flate2 = "1"
 qrcode = { version = "0.14", default-features = false }
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
 tar = "0.4"
-
 tower = { version = "0.5", features = ["util"] }
-
 # URL parsing
 url = "2"
-
 # Testing
 tokio-test = "0.4"
 tempfile = "3"
 proptest = "1.11"
 wiremock = "0.6"
-
 # -- Release configuration --------------------------------------------------
 [workspace.metadata.release]
 shared-version = true

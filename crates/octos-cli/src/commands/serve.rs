@@ -604,11 +604,11 @@ impl ServeCommand {
                     // A guaranteed clean, un-colored stderr line the octoscode
                     // client greps on child-exit (color-eyre's rendering of the
                     // returned error may interleave ANSI, so don't rely on it).
-                    eprintln!(
+                    let _ = super::serve_console::print_stderr(&format!(
                         "{DATA_DIR_LOCKED_MARKER}: another octos server already owns data \
                          directory {}",
                         data_dir.display()
-                    );
+                    ));
                 }
                 return Err(error);
             }
@@ -1774,18 +1774,23 @@ impl ServeCommand {
             tracing::info!(count = enabled_count, "gateway profiles auto-started");
         }
 
-        println!("{}", "octos API server".cyan().bold());
-        println!("{}: http://{}", "Listening".green(), addr);
-        println!("{}: http://{}/app/", "App".green(), addr);
-        println!("{}: http://{}/admin/", "Admin dashboard".green(), addr);
+        use super::serve_console;
+        let _ = serve_console::print_stdout(&format!("{}", "octos API server".cyan().bold()));
+        let _ = serve_console::print_stdout(&format!("{}: http://{}", "Listening".green(), addr));
+        let _ = serve_console::print_stdout(&format!("{}: http://{}/app/", "App".green(), addr));
+        let _ = serve_console::print_stdout(&format!(
+            "{}: http://{}/admin/",
+            "Admin dashboard".green(),
+            addr
+        ));
         if enabled_count > 0 {
-            println!(
+            let _ = serve_console::print_stdout(&format!(
                 "{}: {} profiles auto-started",
                 "Gateways".green(),
                 enabled_count
-            );
+            ));
         }
-        println!();
+        let _ = serve_console::print_stdout("");
 
         axum::serve(
             listener,
@@ -1793,18 +1798,18 @@ impl ServeCommand {
         )
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
-            println!();
-            println!("{}", "Shutting down server...".yellow());
+            let _ = serve_console::print_stdout("");
+            let _ = serve_console::print_stdout(&format!("{}", "Shutting down server...".yellow()));
         })
         .await?;
 
         // Stop all gateway child processes before exiting
         tracing::info!("stopping all gateway child processes");
-        println!("{}", "Stopping gateways...".yellow());
+        let _ = serve_console::print_stdout(&format!("{}", "Stopping gateways...".yellow()));
         let stopped = process_manager.stop_all().await;
         if stopped > 0 {
             tracing::info!(count = stopped, "gateways stopped");
-            println!("  stopped {} gateway(s)", stopped);
+            let _ = serve_console::print_stdout(&format!("  stopped {} gateway(s)", stopped));
         }
 
         // Force exit — background tokio tasks (profile watcher, auth cleanup,
