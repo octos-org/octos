@@ -8,6 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::sandbox::{MountMode, SandboxConfig, SandboxMode};
+use crate::tools::policy::BashFileWrites;
 
 /// Decision for a command execution request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +152,10 @@ pub struct EffectivePermissions {
     pub filesystem_scope: FilesystemScope,
     pub file_access: FileAccessMode,
     pub network: NetworkPolicy,
+    /// #28d — the bash-file-writes knob carried from the session's
+    /// ToolPolicy at LOAD time (default `allow` = zero behavior change).
+    /// Consumed by the registry when it constructs the shell-family tools.
+    pub bash_file_writes: BashFileWrites,
 }
 
 impl Default for EffectivePermissions {
@@ -168,6 +173,7 @@ impl EffectivePermissions {
             filesystem_scope: FilesystemScope::Workspace,
             file_access: FileAccessMode::ReadWrite,
             network: NetworkPolicy::Inherit,
+            bash_file_writes: BashFileWrites::default(),
         }
     }
 
@@ -179,6 +185,7 @@ impl EffectivePermissions {
             filesystem_scope: FilesystemScope::Workspace,
             file_access: FileAccessMode::ReadOnly,
             network: NetworkPolicy::Inherit,
+            bash_file_writes: BashFileWrites::default(),
         }
     }
 
@@ -190,6 +197,7 @@ impl EffectivePermissions {
             filesystem_scope: FilesystemScope::Host,
             file_access: FileAccessMode::ReadWrite,
             network: NetworkPolicy::Allowed,
+            bash_file_writes: BashFileWrites::default(),
         }
     }
 

@@ -30,6 +30,7 @@ use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, FileAccessMode, Fil
 use crate::sandbox::Sandbox;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::{RelaunchOpts, TaskRelaunchError, TaskStatus};
+use crate::tools::policy::BashFileWrites;
 
 const MAX_EXEC_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
@@ -295,6 +296,9 @@ struct ExecCommandInput {
 }
 
 pub struct ExecCommandTool {
+    /// #28d — bash file-writes knob (shared judge/escape-hatch; see
+    /// `super::shell`), loaded ONCE at construction.
+    bash_file_writes: BashFileWrites,
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
     policy: Arc<dyn CommandPolicy>,
@@ -310,7 +314,14 @@ impl ExecCommandTool {
             policy: Arc::new(crate::policy::SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
             sandbox,
+            bash_file_writes: BashFileWrites::default(),
         }
+    }
+
+    /// #28d — set the bash file-writes knob (defaults to `allow`).
+    pub fn with_bash_file_writes(mut self, mode: BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
     }
 
     pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
@@ -417,6 +428,26 @@ impl ExecCommandTool {
             .timeout_secs
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
+        // #28d — deny knob on the CODING bash path: same heuristic judge
+        // and escape hatch as ShellTool (single shared implementation in
+        // `super::shell`), loaded at construction. A refusal happens BEFORE
+        // any spawn/approval/snapshot.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a \
+                         file-writing shell command). Use the edit_file / diff_edit tools for \
+                         code changes instead. If this refusal is a false positive, append the \
+                         comment `# octos:allow-write` to the command line to run it \
+                         explicitly. Command: "
+                    .to_owned()
+                    + &command,
+                success: false,
+                ..Default::default()
+            });
+        }
         // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
         // prefix (the coding-session idiom) makes X the root; otherwise the
         // session workdir. Prevents the false `files_changed: 0` on writes
@@ -482,6 +513,16 @@ impl ExecCommandTool {
                 ) {
                     text.push_str(&receipt);
                     text.push_str(&format!("\nscope: {receipt_scope}"));
+                    // #28d — warn knob: nudge ONLY when files actually
+                    // changed (same after-snapshot as the receipt; no
+                    // second scan). Zero behavior under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
                 }
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
                 Ok(ToolResult {
@@ -1752,6 +1793,10 @@ pub struct BashTool {
     policy: Arc<dyn CommandPolicy>,
     approval_policy: ApprovalPolicy,
     sandbox: Arc<dyn Sandbox>,
+    /// #28d — the bash-file-writes knob, loaded ONCE at construction from
+    /// the session's ToolPolicy (never re-read per call). Shared
+    /// judge/escape-hatch with ShellTool — see `super::shell`.
+    bash_file_writes: BashFileWrites,
 }
 
 impl BashTool {
@@ -1762,9 +1807,15 @@ impl BashTool {
             policy: Arc::new(crate::policy::SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
             sandbox,
+            bash_file_writes: BashFileWrites::default(),
         }
     }
 
+    /// #28d — set the bash file-writes knob (defaults to `allow`).
+    pub fn with_bash_file_writes(mut self, mode: BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
+    }
     pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
         self.filesystem_scope = filesystem_scope;
         self
@@ -1785,6 +1836,10 @@ impl BashTool {
 impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn description(&self) -> &str {
@@ -1867,6 +1922,27 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
             .clamp(1, MAX_BASH_TIMEOUT_SECS);
 
+        // #28d — deny knob on the CODING bash path: same heuristic judge
+        // and escape hatch as ShellTool (single shared implementation in
+        // `super::shell`), loaded at construction. A refusal happens BEFORE
+        // any spawn/snapshot.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a \
+                         file-writing shell command). Use the edit_file / diff_edit tools for \
+                         code changes instead. If this refusal is a false positive, append the \
+                         comment `# octos:allow-write` to the command line to run it \
+                         explicitly. Command: "
+                    .to_owned()
+                    + &command,
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
         // prefix (the coding-session idiom) makes X the root; otherwise the
         // session workdir. Prevents the false `files_changed: 0` on writes
@@ -1938,6 +2014,16 @@ impl Tool for BashTool {
                 ) {
                     text.push_str(&receipt);
                     text.push_str(&format!("\nscope: {receipt_scope}"));
+                    // #28d — warn knob: nudge ONLY when files actually
+                    // changed (same after-snapshot as the receipt; no
+                    // second scan). Zero behavior under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
                 }
                 Ok(ToolResult {
                     output: truncate_output(text, MAX_CAPTURE_BYTES),

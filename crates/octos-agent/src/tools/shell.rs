@@ -1981,7 +1981,7 @@ mod tests {
 
 /// #28b — escape hatch: a trailing `# octos:allow-write` comment on the
 /// command line explicitly authorizes a write-shaped command under `deny`.
-fn command_allows_write_explicitly(command: &str) -> bool {
+pub(crate) fn command_allows_write_explicitly(command: &str) -> bool {
     command
         .lines()
         .last()
@@ -1999,7 +1999,7 @@ fn command_allows_write_explicitly(command: &str) -> bool {
 ///   * `python -c`/`python3 -c`/`node -e` whose payload mentions
 ///     open(...,"w") / fs.write — the two dominant scripted-write shapes
 ///   * `dd of=`, `install`, `patch <`, `git apply`, `unzip -o`, `tar -x`
-fn command_looks_like_file_write(command: &str) -> bool {
+pub(crate) fn command_looks_like_file_write(command: &str) -> bool {
     // Redirections (single-line scan; quotes rarely wrap the target).
     for token_hint in [">>", " 2> ", "&> ", "> ", ">/"] {
         if command.contains(token_hint) {
