@@ -18,6 +18,7 @@ use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::TaskSupervisor;
+use crate::tools::policy::BashFileWrites;
 
 /// Monotonic sequence used to synthesise a `tool_call_id` for background shell
 /// tasks when the caller did not thread one through `ToolContext` (e.g. the
@@ -33,6 +34,8 @@ pub struct ShellTool {
     cwd: std::path::PathBuf,
     /// Policy for command approval.
     policy: Arc<dyn CommandPolicy>,
+    /// #28b — loaded ONCE at construction (never re-read per call).
+    bash_file_writes: crate::tools::policy::BashFileWrites,
     /// Runtime approval behavior for commands that request approval.
     approval_policy: ApprovalPolicy,
     /// Sandbox for command isolation.
@@ -73,6 +76,7 @@ impl ShellTool {
             timeout: Duration::from_secs(120),
             cwd: cwd.into(),
             policy: Arc::new(SafePolicy::default()),
+            bash_file_writes: BashFileWrites::default(),
             approval_policy: ApprovalPolicy::Ask,
             sandbox: Arc::new(NoSandbox),
             task_supervisor: None,
@@ -115,6 +119,12 @@ impl ShellTool {
     }
 
     /// Set a custom command policy.
+    /// #28b — set the bash file-writes knob (defaults to `Allow`).
+    pub fn with_bash_file_writes(mut self, mode: crate::tools::policy::BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
+    }
+
     pub fn with_policy(mut self, policy: Arc<dyn CommandPolicy>) -> Self {
         self.policy = policy;
         self
@@ -698,6 +708,22 @@ impl Tool for ShellTool {
             Some(scope) if scope.workspace() == self.cwd.as_path() => scope.workspace(),
             _ => &self.cwd,
         };
+        // #28b — deny knob: heuristic pre-screen of the command TEXT for
+        // write-shaped shell usage. False negatives are tolerated (the 28a
+        // receipt still shows what actually changed); false positives
+        // escape via a trailing `# octos:allow-write` comment on the
+        // command line (documented escape hatch). The knob was loaded at
+        // construction — no per-call I/O.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !command_allows_write_explicitly(&input.command)
+            && command_looks_like_file_write(&input.command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a file-writing shell command). Use the edit_file / diff_edit tools for code changes instead. If this refusal is a false positive, append the comment `# octos:allow-write` to the command line to run it explicitly. Command: ".to_owned() + &input.command,
+                success: false,
+                ..Default::default()
+            });
+        }
         // #28a — BEFORE snapshot for the file-change receipt (git-status
         // level; None on non-git/fail-open omits the receipt entirely).
         let dirty_before = snapshot_dirty_paths(effective_cwd);
@@ -886,10 +912,20 @@ impl Tool for ShellTool {
                 // #28a — file-change receipt: AFTER snapshot + diff,
                 // appended ONCE to THIS result's tail (never the system
                 // prompt, never a history rewrite — prompt-cache stable).
-                if let Some(receipt) =
-                    diff_to_receipt(dirty_before, snapshot_dirty_paths(effective_cwd))
-                {
-                    result_text.push_str(&receipt);
+                let receipt = diff_to_receipt(dirty_before, snapshot_dirty_paths(effective_cwd));
+                if let Some(receipt) = receipt.as_deref() {
+                    result_text.push_str(receipt);
+                    // #28b — warn knob: nudge ONLY when files actually
+                    // changed (files_changed > 0), sharing the receipt's
+                    // AFTER snapshot (no second git-status scan). Zero
+                    // behavior change under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        result_text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
                 }
 
                 Ok(ToolResult {
@@ -977,6 +1013,208 @@ mod tests {
     /// run nothing, and a genuinely broken run still fails — just later.
     /// Mirrors `spawn_tests::BACKGROUND_DEADLINE`.
     const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // -----------------------------------------------------------------------
+    // #28b — bash_file_writes knob: three positions, escape hatch, and the
+    // zero-difference-under-default guarantee.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bash_file_writes_default_is_allow_and_serializes_round_trip() {
+        // Config round-trip: absent key deserializes to `allow` (zero-diff
+        // default for existing profiles), and all three values survive.
+        #[derive(serde::Deserialize)]
+        struct Cfg {
+            #[serde(default)]
+            bash_file_writes: crate::tools::policy::BashFileWrites,
+        }
+        let absent: Cfg = serde_json::from_str("{}").expect("absent key");
+        assert_eq!(
+            absent.bash_file_writes,
+            crate::tools::policy::BashFileWrites::Allow
+        );
+        for (raw, want) in [
+            ("allow", crate::tools::policy::BashFileWrites::Allow),
+            ("warn", crate::tools::policy::BashFileWrites::Warn),
+            ("deny", crate::tools::policy::BashFileWrites::Deny),
+        ] {
+            let got: Cfg =
+                serde_json::from_str(&format!("{{\"bash_file_writes\": \"{raw}\"}}")).expect(raw);
+            assert_eq!(got.bash_file_writes, want, "value {raw}");
+        }
+    }
+
+    #[test]
+    fn bash_file_writes_heuristic_matches_write_shapes_only() {
+        for cmd in [
+            "echo hi > /tmp/f",
+            "echo hi >> /tmi/f",
+            "cmd 2> /tmp/f",
+            "cmd &> /tmp/f",
+            "cat <<EOF > f\nhi\nEOF",
+            "printf x | tee /tmp/f",
+            "sed -i s/a/b/ file",
+            "cp a b",
+            "mv a b",
+            "rm file",
+            "mkdir d",
+            "touch f",
+            "truncate -s 0 f",
+            "ln -s a b",
+            "python3 -c 'open(\"f\",\"w\")'",
+            "node -e 'fs.writeFileSync(\"f\",1)'",
+            "dd if=/dev/zero of=f",
+            "git apply p.patch",
+        ] {
+            assert!(command_looks_like_file_write(cmd), "should match: {cmd}");
+        }
+        for cmd in [
+            "ls -la",
+            "cat /etc/hosts",
+            "grep -rn foo crates/",
+            "git status",
+            "git diff --stat",
+            "cargo build -p octos-agent",
+            "cargo test -p octos-agent --lib",
+            "echo hello",
+            "rg --files | head",
+            "sed -n 1,3p file",
+            "python3 --version",
+            "ps aux | grep octos",
+        ] {
+            assert!(
+                !command_looks_like_file_write(cmd),
+                "should NOT match: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_file_writes_escape_hatch_allows_explicit_write() {
+        assert!(command_allows_write_explicitly(
+            "sed -i s/a/b/ file # octos:allow-write"
+        ));
+        assert!(command_allows_write_explicitly(
+            "echo x > /tmp/f # octos:allow-write"
+        ));
+        // Only the LAST line's comment counts as the hatch.
+        assert!(!command_allows_write_explicitly(
+            "# octos:allow-write\nsed -i s/a/b/ file"
+        ));
+        assert!(!command_allows_write_explicitly("sed -i s/a/b/ file"));
+    }
+
+    #[test]
+    fn bash_file_writes_deny_refuses_write_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({
+                "command": "echo hi > /tmp/never-created-28b",
+            })))
+            .expect("execute");
+        assert!(!out.success);
+        assert!(out.output.contains("tool_policy.bash_file_writes=deny"));
+        assert!(out.output.contains("edit_file / diff_edit"));
+        assert!(out.output.contains("# octos:allow-write"));
+        assert!(!std::path::Path::new("/tmp/never-created-28b").exists());
+        std::fs::remove_file("/tmp/never-created-28b").ok();
+    }
+
+    #[test]
+    fn bash_file_writes_deny_lets_readonly_command_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": "echo hello" })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("hello"));
+        assert!(!out.output.contains("bash_file_writes"));
+    }
+
+    #[test]
+    fn bash_file_writes_escape_hatch_runs_under_deny() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("hatch.txt");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let cmd = format!("echo hatch > {:?} # octos:allow-write", target);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": cmd })))
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(target.exists(), "escape hatch must run the write");
+        std::fs::remove_file(&target).ok();
+    }
+
+    #[test]
+    fn bash_file_writes_allow_is_zero_difference() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path());
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({
+                "command": "echo zero-diff",
+            })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("zero-diff"));
+        // No warn nudge, no deny text, no policy mention at all.
+        assert!(!out.output.contains("bash_file_writes"));
+        assert!(!out.output.contains("edit_file / diff_edit"));
+    }
+
+    #[test]
+    fn bash_file_writes_warn_nudges_only_when_files_changed() {
+        // The 28a receipt requires a git repo (fail-open elsewhere), so run
+        // inside an initialized temp repo.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        let tool = super::ShellTool::new(cwd)
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Warn);
+        // Read-only: no nudge (receipt may report files_changed: 0).
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": "echo no-change" })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(
+            !out.output.contains("bash_file_writes=warn"),
+            "output: {}",
+            out.output
+        );
+
+        // Write: receipt present (28a) + nudge appended once.
+        let target = cwd.join("warned.txt");
+        let cmd = format!("echo data > {:?}", target);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": cmd })))
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "receipt should be present: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("bash_file_writes=warn"),
+            "nudge missing: {}",
+            out.output
+        );
+        std::fs::remove_file(&target).ok();
+    }
 
     #[test]
     fn shell_tool_is_exclusive() {
@@ -1735,6 +1973,86 @@ mod tests {
             result.output
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #28b — bash file-writes knob helpers.
+// ---------------------------------------------------------------------------
+
+/// #28b — escape hatch: a trailing `# octos:allow-write` comment on the
+/// command line explicitly authorizes a write-shaped command under `deny`.
+fn command_allows_write_explicitly(command: &str) -> bool {
+    command
+        .lines()
+        .last()
+        .is_some_and(|last| last.contains("# octos:allow-write"))
+}
+
+/// #28b — heuristic: does this command LOOK like it writes files? A
+/// curated WHITELIST of shapes (documented; false negatives tolerated —
+/// the 28a receipt still reports what actually changed):
+///   * shell redirection to a file: `> file`, `>> file`, `2> file`, `&> file`
+///   * `tee file` / `tee -a file`
+///   * in-place editors: `sed -i`, `gawk -i`, `perl -pi`, `ruby -pi`
+///   * `cp`/`mv`/`rm`/`mkdir`/`touch`/`truncate`/`ln` with a non-flag arg
+///   * heredocs: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`
+///   * `python -c`/`python3 -c`/`node -e` whose payload mentions
+///     open(...,"w") / fs.write — the two dominant scripted-write shapes
+///   * `dd of=`, `install`, `patch <`, `git apply`, `unzip -o`, `tar -x`
+fn command_looks_like_file_write(command: &str) -> bool {
+    // Redirections (single-line scan; quotes rarely wrap the target).
+    for token_hint in [">>", " 2> ", "&> ", "> ", ">/"] {
+        if command.contains(token_hint) {
+            return true;
+        }
+    }
+    if command.contains("<<") {
+        return true; // heredoc (covers <<- / <<' / <<" variants).
+    }
+    let lowered = command.to_ascii_lowercase();
+    for kw in [
+        " tee ",
+        "tee -a",
+        "sed -i",
+        "sed --in-place",
+        "gawk -i",
+        "perl -pi",
+        "perl -i",
+        "ruby -pi",
+        "dd of=",
+        " of=",
+        " install ",
+        "patch <",
+        "git apply",
+        "unzip -o",
+        "tar -x",
+    ] {
+        if lowered.contains(kw) {
+            return true;
+        }
+    }
+    // Mutating coreutils with a non-flag argument (flags skipped so
+    // `truncate -s 0 f` matches, while `grep -rn foo` style stays clean —
+    // the keyword list itself disambiguates).
+    for kw in ["cp ", "mv ", "rm ", "mkdir ", "touch ", "truncate ", "ln "] {
+        if let Some((_, rest)) = lowered.split_once(kw) {
+            let has_operand = rest.split_whitespace().any(|w| !w.starts_with('-'));
+            if has_operand {
+                return true;
+            }
+        }
+    }
+    // Scripted writes via `python -c` / `node -e`.
+    if (lowered.contains("python -c")
+        || lowered.contains("python3 -c")
+        || lowered.contains("node -e"))
+        && ((lowered.contains("open(") && lowered.contains("\"w"))
+            || lowered.contains("fs.write")
+            || lowered.contains("writefilesync"))
+    {
+        return true;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

@@ -38,6 +38,30 @@ pub struct ToolPolicy {
     /// see [`ToolPolicy::is_allowed_with_tags`].
     #[serde(default)]
     pub require_tags: Vec<String>,
+    /// #28b — policy for FILE-WRITING via the bash/shell tool. `allow`
+    /// (default) = zero behavior change; `warn` = the change receipt's tail
+    /// appends a nudge to prefer `edit_file`/`diff_edit` when the command
+    /// actually changed files; `deny` = a heuristic pre-screen refuses
+    /// write-shaped commands and points at `edit_file` (escape hatch: a
+    /// trailing `# octos:allow-write` comment on the command line).
+    /// Loaded ONCE with the policy (never re-read per call).
+    #[serde(default)]
+    pub bash_file_writes: BashFileWrites,
+}
+
+/// #28b — the three-position knob for bash-driven file writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BashFileWrites {
+    /// Default: the shell tool behaves exactly as before (28a receipt only).
+    #[default]
+    Allow,
+    /// Receipt tail appends a nudge when files actually changed.
+    Warn,
+    /// Write-shaped commands are refused before execution; heuristic-based,
+    /// false-negatives tolerated (the 28a receipt still backs it up),
+    /// false-positives escape via the `# octos:allow-write` comment.
+    Deny,
 }
 
 impl ToolPolicy {
