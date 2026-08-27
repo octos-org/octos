@@ -217,23 +217,40 @@ pub fn estimate_message_tokens(msg: &Message) -> u32 {
     tokens + 4
 }
 
-/// Route-fit guard for failover/fallback dispatch (#2135 round-7 P1):
+/// Rough token cost of ONE tool declaration in the request: providers
+/// serialize every name, description, and full input schema (#2135
+/// round-8 P1 — a guard that only totals messages passes a tiny prompt
+/// whose tool schemas alone overflow a small window).
+pub(crate) fn estimate_tool_tokens(tool: &crate::types::ToolSpec) -> u32 {
+    estimate_tokens(&tool.name)
+        + estimate_tokens(&tool.description)
+        + estimate_tokens(&tool.input_schema.to_string())
+        + 8 // serialization scaffolding per tool
+}
+
+/// Route-fit guard for failover/fallback dispatch (#2135 rounds 7-8, P1):
 /// before re-sending an UNCHANGED request to an alternate route, resolve
 /// that route's readiness (a lazily-probed local provider may still be
-/// reporting its catalog guess) and check the prompt plausibly fits its
-/// window. The min-across-routes sizing accessors bound the envelope at
-/// PROMPT-BUILD time with whatever was resolved then; this guard is the
-/// dispatch-time recheck for routes that resolved smaller afterwards. A
-/// route that cannot fit is SKIPPED like a failed route — an oversized
-/// request would be truncated or rejected server-side anyway, with worse
-/// failure modes than trying the next lane.
+/// reporting its catalog guess) and check the ACTUAL request — messages
+/// plus serialized tool declarations — plausibly fits its window. The
+/// min-across-routes sizing accessors bound the envelope at PROMPT-BUILD
+/// time with whatever was resolved then; this guard is the dispatch-time
+/// recheck for routes that resolved smaller afterwards. A route that
+/// cannot fit is SKIPPED like a failed route — an oversized request would
+/// be truncated or rejected server-side anyway, with worse failure modes
+/// than trying the next lane.
 pub(crate) async fn route_fits_request(
     provider: &std::sync::Arc<dyn crate::provider::LlmProvider>,
     messages: &[octos_core::Message],
+    tools: &[crate::types::ToolSpec],
 ) -> bool {
     provider.ensure_ready().await;
     let window = provider.context_window();
-    let estimated: u32 = messages.iter().map(estimate_message_tokens).sum();
+    let estimated: u32 = messages
+        .iter()
+        .map(estimate_message_tokens)
+        .chain(tools.iter().map(estimate_tool_tokens))
+        .sum();
     let margin = (window / 8).clamp(64, 1024);
     estimated <= window.saturating_sub(margin)
 }
@@ -241,6 +258,47 @@ pub(crate) async fn route_fits_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2135 round-8 P1: the fit guard measures the ACTUAL request — a
+    /// tiny message with a large tool schema must fail a small window.
+    #[tokio::test]
+    async fn should_count_tool_schemas_in_route_fit() {
+        use std::sync::Arc;
+        struct Tiny;
+        #[async_trait::async_trait]
+        impl crate::provider::LlmProvider for Tiny {
+            async fn chat(
+                &self,
+                _m: &[octos_core::Message],
+                _t: &[crate::types::ToolSpec],
+                _c: &crate::config::ChatConfig,
+            ) -> eyre::Result<crate::types::ChatResponse> {
+                unreachable!()
+            }
+            fn model_id(&self) -> &str {
+                "tiny"
+            }
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+        }
+        let provider: Arc<dyn crate::provider::LlmProvider> =
+            Arc::new(crate::ContextWindowOverride::new(Arc::new(Tiny), 2_000));
+        let msg = [octos_core::Message::user("hi")];
+        let fat_tool = crate::types::ToolSpec {
+            name: "big".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"properties": {"x": "y".repeat(20_000)}}),
+        };
+        assert!(
+            route_fits_request(&provider, &msg, &[]).await,
+            "message alone fits"
+        );
+        assert!(
+            !route_fits_request(&provider, &msg, &[fat_tool]).await,
+            "tool schema must count against the window"
+        );
+    }
 
     #[test]
     fn test_context_window_default() {

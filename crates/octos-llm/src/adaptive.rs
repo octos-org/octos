@@ -2181,6 +2181,20 @@ impl AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        // #2135 round-8 P1: every adaptive dispatch — primary selection,
+        // stochastic probe, hedge racer, failover candidate — funnels
+        // through here, so this is the ONE place the route-fit guard
+        // covers them all. An unfit route errors WITHOUT touching the
+        // slot's metrics (not the provider's fault; the circuit breaker
+        // must not open over prompt size) — failover treats it like any
+        // other error and moves to a lane that fits.
+        if !crate::context::route_fits_request(&self.slots[idx].provider, messages, tools).await {
+            return Err(eyre::eyre!(
+                "route {} skipped: request does not fit its context window ({} tokens)",
+                self.slots[idx].provider.provider_name(),
+                self.slots[idx].provider.context_window()
+            ));
+        }
         let start = Instant::now();
         let result = self.slots[idx].provider.chat(messages, tools, config).await;
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -2262,6 +2276,20 @@ impl AdaptiveRouter {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        // #2135 round-8 P1: every adaptive dispatch — primary selection,
+        // stochastic probe, hedge racer, failover candidate — funnels
+        // through here, so this is the ONE place the route-fit guard
+        // covers them all. An unfit route errors WITHOUT touching the
+        // slot's metrics (not the provider's fault; the circuit breaker
+        // must not open over prompt size) — failover treats it like any
+        // other error and moves to a lane that fits.
+        if !crate::context::route_fits_request(&self.slots[idx].provider, messages, tools).await {
+            return Err(eyre::eyre!(
+                "route {} skipped: request does not fit its context window ({} tokens)",
+                self.slots[idx].provider.provider_name(),
+                self.slots[idx].provider.context_window()
+            ));
+        }
         let start = Instant::now();
         let result = self.slots[idx]
             .provider

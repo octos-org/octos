@@ -165,28 +165,35 @@ impl ProviderChain {
                 continue;
             }
 
-            // #2135 round-7 P1: an ALTERNATE lane receives the unchanged
-            // request, so resolve its readiness and skip it when the prompt
-            // cannot plausibly fit its (possibly just-resolved) window — an
-            // oversized send would truncate or be rejected server-side.
-            if offset > 0 && !crate::context::route_fits_request(&slot.provider, messages).await {
-                tracing::warn!(
-                    provider = slot.provider.provider_name(),
-                    window = slot.provider.context_window(),
-                    "skipping failover lane: prompt does not fit its context window"
-                );
-                continue;
-            }
-
             let result = self
-                .with_lane_timeout(
-                    slot.provider.provider_name(),
-                    slot.provider.chat(messages, tools, config),
-                )
+                .with_lane_timeout(slot.provider.provider_name(), async {
+                    // #2135 rounds 7-8: an ALTERNATE lane receives the
+                    // unchanged request — resolve its readiness and skip it
+                    // when the request cannot fit its window. The guard
+                    // runs INSIDE the lane timeout so a slow local
+                    // readiness counts against the SAME deadline as the
+                    // request and cannot delay failover (round-8 P2).
+                    // Ok(None) = unfit skip, distinct from a lane failure.
+                    if offset > 0
+                        && !crate::context::route_fits_request(&slot.provider, messages, tools)
+                            .await
+                    {
+                        return Ok(None);
+                    }
+                    slot.provider.chat(messages, tools, config).await.map(Some)
+                })
                 .await;
 
             match result {
-                Ok(mut response) => {
+                Ok(None) => {
+                    tracing::warn!(
+                        provider = slot.provider.provider_name(),
+                        window = slot.provider.context_window(),
+                        "skipping failover lane: request does not fit its context window"
+                    );
+                    continue;
+                }
+                Ok(Some(mut response)) => {
                     self.record_success(idx);
                     response.provider_index = Some(idx);
                     return Ok(response);
@@ -265,31 +272,36 @@ impl LlmProvider for ProviderChain {
                 continue;
             }
 
-            // #2135 round-7 P1: an ALTERNATE lane receives the unchanged
-            // request, so resolve its readiness and skip it when the prompt
-            // cannot plausibly fit its (possibly just-resolved) window — an
-            // oversized send would truncate or be rejected server-side.
-            if offset > 0 && !crate::context::route_fits_request(&slot.provider, messages).await {
-                tracing::warn!(
-                    provider = slot.provider.provider_name(),
-                    window = slot.provider.context_window(),
-                    "skipping failover lane: prompt does not fit its context window"
-                );
-                continue;
-            }
-
             // Cap stream *initialization* per lane; consuming the returned
             // stream is unaffected. A hung init is recorded below and the
-            // chain fails over like any other retriable error.
+            // chain fails over like any other retriable error. The fit
+            // guard runs INSIDE the cap (#2135 round-8 P2), and Ok(None)
+            // means an unfit skip, distinct from a lane failure.
             let result = self
-                .with_lane_timeout(
-                    slot.provider.provider_name(),
-                    slot.provider.chat_stream(messages, tools, config),
-                )
+                .with_lane_timeout(slot.provider.provider_name(), async {
+                    if offset > 0
+                        && !crate::context::route_fits_request(&slot.provider, messages, tools)
+                            .await
+                    {
+                        return Ok(None);
+                    }
+                    slot.provider
+                        .chat_stream(messages, tools, config)
+                        .await
+                        .map(Some)
+                })
                 .await;
 
             match result {
-                Ok(stream) => {
+                Ok(None) => {
+                    tracing::warn!(
+                        provider = slot.provider.provider_name(),
+                        window = slot.provider.context_window(),
+                        "skipping failover lane: request does not fit its context window"
+                    );
+                    continue;
+                }
+                Ok(Some(stream)) => {
                     self.record_success(idx);
                     return Ok(self.stream_with_provider_index(idx, stream));
                 }
@@ -764,5 +776,49 @@ mod tests {
         ));
         let chain = ProviderChain::new(vec![big, small]);
         assert_eq!(chain.context_window(), 32_768);
+    }
+
+    /// #2135 round-8 P2: the fit guard's readiness runs INSIDE the lane
+    /// timeout — a lane whose local readiness hangs must be abandoned at
+    /// the configured deadline, not delay failover for a probe budget.
+    #[tokio::test]
+    async fn should_cap_readiness_inside_the_lane_timeout() {
+        struct SlowReadyProvider;
+        #[async_trait]
+        impl LlmProvider for SlowReadyProvider {
+            async fn chat(
+                &self,
+                _m: &[Message],
+                _t: &[ToolSpec],
+                _c: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                unreachable!("never dispatched");
+            }
+            fn model_id(&self) -> &str {
+                "slow-ready"
+            }
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+            async fn ensure_ready(&self) {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+        let failing: Arc<dyn LlmProvider> = Arc::new(FailingProvider {
+            name: "primary",
+            error: "boom",
+        });
+        let slow: Arc<dyn LlmProvider> = Arc::new(SlowReadyProvider);
+        let chain = ProviderChain::new(vec![failing, slow])
+            .with_max_request_duration(Some(std::time::Duration::from_millis(100)));
+        let start = std::time::Instant::now();
+        let _ = chain
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "slow readiness must be capped by the lane deadline; took {:?}",
+            start.elapsed()
+        );
     }
 }

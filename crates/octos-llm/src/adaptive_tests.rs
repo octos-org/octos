@@ -2507,3 +2507,101 @@ async fn test_sizing_is_min_across_slots_and_identity_is_deterministic() {
     // the correct choice.
     assert_eq!(first, "m1", "cold identical slots must select the primary");
 }
+
+/// #2135 round-8 P1: every adaptive dispatch passes the route-fit guard —
+/// a lane that resolves too small at dispatch is skipped (its chat never
+/// invoked), failover serves from a fitting lane, and the skip must NOT
+/// poison the skipped lane's circuit breaker.
+#[tokio::test]
+async fn test_unfit_lane_is_skipped_without_breaker_pollution() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct LateSmall {
+        resolved: AtomicBool,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for LateSmall {
+        async fn chat(
+            &self,
+            _m: &[Message],
+            _t: &[ToolSpec],
+            _c: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: Some("from-small".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: crate::StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "m-small"
+        }
+        fn provider_name(&self) -> &str {
+            "local"
+        }
+        fn context_window(&self) -> u32 {
+            if self.resolved.load(Ordering::SeqCst) {
+                1_024
+            } else {
+                131_072
+            }
+        }
+        async fn ensure_ready(&self) {
+            self.resolved.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let small_calls = Arc::new(AtomicUsize::new(0));
+    let router = AdaptiveRouter::new(
+        vec![
+            Arc::new(LateSmall {
+                resolved: AtomicBool::new(false),
+                calls: small_calls.clone(),
+            }),
+            Arc::new(MockProvider {
+                name: "fallback",
+                model: "m2",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            }),
+        ],
+        &[],
+        AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        },
+    );
+    let big = Message::user("x ".repeat(20_000));
+    for _ in 0..4 {
+        let resp = router
+            .chat(std::slice::from_ref(&big), &[], &ChatConfig::default())
+            .await
+            .expect("the fitting lane must serve the request");
+        assert_eq!(resp.content.unwrap(), "from-fallback");
+    }
+    assert_eq!(
+        small_calls.load(Ordering::SeqCst),
+        0,
+        "unfit lane must never be dispatched for oversized prompts"
+    );
+    // Breaker not poisoned: for a SMALL prompt the lane fits again and —
+    // being the deterministic primary — must serve it. Four unfit skips
+    // above exceed the default failure threshold, so if skips recorded
+    // failures the breaker would be open and this would route to the
+    // fallback instead.
+    let resp = router
+        .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+        .await
+        .expect("small prompt must succeed");
+    assert_eq!(
+        resp.content.unwrap(),
+        "from-small",
+        "skips must not open the unfit lane's breaker"
+    );
+}

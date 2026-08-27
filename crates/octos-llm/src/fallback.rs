@@ -101,7 +101,7 @@ impl LlmProvider for FallbackProvider {
                     // #2135 round-7 P1: the fallback receives the unchanged
                     // request — resolve its readiness and skip it when the
                     // prompt cannot fit its (possibly just-resolved) window.
-                    if !crate::context::route_fits_request(fb, messages).await {
+                    if !crate::context::route_fits_request(fb, messages, tools).await {
                         warn!(
                             fallback = fb.model_id(),
                             window = fb.context_window(),
@@ -157,7 +157,7 @@ impl LlmProvider for FallbackProvider {
                 );
                 for fb in &self.fallbacks {
                     // #2135 round-7 P1: same fit guard as the chat path.
-                    if !crate::context::route_fits_request(fb, messages).await {
+                    if !crate::context::route_fits_request(fb, messages, tools).await {
                         warn!(
                             fallback = fb.model_id(),
                             window = fb.context_window(),
