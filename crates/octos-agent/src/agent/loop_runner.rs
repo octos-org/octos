@@ -2185,10 +2185,28 @@ impl Agent {
                     ) {
                         turn.record_budget_stop(&stop);
                         self.report_budget_stop(&stop, stop_iteration);
+                        // #27e (R2) — checkpoint a DIRTY worktree before the
+                        // turn ends: auto-commit (local only), staged
+                        // result.md (atomic), distinct budget_exhausted
+                        // marker in the TaskResult output. Clean worktrees
+                        // and non-git dirs are untouched (no empty commits).
+                        let workdir = self
+                            .tools
+                            .workspace_root()
+                            .map(std::path::Path::to_path_buf);
+                        let marker = super::budget::checkpoint_budget_exhaustion(
+                            workdir.as_deref(),
+                            &stop,
+                            stop_iteration,
+                        );
+                        let output = match marker.as_deref() {
+                            Some(m) => format!("{}\n{}", stop.message(), m),
+                            None => stop.message(),
+                        };
                         return Ok(TaskResult {
                             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
                             success: false,
-                            output: stop.message(),
+                            output,
                             files_modified,
                             files_to_send,
                             subtasks: Vec::new(),
