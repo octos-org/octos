@@ -31,6 +31,10 @@ if ! command -v node >/dev/null 2>&1; then
     echo "error: node not found — install Node.js (https://nodejs.org) to build octos-web" >&2
     exit 1
 fi
+# corepack reads `packageManager` from package.json, so it must run INSIDE
+# $WEB_DIR — from the repo root (as on the windows base-url CI job) it exits
+# with "Couldn't find a project in the local directory".
+cd "$WEB_DIR"
 if ! command -v pnpm >/dev/null 2>&1; then
     # Corepack ships with Node >=16.10 and reads `packageManager` from
     # package.json, so this also pins the exact pnpm version the lockfile needs.
@@ -43,7 +47,6 @@ if ! command -v pnpm >/dev/null 2>&1; then
     fi
 fi
 
-cd "$WEB_DIR"
 if [ ! -d node_modules ]; then
     echo "Installing octos-web dependencies (pnpm install --frozen-lockfile)…"
     pnpm install --frozen-lockfile
