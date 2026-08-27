@@ -148,6 +148,16 @@ pub enum TaskStatus {
     /// `Failed` so dashboards can surface "user cancelled" instead of
     /// "the task crashed".
     Cancelled,
+    /// #27c — an orphaned task parked for CLIENT REATTACHMENT. The
+    /// supervisor lost its in-process worker to a serve restart, but the
+    /// task's durable work (a staged peer's brief + worktree) is intact
+    /// and a returning client can adopt it — so it is RECOVERABLE, unlike
+    /// `Failed`. Not `is_active()` (no worker drives it here), not
+    /// `is_terminal()` (it must stay re-attachable). The boot sweep
+    /// (`refresh_from_persistence`) parks cross-restart orphans here
+    /// instead of failing them; `mark_running` (a re-attached client's
+    /// first action) revives Parked → Running.
+    Parked,
 }
 
 impl TaskStatus {
@@ -158,17 +168,20 @@ impl TaskStatus {
     /// Whether this status is a terminal (non-recoverable, non-running)
     /// state. Used by the API layer to reject `cancel`/`restart` against
     /// already-terminal tasks with a `409 Conflict` response.
+    /// `Parked` is deliberately NOT terminal: it awaits client re-attach
+    /// (#27c) and may transition back to `Running`.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Spawned => "spawned",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Parked => "parked",
         }
     }
 }
@@ -353,6 +366,11 @@ impl BackgroundTask {
             TaskStatus::Completed => TaskLifecycleState::Ready,
             TaskStatus::Failed => TaskLifecycleState::Failed,
             TaskStatus::Cancelled => TaskLifecycleState::Cancelled,
+            // #27c — awaiting client re-attach: not queued (no worker here),
+            // not failed (the work is recoverable). Reuse `Cancelled`'s
+            // idle lifecycle slot so dashboards read it as "stopped",
+            // with the `parked` status string carrying the distinction.
+            TaskStatus::Parked => TaskLifecycleState::Cancelled,
             TaskStatus::Running => match self.runtime_state {
                 TaskRuntimeState::Spawned | TaskRuntimeState::ExecutingTool => {
                     TaskLifecycleState::Running
@@ -1566,8 +1584,27 @@ impl TaskSupervisor {
                 })
                 .collect()
         };
-        for (task_id, _, _) in &orphans {
-            self.mark_failed(task_id, "orphaned across restart".to_string());
+        // #27c — park cross-restart TOP-LEVEL orphans for CLIENT
+        // REATTACHMENT instead of failing them: the durable work (a staged
+        // peer's brief + worktree) survives the restart, so a returning
+        // client can adopt the task (`mark_running` revives Parked →
+        // Running). Live evidence: the 2026-08-26/27 f182/a9c4 streams
+        // recorded 24+28 "orphaned across restart" FAILED children whose
+        // work was fully recoverable.
+        //
+        // RED LINE ① — parking is scoped to `peer_handoff` tasks ONLY: a
+        // staged peer has durable state (brief + worktree on disk) that a
+        // returning client can adopt. Every OTHER orphan (pipeline
+        // children, run_pipeline parents, generic spawned work) has no
+        // independent re-attach path, so it keeps the legacy genuine
+        // `Failed` verdict — a real failure must never masquerade as
+        // recoverable.
+        for (task_id, _, tool_name) in &orphans {
+            if tool_name == "peer_handoff" {
+                self.mark_parked(task_id, "orphaned across restart".to_string());
+            } else {
+                self.mark_failed(task_id, "orphaned across restart".to_string());
+            }
         }
         if !orphans.is_empty() {
             counter!("octos_orphaned_tasks_reaped_total").increment(orphans.len() as u64);
@@ -2916,6 +2953,45 @@ impl TaskSupervisor {
         self.mark_failed_inner(task_id, error, true)
     }
 
+    /// #27c — park a task as awaiting CLIENT REATTACHMENT. The boot sweep
+    /// uses this for cross-restart orphans instead of `mark_failed`: the
+    /// worker is gone (serve restarted), but the task's durable work (a
+    /// staged peer's brief + worktree) is intact and a returning client
+    /// can adopt it — `mark_running` revives Parked → Running. A terminal
+    /// task (already Completed/Failed/Cancelled) is left untouched.
+    pub fn mark_parked(&self, task_id: &str, reason: String) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(task_id) {
+                if task.status.is_terminal() {
+                    tracing::debug!(
+                        task_id = %task_id,
+                        current_status = task.status.as_str(),
+                        "ignoring mark_parked on terminal task"
+                    );
+                    return;
+                }
+                task.status = TaskStatus::Parked;
+                task.runtime_state = TaskRuntimeState::Failed;
+                // Mirror mark_failed's field placement so operators and the
+                // restored-persistence views find the park reason in `error`
+                // (the stable, greppable slot) — `runtime_detail` keeps the
+                // richer context copy.
+                task.error = Some(reason.clone());
+                task.runtime_detail = Some(reason);
+                task.updated_at = Utc::now();
+                Some(task.clone())
+            } else {
+                tracing::warn!(task_id = %task_id, "mark_parked: unknown task");
+                return;
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            self.persist_snapshot_by_id(&snapshot.id);
+            self.notify_change(&snapshot);
+        }
+    }
+
     fn mark_failed_inner(&self, task_id: &str, error: String, observed: bool) {
         let (snapshot, was_already_failed) = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -3693,8 +3769,11 @@ impl TaskSupervisor {
                 })
             }
             // Non-terminal status — defensive; callers only invoke this on
-            // terminal transitions.
-            TaskStatus::Spawned | TaskStatus::Running => return,
+            // terminal transitions. #27c: `Parked` is non-terminal (it
+            // awaits client re-attach) and must NOT fire the terminal
+            // callback — that is the whole point of parking an orphan
+            // instead of failing it.
+            TaskStatus::Spawned | TaskStatus::Running | TaskStatus::Parked => return,
         };
         // Idempotency under the shared mutex so the live → cascade → orphan
         // re-mark paths cannot double-fire.
