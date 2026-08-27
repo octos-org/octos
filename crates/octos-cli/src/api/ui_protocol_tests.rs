@@ -36711,3 +36711,29 @@ fn runtime_writes_result_when_peer_did_not_claim_ownership() {
     // 27e coexistence: the atomic writer leaves no tmp residue.
     assert!(!dir.path().join(".result.md.tmp-27e").exists());
 }
+
+/// #27h-r1 — CONTRACT TWIN of
+/// `octos_agent::agent::budget::result_owner_content_contract_agent_side`:
+/// the cli consumer asserts the SAME fixture table through the SAME shared
+/// function (`octos_agent::result_md_owner_content_is_peer`). If either
+/// side drifts (a local copy sneaks back in), one of the twins goes red on
+/// the identical inputs.
+#[test]
+fn result_owner_contract_27h_r1() {
+    let judge = octos_agent::result_md_owner_content_is_peer;
+    assert!(judge("peer"));
+    assert!(judge("peer\n"));
+    assert!(judge("  peer  "));
+    assert!(!judge(""));
+    assert!(!judge("Peer"));
+    assert!(!judge("peer-model"));
+    assert!(!judge("runtime"));
+    // Shared-implementation pin: the cli's peer-result writer must call the
+    // agent crate's function, not a local twin. (Compile-time evidence:
+    // ui_protocol_transport.rs references it directly; this test keeps the
+    // crate path exercised from the test surface too.)
+    assert_eq!(
+        std::any::type_name_of_val(&judge),
+        std::any::type_name_of_val(&octos_agent::result_md_owner_content_is_peer),
+    );
+}

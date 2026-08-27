@@ -518,19 +518,29 @@ fn write_result_md_named(dir: &std::path::Path, name: &str, body: &str) -> std::
 /// budgets are out of scope); NOTHING is pushed; a CLEAN worktree produces
 /// NO empty commit (the git call is skipped when `status --porcelain` is
 /// empty) and no result.md overwrite.
-/// #27h — SINGLE source of truth for `result.md` write ownership.
-///
-/// Mirrors `ui_protocol_transport::write_peer_result_if_peer_session`'s
-/// #27f check (peer sidecar `.result-owner` == "peer" ⇒ the runtime must
-/// not overwrite `result.md`). One implementation, consumed by BOTH the
-/// peer-result runtime writer and the budget checkpoint path, so the
-/// combined path (peer owns result + dirty wt + MaxIterations) can never
-/// clobber the peer's authoritative final version (#27h, BLOCKER-2).
+/// #27h/27h-r1 — SINGLE source of truth for `result.md` write ownership,
+/// sunk to octos-agent (the shared dependency of BOTH consumers: the budget
+/// checkpoint here, and the cli-side peer-result runtime writer). The
+/// judgment itself — sidecar leaf `.result-owner` whose content trims to
+/// exactly "peer" ⇒ the runtime must not overwrite `result.md`; anything
+/// else (absent, unreadable, other content) is fail-open — lives HERE and
+/// nowhere else, so the combined path (peer owns result + dirty wt +
+/// MaxIterations) can never clobber the peer's authoritative final version
+/// (#27h BLOCKER-2). The cli consumer feeds its fd-anchored read through
+/// [`result_md_owner_content_is_peer`], keeping its #1824-safe open path
+/// while sharing this one judgment.
 pub(super) fn result_md_owned_by_peer(dir: &std::path::Path) -> bool {
     match std::fs::read_to_string(dir.join(".result-owner")) {
-        Ok(owner) => owner.trim() == "peer",
+        Ok(owner) => result_md_owner_content_is_peer(&owner),
         Err(_) => false, // fail-open: no sidecar ⇒ runtime/checkpoint writes
     }
+}
+
+/// #27h-r1 — the ownership JUDGMENT on sidecar CONTENT (the part that must
+/// never drift between the two consumers). Public so the cli crate can
+/// route its fd-anchored read result through the same single judgment.
+pub fn result_md_owner_content_is_peer(owner: &str) -> bool {
+    owner.trim() == "peer"
 }
 
 pub(super) fn checkpoint_budget_exhaustion(
@@ -662,6 +672,36 @@ mod budget_checkpoint_tests {
             std::fs::read_to_string(cwd.join(".result-owner")).expect("sidecar"),
             "peer"
         );
+    }
+
+    /// #27h-r1 — the ownership JUDGMENT on sidecar content (single shared
+    /// implementation; the cli consumer routes its fd-anchored read through
+    /// the same function — see the twin contract test in
+    /// octos-cli ui_protocol_tests::result_owner_contract_27h_r1).
+    #[test]
+    fn result_owner_content_contract_agent_side() {
+        use super::result_md_owner_content_is_peer;
+        assert!(result_md_owner_content_is_peer("peer"));
+        assert!(result_md_owner_content_is_peer("peer\n"));
+        assert!(result_md_owner_content_is_peer("  peer  "));
+        // Anything else is NOT ownership (fail-open).
+        assert!(!result_md_owner_content_is_peer(""));
+        assert!(!result_md_owner_content_is_peer("Peer")); // case-sensitive
+        assert!(!result_md_owner_content_is_peer("peer-model"));
+        assert!(!result_md_owner_content_is_peer("runtime"));
+    }
+
+    /// #27h-r1 — dir-level ownership through the fs path (this crate's
+    /// consumer shape).
+    #[test]
+    fn result_owner_dir_level_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Absent sidecar ⇒ fail-open.
+        assert!(!super::result_md_owned_by_peer(dir.path()));
+        std::fs::write(dir.path().join(".result-owner"), "peer\n").expect("write");
+        assert!(super::result_md_owned_by_peer(dir.path()));
+        std::fs::write(dir.path().join(".result-owner"), "runtime").expect("write");
+        assert!(!super::result_md_owned_by_peer(dir.path()));
     }
 
     /// #27h — no-sidecar path is byte-identical to 27e: staged view still

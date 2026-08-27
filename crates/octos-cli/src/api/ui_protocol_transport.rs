@@ -13831,7 +13831,11 @@ fn write_peer_result_if_peer_session(
         ".result-owner",
         peer_io::PEER_FILE_READ_CAP_SMALL,
     )
-    .map(|owner| owner.trim() == "peer")
+    // #27h-r1 — the OWNERSHIP JUDGMENT is the single shared implementation
+    // in octos-agent (`result_md_owner_content_is_peer`); this side keeps
+    // only its #1824-safe fd-anchored read, so the judgment can never
+    // drift between the peer-result writer and the budget checkpoint.
+    .map(|owner| octos_agent::result_md_owner_content_is_peer(&owner))
     .unwrap_or(false);
     if peer_owns_result {
         tracing::info!(

@@ -9,6 +9,7 @@
 
 pub mod abi_schema;
 mod agent;
+pub use agent::result_md_owner_content_is_peer;
 pub mod agents;
 pub mod approval;
 pub mod arc_task;
