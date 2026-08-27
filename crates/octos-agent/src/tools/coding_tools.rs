@@ -66,6 +66,73 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
     output
 }
 
+/// #28c-r1 — resolve the RECEIPT SNAPSHOT ROOT from the command text.
+///
+/// Coding sessions habitually run `cd <target> && <mutate>` with the tool
+/// workdir left at the session workspace root; a receipt snapshotted at the
+/// root then reports `files_changed: 0` for a real write inside the target
+/// — a FALSE phantom signal, worse than no receipt (outer-loop live
+/// verdict, w4). Ruling implementation:
+///   * a SINGLE leading `cd <literal-path> && ...` prefix (one token, no
+///     `$`/backtick/whitespace, optional matching quotes, `~` expanded)
+///     makes that path the snapshot root (`scope: cd-target`);
+///   * anything ambiguous — no cd prefix, cd without `&&`, `;` chains,
+///     variable paths — falls back to the session workdir
+///     (`scope: workdir`), matching the pre-r1 behavior.
+fn receipt_scope_root(workdir: &Path, command: &str) -> (PathBuf, &'static str) {
+    let fallback = || (workdir.to_path_buf(), "workdir");
+    let trimmed = command.trim_start();
+    let Some(rest) = trimmed.strip_prefix("cd ") else {
+        return fallback();
+    };
+    let Some((target, _tail)) = rest.split_once("&&") else {
+        return fallback();
+    };
+    let target = target.trim();
+    if target.is_empty() || target.contains(';') {
+        return fallback();
+    }
+    let literal = if target.len() >= 2 {
+        let bytes = target.as_bytes();
+        let (first, last) = (bytes[0], bytes[target.len() - 1]);
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            &target[1..target.len() - 1]
+        } else {
+            target
+        }
+    } else {
+        target
+    };
+    if literal.is_empty()
+        || literal.contains('$')
+        || literal.contains('`')
+        || literal.contains(' ')
+        || literal.contains('\\')
+        || literal.starts_with('-')
+    {
+        return fallback();
+    }
+    let path = if literal == "~" {
+        match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home),
+            Err(_) => return fallback(),
+        }
+    } else if let Some(sub) = literal.strip_prefix("~/") {
+        match std::env::var("HOME") {
+            Ok(home) => Path::new(&home).join(sub),
+            Err(_) => return fallback(),
+        }
+    } else {
+        Path::new(literal).to_path_buf()
+    };
+    let root = if path.is_absolute() {
+        path
+    } else {
+        workdir.join(path)
+    };
+    (root, "cd-target")
+}
+
 fn resolve_optional_workdir(
     base_dir: &Path,
     workdir: Option<&str>,
@@ -350,10 +417,15 @@ impl ExecCommandTool {
             .timeout_secs
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
+        // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
+        // prefix (the coding-session idiom) makes X the root; otherwise the
+        // session workdir. Prevents the false `files_changed: 0` on writes
+        // outside the workspace root (outer-loop live verdict).
+        let (snapshot_root, receipt_scope) = receipt_scope_root(&cwd, &command);
         // #28c — BEFORE snapshot for the file-change receipt, reusing the
-        // SAME shared 28a module as ShellTool (snapshot_dirty_paths /
-        // diff_to_receipt). `None` on non-git/fail-open omits the receipt.
-        let dirty_before = super::shell::snapshot_dirty_paths(&cwd);
+        // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
+        // omits the receipt.
+        let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Put the child in its own process group so the timeout path can
@@ -406,9 +478,10 @@ impl ExecCommandTool {
                 // semantics as ShellTool / BashTool).
                 if let Some(receipt) = super::shell::diff_to_receipt(
                     dirty_before,
-                    super::shell::snapshot_dirty_paths(&cwd),
+                    super::shell::snapshot_dirty_paths(&snapshot_root),
                 ) {
                     text.push_str(&receipt);
+                    text.push_str(&format!("\nscope: {receipt_scope}"));
                 }
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
                 Ok(ToolResult {
@@ -1794,10 +1867,15 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
             .clamp(1, MAX_BASH_TIMEOUT_SECS);
 
+        // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
+        // prefix (the coding-session idiom) makes X the root; otherwise the
+        // session workdir. Prevents the false `files_changed: 0` on writes
+        // outside the workspace root (outer-loop live verdict).
+        let (snapshot_root, receipt_scope) = receipt_scope_root(&cwd, &command);
         // #28c — BEFORE snapshot for the file-change receipt, reusing the
-        // SAME shared 28a module as ShellTool (snapshot_dirty_paths /
-        // diff_to_receipt). `None` on non-git/fail-open omits the receipt.
-        let dirty_before = super::shell::snapshot_dirty_paths(&cwd);
+        // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
+        // omits the receipt.
+        let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // codex review (#1172) P2 (follow-up): put the child in its own
@@ -1856,9 +1934,10 @@ impl Tool for BashTool {
                 // omitted (acceptance ④ of the 28a set).
                 if let Some(receipt) = super::shell::diff_to_receipt(
                     dirty_before,
-                    super::shell::snapshot_dirty_paths(&cwd),
+                    super::shell::snapshot_dirty_paths(&snapshot_root),
                 ) {
                     text.push_str(&receipt);
+                    text.push_str(&format!("\nscope: {receipt_scope}"));
                 }
                 Ok(ToolResult {
                     output: truncate_output(text, MAX_CAPTURE_BYTES),

@@ -2847,3 +2847,112 @@ mod exec_change_receipt_28c {
         );
     }
 }
+
+mod receipt_scope_root_28c_r1 {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::{BashTool, receipt_scope_root};
+    use std::sync::Arc;
+
+    fn git_init(cwd: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+    }
+
+    // Resolver unit pins (ruling ②): literal cd prefix wins; ambiguous
+    // shapes fall back to workdir.
+    #[test]
+    fn resolver_literal_cd_prefix_wins_and_var_falls_back() {
+        let workdir = std::path::Path::new("/ws");
+        let (root, scope) = receipt_scope_root(workdir, "cd /tmp/x && echo hi > f");
+        assert_eq!(root, std::path::PathBuf::from("/tmp/x"));
+        assert_eq!(scope, "cd-target");
+
+        let (root, scope) = receipt_scope_root(workdir, "cd ~/proj && echo hi > f");
+        assert_eq!(scope, "cd-target");
+        assert!(root.starts_with(std::path::Path::new("/")));
+
+        // No cd prefix ⇒ workdir.
+        let (root, scope) = receipt_scope_root(workdir, "echo hi > f");
+        assert_eq!(root, std::path::PathBuf::from("/ws"));
+        assert_eq!(scope, "workdir");
+
+        // Variable path ⇒ ambiguous ⇒ workdir.
+        let (root, scope) = receipt_scope_root(workdir, "cd $TARGET && echo hi > f");
+        assert_eq!(root, std::path::PathBuf::from("/ws"));
+        assert_eq!(scope, "workdir");
+
+        // cd without && ⇒ workdir.
+        let (_root, scope) = receipt_scope_root(workdir, "cd /tmp/x");
+        assert_eq!(scope, "workdir");
+
+        // Semicolon chain ⇒ ambiguous ⇒ workdir.
+        let (root, scope) = receipt_scope_root(workdir, "cd /tmp/x; cd /tmp/y && echo hi > f");
+        assert_eq!(scope, "workdir");
+        assert_eq!(root, std::path::PathBuf::from("/ws"));
+    }
+
+    // Live-shape pin (ruling ④): cd-prefix write reports files_changed: 1
+    // plus the cd-target scope tag — the exact false-phantom regression.
+    #[tokio::test]
+    async fn cd_prefix_write_reports_one_with_scope_tag() {
+        let session_ws = tempfile::tempdir().expect("tempdir"); // session workdir: NOT a repo
+        let target = tempfile::tempdir().expect("tempdir"); // cd target: a git repo
+        git_init(target.path());
+        let tool = BashTool::new(session_ws.path(), Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy));
+        let file = target.path().join("r1.txt");
+        let out = tool
+            .execute(&json!({
+                "cmd": format!("cd {} && echo real > {:?}", target.path().display(), file),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "cd-target write must count 1: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("scope: cd-target"),
+            "scope tag missing: {}",
+            out.output
+        );
+    }
+
+    // Variable cd path falls back to workdir (ruling ④): the write happens
+    // inside the workdir repo, but the snapshot root is the workdir — the
+    // count is still correct for a workdir write; the tag says workdir.
+    #[tokio::test]
+    async fn variable_cd_path_falls_back_to_workdir_scope() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        git_init(ws.path());
+        let tool = BashTool::new(ws.path(), Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy));
+        let file = ws.path().join("var.txt");
+        // $TARGET is unset in the child, so `cd $TARGET` fails and the write
+        // still lands relative to the workdir via the absolute path — the
+        // receipt must not phantom-zero this.
+        let out = tool
+            .execute(&json!({
+                "cmd": format!("cd $TARGET 2>/dev/null; echo v > {:?} # octos:allow-write", file),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "workdir write must count 1: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("scope: workdir"),
+            "fallback scope tag missing: {}",
+            out.output
+        );
+    }
+}
