@@ -698,6 +698,9 @@ impl Tool for ShellTool {
             Some(scope) if scope.workspace() == self.cwd.as_path() => scope.workspace(),
             _ => &self.cwd,
         };
+        // #28a — BEFORE snapshot for the file-change receipt (git-status
+        // level; None on non-git/fail-open omits the receipt entirely).
+        let dirty_before = snapshot_dirty_paths(effective_cwd);
 
         // Check policy first
         let decision = self.policy.check(&input.command, effective_cwd);
@@ -879,6 +882,15 @@ impl Tool for ShellTool {
                 );
 
                 result_text.push_str(&exit_suffix);
+
+                // #28a — file-change receipt: AFTER snapshot + diff,
+                // appended ONCE to THIS result's tail (never the system
+                // prompt, never a history rewrite — prompt-cache stable).
+                if let Some(receipt) =
+                    diff_to_receipt(dirty_before, snapshot_dirty_paths(effective_cwd))
+                {
+                    result_text.push_str(&receipt);
+                }
 
                 Ok(ToolResult {
                     output: result_text,
@@ -1722,5 +1734,250 @@ mod tests {
             "expected deny, got: {}",
             result.output
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #28a — file-change receipt: a `git status`-level dirty-diff taken before
+// and after the command, appended ONCE to THIS tool result's tail.
+// ---------------------------------------------------------------------------
+
+/// #28a — one entry of the working-tree dirty set (`git status --porcelain`
+/// line, path made repo-relative). No timestamps, no timings, no absolute
+/// paths — the receipt must stay noise-free for the model and for prompt-
+/// cache stability (it lives only in the tool result, never in the system
+/// prompt and never rewriting history).
+#[derive(Debug, Clone)]
+struct ChangeReceipt {
+    files_changed: usize,
+    listed: Vec<String>,
+    truncated: bool,
+}
+
+impl ChangeReceipt {
+    fn render(&self) -> String {
+        let mut out = format!("\nfiles_changed: {}", self.files_changed);
+        for path in &self.listed {
+            out.push_str("\n  ");
+            out.push_str(path);
+        }
+        if self.truncated {
+            out.push_str(&format!(
+                "\n  (+{} more; not listed)",
+                self.files_changed - self.listed.len()
+            ));
+        }
+        out
+    }
+}
+
+/// #28a — snapshot the repo-relative dirty paths (modified + untracked,
+/// i.e. `git status --porcelain` lines) at `git status` cost (ms-scale, no
+/// index refresh beyond what status itself does; no new dependencies).
+/// `None` when the dir is not a git work tree (receipt silently omitted —
+/// acceptance ④) or git is unavailable (fail-open).
+fn snapshot_dirty_paths(cwd: &Path) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // not a git work tree (or git absent) — omit silently.
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Keep the RAW porcelain line ("XY PATH") so the diff can compare status
+    // flips; strip only a rename's "ORIG -> " to keep the destination side.
+    Some(
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let path = line.get(3..).unwrap_or("").trim();
+                match path.split_once(" -> ") {
+                    Some((_, dst)) => format!("{} {}", &line[..2], dst),
+                    None => line.to_owned(),
+                }
+            })
+            .collect(),
+    )
+}
+
+const CHANGE_RECEIPT_MAX_LISTED: usize = 20;
+
+fn diff_to_receipt(before: Option<Vec<String>>, after: Option<Vec<String>>) -> Option<String> {
+    // Either side missing the snapshot ⇒ non-git or fail-open: no receipt.
+    let (before, after) = (before?, after?);
+    let before_set: std::collections::HashSet<&String> = before.iter().collect();
+    // CHANGED = after-line not present verbatim in before (new file OR a
+    // status flip on the same path — both are real tree changes).
+    let mut changed: Vec<String> = after
+        .iter()
+        .filter(|line| !before_set.contains(*line))
+        .map(|line| line.get(3..).unwrap_or(line.as_str()).trim().to_owned())
+        .collect();
+    if changed.is_empty() {
+        return Some("\nfiles_changed: 0".to_owned());
+    }
+    let total = changed.len();
+    changed.sort();
+    changed.dedup();
+    let truncated = total > CHANGE_RECEIPT_MAX_LISTED;
+    let listed: Vec<String> = changed
+        .into_iter()
+        .take(CHANGE_RECEIPT_MAX_LISTED)
+        .collect();
+    Some(
+        ChangeReceipt {
+            files_changed: total,
+            listed,
+            truncated,
+        }
+        .render(),
+    )
+}
+
+#[cfg(test)]
+mod change_receipt_tests {
+    use super::*;
+
+    fn init_repo(dir: &std::path::Path) {
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        // seed + commit so status has a baseline tree.
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["commit", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// ① real edit → receipt lists exactly that file (repo-relative).
+    #[test]
+    fn real_edit_lists_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert!(receipt.contains("files_changed: 1"), "receipt: {receipt}");
+        assert!(
+            receipt.contains("src/lib.rs"),
+            "lists the relative path: {receipt}"
+        );
+        // noise-free: no timestamps/durations/absolute tmp paths.
+        assert!(!receipt.contains(&dir.path().display().to_string()));
+    }
+
+    /// ② phantom edit (zero-match replace) → files_changed: 0.
+    #[test]
+    fn phantom_edit_reports_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        // zero-match replace — touches nothing (no file is read or written).
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert_eq!(receipt.trim(), "files_changed: 0");
+    }
+
+    /// ③ a `target/` build artifact never appears — .gitignore filters it.
+    #[test]
+    fn gitignored_paths_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", ".gitignore"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["commit", "-m", "ignore"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/artifact.bin"), b"x").unwrap();
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert_eq!(
+            receipt.trim(),
+            "files_changed: 0",
+            "target/ excluded: {receipt}"
+        );
+    }
+
+    /// ④ non-git dir → no receipt, no error (snapshot None ⇒ omitted).
+    #[test]
+    fn non_git_dir_omits_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(snapshot_dirty_paths(dir.path()).is_none());
+        assert!(diff_to_receipt(None, None).is_none());
+    }
+
+    /// ⑤ cap: >20 changed files list 20 + "(+N more; not listed)".
+    #[test]
+    fn listing_caps_at_twenty_with_total() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("many")).unwrap();
+        for i in 0..25 {
+            std::fs::write(dir.path().join(format!("many/f{i}.txt")), "x\n").unwrap();
+        }
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert!(
+            receipt.contains("files_changed: 25"),
+            "total counted: {receipt}"
+        );
+        assert!(
+            receipt.contains("more; not listed"),
+            "truncation marker: {receipt}"
+        );
+        let listed_count = receipt
+            .lines()
+            .filter(|l| l.trim_start().starts_with("many/"))
+            .count();
+        assert_eq!(listed_count, 20, "exactly 20 listed (cap): {receipt}");
     }
 }
