@@ -115,6 +115,13 @@
       "provider": "deepseek",
       "model": "deepseek-chat",
       "description": "Fast model for simple tasks"
+    },
+    // Z.AI GLM 车道 —— api_key_env 省略时默认使用 ZAI_API_KEY
+    {
+      "key": "zai",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "description": "Z.AI GLM 5.2 lane (1M context)"
     }
   ],
 

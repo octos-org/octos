@@ -32042,6 +32042,32 @@ fn config_with_lane(key: &str) -> crate::config::Config {
     config
 }
 
+/// A profile config carrying the `zai` GLM-5.2 model lane (#19-S2) in the
+/// RECOMMENDED `sub_providers` shape: `provider: "zai"`, `model: "glm-5.2"`,
+/// explicit `api_key_env: "ZAI_API_KEY"` (whose credential is seeded offline
+/// through `env_vars`), and NO `base_url` / `api_type` — the zai registry
+/// entry supplies both defaults (`https://api.z.ai/api/anthropic`, Anthropic
+/// Messages protocol) and returns the provider directly without an `api_type`
+/// dispatch.
+fn config_with_zai_lane() -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config
+        .env_vars
+        .insert("ZAI_API_KEY".to_owned(), "sk-zai-lane-test".to_owned());
+    config.sub_providers = vec![crate::config::SubProviderConfig {
+        key: "zai".to_owned(),
+        provider: "zai".to_owned(),
+        model: Some("glm-5.2".to_owned()),
+        api_key_env: Some("ZAI_API_KEY".to_owned()),
+        base_url: None,
+        description: Some("zai GLM-5.2 lane for goal peers".to_owned()),
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    }];
+    config
+}
+
 fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
     PeerBlackboardRow {
         slug: slug.to_owned(),
@@ -32908,6 +32934,294 @@ fn resolve_peer_lane_provider_none_without_model_file() {
         resolve_peer_lane_provider(&peers_root, "synth", &config).is_none(),
         "no model file → primary model (None)"
     );
+}
+
+/// #19-S2 (zai lane, HIT state): the profile carries a `zai` GLM-5.2
+/// `sub_providers` lane, the master hands off a peer requesting that lane →
+/// the lane is recorded cleanly (NO `model_note` warning) AND the turn-path
+/// resolver builds the zai provider (`zai/glm-5.2`) for the peer.
+#[test]
+fn zai_lane_peer_handoff_hit_records_and_resolves_zai_glm52() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = config_with_zai_lane();
+    let lanes: Vec<String> = config
+        .sub_providers
+        .iter()
+        .map(|sp| sp.key.clone())
+        .collect();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        lanes,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Synthesize with GLM-5.2.".to_owned(),
+        name: "Zai Synth".to_owned(),
+        worktree: false,
+        model: Some("zai".to_owned()),
+        goal_id: None,
+        task_id: None,
+    })
+    .expect("a configured zai lane still stages the peer");
+
+    assert!(
+        staged.model_note.is_none(),
+        "a configured zai lane produces no warning note: {:?}",
+        staged.model_note
+    );
+    assert_eq!(
+        std::fs::read_to_string(peers_root.join(&staged.slug).join("model")).unwrap(),
+        "zai",
+        "the zai lane is recorded beside the brief"
+    );
+
+    let provider = resolve_peer_lane_provider(&peers_root, &staged.slug, &config)
+        .expect("a recorded zai lane resolves a provider");
+    assert_eq!(provider.provider_name(), "zai");
+    assert_eq!(provider.model_id(), "glm-5.2");
+}
+
+/// #19-S2 (zai lane config shape): the recommended zai lane selects and
+/// builds to the zai registry provider (Anthropic Messages protocol, default
+/// base URL) even when the PRIMARY profile config points at another provider
+/// — the lane keeps its own `ZAI_API_KEY` credential, never borrows the
+/// primary's.
+#[test]
+fn zai_lane_config_selects_and_builds_zai_glm52_provider() {
+    let mut config = config_with_zai_lane();
+    config.provider = Some("openai".to_owned());
+    config.api_key_env = Some("OPENAI_API_KEY".to_owned());
+
+    let sp = select_peer_lane(&config, "zai").expect("the zai lane is selected");
+    assert_eq!(sp.provider, "zai");
+    assert_eq!(sp.model.as_deref(), Some("glm-5.2"));
+    assert_eq!(sp.api_key_env.as_deref(), Some("ZAI_API_KEY"));
+    assert!(
+        sp.api_type.is_none(),
+        "zai registry returns the provider directly — no api_type dispatch"
+    );
+    assert!(
+        sp.base_url.is_none(),
+        "the zai registry default base URL is already correct"
+    );
+
+    let lane_config = lane_provider_config(&config, sp);
+    assert_eq!(
+        lane_config.api_key_env.as_deref(),
+        Some("ZAI_API_KEY"),
+        "the lane uses its own credential, never the primary's OPENAI_API_KEY"
+    );
+
+    let provider =
+        build_peer_lane_provider(&config, "zai").expect("the zai lane builds a provider");
+    assert_eq!(provider.provider_name(), "zai");
+    assert_eq!(provider.model_id(), "glm-5.2");
+}
+
+/// #19-S2 (zai lane, MISS state): the profile carries NO `zai` lane, the
+/// master hands off a peer requesting it → the handoff still stages, the lane
+/// is NOT recorded, and the host surfaces a truthful `model_note` fallback
+/// warning naming the requested lane, the available lanes, and the primary
+/// model.
+#[test]
+fn zai_lane_peer_handoff_miss_warns_and_falls_back_to_primary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Only cheap/strong configured — NO zai lane in the profile.
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        vec!["cheap".to_owned(), "strong".to_owned()],
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Request a lane the profile never configured.".to_owned(),
+        name: "Zai Miss".to_owned(),
+        worktree: false,
+        model: Some("zai".to_owned()),
+        goal_id: None,
+        task_id: None,
+    })
+    .expect("an unknown zai lane warns, it does not fail staging");
+
+    let note = staged
+        .model_note
+        .expect("requesting an unconfigured zai lane yields a note");
+    assert!(
+        note.contains("model lane 'zai' not found"),
+        "note names the missing zai lane: {note}"
+    );
+    assert!(
+        note.contains("cheap, strong"),
+        "note lists the available lanes: {note}"
+    );
+    assert!(
+        note.contains("primary model"),
+        "note explains the primary-model fallback: {note}"
+    );
+    assert!(
+        !peers_root.join(&staged.slug).join("model").exists(),
+        "an unconfigured zai lane is not recorded on disk"
+    );
+    // The profile has no zai lane to resolve even if a stale record existed:
+    let primary_only = crate::config::Config::default();
+    assert!(
+        select_peer_lane(&primary_only, "zai").is_none(),
+        "no zai sub_provider → selection miss → primary model"
+    );
+}
+
+/// #19-S3 — REAL-machine three-layer acceptance probe for the zai GLM-5.2
+/// peer model lane. NOT a mock: drives the full lane path and makes ONE real
+/// LLM call to `https://api.z.ai/api/anthropic`. Gated `#[ignore]` so CI never
+/// needs the key; run explicitly with the key in env:
+///   ZAI_API_KEY=… cargo test -p octos-cli --lib --features api -- \
+///     --ignored --exact \
+///     api::ui_protocol_transport::tests::s3_zai_lane_real_three_layer_probe
+///
+/// Three layers proven against real artifacts:
+///   1. CONFIG layer  — `record_peer_model_lane` with the zai lane among
+///      `available_lanes` records `peers/<slug>/model` = "zai" with NO note.
+///   2. RUNTIME layer — `resolve_peer_lane_provider` reads that record back and
+///      builds the zai provider (`provider_name=="zai"`, `model_id=="glm-5.2"`),
+///      then the provider REALLY answers a chat call and reports glm usage.
+///   3. DELIVERY layer — the probe writes its evidence to `<tmp>/result.md`.
+#[test]
+#[ignore = "real z.ai network call; run explicitly with ZAI_API_KEY in env"]
+fn s3_zai_lane_real_three_layer_probe() {
+    // Layer precondition: the credential must be genuinely present.
+    let key = std::env::var("ZAI_API_KEY").expect(
+        "S3 probe requires ZAI_API_KEY in the process env (operator-provided); \
+         do not substitute a mock",
+    );
+    assert!(!key.trim().is_empty(), "ZAI_API_KEY must be non-empty");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let slug = "s3-zai-probe";
+    // Stage the peer dir the way the real staging path does.
+    let peer_dir = peers_root.join(slug);
+    std::fs::create_dir_all(&peer_dir).unwrap();
+    std::fs::write(peer_dir.join("brief.md"), "S3 probe peer").unwrap();
+
+    // ---- LAYER 1: config — record the requested zai lane, no fallback note.
+    let available = vec!["zai".to_owned()];
+    let note = crate::peers::record_peer_model_lane(&peers_root, slug, Some("zai"), &available);
+    assert!(
+        note.is_none(),
+        "LAYER 1 FAIL: a configured zai lane must record cleanly (no note), got {note:?}"
+    );
+    let recorded = crate::peers::read_peer_model_lane(&peers_root, slug);
+    assert_eq!(
+        recorded.as_deref(),
+        Some("zai"),
+        "LAYER 1 FAIL: peers/{slug}/model must record 'zai', got {recorded:?}"
+    );
+
+    // ---- LAYER 2: runtime — resolve + build the lane provider, real call.
+    let mut config = config_with_zai_lane();
+    // Use the REAL credential from the process env, not the offline seed.
+    config
+        .env_vars
+        .insert("ZAI_API_KEY".to_owned(), key.clone());
+    config.provider = Some("openai".to_owned());
+    config.api_key_env = Some("OPENAI_API_KEY".to_owned());
+
+    let provider = resolve_peer_lane_provider(&peers_root, slug, &config)
+        .expect("LAYER 2 FAIL: resolve_peer_lane_provider must build the zai provider");
+    assert_eq!(
+        provider.provider_name(),
+        "zai",
+        "LAYER 2 FAIL: lane provider must be zai"
+    );
+    assert_eq!(
+        provider.model_id(),
+        "glm-5.2",
+        "LAYER 2 FAIL: lane provider must be glm-5.2"
+    );
+
+    // The REAL call — proves the runtime layer actually reaches GLM. Captures
+    // the reply text AND the token usage (the running-layer model identifier
+    // evidence demanded by the S3 brief).
+    let (reply, usage) = run_zai_real_call(&provider);
+    eprintln!(
+        "S3-RUNTIME-EVIDENCE provider={} model={} reply={} usage_in={} usage_out={}",
+        provider.provider_name(),
+        provider.model_id(),
+        reply.trim(),
+        usage.input_tokens,
+        usage.output_tokens
+    );
+    assert!(
+        reply.contains("OCTOS_S3_ZAI_OK"),
+        "LAYER 2 FAIL: real GLM-5.2 reply must echo the marker, got: {reply}"
+    );
+    assert!(
+        usage.output_tokens > 0,
+        "LAYER 2 FAIL: real call must bill output tokens, got {usage:?}"
+    );
+
+    // ---- LAYER 3: delivery — the probe's evidence artifact lands on disk.
+    let result_path = tmp.path().join("result.md");
+    std::fs::write(
+        &result_path,
+        format!(
+            "# S3 zai lane probe result\n\n- lane: zai\n- provider: {}\n- model: {}\n- reply: {}\n- usage: in={} out={}\n",
+            provider.provider_name(),
+            provider.model_id(),
+            reply.trim(),
+            usage.input_tokens,
+            usage.output_tokens,
+        ),
+    )
+    .unwrap();
+    let delivered = std::fs::read_to_string(&result_path).unwrap();
+    assert!(
+        delivered.contains("model: glm-5.2") && delivered.contains("OCTOS_S3_ZAI_OK"),
+        "LAYER 3 FAIL: result.md must carry the model id and the real reply"
+    );
+}
+
+/// Layer-2 helper: perform ONE blocking real chat call against the zai lane
+/// provider and return the reply text plus the billed token usage. Kept
+/// separate so the probe body reads as the three acceptance layers.
+fn run_zai_real_call(
+    provider: &Arc<dyn octos_llm::LlmProvider>,
+) -> (String, octos_llm::TokenUsage) {
+    use octos_core::Message;
+    use octos_llm::ChatConfig;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for the real zai call");
+    rt.block_on(async {
+        let messages = vec![Message::user("Reply with exactly: OCTOS_S3_ZAI_OK")];
+        let config = ChatConfig {
+            max_tokens: Some(32),
+            ..Default::default()
+        };
+        let resp = provider
+            .chat(&messages, &[], &config)
+            .await
+            .expect("real zai GLM-5.2 call must succeed");
+        (resp.content.unwrap_or_default(), resp.usage)
+    })
 }
 
 /// #peer-model (part 3): the wrapper returns None for a NON-peer session — it
