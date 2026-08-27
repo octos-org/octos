@@ -447,6 +447,33 @@ fn decide_for_variant(error: &HarnessError) -> LoopDecision {
 mod tests {
     use super::*;
 
+    /// #27b — integration: quota exhaustion routes to `RotateAndRetry`
+    /// (the loop advances the provider chain to the fallback slot and
+    /// retries), while a TRUE 401 escalates (red line — a wrong key fails
+    /// on every lane). Pinned against the live 2026-08-26/27 k3 quota burn.
+    #[test]
+    fn quota_rotates_lane_but_auth_escalates() {
+        let quota = HarnessError::Quota {
+            message: "402 quota will reset when the current 7-day window ends".into(),
+        };
+        let mut state = LoopRetryState::default();
+        let decision = state.observe(&quota);
+        assert!(
+            matches!(decision, LoopDecision::RotateAndRetry),
+            "quota must rotate to the fallback lane and retry (#27b), got {decision:?}"
+        );
+
+        let auth = HarnessError::Authentication {
+            message: "401 invalid api key".into(),
+        };
+        let mut state = LoopRetryState::default();
+        let decision = state.observe(&auth);
+        assert!(
+            matches!(decision, LoopDecision::Escalate),
+            "a true 401 must escalate (FailFast red line), got {decision:?}"
+        );
+    }
+
     fn rate_limit() -> HarnessError {
         HarnessError::RateLimited {
             retry_after_secs: Some(1),
