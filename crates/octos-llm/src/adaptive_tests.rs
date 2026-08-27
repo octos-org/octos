@@ -2455,3 +2455,49 @@ async fn should_not_failover_when_failfast_and_primary_fails() {
         "FailFast must NOT call fallback provider"
     );
 }
+
+/// #2135 round-6 P1: sizing accessors take the minimum across slots
+/// (selection-independent — safe for hedge/probe/failover routing), and
+/// the identity accessors are DETERMINISTIC (best-scored slot, no
+/// stochastic exploration).
+#[tokio::test]
+async fn test_sizing_is_min_across_slots_and_identity_is_deterministic() {
+    let big: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "primary",
+            model: "m1",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        262_144,
+    ));
+    let small: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "fallback",
+            model: "m2",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        32_768,
+    ));
+    let router = AdaptiveRouter::new(
+        vec![big, small],
+        &[],
+        AdaptiveConfig {
+            // Exploration ON: identity must be stable regardless.
+            probe_probability: 0.5,
+            ..Default::default()
+        },
+    );
+    assert_eq!(router.context_window(), 32_768, "min across slots");
+    let first = router.model_id().to_string();
+    for _ in 0..50 {
+        assert_eq!(
+            router.model_id(),
+            first,
+            "identity must not flip stochastically"
+        );
+    }
+}

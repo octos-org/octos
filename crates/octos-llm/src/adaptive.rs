@@ -1704,6 +1704,22 @@ impl AdaptiveRouter {
         }
     }
 
+    /// The slot the router would pick with NO stochastic exploration: the
+    /// best-scored non-circuit-open slot, falling back to slot 0. Used by
+    /// the identity/readiness accessors (#2135 round-6 P1) so metadata and
+    /// preloading are stable across calls, while `select_provider` keeps
+    /// its exploration for actual request routing.
+    fn preferred_slot_index(&self) -> usize {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.metrics.is_circuit_open(self.config.failure_threshold))
+            .map(|(i, s)| (i, self.score(s)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
     /// Score a provider. Lower is better.
     ///
     /// Four factors:
@@ -2459,37 +2475,52 @@ impl LlmProvider for AdaptiveRouter {
         }
     }
 
-    // #2135 review P1: same slot selection as model_id — the router must
-    // report the window of the provider it would actually route to, not
-    // the static catalog default.
+    // #2135 round-6 P1: the sizing accessors take the MINIMUM across all
+    // slots — selection-INDEPENDENT and safe for every route this router
+    // can take (Lane-mode stochastic probes, hedged sends, failover): a
+    // prompt sized for a probed 256K local primary must not reach a 32K
+    // lane. Per-route resizing at dispatch is the precise fix and belongs
+    // to the router itself; until then the conservative envelope is the
+    // pre-probe catalog behavior restored, minus its staleness.
     fn context_window(&self) -> u32 {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.context_window()
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.context_window())
+            .min()
+            .unwrap_or(32_768)
     }
 
     fn max_output_tokens(&self) -> u32 {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.max_output_tokens()
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.max_output_tokens())
+            .min()
+            .unwrap_or(4096)
     }
 
     async fn ensure_ready(&self) {
-        let (idx, _) = self.select_provider();
+        // Readiness preps the lane the router would DETERMINISTICALLY
+        // prefer (best score, no stochastic exploration — #2135 round-6
+        // P1): readiness may preload, and a coin-flipped lane must not
+        // decide which model gets loaded into memory.
+        let idx = self.preferred_slot_index();
         self.slots[idx].provider.ensure_ready().await;
     }
 
     fn model_id(&self) -> &str {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.model_id()
+        self.slots[self.preferred_slot_index()].provider.model_id()
     }
 
     fn provider_name(&self) -> &str {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.provider_name()
+        self.slots[self.preferred_slot_index()]
+            .provider
+            .provider_name()
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
-        let (idx, _) = self.select_provider();
-        self.slots[idx].provider.provider_metadata()
+        self.slots[self.preferred_slot_index()]
+            .provider
+            .provider_metadata()
     }
 
     fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {

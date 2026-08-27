@@ -166,8 +166,17 @@ impl LlmProvider for FallbackProvider {
         self.primary.provider_name()
     }
 
+    // #2135 round-6 P1: the MINIMUM across primary and every fallback —
+    // this wrapper re-sends the SAME messages to a fallback on failure, so
+    // a prompt sized for a probed 256K primary must fit the smallest route
+    // it can take. (The pre-probe catalog value was accidentally safe this
+    // way; per-route resizing before each fallback send is the precise
+    // fix, tracked with the router follow-ups.)
     fn context_window(&self) -> u32 {
-        self.primary.context_window()
+        std::iter::once(self.primary.context_window())
+            .chain(self.fallbacks.iter().map(|fb| fb.context_window()))
+            .min()
+            .unwrap_or_else(|| self.primary.context_window())
     }
 
     async fn ensure_ready(&self) {
@@ -175,7 +184,10 @@ impl LlmProvider for FallbackProvider {
     }
 
     fn max_output_tokens(&self) -> u32 {
-        self.primary.max_output_tokens()
+        std::iter::once(self.primary.max_output_tokens())
+            .chain(self.fallbacks.iter().map(|fb| fb.max_output_tokens()))
+            .min()
+            .unwrap_or_else(|| self.primary.max_output_tokens())
     }
 
     fn report_stream_metrics(&self, output_tokens: u32, stream_duration_us: u64) {
@@ -352,5 +364,22 @@ mod tests {
             1,
             "fallback must be called once"
         );
+    }
+
+    /// #2135 round-6 P1: the same messages are re-sent to a fallback on
+    /// failure, so the reported window must fit the SMALLEST possible
+    /// route — a probed 256K primary over a 32K fallback budgets as 32K.
+    #[test]
+    fn should_report_minimum_window_across_routes() {
+        let primary: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(CountingProvider::ok()),
+            262_144,
+        ));
+        let small_fallback: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(CountingProvider::ok()),
+            32_768,
+        ));
+        let provider = FallbackProvider::new(primary, vec![small_fallback]);
+        assert_eq!(provider.context_window(), 32_768);
     }
 }

@@ -290,17 +290,23 @@ impl LlmProvider for ProviderChain {
         Err(last_error.unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
     }
 
-    // #2135 review P1: same slot selection as model_id — the chain must
-    // report the window of the provider it would actually use, not the
-    // static catalog default.
+    // #2135 round-6 P1: the MINIMUM across every slot — the chain fails
+    // over with the SAME request, so the prompt must fit the smallest lane
+    // it can land on, not just the preferred one.
     fn context_window(&self) -> u32 {
-        let idx = self.pick_start();
-        self.slots[idx].provider.context_window()
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.context_window())
+            .min()
+            .unwrap_or(32_768)
     }
 
     fn max_output_tokens(&self) -> u32 {
-        let idx = self.pick_start();
-        self.slots[idx].provider.max_output_tokens()
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.max_output_tokens())
+            .min()
+            .unwrap_or(4096)
     }
 
     async fn ensure_ready(&self) {
@@ -716,5 +722,21 @@ mod tests {
             Some(StreamEvent::ProviderIndex(idx)) => assert_eq!(idx, 1),
             other => panic!("expected ProviderIndex(1) first, got {other:?}"),
         }
+    }
+
+    /// #2135 round-6 P1: the chain fails over with the same request, so
+    /// the reported window is the minimum across slots.
+    #[test]
+    fn should_report_minimum_window_across_slots() {
+        let big: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(SuccessProvider { name: "big" }),
+            262_144,
+        ));
+        let small: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(SuccessProvider { name: "small" }),
+            32_768,
+        ));
+        let chain = ProviderChain::new(vec![big, small]);
+        assert_eq!(chain.context_window(), 32_768);
     }
 }

@@ -72,17 +72,23 @@ fn attempt_deadline_secs(request_timeout_secs: u64) -> u64 {
 }
 
 /// Conservative window in force PROVISIONALLY while a cold Ollama model's
-/// real allocation is unknown (#2135 round-4/5 P1): 2048 — the smallest
-/// window Ollama's scheduler treats as practically usable (its documented
-/// vision minimum; the stock allocation is 4096 and configured contexts
-/// are usually larger). Smaller is safer here: over-budgeting a small
-/// allocation truncates server-side, under-budgeting only compacts more
-/// aggressively. Explicitly configured sub-2048 `num_ctx` values are out
-/// of scope for the floor (no non-trivial constant is safe against
-/// `num_ctx 4`); the floor is replaced by the REAL allocation as soon as
-/// any attempt reads it from /api/ps — including cheap post-cap refreshes,
-/// see `run_probe_attempt`.
-const OLLAMA_PROVISIONAL_WINDOW: u32 = 2048;
+/// real allocation is unknown (#2135 rounds 4-6, P1/P2): 1024 — the SAME
+/// lower bound this probe's own parsers accept as a plausible window
+/// (`sane_context_window`), and below every allocation Ollama's env
+/// config will produce in practice (`OLLAMA_CONTEXT_LENGTH=1024` is the
+/// smallest configuration the reviewer's audit of envconfig surfaced as
+/// realistic; the stock allocation is 4096). Smaller is safer: over-
+/// budgeting truncates server-side, under-budgeting only compacts more
+/// aggressively. Sub-1024 `num_ctx` values are below the probe's own
+/// plausibility threshold everywhere and are out of scope by design; the
+/// floor is replaced by the REAL allocation as soon as any attempt reads
+/// it from /api/ps — including cheap post-cap refreshes.
+const OLLAMA_PROVISIONAL_WINDOW: u32 = 1024;
+
+/// `preload_state` values — see the field doc.
+const PRELOAD_IDLE: u32 = 0;
+const PRELOAD_RUNNING: u32 = 1;
+const PRELOAD_ANSWERED: u32 = 2;
 
 /// llama.cpp serves `/props` at the server root, not under `/v1`.
 /// Single-suffix strip: a proxy mounting the API under `/v1/v1` keeps its
@@ -164,9 +170,13 @@ pub struct LocalContextProbe {
     /// window; `None` = the server answered but names none (or the attempt
     /// cap was spent) — the catalog value stands either way.
     window: OnceLock<Option<u32>>,
-    /// One preload per probe lifetime: the detached /api/generate task is
-    /// spawned at most once, however many readiness attempts run.
-    preload_started: std::sync::atomic::AtomicBool,
+    /// Preload lifecycle (#2135 round-6 P1): 0 = idle (may start), 1 =
+    /// running (poll /api/ps), 2 = request answered (load reached the
+    /// server; keep polling). A TRANSIENT preload failure (429/503,
+    /// transport) resets to idle so a later readiness attempt can retry —
+    /// the round-5 boolean latched such failures into "never preload
+    /// again, but keep burning the poll deadline anyway".
+    preload_state: Arc<AtomicU32>,
     /// Non-zero = a SAFE conservative window in force while the real one is
     /// still unknown (cold Ollama model that could not finish loading
     /// inside the attempt budget). Consulted by `context_window()` after
@@ -243,7 +253,7 @@ impl LocalContextProbe {
             api_key: api_key.filter(|k| !k.is_empty() && k != "no-key"),
             timeouts,
             window: OnceLock::new(),
-            preload_started: std::sync::atomic::AtomicBool::new(false),
+            preload_state: Arc::new(AtomicU32::new(PRELOAD_IDLE)),
             provisional: AtomicU32::new(0),
             attempts: AtomicU32::new(0),
             in_flight: tokio::sync::Mutex::new(()),
@@ -280,20 +290,39 @@ impl LocalContextProbe {
     /// the probe's short per-request timeout may own this future. Bounded
     /// by its own generous timeout; fire-and-forget outcome (the /api/ps
     /// polls observe the result).
-    fn start_preload_once(&self, generate_url: &str, model: &str) {
+    fn start_preload(&self, generate_url: &str, model: &str) {
         if self
-            .preload_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+            .preload_state
+            .compare_exchange(
+                PRELOAD_IDLE,
+                PRELOAD_RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
         {
-            return;
+            return; // already running or answered
         }
         const PRELOAD_TIMEOUT_SECS: u64 = 900;
         let client = build_http_client(PRELOAD_TIMEOUT_SECS, self.timeouts.1);
         let url = generate_url.to_string();
         let body = serde_json::json!({ "model": model });
+        let state = Arc::clone(&self.preload_state);
+        let model = model.to_string();
         tracing::info!(model, "preloading cold Ollama model (detached)");
         tokio::spawn(async move {
-            let _ = fetch_post_json(&client, &url, &body).await;
+            match fetch_post_json(&client, &url, &body).await {
+                FetchOutcome::Answered(_) => {
+                    state.store(PRELOAD_ANSWERED, Ordering::SeqCst);
+                }
+                FetchOutcome::Transient => {
+                    // 429/503/transport: reset so a later readiness attempt
+                    // retries the load instead of polling a load that never
+                    // started (#2135 round-6 P1).
+                    tracing::debug!(model, "cold-model preload failed transiently; will retry");
+                    state.store(PRELOAD_IDLE, Ordering::SeqCst);
+                }
+            }
         });
     }
 
@@ -464,8 +493,13 @@ impl LocalContextProbe {
                     // loop the model cold forever. The deadline cancels
                     // only the POLLING below; the load itself runs on.
                     if window.is_none() && allow_preload {
-                        self.start_preload_once(generate_url, model);
-                        loop {
+                        self.start_preload(generate_url, model);
+                        // Poll only while a load is actually in flight or
+                        // reached the server; a transient preload failure
+                        // resets the state to idle and this loop stops
+                        // instead of burning the attempt deadline
+                        // (#2135 round-6 P1).
+                        while self.preload_state.load(Ordering::SeqCst) != PRELOAD_IDLE {
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             if let FetchOutcome::Answered(Some(ps_after)) =
                                 fetch(&client, ps_url, None).await
@@ -760,12 +794,26 @@ mod tests {
         Arc<std::sync::Mutex<Vec<String>>>,
         Arc<std::sync::atomic::AtomicBool>,
     ) {
+        spawn_ollama_stub_failing(generate_delay, 0).await
+    }
+
+    /// Like [`spawn_ollama_stub`], with the first `generate_failures`
+    /// /api/generate requests answered 503 (transient) without loading.
+    async fn spawn_ollama_stub_failing(
+        generate_delay: std::time::Duration,
+        generate_failures: u32,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let hits: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let loaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let loaded_out = loaded.clone();
+        let failures_left = Arc::new(std::sync::atomic::AtomicU32::new(generate_failures));
         let hits_srv = hits.clone();
         tokio::spawn(async move {
             loop {
@@ -774,6 +822,7 @@ mod tests {
                 };
                 let hits = hits_srv.clone();
                 let loaded = loaded.clone();
+                let failures_left = failures_left.clone();
                 let delay = generate_delay;
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
@@ -792,6 +841,18 @@ mod tests {
                         }
                         "/api/show" => r#"{"parameters":"stop "x""}"#.to_string(),
                         "/api/generate" => {
+                            if failures_left
+                                .fetch_update(
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    |n| n.checked_sub(1),
+                                )
+                                .is_ok()
+                            {
+                                let response = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                return;
+                            }
                             tokio::time::sleep(delay).await;
                             loaded.store(true, std::sync::atomic::Ordering::SeqCst);
                             "{}".to_string()
@@ -949,6 +1010,38 @@ mod tests {
             0,
             "floor cleared once the real allocation pins"
         );
+    }
+
+    /// #2135 round-6 P1 regression: a TRANSIENT preload failure (503)
+    /// resets the preload state — the poll loop stops early instead of
+    /// burning the deadline, and the NEXT readiness attempt retries the
+    /// load and adopts the allocation. The round-5 boolean latched the
+    /// failure forever.
+    #[tokio::test]
+    async fn should_retry_preload_after_transient_failure() {
+        let (base, hits, _loaded) =
+            spawn_ollama_stub_failing(std::time::Duration::from_millis(100), 1).await;
+        let probe = LocalContextProbe::new_ollama(Arc::new(DummyProvider), &base, Some((2, 1)));
+        // Attempt 1: preload 503s; state resets; readiness returns with the
+        // floor, well before the deadline (poll loop must stop early).
+        let start = std::time::Instant::now();
+        probe.ensure_ready().await;
+        assert!(probe.window.get().is_none());
+        assert_eq!(probe.context_window(), OLLAMA_PROVISIONAL_WINDOW);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(attempt_deadline_secs(2)),
+            "failed preload must not burn the full deadline"
+        );
+        // Attempt 2: preload retries and the allocation is adopted.
+        probe.ensure_ready().await;
+        assert_eq!(probe.window.get(), Some(&Some(32_768)));
+        let generates = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == "/api/generate")
+            .count();
+        assert_eq!(generates, 2, "one failed + one successful preload");
     }
 
     /// #2135 round-3 P2: retryable client statuses must classify as
