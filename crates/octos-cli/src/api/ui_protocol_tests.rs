@@ -33332,7 +33332,7 @@ fn zai_lane_peer_handoff_hit_records_and_resolves_zai_glm52() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Synthesize with GLM-5.2.".to_owned(),
         name: "Zai Synth".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: Some("zai".to_owned()),
         goal_id: None,
         task_id: None,
@@ -33419,7 +33419,7 @@ fn zai_lane_peer_handoff_miss_warns_and_falls_back_to_primary() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Request a lane the profile never configured.".to_owned(),
         name: "Zai Miss".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: Some("zai".to_owned()),
         goal_id: None,
         task_id: None,
