@@ -350,6 +350,10 @@ impl ExecCommandTool {
             .timeout_secs
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
+        // #28c — BEFORE snapshot for the file-change receipt, reusing the
+        // SAME shared 28a module as ShellTool (snapshot_dirty_paths /
+        // diff_to_receipt). `None` on non-git/fail-open omits the receipt.
+        let dirty_before = super::shell::snapshot_dirty_paths(&cwd);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Put the child in its own process group so the timeout path can
@@ -397,6 +401,15 @@ impl ExecCommandTool {
                     "\n\nExit code: {}",
                     output.status.code().unwrap_or(-1)
                 ));
+                // #28c — file-change receipt on the coding-session exec
+                // path too (same shared 28a module; same five acceptance
+                // semantics as ShellTool / BashTool).
+                if let Some(receipt) = super::shell::diff_to_receipt(
+                    dirty_before,
+                    super::shell::snapshot_dirty_paths(&cwd),
+                ) {
+                    text.push_str(&receipt);
+                }
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
                 Ok(ToolResult {
                     output: truncate_output(text, max),
@@ -1781,6 +1794,10 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
             .clamp(1, MAX_BASH_TIMEOUT_SECS);
 
+        // #28c — BEFORE snapshot for the file-change receipt, reusing the
+        // SAME shared 28a module as ShellTool (snapshot_dirty_paths /
+        // diff_to_receipt). `None` on non-git/fail-open omits the receipt.
+        let dirty_before = super::shell::snapshot_dirty_paths(&cwd);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // codex review (#1172) P2 (follow-up): put the child in its own
@@ -1833,6 +1850,16 @@ impl Tool for BashTool {
                 }
                 let exit_code = output.status.code().unwrap_or(-1);
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
+                // #28c — file-change receipt appended ONCE to THIS result's
+                // tail (28a semantics: prompt-cache stable, never a system
+                // prompt / history rewrite). Non-git fail-open ⇒ None ⇒
+                // omitted (acceptance ④ of the 28a set).
+                if let Some(receipt) = super::shell::diff_to_receipt(
+                    dirty_before,
+                    super::shell::snapshot_dirty_paths(&cwd),
+                ) {
+                    text.push_str(&receipt);
+                }
                 Ok(ToolResult {
                     output: truncate_output(text, MAX_CAPTURE_BYTES),
                     success: output.status.success(),

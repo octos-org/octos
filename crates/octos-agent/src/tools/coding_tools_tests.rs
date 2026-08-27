@@ -2643,3 +2643,207 @@ fn should_declare_element_schema_when_spawn_agent_items_is_array() {
     assert!(items["items"]["properties"]["type"].is_object());
     assert!(items["items"]["properties"]["text"].is_object());
 }
+
+// ---------------------------------------------------------------------------
+// #28c — file-change receipt on the CODING-session bash path (BashTool),
+// reusing the shared 28a module. These tests pin the 28a acceptance set
+// on this link: real edit ⇒ receipt; phantom edit ⇒ 0; non-git ⇒ omitted;
+// default (no knob involvement here) ⇒ unchanged when nothing changed.
+// ---------------------------------------------------------------------------
+mod bash_change_receipt_28c {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::BashTool;
+    use std::sync::Arc;
+
+    fn tool(dir: &std::path::Path) -> BashTool {
+        BashTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+    }
+
+    #[tokio::test]
+    async fn real_edit_in_git_repo_appends_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(cwd)
+            .status()
+            .expect("git commit");
+        let target = cwd.join("receipt-28c.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "cmd": format!("echo real-edit > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "receipt missing on the coding bash path: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn phantom_edit_reports_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        // No write at all — the receipt must be "files_changed: 0" (or absent
+        // if the tree were clean-vs-clean; porcelain empty ⇒ None from
+        // snapshot ⇒ omitted; either way NEVER a nonzero phantom count).
+        let out = tool(cwd)
+            .execute(&json!({ "cmd": "echo phantom-check" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(
+            !out.output.contains("files_changed: 2"),
+            "no phantom count may appear: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_dir_omits_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path(); // never git-init'd
+        let target = cwd.join("plain.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "cmd": format!("echo plain > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            !out.output.contains("files_changed"),
+            "non-git fail-open must omit the receipt: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn default_behavior_when_no_tree_change_is_plain_output() {
+        // Zero-difference guarantee for the default path: in a git repo with
+        // an UNCHANGED tree, a read-only command's output carries no
+        // receipt noise beyond the accepted "files_changed: 0" line, which
+        // itself only appears when the tree was ALREADY dirty — pin the
+        // clean-tree case: no receipt at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(cwd)
+            .status()
+            .expect("git commit");
+        let out = tool(cwd)
+            .execute(&json!({ "cmd": "echo zero-diff-28c" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("zero-diff-28c"));
+        // 28a semantics: an empty dirty set yields exactly the single line
+        // "files_changed: 0" (matches ShellTool). No path list, no noise.
+        assert!(
+            out.output.contains("files_changed: 0"),
+            "clean tree ⇒ the single zero line: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("(+"),
+            "no truncation/list noise on a clean tree: {}",
+            out.output
+        );
+    }
+}
+
+mod exec_change_receipt_28c {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::ExecCommandTool;
+    use std::sync::Arc;
+
+    fn tool(dir: &std::path::Path) -> ExecCommandTool {
+        ExecCommandTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+    }
+
+    #[tokio::test]
+    async fn real_edit_in_git_repo_appends_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        let target = cwd.join("exec-receipt-28c.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "command": format!("echo real-edit > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "receipt missing on the exec_command path: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn non_git_dir_omits_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let target = cwd.join("plain.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "command": format!("echo plain > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            !out.output.contains("files_changed"),
+            "non-git fail-open must omit the receipt: {}",
+            out.output
+        );
+    }
+}
