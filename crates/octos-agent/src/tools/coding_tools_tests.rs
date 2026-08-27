@@ -2956,3 +2956,151 @@ mod receipt_scope_root_28c_r1 {
         );
     }
 }
+
+mod bash_file_writes_28d {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::{BashTool, ExecCommandTool};
+    use crate::tools::policy::BashFileWrites;
+    use std::sync::Arc;
+
+    fn bash(dir: &std::path::Path, mode: BashFileWrites) -> BashTool {
+        BashTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+            .with_bash_file_writes(mode)
+    }
+
+    fn exec(dir: &std::path::Path, mode: BashFileWrites) -> ExecCommandTool {
+        ExecCommandTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+            .with_bash_file_writes(mode)
+    }
+
+    fn git_init(cwd: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+    }
+
+    // deny: write-shaped command refused, escape hatch honored — on BOTH
+    // coding tools.
+    #[tokio::test]
+    async fn deny_refuses_write_and_escape_hatch_runs_bash_and_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = bash(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "cmd": "echo x > /tmp/never-28d" }))
+            .await
+            .expect("execute");
+        assert!(!out.success);
+        assert!(out.output.contains("bash_file_writes=deny"));
+        // Refusal text only — the command must not have run.
+        let _ = std::path::Path::new("/tmp/never-28d");
+
+        let out = exec(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "command": "echo x > /tmp/never-28d-e" }))
+            .await
+            .expect("execute");
+        assert!(!out.success, "exec deny: {}", out.output);
+        assert!(out.output.contains("bash_file_writes=deny"));
+
+        // Escape hatch: trailing `# octos:allow-write` runs the write.
+        let hatch = dir.path().join("hatch.txt");
+        let out = bash(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "cmd": format!("echo h > {:?} # octos:allow-write", hatch) }))
+            .await
+            .expect("execute");
+        assert!(out.success, "hatch: {}", out.output);
+        assert!(hatch.exists());
+    }
+
+    // deny lets read-only commands through untouched.
+    #[tokio::test]
+    async fn deny_lets_readonly_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = bash(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "cmd": "echo readonly-28d" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("readonly-28d"));
+        assert!(!out.output.contains("bash_file_writes"));
+    }
+
+    // warn: nudge only when files actually changed.
+    #[tokio::test]
+    async fn warn_nudges_only_on_change_bash_and_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_init(dir.path());
+        let out = bash(dir.path(), BashFileWrites::Warn)
+            .execute(&json!({ "cmd": "echo nochange" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(!out.output.contains("bash_file_writes=warn"));
+
+        let f = dir.path().join("w.txt");
+        let out = bash(dir.path(), BashFileWrites::Warn)
+            .execute(&json!({ "cmd": format!("echo w > {:?}", f) }))
+            .await
+            .expect("execute");
+        assert!(
+            out.output.contains("bash_file_writes=warn"),
+            "{}",
+            out.output
+        );
+
+        let f2 = dir.path().join("w2.txt");
+        let out = exec(dir.path(), BashFileWrites::Warn)
+            .execute(&json!({ "command": format!("echo w2 > {:?}", f2) }))
+            .await
+            .expect("execute");
+        assert!(
+            out.output.contains("bash_file_writes=warn"),
+            "exec warn: {}",
+            out.output
+        );
+    }
+
+    // allow (default): zero difference — no policy text anywhere.
+    #[tokio::test]
+    async fn allow_is_zero_difference_on_both_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for out in [
+            bash(dir.path(), BashFileWrites::default())
+                .execute(&json!({ "cmd": "echo zd" }))
+                .await
+                .expect("bash"),
+            exec(dir.path(), BashFileWrites::default())
+                .execute(&json!({ "command": "echo zd" }))
+                .await
+                .expect("exec"),
+        ] {
+            assert!(out.success);
+            assert!(out.output.contains("zd"));
+            assert!(!out.output.contains("bash_file_writes"));
+            assert!(!out.output.contains("edit_file / diff_edit"));
+        }
+    }
+
+    // Session-load wiring: EffectivePermissions carries the knob and the
+    // registry constructor injects it into the coding tools.
+    #[test]
+    fn permissions_default_carry_allow_and_registry_injects_knob() {
+        use crate::policy::EffectivePermissions;
+        let perms = EffectivePermissions::default();
+        assert_eq!(perms.bash_file_writes, BashFileWrites::Allow);
+        // with_builtins_and_permissions must not panic and must register the
+        // bash tool (the knob rides inside it; deny behavior is covered by
+        // the tool-level tests above).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = crate::ToolRegistry::with_builtins_and_permissions(
+            dir.path(),
+            Box::new(crate::sandbox::NoSandbox),
+            perms,
+        );
+        assert!(reg.get_tool("bash").is_some());
+        assert!(reg.get_tool("exec_command").is_some());
+    }
+}

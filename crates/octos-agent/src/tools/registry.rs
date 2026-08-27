@@ -1275,7 +1275,8 @@ impl ToolRegistry {
             ExecCommandTool::new(cwd, sandbox.clone())
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         // #1172: Codex-compatible `bash` alias. Shares command policy /
         // approval policy / sandbox with `shell` and `exec_command`, so a
@@ -1284,7 +1285,8 @@ impl ToolRegistry {
             super::coding_tools::BashTool::new(cwd, sandbox)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         registry.register(WriteStdinTool);
         registry.register(UpdatePlanTool);
@@ -1505,14 +1507,16 @@ impl ToolRegistry {
             ExecCommandTool::new(cwd, sandbox.clone())
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         // #1172: re-register the `bash` alias against the new cwd.
         registry.register(
             super::coding_tools::BashTool::new(cwd, sandbox)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         registry
             .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
