@@ -15496,7 +15496,17 @@ fn loop_runtime_wait_error(record: &AutonomyLoopRecord, wait: &WaitUntil) -> Rpc
 /// precedence over user doc, which takes precedence over the built-in
 /// fallback. Bullet 3 of #977.
 fn resolve_maintenance_prompt_at_fire_time() -> MaintenancePromptResolution {
-    let project = std::fs::read_to_string(PROJECT_MAINTENANCE_PROMPT_PATH).ok();
+    // #38 — thin shell over the parameterized core: the PRODUCTION caller
+    // reads the process CWD; tests inject an explicit temp dir instead of
+    // chdir'ing the whole process (a process-global CWD races every
+    // parallel neighbor on Windows — the round-6 error-3 cluster).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_maintenance_prompt_at_fire_time_in(&cwd)
+}
+
+/// #38 — the cwd-parameterized core of the fire-time prompt resolution.
+fn resolve_maintenance_prompt_at_fire_time_in(cwd: &Path) -> MaintenancePromptResolution {
+    let project = std::fs::read_to_string(cwd.join(PROJECT_MAINTENANCE_PROMPT_PATH)).ok();
     let user = expand_home_path(USER_MAINTENANCE_PROMPT_PATH)
         .and_then(|path| std::fs::read_to_string(path).ok());
     // `resolve_maintenance_prompt` only errors when *every* candidate is
@@ -15555,22 +15565,51 @@ pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
 mod tests {
     use super::*;
 
-    /// #1135 codex P2: serialize all cwd-mutating tests in this module
-    /// (currently `maintenance_loop_resolves_prompt_at_fire_time_from_project_doc`
-    /// and `scheduled_maintenance_fire_emits_resolved_prompt_source`).
-    /// Rust runs tests in parallel by default; both tests `chdir` to
-    /// their own tempdir and write `.octos/loop.md` there. Without a
-    /// shared lock the two tests can overlap, with one resolving the
-    /// OTHER's project doc and producing nondeterministic content
-    /// failures. The lock is poisoning-safe — we recover from a poisoned
-    /// lock so an earlier panic doesn't permanently disable the suite.
-    static CWD_MUTATING_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-    fn cwd_mutating_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        CWD_MUTATING_TEST_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// #38 — the cwd-PARAMETERIZED core test: no chdir, no process-global
+    /// CWD mutation, no cross-module guard needed. The end-to-end loop path
+    /// reaches this core through the thin shell (`env::current_dir`), which
+    /// production callers exercise naturally.
+    #[test]
+    fn maintenance_prompt_core_resolves_project_doc_from_injected_cwd() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let octos_dir = temp.path().join(".octos");
+        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
+        std::fs::write(octos_dir.join("loop.md"), "  project maintenance steps\n  ")
+            .expect("write loop.md");
+        let resolution = resolve_maintenance_prompt_at_fire_time_in(temp.path());
+        assert_eq!(
+            resolution.prompt.trim(),
+            "project maintenance steps",
+            "prompt resolved from the INJECTED cwd, no chdir (#38)"
+        );
+        assert_eq!(
+            maintenance_prompt_source_label(resolution.source),
+            "project"
+        );
+    }
+
+    /// #38 — scheduled-path twin: the parameterized core resolves the
+    /// project doc from an injected cwd (the end-to-end scheduled tick
+    /// reaches the same core through the thin shell).
+    #[test]
+    fn scheduled_maintenance_core_resolves_project_doc_from_injected_cwd() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let octos_dir = temp.path().join(".octos");
+        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
+        std::fs::write(
+            octos_dir.join("loop.md"),
+            "scheduled project maintenance steps\n",
+        )
+        .expect("write loop.md");
+        let resolution = resolve_maintenance_prompt_at_fire_time_in(temp.path());
+        assert_eq!(
+            resolution.prompt.trim(),
+            "scheduled project maintenance steps"
+        );
+        assert_eq!(
+            maintenance_prompt_source_label(resolution.source),
+            "project"
+        );
     }
 
     struct NativeMockProvider {
@@ -30303,146 +30342,6 @@ mod tests {
             }
             std::task::Poll::Pending => {}
         }
-    }
-
-    #[test]
-    fn maintenance_loop_resolves_prompt_at_fire_time_from_project_doc() {
-        use std::env;
-        // #1135 codex P2: serialize cwd-mutating tests in this module.
-        let _cwd_guard = cwd_mutating_test_guard();
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let cwd_before = env::current_dir().expect("cwd");
-        env::set_current_dir(temp.path()).expect("chdir tmp");
-        let octos_dir = temp.path().join(".octos");
-        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
-        std::fs::write(octos_dir.join("loop.md"), "  project maintenance steps\n  ")
-            .expect("write loop.md");
-
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-maint");
-        let created = orchestrator
-            .create_loop(LoopCreateRequest {
-                session_id: session_id.clone(),
-                profile_id: "tenant-a".into(),
-                prompt: None,
-                command: None,
-                interval_seconds: None,
-                mode: Some("maintenance".into()),
-            })
-            .expect("create maintenance loop");
-        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
-
-        let fired = orchestrator
-            .control_loop(LoopControlRequest {
-                loop_id,
-                session_id: Some(session_id.clone()),
-                profile_id: "tenant-a".into(),
-                kind: LoopControlKind::FireNow,
-            })
-            .expect("fire maintenance loop");
-        assert_eq!(fired["status"], json!("queued"));
-
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &session_id,
-            "tenant-a",
-            MasterContinuationRuntimeState::idle(),
-            1,
-        );
-        env::set_current_dir(&cwd_before).expect("restore cwd");
-        assert_eq!(drained.len(), 1);
-        let prompt_meta = drained[0]
-            .metadata
-            .get("prompt")
-            .cloned()
-            .expect("prompt metadata");
-        assert_eq!(
-            prompt_meta, "project maintenance steps",
-            "maintenance prompt must be resolved at fire time from .octos/loop.md (#977)"
-        );
-        let source = drained[0]
-            .metadata
-            .get("prompt_source")
-            .cloned()
-            .expect("prompt_source metadata");
-        assert_eq!(source, "project");
-    }
-
-    /// #1135 acceptance: the scheduled-due path must also report the
-    /// resolved `prompt_source` (`project` / `user` / `built_in`) and
-    /// not the legacy `"record"` placeholder. The continuation prompt
-    /// must match the file content, proving the resolution actually
-    /// ran for the scheduled tick, not just for `fire_now`.
-    #[test]
-    fn scheduled_maintenance_fire_emits_resolved_prompt_source() {
-        use std::env;
-        // #1135 codex P2: serialize cwd-mutating tests in this module.
-        let _cwd_guard = cwd_mutating_test_guard();
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let cwd_before = env::current_dir().expect("cwd");
-        env::set_current_dir(temp.path()).expect("chdir tmp");
-        let octos_dir = temp.path().join(".octos");
-        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
-        std::fs::write(
-            octos_dir.join("loop.md"),
-            "scheduled project maintenance steps\n",
-        )
-        .expect("write loop.md");
-
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let session_id = SessionKey::with_profile("tenant-a", "api", "sched-loop-maint");
-        let created = orchestrator
-            .create_loop(LoopCreateRequest {
-                session_id: session_id.clone(),
-                profile_id: "tenant-a".into(),
-                prompt: None,
-                command: None,
-                interval_seconds: None,
-                mode: Some("maintenance".into()),
-            })
-            .expect("create maintenance loop");
-        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
-
-        // Force the scheduled-due path: stamp a past `next_run_at_ms`
-        // and tick the scheduler. `fire_now` is NOT involved here.
-        {
-            let mut state = orchestrator.state();
-            let loop_record = state.loops.get_mut(&loop_id).expect("loop record");
-            loop_record.next_run_at_ms = Some(now_ms() - 1);
-        }
-        let ticked = orchestrator.tick_due_loops_for_session(
-            &session_id,
-            "tenant-a",
-            MasterContinuationRuntimeState::idle(),
-        );
-        assert_eq!(ticked, 1, "scheduled maintenance loop should enqueue");
-
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &session_id,
-            "tenant-a",
-            MasterContinuationRuntimeState::idle(),
-            usize::MAX,
-        );
-        env::set_current_dir(&cwd_before).expect("restore cwd");
-        assert_eq!(drained.len(), 1);
-        let prompt_meta = drained[0]
-            .metadata
-            .get("prompt")
-            .cloned()
-            .expect("prompt metadata");
-        assert_eq!(
-            prompt_meta.trim(),
-            "scheduled project maintenance steps",
-            "scheduled maintenance prompt must be resolved from .octos/loop.md (#1135)"
-        );
-        let source = drained[0]
-            .metadata
-            .get("prompt_source")
-            .cloned()
-            .expect("prompt_source metadata");
-        assert_eq!(
-            source, "project",
-            "scheduled fire must carry the resolved MaintenancePromptSource label (#1135)"
-        );
     }
 
     #[test]
