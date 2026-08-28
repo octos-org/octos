@@ -1205,6 +1205,8 @@ impl SupervisorStore {
         // transient spectrum). Retry-wrapped on Windows, single-shot on unix.
         #[cfg(windows)]
         let mut file = fs_retry(
+            &RetryClock::default(),
+            std::time::Duration::from_millis(fs_retry_total_ms()),
             || {
                 fs_ctx(
                     "events-append-open",
@@ -1230,6 +1232,8 @@ impl SupervisorStore {
         )?;
         #[cfg(windows)]
         let len = fs_retry(
+            &RetryClock::default(),
+            std::time::Duration::from_millis(fs_retry_total_ms()),
             || fs_ctx("events-metadata", &self.events_path, file.metadata()),
             is_transient_windows_lock,
         )?
@@ -1346,6 +1350,8 @@ impl SupervisorStore {
             let tmp_path = &tmp_path;
             let body_bytes = body.as_bytes();
             fs_retry(
+                &RetryClock::default(),
+                std::time::Duration::from_millis(fs_retry_total_ms()),
                 || {
                     fs_ctx("snapshot-tmp-create", tmp_path, File::create(tmp_path)).and_then(
                         |mut tmp| {
