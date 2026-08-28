@@ -2123,8 +2123,43 @@ mod tests {
 
     impl Drop for TestDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(self.path.parent().unwrap());
+            // #41 — remove ONLY this test's own root. The pre-#41 body
+            // removed `self.path.parent()` — i.e. the SHARED %TEMP% parent
+            // — so ANY TestDir's destruction deleted every parallel
+            // neighbor's root (winlab 33168585440: errno-3 victims with
+            // unique roots, sequence ...18,1,2, empty state; git blame
+            // c42b4713). Never touch the parent again.
+            let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// #41 — REGRESSION: two TestDirs share the %TEMP% parent; dropping A
+    /// must NOT remove B's root or its sentinel. The pre-#41 Drop removed
+    /// `self.path.parent()` and erased every parallel neighbor (winlab
+    /// 33168585440 mechanical lock). Cross-platform, non-zero assertions.
+    #[test]
+    fn testdir_drop_removes_only_own_root_not_shared_parent() {
+        let a = TestDir::new("drop-regression-a");
+        let b = TestDir::new("drop-regression-b");
+        let sentinel = b.path.join("sentinel.txt");
+        std::fs::write(&sentinel, "alive").expect("write sentinel");
+        assert_eq!(
+            a.path.parent().map(std::path::Path::to_path_buf),
+            b.path.parent().map(std::path::Path::to_path_buf),
+            "fixture premise: the two roots share one parent"
+        );
+        drop(a);
+        assert!(
+            b.path.is_dir(),
+            "#41: dropping A must not remove B's root: {}",
+            b.path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel readable"),
+            "alive",
+            "#41: B's sentinel must survive A's drop"
+        );
+        drop(b);
     }
 
     /// #26a — tolerant replay: a malformed row (torn write, unknown variant
