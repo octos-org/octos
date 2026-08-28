@@ -3866,25 +3866,6 @@ impl InProcessAgentOrchestrator {
             .count()
     }
 
-    /// #20b (main-tree sovereignty) — the goal id recorded as the main
-    /// tree's OWNER, persisted in the goal's ledger (`ledger_kv` sidecar,
-    /// key `main_tree_owner`) so it survives a restart. `None` when no goal
-    /// has claimed the tree yet (or the ledger is unavailable — reads are
-    /// best-effort and fail-open to "no owner", matching the guard's
-    /// fail-open-on-missing-DB rule).
-    pub(crate) fn main_tree_owner_goal(
-        &self,
-        profile_data_dir: &std::path::Path,
-        goal_id: &str,
-    ) -> Option<String> {
-        let ledger_path = Self::goal_ledger_path(profile_data_dir, goal_id);
-        if !ledger_path.is_file() {
-            return None;
-        }
-        let ledger = octos_fleet::GoalLedger::open(&ledger_path).ok()?;
-        ledger.main_tree_owner_goal().ok().flatten()
-    }
-
     /// #20b — scan `goal-ledgers/` for ANY recorded main-tree owner. The owner
     /// goal records sovereignty in its OWN ledger, but the shell guard runs for
     /// whichever goal issued the command — usually NOT the owner — so the owner
@@ -3899,18 +3880,38 @@ impl InProcessAgentOrchestrator {
     ) -> Option<String> {
         let dir = Self::goal_ledger_dir(profile_data_dir);
         let entries = std::fs::read_dir(&dir).ok()?;
+        // #34c — pick the EARLIEST claim ACROSS ledgers, never the first
+        // directory entry: `read_dir` order is inode/allocation order, so
+        // with two goals each claiming in their OWN ledger (kv_put OR IGNORE
+        // is first-writer-wins only WITHIN one file), the old scan returned
+        // whichever .db the OS listed first — nondeterministic (CI red,
+        // local green). Fix: compare claim timestamps (earliest wins); ties
+        // broken by goal id lexicographic order (a deterministic, documented
+        // tiebreak — identical ms claims are a same-clock race, and a stable
+        // order beats coin-flipping).
+        let mut earliest: Option<(i64, String)> = None;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("db") {
                 continue;
             }
-            if let Ok(ledger) = octos_fleet::GoalLedger::open(&path) {
-                if let Ok(Some(owner)) = ledger.main_tree_owner_goal() {
-                    return Some(owner);
-                }
+            let Ok(ledger) = octos_fleet::GoalLedger::open(&path) else {
+                continue;
+            };
+            let Ok(Some((owner, claimed_at))) =
+                ledger.kv_get_with_time(octos_fleet::GoalLedger::MAIN_TREE_OWNER_KEY)
+            else {
+                continue;
+            };
+            let wins = match &earliest {
+                None => true,
+                Some((best_at, best_owner)) => (claimed_at, &owner) < (*best_at, best_owner),
+            };
+            if wins {
+                earliest = Some((claimed_at, owner));
             }
         }
-        None
+        earliest.map(|(_, owner)| owner)
     }
 
     /// #20b — record `goal_id` as the first goal to land a non-default

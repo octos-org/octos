@@ -1370,6 +1370,22 @@ impl GoalLedger {
         Ok(value)
     }
 
+    /// #34c — value + claim timestamp for the multi-ledger sovereignty scan.
+    /// The scan must pick the EARLIEST claim across ledgers (first-writer-
+    /// wins ACROSS files, not just within one), so it needs the row's
+    /// `updated_at_ms`, which `kv_get` alone does not expose.
+    pub fn kv_get_with_time(&self, key: &str) -> Result<Option<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare_cached("SELECT value, updated_at_ms FROM ledger_kv WHERE key = ?1")?;
+        let value = stmt
+            .query_row(params![key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        Ok(value)
+    }
+
     /// Write a value into the `ledger_kv` sidecar, first-writer-wins when
     /// `overwrite` is false: a pre-existing row is left untouched and the
     /// EXISTING value is returned, so a racing second claimant observes the
