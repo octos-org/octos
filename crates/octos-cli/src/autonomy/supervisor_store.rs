@@ -2076,7 +2076,7 @@ mod tests {
             assert!(out.is_err());
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                if cfg!(windows) { 10 } else { 1 },
+                if cfg!(windows) { 8 } else { 1 },
                 "#42: unix single call; windows = VIRTUAL-time-derived count (machine-speed independent)"
             );
         }
@@ -2099,7 +2099,7 @@ mod tests {
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                if cfg!(windows) { 10 } else { 1 },
+                if cfg!(windows) { 8 } else { 1 },
                 "#42: windows exhausts the virtual budget then returns the LAST error (count derived from virtual time)"
             );
         }
@@ -2141,9 +2141,13 @@ mod tests {
             let err = out.expect_err("persistent remove error must surface");
             let msg = err.to_string();
             if cfg!(windows) {
-                assert_eq!(calls.load(Ordering::SeqCst), 10, "retried to the bound");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    8,
+                    "retried to the virtual budget"
+                );
                 assert!(
-                    msg.contains("attempt-9"),
+                    msg.contains("attempt-7"),
                     "must return the LAST error, got: {msg}"
                 );
                 assert!(
