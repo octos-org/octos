@@ -1242,10 +1242,22 @@ impl SupervisorStore {
                 cache.appends_since_fsync = 0;
             }
         }
+        // #34f — release the events-file handle BEFORE the caller may
+        // compact: on Windows, renaming a file that still has an open handle
+        // fails, and `append_event`'s auto-compaction below renames exactly
+        // this file. POSIX tolerates the open handle, which is why the five
+        // snapshot tests were green on Linux and Os error 3 on Windows.
         cache.last_sequence = cache.last_sequence.max(row.sequence);
         // Exact length of the file we just extended; nothing else can write
         // while we hold the lock.
         cache.events_len = file.metadata()?.len();
+        // #34f — release the events-file handle BEFORE the caller may
+        // compact (metadata read above must come first): on Windows,
+        // renaming a file that still has an open handle fails, and
+        // `append_event`'s auto-compaction renames exactly this file.
+        // POSIX tolerates the open handle — the five snapshot tests were
+        // green on Linux and Os error 3 on Windows for exactly this reason.
+        drop(file);
         cache.ledger_rows = cache.ledger_rows.saturating_add(1);
         cache.seeded = true;
         Ok(())
@@ -1308,6 +1320,9 @@ impl SupervisorStore {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
+            // #34f — Windows rename is NOT replace-on-existing; the remove
+            // above cleared the target, so a plain rename works on both
+            // platforms. (kept explicit for the audit trail)
             fs::rename(&self.events_path, &self.rotated_events_path)?;
             fsync_dir(&self.root_dir)?;
         }

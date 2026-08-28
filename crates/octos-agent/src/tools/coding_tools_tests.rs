@@ -3044,12 +3044,21 @@ mod receipt_scope_root_28c_r1 {
     // (per the 34e ruling's first option) instead of gating it off.
     #[test]
     fn resolver_literal_cd_prefix_wins_and_var_falls_back() {
-        let base = std::env::temp_dir(); // platform-absolute anchor
+        // #34f — the fixture text and the expected path must be built from
+        // the SAME string: on Windows `PathBuf::display()` renders
+        // backslashes, the resolver's literal screen rejects `\` (falls
+        // back to workdir), and the assertion pairs then cross (34e's own
+        // mistake — expected Temp\ws, got Temp\tmp\x). Building both the
+        // command text and the expectation from one forward-slash string
+        // keeps the pairs aligned on every platform; `Path::new` on a
+        // forward-slash string is still absolute on Windows (drive prefix).
+        let base = std::env::temp_dir();
         let ws = base.join("ws");
-        let target_dir = base.join("tmp").join("x");
-        let cd_cmd = format!("cd {} && echo hi > f", target_dir.display());
+        let base_text = base.to_string_lossy().replace('\\', "/");
+        let target_text = format!("{base_text}/tmp/x");
+        let cd_cmd = format!("cd {target_text} && echo hi > f");
         let (root, scope) = receipt_scope_root(&ws, &cd_cmd);
-        assert_eq!(root, target_dir);
+        assert_eq!(root, std::path::PathBuf::from(&target_text));
         assert_eq!(scope, "cd-target");
 
         let (root, scope) = receipt_scope_root(&ws, "cd ~/proj && echo hi > f");
