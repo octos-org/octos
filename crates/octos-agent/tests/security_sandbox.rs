@@ -444,6 +444,7 @@ fn should_restrict_reads_when_configured() {
     // (needs mach-lookup, dyld shared cache access, etc.), so we test the profile
     // generation rather than live execution with restricted reads.
     let config = octos_agent::SandboxConfig {
+        allow_toolchains: true,
         enabled: true,
         mode: octos_agent::sandbox::SandboxMode::Macos,
         allow_network: false,
@@ -672,6 +673,7 @@ fn should_block_dangerous_docker_cwd() {
 
     // Test via the actual sandbox module
     let sb = octos_agent::sandbox::create_sandbox(&octos_agent::SandboxConfig {
+        allow_toolchains: true,
         enabled: true,
         mode: octos_agent::sandbox::SandboxMode::Docker,
         allow_network: false,

@@ -822,6 +822,17 @@ pub struct LlmModelSelectionConfig {
     /// Whether this is considered a strong model for large tool-heavy runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strong: Option<bool>,
+    /// Operator override for the effective context window, in tokens. When
+    /// set it takes precedence over BOTH the static catalog and the runtime
+    /// probe (#2135): the provider is wrapped in `ContextWindowOverride` as
+    /// the outermost layer, so `context_window()` resolves to this value
+    /// through the entire runtime stack. Use it to pin a smaller window than
+    /// a server advertises (e.g. cap a 262K llama-server at 16384 to bound
+    /// KV/compaction) or to correct a mis-probed backend. `None` = defer to
+    /// probe/catalog. Applies to the primary and to each fallback
+    /// independently. (#2142, split from #2127.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 /// A provider route / endpoint choice for one model.
@@ -1190,6 +1201,9 @@ impl LlmModelSelectionConfig {
             && self.model_hints.is_none()
             && self.cost_per_m.is_none()
             && self.strong.is_none()
+            // #2142: a selection that pins ONLY a context_window override is
+            // meaningful — it must not be collapsed as "empty" and dropped.
+            && self.context_window.is_none()
     }
 }
 
@@ -2705,12 +2719,16 @@ pub(crate) fn config_from_profile(
             api_type: fb.route.as_ref().and_then(|route| route.api_type.clone()),
             cost_per_m: fb.cost_per_m,
             strong: fb.strong.unwrap_or_else(crate::config::default_true),
+            // #2142: per-fallback operator override of the effective window.
+            context_window: fb.context_window,
         })
         .collect();
 
     Config {
         provider: primary.and_then(|selection| selection.family_id.clone()),
         model: primary.and_then(|selection| selection.model_id.clone()),
+        // #2142: operator override of the primary's effective context window.
+        context_window: primary.and_then(|selection| selection.context_window),
         base_url: primary.and_then(|selection| {
             selection
                 .route
@@ -3939,6 +3957,8 @@ mod tests {
                         }),
                         cost_per_m: Some(4.5),
                         strong: Some(true),
+                        // #2142: operator window override on the primary.
+                        context_window: Some(16_384),
                     }),
                     fallbacks: vec![LlmModelSelectionConfig {
                         family_id: Some("minimax".into()),
@@ -3959,6 +3979,9 @@ mod tests {
                         }),
                         cost_per_m: Some(3.2),
                         strong: Some(true),
+                        // #2142: a DIFFERENT per-fallback window override —
+                        // must project independently of the primary's.
+                        context_window: Some(8_192),
                     }],
                 }),
                 ..Default::default()
@@ -4000,6 +4023,12 @@ mod tests {
                 .map(|h| h.merge_system_messages),
             Some(true)
         );
+        // #2142: the per-selection context_window overrides project through
+        // to the flattened Config — primary onto `config.context_window`, and
+        // each fallback onto its own `FallbackModel.context_window`,
+        // independently (16384 vs 8192).
+        assert_eq!(config.context_window, Some(16_384));
+        assert_eq!(config.fallback_models[0].context_window, Some(8_192));
     }
 
     #[test]

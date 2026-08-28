@@ -1037,6 +1037,9 @@ impl Agent {
                         hook_ctx.as_ref(),
                     );
                     match hooks.run(HookEvent::UserPromptSubmit, &payload).await {
+                        // Feedback is an after-event-only outcome; treat as
+                        // allow for a prompt-submit hook.
+                        HookResult::Feedback(_) => {}
                         HookResult::Deny(reason) => {
                             let reason = reason.trim();
                             let message = if reason.is_empty() {

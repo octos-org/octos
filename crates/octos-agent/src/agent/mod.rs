@@ -1543,7 +1543,15 @@ mod profile_integration_tests {
             lean_names.iter().all(|n| base_names.contains(n)),
             "lean set must be a subset of the default set",
         );
-        for kept in ["read_file", "shell", "edit_file", "grep"] {
+        for kept in [
+            "read_file",
+            "shell",
+            "bash",
+            "edit_file",
+            "grep",
+            "check",
+            "update_plan",
+        ] {
             assert!(
                 lean_names.contains(&kept.to_string()),
                 "core-loop tool {kept} missing from lean set: {lean_names:?}",

@@ -4586,6 +4586,7 @@ mod tests {
                 model_hints: None,
                 cost_per_m: None,
                 strong: None,
+                context_window: None,
             }),
             fallbacks: vec![],
         });

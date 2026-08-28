@@ -52,6 +52,7 @@ struct ExecSession {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     output: Arc<Mutex<String>>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    sandboxed: bool,
 }
 
 fn next_exec_session_id() -> String {
@@ -132,6 +133,29 @@ fn receipt_scope_root(workdir: &Path, command: &str) -> (PathBuf, &'static str) 
         workdir.join(path)
     };
     (root, "cd-target")
+}
+
+use crate::sandbox::sandbox_denial_hint;
+
+/// Session-output payload shared by `exec_command`'s yielded path and
+/// `write_stdin` (#2136 review, P1: the principal ASYNC execution path
+/// returned permission failures without the [sandbox] explanation the
+/// synchronous paths carry). Scans the FULL captured text, truncates,
+/// then appends the hint so it survives the cap — same ordering contract
+/// as the synchronous assemblers.
+fn session_output_payload(
+    captured: String,
+    exit_code: Option<i32>,
+    sandboxed: bool,
+    cap: usize,
+) -> String {
+    let failed = matches!(exit_code, Some(code) if code != 0);
+    let hint = sandbox_denial_hint(sandboxed, !failed, &captured);
+    let mut output = truncate_output(captured, cap);
+    if let Some(hint) = hint {
+        output.push_str(hint);
+    }
+    output
 }
 
 fn resolve_optional_workdir(
@@ -524,9 +548,17 @@ impl ExecCommandTool {
                         );
                     }
                 }
+                // Scan BEFORE truncation (the denial line may be what gets
+                // cut), append AFTER (so the hint itself survives the cut).
+                let hint =
+                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
+                let mut out = truncate_output(text, max);
+                if let Some(hint) = hint {
+                    out.push_str(hint);
+                }
                 Ok(ToolResult {
-                    output: truncate_output(text, max),
+                    output: out,
                     success: output.status.success(),
                     ..Default::default()
                 })
@@ -579,15 +611,34 @@ impl ExecCommandTool {
         let session_id = next_exec_session_id();
         let output = Arc::new(Mutex::new(String::new()));
         let exit_code = Arc::new(Mutex::new(None));
-        if let Some(stdout) = stdout {
-            tokio::spawn(append_reader_output(stdout, output.clone(), "stdout"));
-        }
-        if let Some(stderr) = stderr {
-            tokio::spawn(append_reader_output(stderr, output.clone(), "stderr"));
-        }
+        // #2136 review: after the child exits, give the pipe readers a
+        // BOUNDED grace to drain before publishing the exit code, then
+        // publish regardless. A plain reader-join deadlocked when a
+        // descendant (a backgrounded `server &`, a daemon that inherits
+        // stdout) keeps a pipe write-end open — EOF never arrives and the
+        // session reported `running` forever. The grace closes the
+        // round-2 race (a fast-exiting command's final output — e.g. a
+        // denial line — is captured within the window, since its fds close
+        // at exit) without hanging on a surviving descendant; combined
+        // with sampling the exit code BEFORE the output, "not running"
+        // implies "output drained" in the common case.
+        const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
+        let stdout_reader = stdout
+            .map(|stdout| tokio::spawn(append_reader_output(stdout, output.clone(), "stdout")));
+        let stderr_reader = stderr
+            .map(|stderr| tokio::spawn(append_reader_output(stderr, output.clone(), "stderr")));
         let exit_code_for_wait = exit_code.clone();
         tokio::spawn(async move {
             let code = child.wait().await.ok().and_then(|status| status.code());
+            let _ = tokio::time::timeout(READER_DRAIN_GRACE, async {
+                if let Some(handle) = stdout_reader {
+                    let _ = handle.await;
+                }
+                if let Some(handle) = stderr_reader {
+                    let _ = handle.await;
+                }
+            })
+            .await;
             *exit_code_for_wait.lock().await = Some(code.unwrap_or(-1));
         });
         exec_sessions().lock().await.insert(
@@ -596,20 +647,31 @@ impl ExecCommandTool {
                 stdin: Arc::new(Mutex::new(stdin)),
                 output: output.clone(),
                 exit_code: exit_code.clone(),
+                sandboxed: !self.sandbox.is_noop(),
             },
         );
         tokio::time::sleep(Duration::from_millis(
             input.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_MS),
         ))
         .await;
-        let captured = output.lock().await.clone();
+        // #2136 review round 3, P2: sample the exit code FIRST, then the
+        // output. The exit-code task sets the code only AFTER joining the
+        // pipe readers, so `code.is_some()` (not running) guarantees the
+        // output buffer is fully drained — reading output after the code
+        // therefore never sees a stale/empty capture with running:false.
         let code = *exit_code.lock().await;
+        let captured = output.lock().await.clone();
         Ok(ToolResult {
             output: json!({
                 "session_id": session_id,
                 "running": code.is_none(),
                 "exit_code": code,
-                "output": truncate_output(captured, input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES)),
+                "output": session_output_payload(
+                    captured,
+                    code,
+                    !self.sandbox.is_noop(),
+                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
+                ),
             })
             .to_string(),
             success: true,
@@ -682,14 +744,20 @@ impl Tool for WriteStdinTool {
             }
         }
         tokio::time::sleep(Duration::from_millis(input.yield_time_ms.unwrap_or(250))).await;
-        let output = session.output.lock().await.clone();
+        // #2136 review round 3, P2: code before output (see spawn_session).
         let code = *session.exit_code.lock().await;
+        let output = session.output.lock().await.clone();
         Ok(ToolResult {
             output: json!({
                 "session_id": input.session_id,
                 "running": code.is_none(),
                 "exit_code": code,
-                "output": truncate_output(output, input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES)),
+                "output": session_output_payload(
+                    output,
+                    code,
+                    session.sandboxed,
+                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
+                ),
             })
             .to_string(),
             success: true,
@@ -739,7 +807,7 @@ macro_rules! simple_codex_tool {
 /// typed [`UiPlanRecord`]. Accepts item text under `step` / `title` / `content`
 /// and tolerates a few status spellings; assigns a stable 1-based `id` when the
 /// caller doesn't supply one so downstream clients can re-render in place.
-fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanRecord {
+pub(crate) fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanRecord {
     use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
     let items = args
         .get("plan")
@@ -822,7 +890,7 @@ async fn request_user_input_body(
             "status": "requested",
             "request": args,
             "response": null,
-            "message": "User input request recorded; no synchronous host response channel is attached to this runtime."
+            "message": "User input request recorded in the transcript; no synchronous host response channel is attached to this runtime (non-interactive or unattended run). Do NOT wait or re-ask: proceed with your best judgment, state the assumption in one line, and continue the task so the user can redirect you later if needed."
         })
         .to_string(),
         success: true,
@@ -2025,8 +2093,15 @@ impl Tool for BashTool {
                         );
                     }
                 }
+                // Scan BEFORE truncation, append AFTER — see run_to_completion.
+                let hint =
+                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let mut out = truncate_output(text, MAX_CAPTURE_BYTES);
+                if let Some(hint) = hint {
+                    out.push_str(hint);
+                }
                 Ok(ToolResult {
-                    output: truncate_output(text, MAX_CAPTURE_BYTES),
+                    output: out,
                     success: output.status.success(),
                     structured_metadata: Some(json!({
                         "codex_tool": "bash",

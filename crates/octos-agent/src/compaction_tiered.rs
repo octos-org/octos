@@ -74,6 +74,35 @@ pub struct MicroCompactionPolicy {
     pub max_age_turns: u32,
     /// Tool results larger than this (in bytes) get content-cleared on sight.
     pub max_size_bytes_per_result: u32,
+    /// #2131 working-set pinning: the most-recently-*touched* (read or
+    /// written) distinct files are the active working set — evicting one
+    /// mid-task just forces the model to re-read it next turn (the observed
+    /// llm.c pathology: the same source file read 66 times). The read/write
+    /// results for the newest `pin_recent_files` files are exempt from BOTH
+    /// the stale and oversized conditions, so the file the model is actually
+    /// working on stays in context. `0` disables pinning (pre-#2131
+    /// behaviour). Bounded by design: only K files are pinned, so older
+    /// reads still evict and tier-3 can still summarise.
+    #[serde(default = "default_pin_recent_files")]
+    pub pin_recent_files: u32,
+    /// #2131 read dedup: when several tool results read the SAME file+range,
+    /// keep only the newest and stub the rest on sight (regardless of age or
+    /// size). Collapses the N-stubs-for-one-file clutter a re-read loop
+    /// leaves behind. `true` by default; the newest read of each range (and
+    /// any pinned file) always survives.
+    #[serde(default = "default_dedup_duplicate_reads")]
+    pub dedup_duplicate_reads: bool,
+}
+
+/// Default number of recently-touched files to pin (#2131).
+pub const DEFAULT_TIER1_PIN_RECENT_FILES: u32 = 5;
+
+fn default_pin_recent_files() -> u32 {
+    DEFAULT_TIER1_PIN_RECENT_FILES
+}
+
+fn default_dedup_duplicate_reads() -> bool {
+    true
 }
 
 impl Default for MicroCompactionPolicy {
@@ -81,6 +110,8 @@ impl Default for MicroCompactionPolicy {
         Self {
             max_age_turns: DEFAULT_TIER1_MAX_AGE_TURNS,
             max_size_bytes_per_result: DEFAULT_TIER1_MAX_SIZE_BYTES_PER_RESULT,
+            pin_recent_files: DEFAULT_TIER1_PIN_RECENT_FILES,
+            dedup_duplicate_reads: true,
         }
     }
 }
@@ -120,7 +151,13 @@ impl MicroCompactionPolicy {
         protected_tool_call_ids: &[String],
         pass: Tier1Pass,
     ) -> Tier1Report {
-        if self.max_age_turns == 0 && self.max_size_bytes_per_result == u32::MAX {
+        // Nothing to do only when EVERY tier-1 lever is inactive — the age and
+        // size thresholds AND the #2131 pin/dedup features.
+        if self.max_age_turns == 0
+            && self.max_size_bytes_per_result == u32::MAX
+            && self.pin_recent_files == 0
+            && !self.dedup_duplicate_reads
+        {
             return Tier1Report::default();
         }
 
@@ -149,6 +186,12 @@ impl MicroCompactionPolicy {
         let age_threshold = self.max_age_turns;
         let size_threshold = self.max_size_bytes_per_result as usize;
 
+        // #2131: which read results are the freshest copy of an actively-used
+        // file (pin — never evict) and which are superseded duplicates (dedup —
+        // evict on sight). Computed once from the assistant tool calls.
+        let working_set =
+            WorkingSet::analyze(messages, self.pin_recent_files, self.dedup_duplicate_reads);
+
         let mut results_pruned = 0usize;
         let mut bytes_reclaimed: u64 = 0;
 
@@ -167,6 +210,13 @@ impl MicroCompactionPolicy {
                 continue;
             }
 
+            // #2131 working-set pin: never evict the freshest read of an
+            // actively-used file, even when oversized — evicting it just
+            // forces a re-read next turn.
+            if working_set.pinned_ids.contains(id) {
+                continue;
+            }
+
             let (tool_name, turn_id) = id_to_meta
                 .get(id)
                 .cloned()
@@ -176,11 +226,21 @@ impl MicroCompactionPolicy {
             let content_len = msg.content.len();
             let oversized = size_threshold != usize::MAX && content_len > size_threshold;
             let stale = matches!(pass, Tier1Pass::Full) && age_threshold > 0 && age > age_threshold;
+            // #2131 dedup: a read superseded by a newer read of the same
+            // file+range is pure redundancy — collapse it regardless of age or
+            // size. Gated to the Full pass like `stale`, so the per-iteration
+            // OversizedOnly pass never rewrites deep history (KV-cache friendly).
+            let superseded =
+                matches!(pass, Tier1Pass::Full) && working_set.superseded_ids.contains(id);
 
-            let reason: Option<&'static str> = match (stale, oversized) {
-                (true, _) => Some("tier1_stale"),
-                (false, true) => Some("tier1_oversized"),
-                _ => None,
+            let reason: Option<&'static str> = if superseded {
+                Some("tier1_superseded")
+            } else if stale {
+                Some("tier1_stale")
+            } else if oversized {
+                Some("tier1_oversized")
+            } else {
+                None
             };
             let Some(reason) = reason else { continue };
 
@@ -201,6 +261,140 @@ impl MicroCompactionPolicy {
         Tier1Report {
             results_pruned,
             bytes_reclaimed,
+        }
+    }
+}
+
+/// Tool names whose result carries a file READ (dedup + pin candidates).
+fn is_read_tool(name: &str) -> bool {
+    matches!(name, "read_file" | "read")
+}
+
+/// Tool names whose call TOUCHES (writes/edits) a file — they contribute to
+/// the recently-touched working set even though the result itself is usually
+/// a small confirmation rather than file content.
+fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "diff_edit" | "apply_patch"
+    )
+}
+
+/// The file path a read/write tool call targets, from its arguments. Covers
+/// the `path`, `file_path`, and `filePath` conventions — `read_file` accepts
+/// the camelCase `filePath` alias (#1767), so missing it would silently leave
+/// alias-style reads unpinned/undeduped.
+fn tool_target_path(args: &serde_json::Value) -> Option<String> {
+    args.get("path")
+        .or_else(|| args.get("file_path"))
+        .or_else(|| args.get("filePath"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// A read's (path, start, end, limit) identity for dedup — the same window of
+/// the same file is the same read. `read_file`'s range is `start_line`/`offset`
+/// plus EITHER `end_line` OR `limit`, so ALL of them belong in the key: two
+/// reads of `x` at start 1 with `end_line: 50` vs `end_line: 10` are different
+/// windows and must NOT dedup to each other (that would silently drop lines
+/// 11-50 and force a re-read — the very thrash this feature prevents).
+fn read_range_key(args: &serde_json::Value) -> Option<String> {
+    let path = tool_target_path(args)?;
+    let start = args
+        .get("offset")
+        .or_else(|| args.get("start_line"))
+        .and_then(serde_json::Value::as_i64);
+    let end = args.get("end_line").and_then(serde_json::Value::as_i64);
+    let limit = args.get("limit").and_then(serde_json::Value::as_i64);
+    Some(format!("{path}\u{1f}{start:?}\u{1f}{end:?}\u{1f}{limit:?}"))
+}
+
+/// Working-set analysis of the conversation for one tier-1 pass (#2131):
+/// which tool-result ids hold the freshest read of a pinned (recently-touched)
+/// file, and which read ids are superseded duplicates.
+#[derive(Default)]
+struct WorkingSet {
+    /// Ids to exempt from eviction: the newest read of each pinned file.
+    pinned_ids: std::collections::HashSet<String>,
+    /// Read ids that a newer read of the SAME file+range supersedes.
+    superseded_ids: std::collections::HashSet<String>,
+}
+
+impl WorkingSet {
+    /// Analyse assistant tool calls in message order. `pin_recent_files` is K
+    /// (0 disables pinning); `dedup` toggles the superseded-read set.
+    fn analyze(messages: &[Message], pin_recent_files: u32, dedup: bool) -> Self {
+        if pin_recent_files == 0 && !dedup {
+            return Self::default();
+        }
+        // Latest touch order per path, latest read (order,id) per path, and
+        // latest read (order,id) per range key — all keyed by encounter order.
+        let mut order: usize = 0;
+        let mut latest_touch: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut latest_read_by_path: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+        let mut latest_read_by_range: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+        // Every read id with its range key, so we can subtract the survivors.
+        let mut reads: Vec<(String, String)> = Vec::new();
+
+        for msg in messages {
+            if msg.role != MessageRole::Assistant {
+                continue;
+            }
+            let Some(ref calls) = msg.tool_calls else {
+                continue;
+            };
+            for call in calls {
+                let is_read = is_read_tool(&call.name);
+                let is_write = is_write_tool(&call.name);
+                if !is_read && !is_write {
+                    continue;
+                }
+                let Some(path) = tool_target_path(&call.arguments) else {
+                    continue;
+                };
+                order += 1;
+                latest_touch.insert(path.clone(), order);
+                if is_read {
+                    latest_read_by_path.insert(path.clone(), (order, call.id.clone()));
+                    if let Some(range) = read_range_key(&call.arguments) {
+                        reads.push((call.id.clone(), range.clone()));
+                        latest_read_by_range.insert(range, (order, call.id.clone()));
+                    }
+                }
+            }
+        }
+
+        // Pin the newest read of the K most-recently-touched files.
+        let mut pinned_ids = std::collections::HashSet::new();
+        if pin_recent_files > 0 {
+            let mut by_recency: Vec<(&String, &usize)> = latest_touch.iter().collect();
+            by_recency.sort_by(|a, b| b.1.cmp(a.1));
+            for (path, _) in by_recency.into_iter().take(pin_recent_files as usize) {
+                if let Some((_, id)) = latest_read_by_path.get(path) {
+                    pinned_ids.insert(id.clone());
+                }
+            }
+        }
+
+        // A read is superseded when it is not the newest read of its range.
+        let mut superseded_ids = std::collections::HashSet::new();
+        if dedup {
+            for (id, range) in reads {
+                if latest_read_by_range
+                    .get(&range)
+                    .is_some_and(|(_, newest)| newest != &id)
+                {
+                    superseded_ids.insert(id);
+                }
+            }
+        }
+
+        Self {
+            pinned_ids,
+            superseded_ids,
         }
     }
 }
@@ -557,6 +751,35 @@ mod tests {
         }
     }
 
+    /// An assistant message issuing one tool call with explicit `arguments`
+    /// (so #2131 pin/dedup can read the `path`/`offset`/`limit`).
+    fn assistant_call_args(
+        tool_name: &str,
+        tool_id: &str,
+        arguments: serde_json::Value,
+    ) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: tool_id.to_string(),
+                name: tool_name.to_string(),
+                arguments,
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn is_placeholder(content: &str) -> bool {
+        ToolResultPlaceholder::from_placeholder_content(content).is_ok()
+    }
+
     fn tiered_runner(
         tier1: MicroCompactionPolicy,
         tier2: ApiMicroCompactionConfig,
@@ -629,6 +852,169 @@ mod tests {
         assert_eq!(parsed.tool_call_id, "call_big");
         assert_eq!(parsed.original_byte_len, Some(50_000));
         assert_eq!(parsed.reason, "tier1_oversized");
+    }
+
+    #[test]
+    fn pins_the_freshest_read_of_the_active_working_file_against_oversize() {
+        // #2131: an oversized read of the file the model is actively using must
+        // NOT be cleared — evicting it just forces a re-read next turn (the
+        // llm.c pathology). K=1 pins only the single most-recently-touched
+        // file, so a second, older file's oversized read still evicts.
+        let big = "x".repeat(4096);
+        let mut messages = vec![
+            user_msg("go"),
+            assistant_call_args("read_file", "r_old", serde_json::json!({"path": "old.txt"})),
+            tool_result("r_old", &big),
+            assistant_call_args(
+                "read_file",
+                "r_active",
+                serde_json::json!({"path": "active.rs"}),
+            ),
+            tool_result("r_active", &big),
+        ];
+        let policy = MicroCompactionPolicy {
+            max_age_turns: 0, // no stale pruning; isolate the size/pin paths
+            max_size_bytes_per_result: 1024,
+            pin_recent_files: 1,
+            dedup_duplicate_reads: false,
+        };
+        policy.prune(&mut messages, &[]);
+        // active.rs is the single pinned file → its (oversized) read survives.
+        assert!(
+            !is_placeholder(&messages[4].content),
+            "the freshest read of the active file must be pinned"
+        );
+        // old.txt is outside the top-1 working set → oversized read is cleared.
+        assert!(
+            is_placeholder(&messages[2].content),
+            "a non-working-set oversized read still evicts"
+        );
+    }
+
+    #[test]
+    fn writing_a_file_keeps_it_in_the_working_set() {
+        // #2131: a file WRITTEN this turn counts as touched, so its earlier
+        // read stays pinned (you are actively editing it).
+        let big = "x".repeat(4096);
+        let mut messages = vec![
+            user_msg("go"),
+            assistant_call_args("read_file", "r_out", serde_json::json!({"path": "out.rs"})),
+            tool_result("r_out", &big),
+            assistant_call_args("read_file", "r_ref", serde_json::json!({"path": "ref.txt"})),
+            tool_result("r_ref", &big),
+            // Now WRITE out.rs — the most recent touch of any file.
+            assistant_call_args("write_file", "w_out", serde_json::json!({"path": "out.rs"})),
+            tool_result("w_out", "ok"),
+        ];
+        let policy = MicroCompactionPolicy {
+            max_age_turns: 0,
+            max_size_bytes_per_result: 1024,
+            pin_recent_files: 1,
+            dedup_duplicate_reads: false,
+        };
+        policy.prune(&mut messages, &[]);
+        // out.rs is the most-recently-touched file (via the write) → its read
+        // is pinned even though ref.txt was read more recently than out.rs.
+        assert!(
+            !is_placeholder(&messages[2].content),
+            "the read of a just-written file must stay pinned"
+        );
+    }
+
+    #[test]
+    fn dedups_superseded_reads_of_the_same_range() {
+        // #2131: two reads of the SAME file+range — the older is redundant and
+        // collapses to a placeholder; the newest survives.
+        let mut messages = vec![
+            user_msg("go"),
+            assistant_call_args(
+                "read_file",
+                "r1",
+                serde_json::json!({"path": "a.txt", "offset": 0, "limit": 100}),
+            ),
+            tool_result("r1", "stale content"),
+            assistant_call_args(
+                "read_file",
+                "r2",
+                serde_json::json!({"path": "a.txt", "offset": 0, "limit": 100}),
+            ),
+            tool_result("r2", "fresh content"),
+        ];
+        let policy = MicroCompactionPolicy {
+            max_age_turns: 0,                    // not stale
+            max_size_bytes_per_result: u32::MAX, // not oversized
+            pin_recent_files: 0,                 // isolate dedup from pinning
+            dedup_duplicate_reads: true,
+        };
+        policy.prune(&mut messages, &[]);
+        // r1 (older duplicate) is superseded → cleared with the dedup reason.
+        let parsed = ToolResultPlaceholder::from_placeholder_content(&messages[2].content)
+            .expect("superseded read is a placeholder");
+        assert_eq!(parsed.reason, "tier1_superseded");
+        // r2 (newest) survives untouched.
+        assert!(!is_placeholder(&messages[4].content));
+    }
+
+    #[test]
+    fn reads_differing_only_by_end_line_are_not_deduped() {
+        // #2131 review: end_line is part of a read's window identity. Two reads
+        // of the same file+start but different end_line are DIFFERENT windows
+        // and must both survive — deduping them would silently drop content.
+        let mut messages = vec![
+            user_msg("go"),
+            assistant_call_args(
+                "read_file",
+                "r_wide",
+                serde_json::json!({"path": "a.txt", "start_line": 1, "end_line": 50}),
+            ),
+            tool_result("r_wide", "lines 1-50"),
+            assistant_call_args(
+                "read_file",
+                "r_narrow",
+                serde_json::json!({"path": "a.txt", "start_line": 1, "end_line": 10}),
+            ),
+            tool_result("r_narrow", "lines 1-10"),
+        ];
+        let policy = MicroCompactionPolicy {
+            max_age_turns: 0,
+            max_size_bytes_per_result: u32::MAX,
+            pin_recent_files: 0, // isolate dedup
+            dedup_duplicate_reads: true,
+        };
+        policy.prune(&mut messages, &[]);
+        assert!(
+            !is_placeholder(&messages[2].content),
+            "the wider read (lines 1-50) must NOT be deduped away by a narrower one"
+        );
+        assert!(
+            !is_placeholder(&messages[4].content),
+            "the narrower read survives too"
+        );
+    }
+
+    #[test]
+    fn dedup_is_skipped_in_the_oversized_only_pass() {
+        // #2131: dedup rewrites deep history, so like `stale` it runs only in
+        // the Full pass — the per-iteration OversizedOnly pass leaves the KV
+        // prefix cache intact.
+        let mut messages = vec![
+            user_msg("go"),
+            assistant_call_args("read_file", "r1", serde_json::json!({"path": "a.txt"})),
+            tool_result("r1", "old"),
+            assistant_call_args("read_file", "r2", serde_json::json!({"path": "a.txt"})),
+            tool_result("r2", "new"),
+        ];
+        let policy = MicroCompactionPolicy {
+            max_age_turns: 0,
+            max_size_bytes_per_result: u32::MAX,
+            pin_recent_files: 0,
+            dedup_duplicate_reads: true,
+        };
+        policy.prune_with_pass(&mut messages, &[], Tier1Pass::OversizedOnly);
+        assert!(
+            !is_placeholder(&messages[2].content),
+            "OversizedOnly must not dedup deep history"
+        );
     }
 
     #[test]
@@ -757,6 +1143,9 @@ mod tests {
         let policy = MicroCompactionPolicy {
             max_age_turns: 0,
             max_size_bytes_per_result: u32::MAX,
+            // Every lever off → the pass early-returns as a true no-op.
+            pin_recent_files: 0,
+            dedup_duplicate_reads: false,
         };
         let report = policy.prune(&mut messages, &[]);
         assert_eq!(report, Tier1Report::default());

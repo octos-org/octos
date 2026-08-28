@@ -287,6 +287,25 @@ impl LlmProvider for AnthropicProvider {
         Ok(Box::pin(event_stream))
     }
 
+    fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::types::ToolSpec],
+    ) -> u32 {
+        // #2143 part 3: the base estimate (messages + tool schemas) plus the
+        // Anthropic request-envelope overhead the flat estimator omits — each
+        // message is wrapped in a content-block array, system parts are lifted
+        // into a separate top-level `system` array, and cache_control
+        // breakpoints / tool_choice / metadata ride along. Conservative fixed
+        // additions (they only ever OVER-count, so the route-fit guard never
+        // under-estimates and lets an oversized request through).
+        let base = crate::context::estimate_request_tokens_base(messages, tools);
+        let per_message_framing = messages.len() as u32 * 4;
+        const REQUEST_ENVELOPE_OVERHEAD: u32 = 24;
+        base.saturating_add(per_message_framing)
+            .saturating_add(REQUEST_ENVELOPE_OVERHEAD)
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }

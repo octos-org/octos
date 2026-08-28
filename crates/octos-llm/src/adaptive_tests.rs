@@ -2508,6 +2508,79 @@ async fn test_sizing_is_min_across_slots_and_identity_is_deterministic() {
     assert_eq!(first, "m1", "cold identical slots must select the primary");
 }
 
+/// #2143 part 1: INSIDE a turn scope, the sizing accessors resolve to the ONE
+/// pinned route's window (not the conservative min), and the pin is stable for
+/// the whole turn — so a prompt is sized for the exact route the send takes.
+#[tokio::test]
+async fn turn_pin_sizes_for_the_pinned_route_not_the_min() {
+    let big: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "primary",
+            model: "m1",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        262_144,
+    ));
+    let small: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "fallback",
+            model: "m2",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        32_768,
+    ));
+    let router = Arc::new(AdaptiveRouter::new(
+        vec![big, small],
+        &[],
+        AdaptiveConfig {
+            // No stochastic probe so the pin resolves to the deterministic
+            // primary and the assertion is stable.
+            probe_probability: 0.0,
+            ..Default::default()
+        },
+    ));
+
+    // Outside a turn: the pre-#2143 conservative min-across-slots envelope.
+    assert_eq!(
+        router.context_window(),
+        32_768,
+        "unpinned sizing is the min"
+    );
+
+    // Inside a turn: pinned to the deterministic primary → its full window,
+    // stable across repeated sizing/identity calls.
+    let r = router.clone();
+    with_router_context(RouterContext::default(), async move {
+        assert_eq!(
+            r.context_window(),
+            262_144,
+            "turn sizing must use the pinned route's window"
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                r.context_window(),
+                262_144,
+                "the pin is stable for the turn"
+            );
+        }
+        assert_eq!(r.max_output_tokens(), r.max_output_tokens());
+        assert_eq!(r.model_id(), "m1", "identity resolves to the pinned route");
+        r.ensure_ready().await;
+    })
+    .await;
+
+    // A fresh turn re-resolves the pin (no leakage across turns).
+    let r2 = router.clone();
+    with_router_context(RouterContext::default(), async move {
+        assert_eq!(r2.context_window(), 262_144);
+    })
+    .await;
+}
+
 /// #2135 round-8 P1: every adaptive dispatch passes the route-fit guard —
 /// a lane that resolves too small at dispatch is skipped (its chat never
 /// invoked), failover serves from a fitting lane, and the skip must NOT

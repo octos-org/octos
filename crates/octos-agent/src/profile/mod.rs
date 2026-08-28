@@ -11,10 +11,12 @@
 //! consolidates the envelope.
 //!
 //! The built-in `coding` profile is the no-flag default and carries a lean
-//! core-coding allow list (files, shell, search, memory, spawn, user
-//! questions) so `octos chat` does not ship every tool schema to the LLM on
-//! every round. The `coding-full` built-in preserves the pre-lean
-//! unfiltered surface byte-for-byte for sessions that want everything.
+//! core-coding allow list (files, shell, search, memory, spawn, the workspace
+//! check tool, plan tracking, user questions, and tool_search) so `octos chat`
+//! does not ship every tool schema to the LLM on every round. The allow-list
+//! filter narrows the VISIBLE registry, so tools it excludes (web/research/
+//! media/pipeline) are restored via the `coding-full` built-in, which
+//! preserves the pre-lean unfiltered surface byte-for-byte.
 //! Alternate profiles (e.g. `swarm`) declare their own allow lists and
 //! expanded agent sets.
 //!
@@ -681,22 +683,37 @@ mod tests {
         // per-round tool-schema overhead.
         match &coding.tools {
             ProfileTools::AllowList { tools } => {
+                // #2133: the lean surface KEEPS files/shell/search/memory/spawn
+                // and ADDS the three core-loop tools it was missing — `check`,
+                // `update_plan`, `tool_search`. Only `apply_patch` is dropped
+                // (edit_file/diff_edit cover it), so the fs tools are named
+                // explicitly instead of via `group:fs`.
                 for required in [
-                    "group:fs",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "diff_edit",
                     "group:runtime",
                     "group:search",
                     "group:memory",
                     "spawn",
                     "ask_user_question",
+                    "check",
+                    "update_plan",
+                    "tool_search",
                 ] {
                     assert!(
                         tools.contains(&required.to_string()),
                         "coding allow list must keep {required}, got {tools:?}",
                     );
                 }
-                // The heavy non-core surfaces must stay out of the lean
-                // default (available via `coding-full` or a custom profile).
+                // Dropped or never-included: `apply_patch` (redundant), the
+                // `group:fs` alias (fs named explicitly to exclude apply_patch),
+                // and the heavy web / research / media / pipeline surfaces
+                // (restored via `--profile coding-full`).
                 for excluded in [
+                    "group:fs",
+                    "apply_patch",
                     "group:web",
                     "group:research",
                     "group:media",
@@ -782,8 +799,9 @@ mod tests {
             name: "get_weather",
         });
         // `spawn` is registered by the chat/acp bootstrap (SpawnTool),
-        // not by `with_builtins`; a stub stands in for the inclusion
-        // assertion.
+        // not by `with_builtins`; a stub stands in so the inclusion
+        // assertion proves the lean profile keeps it (#2133 softened: spawn
+        // stays in the default surface).
         tools.register(StubTool { name: "spawn" });
 
         let coding = ProfileDefinition::builtin("coding").expect("coding");
@@ -796,11 +814,20 @@ mod tests {
             "read_file",
             "write_file",
             "edit_file",
+            "diff_edit",
+            // group:runtime — all shells kept (interactive sessions live on
+            // exec_command + write_stdin; bash is the Codex-compatible alias).
+            "bash",
             "shell",
+            "exec_command",
+            "write_stdin",
             "glob",
             "grep",
             "list_dir",
             "spawn",
+            "check",
+            "update_plan",
+            "tool_search",
             "ask_user_question",
         ] {
             assert!(
@@ -809,6 +836,9 @@ mod tests {
             );
         }
         for excluded in [
+            // #2133: only apply_patch is dropped (edit_file/diff_edit cover
+            // it); the heavy web/research/media surfaces stay out.
+            "apply_patch",
             "web_search",
             "web_fetch",
             "browser",
@@ -818,7 +848,6 @@ mod tests {
             "workspace_diff",
             "spawn_agent",
             "delegate",
-            "update_plan",
         ] {
             assert!(
                 !names.contains(excluded),
@@ -827,10 +856,10 @@ mod tests {
         }
         // Budget pin (#1578 harness review: 48 tools ≈ 9.3K tokens per
         // round in the unfiltered default). The lean surface must stay a
-        // small fraction of that; 20 leaves headroom for core-loop growth
-        // while failing loudly on accidental bloat.
+        // small fraction of that; 24 leaves headroom for the core loop +
+        // shells + memory while failing loudly on accidental bloat.
         assert!(
-            names.len() <= 20,
+            names.len() <= 24,
             "lean coding profile grew to {} tools: {names:?}",
             names.len(),
         );

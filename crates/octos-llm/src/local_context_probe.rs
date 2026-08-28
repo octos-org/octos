@@ -708,6 +708,16 @@ impl LlmProvider for LocalContextProbe {
         self.inner.max_output_tokens()
     }
 
+    fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::types::ToolSpec],
+    ) -> u32 {
+        // #2143 part 3: delegate so the inner provider's request-size override
+        // reaches the route-fit guard through the probe wrapper.
+        self.inner.estimate_request_tokens(messages, tools)
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

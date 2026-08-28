@@ -1403,6 +1403,122 @@ async fn exec_command_runs_to_completion() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn exec_session_completes_even_when_a_descendant_keeps_stdout_open() {
+    // #2136 review: joining pipe readers before publishing the exit code
+    // hung forever when a backgrounded descendant held a pipe write-end
+    // open (EOF never arrives). The bounded drain grace must let the
+    // foreground command report completion regardless. `sleep 30 &` keeps
+    // a child alive with stdout inherited; the foreground shell exits
+    // immediately, and the session must report running:false well within
+    // the sleep.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let registry = ToolRegistry::with_builtins(temp.path());
+    let start = std::time::Instant::now();
+    let result = registry
+        .execute(
+            "exec_command",
+            &json!({
+                // Yield past the reader-drain grace so the completed exit
+                // code has published; the background `sleep 30` is still
+                // alive, which is exactly the descendant-holds-stdout case.
+                "cmd": "sleep 30 & echo foreground-done",
+                "yield_time_ms": 600
+            }),
+        )
+        .await
+        .expect("exec command");
+    let payload: Value = serde_json::from_str(&result.output).expect("session payload");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "must not block on a surviving descendant; took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        payload["running"],
+        Value::Bool(false),
+        "foreground command must report completion despite the background child: {}",
+        result.output
+    );
+    assert!(
+        payload["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("foreground-done"),
+        "foreground output must be captured: {}",
+        result.output
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn exec_session_captures_all_output_when_process_exits_at_deadline() {
+    // #2136 review round 2, P2: a process that prints then exits right at
+    // the yield deadline must still have its FULL output captured before
+    // `running` flips to false — the exit-code task joins the pipe readers
+    // first. Runs many trials because the race is timing-sensitive.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let registry = ToolRegistry::with_builtins(temp.path());
+    let mut completed = 0;
+    for _ in 0..40 {
+        let result = registry
+            .execute(
+                "exec_command",
+                &json!({
+                    // Emit a distinctive tail, then exit immediately; the
+                    // 5ms yield races the ~instant exit.
+                    "cmd": "printf 'HEAD MIDDLE TAIL_MARKER'; exit 0",
+                    "yield_time_ms": 5
+                }),
+            )
+            .await
+            .expect("exec command");
+        let payload: Value = serde_json::from_str(&result.output).expect("session payload");
+        if payload["running"] == Value::Bool(false) {
+            completed += 1;
+            let out = payload["output"].as_str().unwrap_or("");
+            assert!(
+                out.contains("TAIL_MARKER"),
+                "completed session dropped output to a race: {out:?}"
+            );
+        }
+    }
+    // Non-vacuous: the completed-session path MUST have been exercised
+    // (otherwise the assertion above never runs).
+    assert!(
+        completed > 0,
+        "no trial reached the completed path — test is vacuous"
+    );
+}
+
+/// #2128 acceptance: execute a command DENIED by a real sandbox and assert
+/// the tool response carries the [sandbox] explanation (macOS only — needs
+/// a live seatbelt profile).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn denied_command_response_carries_sandbox_hint() {
+    use crate::sandbox::{SandboxConfig, create_sandbox};
+    let temp = tempfile::tempdir().expect("tempdir");
+    // Real seatbelt sandbox, workspace = temp; writing OUTSIDE it is denied.
+    let sandbox = create_sandbox(&SandboxConfig::default());
+    let registry = ToolRegistry::with_builtins_and_sandbox(temp.path(), sandbox);
+    // Target a path guaranteed outside the workspace and not otherwise
+    // writable; the shell's own error carries the kernel EPERM phrase.
+    let result = registry
+        .execute(
+            "exec_command",
+            &json!({ "cmd": "echo x > /etc/octos_denied_probe" }),
+        )
+        .await
+        .expect("exec command");
+    assert!(
+        result.output.contains("[sandbox]"),
+        "denied command must surface the sandbox hint, got: {}",
+        result.output
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn write_stdin_talks_to_exec_session() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
@@ -2793,6 +2909,52 @@ mod bash_change_receipt_28c {
     }
 }
 
+/// The sandbox-denial hint fires only on the exact combination that needs
+/// explaining: a FAILED command, under a REAL sandbox, whose output carries
+/// one of the kernel's denial phrases — EPERM (macOS seatbelt), EACCES
+/// (Landlock), or EROFS (bwrap/Docker read-only). Every other combination
+/// stays untouched (a passing command that merely logs a phrase is not a
+/// denial).
+#[test]
+fn sandbox_denial_hint_fires_only_on_sandboxed_failures() {
+    use crate::sandbox::sandbox_denial_hint;
+
+    for denial in [
+        "error: could not read settings file: Operation not permitted",
+        "mkdir: cannot create directory: Permission denied",
+        "touch: cannot touch '/etc/x': Read-only file system",
+    ] {
+        let hint = sandbox_denial_hint(true, false, denial);
+        let hint = hint.expect("sandboxed failure must be explained");
+        assert!(hint.contains("[sandbox]"), "hint must be tagged: {hint}");
+    }
+
+    // The toolchain-cache lever is only advertised where it is implemented.
+    let hint = sandbox_denial_hint(true, false, "Operation not permitted").unwrap();
+    if cfg!(target_os = "macos") {
+        assert!(
+            hint.contains("allow_toolchains"),
+            "macOS hint names the lever"
+        );
+    } else {
+        assert!(
+            !hint.contains("allow_toolchains"),
+            "non-macOS backends do not implement the grants; the hint must not advertise them"
+        );
+    }
+
+    for (sandboxed, success, body) in [
+        (false, false, "Operation not permitted"), // no sandbox: errno is real
+        (true, true, "Operation not permitted"),   // command succeeded
+        (true, false, "error: normal compile failure"), // failed, but no denial phrase
+    ] {
+        assert!(
+            sandbox_denial_hint(sandboxed, success, body).is_none(),
+            "no hint for ({sandboxed}, {success}, {body})"
+        );
+    }
+}
+
 mod exec_change_receipt_28c {
     use super::*;
     use crate::policy::AllowAllPolicy;
@@ -3103,4 +3265,22 @@ mod bash_file_writes_28d {
         assert!(reg.get_tool("bash").is_some());
         assert!(reg.get_tool("exec_command").is_some());
     }
+}
+
+/// #2136 review P1: the session paths (exec_command yielded, write_stdin)
+/// carry the [sandbox] denial hint too — scan the FULL capture, truncate,
+/// then append so the hint survives the cap.
+#[test]
+fn session_payload_carries_denial_hint_on_sandboxed_failures() {
+    let denial = "error: could not read settings file: Operation not permitted".to_string();
+    let payload = super::session_output_payload(denial.clone(), Some(1), true, 4096);
+    if cfg!(target_os = "macos") {
+        assert!(payload.contains("[sandbox]"), "{payload}");
+    }
+    // Still running (no exit code): not a failure, no hint.
+    let payload = super::session_output_payload(denial.clone(), None, true, 4096);
+    assert!(!payload.contains("[sandbox]"), "{payload}");
+    // Unsandboxed: EPERM is real, no hint.
+    let payload = super::session_output_payload(denial, Some(1), false, 4096);
+    assert!(!payload.contains("[sandbox]"), "{payload}");
 }

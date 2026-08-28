@@ -441,6 +441,8 @@ impl Agent {
                         Err("tool arguments changed since approval request was created".to_string())
                     }
                 }
+                // Feedback is an after-event-only outcome; never arises here.
+                HookResult::Feedback(_) => Ok(()),
                 // Context injection is a `user_prompt_submit`-only outcome and
                 // never arises for a before-tool re-validation; allow the call.
                 HookResult::Context(_) => Ok(()),
@@ -526,7 +528,7 @@ impl Agent {
         // default delegation), so every field above was reaching only
         // task-local (`TOOL_CTX`) readers. TOOL_CTX stays scoped for plugin
         // tools that read the task-local.
-        let result = TOOL_APPROVAL_CTX
+        let mut result = TOOL_APPROVAL_CTX
             .scope(
                 approver,
                 TOOL_CTX.scope(
@@ -547,9 +549,28 @@ impl Agent {
                 octos_core::truncated_utf8(&result.output, 500, "..."),
                 result.success,
                 tool_start.elapsed().as_millis() as u64,
+                Some(&pending.tool_args),
+                self.tools.workspace_root(),
                 self.hook_ctx().as_ref(),
             );
-            let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+            // Feedback (a checker reporting diagnostics) reaches the model;
+            // infra errors (missing binary, timeout) stay log-only — see
+            // HookResult::Feedback. Sanitized like every other model-facing
+            // tool output: checkers quote source lines, and source lines
+            // carry secrets.
+            if let HookResult::Feedback(entries) =
+                hooks.run(HookEvent::AfterToolCall, &payload).await
+            {
+                let feedback = crate::sanitize::sanitize_tool_output(&entries.join("\n\n"));
+                // #2129 review round 2, finding 4: truncate the tool output
+                // to its limit FIRST, then append feedback — mirrors the
+                // spawned dispatch site so a downstream cap cannot cut the
+                // checker feedback appended last.
+                let limit = octos_core::tool_output_limit(&pending.request.tool_name);
+                result.output = octos_core::truncate_head_tail(&result.output, limit, 0.7);
+                result.output.push_str("\n\n[hook] ");
+                result.output.push_str(&feedback);
+            }
         }
 
         Ok(result)
@@ -2345,7 +2366,12 @@ impl Agent {
                 }
             };
 
-            // After-tool hook (fire-and-forget)
+            // After-tool hooks. Hook FEEDBACK (a checker reporting
+            // diagnostics — see HookResult::Feedback) reaches the model:
+            // appended to the tool message below AFTER truncation so it
+            // survives the output cap, and sanitized because checkers quote
+            // source lines. Infra errors stay log-only.
+            let mut hook_feedback: Option<String> = None;
             if let Some(ref hooks) = hooks {
                 let payload = HookPayload::after_tool(
                     &tc_name,
@@ -2353,9 +2379,16 @@ impl Agent {
                     octos_core::truncated_utf8(&content, 500, "..."),
                     tool_success,
                     duration.as_millis() as u64,
+                    Some(&effective_args),
+                    tools.workspace_root(),
                     hook_ctx.as_ref(),
                 );
-                let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+                if let HookResult::Feedback(entries) =
+                    hooks.run(HookEvent::AfterToolCall, &payload).await
+                {
+                    hook_feedback =
+                        Some(crate::sanitize::sanitize_tool_output(&entries.join("\n\n")));
+                }
             }
 
             // Per-tool output truncation with head/tail split.
@@ -2384,7 +2417,12 @@ impl Agent {
                 }
             }
             let content = content;
-            let content = crate::sanitize::sanitize_tool_output(&content);
+            let mut content = crate::sanitize::sanitize_tool_output(&content);
+            if let Some(feedback) = hook_feedback {
+                content.push_str("\n\n[hook] ");
+                content.push_str(&feedback);
+            }
+            let content = content;
 
             // Pair the structured side-channel with the originating tool's
             // call id so the session actor (which keys cost rows by

@@ -69,6 +69,24 @@ pub trait LlmProvider: Send + Sync {
         context::max_output_tokens(self.model_id())
     }
 
+    /// #2143 part 3: estimate the token size of the REQUEST this provider would
+    /// build from `messages` + `tools`, INCLUDING provider-specific
+    /// serialization overhead (a separate system block, per-message
+    /// content-block framing, cache-control metadata) that the flat estimator
+    /// omits. The route-fit guard calls this instead of summing messages/tools
+    /// itself, so the ~12.5% safety margin no longer has to stand in for that
+    /// overhead. The default is the provider-agnostic base estimate; concrete
+    /// providers override to tighten it, and WRAPPERS DELEGATE to their inner
+    /// provider so the override survives the RetryProvider / context-override /
+    /// local-probe stack the router dispatches through.
+    fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::types::ToolSpec],
+    ) -> u32 {
+        context::estimate_request_tokens_base(messages, tools)
+    }
+
     /// Get the model identifier.
     fn model_id(&self) -> &str;
 

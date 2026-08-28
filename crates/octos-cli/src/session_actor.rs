@@ -4683,6 +4683,17 @@ impl SessionActor {
             // Context injection is a `user_prompt_submit`-only outcome; these
             // emitted lifecycle events never produce it. Exhaustive-match arm.
             HookResult::Context(_) => {}
+            // Feedback is an AfterToolCall-only outcome (checker diagnostics
+            // appended by the agent's own dispatch sites); these lifecycle
+            // events have no tool result to carry it — log and continue.
+            HookResult::Feedback(entries) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    count = entries.len(),
+                    "lifecycle hook produced feedback; ignored"
+                );
+            }
             HookResult::Deny(reason) => {
                 warn!(
                     session = %self.session_key,

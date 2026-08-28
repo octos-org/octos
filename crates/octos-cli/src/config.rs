@@ -36,6 +36,15 @@ pub struct Config {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Operator override for the primary provider's effective context window,
+    /// in tokens. When set it wraps the (probed) primary provider in
+    /// `ContextWindowOverride` as the OUTERMOST layer, so it beats both the
+    /// static catalog and the runtime probe (#2135). Projected from
+    /// `LlmModelSelectionConfig.context_window` by `config_from_profile`.
+    /// `None` = defer to probe/catalog. (#2142)
+    #[serde(default)]
+    pub context_window: Option<u32>,
+
     /// Custom base URL for the API endpoint.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -455,6 +464,13 @@ pub struct FallbackModel {
     /// Defaults to true for backward compat — set false for weak/proxy providers.
     #[serde(default = "default_true")]
     pub strong: bool,
+    /// Operator override for THIS fallback's effective context window, in
+    /// tokens. Wraps this fallback provider in `ContextWindowOverride`
+    /// (outermost) so it beats the catalog and the probe (#2135). Projected
+    /// from the per-fallback `LlmModelSelectionConfig.context_window`.
+    /// `None` = defer to probe/catalog. (#2142)
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 pub fn default_true() -> bool {

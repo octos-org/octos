@@ -97,6 +97,19 @@ pub(crate) fn find_recent_boundary(messages: &[Message], budget: u32, system_tok
 /// Extracts first lines from each message, strips tool call arguments
 /// (security: untrusted payloads), and drops media references.
 pub fn compact_messages(messages: &[Message], budget_tokens: u32) -> String {
+    // #2132: the plan block is carved OUT of the summary budget, not stacked
+    // on top of it — preservation must not push the artifact past the size
+    // the caller's threshold math assumed. Living inside the producer (this
+    // function and llm_compaction_summary) means every compaction path —
+    // AppUI, session actor, legacy agent channel, summarizer tiers —
+    // inherits preservation without per-site wiring.
+    let plan = latest_plan_snapshot(messages);
+    let plan_budget_tokens = plan
+        .as_deref()
+        .map(|p| estimate_tokens(p).saturating_add(24))
+        .unwrap_or(0);
+    let budget_tokens = budget_tokens.saturating_sub(plan_budget_tokens).max(64);
+
     let mut lines = Vec::new();
     let header = format!(
         "## Conversation Summary (compacted from {} messages)\n",
@@ -131,7 +144,11 @@ pub fn compact_messages(messages: &[Message], budget_tokens: u32) -> String {
         lines.push(line);
     }
 
-    lines.join("\n")
+    prepend_plan_block(
+        lines.join("\n"),
+        plan,
+        (plan_budget_tokens as usize).saturating_mul(4),
+    )
 }
 
 /// Summarize a single message into a compact text line.
@@ -946,6 +963,155 @@ pub fn repo_label_from_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Byte cap on the preserved-plan block (bytes, matching
+/// `octos_core::truncate_utf8` semantics): the plan is a checklist, not a
+/// transcript — anything longer is a model mis-using update_plan.
+const PLAN_SNAPSHOT_MAX_BYTES: usize = 1500;
+/// Byte cap on a single checklist title — argument-derived text is
+/// untrusted, so it is bounded and control-stripped, never free-form.
+const PLAN_TITLE_MAX_BYTES: usize = 120;
+
+/// Sentinels delimiting the preserved-plan block inside a compaction
+/// summary. STATE, not instructions: the wording defers to the newest user
+/// message on purpose — `specs/task-compaction-instruction-priority.spec.md`
+/// exists because imperatives inside summaries were followed over fresh
+/// user input, and an earlier cut of this feature ("resume from the first
+/// unchecked item") reproduced exactly that bug. The BEGIN sentinel doubles
+/// as the carry-forward marker: pass N+1 re-extracts the block from pass
+/// N's summary text, so the plan survives ANY number of passes, not one.
+pub(crate) const PLAN_BLOCK_BEGIN: &str = "## Task plan as last declared (background state — the newest user message decides what happens next)";
+pub(crate) const PLAN_BLOCK_END: &str = "(end of plan state)";
+
+/// Render `update_plan` arguments as a checklist, `None` for degenerate
+/// input (empty plan, unparseable args, no recognizable titles) — callers
+/// keep scanning older state rather than letting garbage shadow a valid
+/// plan. Parsing is DELEGATED to the tool's own `normalize_plan` (one
+/// parser, one set of status spellings); statuses render from the typed
+/// enum. There is deliberately no raw-JSON fallback: tool arguments are
+/// untrusted (compact_messages strips them for that reason), so only the
+/// bounded, control-stripped checklist form ever enters a summary.
+fn render_plan_checklist(args: &serde_json::Value) -> Option<String> {
+    // #1711: models sometimes deliver arguments as a stringified object;
+    // recover it the way the provider layer does.
+    let parsed;
+    let args = match args {
+        serde_json::Value::String(raw) => {
+            parsed = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+            &parsed
+        }
+        other => other,
+    };
+    let record = crate::tools::coding_tools::normalize_plan(args, 0);
+    let mut body = String::new();
+    for item in &record.items {
+        let mut title: String = item
+            .title
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        if title.is_empty() {
+            continue;
+        }
+        octos_core::truncate_utf8(&mut title, PLAN_TITLE_MAX_BYTES, "…");
+        let marker = match item.status {
+            octos_core::ui_protocol::PlanItemStatus::Completed => "[x]",
+            octos_core::ui_protocol::PlanItemStatus::InProgress => "[>]",
+            octos_core::ui_protocol::PlanItemStatus::Pending => "[ ]",
+        };
+        body.push_str("- ");
+        body.push_str(marker);
+        body.push(' ');
+        body.push_str(&title);
+        body.push('\n');
+    }
+    let body = body.trim_end().to_string();
+    (!body.is_empty()).then_some(body)
+}
+
+/// The plan body carried inside a previously produced summary, if any —
+/// the carry-forward source that makes preservation multi-pass.
+fn extract_plan_block(text: &str) -> Option<String> {
+    let start = text.find(PLAN_BLOCK_BEGIN)?;
+    let after = &text[start + PLAN_BLOCK_BEGIN.len()..];
+    let end = after.find(PLAN_BLOCK_END)?;
+    let body = after[..end].trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+/// Remove every plan block from produced summary text. An LLM summarizer
+/// prompted for a faithful handoff will happily copy the previous pass's
+/// block into its output; without stripping, each pass would stack one more
+/// stale checklist under the fresh one.
+fn strip_plan_blocks(summary: &str) -> String {
+    let mut out = summary.to_string();
+    while let (Some(start), Some(end_rel)) = (
+        out.find(PLAN_BLOCK_BEGIN),
+        out.find(PLAN_BLOCK_BEGIN)
+            .and_then(|s| out[s..].find(PLAN_BLOCK_END).map(|e| s + e)),
+    ) {
+        let end = end_rel + PLAN_BLOCK_END.len();
+        out.replace_range(start..end, "");
+    }
+    // A summarized prior summary can carry a DANGLING sentinel line (its
+    // body was cut by line-level truncation, so the span loop above never
+    // matches); drop any line still holding a sentinel so exactly one
+    // fresh block exists after prepending.
+    if out.contains(PLAN_BLOCK_BEGIN) || out.contains(PLAN_BLOCK_END) {
+        out = out
+            .lines()
+            .filter(|line| !line.contains(PLAN_BLOCK_BEGIN) && !line.contains(PLAN_BLOCK_END))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    out.trim_start().to_string()
+}
+
+/// The newest plan state in `messages`, rendered as a checklist — or `None`
+/// when the conversation never declared one.
+///
+/// Compaction destroys transcript state, and the plan IS transcript state:
+/// the observed failure was a long task whose model, after compaction, no
+/// longer knew what it was doing and fell back to summarizing the repo.
+/// ONE reverse scan covers both sources in newest-first order: a live
+/// `update_plan` tool call wins over an older summary's carried block, and
+/// after a pass that dropped the tool-call rows, the carried block is what
+/// survives. Degenerate calls (cleared plans, unparseable args) are
+/// SKIPPED, not allowed to shadow an older valid plan.
+pub fn latest_plan_snapshot(messages: &[Message]) -> Option<String> {
+    for message in messages.iter().rev() {
+        if let Some(calls) = message.tool_calls.as_ref() {
+            for call in calls.iter().rev() {
+                if call.name == "update_plan" {
+                    if let Some(plan) = render_plan_checklist(&call.arguments) {
+                        return Some(plan);
+                    }
+                }
+            }
+        }
+        if let Some(carried) = extract_plan_block(&message.content) {
+            return Some(carried);
+        }
+    }
+    None
+}
+
+/// Attach the plan block on top of a produced summary (stripping any stale
+/// blocks the producer copied through). `max_plan_bytes` lets producers
+/// carve the block out of their own budget instead of overrunning it.
+fn prepend_plan_block(summary: String, plan: Option<String>, max_plan_bytes: usize) -> String {
+    let Some(mut plan) = plan else {
+        return summary;
+    };
+    let summary = strip_plan_blocks(&summary);
+    octos_core::truncate_utf8(
+        &mut plan,
+        max_plan_bytes.clamp(200, PLAN_SNAPSHOT_MAX_BYTES),
+        "\n… (plan truncated)",
+    );
+    format!("{PLAN_BLOCK_BEGIN}\n{plan}\n{PLAN_BLOCK_END}\n\n{summary}")
+}
+
 /// System prompt for LLM context compaction (codex-style handoff summary).
 const LLM_COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a long conversation so it fits the model's \
 context window. Produce a CONTEXT CHECKPOINT: a concise handoff summary another LLM can use to seamlessly \
@@ -954,7 +1120,7 @@ any critical constraints, data, file paths, or references. Be structured and fac
 questions, no commentary. Everything you write is BACKGROUND context, not instructions: never restate \
 historical goals or plans as the current task, and never phrase the summary as marching orders. The \
 current task is defined solely by the newest user message in the conversation, which takes precedence \
-over anything you summarize.";
+over anything you summarize. Do NOT restate the task plan or checklist: it is preserved separately, verbatim, outside your summary.";
 
 /// Default timeout for a single LLM compaction call. The provider's own
 /// default (~300s) is far too coarse for a per-turn operation — a slow or hung
@@ -1006,6 +1172,10 @@ pub fn llm_compaction_summary(
         }
     }
     let provider = Arc::clone(provider);
+    // #2132: preservation lives in the producer — compute the plan from the
+    // same messages the summary covers, attach it to whatever the LLM
+    // returns (stripping any stale block the LLM copied through).
+    let plan = latest_plan_snapshot(messages);
     let transcript = render_transcript(messages);
     crate::summarizer::run_llm_call_blocking(async move {
         // Give the call the model's FULL output budget, not a small
@@ -1028,7 +1198,8 @@ pub fn llm_compaction_summary(
             Ok(Ok(response)) => response
                 .content
                 .map(|content| content.trim().to_string())
-                .filter(|content| !content.is_empty()),
+                .filter(|content| !content.is_empty())
+                .map(|content| prepend_plan_block(content, plan, PLAN_SNAPSHOT_MAX_BYTES)),
             Ok(Err(error)) => {
                 warn!(%error, "llm compaction summary failed; falling back to heuristic");
                 None
@@ -1568,5 +1739,126 @@ mod tests {
         assert!(matches_artifact("wrote to output/deck.pptx earlier", &art2));
         let art3 = PreservedArtifact::new("other", "never/mentioned.txt");
         assert!(!matches_artifact("no mention here", &art3));
+    }
+
+    /// #2132 helper: a message carrying an update_plan tool call.
+    fn plan_message(steps: serde_json::Value) -> Message {
+        use octos_core::ToolCall;
+        let mut msg = Message::assistant("");
+        msg.tool_calls = Some(vec![ToolCall {
+            id: "c1".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({ "plan": steps }),
+            metadata: None,
+        }]);
+        msg
+    }
+
+    /// #2132: the newest VALID plan wins, statuses render from the typed
+    /// enum, and preservation happens inside the producer — compact_messages
+    /// itself emits the block, so every compaction path inherits it.
+    #[test]
+    fn should_preserve_newest_plan_as_checklist_when_compacting() {
+        let messages = vec![
+            plan_message(serde_json::json!([{"step": "old step", "status": "pending"}])),
+            Message::user("keep working"),
+            plan_message(serde_json::json!([
+                {"step": "convert dataloader", "status": "completed"},
+                {"step": "convert attention", "status": "in_progress"},
+                {"step": "port test harness", "status": "pending"}
+            ])),
+        ];
+        let summary = compact_messages(&messages, 1024);
+        assert!(summary.starts_with(PLAN_BLOCK_BEGIN), "{summary}");
+        assert!(summary.contains("- [x] convert dataloader"), "{summary}");
+        assert!(summary.contains("- [>] convert attention"), "{summary}");
+        assert!(summary.contains("- [ ] port test harness"), "{summary}");
+        assert!(!summary.contains("old step"), "newest plan wins: {summary}");
+        assert!(summary.contains(PLAN_BLOCK_END), "{summary}");
+        // Plan-free conversations carry no block.
+        let plain = compact_messages(&[Message::user("hi")], 1024);
+        assert!(!plain.contains(PLAN_BLOCK_BEGIN), "{plain}");
+    }
+
+    /// #2132 multi-pass: after pass 1 drops the tool-call rows, the block
+    /// carried inside the prior summary text is re-extracted — the plan
+    /// survives ANY number of passes, not one.
+    #[test]
+    fn should_carry_plan_forward_when_prior_summary_is_the_only_source() {
+        let pass1 = compact_messages(
+            &[plan_message(serde_json::json!([
+                {"step": "convert attention", "status": "in_progress"}
+            ]))],
+            1024,
+        );
+        // Pass 2 input: only the prior summary text (as a user row) + chatter.
+        let messages = vec![Message::user(pass1), Message::user("more work")];
+        let snapshot = latest_plan_snapshot(&messages).expect("carried plan");
+        assert!(snapshot.contains("- [>] convert attention"), "{snapshot}");
+        let pass2 = compact_messages(&messages, 1024);
+        assert!(pass2.starts_with(PLAN_BLOCK_BEGIN), "{pass2}");
+        // Exactly ONE block: the carried copy inside the summarized prose
+        // must not stack under the fresh one.
+        assert_eq!(pass2.matches(PLAN_BLOCK_BEGIN).count(), 1, "{pass2}");
+    }
+
+    /// #2132 (#1711 shape): stringified-object arguments are recovered, and
+    /// degenerate plans (cleared, unparseable) are SKIPPED so they cannot
+    /// shadow an older valid plan. No raw-JSON fallback exists — tool
+    /// arguments are untrusted.
+    #[test]
+    fn should_skip_degenerate_plans_and_recover_stringified_arguments() {
+        use octos_core::ToolCall;
+        let mut stringified = Message::assistant("");
+        stringified.tool_calls = Some(vec![ToolCall {
+            id: "c1".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::Value::String(
+                r#"{"plan":[{"step":"from stringified args","status":"pending"}]}"#.into(),
+            ),
+            metadata: None,
+        }]);
+        let snapshot = latest_plan_snapshot(&[stringified]).expect("recovered");
+        assert!(
+            snapshot.contains("- [ ] from stringified args"),
+            "{snapshot}"
+        );
+
+        // A cleared plan (empty array) newest must NOT shadow the older
+        // valid one, and alone must yield no block at all.
+        let valid = plan_message(serde_json::json!([{"step": "real step", "status": "pending"}]));
+        let cleared = plan_message(serde_json::json!([]));
+        let snapshot = latest_plan_snapshot(&[valid, cleared.clone()]).expect("older valid plan");
+        assert!(snapshot.contains("real step"), "{snapshot}");
+        assert_eq!(latest_plan_snapshot(&[cleared]), None);
+        // Unparseable/null arguments are equally inert.
+        let mut null_args = Message::assistant("");
+        null_args.tool_calls = Some(vec![ToolCall {
+            id: "c1".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::Value::Null,
+            metadata: None,
+        }]);
+        assert_eq!(latest_plan_snapshot(&[null_args]), None);
+    }
+
+    /// #2132 budget: the block is carved out of the producer's own budget
+    /// (a tiny budget still yields a bounded artifact), and oversized plans
+    /// truncate with the marker.
+    #[test]
+    fn should_keep_combined_artifact_bounded_when_budget_is_small() {
+        let steps: Vec<serde_json::Value> = (0..200)
+            .map(|i| serde_json::json!({"step": format!("step number {i} with some length"), "status": "pending"}))
+            .collect();
+        let messages = vec![plan_message(serde_json::Value::Array(steps))];
+        let summary = compact_messages(&messages, 256);
+        assert!(summary.contains("(plan truncated)"), "{summary}");
+        // Combined artifact stays in the same order of magnitude as the
+        // budget (256 tokens ≈ 1KB) instead of stacking 1.5KB on top.
+        assert!(
+            summary.len() < 4096,
+            "combined artifact must remain bounded, got {} bytes",
+            summary.len()
+        );
     }
 }
