@@ -1780,7 +1780,7 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
 mod tests {
     /// ###27-B2 — rename_replace error-classification pins (unix arm).
     mod replace_ops_27b2 {
-        use super::super::{ReplaceOps, replace_with};
+        use super::super::{RemoveFn, RenameFn, ReplaceOps, SleepFn, replace_with};
         use std::path::Path;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1789,19 +1789,52 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::PermissionDenied)
         }
 
+        /// ###27-r1 — CROSS-PLATFORM constructor: `ReplaceOps.is_transient`
+        /// is a `#[cfg(windows)]` REQUIRED field, so every literal in this
+        /// module must go through this helper — a bare 3-field literal
+        /// compiles on Linux and FAILS on Windows (codex pre-commit catch:
+        /// the Linux 4/4 masked it). The Windows arm injects a transient
+        /// judge that classifies PermissionDenied/AlreadyExists as retryable
+        /// — the same classes `is_transient_windows_lock` recognizes.
+        fn ops(remove: RemoveFn, rename: RenameFn, sleep: SleepFn) -> ReplaceOps {
+            #[cfg(windows)]
+            {
+                ReplaceOps {
+                    remove,
+                    rename,
+                    sleep,
+                    is_transient: Box::new(|err: &std::io::Error| {
+                        matches!(
+                            err.kind(),
+                            std::io::ErrorKind::PermissionDenied
+                                | std::io::ErrorKind::AlreadyExists
+                        )
+                    }),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                ReplaceOps {
+                    remove,
+                    rename,
+                    sleep,
+                }
+            }
+        }
+
         // remove 非 NotFound 真错误立即返回(不重试,不吞)。
         #[test]
         fn remove_real_error_returns_immediately() {
             let calls = Arc::new(AtomicU32::new(0));
             let c = calls.clone();
-            let ops = ReplaceOps {
-                remove: Box::new(move |_p: &Path| {
+            let ops = ops(
+                Box::new(move |_p: &Path| {
                     c.fetch_add(1, Ordering::SeqCst);
                     Err(err_denied())
                 }),
-                rename: Box::new(|_s: &Path, _d: &Path| Ok(())),
-                sleep: Box::new(|_| {}),
-            };
+                Box::new(|_s: &Path, _d: &Path| Ok(())),
+                Box::new(|_| {}),
+            );
             let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
             assert!(out.is_err());
             assert_eq!(
@@ -1816,14 +1849,14 @@ mod tests {
         fn persistent_rename_error_is_returned_not_swallowed() {
             let calls = Arc::new(AtomicU32::new(0));
             let c = calls.clone();
-            let ops = ReplaceOps {
-                remove: Box::new(|_p: &Path| Ok(())),
-                rename: Box::new(move |_s: &Path, _d: &Path| {
+            let ops = ops(
+                Box::new(|_p: &Path| Ok(())),
+                Box::new(move |_s: &Path, _d: &Path| {
                     c.fetch_add(1, Ordering::SeqCst);
                     Err(err_denied())
                 }),
-                sleep: Box::new(|_| {}),
-            };
+                Box::new(|_| {}),
+            );
             let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
             let err = out.expect_err("persistent error must surface");
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -1837,44 +1870,52 @@ mod tests {
         // 成功路径: remove NotFound 容忍(首周期), rename 成功。
         #[test]
         fn remove_not_found_is_tolerated_first_cycle() {
-            let ops = ReplaceOps {
-                remove: Box::new(|_p: &Path| {
-                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-                }),
-                rename: Box::new(|_s: &Path, _d: &Path| Ok(())),
-                sleep: Box::new(|_| {}),
-            };
+            let ops = ops(
+                Box::new(|_p: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+                Box::new(|_s: &Path, _d: &Path| Ok(())),
+                Box::new(|_| {}),
+            );
             assert!(replace_with(&ops, Path::new("/a"), Path::new("/b")).is_ok());
         }
 
-        // 耗尽后返回的是"最后一次"错误(与 doc comment 一致),非首错。
+        /// ###27-r1 — EXHAUSTION returns the LAST observed error (not the
+        /// first), pinned with DISTINCT error payloads on Windows: remove
+        /// errors carry their attempt number; after the 10-attempt bound
+        /// the surfaced error must be the FINAL one. Unix has no retry arm
+        /// (single-shot), so the same scenario pins the immediate return.
         #[test]
         fn exhaustion_returns_last_error_not_first() {
             let calls = Arc::new(AtomicU32::new(0));
             let c = calls.clone();
-            let ops = ReplaceOps {
-                remove: Box::new(move |_p: &Path| {
+            let ops = ops(
+                Box::new(move |_p: &Path| {
                     let n = c.fetch_add(1, Ordering::SeqCst);
-                    // 目标不存在前几次,之后持续 PermissionDenied——
-                    // 错误分类在 remove 臂逐次生效。
-                    if n < 1 {
-                        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-                    } else {
-                        Err(err_denied())
-                    }
+                    // Persistent PermissionDenied whose PAYLOAD names the
+                    // attempt — the surfaced error must carry the LAST.
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("attempt-{n}"),
+                    ))
                 }),
-                rename: Box::new(|_s: &Path, _d: &Path| Ok(())),
-                sleep: Box::new(|_| {}),
-            };
-            let _ = replace_with(&ops, Path::new("/a"), Path::new("/b"));
-            // unix 臂: remove NotFound 一次即过,第二次真错立即返回(=2);
-            // windows 臂: 同样进入重试到界(≥2)。两平台都应至少重试/推进一次。
-            // unix: NotFound 一次即过,remove 不再被调(计数 1,返回 Ok);
-            // windows: 第二次起 PermissionDenied 进重试到界(计数 10,返回最后错)。
+                Box::new(|_s: &Path, _d: &Path| Ok(())),
+                Box::new(|_| {}),
+            );
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            let err = out.expect_err("persistent remove error must surface");
+            let msg = err.to_string();
             if cfg!(windows) {
-                assert!(calls.load(Ordering::SeqCst) >= 10);
+                assert_eq!(calls.load(Ordering::SeqCst), 10, "retried to the bound");
+                assert!(
+                    msg.contains("attempt-9"),
+                    "must return the LAST error, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("attempt-0"),
+                    "must NOT return the first error, got: {msg}"
+                );
             } else {
-                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "unix single-shot");
+                assert!(msg.contains("attempt-0"), "unix returns the only error");
             }
         }
     }
