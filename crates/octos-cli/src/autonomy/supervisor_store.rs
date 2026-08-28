@@ -1822,6 +1822,54 @@ mod tests {
             }
         }
 
+        /// ###29 — NON-transient remove error returns after exactly ONE
+        /// call on BOTH platforms (windows: InvalidInput is not in the
+        /// transient set, so the retry arm never engages; unix has no
+        /// retry arm at all), rename is never invoked, and the ORIGINAL
+        /// error surfaces. (The PermissionDenied twin above pins the
+        /// transient-exhaustion path instead.)
+        #[test]
+        fn remove_non_transient_error_returns_after_one_call() {
+            let removes = Arc::new(AtomicU32::new(0));
+            let renames = Arc::new(AtomicU32::new(0));
+            let (r2, n2) = (removes.clone(), renames.clone());
+            let ops = ops(
+                Box::new(move |_p: &Path| {
+                    r2.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "non-transient remove failure",
+                    ))
+                }),
+                Box::new(move |_s: &Path, _d: &Path| {
+                    n2.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                Box::new(|_| {}),
+            );
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            let err = out.expect_err("non-transient remove error must surface");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "the ORIGINAL error kind surfaces"
+            );
+            assert!(
+                err.to_string().contains("non-transient remove failure"),
+                "the original error payload surfaces: {err}"
+            );
+            assert_eq!(
+                removes.load(Ordering::SeqCst),
+                1,
+                "exactly ONE remove call on both platforms (windows: non-transient never retries)"
+            );
+            assert_eq!(
+                renames.load(Ordering::SeqCst),
+                0,
+                "rename never runs when remove fails"
+            );
+        }
+
         // remove 非 NotFound 真错误立即返回(不重试,不吞)。
         #[test]
         fn remove_real_error_returns_immediately() {
