@@ -25,6 +25,18 @@ mod imp {
     /// (model catalog, profile store) — serialize them.
     static SERIAL: Mutex<()> = Mutex::new(());
 
+    /// #37 — acquire SERIAL across a poisoned lock: a panic in one test
+    /// while holding the guard used to poison the mutex and cascade
+    /// PoisonError failures into every sibling (CI round 6: 2/4 failed,
+    /// one real timeout + one PoisonError). The lock is only a serialization
+    /// hint — a poisoned guard carries no broken invariant, so recover it.
+    fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        match SERIAL.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Path to a real octos binary that includes the `serve` subcommand.
     ///
     /// When this harness itself is compiled WITH the `api` feature, Cargo
@@ -146,7 +158,7 @@ mod imp {
     /// the process must exit 0 — not SIGABRT/SIGPIPE.
     #[test]
     fn serve_shutdown_broken_pipe_cleanup_marker_observed() {
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = serial_guard();
         let port = find_free_port();
         let data_dir = std::env::temp_dir().join(format!("octos_bp_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -186,7 +198,18 @@ mod imp {
         // future is polled inside axum::serve. A settle wait lets that
         // happen; without it an early SIGINT hits the default disposition
         // and kills the process (observed: signal=Some(2)).
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // #37 — settle was a fixed 1500ms sleep; on a fast runner that is
+        // wasted time and on a slow CI runner it may STILL be too early for
+        // the ctrl_c handler registration. Poll the stdout pipe for the
+        // graceful-shutdown readiness marker instead (up to 60s / 200ms
+        // steps) — observed value kept as the floor: the marker itself only
+        // appears once axum::serve is polling.
+        let _settled = wait_for_pipe_contains(
+            &mut stdout_reader,
+            "octos API server", // banner re-check keeps reading the pipe
+            std::time::Duration::from_secs(60),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200)); // handler-registration floor
 
         // SIGINT, then IMMEDIATELY close the read end: every shutdown-time
         // console write now hits a genuinely broken pipe (EPIPE).
@@ -199,8 +222,21 @@ mod imp {
         let stderr_log = std::fs::read_to_string(&err_path).unwrap_or_default();
         // Cleanup evidence must come from a NON-stdout sink: serve's rolling
         // tracing log under data_dir/logs (created by init_tracing).
+        // #37 — POLL the log instead of a single immediate read: on a slow
+        // CI runner the tracing writer's flush trails process exit (local
+        // 11s vs CI 431s for the same tip), so the one-shot read raced the
+        // marker and failed. Poll up to 60s in 200ms steps (300 attempts);
+        // fall through to the original assert with the final content.
         let log_dir = data_dir.join("logs");
-        let tracing_log = read_dir_logs_concat(&log_dir);
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut tracing_log = read_dir_logs_concat(&log_dir);
+        while !(tracing_log.contains("stopping all gateway child processes")
+            || tracing_log.contains("gateways stopped"))
+            && std::time::Instant::now() < marker_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            tracing_log = read_dir_logs_concat(&log_dir);
+        }
         let orphaned = unsafe { libc::kill(pid, 0) } == 0;
         let _ = std::fs::remove_dir_all(&data_dir);
 
@@ -236,7 +272,7 @@ mod imp {
     /// "Stopping gateways..." (stop_all) in the shutdown output.
     #[test]
     fn serve_shutdown_order_preserved() {
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = serial_guard();
         let port = find_free_port();
         let data_dir = std::env::temp_dir().join(format!("octos_ord_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -306,7 +342,7 @@ mod imp {
     /// keep listening.
     #[test]
     fn serve_startup_broken_pipe_no_panic() {
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = serial_guard();
         let port = find_free_port();
         let data_dir = std::env::temp_dir().join(format!("octos_start_{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
