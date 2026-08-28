@@ -2777,6 +2777,8 @@ mod bash_change_receipt_28c {
             .with_policy(Arc::new(AllowAllPolicy))
     }
 
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn real_edit_in_git_repo_appends_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2816,6 +2818,8 @@ mod bash_change_receipt_28c {
         );
     }
 
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn phantom_edit_reports_zero() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2840,6 +2844,8 @@ mod bash_change_receipt_28c {
         );
     }
 
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn non_git_dir_omits_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2859,6 +2865,8 @@ mod bash_change_receipt_28c {
         );
     }
 
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn default_behavior_when_no_tree_change_is_plain_output() {
         // Zero-difference guarantee for the default path: in a git repo with
@@ -2966,6 +2974,7 @@ mod exec_change_receipt_28c {
             .with_policy(Arc::new(AllowAllPolicy))
     }
 
+    #[cfg(unix)] // #34d: POSIX shell spawn semantics — repo convention (see bash_change_receipt_28c).
     #[tokio::test]
     async fn real_edit_in_git_repo_appends_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2990,6 +2999,7 @@ mod exec_change_receipt_28c {
         );
     }
 
+    #[cfg(unix)] // #34d: POSIX shell spawn semantics — repo convention (see bash_change_receipt_28c).
     #[tokio::test]
     async fn non_git_dir_omits_receipt() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3148,6 +3158,8 @@ mod bash_file_writes_28d {
 
     // deny: write-shaped command refused, escape hatch honored — on BOTH
     // coding tools.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn deny_refuses_write_and_escape_hatch_runs_bash_and_exec() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3178,6 +3190,8 @@ mod bash_file_writes_28d {
     }
 
     // deny lets read-only commands through untouched.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn deny_lets_readonly_run() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3191,6 +3205,8 @@ mod bash_file_writes_28d {
     }
 
     // warn: nudge only when files actually changed.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn warn_nudges_only_on_change_bash_and_exec() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3226,6 +3242,8 @@ mod bash_file_writes_28d {
     }
 
     // allow (default): zero difference — no policy text anywhere.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
     #[tokio::test]
     async fn allow_is_zero_difference_on_both_tools() {
         let dir = tempfile::tempdir().expect("tempdir");
