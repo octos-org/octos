@@ -1694,25 +1694,48 @@ fn fs_retry_total_ms() -> u64 {
 /// policy (Windows only; unix is single-shot). Used for EVERY fs mutation
 /// on the snapshot/compaction path so the whole path shares one budget
 /// class, not just the two rename sites.
+/// #42 — injectable retry clock: `now` for elapsed-time bookkeeping and
+/// `sleep` for the backoff pause. Production passes the real pair
+/// (semantics unchanged: real Instant + real thread sleep, budget from
+/// OCTOS_FS_RETRY_TOTAL_MS); tests pass a virtual clock so attempt counts
+/// are DERIVED from virtual time, not the machine's speed (the round-8
+/// winlab reds were slow runners eating the 2.5s budget with real sleeps
+/// before the 10th attempt).
+pub(crate) struct RetryClock {
+    pub(crate) now: NowFn,
+    pub(crate) sleep: SleepFn,
+}
+
+impl Default for RetryClock {
+    fn default() -> Self {
+        let start = std::time::Instant::now();
+        Self {
+            now: Box::new(move || start.elapsed()),
+            sleep: Box::new(std::thread::sleep),
+        }
+    }
+}
+
 #[cfg(windows)]
 fn fs_retry<T>(
+    clock: &RetryClock,
+    total: std::time::Duration,
     op: impl Fn() -> io::Result<T>,
     is_transient: impl Fn(&io::Error) -> bool,
 ) -> io::Result<T> {
     // #40 — callers wrap `op` with fs_ctx so retries and the final return
     // both carry op+path+errno context (the transient judge reads the
     // KIND, which fs_ctx preserves).
-    let total = std::time::Duration::from_millis(fs_retry_total_ms());
-    let start = std::time::Instant::now();
+    let start = (clock.now)();
     let mut delay = 20u64;
     loop {
         match op() {
             Ok(v) => return Ok(v),
             Err(err) if is_transient(&err) => {
-                if start.elapsed() >= total {
+                if (clock.now)().saturating_sub(start) >= total {
                     return Err(err); // budget exhausted — LAST observed error
                 }
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+                (clock.sleep)(std::time::Duration::from_millis(delay));
                 delay = delay.saturating_mul(2);
             }
             Err(err) => return Err(err),
@@ -1720,6 +1743,7 @@ fn fs_retry<T>(
     }
 }
 
+type NowFn = Box<dyn Fn() -> std::time::Duration + Send + Sync>;
 type RemoveFn = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 type RenameFn = Box<dyn Fn(&Path, &Path) -> io::Result<()> + Send + Sync>;
 type SleepFn = Box<dyn Fn(std::time::Duration) + Send + Sync>;
@@ -1727,9 +1751,15 @@ type SleepFn = Box<dyn Fn(std::time::Duration) + Send + Sync>;
 pub(crate) struct ReplaceOps {
     pub(crate) remove: RemoveFn,
     pub(crate) rename: RenameFn,
-    pub(crate) sleep: SleepFn,
     #[cfg(windows)]
     pub(crate) is_transient: Box<dyn Fn(&io::Error) -> bool + Send + Sync>,
+    /// #42 — retry clock + budget; default = real clock + env budget
+    /// (production semantics unchanged). Tests inject a virtual clock and
+    /// an explicit budget so counts derive from VIRTUAL time.
+    #[cfg(windows)]
+    pub(crate) clock: RetryClock,
+    #[cfg(windows)]
+    pub(crate) budget: std::time::Duration,
 }
 
 impl Default for ReplaceOps {
@@ -1737,9 +1767,12 @@ impl Default for ReplaceOps {
         Self {
             remove: Box::new(|p: &Path| fs::remove_file(p)),
             rename: Box::new(|s: &Path, d: &Path| fs::rename(s, d)),
-            sleep: Box::new(std::thread::sleep),
             #[cfg(windows)]
             is_transient: Box::new(is_transient_windows_lock),
+            #[cfg(windows)]
+            clock: RetryClock::default(),
+            #[cfg(windows)]
+            budget: std::time::Duration::from_millis(fs_retry_total_ms()),
         }
     }
 }
@@ -1776,6 +1809,8 @@ pub(crate) fn replace_with(ops: &ReplaceOps, src: &Path, dst: &Path) -> io::Resu
         // sleep/is_transient keep the ###29 mechanical pins meaningful.
         let is_t = &ops.is_transient;
         let remove_result = fs_retry(
+            &ops.clock,
+            ops.budget,
             || match (ops.remove)(dst) {
                 Ok(()) => Ok(()),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()), // first cycle
@@ -1784,7 +1819,12 @@ pub(crate) fn replace_with(ops: &ReplaceOps, src: &Path, dst: &Path) -> io::Resu
             |e| is_t(e),
         );
         remove_result?;
-        fs_retry(|| (ops.rename)(src, dst), |e| is_t(e))
+        fs_retry(
+            &ops.clock,
+            ops.budget,
+            || (ops.rename)(src, dst),
+            |e| is_t(e),
+        )
     }
     #[cfg(not(windows))]
     {
@@ -1906,7 +1946,7 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
 mod tests {
     /// ###27-B2 — rename_replace error-classification pins (unix arm).
     mod replace_ops_27b2 {
-        use super::super::{RemoveFn, RenameFn, ReplaceOps, SleepFn, replace_with};
+        use super::super::{RemoveFn, RenameFn, ReplaceOps, replace_with};
         use std::path::Path;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1922,13 +1962,19 @@ mod tests {
         /// the Linux 4/4 masked it). The Windows arm injects a transient
         /// judge that classifies PermissionDenied/AlreadyExists as retryable
         /// — the same classes `is_transient_windows_lock` recognizes.
-        fn ops(remove: RemoveFn, rename: RenameFn, sleep: SleepFn) -> ReplaceOps {
+        /// #42 — build ReplaceOps with a VIRTUAL clock: `sleep` ADVANCES
+        /// virtual time by the requested delay (zero real sleeping), and
+        /// `now` reads it. Attempt counts then derive from VIRTUAL time —
+        /// identical on any platform, at any runner speed. Production keeps
+        /// the real clock (ReplaceOps::default), semantics unchanged.
+        fn ops_virtual(remove: RemoveFn, rename: RenameFn, budget_ms: u64) -> ReplaceOps {
             #[cfg(windows)]
             {
+                let virtual_now = Arc::new(AtomicU64::new(0));
+                let tick = virtual_now.clone();
                 ReplaceOps {
                     remove,
                     rename,
-                    sleep,
                     is_transient: Box::new(|err: &std::io::Error| {
                         matches!(
                             err.kind(),
@@ -1936,15 +1982,21 @@ mod tests {
                                 | std::io::ErrorKind::AlreadyExists
                         )
                     }),
+                    clock: RetryClock {
+                        now: Box::new(move || {
+                            std::time::Duration::from_millis(tick.load(Ordering::SeqCst))
+                        }),
+                        sleep: Box::new(move |d: std::time::Duration| {
+                            tick.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+                        }),
+                    },
+                    budget: std::time::Duration::from_millis(budget_ms),
                 }
             }
             #[cfg(not(windows))]
             {
-                ReplaceOps {
-                    remove,
-                    rename,
-                    sleep,
-                }
+                let _ = budget_ms;
+                ReplaceOps { remove, rename }
             }
         }
 
@@ -1959,7 +2011,7 @@ mod tests {
             let removes = Arc::new(AtomicU32::new(0));
             let renames = Arc::new(AtomicU32::new(0));
             let (r2, n2) = (removes.clone(), renames.clone());
-            let ops = ops(
+            let ops = ops_virtual(
                 Box::new(move |_p: &Path| {
                     r2.fetch_add(1, Ordering::SeqCst);
                     Err(std::io::Error::new(
@@ -1971,7 +2023,7 @@ mod tests {
                     n2.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }),
-                Box::new(|_| {}),
+                2500,
             );
             let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
             let err = out.expect_err("non-transient remove error must surface");
@@ -2001,20 +2053,20 @@ mod tests {
         fn remove_real_error_returns_immediately() {
             let calls = Arc::new(AtomicU32::new(0));
             let c = calls.clone();
-            let ops = ops(
+            let ops = ops_virtual(
                 Box::new(move |_p: &Path| {
                     c.fetch_add(1, Ordering::SeqCst);
                     Err(err_denied())
                 }),
                 Box::new(|_s: &Path, _d: &Path| Ok(())),
-                Box::new(|_| {}),
+                2500,
             );
             let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
             assert!(out.is_err());
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 if cfg!(windows) { 10 } else { 1 },
-                "unix: single call, error returned immediately (windows: retried to exhaustion)"
+                "#42: unix single call; windows = VIRTUAL-time-derived count (machine-speed independent)"
             );
         }
 
@@ -2023,13 +2075,13 @@ mod tests {
         fn persistent_rename_error_is_returned_not_swallowed() {
             let calls = Arc::new(AtomicU32::new(0));
             let c = calls.clone();
-            let ops = ops(
+            let ops = ops_virtual(
                 Box::new(|_p: &Path| Ok(())),
                 Box::new(move |_s: &Path, _d: &Path| {
                     c.fetch_add(1, Ordering::SeqCst);
                     Err(err_denied())
                 }),
-                Box::new(|_| {}),
+                2500,
             );
             let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
             let err = out.expect_err("persistent error must surface");
@@ -2037,17 +2089,17 @@ mod tests {
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 if cfg!(windows) { 10 } else { 1 },
-                "windows exhausts the 10-attempt bound then returns the LAST error"
+                "#42: windows exhausts the virtual budget then returns the LAST error (count derived from virtual time)"
             );
         }
 
         // 成功路径: remove NotFound 容忍(首周期), rename 成功。
         #[test]
         fn remove_not_found_is_tolerated_first_cycle() {
-            let ops = ops(
+            let ops = ops_virtual(
                 Box::new(|_p: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
                 Box::new(|_s: &Path, _d: &Path| Ok(())),
-                Box::new(|_| {}),
+                2500,
             );
             assert!(replace_with(&ops, Path::new("/a"), Path::new("/b")).is_ok());
         }
@@ -2061,7 +2113,7 @@ mod tests {
         fn exhaustion_returns_last_error_not_first() {
             let calls = Arc::new(AtomicU32::new(0));
             let c = calls.clone();
-            let ops = ops(
+            let ops = ops_virtual(
                 Box::new(move |_p: &Path| {
                     let n = c.fetch_add(1, Ordering::SeqCst);
                     // Persistent PermissionDenied whose PAYLOAD names the
@@ -2072,7 +2124,7 @@ mod tests {
                     ))
                 }),
                 Box::new(|_s: &Path, _d: &Path| Ok(())),
-                Box::new(|_| {}),
+                2500,
             );
             let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
             let err = out.expect_err("persistent remove error must surface");
