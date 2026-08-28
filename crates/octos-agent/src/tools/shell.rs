@@ -1381,6 +1381,8 @@ mod tests {
         assert!(!out.output.contains("bash_file_writes"));
     }
 
+    #[cfg(unix)]
+    // #34e: POSIX shell spawn semantics (echo > file) — same convention as the coding_tools #34d gates.
     #[test]
     fn bash_file_writes_escape_hatch_runs_under_deny() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1414,6 +1416,8 @@ mod tests {
         assert!(!out.output.contains("edit_file / diff_edit"));
     }
 
+    #[cfg(unix)]
+    // #34e: POSIX shell spawn semantics (echo > file) — same convention as the coding_tools #34d gates.
     #[test]
     fn bash_file_writes_warn_nudges_only_when_files_changed() {
         // The 28a receipt requires a git repo (fail-open elsewhere), so run

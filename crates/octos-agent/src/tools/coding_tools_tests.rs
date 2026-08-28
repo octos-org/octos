@@ -3036,39 +3036,55 @@ mod receipt_scope_root_28c_r1 {
 
     // Resolver unit pins (ruling ②): literal cd prefix wins; ambiguous
     // shapes fall back to workdir.
+    // #34e — portable fixtures: the RESOLVER is pure string logic (no POSIX
+    // dependency), but absolute-path literals like "/tmp/x" are NOT absolute
+    // on Windows (no drive prefix), so `is_absolute()` flips the join arm
+    // and the scope assertion fails. Building the literals from a platform
+    // absolute base keeps this test covering the judgment on BOTH platforms
+    // (per the 34e ruling's first option) instead of gating it off.
     #[test]
     fn resolver_literal_cd_prefix_wins_and_var_falls_back() {
-        let workdir = std::path::Path::new("/ws");
-        let (root, scope) = receipt_scope_root(workdir, "cd /tmp/x && echo hi > f");
-        assert_eq!(root, std::path::PathBuf::from("/tmp/x"));
+        let base = std::env::temp_dir(); // platform-absolute anchor
+        let ws = base.join("ws");
+        let target_dir = base.join("tmp").join("x");
+        let cd_cmd = format!("cd {} && echo hi > f", target_dir.display());
+        let (root, scope) = receipt_scope_root(&ws, &cd_cmd);
+        assert_eq!(root, target_dir);
         assert_eq!(scope, "cd-target");
 
-        let (root, scope) = receipt_scope_root(workdir, "cd ~/proj && echo hi > f");
+        let (root, scope) = receipt_scope_root(&ws, "cd ~/proj && echo hi > f");
         assert_eq!(scope, "cd-target");
-        assert!(root.starts_with(std::path::Path::new("/")));
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .expect("HOME/USERPROFILE set");
+        assert!(
+            root.starts_with(std::path::Path::new(&home)),
+            "~ expansion anchors at the platform home: {root:?}"
+        );
 
         // No cd prefix ⇒ workdir.
-        let (root, scope) = receipt_scope_root(workdir, "echo hi > f");
-        assert_eq!(root, std::path::PathBuf::from("/ws"));
+        let (root, scope) = receipt_scope_root(&ws, "echo hi > f");
+        assert_eq!(root, ws.clone());
         assert_eq!(scope, "workdir");
 
         // Variable path ⇒ ambiguous ⇒ workdir.
-        let (root, scope) = receipt_scope_root(workdir, "cd $TARGET && echo hi > f");
-        assert_eq!(root, std::path::PathBuf::from("/ws"));
+        let (root, scope) = receipt_scope_root(&ws, "cd $TARGET && echo hi > f");
+        assert_eq!(root, ws.clone());
         assert_eq!(scope, "workdir");
 
         // cd without && ⇒ workdir.
-        let (_root, scope) = receipt_scope_root(workdir, "cd /tmp/x");
+        let (_root, scope) = receipt_scope_root(&ws, "cd /tmp/x");
         assert_eq!(scope, "workdir");
 
         // Semicolon chain ⇒ ambiguous ⇒ workdir.
-        let (root, scope) = receipt_scope_root(workdir, "cd /tmp/x; cd /tmp/y && echo hi > f");
+        let (root, scope) = receipt_scope_root(&ws, "cd /tmp/x; cd /tmp/y && echo hi > f");
         assert_eq!(scope, "workdir");
-        assert_eq!(root, std::path::PathBuf::from("/ws"));
+        assert_eq!(root, ws.clone());
     }
 
     // Live-shape pin (ruling ④): cd-prefix write reports files_changed: 1
     // plus the cd-target scope tag — the exact false-phantom regression.
+    #[cfg(unix)] // #34e: POSIX shell spawn semantics (cd && echo >) — same convention as the #34d gates.
     #[tokio::test]
     async fn cd_prefix_write_reports_one_with_scope_tag() {
         let session_ws = tempfile::tempdir().expect("tempdir"); // session workdir: NOT a repo
@@ -3099,6 +3115,7 @@ mod receipt_scope_root_28c_r1 {
     // Variable cd path falls back to workdir (ruling ④): the write happens
     // inside the workdir repo, but the snapshot root is the workdir — the
     // count is still correct for a workdir write; the tag says workdir.
+    #[cfg(unix)] // #34e: POSIX shell spawn semantics (cd && echo >) — same convention as the #34d gates.
     #[tokio::test]
     async fn variable_cd_path_falls_back_to_workdir_scope() {
         let ws = tempfile::tempdir().expect("tempdir");
