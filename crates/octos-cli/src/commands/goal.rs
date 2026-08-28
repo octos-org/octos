@@ -217,25 +217,36 @@ fn print_table(view: &GoalStatusView) {
 impl Executable for GoalCommand {
     fn execute(self) -> Result<()> {
         let data_dir = super::resolve_data_dir(self.data_dir)?;
-        // Mirror the serve layout: the supervisor store for a profile lives
-        // under `<data_dir>/supervisor` (the store itself namespaces its
-        // events/snapshot files inside that root).
-        let store_root = data_dir.join("supervisor");
-        let store = SupervisorStore::new(&store_root);
-        // #26a — goal-scoped view: folded BY GOAL ID so superseded goals (the
-        // same session scope's earlier goal_NN rows) remain visible for
-        // zombie cleanup, instead of vanishing under the newest goal's group.
-        let goals_by_id = store.load_goal_groups_by_id().map_err(|error| {
-            eyre!("failed to load goal-scoped view from {store_root:?}: {error}")
-        })?;
-
         match self.subcommand {
-            GoalSubcommand::List => cmd_list(&goals_by_id),
-            GoalSubcommand::Reopen { goal_id } => {
-                cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "reopen")
-            }
-            GoalSubcommand::Archive { goal_id } => {
-                cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "archive")
+            // ###27-B3 — the supervisor store load lives INSIDE the
+            // transition arms: `goal status` is contractually a DIRECT
+            // ledger read that must succeed even when the (unrelated)
+            // supervisor event store is corrupt or unreadable — hoisting
+            // the load above the match let a broken store break status.
+            GoalSubcommand::List
+            | GoalSubcommand::Reopen { .. }
+            | GoalSubcommand::Archive { .. } => {
+                // Mirror the serve layout: the supervisor store for a profile lives
+                // under `<data_dir>/supervisor` (the store itself namespaces its
+                // events/snapshot files inside that root).
+                let store_root = data_dir.join("supervisor");
+                let store = SupervisorStore::new(&store_root);
+                // #26a — goal-scoped view: folded BY GOAL ID so superseded goals (the
+                // same session scope's earlier goal_NN rows) remain visible for
+                // zombie cleanup, instead of vanishing under the newest goal's group.
+                let goals_by_id = store.load_goal_groups_by_id().map_err(|error| {
+                    eyre!("failed to load goal-scoped view from {store_root:?}: {error}")
+                })?;
+                match self.subcommand {
+                    GoalSubcommand::List => cmd_list(&goals_by_id),
+                    GoalSubcommand::Reopen { goal_id } => {
+                        cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "reopen")
+                    }
+                    GoalSubcommand::Archive { goal_id } => {
+                        cmd_transition(&store, &goals_by_id, &self.profile, &goal_id, "archive")
+                    }
+                    GoalSubcommand::Status(_) => unreachable!("guarded by the outer match"),
+                }
             }
             // #35 — union with #2116's read-only Status: reads the goal
             // ledger DIRECTLY (no serve required), --json / table shared
@@ -635,6 +646,29 @@ mod tests_2116_readonly {
                 updated_at_ms: 200,
             })
             .expect("seed goal");
+    }
+
+    /// ###27-B3 — REAL-dispatch regression: `goal status` must succeed
+    /// when the (unrelated) supervisor event store is CORRUPT. The store
+    /// load was hoisted above the subcommand match in #35's union merge,
+    /// which let a broken store break the direct-ledger read; the load now
+    /// lives inside the List/Reopen/Archive arms only.
+    #[test]
+    fn goal_status_survives_corrupt_supervisor_store() {
+        let data_dir = std::env::temp_dir().join("olp-goal-corrupt-supervisor");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        seed_goal(&data_dir, "goal_01", "active");
+        // A corrupt supervisor event store: unparseable rows poison
+        // load_goal_groups_by_id for the transition arms — status must not care.
+        let sup_dir = data_dir.join("supervisor");
+        std::fs::create_dir_all(&sup_dir).expect("mkdir supervisor");
+        std::fs::write(sup_dir.join("supervisor-events.jsonl"), "{not json!\n")
+            .expect("corrupt supervisor stream");
+        let view = load_goal_status(&data_dir, "goal_01")
+            .expect("direct ledger read must not touch the supervisor store")
+            .expect("seeded goal row");
+        assert_eq!(view.status, "active");
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// Contract scenario "serve 停止时仍可读 goal 状态" (critical): with

@@ -1568,6 +1568,35 @@ fn is_transient_windows_lock(err: &io::Error) -> bool {
         || err.raw_os_error().is_some_and(|code| code == 32) // ERROR_SHARING_VIOLATION
 }
 
+/// ###27-B2 — injectable file ops so tests can mechanically pin the
+/// rename_replace error-classification contract (persistent
+/// PermissionDenied is never success-ified; remove's non-NotFound real
+/// error returns immediately; retry exhaustion returns the LAST observed
+/// error). Production uses the real fs; tests swap in scripted outcomes.
+type RemoveFn = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+type RenameFn = Box<dyn Fn(&Path, &Path) -> io::Result<()> + Send + Sync>;
+type SleepFn = Box<dyn Fn(std::time::Duration) + Send + Sync>;
+
+pub(crate) struct ReplaceOps {
+    pub(crate) remove: RemoveFn,
+    pub(crate) rename: RenameFn,
+    pub(crate) sleep: SleepFn,
+    #[cfg(windows)]
+    pub(crate) is_transient: Box<dyn Fn(&io::Error) -> bool + Send + Sync>,
+}
+
+impl Default for ReplaceOps {
+    fn default() -> Self {
+        Self {
+            remove: Box::new(|p: &Path| fs::remove_file(p)),
+            rename: Box::new(|s: &Path, d: &Path| fs::rename(s, d)),
+            sleep: Box::new(std::thread::sleep),
+            #[cfg(windows)]
+            is_transient: Box::new(is_transient_windows_lock),
+        }
+    }
+}
+
 /// #34g/#34h — cross-platform REPLACE-ON-EXISTING rename with a BOUNDED
 /// retry on Windows transient locks.
 ///
@@ -1584,40 +1613,47 @@ fn is_transient_windows_lock(err: &io::Error) -> bool {
 /// A remove error that is NOT NotFound (and not, on Windows, transient) is
 /// returned immediately — never silently swallowed.
 fn rename_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    replace_with(&ReplaceOps::default(), src, dst)
+}
+
+/// ###27-B2 — the rename_replace core over injectable ops. Windows arms
+/// retry transient locks; the unix arm is single-shot. Retry exhaustion
+/// returns the LAST observed error (not the first — the doc comment on
+/// rename_replace says exactly that).
+#[allow(clippy::too_many_lines)]
+pub(crate) fn replace_with(ops: &ReplaceOps, src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         const MAX_ATTEMPTS: u32 = 10;
         const BASE_DELAY_MS: u64 = 20;
-        // Remove (bounded retry on transient locks; NotFound = first cycle).
         let mut attempt = 0u32;
         let mut delay = BASE_DELAY_MS;
         loop {
-            match fs::remove_file(dst) {
+            match (ops.remove)(dst) {
                 Ok(()) => break,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => break,
-                Err(err) if is_transient_windows_lock(&err) => {
+                Err(err) if (ops.is_transient)(&err) => {
                     attempt += 1;
                     if attempt >= MAX_ATTEMPTS {
                         return Err(err);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    (ops.sleep)(std::time::Duration::from_millis(delay));
                     delay = delay.saturating_mul(2);
                 }
                 Err(err) => return Err(err),
             }
         }
-        // Rename (same bounded retry against a delete-pending dst).
         let mut attempt = 0u32;
         let mut delay = BASE_DELAY_MS;
         loop {
-            match fs::rename(src, dst) {
+            match (ops.rename)(src, dst) {
                 Ok(()) => return Ok(()),
-                Err(err) if is_transient_windows_lock(&err) => {
+                Err(err) if (ops.is_transient)(&err) => {
                     attempt += 1;
                     if attempt >= MAX_ATTEMPTS {
                         return Err(err);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    (ops.sleep)(std::time::Duration::from_millis(delay));
                     delay = delay.saturating_mul(2);
                 }
                 Err(err) => return Err(err),
@@ -1626,12 +1662,12 @@ fn rename_replace(src: &Path, dst: &Path) -> io::Result<()> {
     }
     #[cfg(not(windows))]
     {
-        match fs::remove_file(dst) {
+        match (ops.remove)(dst) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        fs::rename(src, dst)
+        (ops.rename)(src, dst)
     }
 }
 
@@ -1742,6 +1778,107 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    /// ###27-B2 — rename_replace error-classification pins (unix arm).
+    mod replace_ops_27b2 {
+        use super::super::{ReplaceOps, replace_with};
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn err_denied() -> std::io::Error {
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        }
+
+        // remove 非 NotFound 真错误立即返回(不重试,不吞)。
+        #[test]
+        fn remove_real_error_returns_immediately() {
+            let calls = Arc::new(AtomicU32::new(0));
+            let c = calls.clone();
+            let ops = ReplaceOps {
+                remove: Box::new(move |_p: &Path| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err(err_denied())
+                }),
+                rename: Box::new(|_s: &Path, _d: &Path| Ok(())),
+                sleep: Box::new(|_| {}),
+            };
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            assert!(out.is_err());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if cfg!(windows) { 10 } else { 1 },
+                "unix: single call, error returned immediately (windows: retried to exhaustion)"
+            );
+        }
+
+        // rename 的持久错误不被成功化——返回最后观察到的错误。
+        #[test]
+        fn persistent_rename_error_is_returned_not_swallowed() {
+            let calls = Arc::new(AtomicU32::new(0));
+            let c = calls.clone();
+            let ops = ReplaceOps {
+                remove: Box::new(|_p: &Path| Ok(())),
+                rename: Box::new(move |_s: &Path, _d: &Path| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err(err_denied())
+                }),
+                sleep: Box::new(|_| {}),
+            };
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            let err = out.expect_err("persistent error must surface");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if cfg!(windows) { 10 } else { 1 },
+                "windows exhausts the 10-attempt bound then returns the LAST error"
+            );
+        }
+
+        // 成功路径: remove NotFound 容忍(首周期), rename 成功。
+        #[test]
+        fn remove_not_found_is_tolerated_first_cycle() {
+            let ops = ReplaceOps {
+                remove: Box::new(|_p: &Path| {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                }),
+                rename: Box::new(|_s: &Path, _d: &Path| Ok(())),
+                sleep: Box::new(|_| {}),
+            };
+            assert!(replace_with(&ops, Path::new("/a"), Path::new("/b")).is_ok());
+        }
+
+        // 耗尽后返回的是"最后一次"错误(与 doc comment 一致),非首错。
+        #[test]
+        fn exhaustion_returns_last_error_not_first() {
+            let calls = Arc::new(AtomicU32::new(0));
+            let c = calls.clone();
+            let ops = ReplaceOps {
+                remove: Box::new(move |_p: &Path| {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    // 目标不存在前几次,之后持续 PermissionDenied——
+                    // 错误分类在 remove 臂逐次生效。
+                    if n < 1 {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                    } else {
+                        Err(err_denied())
+                    }
+                }),
+                rename: Box::new(|_s: &Path, _d: &Path| Ok(())),
+                sleep: Box::new(|_| {}),
+            };
+            let _ = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            // unix 臂: remove NotFound 一次即过,第二次真错立即返回(=2);
+            // windows 臂: 同样进入重试到界(≥2)。两平台都应至少重试/推进一次。
+            // unix: NotFound 一次即过,remove 不再被调(计数 1,返回 Ok);
+            // windows: 第二次起 PermissionDenied 进重试到界(计数 10,返回最后错)。
+            if cfg!(windows) {
+                assert!(calls.load(Ordering::SeqCst) >= 10);
+            } else {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};

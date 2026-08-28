@@ -33129,6 +33129,61 @@ mod tests {
     /// the tree sits on a non-default branch, and — through the REAL denial
     /// predicate fed by the INSTALLED provider — refuses goal_02's cross-goal
     /// checkout while goal_01 (the owner) passes through.
+    /// ###27-B1 — CONTROLLED-timestamp contract pins for the multi-ledger
+    /// sovereignty scan (#34c): the scan must pick the EARLIEST claim, and a
+    /// same-millisecond tie must resolve by goal-id lexicographic order.
+    /// Both use DIRECT kv_put timestamps (not two `now()` calls, which race
+    /// the wall clock and pin nothing).
+    #[test]
+    fn sovereignty_scan_picks_earliest_claim_over_lexicographic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let ledger_dir = profile_data_dir.join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let orchestrator = default_agent_orchestrator();
+
+        // goal_99 claims FIRST (earlier timestamp); goal_01 claims later.
+        // Lexicographic order would pick goal_01 — the timestamp must win.
+        let ledger_99 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_99.db")).unwrap();
+        ledger_99.claim_main_tree_owner("goal_99", 1_000).unwrap();
+        let ledger_01 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_01.db")).unwrap();
+        ledger_01.claim_main_tree_owner("goal_01", 2_000).unwrap();
+
+        assert_eq!(
+            orchestrator
+                .scan_main_tree_owner(&profile_data_dir)
+                .as_deref(),
+            Some("goal_99"),
+            "earlier claim wins over lexicographic goal-id order"
+        );
+    }
+
+    #[test]
+    fn sovereignty_scan_same_millisecond_tie_breaks_by_goal_id_lex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let ledger_dir = profile_data_dir.join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let orchestrator = default_agent_orchestrator();
+
+        // Same millisecond: the tiebreak is goal-id lexicographic (documented
+        // in scan_main_tree_owner), so goal_02 beats goal_10 ("goal_02" <
+        // "goal_10" as STRINGS — the numeric reading would pick 02 anyway;
+        // inverted pair below pins the string order explicitly).
+        let ledger_10 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_10.db")).unwrap();
+        ledger_10.claim_main_tree_owner("goal_10", 5_000).unwrap();
+        let ledger_2 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_02.db")).unwrap();
+        ledger_2.claim_main_tree_owner("goal_02", 5_000).unwrap();
+
+        assert_eq!(
+            orchestrator
+                .scan_main_tree_owner(&profile_data_dir)
+                .as_deref(),
+            Some("goal_02"),
+            "same-ms tie resolves by goal-id lexicographic (goal_02 < goal_10)"
+        );
+    }
+
     #[test]
     fn dual_goal_sovereignty_provider_scan_claim_and_denial() {
         let _serial = sovereignty_provider_guard();
