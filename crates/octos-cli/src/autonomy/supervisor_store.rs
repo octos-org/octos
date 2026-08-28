@@ -1982,6 +1982,7 @@ mod tests {
             {
                 let virtual_now = Arc::new(AtomicU64::new(0));
                 let tick = virtual_now.clone();
+                let tick_sleep = virtual_now.clone();
                 ReplaceOps {
                     remove,
                     rename,
@@ -1997,7 +1998,7 @@ mod tests {
                             std::time::Duration::from_millis(tick.load(Ordering::SeqCst))
                         }),
                         sleep: Box::new(move |d: std::time::Duration| {
-                            tick.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+                            tick_sleep.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
                         }),
                     },
                     budget: std::time::Duration::from_millis(budget_ms),
