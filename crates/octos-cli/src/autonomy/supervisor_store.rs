@@ -1952,9 +1952,13 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
 mod tests {
     /// ###27-B2 — rename_replace error-classification pins (unix arm).
     mod replace_ops_27b2 {
+        #[cfg(windows)]
+        use super::super::RetryClock;
         use super::super::{RemoveFn, RenameFn, ReplaceOps, replace_with};
         use std::path::Path;
         use std::sync::Arc;
+        #[cfg(windows)]
+        use std::sync::atomic::AtomicU64;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         fn err_denied() -> std::io::Error {
