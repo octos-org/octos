@@ -765,6 +765,8 @@ pub trait Tool: Send + Sync {
 }
 
 // Tool registry (extracted to its own module)
+/// Observe-only probe for the read-paging decision (changes no behaviour).
+pub(crate) mod read_paging_probe;
 mod registry;
 pub use registry::ToolRegistry;
 
@@ -815,6 +817,7 @@ pub mod peer_respond;
 pub mod peer_send_input;
 pub mod read_file;
 pub mod read_task_output;
+pub mod recall;
 pub mod recall_memory;
 pub mod record_memory_use;
 pub(crate) mod replacer;
@@ -887,6 +890,7 @@ pub use peer_respond::{
 pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
+pub use recall::{RecallTool, ToolOutputLedger};
 pub use recall_memory::RecallMemoryTool;
 pub use record_memory_use::RecordMemoryUseTool;
 pub use save_memory::SaveMemoryTool;

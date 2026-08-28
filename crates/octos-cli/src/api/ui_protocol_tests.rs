@@ -32385,6 +32385,29 @@ fn stage_peer_dir_with(peers_root: &std::path::Path, slug: &str) -> std::path::P
     dir
 }
 
+/// Contract scenario "peer 交付追加结构化事件且带 model_lane": when a
+/// goal-scoped peer (no explicit lane) records a finding, events.jsonl
+/// gains a kind=finding_recorded line with model_lane = "primary".
+#[test]
+fn olp_obs_finding_appends_event_with_lane() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path();
+    let peers_root = data_dir.join("peers");
+    stage_peer_dir_with(&peers_root, "edison"); // no `model` leaf -> default lane
+    emit_finding_recorded_event(data_dir, "goal_05", "edison", "writer is innocent");
+    let lines: Vec<Value> = std::fs::read_to_string(data_dir.join("events.jsonl"))
+        .expect("events.jsonl written")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON line"))
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["kind"], "finding_recorded");
+    assert_eq!(lines[0]["goal_id"], "goal_05");
+    assert_eq!(lines[0]["slug"], "edison");
+    assert_eq!(lines[0]["model_lane"], "primary");
+    assert_eq!(lines[0]["detail"], "writer is innocent");
+}
+
 /// A minimal profile config carrying ONE model lane (`key`) whose credential
 /// resolves offline through `env_vars` — enough to exercise lane selection +
 /// provider construction without a network call.

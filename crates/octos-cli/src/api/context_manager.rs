@@ -388,7 +388,24 @@ pub(crate) struct ContextManager {
     recovery_state: ContextRecoveryState,
     tool_output_policy: ToolOutputPolicy,
     tool_output_artifacts: HashMap<String, Vec<u8>>,
+    /// #2131: `tool_call_id` -> recall handle, populated at record time and
+    /// NEVER pruned by `compact_context` (which drops old `items`). Without
+    /// this, a `recall(...)` placeholder emitted for an evicted output could
+    /// not resolve — the envelope carrying its `raw_artifact_ref` is gone from
+    /// `items`, orphaning the still-present artifact bytes. The index keeps the
+    /// call_id -> (artifact_ref, model-visible content) link alive so recall
+    /// works for exactly the evicted case it exists to serve.
+    recall_index: HashMap<String, ToolOutputRecallEntry>,
     compactions: Vec<ContextCompactionRecord>,
+}
+
+/// #2131: what `recall` needs to re-materialize an output after its transcript
+/// envelope has been compacted away — the spilled-artifact ref (if any) and
+/// the model-visible content as the always-available floor.
+#[derive(Debug, Clone)]
+struct ToolOutputRecallEntry {
+    artifact_ref: Option<String>,
+    model_visible_content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +740,7 @@ impl ContextManager {
             recovery_state: ContextRecoveryState::Exact,
             tool_output_policy: ToolOutputPolicy::default(),
             tool_output_artifacts: HashMap::new(),
+            recall_index: HashMap::new(),
             compactions: Vec::new(),
         }
     }
@@ -787,6 +805,7 @@ impl ContextManager {
             recovery_state: ContextRecoveryState::Rebuilt,
             tool_output_policy: ToolOutputPolicy::default(),
             tool_output_artifacts: HashMap::new(),
+            recall_index: HashMap::new(),
             compactions: Vec::new(),
         }
     }
@@ -897,6 +916,7 @@ impl ContextManager {
             recovery_state: snapshot.state.recovery_state,
             tool_output_policy: ToolOutputPolicy::default(),
             tool_output_artifacts: HashMap::new(),
+            recall_index: HashMap::new(),
             compactions: snapshot.compactions,
         }
     }
@@ -1156,6 +1176,31 @@ impl ContextManager {
         self.record_tool_output_with_source_ref(tool_call_id, tool_name, raw_output, None)
     }
 
+    /// #2131: re-materialize a tool output by its `tool_call_id` — the handle
+    /// compaction leaves on every evicted stub. Resolves through the
+    /// compaction-surviving `recall_index` (NOT `items`, which
+    /// `compact_context` prunes), so it works for exactly the evicted case the
+    /// feature exists for. Returns the FULL raw bytes when the output was
+    /// spilled to the content-addressed ledger, otherwise the model-visible
+    /// content that was recorded (already all there was). `None` when no tool
+    /// output with that call id is known.
+    ///
+    /// Same-process: the artifact map is populated live, so the full bytes come
+    /// back. After a cold reload the artifact map is empty; the model-visible
+    /// content is the always-available floor (with its `[truncated]` marker
+    /// when it was capped, so the model is not silently misled).
+    pub(crate) fn tool_output_by_call_id(&self, call_id: &str) -> Option<String> {
+        // Match the record-time id normalization so a placeholder id resolves.
+        let call_id = normalize_tool_call_id(call_id);
+        let entry = self.recall_index.get(&call_id)?;
+        if let Some(artifact_ref) = entry.artifact_ref.as_ref()
+            && let Some(bytes) = self.tool_output_artifacts.get(artifact_ref)
+        {
+            return Some(String::from_utf8_lossy(bytes).into_owned());
+        }
+        Some(entry.model_visible_content.clone())
+    }
+
     pub(crate) fn record_tool_output_with_source_ref(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -1180,6 +1225,15 @@ impl ContextManager {
             self.tool_output_artifacts
                 .insert(artifact_ref.clone(), raw_output.as_bytes().to_vec());
         }
+        // #2131: keep the call_id -> recall handle alive independent of `items`,
+        // which `compact_context` prunes. Latest write wins for a reused id.
+        self.recall_index.insert(
+            tool_call_id.clone(),
+            ToolOutputRecallEntry {
+                artifact_ref: raw_artifact_ref.clone(),
+                model_visible_content: model_visible_content.clone(),
+            },
+        );
         let ui_preview_content = tool_output_preview(&model_visible_content);
         let ui_preview = Some(ToolOutputPreviewLink {
             preview_ref: format!("appui/tool-output-preview/{tool_call_id}"),
@@ -2322,6 +2376,71 @@ mod tests {
             std::fs::read(&artifact_path).expect("read artifact"),
             b"sentinel",
             "second persist must not rewrite an existing content-addressed artifact"
+        );
+    }
+
+    /// #2131: recall re-materializes an evicted tool output by its
+    /// tool_call_id. A large (spilled) output comes back in FULL from the
+    /// content-addressed ledger; a small one returns its recorded content; an
+    /// unknown id returns None.
+    #[test]
+    fn tool_output_by_call_id_recovers_spilled_and_inline_outputs() {
+        let mut manager = ContextManager::new("coding:local:recall", None);
+        manager.record_message(&assistant_tool_call("call_big"));
+        let big = "y".repeat(20 * 1024); // > inline threshold -> spilled artifact
+        manager.record_tool_output("call_big", "read_file", &big);
+        manager.record_message(&assistant_tool_call("call_small"));
+        manager.record_tool_output("call_small", "shell", "tiny output");
+
+        assert_eq!(
+            manager.tool_output_by_call_id("call_big").as_deref(),
+            Some(big.as_str()),
+            "a spilled output recalls in FULL from the ledger"
+        );
+        assert_eq!(
+            manager.tool_output_by_call_id("call_small").as_deref(),
+            Some("tiny output"),
+            "a small inline output recalls its recorded content"
+        );
+        assert_eq!(manager.tool_output_by_call_id("call_missing"), None);
+    }
+
+    /// #2131 P2 (review): the case recall EXISTS for — once an output is
+    /// evicted, `compact_context` prunes its transcript envelope, but recall
+    /// must still resolve it via the compaction-surviving `recall_index`.
+    #[test]
+    fn recall_survives_compaction_that_prunes_the_transcript() {
+        let mut manager = ContextManager::new("coding:local:recall-compact", None);
+        manager.record_message(&assistant_tool_call("call_src"));
+        let src = "y".repeat(20 * 1024); // spilled to the artifact ledger
+        manager.record_tool_output("call_src", "read_file", &src);
+        // Many later turns so the tool output falls outside keep_recent_items.
+        for i in 0..10 {
+            manager.record_message(&Message::user(format!("u{i}")));
+            manager.record_message(&Message::assistant(format!("a{i}")));
+        }
+        manager.compact_context(
+            "older turns summarized",
+            CompactContextPolicy {
+                policy_id: "test".into(),
+                trigger: "context_pressure".into(),
+                keep_recent_items: 2,
+                preserve_system_instructions: true,
+            },
+        );
+        // Precondition: the ToolOutput envelope is gone from `items`.
+        assert!(
+            !manager.items().iter().any(|it| matches!(
+                &it.kind,
+                TranscriptItemKind::ToolOutput { envelope } if envelope.tool_call_id == "call_src"
+            )),
+            "compaction should have pruned the tool-output envelope"
+        );
+        // Recall still returns the FULL bytes via the surviving index.
+        assert_eq!(
+            manager.tool_output_by_call_id("call_src").as_deref(),
+            Some(src.as_str()),
+            "recall must survive compaction that pruned the transcript"
         );
     }
 

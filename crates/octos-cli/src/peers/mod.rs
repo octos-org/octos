@@ -42,6 +42,7 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, PeerStagedEvent, RpcError,
     UserQuestionRespondParams,
 };
+#[cfg(any(feature = "api", test))]
 use tracing::warn;
 
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
@@ -120,6 +121,7 @@ impl PeerWireRegistry {
     /// reopened under a newer wire key (register overwrote the value), a late
     /// close of the OLD session must not clobber the fresh mapping. Returns
     /// whether an entry was removed. Also frees a slot against the cap.
+    #[cfg(feature = "api")]
     pub(crate) fn evict_if_value(&self, key: &str, session_id: &SessionKey) -> bool {
         let mut map = self
             .by_key
@@ -160,16 +162,19 @@ pub(crate) fn peer_wire_registry() -> &'static PeerWireRegistry {
 /// staging, dropped by `take` on the close path. Holding it anywhere shorter
 /// (the staging closure, the turn's supervisor) would put it out of scope
 /// while the peer is still working, which is the defect.
+#[cfg(any(feature = "api", test))]
 pub(crate) struct PeerTaskBinding {
     task_id: String,
     _liveness: octos_agent::TaskLivenessLease,
 }
 
+#[cfg(any(feature = "api", test))]
 #[derive(Default)]
 pub(crate) struct PeerTaskRegistry {
     pub(crate) by_key: std::sync::Mutex<HashMap<String, PeerTaskBinding>>,
 }
 
+#[cfg(any(feature = "api", test))]
 impl PeerTaskRegistry {
     /// Bind `key` to a supervisor task id and take a liveness lease on it. A
     /// re-stage under the same key overwrites, mirroring
@@ -216,6 +221,7 @@ impl PeerTaskRegistry {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
     static PEER_TASK_REGISTRY: OnceLock<PeerTaskRegistry> = OnceLock::new();
     PEER_TASK_REGISTRY.get_or_init(PeerTaskRegistry::default)
@@ -231,6 +237,7 @@ pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
 /// signals that with an EMPTY-STRING sentinel, and binding it would make the
 /// close path try to retire a task that never existed. The peer then runs
 /// UNSUPERVISED (no task row, no cancel token); callers should say so loudly.
+#[cfg(any(feature = "api", test))]
 pub(crate) fn bind_peer_supervised_task(
     supervisor: &octos_agent::TaskSupervisor,
     registry_key: String,
@@ -253,6 +260,7 @@ pub(crate) fn bind_peer_supervised_task(
 /// Retirement is exactly-once — `take` removes the binding, so a second close
 /// finds nothing rather than re-marking a terminal task (or, worse, a task id
 /// later reused). Returns the retired task id.
+#[cfg(any(feature = "api", test))]
 pub(crate) fn retire_peer_supervised_task(
     supervisor: &octos_agent::TaskSupervisor,
     profile_id: &str,
@@ -271,6 +279,7 @@ pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
 /// a non-peer or unprofiled session.
+#[cfg(any(feature = "api", test))]
 pub(crate) fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
     // NOT a peer session. The overwhelmingly common case, and the only one where
     // `None` is uninteresting — every caller correctly skips peer bookkeeping.
@@ -1409,6 +1418,7 @@ pub(crate) fn peer_send_input_authorized(
 
 /// Upper bound on a peer brief. Briefs are task contracts, not payloads — a
 /// cap keeps a runaway client from turning the profile dir into blob storage.
+#[cfg(feature = "api")]
 pub(crate) const PEER_BRIEF_MAX_BYTES: usize = 64 * 1024;
 
 /// Derive a unique directory slug for a peer under `peers/`: sanitized from
@@ -1847,6 +1857,7 @@ pub(crate) fn remove_peer_worktree(workspace_root: &Path, dir: &Path) {
 /// Best-effort by design: a peer that never committed, was staged without a
 /// worktree, or whose clone is gone simply has nothing to collect, and none of
 /// those should fail the close.
+#[cfg(feature = "api")]
 pub(crate) fn collect_peer_branch(peer_dir: &Path, slug: &str) {
     let clone = peer_dir.join("wt");
     if !clone.join(".git").exists() {
@@ -1919,6 +1930,7 @@ pub(crate) const PEER_HANDOFFS_PER_TURN_MAX: u32 = 4;
 /// #1801 v3 depth-1 guard: a peer session (topic `peer-<slug>`) never gets
 /// the `peer_handoff` tool registered at all — peers cannot hand off
 /// recursively, and the tool is not even visible to the model there.
+#[cfg(any(feature = "api", test))]
 pub(crate) fn peer_handoff_allowed_for_session(session_id: &SessionKey) -> bool {
     !session_id
         .topic()
@@ -2106,6 +2118,7 @@ pub(crate) fn build_peer_handoff_callback(
             request.model.as_deref(),
             &available_lanes,
         );
+
         // #20a — surface an explicit-false override warning alongside any
         // model-lane note in the SAME `model_note` field the tool already
         // appends to its success output.
@@ -2114,6 +2127,28 @@ pub(crate) fn build_peer_handoff_callback(
                 Some(note) => format!("{note} {warning}"),
                 None => warning,
             });
+        }
+        // OLP L1 (slice 5): structured observability event. The lane is
+        // the RESOLVED one (what record_peer_model_lane actually persisted);
+        // an unset/invalid lane resolves to the primary model, which the
+        // contract pins as the literal "primary".
+        {
+            let resolved_lane = read_peer_model_lane(&peers_root, &staged.slug);
+            let lane = resolved_lane.as_deref().unwrap_or("primary");
+            let session_str = originating_session.0.as_str();
+            // events.jsonl lives at the data-dir root = peers_root's parent.
+            let data_dir = peers_root
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| peers_root.clone());
+            crate::obs_events::append_obs_event(
+                &data_dir,
+                &crate::obs_events::ObsEvent::new("peer_staged", "peer staged")
+                    .goal_id(resolved_goal_id.as_deref())
+                    .slug(Some(staged.slug.as_str()))
+                    .session(Some(session_str))
+                    .model_lane(Some(lane)),
+            );
         }
         // Durable so reconnect replay still delivers the open request; the
         // client dedups by an already-open session for the topic.
@@ -2643,12 +2678,17 @@ pub(crate) struct PeerBlackboardRow {
     /// Display NAME from `peers/<slug>/name` (the peer's primary address),
     /// falling back to the slug for legacy peers that have no `name` file.
     pub(crate) name: String,
-    /// `brief.md`, capped at [`PEER_GATHER_BRIEF_CAP`].
+    /// `brief.md`, capped at [`PEER_GATHER_BRIEF_CAP`]. Read only on the
+    /// api `peer/gather` path — non-api consumers (peer_list renderer) use
+    /// the slug/status columns only.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) brief: String,
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) brief_truncated: bool,
     /// `result.md` when any peer turn has terminated, capped at
     /// [`PEER_GATHER_RESULT_CAP`]; `None` = still running.
     pub(crate) result: Option<String>,
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) result_truncated: bool,
     pub(crate) result_updated_unix: Option<u64>,
     pub(crate) has_worktree: bool,

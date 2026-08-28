@@ -659,6 +659,12 @@ impl LedgerInner {
 }
 
 impl UiProtocolLedger {
+    /// The durable data dir this ledger writes to (None when RAM-only) —
+    /// exposed for the OLP observability event stream, which shares the
+    /// same root (`<data_dir>/events.jsonl`).
+    pub(crate) fn config_data_dir(&self) -> Option<PathBuf> {
+        self.config.data_dir.clone()
+    }
     /// RAM-only ledger. Used for tests and as the no-data-dir fallback.
     #[cfg(test)]
     pub(crate) fn new(retained_per_session: usize) -> Self {

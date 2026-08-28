@@ -81,6 +81,7 @@ pub mod otp;
 // the serve WS path uses. Everything AppState/WebSocket-shaped stayed in
 // `api::ui_protocol`; see the module doc for the exact split.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) mod obs_events;
 pub(crate) mod peers;
 pub use octos_services::persona_service;
 #[cfg(feature = "api")]

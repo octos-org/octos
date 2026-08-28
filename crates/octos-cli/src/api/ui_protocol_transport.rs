@@ -213,6 +213,21 @@ const _: () = assert!(MAX_PEER_WAKE_SUMMARY_CHARS < MAX_PEER_FINDING_RECORD_CHAR
 /// corrupt evidence rather than as an abridged report. The verifier's own
 /// input stays bounded independently, by `MAX_LEDGER_EVIDENCE_ASSERTION_CHARS`
 /// at the assembly site in `goal_tool`.
+/// OLP L1 (slice 5): emit the `finding_recorded` structured event for a
+/// peer's delivered finding. Best-effort; model_lane is the peer's
+/// recorded lane, defaulting to "primary" (contract scenario
+/// "peer 交付追加结构化事件且带 model_lane").
+fn emit_finding_recorded_event(data_dir: &Path, goal_id: &str, slug: &str, detail: &str) {
+    let lane = crate::peers::read_peer_model_lane(&data_dir.join("peers"), slug);
+    crate::obs_events::append_obs_event(
+        data_dir,
+        &crate::obs_events::ObsEvent::new("finding_recorded", detail)
+            .goal_id(Some(goal_id))
+            .slug(Some(slug))
+            .model_lane(Some(lane.as_deref().unwrap_or("primary"))),
+    );
+}
+
 fn peer_finding_assertion(outcome: &str, body: &str) -> String {
     let content = octos_core::truncated_utf8(body, MAX_PEER_FINDING_RECORD_CHARS, " …[truncated]");
     format!("[{outcome}] {content}")
@@ -13956,6 +13971,7 @@ fn write_peer_result_if_peer_session(
                         outcome = outcome_str,
                         "peer-goal: recorded finding to goal ledger"
                     );
+                    emit_finding_recorded_event(&runtime.data_dir, goal_id, slug, &content_summary);
                     goal_still_active
                 }
             };
@@ -32098,7 +32114,9 @@ async fn run_standalone_turn(
             let context_dir = steer_context_dir.clone();
             let context_manager = steer_context_manager.clone();
             Box::pin(async move {
+                let mut drained_count = 0usize;
                 for text in texts {
+                    drained_count += 1;
                     let message = pre_stamp_turn_thread_id(Message::user(text), &thread_id);
                     match octos_bus::session::persist_message_through_canonical_path(
                         &data_dir,
@@ -32128,6 +32146,17 @@ async fn run_standalone_turn(
                             );
                         }
                     }
+                }
+                // OLP L1 (slice 5): steer_consumed event, best-effort.
+                if drained_count > 0 {
+                    crate::obs_events::append_obs_event(
+                        &data_dir,
+                        &crate::obs_events::ObsEvent::new(
+                            "steer_consumed",
+                            &format!("{drained_count} steer(s) drained into turn"),
+                        )
+                        .session(Some(session_id.0.as_str())),
+                    );
                 }
             })
         });
@@ -35931,6 +35960,19 @@ async fn abort_connection_turns(
                     code: "connection_closed".to_owned(),
                     message: "connection closed before turn completed".to_owned(),
                 }));
+                // OLP L1 (slice 5): turn_error event, best-effort. The
+                // ledger's configured data dir is the same root serve
+                // writes events.jsonl to; None (RAM-only) drops the event.
+                if let Some(data_dir) = ledger.config_data_dir() {
+                    crate::obs_events::append_obs_event(
+                        &data_dir,
+                        &crate::obs_events::ObsEvent::new(
+                            "turn_error",
+                            "connection closed before turn completed",
+                        )
+                        .session(Some(session_id.0.as_str())),
+                    );
+                }
                 if let Some(ack) = transition.ack {
                     let _ = ack.send(());
                 }

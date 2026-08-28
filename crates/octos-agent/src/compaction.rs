@@ -393,6 +393,11 @@ impl ToolResultPlaceholder {
             "turn_id": self.turn_id,
             "original_byte_len": self.original_byte_len,
             "reason": self.reason,
+            // #2131: the placeholder already carries `tool_call_id`, and the
+            // `recall` tool's description tells the model to restore an evicted
+            // output by exactly that id — so no in-placeholder call hint is
+            // needed. Emitting one here would also mislead the chat/acp/mcp
+            // paths, which build placeholders but register no recall tool.
         });
         format!(
             "{}{}",
@@ -1623,6 +1628,8 @@ mod tests {
         };
         let content = p.to_placeholder_content();
         assert!(content.starts_with(TOOL_RESULT_PLACEHOLDER_PREFIX));
+        // The placeholder carries tool_call_id (the recall handle).
+        assert!(content.contains("id1"), "{content}");
         let parsed = ToolResultPlaceholder::from_placeholder_content(&content).unwrap();
         assert_eq!(parsed, p);
     }

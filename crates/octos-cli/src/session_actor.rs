@@ -65,6 +65,20 @@ use crate::context_manager::{
 };
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
+
+/// #2131: adapts the per-session `ContextManager` to the `RecallTool`'s
+/// ledger read-back trait, so an evicted tool output can be re-materialized by
+/// its `tool_call_id` without re-execution.
+struct SessionToolOutputLedger(Arc<StdMutex<ContextManager>>);
+
+impl octos_agent::tools::ToolOutputLedger for SessionToolOutputLedger {
+    fn fetch(&self, tool_call_id: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tool_output_by_call_id(tool_call_id)
+    }
+}
 use crate::usage_ledger::{PersistentUsageLedger, UsageCostSource, UsageEvent};
 use crate::workflow_runtime::{WorkflowInstance, WorkflowKind};
 
@@ -3479,6 +3493,12 @@ impl ActorFactory {
         // RFC-0 (#1289): LRU tool deferral was removed — `read_task_output`
         // (like every enabled tool) is emitted every turn, so no base-tool
         // pin is needed.
+        // #2131: recall an evicted tool output by its tool_call_id from THIS
+        // session's content-addressed ledger. Registered per-session (like the
+        // task tools above) because the ContextManager is session-scoped.
+        tools.register(octos_agent::tools::RecallTool::new(Arc::new(
+            SessionToolOutputLedger(context_manager.clone()),
+        )));
         tools.register(message_tool);
         tools.register(send_file_tool);
         tools.register(octos_agent::SendAppCardTool::with_context(
