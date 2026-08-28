@@ -20508,6 +20508,10 @@ async fn handle_turn_start_with_accept(
                 false,
                 // #436 P1 #2 — regular turns don't gate completion on dispatch.
                 None,
+                // OLP-CTRL 回合 4 — an interactive turn is never a steer
+                // continuation turn; it must not consume reviewer-notes.
+                false,
+                None,
             )
             .await;
         }
@@ -20973,11 +20977,15 @@ async fn maybe_spawn_appui_master_continuation_runner(
     };
     // #436 — a `peer_send_input` continuation's prompt is a real user turn:
     // persist it as a `UserMessage` (transcript + durable history) rather than
-    // skipping it like a system-internal continuation.
+    // skipping it like a system-internal continuation. OLP-CTRL 回合 3: a
+    // STEER continuation is likewise a real user turn (its prompt IS the
+    // steer, a standalone role=user message body) — persist it the same way
+    // so the steer lands as a UserMessage, never a prompt appendix.
     let persist_peer_input_prompt = matches!(
         &continuation.reason,
         MasterContinuationReason::External(kind)
             if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
+                || kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
     );
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
@@ -21073,6 +21081,33 @@ async fn maybe_spawn_appui_master_continuation_runner(
             // #436 — persist a peer_send_input injection as a UserMessage.
             persist_peer_input_prompt,
             turn_dispatched.clone(),
+            // OLP-CTRL 回合 4 (消费权归一): only a STEER continuation's
+            // turn may consume the reviewer-notes sidecar.
+            matches!(
+                &continuation.reason,
+                MasterContinuationReason::External(kind)
+                    if kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
+            ),
+            // #8c ② — thread the exact steer line for per-line consumption.
+            if matches!(
+                &continuation.reason,
+                MasterContinuationReason::External(kind)
+                    if kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
+            ) {
+                let ts = continuation
+                    .metadata
+                    .get(crate::autonomy::agent_orchestrator::STEER_META_ENQUEUED_TS)
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_owned());
+                let text = continuation
+                    .metadata
+                    .get(crate::autonomy::agent_orchestrator::STEER_META_TEXT)
+                    .cloned()
+                    .unwrap_or_default();
+                Some((ts, text))
+            } else {
+                None
+            },
         )
         .await;
         // #436 P1 #2 — keep an undelivered peer injection durable; every other
@@ -21497,6 +21532,45 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     );
                 crate::autonomy::monitor_runtime::monitor_process_runtime()
                     .reconcile(desired, sink);
+            }
+
+            // OLP-CTRL 首航第二/四回合 整改 (cross-process steer wake):
+            // sweep the instance inbox for unconsumed `.reviewer-notes`
+            // sidecars and enqueue a steer continuation per addressed
+            // session — the `octos steer` CLI only writes FILES. 回合 4:
+            // the inbox root MUST be the SAME resolution the steer CLI
+            // uses — the profile runtime's data_dir (what
+            // ProfileStore::resolve_data_dir yields), NOT the sessions
+            // manager's data_dir (which pointed at a different tree and
+            // made read_dir fail silently for 5 minutes). The sweep logs
+            // a throttled trace every pass (even 0 sidecars) and WARNs on
+            // a read_dir failure — silence here was the blind spot.
+            // 回合 5 (收官): sweep EVERY profile's data_dir — a steer may
+            // target any profile's session, and gating on
+            // `profiles.get(MAIN_PROFILE_ID)` was a dead door
+            // (MAIN_PROFILE_ID is "_main" while the runtime profile is
+            // "octos", so the sweep was never invoked). An EMPTY profiles
+            // table is itself a trace-worthy condition (throttled WARN) —
+            // the r4 no-silence rule applies to the call gate too.
+            if state.profiles.is_empty() {
+                use std::sync::atomic::{AtomicI64, Ordering};
+                static LAST_EMPTY_WARN_MS: AtomicI64 = AtomicI64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let last = LAST_EMPTY_WARN_MS.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= 60_000 {
+                    LAST_EMPTY_WARN_MS.store(now, Ordering::Relaxed);
+                    tracing::warn!(
+                        "steer inbox sweep: AppState has NO profiles registered; \
+                         steer wake cannot run for any session"
+                    );
+                }
+            }
+            for (profile_id, profile_runtime) in &state.profiles {
+                let sweep_data_dir = profile_runtime.data_dir.clone();
+                default_agent_orchestrator().steer_inbox_sweep(&sweep_data_dir, profile_id);
             }
 
             // #1967 — resolve expired open escalations across every profile's
@@ -30047,6 +30121,17 @@ async fn run_standalone_turn(
     // injection durable for retry/replay instead of marking it completed.
     // `None` for the regular `turn/start` path, which doesn't need the signal.
     turn_dispatched: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    // OLP-CTRL 回合 4 (消费权归一): `true` ONLY when this turn drains a
+    // STEER continuation — the sole turn allowed to read-and-clear the
+    // reviewer-notes sidecar and emit the steer_consumed receipt. Every
+    // other turn (interactive, loop, goal) must NOT swallow a steer
+    // (round-2's coincidental consume was exactly that leak).
+    is_steer_continuation_turn: bool,
+    // OLP-CTRL #8c ② — when this is a steer continuation turn, the exact
+    // steer LINE it must consume (enqueue_ts, text) from the sidecar, so
+    // consumption is per-line (exactly-once), never a whole-file clear
+    // that would drop sibling steers enqueued but not yet run.
+    steer_line_to_consume: Option<(String, String)>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -31842,6 +31927,46 @@ async fn run_standalone_turn(
         ) {
             prompt.push_str("\n\n");
             prompt.push_str(&notes);
+        }
+        // OLP-CTRL 回合 3+4 整改: steer is NO LONGER injected as a prompt
+        // appendix (回合 3: that read-not-act pattern is dead — the steer
+        // rides its OWN continuation turn whose user message IS the
+        // steer). And 回合 4 (消费权归一): ONLY the steer continuation
+        // turn itself may read-and-clear the sidecar + emit the receipt —
+        // any other turn must leave the batch alone so it can't be
+        // swallowed and evaporate (round-2's coincidental consume).
+        if is_steer_continuation_turn {
+            // #8c ② — consume ONLY this turn's steer line (per-line,
+            // exactly-once). When the caller didn't thread the exact line
+            // (legacy path), fall back to clearing the whole batch so the
+            // receipt still fires once.
+            let receipt: Vec<u64> = match &steer_line_to_consume {
+                Some((ts, text)) => crate::autonomy::monitor_runtime::consume_reviewer_line(
+                    &session_runtime.profile.data_dir,
+                    &session_id.to_string(),
+                    ts,
+                    text,
+                )
+                .into_iter()
+                .collect(),
+                None => crate::autonomy::monitor_runtime::read_and_clear_reviewer_notes(
+                    &session_runtime.profile.data_dir,
+                    &session_id.to_string(),
+                )
+                .map(|s| s.enqueued_at_secs)
+                .unwrap_or_default(),
+            };
+            let session_str = session_id.to_string();
+            for ts in &receipt {
+                crate::obs_events::append_obs_event(
+                    &session_runtime.profile.data_dir,
+                    &crate::obs_events::ObsEvent::new(
+                        "steer_consumed",
+                        &format!("steer enqueued_at={ts} consumed by turn {}", turn_id.0),
+                    )
+                    .session(Some(session_str.as_str())),
+                );
+            }
         }
         prompt
     })

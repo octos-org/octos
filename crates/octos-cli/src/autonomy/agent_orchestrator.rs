@@ -299,6 +299,24 @@ pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input"
 /// finding WITHOUT waiting for the next scheduled goal turn).
 pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 
+/// OLP-CTRL — kind label for the `External(_)` continuation an
+/// `octos steer` enqueues to wake the steered session (same doorbell +
+/// scheduling mechanism as the goal-progress wake).
+pub(crate) const STEER_EXTERNAL_KIND: &str = "steer";
+
+/// OLP-CTRL — metadata key carrying the steer text on a steer
+/// continuation, so the continuation turn's user message IS the steer
+/// (回合 3 整改: standalone user message body, never a prompt appendix).
+pub(crate) const STEER_META_TEXT: &str = "steer_text";
+
+/// OLP-CTRL #8c — the steer line's enqueue timestamp (unix secs string),
+/// carried so the steer_consumed receipt names WHEN it was queued.
+pub(crate) const STEER_META_ENQUEUED_TS: &str = "steer_enqueued_ts";
+
+/// OLP-CTRL #8c — the content hash of (session, ts, text) that gives each
+/// steer line its exactly-once identity (dedupe key + receipt join).
+pub(crate) const STEER_META_LINE_HASH: &str = "steer_line_hash";
+
 /// #1977 Monitor WAKE — kind label for the `External(_)` master continuation a
 /// [`crate::autonomy::monitor_runtime`] watcher enqueues when its filtered probe
 /// output changes (poll) or a stream batch lands. Rides the SAME hardened
@@ -4552,6 +4570,194 @@ impl InProcessAgentOrchestrator {
         state.continuations.enqueue(request)
     }
 
+    /// OLP-CTRL 首航第二回合 整改 (cross-process steer wake): the drain
+    /// loop calls this every tick with the instance data dir. For every
+    /// unconsumed `inbox/*.reviewer-notes` sidecar whose companion
+    /// `<hash>.reviewer-session` marker names a session, enqueue an
+    /// `External("steer")` continuation so the steered session is
+    /// scheduled — the CLI only ever WRITES files (its in-process
+    /// continuation enqueue never reaches a running serve), so this sweep
+    /// is what makes the cross-process wake real. Idempotent: the dedupe
+    /// key pins the notes file's (session, mtime), so an already-queued
+    /// batch is not re-enqueued every tick, and a NEW append (mtime
+    /// bumps) re-arms exactly once. The notes file itself is consumed
+    /// (read+cleared) by the turn-start injection, which also removes the
+    /// marker — so a consumed batch stops matching here.
+    pub(crate) fn steer_inbox_sweep(&self, data_dir: &std::path::Path, profile_id: &str) {
+        let inbox = data_dir.join("inbox");
+        let entries = match std::fs::read_dir(&inbox) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // 回合 4 整改: a failed inbox read MUST be loud — a
+                // silent return here was the r4 5-minute blind spot.
+                tracing::warn!(
+                    ?error,
+                    inbox = %inbox.display(),
+                    "steer inbox sweep: failed to read inbox dir"
+                );
+                return;
+            }
+        };
+        let mut sidecars = 0usize;
+        let mut enqueued = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".reviewer-notes") {
+                continue;
+            }
+            sidecars += 1;
+            let notes_path = entry.path();
+            let marker_path = notes_path.with_extension("reviewer-session");
+            let Ok(session_id) = std::fs::read_to_string(&marker_path) else {
+                continue; // legacy steer without a marker: no way to address it
+            };
+            let session_id = session_id.trim();
+            if session_id.is_empty() {
+                continue;
+            }
+            // Skip empty files (already drained but not yet unlinked).
+            let is_nonempty = std::fs::metadata(&notes_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            if !is_nonempty {
+                continue;
+            }
+            // #8c ② — exactly-once delivery: enqueue ONE continuation PER
+            // STEER LINE (not one per file), deduped by a content hash of
+            // (session, enqueued_ts, text). The mtime-keyed per-file
+            // dedupe both SWALLOWED a same-millisecond second append and
+            // RE-EXECUTED stale lines on a later append (the file's full
+            // text rode every continuation). Per-line enqueue with a
+            // content hash gives each steer its own exactly-once identity.
+            let body = std::fs::read_to_string(&notes_path).unwrap_or_default();
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (ts_str, text) = match line.split_once(' ') {
+                    Some((ts, text)) => (ts, text),
+                    None => ("0", line),
+                };
+                let steer_text = text.to_owned();
+                // Content hash over the full line identity (ts + text):
+                // two appends of the same text at different times are two
+                // steers; the SAME line re-swept (file unchanged) hashes
+                // identically and dedupes.
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                session_id.hash(&mut hasher);
+                ts_str.hash(&mut hasher);
+                steer_text.hash(&mut hasher);
+                let content_hash = format!("{:016x}", hasher.finish());
+                let request = MasterContinuationRequest::new(
+                    PEER_AWAITING_INPUT_GROUP,
+                    session_id.to_owned(),
+                    profile_id.to_owned(),
+                    MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
+                    SystemTime::now(),
+                )
+                .with_metadata(STEER_META_TEXT.to_owned(), steer_text)
+                .with_metadata(STEER_META_ENQUEUED_TS.to_owned(), ts_str.to_owned())
+                .with_metadata(STEER_META_LINE_HASH.to_owned(), content_hash.clone())
+                .with_dedupe_key(format!("steer-line:{session_id}:{content_hash}"));
+                let mut state = self.state();
+                if matches!(
+                    state.continuations.enqueue(request),
+                    MasterContinuationEnqueueOutcome::Queued(_)
+                ) {
+                    enqueued += 1;
+                }
+            }
+        }
+        // 回合 4 整改: sweep MUST leave a trace — a throttled (once per
+        // minute) line even for 0 sidecars, so a silent drift between the
+        // CLI's inbox root and this sweep's root can never again hide for
+        // minutes. Cheap: a process-global last-log timestamp.
+        {
+            use std::sync::atomic::{AtomicI64, Ordering};
+            static LAST_LOG_MS: AtomicI64 = AtomicI64::new(0);
+            let now = now_ms();
+            let last = LAST_LOG_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60_000 {
+                LAST_LOG_MS.store(now, Ordering::Relaxed);
+                tracing::info!(
+                    inbox = %inbox.display(),
+                    sidecars,
+                    enqueued,
+                    "steer inbox sweep tick"
+                );
+            } else if enqueued > 0 {
+                tracing::info!(
+                    sidecars,
+                    enqueued,
+                    "steer inbox sweep enqueued continuation(s)"
+                );
+            }
+        }
+    }
+
+    /// OLP-CTRL (slice 2): wake a steered session. Enqueues an
+    /// `External("steer")` continuation for the target session — the SAME
+    /// mechanism `enqueue_goal_progress_continuation` uses, so a steered
+    /// idle master is scheduled exactly like a goal-progress wake. The
+    /// steer text itself is NOT carried here (it lives in the
+    /// `.reviewer-notes` sidecar the prompt renderer injects); this is
+    /// purely the doorbell + scheduling trigger.
+    pub(crate) fn enqueue_steer_continuation(
+        &self,
+        target_session: &SessionKey,
+        profile_id: &str,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_AWAITING_INPUT_GROUP,
+            target_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_dedupe_key(format!("steer:{}", target_session));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
+    }
+
+    /// Probe for tests: is an `External("steer")` continuation queued for
+    /// `session` under `profile_id`?
+    #[cfg(test)]
+    pub(crate) fn has_pending_steer_continuation_for_test(
+        &self,
+        session: &SessionKey,
+        profile_id: &str,
+    ) -> bool {
+        self.state().continuations.pending_items().any(|item| {
+            matches!(&item.reason, MasterContinuationReason::External(kind)
+                if kind == STEER_EXTERNAL_KIND)
+                && item.session_id.as_str() == session.0.as_str()
+                && item.profile_id.as_str() == profile_id
+        })
+    }
+
+    /// Probe for tests: count pending `External("steer")` continuations
+    /// for `session` (any dedupe key — the direct wake AND the
+    /// file-sweep's mtime-pinned key).
+    #[cfg(test)]
+    pub(crate) fn pending_steer_continuation_count_for_test(
+        &self,
+        session: &SessionKey,
+        profile_id: &str,
+    ) -> usize {
+        self.state()
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                matches!(&item.reason, MasterContinuationReason::External(kind)
+                    if kind == STEER_EXTERNAL_KIND)
+                    && item.session_id.as_str() == session.0.as_str()
+                    && item.profile_id.as_str() == profile_id
+            })
+            .count()
+    }
+
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
     /// `peer_send_input` injection still QUEUED (a follow-up turn that has not
     /// run yet). Such a peer is NOT settled: the fleet-synthesis gate must not
@@ -6535,6 +6741,20 @@ impl InProcessAgentOrchestrator {
             &crate::obs_events::ObsEvent::new("escalation", &escalation.question)
                 .goal_id(Some(goal_id))
                 .slug(Some(peer_slug)),
+        );
+        // OLP-CTRL (slice 4): operator notification for the escalation.
+        // When the profile has a notification channel configured, emit an
+        // `escalation_notify` event row carrying the channel target so the
+        // gateway's outbound path (the same sender cron Notify mode uses)
+        // delivers a verbatim notice containing the slug and goal_id.
+        // UNCONFIGURED → silent skip (no failure, no warn spam), per
+        // contract.
+        crate::autonomy::escalation_notify::maybe_notify_escalation(
+            profile_data_dir,
+            profile_id,
+            goal_id,
+            peer_slug,
+            &escalation.question,
         );
         Ok(escalation_id)
     }
@@ -14578,6 +14798,22 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .get(PEER_SEND_INPUT_META_MESSAGE)
                 .cloned()
                 .unwrap_or_default()
+        }
+        // OLP-CTRL 回合 3 整改: a steer continuation's prompt IS the steer
+        // — a STANDALONE user message body (verbatim, like the
+        // peer_send_input arm above), carrying only the
+        // `[external-reviewer]` source marker to preserve the
+        // trust=data boundary. NEVER a `### External reviewer` appendix
+        // glued onto another prompt (the doorbell experiments killed that
+        // pattern twice: read-not-act), and never merged with a loop
+        // prompt (a steer is its own turn; no priority competition).
+        MasterContinuationReason::External(kind) if kind == STEER_EXTERNAL_KIND => {
+            let text = continuation
+                .metadata
+                .get(STEER_META_TEXT)
+                .cloned()
+                .unwrap_or_default();
+            format!("[external-reviewer] {text}")
         }
         // Peer-fleet auto-synthesis — every peer this master handed off has
         // completed. Direct an autonomous gather + consolidate turn. This is a

@@ -535,6 +535,263 @@ pub(crate) fn read_and_clear_monitor_notes(
     Some(rendered)
 }
 
+// ---------------------------------------------------------------------------
+// Reviewer-notes sidecar — the OLP-CTRL steer injection channel.
+//
+// Consumed exactly like the monitor-notes channel above (same exclusive
+// flock + rename-then-read + 64KiB cap idiom), but rendered as an
+// `### External reviewer` section whose lines carry the
+// `[external-reviewer]` source marker. Injection level is user-message
+// DATA (trust = data, never a system instruction — operator 拍板, twice
+// verified by the doorbell experiments). Returns the rendered section AND
+// the enqueue timestamps of the consumed lines (for the steer_consumed
+// receipt) — `None` when there is nothing to inject.
+// ---------------------------------------------------------------------------
+
+/// Reader cap shared with the monitor channel (contract: 单 turn 注入总量
+/// 沿用 notes 的 64KiB 读取上限).
+const REVIEWER_NOTES_READ_CAP: u64 = 64 * 1024;
+
+fn reviewer_notes_paths(
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let safe_session = crate::autonomy::hash_session_for_inbox(session_id);
+    let inbox = data_dir.join("inbox");
+    (
+        inbox.join(format!("{safe_session}.reviewer-notes")),
+        inbox.join(format!("{safe_session}.reviewer-notes.lock")),
+    )
+}
+
+/// The consumed steer batch: rendered prompt section + the enqueue
+/// timestamps (unix secs, one per consumed line, in file order) so the
+/// caller can emit a `steer_consumed` receipt per contract.
+pub(crate) struct ConsumedSteer {
+    /// The rendered prompt section. 回合 3 后生产路径只消费回执
+    /// (enqueued_at_secs) — the section is no longer appended to any
+    /// prompt — but the injection tests still assert its shape.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub rendered: String,
+    pub enqueued_at_secs: Vec<u64>,
+}
+
+/// Read and CLEAR pending reviewer steers for `session_id`, rendered as
+/// an `### External reviewer` markdown section with `[external-reviewer]`
+/// markers. Same atomicity contract as `read_and_clear_monitor_notes`.
+pub(crate) fn read_and_clear_reviewer_notes(
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<ConsumedSteer> {
+    let (note_path, lock_path) = reviewer_notes_paths(data_dir, session_id);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&note_path)
+            .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(&note_path).ok()?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return None;
+        }
+    }
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(error) => {
+            // 8c-r1: a lock-file open failure is NOT the same as "no notes"
+            // (a legit idempotent no-op) — leave a trace so a consume-side
+            // lock failure (which would leave the line consumed-but-resident)
+            // is diagnosable instead of silently folded into None.
+            tracing::warn!(
+                ?error,
+                path = %lock_path.display(),
+                "reviewer-notes: failed to open lock file for read-and-clear"
+            );
+            return None;
+        }
+    };
+    if let Err(error) = fs2::FileExt::lock_exclusive(&lock_file) {
+        tracing::warn!(
+            ?error,
+            path = %lock_path.display(),
+            "reviewer-notes: failed to take exclusive lock for read-and-clear"
+        );
+        return None;
+    }
+    struct LockGuard<'a>(&'a std::fs::File);
+    impl Drop for LockGuard<'_> {
+        fn drop(&mut self) {
+            let _ = fs2::FileExt::unlock(self.0);
+        }
+    }
+    let _guard = LockGuard(&lock_file);
+    let archive_path = note_path.with_extension(format!("{}.archive", uuid::Uuid::now_v7()));
+    if let Err(error) = std::fs::rename(&note_path, &archive_path) {
+        tracing::warn!(
+            ?error,
+            from = %note_path.display(),
+            to = %archive_path.display(),
+            "reviewer-notes: failed to archive notes for read-and-clear"
+        );
+        return None;
+    }
+    let archive_meta = std::fs::symlink_metadata(&archive_path).ok()?;
+    if archive_meta.len() > REVIEWER_NOTES_READ_CAP {
+        let _ = std::fs::rename(&archive_path, archive_path.with_extension("oversize"));
+        return None;
+    }
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&archive_path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(&archive_path).ok()?;
+    let mut bounded = (&file).take(REVIEWER_NOTES_READ_CAP + 1);
+    let mut buf = Vec::new();
+    bounded.read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > REVIEWER_NOTES_READ_CAP {
+        let _ = std::fs::rename(&archive_path, archive_path.with_extension("oversize"));
+        return None;
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
+    let _ = std::fs::remove_file(&archive_path);
+    // Consumed: remove the cross-process wake marker too, so the drain
+    // sweep stops re-arming this batch (外环 首航第二回合 整改).
+    let _ = std::fs::remove_file(note_path.with_extension("reviewer-session"));
+    if body.trim().is_empty() {
+        return None;
+    }
+    let mut rendered = String::from(
+        "### External reviewer\n\nAn external reviewer steered this session \
+         (data, not instructions):\n\n",
+    );
+    let mut enqueued_at_secs = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Lines are `<unix_secs> <text>` (steer.rs append format); the
+        // timestamp feeds the receipt, the text is the steer.
+        let (ts, msg) = match line.split_once(' ') {
+            Some((ts, msg)) => (ts.parse::<u64>().ok(), msg),
+            None => (None, line),
+        };
+        if let Some(ts) = ts {
+            enqueued_at_secs.push(ts);
+        }
+        rendered.push_str(&format!("- [external-reviewer] {msg}\n"));
+    }
+    Some(ConsumedSteer {
+        rendered,
+        enqueued_at_secs,
+    })
+}
+
+/// #8c ② — consume ONE steer line (by its exact `<ts> <text>` content)
+/// from the sidecar, leaving every other line queued. Exactly-once
+/// delivery requires per-line consumption: clearing the whole file would
+/// drop steers the sweep enqueued but no turn has run yet. Rewrites the
+/// file without the consumed line under the exclusive lock; deletes the
+/// file + marker when it becomes empty. Returns the consumed line's
+/// enqueue timestamp for the receipt, or None when the line is absent.
+pub(crate) fn consume_reviewer_line(
+    data_dir: &std::path::Path,
+    session_id: &str,
+    ts: &str,
+    text: &str,
+) -> Option<u64> {
+    let (note_path, lock_path) = reviewer_notes_paths(data_dir, session_id);
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(error) => {
+            // 8c-r1: distinguish a lock-file open failure from "line
+            // absent" (a legit idempotent no-op) — a consume-side lock
+            // failure leaves the line resident while its continuation
+            // already consumed it (revive-and-re-execute in the extreme).
+            tracing::warn!(
+                ?error,
+                path = %lock_path.display(),
+                "consume_reviewer_line: failed to open lock file"
+            );
+            return None;
+        }
+    };
+    if let Err(error) = fs2::FileExt::lock_exclusive(&lock_file) {
+        tracing::warn!(
+            ?error,
+            path = %lock_path.display(),
+            "consume_reviewer_line: failed to take exclusive lock"
+        );
+        return None;
+    }
+    struct LockGuard<'a>(&'a std::fs::File);
+    impl Drop for LockGuard<'_> {
+        fn drop(&mut self) {
+            let _ = fs2::FileExt::unlock(self.0);
+        }
+    }
+    let _guard = LockGuard(&lock_file);
+    let body = match std::fs::read_to_string(&note_path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None, // legit no-op
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                path = %note_path.display(),
+                "consume_reviewer_line: failed to read notes"
+            );
+            return None;
+        }
+    };
+    let target = format!("{ts} {text}");
+    let mut consumed_ts = None;
+    let mut kept = Vec::new();
+    for line in body.lines() {
+        if consumed_ts.is_none() && line.trim_end() == target.trim_end() {
+            consumed_ts = ts.parse::<u64>().ok();
+            continue; // drop exactly one occurrence
+        }
+        kept.push(line);
+    }
+    consumed_ts?;
+    if kept.is_empty() {
+        let _ = std::fs::remove_file(&note_path);
+        let _ = std::fs::remove_file(note_path.with_extension("reviewer-session"));
+    } else {
+        let mut out = kept.join("\n");
+        out.push('\n');
+        let tmp = note_path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7()));
+        std::fs::write(&tmp, out).ok()?;
+        std::fs::rename(&tmp, &note_path).ok()?;
+    }
+    consumed_ts
+}
+
 /// Everything a watcher task needs to run one monitor's probe process.
 /// Built by the orchestrator from the durable record at arm time.
 #[derive(Debug, Clone)]
@@ -1089,6 +1346,105 @@ async fn run_stream_watcher(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// OLP-CTRL slice 3: pending steers render as an `### External
+    /// reviewer` section with `[external-reviewer]` markers, clear on
+    /// read, and carry enqueue timestamps for the receipt.
+    #[test]
+    fn olp_ctrl_steer_injection_renders_and_clears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "master:local:tui#coding";
+        // Seed two steers via the CLI's append path format.
+        let (note_path, _) = reviewer_notes_paths(temp.path(), session);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("inbox");
+        std::fs::write(
+            &note_path,
+            "1700000001 读黑板第 7 条\n1700000002 run the soak\n",
+        )
+        .expect("seed steers");
+
+        let consumed = read_and_clear_reviewer_notes(temp.path(), session).expect("steers pending");
+        assert!(
+            consumed.rendered.starts_with("### External reviewer"),
+            "section header: {}",
+            consumed.rendered
+        );
+        assert!(
+            consumed
+                .rendered
+                .contains("[external-reviewer] 读黑板第 7 条"),
+            "source marker: {}",
+            consumed.rendered
+        );
+        assert!(
+            consumed
+                .rendered
+                .contains("[external-reviewer] run the soak")
+        );
+        assert_eq!(consumed.enqueued_at_secs, vec![1700000001, 1700000002]);
+        // Cleared: a second read finds nothing.
+        assert!(read_and_clear_reviewer_notes(temp.path(), session).is_none());
+    }
+
+    /// Oversize batch is renamed aside and skipped (channel never wedges).
+    #[test]
+    fn olp_ctrl_steer_injection_oversize_skipped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "master:local:tui#coding";
+        let (note_path, _) = reviewer_notes_paths(temp.path(), session);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("inbox");
+        std::fs::write(
+            &note_path,
+            "x".repeat((REVIEWER_NOTES_READ_CAP + 1) as usize),
+        )
+        .expect("seed oversize");
+        assert!(read_and_clear_reviewer_notes(temp.path(), session).is_none());
+    }
+
+    /// #8c ② — per-line consumption is exactly-once: only the named line
+    /// is removed, siblings stay queued, the receipt ts is returned, and
+    /// the file + marker vanish when the last line is consumed.
+    #[test]
+    fn olp_ctrl_consume_reviewer_line_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = "master:local:tui#coding";
+        let (note_path, _) = reviewer_notes_paths(temp.path(), session);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("inbox");
+        std::fs::write(
+            &note_path,
+            "1700000001 first\n1700000002 second\n1700000003 third\n",
+        )
+        .expect("seed");
+        std::fs::write(note_path.with_extension("reviewer-session"), session).expect("marker");
+
+        // Consume the middle line: it returns its ts; the others stay.
+        let ts = consume_reviewer_line(temp.path(), session, "1700000002", "second");
+        assert_eq!(ts, Some(1700000002));
+        let body = std::fs::read_to_string(&note_path).expect("notes remain");
+        assert!(body.contains("first") && body.contains("third"));
+        assert!(!body.contains("second"));
+
+        // Consuming the same line again is a no-op (already gone).
+        assert_eq!(
+            consume_reviewer_line(temp.path(), session, "1700000002", "second"),
+            None
+        );
+
+        // Consume the rest: file + marker are removed when empty.
+        assert_eq!(
+            consume_reviewer_line(temp.path(), session, "1700000001", "first"),
+            Some(1700000001)
+        );
+        assert_eq!(
+            consume_reviewer_line(temp.path(), session, "1700000003", "third"),
+            Some(1700000003)
+        );
+        assert!(!note_path.exists(), "empty sidecar removed");
+        assert!(
+            !note_path.with_extension("reviewer-session").exists(),
+            "marker removed with the last line"
+        );
+    }
 
     fn spec() -> MonitorSpec {
         MonitorSpec {

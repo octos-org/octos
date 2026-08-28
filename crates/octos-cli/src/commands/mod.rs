@@ -31,6 +31,7 @@ mod serve;
 pub mod serve_console;
 pub mod skills;
 mod status;
+mod steer;
 mod update;
 
 use std::path::PathBuf;
@@ -74,6 +75,7 @@ pub use profile::ProfileCommand;
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
 pub use status::StatusCommand;
+pub use steer::SteerCommand;
 pub use update::UpdateCommand;
 
 /// octos: Rust-native coding agent orchestration.
@@ -149,6 +151,8 @@ pub enum Command {
     Skills(SkillsCommand),
     /// Show system status.
     Status(StatusCommand),
+    /// Queue an external-reviewer steer into a session (OLP control).
+    Steer(SteerCommand),
     /// Check for a newer octos release (`--check`); self-update is Stage 3.
     Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
@@ -395,6 +399,7 @@ impl Executable for Command {
             Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),
             Self::Status(cmd) => cmd.execute(),
+            Self::Steer(cmd) => cmd.execute(),
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
             Self::Goal(cmd) => cmd.execute(),
