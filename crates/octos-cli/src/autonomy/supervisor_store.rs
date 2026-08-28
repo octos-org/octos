@@ -1302,7 +1302,10 @@ impl SupervisorStore {
             tmp.write_all(body.as_bytes())?;
             tmp.sync_all()?;
         }
-        fs::rename(&tmp_path, &self.snapshot_path)?;
+        // #34g — via rename_replace: on a SECOND snapshot the destination
+        // already exists, and a bare fs::rename fails on Windows (POSIX
+        // replaces). This was the error-2 (B) cluster's primary suspect.
+        rename_replace(&tmp_path, &self.snapshot_path)?;
         fsync_dir(&self.root_dir)?;
         Ok(snapshot)
     }
@@ -1315,15 +1318,10 @@ impl SupervisorStore {
     fn snapshot_and_compact_locked(&self, cache: &mut SeqCache) -> io::Result<SupervisorSnapshot> {
         let snapshot = self.write_snapshot_locked()?;
         if self.events_path.exists() {
-            match fs::remove_file(&self.rotated_events_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-            // #34f — Windows rename is NOT replace-on-existing; the remove
-            // above cleared the target, so a plain rename works on both
-            // platforms. (kept explicit for the audit trail)
-            fs::rename(&self.events_path, &self.rotated_events_path)?;
+            // #34g — rename_replace handles the previous generation
+            // (remove-then-rename; see the helper for the crash-window
+            // analysis).
+            rename_replace(&self.events_path, &self.rotated_events_path)?;
             fsync_dir(&self.root_dir)?;
         }
         cache.seeded = true;
@@ -1537,6 +1535,27 @@ impl SupervisorStore {
             }
         }
     }
+}
+
+/// #34g — cross-platform REPLACE-ON-EXISTING rename.
+///
+/// Windows `std::fs::rename` FAILS when the destination exists (POSIX
+/// replaces atomically). Both compaction-rename sites in this store target
+/// files that legitimately already exist on a second cycle (the snapshot
+/// overwrites the previous snapshot; the rotated ledger overwrites the
+/// previous generation), so every rename here goes through this helper:
+/// remove the destination first (tolerating NotFound — the first cycle),
+/// then rename. The remove/rename pair is NOT atomic on either platform,
+/// but both callers write crash-recoverable layouts (a missing snapshot
+/// falls back to full replay; a missing rotation leaves the live ledger),
+/// so the tiny window is absorbed by the recovery paths, not by durability.
+fn rename_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::remove_file(dst) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    fs::rename(src, dst)
 }
 
 fn merge_continuation(
@@ -2604,10 +2623,24 @@ mod tests {
         // cycle can land on an identical length, so length alone must never
         // validate the cursor (the ABA the fast path's content check kills).
         let body = fs::read_to_string(store.events_path()).unwrap();
-        let forged = body.replace("\"sequence\":2", "\"sequence\":7");
+        let forged = body.replace("\"sequence\":2,", "\"sequence\":7,");
         assert_ne!(body, forged, "fixture must actually change the tail");
         assert_eq!(body.len(), forged.len(), "fixture must keep the length");
         fs::write(store.events_path(), forged).unwrap();
+        // #34g-C — explicit, timestamp-independent verification: the two
+        // seeded rows may land in the same millisecond (CI runners do), and
+        // the original implicit "different rows" assumption was a
+        // cross-platform flake source; pin the forge landed on the TAIL.
+        let forged_tail = fs::read_to_string(store.events_path())
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert!(
+            forged_tail.contains("\"sequence\":7"),
+            "tail carries the forged sequence"
+        );
 
         let row = store
             .record_heartbeat(test_ping("g", "c-3", "p-3", 3))

@@ -81,6 +81,18 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
 ///   * anything ambiguous — no cd prefix, cd without `&&`, `;` chains,
 ///     variable paths — falls back to the session workdir
 ///     (`scope: workdir`), matching the pre-r1 behavior.
+///
+/// #34g-D — the platform home directory (`HOME` on Unix, `USERPROFILE`
+/// fallback on Windows where `HOME` is typically unset). The 34g ruling:
+/// the resolver's tilde expansion must not be Unix-only in a resolver that
+/// otherwise has no POSIX dependency.
+fn platform_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 fn receipt_scope_root(workdir: &Path, command: &str) -> (PathBuf, &'static str) {
     let fallback = || (workdir.to_path_buf(), "workdir");
     let trimmed = command.trim_start();
@@ -115,14 +127,14 @@ fn receipt_scope_root(workdir: &Path, command: &str) -> (PathBuf, &'static str) 
         return fallback();
     }
     let path = if literal == "~" {
-        match std::env::var("HOME") {
-            Ok(home) => PathBuf::from(home),
-            Err(_) => return fallback(),
+        match platform_home() {
+            Some(home) => home,
+            None => return fallback(),
         }
     } else if let Some(sub) = literal.strip_prefix("~/") {
-        match std::env::var("HOME") {
-            Ok(home) => Path::new(&home).join(sub),
-            Err(_) => return fallback(),
+        match platform_home() {
+            Some(home) => Path::new(&home).join(sub),
+            None => return fallback(),
         }
     } else {
         Path::new(literal).to_path_buf()
