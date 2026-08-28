@@ -1206,24 +1206,36 @@ impl SupervisorStore {
         #[cfg(windows)]
         let mut file = fs_retry(
             || {
-                OpenOptions::new()
-                    .read(true)
-                    .create(true)
-                    .append(true)
-                    .open(&self.events_path)
+                fs_ctx(
+                    "events-append-open",
+                    &self.events_path,
+                    OpenOptions::new()
+                        .read(true)
+                        .create(true)
+                        .append(true)
+                        .open(&self.events_path),
+                )
             },
             is_transient_windows_lock,
         )?;
         #[cfg(not(windows))]
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(&self.events_path)?;
+        let mut file = fs_ctx(
+            "events-append-open",
+            &self.events_path,
+            OpenOptions::new()
+                .read(true)
+                .create(true)
+                .append(true)
+                .open(&self.events_path),
+        )?;
         #[cfg(windows)]
-        let len = fs_retry(|| file.metadata(), is_transient_windows_lock)?.len();
+        let len = fs_retry(
+            || fs_ctx("events-metadata", &self.events_path, file.metadata()),
+            is_transient_windows_lock,
+        )?
+        .len();
         #[cfg(not(windows))]
-        let len = file.metadata()?.len();
+        let len = fs_ctx("events-metadata", &self.events_path, file.metadata())?.len();
         let mut payload = Vec::with_capacity(256);
         if len > 0 {
             file.seek(SeekFrom::Start(len - 1))?;
@@ -1236,10 +1248,18 @@ impl SupervisorStore {
         serde_json::to_writer(&mut payload, row).map_err(invalid_data)?;
         payload.push(b'\n');
         // O_APPEND: the write lands at EOF regardless of the read seek above.
-        file.write_all(&payload)?;
-        file.flush()?;
+        fs_ctx(
+            "events-row-write",
+            &self.events_path,
+            file.write_all(&payload),
+        )?;
+        fs_ctx("events-row-flush", &self.events_path, file.flush())?;
         if created {
-            fsync_dir(&self.root_dir)?;
+            fs_ctx(
+                "events-create-dir-fsync",
+                &self.root_dir,
+                fsync_dir(&self.root_dir),
+            )?;
         }
         Ok(file)
     }
@@ -1327,21 +1347,38 @@ impl SupervisorStore {
             let body_bytes = body.as_bytes();
             fs_retry(
                 || {
-                    let mut tmp = File::create(tmp_path)?;
-                    tmp.write_all(body_bytes)?;
-                    tmp.sync_all()
+                    fs_ctx("snapshot-tmp-create", tmp_path, File::create(tmp_path)).and_then(
+                        |mut tmp| {
+                            fs_ctx("snapshot-tmp-write", tmp_path, tmp.write_all(body_bytes))
+                                .and_then(|()| {
+                                    fs_ctx("snapshot-tmp-sync", tmp_path, tmp.sync_all())
+                                })
+                        },
+                    )
                 },
                 is_transient_windows_lock,
             )?;
         }
         #[cfg(not(windows))]
         {
-            let mut tmp = File::create(&tmp_path)?;
-            tmp.write_all(body.as_bytes())?;
-            tmp.sync_all()?;
+            let mut tmp = fs_ctx("snapshot-tmp-create", &tmp_path, File::create(&tmp_path))?;
+            fs_ctx(
+                "snapshot-tmp-write",
+                &tmp_path,
+                tmp.write_all(body.as_bytes()),
+            )?;
+            fs_ctx("snapshot-tmp-sync", &tmp_path, tmp.sync_all())?;
         }
-        rename_replace(&tmp_path, &self.snapshot_path)?;
-        fsync_dir(&self.root_dir)?;
+        fs_ctx(
+            "snapshot-rename-replace",
+            &self.snapshot_path,
+            rename_replace(&tmp_path, &self.snapshot_path),
+        )?;
+        fs_ctx(
+            "snapshot-dir-fsync",
+            &self.root_dir,
+            fsync_dir(&self.root_dir),
+        )?;
         Ok(snapshot)
     }
 
@@ -1356,8 +1393,16 @@ impl SupervisorStore {
             // #34g — rename_replace handles the previous generation
             // (remove-then-rename; see the helper for the crash-window
             // analysis).
-            rename_replace(&self.events_path, &self.rotated_events_path)?;
-            fsync_dir(&self.root_dir)?;
+            fs_ctx(
+                "events-rotate-rename-replace",
+                &self.rotated_events_path,
+                rename_replace(&self.events_path, &self.rotated_events_path),
+            )?;
+            fs_ctx(
+                "compact-dir-fsync",
+                &self.root_dir,
+                fsync_dir(&self.root_dir),
+            )?;
         }
         cache.seeded = true;
         cache.last_sequence = cache.last_sequence.max(snapshot.last_sequence);
@@ -1547,7 +1592,11 @@ impl SupervisorStore {
     }
 
     fn ensure_root_dir(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.root_dir)
+        fs_ctx(
+            "ensure-root-dir",
+            &self.root_dir,
+            fs::create_dir_all(&self.root_dir),
+        )
     }
 
     fn acquire_append_lock(&self) -> io::Result<SupervisorAppendLock> {
@@ -1608,6 +1657,27 @@ fn is_transient_windows_lock(err: &io::Error) -> bool {
 /// PermissionDenied is never success-ified; remove's non-NotFound real
 /// error returns immediately; retry exhaustion returns the LAST observed
 /// error). Production uses the real fs; tests swap in scripted outcomes.
+/// #40 — wrap a fallible fs op's error with op name + full path + errno,
+/// so a test panic prints the exact culprit path (winlab forensics: the
+/// victim set moves and the error spectrum alone can't name the offender).
+/// Zero behavior change: only the error TEXT gains context; kinds and
+/// results pass through untouched. `source` is chained for full fidelity.
+fn fs_ctx<T>(op: &'static str, path: &Path, r: io::Result<T>) -> io::Result<T> {
+    r.map_err(|err| {
+        let errno = err
+            .raw_os_error()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        io::Error::new(
+            err.kind(),
+            format!(
+                "[fs:{op}] path={} errno={errno} source={err}",
+                path.display()
+            ),
+        )
+    })
+}
+
 /// #39 — total retry budget, environment-tunable. Default ~2.5s (the
 /// 34h bound); CI's slow runners can raise it (e.g. 10s) via
 /// `OCTOS_FS_RETRY_TOTAL_MS`. Read once per call (cheap env read, no lock).
@@ -1629,6 +1699,9 @@ fn fs_retry<T>(
     op: impl Fn() -> io::Result<T>,
     is_transient: impl Fn(&io::Error) -> bool,
 ) -> io::Result<T> {
+    // #40 — callers wrap `op` with fs_ctx so retries and the final return
+    // both carry op+path+errno context (the transient judge reads the
+    // KIND, which fs_ctx preserves).
     let total = std::time::Duration::from_millis(fs_retry_total_ms());
     let start = std::time::Instant::now();
     let mut delay = 20u64;
@@ -2040,6 +2113,10 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
+            // #40 — print this test's root ONCE to stderr (captured by the
+            // harness, shown on failure): winlab forensics needs the exact
+            // culprit path when the victim set moves between runs.
+            eprintln!("[#40 TestDir] label={label} root={}", path.display());
             Self { path }
         }
     }
