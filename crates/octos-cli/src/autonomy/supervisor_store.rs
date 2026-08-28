@@ -1200,11 +1200,29 @@ impl SupervisorStore {
     fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
         self.ensure_root_dir()?;
         let created = !self.events_path.exists();
+        // #39 — the ledger append OPEN also sits on the compaction-adjacent
+        // path (the file was just rotated; Windows reopens can hit the same
+        // transient spectrum). Retry-wrapped on Windows, single-shot on unix.
+        #[cfg(windows)]
+        let mut file = fs_retry(
+            || {
+                OpenOptions::new()
+                    .read(true)
+                    .create(true)
+                    .append(true)
+                    .open(&self.events_path)
+            },
+            is_transient_windows_lock,
+        )?;
+        #[cfg(not(windows))]
         let mut file = OpenOptions::new()
             .read(true)
             .create(true)
             .append(true)
             .open(&self.events_path)?;
+        #[cfg(windows)]
+        let len = fs_retry(|| file.metadata(), is_transient_windows_lock)?.len();
+        #[cfg(not(windows))]
         let len = file.metadata()?.len();
         let mut payload = Vec::with_capacity(256);
         if len > 0 {
@@ -1297,14 +1315,31 @@ impl SupervisorStore {
         self.ensure_root_dir()?;
         let body = serde_json::to_string_pretty(&snapshot).map_err(invalid_data)?;
         let tmp_path = self.snapshot_path.with_extension("json.tmp");
+        // #34g — via rename_replace: on a SECOND snapshot the destination
+        // already exists, and a bare fs::rename fails on Windows (POSIX
+        // replaces). This was the error-2 (B) cluster's primary suspect.
+        // #39 — the tmp write steps also sit on the snapshot path and see
+        // the same transient-lock spectrum (AV/indexer probes on freshly
+        // created files). Route through the retry helper on Windows.
+        #[cfg(windows)]
+        {
+            let tmp_path = &tmp_path;
+            let body_bytes = body.as_bytes();
+            fs_retry(
+                || {
+                    let mut tmp = File::create(tmp_path)?;
+                    tmp.write_all(body_bytes)?;
+                    tmp.sync_all()
+                },
+                is_transient_windows_lock,
+            )?;
+        }
+        #[cfg(not(windows))]
         {
             let mut tmp = File::create(&tmp_path)?;
             tmp.write_all(body.as_bytes())?;
             tmp.sync_all()?;
         }
-        // #34g — via rename_replace: on a SECOND snapshot the destination
-        // already exists, and a bare fs::rename fails on Windows (POSIX
-        // replaces). This was the error-2 (B) cluster's primary suspect.
         rename_replace(&tmp_path, &self.snapshot_path)?;
         fsync_dir(&self.root_dir)?;
         Ok(snapshot)
@@ -1573,6 +1608,45 @@ fn is_transient_windows_lock(err: &io::Error) -> bool {
 /// PermissionDenied is never success-ified; remove's non-NotFound real
 /// error returns immediately; retry exhaustion returns the LAST observed
 /// error). Production uses the real fs; tests swap in scripted outcomes.
+/// #39 — total retry budget, environment-tunable. Default ~2.5s (the
+/// 34h bound); CI's slow runners can raise it (e.g. 10s) via
+/// `OCTOS_FS_RETRY_TOTAL_MS`. Read once per call (cheap env read, no lock).
+#[cfg(windows)]
+fn fs_retry_total_ms() -> u64 {
+    std::env::var("OCTOS_FS_RETRY_TOTAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2_500)
+}
+
+/// #39 — run ONE fallible fs operation under the transient-lock retry
+/// policy (Windows only; unix is single-shot). Used for EVERY fs mutation
+/// on the snapshot/compaction path so the whole path shares one budget
+/// class, not just the two rename sites.
+#[cfg(windows)]
+fn fs_retry<T>(
+    op: impl Fn() -> io::Result<T>,
+    is_transient: impl Fn(&io::Error) -> bool,
+) -> io::Result<T> {
+    let total = std::time::Duration::from_millis(fs_retry_total_ms());
+    let start = std::time::Instant::now();
+    let mut delay = 20u64;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(err) if is_transient(&err) => {
+                if start.elapsed() >= total {
+                    return Err(err); // budget exhausted — LAST observed error
+                }
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                delay = delay.saturating_mul(2);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 type RemoveFn = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 type RenameFn = Box<dyn Fn(&Path, &Path) -> io::Result<()> + Send + Sync>;
 type SleepFn = Box<dyn Fn(std::time::Duration) + Send + Sync>;
@@ -1624,41 +1698,20 @@ fn rename_replace(src: &Path, dst: &Path) -> io::Result<()> {
 pub(crate) fn replace_with(ops: &ReplaceOps, src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        const MAX_ATTEMPTS: u32 = 10;
-        const BASE_DELAY_MS: u64 = 20;
-        let mut attempt = 0u32;
-        let mut delay = BASE_DELAY_MS;
-        loop {
-            match (ops.remove)(dst) {
-                Ok(()) => break,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => break,
-                Err(err) if (ops.is_transient)(&err) => {
-                    attempt += 1;
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(err);
-                    }
-                    (ops.sleep)(std::time::Duration::from_millis(delay));
-                    delay = delay.saturating_mul(2);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        let mut attempt = 0u32;
-        let mut delay = BASE_DELAY_MS;
-        loop {
-            match (ops.rename)(src, dst) {
-                Ok(()) => return Ok(()),
-                Err(err) if (ops.is_transient)(&err) => {
-                    attempt += 1;
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(err);
-                    }
-                    (ops.sleep)(std::time::Duration::from_millis(delay));
-                    delay = delay.saturating_mul(2);
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        // #39 — both steps route through fs_retry (shared env-tunable
+        // budget, OCTOS_FS_RETRY_TOTAL_MS; default 2.5s). The injectable
+        // sleep/is_transient keep the ###29 mechanical pins meaningful.
+        let is_t = &ops.is_transient;
+        let remove_result = fs_retry(
+            || match (ops.remove)(dst) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()), // first cycle
+                Err(err) => Err(err),
+            },
+            |e| is_t(e),
+        );
+        remove_result?;
+        fs_retry(|| (ops.rename)(src, dst), |e| is_t(e))
     }
     #[cfg(not(windows))]
     {

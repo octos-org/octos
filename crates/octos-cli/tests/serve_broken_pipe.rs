@@ -15,6 +15,12 @@
 //! `cargo test -p octos-cli --features api --test serve_broken_pipe -- --test-threads=1`
 
 // Process-control tests require libc pipe/kill/setsid — unsafe is inherent.
+// #39 — the whole `imp` module is unix-only BY ORIGINAL DESIGN (libc pipes,
+// raw-fd Stdio, SIGINT/SIGKILL): the #37 hardening broke the cfg structure
+// by leaving the imports and several `libc::` call sites outside any gate
+// (E0432/E0433 on Windows). Gate the entire module so the file compiles on
+// Windows with the SAME existence shape as before #37: no tests, no imp.
+#[cfg(unix)]
 #[allow(unsafe_code)]
 mod imp {
     use std::os::fd::FromRawFd;
