@@ -1458,6 +1458,12 @@ impl SupervisorStore {
         // Open-and-match instead of exists()-then-open: a concurrent
         // compaction may rotate the ledger away between the two, which must
         // read as "no rows", not an error.
+        // #34h — handle-lifetime self-audit: the file handle (and its
+        // BufReader) live ONLY inside this function's scope and drop on
+        // return, so no in-process handle overlaps the rename_replace
+        // window. `load_snapshot` uses `fs::read_to_string`, whose handle
+        // is opened-and-closed inside the call. Kept explicit so a future
+        // refactor that hoists these handles shows up against this comment.
         let file = match File::open(&self.events_path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1549,13 +1555,84 @@ impl SupervisorStore {
 /// but both callers write crash-recoverable layouts (a missing snapshot
 /// falls back to full replay; a missing rotation leaves the live ledger),
 /// so the tiny window is absorbed by the recovery paths, not by durability.
+/// #34h — is this error a TRANSIENT Windows file-lock condition worth
+/// retrying? The live winlab spectrum (fifth round): 183 AlreadyExists,
+/// 5 AccessDenied, 3 NotFound during the remove→rename pair — delete-pending
+/// windows and AV/indexer transient locks. Unix never hits these (rename is
+/// atomic replace), so the retry is Windows-only and this predicate is
+/// compiled out elsewhere.
+#[cfg(windows)]
+fn is_transient_windows_lock(err: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    matches!(err.kind(), PermissionDenied | AlreadyExists)
+        || err.raw_os_error().is_some_and(|code| code == 32) // ERROR_SHARING_VIOLATION
+}
+
+/// #34g/#34h — cross-platform REPLACE-ON-EXISTING rename with a BOUNDED
+/// retry on Windows transient locks.
+///
+/// Windows `std::fs::rename` fails when the destination exists (POSIX
+/// replaces atomically), so the destination is removed first. Fifth-round
+/// winlab evidence showed the remove→rename pair also colliding with
+/// delete-pending windows and transient AV/indexer locks, so on Windows
+/// both steps retry on PermissionDenied / AlreadyExists / os error 32 with
+/// a 20ms-start exponential backoff, at most 10 attempts (~2s total budget;
+/// 20+40+80+160+320+640+1280 = 2540ms worst case) before the original error
+/// is returned. Unix keeps the single-shot semantics — the retry arm is
+/// cfg'd out entirely.
+///
+/// A remove error that is NOT NotFound (and not, on Windows, transient) is
+/// returned immediately — never silently swallowed.
 fn rename_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    match fs::remove_file(dst) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+    #[cfg(windows)]
+    {
+        const MAX_ATTEMPTS: u32 = 10;
+        const BASE_DELAY_MS: u64 = 20;
+        // Remove (bounded retry on transient locks; NotFound = first cycle).
+        let mut attempt = 0u32;
+        let mut delay = BASE_DELAY_MS;
+        loop {
+            match fs::remove_file(dst) {
+                Ok(()) => break,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+                Err(err) if is_transient_windows_lock(&err) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    delay = delay.saturating_mul(2);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        // Rename (same bounded retry against a delete-pending dst).
+        let mut attempt = 0u32;
+        let mut delay = BASE_DELAY_MS;
+        loop {
+            match fs::rename(src, dst) {
+                Ok(()) => return Ok(()),
+                Err(err) if is_transient_windows_lock(&err) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    delay = delay.saturating_mul(2);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
-    fs::rename(src, dst)
+    #[cfg(not(windows))]
+    {
+        match fs::remove_file(dst) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        fs::rename(src, dst)
+    }
 }
 
 fn merge_continuation(
