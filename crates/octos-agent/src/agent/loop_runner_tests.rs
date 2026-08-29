@@ -6422,3 +6422,129 @@ fn build_chat_config_applies_max_tokens_override_independently() {
     assert_eq!(chat.max_tokens, Some(4096));
     assert_eq!(chat.temperature, Some(0.5));
 }
+
+// --- #2174: conversation-loop recovery from a degenerate empty MaxTokens ---
+
+fn empty_max_tokens_response() -> ChatResponse {
+    // Models the REAL degenerate case: the whole output budget was spent on
+    // reasoning, so `content` is empty and there are no tool calls, but
+    // `reasoning_content` is present. That makes `is_retriable_response` return
+    // false (has_reasoning), so the response is NOT caught by the call-level
+    // empty-retry and instead reaches the conversation-loop MaxTokens branch.
+    ChatResponse {
+        content: None,
+        reasoning_content: Some("(long internal reasoning, no final answer)".to_string()),
+        tool_calls: vec![],
+        stop_reason: StopReason::MaxTokens,
+        usage: LlmTokenUsage {
+            input_tokens: 5,
+            output_tokens: 128,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
+}
+
+async fn run_conversation_content(responses: Vec<ChatResponse>) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("empty-maxtokens"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    agent
+        .process_message("go", &[], vec![])
+        .await
+        .unwrap()
+        .content
+}
+
+#[tokio::test]
+async fn empty_max_tokens_recovers_when_retry_succeeds() {
+    // A degenerate empty MaxTokens (no content, no tool call) must trigger a
+    // nudge-and-retry instead of returning empty; the retry succeeds and its
+    // content is returned — not a silent empty exit.
+    let content = run_conversation_content(vec![
+        empty_max_tokens_response(),
+        end_turn("recovered answer", 4, 6),
+    ])
+    .await;
+    assert_eq!(content, "recovered answer");
+}
+
+/// Always returns the degenerate empty-MaxTokens response, so the loop's
+/// behavior is bounded solely by the recovery cap (not by a fixed script).
+struct AlwaysEmptyMaxTokensProvider;
+
+#[async_trait]
+impl LlmProvider for AlwaysEmptyMaxTokensProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        Ok(empty_max_tokens_response())
+    }
+    fn model_id(&self) -> &str {
+        "always-empty"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn empty_max_tokens_surfaces_error_after_recovery_exhausted() {
+    // A model that keeps returning a degenerate empty MaxTokens: the loop does
+    // two bounded recoveries then surfaces a clear terminal error rather than a
+    // silent empty return. If the recovery counter did NOT persist across
+    // iterations this would instead loop until max_iterations — so this also
+    // pins the bound.
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(AlwaysEmptyMaxTokensProvider);
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("empty-maxtokens"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    // Uses the default (non-FailFast) call policy — the path `octos chat`
+    // takes, where an empty-but-reasoning MaxTokens reaches the conversation
+    // loop rather than being failed fast. (Under FailFast the empty response is
+    // terminal earlier, a different — also non-silent — outcome.)
+    let content = agent
+        .process_message("go", &[], vec![])
+        .await
+        .unwrap()
+        .content;
+    assert_eq!(content, MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE);
+}
+
+#[tokio::test]
+async fn non_empty_max_tokens_returns_content_unchanged() {
+    // Cloud-safety: a MaxTokens response WITH content is returned as-is, with
+    // no retry — behavior unchanged from before #2174.
+    let content = run_conversation_content(vec![ChatResponse {
+        content: Some("partial but real".to_string()),
+        reasoning_content: None,
+        tool_calls: vec![],
+        stop_reason: StopReason::MaxTokens,
+        usage: LlmTokenUsage {
+            input_tokens: 5,
+            output_tokens: 128,
+            ..Default::default()
+        },
+        provider_index: None,
+    }])
+    .await;
+    assert_eq!(content, "partial but real");
+}

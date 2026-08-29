@@ -31,6 +31,14 @@ use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
 const MAX_TOKENS_CONTINUATION_LIMIT: usize = 2;
 const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your output was truncated at the token limit. Continue directly from where you stopped. Do not repeat or summarize what you already wrote.";
+/// Nudge issued when a `MaxTokens` response carried NO content and NO tool call
+/// — a degenerate generation that consumed the whole output budget producing
+/// nothing usable (#2174). Unlike the truncation-continuation prompt, there is
+/// nothing to "continue from", so this asks for a single concise next action.
+const MAX_TOKENS_EMPTY_RECOVERY_PROMPT: &str = "Your previous response reached the output token limit without producing any text or tool call. Respond concisely: take your single next action now — call one tool or give a brief answer. Do not repeat yourself.";
+/// Terminal message when empty-`MaxTokens` recovery is exhausted. Surfaced
+/// instead of an empty success so the turn never silently dead-ends (#2174).
+const MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE: &str = "[The model repeatedly reached the output token limit without producing any text or tool call — a degenerate or looping generation. Try a stronger model, reduce the context size, or configure an anti-repetition sampler (a non-zero temperature or a repeat penalty).]";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
 /// Prepended to the user content on a live video-call turn so the model treats
@@ -1006,6 +1014,9 @@ impl Agent {
                 // #1691 (codex gap G6): fire the in-band budget reminder once,
                 // when the run first crosses ~80% of its iteration cap.
                 let mut budget_reminder_sent = false;
+                // #2174: bounded recovery for a degenerate empty `MaxTokens`
+                // response (no content, no tool call) in the conversation loop.
+                let mut max_token_empty_recoveries: usize = 0;
 
                 // UserPromptSubmit lifecycle hook. Fires exactly once here —
                 // when a real user-submitted prompt enters the turn, after the
@@ -2061,9 +2072,46 @@ impl Agent {
                             }
                         }
                         StopReason::MaxTokens => {
+                            let content_empty = response
+                                .content
+                                .as_deref()
+                                .is_none_or(|c| c.trim().is_empty());
+                            // #2174: a MaxTokens response with NO content AND no
+                            // tool call is a degenerate generation — the whole
+                            // output budget was spent producing nothing usable.
+                            // Returning here would end the turn empty and the
+                            // process would exit silently. Attempt a bounded
+                            // nudge-and-retry (mirroring the task loop's max-token
+                            // continuation), then surface a clear error instead of
+                            // an empty success. A MaxTokens response WITH content
+                            // is returned unchanged — cloud / normal truncation is
+                            // unaffected.
+                            if content_empty
+                                && response.tool_calls.is_empty()
+                                && max_token_empty_recoveries < MAX_TOKENS_CONTINUATION_LIMIT
+                            {
+                                max_token_empty_recoveries += 1;
+                                let mut assistant = Message::assistant(String::new());
+                                assistant.reasoning_content = response.reasoning_content.clone();
+                                messages.push(assistant);
+                                messages.push(Message::user(MAX_TOKENS_EMPTY_RECOVERY_PROMPT));
+                                warn!(
+                                    iteration,
+                                    attempt = max_token_empty_recoveries,
+                                    max = MAX_TOKENS_CONTINUATION_LIMIT,
+                                    "empty MaxTokens response (no content, no tool call); \
+                                     nudging and retrying"
+                                );
+                                continue 'agent_loop;
+                            }
                             self.emit_cost_update(&turn, &response, attributed_cost);
+                            let content = if content_empty && response.tool_calls.is_empty() {
+                                MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE.to_string()
+                            } else {
+                                response.content.clone().unwrap_or_default()
+                            };
                             return Ok(ConversationResponse {
-                                content: response.content.unwrap_or_default(),
+                                content,
                                 reasoning_content: response.reasoning_content.clone(),
                                 provider_metadata: Some(
                                     self.llm.provider_metadata_for_index(response.provider_index),
