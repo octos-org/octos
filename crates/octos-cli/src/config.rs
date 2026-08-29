@@ -1571,6 +1571,14 @@ pub struct GatewayConfig {
     /// until `max_tokens`). See issue #2172.
     #[serde(default)]
     pub llm_temperature: Option<f32>,
+
+    /// Extra sampler params for OpenAI-compatible servers, flattened verbatim
+    /// into the request body — e.g. `{"repeat_penalty": 1.1, "top_p": 0.95}`.
+    /// For params octos does not model. `None` → nothing added, so cloud
+    /// requests are unchanged. The robust fix for local-model repetition
+    /// collapse (temperature alone is only a partial mitigation). #2172.
+    #[serde(default)]
+    pub llm_sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Default for GatewayConfig {
@@ -1594,6 +1602,7 @@ impl Default for GatewayConfig {
             max_output_tokens: None,
             reasoning_effort: None,
             llm_temperature: None,
+            llm_sampling_params: None,
         }
     }
 }
@@ -2397,6 +2406,26 @@ mod tests {
         let json = r#"{"channels": [{"type": "cli"}]}"#;
         let gw: GatewayConfig = serde_json::from_str(json).unwrap();
         assert_eq!(gw.llm_temperature, None);
+    }
+
+    #[test]
+    fn test_gateway_llm_sampling_params_parses() {
+        let json = r#"{
+            "channels": [{"type": "cli"}],
+            "llm_sampling_params": {"repeat_penalty": 1.1, "top_p": 0.95}
+        }"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        let sp = gw.llm_sampling_params.expect("sampling params present");
+        assert_eq!(sp.get("repeat_penalty"), Some(&serde_json::json!(1.1)));
+        assert_eq!(sp.get("top_p"), Some(&serde_json::json!(0.95)));
+    }
+
+    #[test]
+    fn test_gateway_llm_sampling_params_absent_is_none() {
+        // Cloud-safety: absent → None → nothing flattened into the request.
+        let json = r#"{"channels": [{"type": "cli"}]}"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(gw.llm_sampling_params, None);
     }
 
     #[test]

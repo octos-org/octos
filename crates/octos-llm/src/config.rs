@@ -33,6 +33,14 @@ pub struct ChatConfig {
     /// Anthropic ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<serde_json::Value>,
+    /// Extra sampler params for OpenAI-compatible servers, flattened verbatim
+    /// into the request body — e.g. `{"repeat_penalty": 1.1, "top_p": 0.95}`.
+    /// For params octos does not model (`repeat_penalty`, `top_p`, `top_k`,
+    /// `min_p`, `frequency_penalty`, `presence_penalty`, …). `None` → nothing is
+    /// added, so cloud requests are unchanged. Do not put `temperature` /
+    /// `max_tokens` here — use their dedicated fields. See issue #2172.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Structured output format for chat responses.
@@ -85,6 +93,7 @@ impl Default for ChatConfig {
             reasoning_effort: None,
             response_format: None,
             context_management: None,
+            sampling_params: None,
         }
     }
 }
@@ -146,6 +155,7 @@ mod tests {
             reasoning_effort: None,
             response_format: None,
             context_management: None,
+            sampling_params: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ChatConfig = serde_json::from_str(&json).unwrap();
@@ -165,6 +175,7 @@ mod tests {
             reasoning_effort: None,
             response_format: None,
             context_management: None,
+            sampling_params: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("max_tokens").is_none());

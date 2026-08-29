@@ -3861,6 +3861,11 @@ fn build_chat_config(config: &crate::AgentConfig) -> ChatConfig {
     if let Some(temp) = config.chat_temperature {
         c.temperature = Some(temp);
     }
+    // Extra sampler params (e.g. repeat_penalty) for OpenAI-compatible servers.
+    // Unset → nothing added, cloud unchanged.
+    if let Some(sampling) = &config.chat_sampling_params {
+        c.sampling_params = Some(sampling.clone());
+    }
     c.reasoning_effort = config.reasoning_effort;
     c
 }

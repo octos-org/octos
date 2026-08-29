@@ -12788,6 +12788,7 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         reasoning_effort: None,
         response_format: None,
         context_management: None,
+        sampling_params: None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
     let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {

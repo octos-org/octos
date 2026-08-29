@@ -476,6 +476,7 @@ async fn fetch_summary(
         reasoning_effort: None,
         response_format: None,
         context_management: None,
+        sampling_params: None,
     };
     let messages = vec![Message::user(prompt)];
     let fut = async move { provider.chat(&messages, &[], &config).await };

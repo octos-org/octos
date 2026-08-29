@@ -224,6 +224,7 @@ impl PersonaService {
             reasoning_effort: None,
             response_format: None,
             context_management: None,
+            sampling_params: None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {
@@ -386,6 +387,7 @@ impl PersonaService {
             reasoning_effort: None,
             response_format: None,
             context_management: None,
+            sampling_params: None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {

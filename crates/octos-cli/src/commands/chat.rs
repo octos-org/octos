@@ -1780,6 +1780,10 @@ impl ChatCommand {
             save_episodes: !self.no_session_persistence,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
             chat_temperature: config.gateway.as_ref().and_then(|g| g.llm_temperature),
+            chat_sampling_params: config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.llm_sampling_params.clone()),
             // `--effort` (claude/codex parity) overrides `gateway.reasoning_effort`.
             reasoning_effort: self
                 .effort

@@ -91,6 +91,10 @@ pub struct AgentConfig {
     /// OpenAI-compatible models, where forced greedy decoding causes repetition
     /// collapse. See issue #2172.
     pub chat_temperature: Option<f32>,
+    /// Extra sampler params (e.g. `repeat_penalty`) flattened into the request
+    /// for OpenAI-compatible servers. `None` → nothing added (cloud unchanged).
+    /// The robust fix for local-model repetition collapse. See issue #2172.
+    pub chat_sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     /// Reasoning effort for thinking models. Flows into `ChatConfig::reasoning_effort`;
     /// providers translate it per model (no-op for models without a reasoning style).
     pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
@@ -205,6 +209,7 @@ impl Default for AgentConfig {
             ),
             chat_max_tokens: None,
             chat_temperature: None,
+            chat_sampling_params: None,
             reasoning_effort: None,
             suppress_auto_send_files: false,
             llm_first_token_grace: env_secs_or(

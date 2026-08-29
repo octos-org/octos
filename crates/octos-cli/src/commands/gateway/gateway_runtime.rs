@@ -1277,6 +1277,7 @@ impl GatewayRuntime {
             max_timeout: Some(std::time::Duration::from_secs(session_timeout_secs)),
             chat_max_tokens: gw_config.max_output_tokens,
             chat_temperature: gw_config.llm_temperature,
+            chat_sampling_params: gw_config.llm_sampling_params.clone(),
             reasoning_effort: gw_config.reasoning_effort,
             // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): config-driven
             // human-approval rules gate matching tool calls behind a

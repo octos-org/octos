@@ -632,9 +632,39 @@ impl OpenAIProvider {
             response_format,
             reasoning_effort,
             thinking,
+            // Flatten operator-supplied sampler params (e.g. repeat_penalty) into
+            // the request. Empty unless configured → no wire change for cloud.
+            extra_sampling: {
+                let mut extra = config.sampling_params.clone().unwrap_or_default();
+                // Defense-in-depth (#2172): drop keys octos already models with
+                // dedicated fields, so a misconfigured sampler param can't emit
+                // duplicate/divergent keys across the streaming (to_value,
+                // last-wins) and non-streaming (to_vec, duplicate) send paths.
+                for reserved in RESERVED_SAMPLING_KEYS {
+                    extra.remove(*reserved);
+                }
+                extra
+            },
         }
     }
 }
+
+/// Request keys octos sets via dedicated `OpenAIRequest` fields; if an operator
+/// puts one of these in `sampling_params` it is dropped (the dedicated field /
+/// knob wins) rather than emitted twice. See [`OpenAIProvider::build_request`].
+const RESERVED_SAMPLING_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "tools",
+    "response_format",
+    "reasoning_effort",
+    "thinking",
+    "stream",
+    "stream_options",
+];
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
@@ -875,6 +905,13 @@ struct OpenAIRequest<'a> {
     /// DeepSeek V4 thinking toggle (`{"type": "enabled"}`); other styles omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<serde_json::Value>,
+    /// Operator-supplied extra sampler params flattened into the request body
+    /// (`repeat_penalty`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, …) for
+    /// OpenAI-compatible servers (llama.cpp / vLLM / SGLang) — params octos does
+    /// not model. Empty by default, so it flattens to nothing and cloud requests
+    /// are unchanged. See `ChatConfig::sampling_params` / issue #2172.
+    #[serde(flatten)]
+    extra_sampling: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -1570,6 +1607,58 @@ mod tests {
         let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
         assert_eq!(v["reasoning_effort"], "high");
         assert_eq!(v["thinking"], serde_json::json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn build_request_flattens_sampling_params() {
+        // Operator-supplied sampler params (#2172) appear as top-level fields in
+        // the request body, so an OpenAI-compatible server receives e.g.
+        // repeat_penalty even though octos does not model it.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        sp.insert("top_p".to_string(), serde_json::json!(0.95));
+        let cfg = ChatConfig {
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["repeat_penalty"], serde_json::json!(1.1));
+        assert_eq!(v["top_p"], serde_json::json!(0.95));
+    }
+
+    #[test]
+    fn build_request_drops_reserved_keys_from_sampling_params() {
+        // Defense-in-depth (#2172): a modeled key put in sampling_params is
+        // dropped so it can't duplicate/override the dedicated field. The
+        // dedicated `temperature` (0.5, exactly representable) wins; the stray
+        // one (1.9) is gone. `repeat_penalty` (unmodeled) passes through.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("temperature".to_string(), serde_json::json!(1.9));
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        let cfg = ChatConfig {
+            temperature: Some(0.5),
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["temperature"], serde_json::json!(0.5));
+        assert_eq!(v["repeat_penalty"], serde_json::json!(1.1));
+    }
+
+    #[test]
+    fn build_request_omits_sampling_params_when_unset() {
+        // Cloud-safety: with no sampling_params, no extra keys are added — the
+        // request body is unchanged.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        assert!(v.get("repeat_penalty").is_none());
+        assert!(v.get("top_p").is_none());
     }
 
     #[test]

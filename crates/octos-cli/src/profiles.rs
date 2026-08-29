@@ -1502,6 +1502,10 @@ pub struct GatewaySettings {
     /// models, where forced greedy decoding causes repetition collapse. #2172.
     #[serde(default)]
     pub llm_temperature: Option<f32>,
+    /// Extra sampler params (e.g. `repeat_penalty`) flattened into the request
+    /// for OpenAI-compatible servers. `None` → nothing added. #2172.
+    #[serde(default)]
+    pub llm_sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     /// Per-profile watchdog override. `None` inherits the system monitor default.
     #[serde(default)]
     pub watchdog_enabled: Option<bool>,
@@ -2788,6 +2792,8 @@ pub(crate) fn config_from_profile(
             // octoscode sessions (which run via a profile), so a local model
             // can escape forced greedy decoding.
             llm_temperature: profile.config.gateway.llm_temperature,
+            // #2172: same for the sampler passthrough (repeat_penalty, …).
+            llm_sampling_params: profile.config.gateway.llm_sampling_params.clone(),
             ..Default::default()
         }),
         fallback_models,

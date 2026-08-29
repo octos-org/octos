@@ -6411,6 +6411,29 @@ fn build_chat_config_applies_temperature_override() {
 }
 
 #[test]
+fn build_chat_config_threads_sampling_params() {
+    // #2172: chat_sampling_params flows into ChatConfig.sampling_params; unset
+    // → None (cloud unchanged).
+    let mut sp = serde_json::Map::new();
+    sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+    let cfg = AgentConfig {
+        chat_sampling_params: Some(sp),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg);
+    assert_eq!(
+        chat.sampling_params
+            .as_ref()
+            .and_then(|m| m.get("repeat_penalty")),
+        Some(&serde_json::json!(1.1))
+    );
+    assert_eq!(
+        build_chat_config(&AgentConfig::default()).sampling_params,
+        None
+    );
+}
+
+#[test]
 fn build_chat_config_applies_max_tokens_override_independently() {
     // Overrides compose without clobbering each other.
     let cfg = AgentConfig {
