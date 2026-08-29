@@ -688,14 +688,10 @@ impl Agent {
         (limited, blocked_messages)
     }
 
-    /// Build a `ChatConfig` with optional `chat_max_tokens` override from `AgentConfig`.
+    /// Build a `ChatConfig` with optional `chat_max_tokens` / `chat_temperature`
+    /// overrides from `AgentConfig`. Delegates to [`build_chat_config`].
     fn chat_config(&self) -> ChatConfig {
-        let mut c = ChatConfig::default();
-        if let Some(max) = self.config.chat_max_tokens {
-            c.max_tokens = Some(max);
-        }
-        c.reasoning_effort = self.config.reasoning_effort;
-        c
+        build_chat_config(&self.config)
     }
 
     /// Decide what to surface when the loop detector fires.
@@ -3797,6 +3793,28 @@ fn shell_retry_limit_message(content: &str) -> String {
     format!(
         "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\n{latest_output}"
     )
+}
+
+/// Build a `ChatConfig` from an `AgentConfig`, applying the optional
+/// `chat_max_tokens` / `chat_temperature` overrides.
+///
+/// Extracted as a free function so the override semantics are unit-testable
+/// without constructing a full `Agent` — in particular the cloud-safety
+/// invariant (#2172): an unset `chat_temperature` must leave the built-in
+/// `0.0` default untouched, so cloud requests are byte-for-byte unchanged.
+fn build_chat_config(config: &crate::AgentConfig) -> ChatConfig {
+    let mut c = ChatConfig::default();
+    if let Some(max) = config.chat_max_tokens {
+        c.max_tokens = Some(max);
+    }
+    // Temperature override. Unset → keep the built-in default (0.0), so cloud
+    // requests are unchanged; set → override, primarily to avoid forced-greedy
+    // repetition collapse on local models.
+    if let Some(temp) = config.chat_temperature {
+        c.temperature = Some(temp);
+    }
+    c.reasoning_effort = config.reasoning_effort;
+    c
 }
 
 #[cfg(test)]

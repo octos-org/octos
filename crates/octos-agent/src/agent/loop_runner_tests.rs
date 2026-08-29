@@ -6383,3 +6383,42 @@ async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
         &tool_message.content[tool_message.content.len().saturating_sub(200)..]
     );
 }
+
+// --- build_chat_config: temperature/max_tokens override semantics (#2172) ---
+
+#[test]
+fn build_chat_config_keeps_default_temperature_when_unset() {
+    // Cloud-safety invariant: with no chat_temperature override, the chat
+    // temperature must remain the built-in ChatConfig default (0.0), so cloud
+    // requests are byte-for-byte unchanged.
+    let cfg = AgentConfig {
+        chat_temperature: None,
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg);
+    assert_eq!(chat.temperature, ChatConfig::default().temperature);
+    assert_eq!(chat.temperature, Some(0.0));
+}
+
+#[test]
+fn build_chat_config_applies_temperature_override() {
+    let cfg = AgentConfig {
+        chat_temperature: Some(0.7),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg);
+    assert_eq!(chat.temperature, Some(0.7));
+}
+
+#[test]
+fn build_chat_config_applies_max_tokens_override_independently() {
+    // Overrides compose without clobbering each other.
+    let cfg = AgentConfig {
+        chat_max_tokens: Some(4096),
+        chat_temperature: Some(0.5),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg);
+    assert_eq!(chat.max_tokens, Some(4096));
+    assert_eq!(chat.temperature, Some(0.5));
+}

@@ -1497,6 +1497,11 @@ pub struct GatewaySettings {
     /// Overrides the built-in default from model_limits.json.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Sampling temperature override for chat LLM calls. `None` keeps the
+    /// built-in default (`0.0`/greedy). Primarily for local / OpenAI-compatible
+    /// models, where forced greedy decoding causes repetition collapse. #2172.
+    #[serde(default)]
+    pub llm_temperature: Option<f32>,
     /// Per-profile watchdog override. `None` inherits the system monitor default.
     #[serde(default)]
     pub watchdog_enabled: Option<bool>,
@@ -2779,6 +2784,10 @@ pub(crate) fn config_from_profile(
             max_concurrent_sessions: profile.config.gateway.max_concurrent_sessions.unwrap_or(10),
             browser_timeout_secs: profile.config.gateway.browser_timeout_secs,
             max_output_tokens: profile.config.gateway.max_output_tokens,
+            // #2172: surface the profile's temperature override to serve /
+            // octoscode sessions (which run via a profile), so a local model
+            // can escape forced greedy decoding.
+            llm_temperature: profile.config.gateway.llm_temperature,
             ..Default::default()
         }),
         fallback_models,
