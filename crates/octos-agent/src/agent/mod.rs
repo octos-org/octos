@@ -89,6 +89,12 @@ pub struct AgentConfig {
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
+    /// Sampling temperature override. When set, overrides `ChatConfig::default()`
+    /// (which is `0.0`/greedy). When `None`, the default is used unchanged — so
+    /// cloud requests are byte-for-byte identical. Primarily for local /
+    /// OpenAI-compatible models, where forced greedy decoding causes repetition
+    /// collapse. See issue #2172.
+    pub chat_temperature: Option<f32>,
     /// Reasoning effort for thinking models. Flows into `ChatConfig::reasoning_effort`;
     /// providers translate it per model (no-op for models without a reasoning style).
     pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
@@ -202,6 +208,7 @@ impl Default for AgentConfig {
                 DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS,
             ),
             chat_max_tokens: None,
+            chat_temperature: None,
             reasoning_effort: None,
             suppress_auto_send_files: false,
             llm_first_token_grace: env_secs_or(

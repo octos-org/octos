@@ -273,6 +273,24 @@ pub struct ProfileConfig {
     /// Lifecycle hooks for agent events (per-profile).
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
+    /// #2168: per-profile tool-visibility policy (allow / deny / require_tags,
+    /// with `group:*` support). Projected into `Config.tool_policy`, which the
+    /// serve path already applies — it just had no way to be set from a
+    /// profile, so a serve / UserProfile session could not slim its roster the
+    /// way the built-in `coding` profile does (#2133). `None` = no filtering.
+    ///
+    /// NOTE on the mechanism: this goes through `ToolRegistry::apply_policy`
+    /// (deny-wins, then an allow-list `retain`), NOT the built-in profile's
+    /// `filter_by_profile`. The difference: `apply_policy` has NO `spawn_only`
+    /// carve-out (by design, so a `deny: ["run_pipeline"]` actually works). So
+    /// an `allow` list here also drops the per-session serve tools that are not
+    /// in it — `run_pipeline` (spawn_only), `message`, `send_file`,
+    /// `send_app_card`, `read_task_output`, `check_background_tasks`, `recall`,
+    /// `cron`. For a lean *coding* surface that is fine; for a general serve
+    /// profile prefer a **`deny`** list of the heavy web/research/media tools,
+    /// which keeps every coding + channel + task tool intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<octos_agent::ToolPolicy>,
     /// Human-approval rules for tool calls requiring a human decision
     /// (per-profile; see `docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1486,6 +1504,11 @@ pub struct GatewaySettings {
     /// Overrides the built-in default from model_limits.json.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Sampling temperature override for chat LLM calls. `None` keeps the
+    /// built-in default (`0.0`/greedy). Primarily for local / OpenAI-compatible
+    /// models, where forced greedy decoding causes repetition collapse. #2172.
+    #[serde(default)]
+    pub llm_temperature: Option<f32>,
     /// Per-profile watchdog override. `None` inherits the system monitor default.
     #[serde(default)]
     pub watchdog_enabled: Option<bool>,
@@ -2160,6 +2183,11 @@ pub(crate) fn merge_profile_defaults(
     if effective.cost_budget.is_none() {
         effective.cost_budget = defaults.cost_budget.clone();
     }
+    // #2168: tool_policy inherits like its sibling Option fields — the
+    // profile's own wins, else the operator default applies.
+    if effective.tool_policy.is_none() {
+        effective.tool_policy = defaults.tool_policy.clone();
+    }
 
     effective
 }
@@ -2370,6 +2398,10 @@ pub fn resolve_effective_profile(
     // Inherit email config if sub-account doesn't have its own
     if ec.email.is_none() {
         ec.email = pc.email.clone();
+    }
+    // #2168: inherit the parent's tool_policy when the sub-account has none.
+    if ec.tool_policy.is_none() {
+        ec.tool_policy = pc.tool_policy.clone();
     }
 
     // Merge env_vars: parent as base, sub-account overrides win
@@ -2759,6 +2791,10 @@ pub(crate) fn config_from_profile(
             max_concurrent_sessions: profile.config.gateway.max_concurrent_sessions.unwrap_or(10),
             browser_timeout_secs: profile.config.gateway.browser_timeout_secs,
             max_output_tokens: profile.config.gateway.max_output_tokens,
+            // #2172: surface the profile's temperature override to serve /
+            // octoscode sessions (which run via a profile), so a local model
+            // can escape forced greedy decoding.
+            llm_temperature: profile.config.gateway.llm_temperature,
             ..Default::default()
         }),
         fallback_models,
@@ -2774,7 +2810,9 @@ pub(crate) fn config_from_profile(
         // #1768: thread the profile's snapshot opt-in so serve sessions
         // honor it (parity with format_after_edit).
         snapshots: profile.config.snapshots.clone(),
-        tool_policy: None,
+        // #2168: carry the profile's tool policy so a serve / UserProfile
+        // session can slim its roster (the serve path already applies this).
+        tool_policy: profile.config.tool_policy.clone(),
         tool_policy_by_provider: Default::default(),
         embedding: None,
         memory: profile.config.memory.clone(),
@@ -3796,6 +3834,69 @@ mod tests {
             ..profile
         };
         assert!(!config_from_profile(&off, None, None).format_after_edit);
+    }
+
+    #[test]
+    fn config_from_profile_threads_tool_policy() {
+        // #2168: config_from_profile hardcoded `tool_policy: None`, so a serve /
+        // UserProfile session could never slim its tool roster (the lean #2133
+        // roster only reaches the built-in `coding` ProfileDefinition). A
+        // profile-level tool_policy must now reach the runtime Config, where the
+        // serve path already applies it.
+        let policy: octos_agent::ToolPolicy = serde_json::from_value(serde_json::json!({
+            "allow": ["read_file", "write_file", "group:runtime", "check", "update_plan"]
+        }))
+        .expect("valid tool policy");
+        let profile = UserProfile {
+            id: "lean-serve".into(),
+            name: "Lean Serve".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                tool_policy: Some(policy.clone()),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(
+            config_from_profile(&profile, None, None).tool_policy,
+            Some(policy),
+            "a profile tool_policy must reach the runtime config (serve applies it)"
+        );
+        // A profile without one stays None (no filtering) — unchanged behavior.
+        let off = UserProfile {
+            config: ProfileConfig::default(),
+            ..profile
+        };
+        assert_eq!(config_from_profile(&off, None, None).tool_policy, None);
+    }
+
+    #[test]
+    fn tool_policy_inherits_from_defaults_but_own_wins() {
+        // #2168 review (item 4): tool_policy inherits like its sibling Option
+        // fields — an operator profile-default applies when the profile has
+        // none, and the profile's own always wins.
+        let default_policy: octos_agent::ToolPolicy =
+            serde_json::from_value(serde_json::json!({ "deny": ["group:web"] })).unwrap();
+        let own_policy: octos_agent::ToolPolicy =
+            serde_json::from_value(serde_json::json!({ "allow": ["read_file"] })).unwrap();
+        let defaults = ProfileConfig {
+            tool_policy: Some(default_policy.clone()),
+            ..Default::default()
+        };
+        // No own policy -> inherits the default.
+        let inherited = merge_profile_defaults(&ProfileConfig::default(), &defaults);
+        assert_eq!(inherited.tool_policy, Some(default_policy));
+        // Own policy set -> the profile wins.
+        let with_own = ProfileConfig {
+            tool_policy: Some(own_policy.clone()),
+            ..Default::default()
+        };
+        let merged = merge_profile_defaults(&with_own, &defaults);
+        assert_eq!(merged.tool_policy, Some(own_policy));
     }
 
     #[test]

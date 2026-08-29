@@ -1779,6 +1779,7 @@ impl ChatCommand {
             // `--no-session-persistence` (claude parity): skip the episode write.
             save_episodes: !self.no_session_persistence,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
+            chat_temperature: config.gateway.as_ref().and_then(|g| g.llm_temperature),
             // `--effort` (claude/codex parity) overrides `gateway.reasoning_effort`.
             reasoning_effort: self
                 .effort
