@@ -18424,6 +18424,67 @@ fn runtime_unavailable_errors_are_typed_for_protocol_clients() {
 }
 
 #[test]
+fn held_data_dir_lock_yields_a_clear_actionable_error() {
+    // A `session/open` bootstrap that fails because another octos process
+    // already owns the profile's redb must be recognized structurally
+    // (through the eyre wrap chain that `ProfileRuntime::bootstrap` adds) and
+    // rendered with both remedies. Previously this reached the client as
+    // "failed to bootstrap ProfileRuntime for profile 'alan': failed to open
+    // episode store for profile 'alan'" — the cause, the path, and every hint
+    // about what to do were dropped by the `{error}` (non-alternate) format.
+    let report = eyre::Report::new(octos_memory::EpisodeStoreLocked {
+        path: std::path::PathBuf::from("/Users/dev/.octos/profiles/alan/data/episodes.redb"),
+    })
+    .wrap_err("failed to open episode store for profile 'alan'");
+    assert!(
+        octos_memory::is_episode_store_locked(&report),
+        "lock contention must be detected through the eyre wrap chain"
+    );
+
+    let error = data_dir_locked_error("alan", &report);
+    assert_eq!(
+        error.code,
+        octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
+    );
+    assert_eq!(
+        error.data.as_ref().and_then(|d| d.get("kind")),
+        Some(&json!("data_dir_locked")),
+        "clients branch on `kind`; this must not be the generic runtime_unavailable"
+    );
+    let message = error
+        .data
+        .as_ref()
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("alan"),
+        "message must name the profile: {message}"
+    );
+    assert!(
+        message.contains("--instance-data-dir"),
+        "message must offer the private-storage remedy: {message}"
+    );
+    assert!(
+        message.contains("episodes.redb"),
+        "message must carry the underlying cause, including the contended path: {message}"
+    );
+}
+
+#[test]
+fn non_lock_bootstrap_error_is_not_misclassified_as_data_dir_locked() {
+    // Guards the detector against over-matching: a missing provider is not a
+    // lock problem and has no `--instance-data-dir` remedy, so it must keep
+    // falling through to the generic `runtime_unavailable` kind.
+    let report = eyre::eyre!("No LLM provider configured")
+        .wrap_err("failed to bootstrap ProfileRuntime for profile 'alan'");
+    assert!(
+        !octos_memory::is_episode_store_locked(&report),
+        "an unrelated bootstrap failure must not be reported as lock contention"
+    );
+}
+
+#[test]
 fn permission_denied_workspace_yields_a_clear_actionable_error() {
     // A session/open bootstrap failure caused by a non-writable workspace
     // folder must be recognized structurally (through the eyre wrap chain)
@@ -29847,6 +29908,68 @@ fn oversized_frame_with_multibyte_and_control_bytes_is_boundary_safe_and_under_c
     assert!(text.starts_with('情'));
 }
 
+/// 2c performance regression (黑板第 2 条): a multi-MB hydrate-shaped
+/// payload (1000 large messages, the shape that took ~10s through the old
+/// O(payload × rounds) loop) must be previewed in well under a second and
+/// come out ≤ cap with the truncation marker present.
+#[test]
+fn preview_oversized_frame_multi_mb_hydrate_shape_is_single_pass_fast() {
+    // Hydrate reply shape: an array of message objects with large text.
+    let messages: Vec<Value> = (0..1000)
+        .map(|i| {
+            json!({
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "text": format!("msg-{i}-{}", "m".repeat(5 * 1024)),
+            })
+        })
+        .collect();
+    let value = json!({
+        "jsonrpc": "2.0",
+        "id": "hydrate-1",
+        "result": {
+            "session_id": "local:perf",
+            "messages": messages,
+        }
+    });
+    let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+    assert!(
+        frame.len() > 4 * 1024 * 1024,
+        "fixture must be multi-MB, got {}",
+        frame.len()
+    );
+
+    let start = std::time::Instant::now();
+    let out = preview_oversized_frame(frame);
+    let elapsed = start.elapsed();
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "output must fit the cap, got {}",
+        out.len()
+    );
+    let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+    // The marker must survive somewhere in the shrunk message list —
+    // depending on how much had to be cut, the structural fallback may have
+    // dropped leading elements, so scan all surviving messages.
+    let any_marker = parsed["result"]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .any(|m| {
+            m["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("bytes truncated"))
+        });
+    assert!(any_marker, "truncation marker must be present");
+    // Generous CI bound: the old loop needed ~10s on this shape; single
+    // pass is O(payload). 2s even on slow debug CI is >10x margin over the
+    // 200ms release requirement in the contract.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "single-pass preview took {elapsed:?} — regression toward the O(n²) loop"
+    );
+}
+
 #[test]
 fn oversized_frame_with_multiple_large_fields_iterates_until_under_cap() {
     // Two fields each ~0.7 MiB: neither alone exceeds the cap, but the
@@ -31894,6 +32017,29 @@ fn stage_peer_dir_with(peers_root: &std::path::Path, slug: &str) -> std::path::P
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("brief.md"), "brief").unwrap();
     dir
+}
+
+/// Contract scenario "peer 交付追加结构化事件且带 model_lane": when a
+/// goal-scoped peer (no explicit lane) records a finding, events.jsonl
+/// gains a kind=finding_recorded line with model_lane = "primary".
+#[test]
+fn olp_obs_finding_appends_event_with_lane() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path();
+    let peers_root = data_dir.join("peers");
+    stage_peer_dir_with(&peers_root, "edison"); // no `model` leaf -> default lane
+    emit_finding_recorded_event(data_dir, "goal_05", "edison", "writer is innocent");
+    let lines: Vec<Value> = std::fs::read_to_string(data_dir.join("events.jsonl"))
+        .expect("events.jsonl written")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON line"))
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["kind"], "finding_recorded");
+    assert_eq!(lines[0]["goal_id"], "goal_05");
+    assert_eq!(lines[0]["slug"], "edison");
+    assert_eq!(lines[0]["model_lane"], "primary");
+    assert_eq!(lines[0]["detail"], "writer is innocent");
 }
 
 /// A minimal profile config carrying ONE model lane (`key`) whose credential
@@ -35479,4 +35625,352 @@ fn should_report_zero_cache_reads_explicitly_on_a_cold_session() {
     let usage = usage_status_json(&totals);
     assert_eq!(usage["cached_input_tokens"], 0);
     assert!(usage.get("cached_input_tokens").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// #2065 — UI-protocol goal-frame substrate: per-scope generation identities
+// for the #1959 send guard, goal-frame capability gating on the shared
+// filter, and live-forwarder lifecycle hardening (cooperative cancellable
+// stdio sends + retire-before-baseline handover).
+//
+// CI: these run under the `goal_scope_guard` / `session_open_goal` name
+// filters in .github/workflows/ci.yml (test-octos-cli job) — the `api`-gated
+// module is invisible to the unfeatured lib/integration steps (#2029).
+// ---------------------------------------------------------------------------
+
+/// #2065 — the scoped-generation registry, asserted at the send guard.
+///
+/// Two cwd scopes can share ONE wire session id (`appui.sessions_in_cwd`:
+/// the same session key opened from two folders). The #1959 guard is
+/// strictly monotonic per key, so while it was keyed by the WIRE id the two
+/// scopes shared a watermark — and a goal frame's generation is allocated
+/// when it is BUILT, not when it is delivered. Folder B builds a repaint
+/// (generation G_b), folder A then clears its own goal (generation
+/// G_a > G_b) and A's clear is delivered first: the shared watermark jumps
+/// to G_a, and B's still-in-flight repaint is dropped as "stale" even
+/// though it describes a different folder's live goal. B's chip silently
+/// stops updating.
+///
+/// This is the pre-existing defect the registry fixes; the test FAILS on
+/// main (wire-keyed watermark) and passes with per-scope identities.
+#[test]
+fn goal_scope_guard_admits_sibling_scope_repaint_after_other_scope_clear() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let orchestrator = default_agent_orchestrator();
+    // ONE wire session id, opened from two folders.
+    let wire = SessionKey("local:goal-scope-guard".into());
+
+    // Folder B: register its scope, bind a goal, and BUILD its repaint.
+    orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "folder B's live goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind folder B's goal");
+    let scoped_b = orchestrator.scoped_goal_key(&wire);
+    let b_repaint_json = orchestrator
+        .session_goal_updated_event_json(&scoped_b, MAIN_PROFILE_ID)
+        .expect("folder B has a live goal to repaint");
+    let b_repaint: octos_core::ui_protocol::SessionGoalUpdatedEvent =
+        serde_json::from_value(b_repaint_json).expect("updated event");
+
+    // Folder A: register its scope, bind and CLEAR its own goal. The clear
+    // allocates a LATER generation than B's already-built repaint.
+    orchestrator.set_goal_scope(&wire, Some("aaaa1111".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "folder A's goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind folder A's goal");
+    let a_clear_json = orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("clear folder A's goal");
+    let a_clear: octos_core::ui_protocol::SessionGoalClearedEvent =
+        serde_json::from_value(a_clear_json).expect("cleared event");
+
+    // Cleanup the process-global store BEFORE asserting.
+    orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+    let _ = orchestrator.clear_goal(GoalSessionRequest {
+        session_id: wire.clone(),
+        profile_id: MAIN_PROFILE_ID.to_owned(),
+    });
+    let _ = orchestrator.set_goal_scope(&wire, None);
+
+    assert!(
+        a_clear.generation > b_repaint.generation,
+        "the hazard needs A's clear allocated AFTER B's repaint was built \
+         ({} vs {})",
+        a_clear.generation,
+        b_repaint.generation
+    );
+    // Both frames carry the same WIRE session id — the shared key that made
+    // them collide.
+    assert_eq!(a_clear.session_id, b_repaint.session_id);
+
+    // Delivery order: A's clear reaches the guard first, then B's repaint.
+    assert!(
+        goal_event_passes_generation_guard(&UiNotification::SessionGoalCleared(a_clear)),
+        "folder A's clear is admitted"
+    );
+    assert!(
+        goal_event_passes_generation_guard(&UiNotification::SessionGoalUpdated(b_repaint)),
+        "folder B's repaint must still be admitted: it belongs to a DIFFERENT \
+         cwd scope, so folder A's later-allocated clear must not advance the \
+         watermark it is checked against"
+    );
+}
+
+/// A minimal valid frame used to occupy a capacity-1 writer queue.
+fn plug_frame() -> WsMessage {
+    frame_for(&json!({"jsonrpc": "2.0", "method": "test/plug"})).expect("plug frame")
+}
+
+/// #2065 — capability gating on the shared filter: a connection that did
+/// not negotiate `coding.goal_runtime.v1` (the same capability the goal RPC
+/// surface requires) must receive ZERO `session/goal/*` frames through the
+/// full open sequence — replay and live pump alike. Without the gate such a
+/// client received frames it can only report as unknown notifications.
+#[tokio::test]
+async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-capability".into());
+    // Seed the REPLAY lane with a durable goal frame from another connection.
+    ledger.append_notification_from(
+        UiNotification::SessionGoalUpdated(octos_core::ui_protocol::SessionGoalUpdatedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            goal: octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                goal_id: "goal-replayed".into(),
+                objective: "durable goal history".into(),
+                status: "active".into(),
+                token_budget: 1_000,
+                tokens_used: 1,
+                time_used_seconds: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            transition_actor: "backend".into(),
+            generation: 0,
+        }),
+        ConnectionId::next(),
+    );
+
+    let features = ConnectionUiFeatures {
+        coding_goal_runtime_v1: false,
+        ..ConnectionUiFeatures::stdio_defaults()
+    };
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        None,
+        // #2067 — the open-path delivery filter pin; no connection-level pin
+        // in this test, so filtering is per-profile-scope only.
+        None,
+        features,
+        "open-no-goal-runtime".into(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "session/open must succeed");
+    // Feed the LIVE PUMP lane too, from another connection.
+    ledger.append_notification_from(
+        UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            cleared: true,
+            goal: None,
+            transition_actor: "user".into(),
+            generation: 0,
+        }),
+        ConnectionId::next(),
+    );
+    // Collect the full open sequence plus a quiet window of live pumping.
+    let mut goal_frames = Vec::new();
+    let quiet = tokio::time::Duration::from_millis(700);
+    while let Ok(frame) = tokio::time::timeout(quiet, recv_rpc_json(&mut rx)).await {
+        if let Some(method) = frame["method"].as_str() {
+            if method.starts_with("session/goal/") {
+                goal_frames.push(frame.clone());
+            }
+        }
+    }
+    abort_live_forwarders(&forwarders, &ledger).await;
+    assert!(
+        goal_frames.is_empty(),
+        "a connection without coding.goal_runtime.v1 must see zero goal frames: {goal_frames:?}"
+    );
+}
+
+/// #2065 — a re-open must fully
+/// retire the previous live forwarder BEFORE the replacement starts pumping,
+/// so "one live lane per (connection, session)" holds across reopens and an
+/// event is never double-delivered by two overlapping pumps. (The
+/// production open path retires even earlier — before the replay baseline
+/// is computed — this pins the in-spawn defense direct callers rely on.
+/// Handover semantics are at-least-once, not exactly-once: see the
+/// retire-before-baseline comment in `handle_session_open`.)
+#[tokio::test]
+async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-lane-handover".into());
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let first_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        None,
+        first_rx,
+        forwarders.clone(),
+    )
+    .await;
+
+    // Re-open on the SAME connection and session.
+    let second_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        None,
+        second_rx,
+        forwarders.clone(),
+    )
+    .await;
+
+    // An event appended after the handover must arrive exactly once.
+    ledger.append_notification_from(
+        UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "exactly once".into(),
+        }),
+        ConnectionId::next(),
+    );
+    let delivered =
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), recv_rpc_json(&mut rx))
+            .await
+            .expect("the replacement forwarder delivers the live event");
+    assert_eq!(delivered["method"], json!("message/delta"));
+    let duplicate = tokio::time::timeout(
+        tokio::time::Duration::from_millis(400),
+        recv_rpc_json(&mut rx),
+    )
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "the retired forwarder must not double-deliver: {duplicate:?}"
+    );
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2065 (absence-by-construction) — through `WsConnection::new_stdio`:
+/// the stdio durable lane parks
+/// COOPERATIVELY (non-blocking `try_send` probe + async sleep, see
+/// `send_durable_offloaded`), so a forwarder parked on a FULL stdio queue is
+/// fully retired by abort+join — cancellation lands at the probe's await and
+/// the enqueue is atomic. There is no `spawn_blocking(SyncSender::send)`
+/// closure anymore, so no detached in-flight hop can enqueue a stale frame
+/// AFTER the lane was retired.
+#[tokio::test]
+async fn session_open_goal_stdio_lane_retire_leaves_no_inflight_send() {
+    let (writer, frames) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    // Fill the single stdio slot BEFORE the pump runs: its send must park.
+    writer.try_send(plug_frame()).expect("plug the stdio queue");
+    let ws = WsConnection::new_stdio(writer);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-stdio-retire".into());
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let live_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        None,
+        live_rx,
+        forwarders.clone(),
+    )
+    .await;
+    // A live event reaches the pump; its stdio enqueue parks on the full
+    // queue (cooperative probe loop, never a blocking SyncSender::send).
+    ledger.append_notification_from(
+        UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "parked in flight".into(),
+        }),
+        ConnectionId::next(),
+    );
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Retire the lane: abort + join. The join is the proof point — after it
+    // returns there is nothing left that could still enqueue.
+    let lane = forwarders
+        .lock()
+        .await
+        .remove(&session_id)
+        .expect("live lane registered");
+    lane.abort();
+    let _ = lane.await;
+
+    // Drain the plug, then nothing else may EVER arrive: the parked frame
+    // died with the lane (its enqueue was atomic and never happened), and
+    // no detached closure exists to deliver it later.
+    let plug = frames.try_recv().expect("plug frame still queued");
+    drop(plug);
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    assert!(
+        frames.try_recv().is_err(),
+        "no in-flight send may survive lane retirement"
+    );
 }

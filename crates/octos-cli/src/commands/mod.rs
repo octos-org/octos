@@ -13,16 +13,22 @@ mod cron;
 mod docs;
 mod doctor;
 pub mod gateway;
+mod goal;
+mod inbox;
 mod init;
+mod ledger;
 pub mod mcp;
 pub mod mcp_serve;
 mod memory;
+pub(crate) mod obs_resolve;
 mod office;
+mod peer;
 mod profile;
 #[cfg(feature = "api")]
 mod serve;
 pub mod skills;
 mod status;
+mod steer;
 mod update;
 
 use std::path::PathBuf;
@@ -49,16 +55,22 @@ pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
+pub use goal::GoalCommand;
+pub use inbox::InboxCommand;
 pub use init::InitCommand;
+pub use ledger::LedgerCommand;
 pub use mcp::McpCommand;
 pub use mcp_serve::McpServeCommand;
 pub use memory::MemoryCommand;
+pub(crate) use obs_resolve as obs;
 pub use office::OfficeCommand;
+pub use peer::PeerCommand;
 pub use profile::ProfileCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
 pub use status::StatusCommand;
+pub use steer::SteerCommand;
 pub use update::UpdateCommand;
 
 /// octos: Rust-native coding agent orchestration.
@@ -117,6 +129,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Query inbox notes file paths (read-only; OLP observability).
+    Inbox(InboxCommand),
     /// Manage OAuth-authenticated MCP servers (`login`/`logout`).
     Mcp(McpCommand),
     /// Inspect and drive the memory-refresh pipeline.
@@ -132,16 +146,24 @@ pub enum Command {
     Skills(SkillsCommand),
     /// Show system status.
     Status(StatusCommand),
+    /// Queue an external-reviewer steer into a session (OLP control).
+    Steer(SteerCommand),
     /// Check for a newer octos release (`--check`); self-update is Stage 3.
     Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
     Gateway(GatewayCommand),
+    /// Read-only goal status (direct ledger read; OLP observability).
+    Goal(GoalCommand),
+    /// Read-only goal-ledger tail (findings/escalations/decisions; OLP).
+    Ledger(LedgerCommand),
     /// Clean up stale state and cache files.
     Clean(CleanCommand),
     /// Generate shell completions.
     Completions(CompletionsCommand),
     /// Office file manipulation (extract, unpack, pack, clean, add-slide, validate).
     Office(OfficeCommand),
+    /// Read-only peer listing (direct peers/ dir read; OLP observability).
+    Peer(PeerCommand),
 }
 
 /// Whether `command` emits machine-readable output on stdout and therefore
@@ -163,6 +185,8 @@ pub enum Command {
 pub fn reserve_stdout(command: &Command) -> bool {
     match command {
         Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) => true,
+        // `inbox path` prints a single path meant for $(...) capture.
+        Command::Inbox(_) => true,
         Command::Chat(cmd) => cmd.json,
         Command::Doctor(cmd) => cmd.json,
         _ => false,
@@ -360,6 +384,7 @@ impl Executable for Command {
             Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::Inbox(cmd) => cmd.execute(),
             Self::Mcp(cmd) => cmd.execute(),
             Self::Profile(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),
@@ -367,12 +392,16 @@ impl Executable for Command {
             Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),
             Self::Status(cmd) => cmd.execute(),
+            Self::Steer(cmd) => cmd.execute(),
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
+            Self::Goal(cmd) => cmd.execute(),
+            Self::Ledger(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
             Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
+            Self::Peer(cmd) => cmd.execute(),
         }
     }
 }

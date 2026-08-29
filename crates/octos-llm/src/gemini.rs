@@ -78,6 +78,10 @@ enum GeminiAuth {
 /// Google Gemini provider.
 pub struct GeminiProvider {
     client: Client,
+    /// Separate client for streaming requests, built without a total request
+    /// timeout so a healthy long generation is never cut off mid-stream. See
+    /// [`crate::provider::build_streaming_http_client`].
+    stream_client: Client,
     auth: GeminiAuth,
     model: String,
     base_url: String,
@@ -89,6 +93,9 @@ impl GeminiProvider {
         Self {
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
+            stream_client: crate::provider::build_streaming_http_client(
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
             ),
             auth: GeminiAuth::ApiKey(SecretString::from(api_key.into())),
@@ -107,6 +114,9 @@ impl GeminiProvider {
         Self {
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
+            stream_client: crate::provider::build_streaming_http_client(
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
             ),
             auth: GeminiAuth::Vertex {
@@ -164,8 +174,14 @@ impl GeminiProvider {
     }
 
     /// Replace the HTTP client with one using custom timeouts (in seconds).
+    ///
+    /// `timeout_secs` is the **total** request timeout for non-streaming
+    /// requests. The streaming client is rebuilt only with the connect timeout —
+    /// it never takes a total timeout, so a long streamed generation is not
+    /// capped regardless of this value.
     pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
+        self.stream_client = crate::provider::build_streaming_http_client(connect_timeout_secs);
         self
     }
 
@@ -295,8 +311,11 @@ impl LlmProvider for GeminiProvider {
 
         let url = self.build_url(true);
 
+        // Stream client: no total timeout, so a long healthy generation is not
+        // cut off. Stalls are bounded by the client's per-read timeout and the
+        // agent's stream-timeout guards (see build_streaming_http_client).
         let req = self
-            .client
+            .stream_client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&request);

@@ -297,6 +297,24 @@ pub(crate) const PEER_AWAITING_INPUT_EXTERNAL_KIND: &str = "peer_awaiting_input"
 /// finding WITHOUT waiting for the next scheduled goal turn).
 pub(crate) const GOAL_PROGRESS_EXTERNAL_KIND: &str = "goal_progress";
 
+/// OLP-CTRL — kind label for the `External(_)` continuation an
+/// `octos steer` enqueues to wake the steered session (same doorbell +
+/// scheduling mechanism as the goal-progress wake).
+pub(crate) const STEER_EXTERNAL_KIND: &str = "steer";
+
+/// OLP-CTRL — metadata key carrying the steer text on a steer
+/// continuation, so the continuation turn's user message IS the steer
+/// (回合 3 整改: standalone user message body, never a prompt appendix).
+pub(crate) const STEER_META_TEXT: &str = "steer_text";
+
+/// OLP-CTRL #8c — the steer line's enqueue timestamp (unix secs string),
+/// carried so the steer_consumed receipt names WHEN it was queued.
+pub(crate) const STEER_META_ENQUEUED_TS: &str = "steer_enqueued_ts";
+
+/// OLP-CTRL #8c — the content hash of (session, ts, text) that gives each
+/// steer line its exactly-once identity (dedupe key + receipt join).
+pub(crate) const STEER_META_LINE_HASH: &str = "steer_line_hash";
+
 /// #1977 Monitor WAKE — kind label for the `External(_)` master continuation a
 /// [`crate::autonomy::monitor_runtime`] watcher enqueues when its filtered probe
 /// output changes (poll) or a stream batch lands. Rides the SAME hardened
@@ -1497,7 +1515,20 @@ impl InProcessAgentOrchestrator {
     /// `ledger.set_session_scope` so the goal store and the ledger agree on
     /// each session's cwd scope. Mirrors
     /// [`UiProtocolLedger::set_session_scope`].
-    pub(crate) fn set_goal_scope(&self, session_id: &SessionKey, scope: Option<String>) {
+    /// Returns the goal-store key this registration establishes for
+    /// `session_id`, computed INSIDE the same `goal_scopes` lock acquisition
+    /// (#2065): registration and capture used to be two
+    /// separate lock acquisitions (`set_goal_scope` then `scoped_goal_key`),
+    /// a TOCTOU on a multi-thread runtime — a concurrent same-wire open
+    /// could flip the last-writer-wins map between them and the caller
+    /// would pin the OTHER open's key. A caller that pins the RETURNED key
+    /// cannot observe an interleaved flip; the race is unrepresentable at
+    /// this capture site.
+    pub(crate) fn set_goal_scope(
+        &self,
+        session_id: &SessionKey,
+        scope: Option<String>,
+    ) -> SessionKey {
         // #1973 fix-round 4b — GC snapshot: the scoped-goal keys currently in
         // the store, taken (and the state lock RELEASED) BEFORE the
         // goal_scopes lock — the two locks must never nest in that order
@@ -1508,6 +1539,12 @@ impl InProcessAgentOrchestrator {
             .goal_scopes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Same injective encoding as `scoped_goal_key`, evaluated under THIS
+        // lock so it reflects exactly the registration below.
+        let registered_key = match scope.as_deref() {
+            Some(scope) => SessionKey(format!("{}\u{0}~cwd-{scope}", session_id.0)),
+            None => session_id.clone(),
+        };
         let changed = match scope {
             Some(scope) => {
                 self.mark_scope_wire_live(session_id);
@@ -1522,6 +1559,7 @@ impl InProcessAgentOrchestrator {
         if changed {
             self.persist_goal_scopes_locked(&scopes, Some(&gc_live_goal_keys));
         }
+        registered_key
     }
 
     /// PR 4b — register `scope` for `session_id` ONLY when no scope is registered
@@ -2149,6 +2187,30 @@ impl InProcessAgentOrchestrator {
             .get(&upsert.agent_id)
             .map(|agent| agent.status.clone());
         let (agent, payload, transitioned_terminal) = {
+            // Refs #2102 (Gap 3): live spawn admission. A NEW agent record
+            // entering an ALREADY-JOINED group bumps the join epoch BEFORE
+            // the entry is created, under the same state lock — the crash
+            // window is empty and the bump is single-writer.
+            let existing = state.agents.contains_key(&upsert.agent_id);
+            if !existing {
+                let group = format!(
+                    "agent-group:{}:{}:{}",
+                    upsert.profile_id,
+                    upsert.session_id,
+                    upsert.parent_agent_id.as_deref().unwrap_or("master")
+                );
+                let already_joined = state
+                    .scatter_join_state
+                    .get(&group)
+                    .is_some_and(|s| s.last_joined_key.is_some());
+                if already_joined {
+                    state
+                        .scatter_join_state
+                        .entry(group)
+                        .or_default()
+                        .join_epoch += 1;
+                }
+            }
             let entry = state
                 .agents
                 .entry(upsert.agent_id.clone())
@@ -3801,7 +3863,9 @@ impl InProcessAgentOrchestrator {
         }
         // #1959 (codex #1) — stamp the generation like every other goal-event
         // producer so the send guard can order this token-charge update.
-        let generation = next_goal_event_generation(&mut state);
+        // #2065: watermark identity = the scoped key this charge mutated
+        // under (per-scope guard streams).
+        let generation = next_goal_event_generation(&mut state, &key);
         // #1966 — the event carries the WIRE key: clients key goal chips by
         // the wire session id, never the internal scoped storage form.
         Some(json!({
@@ -4142,6 +4206,194 @@ impl InProcessAgentOrchestrator {
         ));
         let mut state = self.state();
         state.continuations.enqueue(request)
+    }
+
+    /// OLP-CTRL 首航第二回合 整改 (cross-process steer wake): the drain
+    /// loop calls this every tick with the instance data dir. For every
+    /// unconsumed `inbox/*.reviewer-notes` sidecar whose companion
+    /// `<hash>.reviewer-session` marker names a session, enqueue an
+    /// `External("steer")` continuation so the steered session is
+    /// scheduled — the CLI only ever WRITES files (its in-process
+    /// continuation enqueue never reaches a running serve), so this sweep
+    /// is what makes the cross-process wake real. Idempotent: the dedupe
+    /// key pins the notes file's (session, mtime), so an already-queued
+    /// batch is not re-enqueued every tick, and a NEW append (mtime
+    /// bumps) re-arms exactly once. The notes file itself is consumed
+    /// (read+cleared) by the turn-start injection, which also removes the
+    /// marker — so a consumed batch stops matching here.
+    pub(crate) fn steer_inbox_sweep(&self, data_dir: &std::path::Path, profile_id: &str) {
+        let inbox = data_dir.join("inbox");
+        let entries = match std::fs::read_dir(&inbox) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // 回合 4 整改: a failed inbox read MUST be loud — a
+                // silent return here was the r4 5-minute blind spot.
+                tracing::warn!(
+                    ?error,
+                    inbox = %inbox.display(),
+                    "steer inbox sweep: failed to read inbox dir"
+                );
+                return;
+            }
+        };
+        let mut sidecars = 0usize;
+        let mut enqueued = 0usize;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".reviewer-notes") {
+                continue;
+            }
+            sidecars += 1;
+            let notes_path = entry.path();
+            let marker_path = notes_path.with_extension("reviewer-session");
+            let Ok(session_id) = std::fs::read_to_string(&marker_path) else {
+                continue; // legacy steer without a marker: no way to address it
+            };
+            let session_id = session_id.trim();
+            if session_id.is_empty() {
+                continue;
+            }
+            // Skip empty files (already drained but not yet unlinked).
+            let is_nonempty = std::fs::metadata(&notes_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            if !is_nonempty {
+                continue;
+            }
+            // #8c ② — exactly-once delivery: enqueue ONE continuation PER
+            // STEER LINE (not one per file), deduped by a content hash of
+            // (session, enqueued_ts, text). The mtime-keyed per-file
+            // dedupe both SWALLOWED a same-millisecond second append and
+            // RE-EXECUTED stale lines on a later append (the file's full
+            // text rode every continuation). Per-line enqueue with a
+            // content hash gives each steer its own exactly-once identity.
+            let body = std::fs::read_to_string(&notes_path).unwrap_or_default();
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (ts_str, text) = match line.split_once(' ') {
+                    Some((ts, text)) => (ts, text),
+                    None => ("0", line),
+                };
+                let steer_text = text.to_owned();
+                // Content hash over the full line identity (ts + text):
+                // two appends of the same text at different times are two
+                // steers; the SAME line re-swept (file unchanged) hashes
+                // identically and dedupes.
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                session_id.hash(&mut hasher);
+                ts_str.hash(&mut hasher);
+                steer_text.hash(&mut hasher);
+                let content_hash = format!("{:016x}", hasher.finish());
+                let request = MasterContinuationRequest::new(
+                    PEER_AWAITING_INPUT_GROUP,
+                    session_id.to_owned(),
+                    profile_id.to_owned(),
+                    MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
+                    SystemTime::now(),
+                )
+                .with_metadata(STEER_META_TEXT.to_owned(), steer_text)
+                .with_metadata(STEER_META_ENQUEUED_TS.to_owned(), ts_str.to_owned())
+                .with_metadata(STEER_META_LINE_HASH.to_owned(), content_hash.clone())
+                .with_dedupe_key(format!("steer-line:{session_id}:{content_hash}"));
+                let mut state = self.state();
+                if matches!(
+                    state.continuations.enqueue(request),
+                    MasterContinuationEnqueueOutcome::Queued(_)
+                ) {
+                    enqueued += 1;
+                }
+            }
+        }
+        // 回合 4 整改: sweep MUST leave a trace — a throttled (once per
+        // minute) line even for 0 sidecars, so a silent drift between the
+        // CLI's inbox root and this sweep's root can never again hide for
+        // minutes. Cheap: a process-global last-log timestamp.
+        {
+            use std::sync::atomic::{AtomicI64, Ordering};
+            static LAST_LOG_MS: AtomicI64 = AtomicI64::new(0);
+            let now = now_ms();
+            let last = LAST_LOG_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60_000 {
+                LAST_LOG_MS.store(now, Ordering::Relaxed);
+                tracing::info!(
+                    inbox = %inbox.display(),
+                    sidecars,
+                    enqueued,
+                    "steer inbox sweep tick"
+                );
+            } else if enqueued > 0 {
+                tracing::info!(
+                    sidecars,
+                    enqueued,
+                    "steer inbox sweep enqueued continuation(s)"
+                );
+            }
+        }
+    }
+
+    /// OLP-CTRL (slice 2): wake a steered session. Enqueues an
+    /// `External("steer")` continuation for the target session — the SAME
+    /// mechanism `enqueue_goal_progress_continuation` uses, so a steered
+    /// idle master is scheduled exactly like a goal-progress wake. The
+    /// steer text itself is NOT carried here (it lives in the
+    /// `.reviewer-notes` sidecar the prompt renderer injects); this is
+    /// purely the doorbell + scheduling trigger.
+    pub(crate) fn enqueue_steer_continuation(
+        &self,
+        target_session: &SessionKey,
+        profile_id: &str,
+    ) -> MasterContinuationEnqueueOutcome {
+        let request = MasterContinuationRequest::new(
+            PEER_AWAITING_INPUT_GROUP,
+            target_session.to_string(),
+            profile_id.to_owned(),
+            MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_dedupe_key(format!("steer:{}", target_session));
+        let mut state = self.state();
+        state.continuations.enqueue(request)
+    }
+
+    /// Probe for tests: is an `External("steer")` continuation queued for
+    /// `session` under `profile_id`?
+    #[cfg(test)]
+    pub(crate) fn has_pending_steer_continuation_for_test(
+        &self,
+        session: &SessionKey,
+        profile_id: &str,
+    ) -> bool {
+        self.state().continuations.pending_items().any(|item| {
+            matches!(&item.reason, MasterContinuationReason::External(kind)
+                if kind == STEER_EXTERNAL_KIND)
+                && item.session_id.as_str() == session.0.as_str()
+                && item.profile_id.as_str() == profile_id
+        })
+    }
+
+    /// Probe for tests: count pending `External("steer")` continuations
+    /// for `session` (any dedupe key — the direct wake AND the
+    /// file-sweep's mtime-pinned key).
+    #[cfg(test)]
+    pub(crate) fn pending_steer_continuation_count_for_test(
+        &self,
+        session: &SessionKey,
+        profile_id: &str,
+    ) -> usize {
+        self.state()
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                matches!(&item.reason, MasterContinuationReason::External(kind)
+                    if kind == STEER_EXTERNAL_KIND)
+                    && item.session_id.as_str() == session.0.as_str()
+                    && item.profile_id.as_str() == profile_id
+            })
+            .count()
     }
 
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
@@ -4540,7 +4792,9 @@ impl InProcessAgentOrchestrator {
         let wire_id = wire_key_from_goal_key(session_id);
         // #1959 — stamp a monotonic generation so a stale update can't
         // resurrect a cleared goal on the client (see the field's doc comment).
-        let generation = next_goal_event_generation(&mut state);
+        // #2065: the watermark identity is the SCOPED key this fn looked up
+        // under (the caller's turn-pinned key), not the wire id emitted.
+        let generation = next_goal_event_generation(&mut state, session_id);
         Some(json!({
             "session_id": wire_id,
             "profile_id": profile_id,
@@ -4548,6 +4802,34 @@ impl InProcessAgentOrchestrator {
             "generation": generation,
             "transition_actor": "backend",
         }))
+    }
+
+    /// #2065 — the SCOPED goal-store key a goal event's `generation` was
+    /// built from, registered at allocation time by
+    /// [`next_goal_event_generation`]. The transport's #1959 send guard
+    /// keys its watermark map by THIS identity rather than the plain wire
+    /// session id the frames carry (falling back to the wire id for
+    /// unstamped/unregistered generations — legacy events, hand-built test
+    /// frames, FIFO-evicted entries).
+    ///
+    /// Two cwd scopes can share one wire session id (`appui.sessions_in_cwd`
+    /// — the same session key opened from two folders), and the guard is
+    /// strictly monotonic per key. Wire-keyed, the two scopes shared one
+    /// watermark, so scope A's later-ALLOCATED clear suppressed scope B's
+    /// earlier-built repaint when B's frame reached the guard second: B's
+    /// live goal chip silently stopped repainting. Per-scope identities
+    /// keep the two streams independent, which is what the guard's
+    /// monotonicity assumption requires. The four goal-event producers
+    /// (set / clear / token-charge / turn repaint) all allocate through
+    /// [`next_goal_event_generation`], so every stamped frame is covered.
+    pub(crate) fn goal_event_watermark_key(&self, generation: u64) -> Option<SessionKey> {
+        if generation == 0 {
+            return None;
+        }
+        self.state()
+            .goal_event_scope_index
+            .get(&generation)
+            .cloned()
     }
 
     /// #1696 — read-only goal snapshot for the model's `goal_get` tool.
@@ -5248,6 +5530,15 @@ impl InProcessAgentOrchestrator {
             decided_by: decided_by.to_string(),
         };
         let _ = ledger.append_decision(&decision);
+        // OLP L1 (slice 5): goal_transition event, best-effort.
+        crate::obs_events::append_obs_event(
+            profile_data_dir,
+            &crate::obs_events::ObsEvent::new(
+                "goal_transition",
+                &format!("goal transitioned to `{}`", snapshot.status),
+            )
+            .goal_id(Some(&snapshot.goal_id)),
+        );
     }
 
     /// #2064(b) — durably settle a late (post-clear) turn charge into the
@@ -5537,8 +5828,9 @@ impl InProcessAgentOrchestrator {
             // `SessionGoalUpdated` so the client can order a clear against a
             // racing stale update. A stale update always bumps before this
             // clear (its goal read preceded the removal above), so
-            // `update.generation < clear.generation`.
-            let generation = next_goal_event_generation(&mut state);
+            // `update.generation < clear.generation`. #2065: watermark
+            // identity = the scoped key this clear resolved and removed under.
+            let generation = next_goal_event_generation(&mut state, &key);
             let fleet_store = state.fleet_store.clone();
             (removed, generation, fleet_store)
         };
@@ -6081,6 +6373,27 @@ impl InProcessAgentOrchestrator {
         ledger
             .append_escalation(&escalation)
             .map_err(|e| format!("failed to append peer escalation: {e}"))?;
+        // OLP L1 (slice 5): structured event, best-effort.
+        crate::obs_events::append_obs_event(
+            profile_data_dir,
+            &crate::obs_events::ObsEvent::new("escalation", &escalation.question)
+                .goal_id(Some(goal_id))
+                .slug(Some(peer_slug)),
+        );
+        // OLP-CTRL (slice 4): operator notification for the escalation.
+        // When the profile has a notification channel configured, emit an
+        // `escalation_notify` event row carrying the channel target so the
+        // gateway's outbound path (the same sender cron Notify mode uses)
+        // delivers a verbatim notice containing the slug and goal_id.
+        // UNCONFIGURED → silent skip (no failure, no warn spam), per
+        // contract.
+        crate::autonomy::escalation_notify::maybe_notify_escalation(
+            profile_data_dir,
+            profile_id,
+            goal_id,
+            peer_slug,
+            &escalation.question,
+        );
         Ok(escalation_id)
     }
 
@@ -9404,7 +9717,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // #1959 (codex #1) — stamp the generation so a user-set goal update
         // participates in the send guard's ordering (it is durable, so an
         // unstamped one could persist a clear->stale-update inversion).
-        let generation = next_goal_event_generation(&mut state);
+        // #2065: watermark identity = the scoped key this set stored under.
+        let generation = next_goal_event_generation(&mut state, &key);
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
@@ -10993,6 +11307,14 @@ pub(crate) fn clear_default_agent_orchestrator_for_test() {
 #[derive(Debug, Default)]
 struct AutonomyRuntimeState {
     agents: HashMap<String, AutonomyAgentRecord>,
+    /// Refs #2102 (Gap 3) — per-group scatter-join bookkeeping. `join_epoch`
+    /// increments when a child is admitted into an already-joined group
+    /// (spawn-admission path, under the state lock, BEFORE insertion);
+    /// `last_joined_key` records the explicit dedupe key of the last
+    /// ScatterJoinComplete actually enqueued, so the all-terminal edge can
+    /// skip an already-joined epoch even across a restart. Defaults are
+    /// additive — legacy persisted state deserializes with epoch 0 / None.
+    scatter_join_state: HashMap<String, ScatterJoinState>,
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
     /// #1977 — durable monitor records (specs + wake accounting). The live
@@ -11039,6 +11361,17 @@ struct AutonomyRuntimeState {
     /// emit no event), so `stale_update.generation < clear.generation` always
     /// holds and the client keeps the newer clear.
     goal_event_generation: u64,
+    /// #2065 — generation → the SCOPED goal-store key the event was built
+    /// from, registered atomically with the allocation (same state lock).
+    /// The transport's #1959 send guard keys its watermark by THIS
+    /// identity, not the plain wire session id: two cwd scopes can share a
+    /// wire id, and a wire-keyed watermark advanced by one scope's
+    /// later-allocated clear falsely dropped the sibling scope's
+    /// earlier-built repaint at the guard. Bounded FIFO — see
+    /// [`next_goal_event_generation`].
+    goal_event_scope_index: HashMap<u64, SessionKey>,
+    /// FIFO eviction order for [`Self::goal_event_scope_index`].
+    goal_event_scope_fifo: std::collections::VecDeque<u64>,
     /// #991 / M15-B — per-agent cancellation handles registered by
     /// `run_native_specialist` (and future specialist runners) so that
     /// `interrupt_agent` / `close_agent` can signal a *real* abort to
@@ -11099,6 +11432,13 @@ struct AutonomyRuntimeState {
     /// `monitor/resume` landing in the unlocked gap (defect 2). Per-instance.
     #[cfg(test)]
     reset_window_before_accounting: bool,
+}
+
+/// Refs #2102 (Gap 3): join bookkeeping for one scatter-join group.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+struct ScatterJoinState {
+    join_epoch: u64,
+    last_joined_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -12549,13 +12889,33 @@ fn enqueue_agent_terminal_continuations(
     {
         return;
     }
-    // NOTE: the `ScatterJoinComplete` continuation deliberately keeps the
-    // auto-derived `stable_dedupe_key` (which folds in the
-    // `terminal_children` count). The join only enqueues on the
-    // all-siblings-terminal edge, and a re-expanded group that finishes
-    // again SHOULD be able to re-join — so an identity-only key would be a
-    // behavior change here. Only the per-child `ChildCompleted` gets the
-    // explicit Gap-1 step-3 key.
+    // Refs #2102 (Gap 3): the auto-derived `stable_dedupe_key` folds every
+    // metadata pair into the key — including `terminal_children` — so a
+    // group that re-reaches all-terminal with a different child count
+    // enqueued a NEW join continuation and the master re-emitted the joined
+    // answer (duplicate output). Replaced by an EXPLICIT key
+    // `scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}`:
+    // same epoch joins exactly once (persisted `last_joined_key` equality
+    // check skips re-observation, restart-safe); a genuinely re-expanded
+    // group gets a new epoch at spawn admission and joins again.
+    let join_group_key = agent_continuation_group_id(agent);
+    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
+    let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
+    let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
+    let join_key = format!(
+        "scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}",
+        group = group_id.as_str(),
+        session = agent.session_id.0,
+        profile = agent.profile_id,
+        cwd_hash = cwd_hash,
+        epoch = join_state.join_epoch,
+    );
+    if join_state.last_joined_key.as_deref() == Some(join_key.as_str()) {
+        // This epoch already joined — skip enqueue entirely (also covers the
+        // re-marked-terminal-with-no-new-child case and restart replay).
+        return;
+    }
     let scatter = MasterContinuationRequest::new(
         group_id,
         agent.session_id.to_string(),
@@ -12563,6 +12923,7 @@ fn enqueue_agent_terminal_continuations(
         MasterContinuationReason::ScatterJoinComplete,
         SystemTime::now(),
     )
+    .with_dedupe_key(join_key.clone())
     .with_metadata(
         "parent_agent_id",
         agent
@@ -12577,6 +12938,9 @@ fn enqueue_agent_terminal_continuations(
         None => scatter,
     };
     enqueue_and_persist_continuation(state, scatter);
+    let join_group_key = agent_continuation_group_id(agent);
+    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
+    join_state.last_joined_key = Some(join_key);
 }
 
 /// Gap-1 step 3: explicit `ChildCompleted` dedupe key, symmetric to the
@@ -13301,6 +13665,24 @@ fn restore_agents_from_supervisor_state(
             context_contract: None,
             restored: true,
         };
+        // Refs #2102 (Gap 3): spawn admission into an ALREADY-JOINED group
+        // bumps the join epoch BEFORE insertion, under the same state lock —
+        // a crash can never land between admission and the increment. The
+        // child's group comes from the supervisor record (`child.group_id`).
+        {
+            let group = child.group_id.clone();
+            let already_joined = state
+                .scatter_join_state
+                .get(&group)
+                .is_some_and(|s| s.last_joined_key.is_some());
+            if already_joined {
+                state
+                    .scatter_join_state
+                    .entry(group)
+                    .or_default()
+                    .join_epoch += 1;
+            }
+        }
         state.agents.insert(agent.agent_id.clone(), agent);
     }
 }
@@ -13380,9 +13762,34 @@ fn restored_agent_artifact(artifact: &SupervisorArtifactRecord) -> AgentArtifact
 /// An unstamped (`0`) event is always admitted by the guard and would reopen
 /// the stale-update-overtakes-clear race (codex #1 caught `set_goal` /
 /// `charge_active_goal_tokens` shipping unstamped).
-fn next_goal_event_generation(state: &mut AutonomyRuntimeState) -> u64 {
+///
+/// #2065 — the allocation also registers `watermark_key`, the SCOPED
+/// goal-store key the event is being built from (the compiler forces every
+/// producer to supply its build-time key — never a later re-resolution of
+/// the last-writer-wins cwd map, which a concurrent same-wire open flips).
+/// The transport's #1959 send guard keys its watermark by this identity via
+/// [`InProcessAgentOrchestrator::goal_event_watermark_key`], so two cwd
+/// scopes sharing one wire session id keep independent, independently
+/// monotonic guard streams — without it, one scope's later-allocated clear
+/// suppressed the sibling scope's earlier-built repaint at the guard. The
+/// registry is a bounded FIFO: at 4096 live entries the oldest is evicted,
+/// and an evicted generation falls back to wire-keyed watermarking at the
+/// guard (strictly the pre-fix behavior, and only for events ~4096
+/// generations stale).
+fn next_goal_event_generation(state: &mut AutonomyRuntimeState, watermark_key: &SessionKey) -> u64 {
+    const GOAL_EVENT_SCOPE_INDEX_CAP: usize = 4096;
     state.goal_event_generation += 1;
-    state.goal_event_generation
+    let generation = state.goal_event_generation;
+    state
+        .goal_event_scope_index
+        .insert(generation, watermark_key.clone());
+    state.goal_event_scope_fifo.push_back(generation);
+    while state.goal_event_scope_fifo.len() > GOAL_EVENT_SCOPE_INDEX_CAP {
+        if let Some(evicted) = state.goal_event_scope_fifo.pop_front() {
+            state.goal_event_scope_index.remove(&evicted);
+        }
+    }
+    generation
 }
 
 fn persist_goal_state(
@@ -13971,6 +14378,22 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .get(PEER_SEND_INPUT_META_MESSAGE)
                 .cloned()
                 .unwrap_or_default()
+        }
+        // OLP-CTRL 回合 3 整改: a steer continuation's prompt IS the steer
+        // — a STANDALONE user message body (verbatim, like the
+        // peer_send_input arm above), carrying only the
+        // `[external-reviewer]` source marker to preserve the
+        // trust=data boundary. NEVER a `### External reviewer` appendix
+        // glued onto another prompt (the doorbell experiments killed that
+        // pattern twice: read-not-act), and never merged with a loop
+        // prompt (a steer is its own turn; no priority competition).
+        MasterContinuationReason::External(kind) if kind == STEER_EXTERNAL_KIND => {
+            let text = continuation
+                .metadata
+                .get(STEER_META_TEXT)
+                .cloned()
+                .unwrap_or_default();
+            format!("[external-reviewer] {text}")
         }
         // Peer-fleet auto-synthesis — every peer this master handed off has
         // completed. Direct an autonomous gather + consolidate turn. This is a

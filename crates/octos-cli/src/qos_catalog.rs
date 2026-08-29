@@ -2,13 +2,42 @@ use std::path::Path;
 use std::sync::Arc;
 
 use octos_llm::{
-    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, BaselineEntry, LlmProvider, ModelCatalogEntry,
-    ProviderChain, QosCatalog, RetryProvider,
+    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, BaselineEntry, ContextWindowOverride,
+    LlmProvider, ModelCatalogEntry, ProviderChain, QosCatalog, RetryProvider,
 };
 use tracing::{info, warn};
 
 use crate::commands::chat::create_provider_with_api_type;
 use crate::config::Config;
+
+/// #2142: wrap a freshly-created (probe-wrapped) provider in the operator's
+/// `context_window` override when the config sets one.
+///
+/// The override sits just OUTSIDE the local-context probe (#2135) and INSIDE
+/// `RetryProvider` / `ProviderChain` / `AdaptiveRouter` — all of which delegate
+/// `context_window()` as of #2135 — so the operator's value resolves through
+/// the entire runtime stack and beats BOTH the static catalog and the runtime
+/// probe. Applied per provider (primary and each fallback independently) so a
+/// primary pin never leaks onto a fallback's own window; the router then
+/// aggregates the per-slot values as it already does. `None` leaves the
+/// provider untouched.
+pub(crate) fn apply_context_window_override(
+    provider: Arc<dyn LlmProvider>,
+    window: Option<u32>,
+    slot: &str,
+) -> Arc<dyn LlmProvider> {
+    match window {
+        Some(w) => {
+            info!(
+                context_window = w,
+                slot,
+                "context window overridden by config.llm (operator override wins over probe/catalog)"
+            );
+            Arc::new(ContextWindowOverride::new(provider, w))
+        }
+        None => provider,
+    }
+}
 
 /// The canonical model catalog (`model_catalog.json`), compiled in. This is the
 /// single source of truth for model provisioning and the researched
@@ -231,6 +260,12 @@ pub(crate) fn build_adaptive_provider_chain(
 ) -> AdaptiveProviderBundle {
     let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
 
+    // #2142: operator override of the primary's effective context window,
+    // applied before RetryProvider/router wrap it so it propagates through
+    // the delegating stack and beats the probe/catalog.
+    let base_provider =
+        apply_context_window_override(base_provider, config.context_window, "primary");
+
     let llm: Arc<dyn LlmProvider> = if no_retry {
         base_provider
     } else if config.fallback_models.is_empty() {
@@ -257,6 +292,8 @@ pub(crate) fn build_adaptive_provider_chain(
                 fb.api_type.as_deref(),
             ) {
                 Ok(p) => {
+                    // #2142: per-fallback context-window override.
+                    let p = apply_context_window_override(p, fb.context_window, "fallback");
                     providers.push(Arc::new(RetryProvider::new(p)));
                     costs.push(fb.cost_per_m.unwrap_or(0.0));
                 }
@@ -839,6 +876,7 @@ mod tests {
                     api_type: None,
                     cost_per_m: Some(0.5),
                     strong: true,
+                    context_window: None,
                 },
                 // Deliberately-broken third fallback — must be skipped
                 // via `warn!` without taking the helper down.
@@ -851,6 +889,7 @@ mod tests {
                     api_type: None,
                     cost_per_m: None,
                     strong: true,
+                    context_window: None,
                 },
             ],
             // A1: AdaptiveRoutingConfig::default() now has `enabled = false`
@@ -1117,6 +1156,7 @@ mod tests {
                 api_type: None,
                 cost_per_m: Some(0.5),
                 strong: true,
+                context_window: None,
             }],
             adaptive_routing: Some(AdaptiveRoutingConfig {
                 enabled: false,
@@ -1178,6 +1218,7 @@ mod tests {
                 api_type: None,
                 cost_per_m: Some(0.5),
                 strong: true,
+                context_window: None,
             }],
             adaptive_routing: None,
             ..Default::default()
@@ -1190,6 +1231,93 @@ mod tests {
         assert!(
             bundle.adaptive_router.is_none(),
             "missing adaptive_routing block MUST default to OFF (no router)"
+        );
+    }
+
+    /// #2142: an operator `context_window` override must resolve through the
+    /// WHOLE assembled stack (RetryProvider here), beating what the underlying
+    /// provider reports — the acceptance criterion "a profile pinning
+    /// context_window: 16384 on a 262K server reports 16384 through the full
+    /// runtime stack".
+    #[test]
+    fn context_window_override_wins_through_the_assembled_stack() {
+        use crate::config::Config;
+        use octos_core::Message;
+        use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
+        use std::sync::Arc;
+
+        // A backend that advertises a large window (stands in for the probed
+        // 262K llama-server).
+        struct WideProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for WideProvider {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                Err(eyre::eyre!("stub not callable in tests"))
+            }
+            fn model_id(&self) -> &str {
+                "wide-model"
+            }
+            fn provider_name(&self) -> &str {
+                "wide"
+            }
+            fn context_window(&self) -> u32 {
+                262_144
+            }
+        }
+
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+
+        // Control: no override → the backend's own window survives the
+        // RetryProvider wrap (delegation, per #2135).
+        let control = build_adaptive_provider_chain(
+            Arc::new(WideProvider),
+            &Config::default(),
+            &data_dir,
+            false,
+            ExporterMode::Disabled,
+        );
+        assert_eq!(
+            control.llm.context_window(),
+            262_144,
+            "without an override the probed/backend window must pass through the stack"
+        );
+
+        // Override: 16384 must win through RetryProvider all the way out.
+        let config = Config {
+            context_window: Some(16_384),
+            ..Default::default()
+        };
+        let overridden = build_adaptive_provider_chain(
+            Arc::new(WideProvider),
+            &config,
+            &data_dir,
+            false,
+            ExporterMode::Disabled,
+        );
+        assert_eq!(
+            overridden.llm.context_window(),
+            16_384,
+            "config.context_window must override the 262K backend through the full stack"
+        );
+
+        // And in the no_retry path (bare provider) the override still holds.
+        let bare = build_adaptive_provider_chain(
+            Arc::new(WideProvider),
+            &config,
+            &data_dir,
+            true,
+            ExporterMode::Disabled,
+        );
+        assert_eq!(
+            bare.llm.context_window(),
+            16_384,
+            "override must hold even on the no_retry (unwrapped) path"
         );
     }
 }

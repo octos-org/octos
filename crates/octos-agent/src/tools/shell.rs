@@ -869,6 +869,15 @@ impl Tool for ShellTool {
                     result_text = "(no output)".to_string();
                 }
 
+                // Sandbox-denial scan runs on the FULL text (the denial line
+                // may be exactly what truncation cuts); the hint is appended
+                // after truncation so it survives the cut.
+                let denial_hint = crate::sandbox::sandbox_denial_hint(
+                    !self.sandbox.is_noop(),
+                    output.status.success(),
+                    &result_text,
+                );
+
                 // Truncate if too long (reserve space for exit code suffix)
                 let exit_suffix = format!("\n\nExit code: {exit_code}");
                 const MAX_OUTPUT: usize = 50000;
@@ -879,6 +888,9 @@ impl Tool for ShellTool {
                 );
 
                 result_text.push_str(&exit_suffix);
+                if let Some(hint) = denial_hint {
+                    result_text.push_str(hint);
+                }
 
                 Ok(ToolResult {
                     output: result_text,

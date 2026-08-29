@@ -168,6 +168,23 @@ impl Tool for WriteFileTool {
             },
         };
 
+        // Observe-only (#read-paging probe): a whole-file overwrite of a path
+        // that was previously read. If `read_file` were ever changed to return
+        // a WINDOW by default, this is the call that would reconstruct the file
+        // from an incomplete view and destroy the tail the model never saw —
+        // the slides workflow does exactly read-then-rebuild-then-write. The
+        // probe records it; nothing here changes.
+        if super::read_paging_probe::enabled() && path.exists() {
+            let tripped = super::read_paging_probe::record_overwrite(&path.to_string_lossy());
+            if tripped {
+                tracing::warn!(
+                    path = %path.display(),
+                    "read-paging probe: overwriting a file whose earlier read would have been \
+                     PARTIAL under a forced window"
+                );
+            }
+        }
+
         // #1976 — per-path write fence. SECURITY ROUND (codex): the allowlist
         // decision and the actual open must target the SAME resolved object,
         // or an attacker who swaps a checked ancestor dir for a symlink

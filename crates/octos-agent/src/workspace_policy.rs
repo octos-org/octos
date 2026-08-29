@@ -1477,7 +1477,15 @@ pub fn coding_default_hooks() -> Vec<crate::hooks::HookConfig> {
             command: vec!["eslint".into(), "--max-warnings".into(), "0".into()],
             timeout_ms: 60_000,
             tool_filter: edit_tools.clone(),
-            path_filter: vec!["**/*.{js,ts,tsx,jsx}".into()],
+            // Four explicit patterns: the `glob` crate treats braces as
+            // LITERALS, so "**/*.{js,ts,tsx,jsx}" matches no real file
+            // (#2129 review, finding 10 — verified empirically).
+            path_filter: vec![
+                "**/*.js".into(),
+                "**/*.ts".into(),
+                "**/*.tsx".into(),
+                "**/*.jsx".into(),
+            ],
             requires_bin: Some("eslint".into()),
         },
         // Python: `ruff check` on `.py` edits.
@@ -3017,12 +3025,15 @@ ignore = []
         // ESLint hook must be opt-out friendly via requires_bin — operators
         // without eslint on PATH must NOT see hook failures every edit.
         assert_eq!(eslint.requires_bin.as_deref(), Some("eslint"));
-        assert!(
-            eslint
-                .path_filter
-                .iter()
-                .any(|p| p.ends_with(".{js,ts,tsx,jsx}"))
-        );
+        // Four explicit patterns — the glob crate treats braces as literals
+        // (#2129 review, finding 10).
+        for ext in ["js", "ts", "tsx", "jsx"] {
+            let pattern = format!("**/*.{ext}");
+            assert!(
+                eslint.path_filter.iter().any(|p| p == &pattern),
+                "missing {pattern}"
+            );
+        }
     }
 
     #[test]
@@ -3126,5 +3137,30 @@ ignore = []
         // without re-running the migration branch.
         let reread = read_workspace_policy(&project_root).unwrap().unwrap();
         assert_eq!(reread, upgraded);
+    }
+
+    /// #2129: the session bootstrap path routes a detected coding workspace
+    /// to `for_coding()`. This pins the two halves the wiring depends on:
+    /// detection keys on the manifest, and the coding policy carries the
+    /// Coding kind marker while inheriting the session contracts.
+    #[test]
+    fn coding_bootstrap_pieces_compose() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(
+            detect_workspace_policy_kind(tmp.path()),
+            WorkspacePolicyKind::Coding
+        );
+        let policy = WorkspacePolicy::for_coding();
+        assert_eq!(policy.workspace.kind, WorkspacePolicyKind::Coding);
+        // The defaults the session merges for that kind include the Rust
+        // checker, gated on the binary being present.
+        let hooks = coding_default_hooks();
+        assert!(
+            hooks
+                .iter()
+                .any(|h| h.command.first().map(String::as_str) == Some("cargo")),
+            "coding defaults must include the cargo hook"
+        );
     }
 }

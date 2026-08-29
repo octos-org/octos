@@ -22,6 +22,10 @@ use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage
 /// OpenAI provider using the Responses API.
 pub struct OpenAIResponsesProvider {
     client: Client,
+    /// Separate client for streaming requests, built without a total request
+    /// timeout so a healthy long generation is never cut off mid-stream. See
+    /// [`crate::provider::build_streaming_http_client`].
+    stream_client: Client,
     api_key: SecretString,
     model: String,
     base_url: String,
@@ -32,6 +36,9 @@ impl OpenAIResponsesProvider {
         Self {
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
+            stream_client: crate::provider::build_streaming_http_client(
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
             ),
             api_key: SecretString::from(api_key.into()),
@@ -47,6 +54,7 @@ impl OpenAIResponsesProvider {
 
     pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
+        self.stream_client = crate::provider::build_streaming_http_client(connect_timeout_secs);
         self
     }
 
@@ -153,8 +161,11 @@ impl LlmProvider for OpenAIResponsesProvider {
         let mut body = self.build_request(messages, tools, config);
         body["stream"] = true.into();
 
+        // Stream client: no total timeout, so a long healthy generation is not
+        // cut off. Stalls are bounded by the client's per-read timeout and the
+        // agent's stream-timeout guards (see build_streaming_http_client).
         let response = self
-            .client
+            .stream_client
             .post(format!("{}/responses", self.base_url))
             .header(
                 "Authorization",

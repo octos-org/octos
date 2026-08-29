@@ -36,6 +36,15 @@ pub struct Config {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Operator override for the primary provider's effective context window,
+    /// in tokens. When set it wraps the (probed) primary provider in
+    /// `ContextWindowOverride` as the OUTERMOST layer, so it beats both the
+    /// static catalog and the runtime probe (#2135). Projected from
+    /// `LlmModelSelectionConfig.context_window` by `config_from_profile`.
+    /// `None` = defer to probe/catalog. (#2142)
+    #[serde(default)]
+    pub context_window: Option<u32>,
+
     /// Custom base URL for the API endpoint.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -455,6 +464,13 @@ pub struct FallbackModel {
     /// Defaults to true for backward compat — set false for weak/proxy providers.
     #[serde(default = "default_true")]
     pub strong: bool,
+    /// Operator override for THIS fallback's effective context window, in
+    /// tokens. Wraps this fallback provider in `ContextWindowOverride`
+    /// (outermost) so it beats the catalog and the probe (#2135). Projected
+    /// from the per-fallback `LlmModelSelectionConfig.context_window`.
+    /// `None` = defer to probe/catalog. (#2142)
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 pub fn default_true() -> bool {
@@ -1545,6 +1561,16 @@ pub struct GatewayConfig {
     /// and Grok get `reasoning_effort`), so non-thinking models silently ignore it.
     #[serde(default)]
     pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
+
+    /// Sampling temperature override for chat LLM calls. When unset (the
+    /// default), the built-in `ChatConfig` default (`0.0`, greedy) is used and
+    /// the request is byte-for-byte unchanged — so cloud providers are
+    /// unaffected. Set a value (e.g. `0.7`) to override it; this is primarily
+    /// for **local / OpenAI-compatible** models, where forced greedy decoding
+    /// triggers repetition collapse (a small model re-emits the same tool call
+    /// until `max_tokens`). See issue #2172.
+    #[serde(default)]
+    pub llm_temperature: Option<f32>,
 }
 
 impl Default for GatewayConfig {
@@ -1567,6 +1593,7 @@ impl Default for GatewayConfig {
             session_timeout_secs: None,
             max_output_tokens: None,
             reasoning_effort: None,
+            llm_temperature: None,
         }
     }
 }
@@ -2350,6 +2377,26 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.gateway.is_none());
+    }
+
+    #[test]
+    fn test_gateway_llm_temperature_parses() {
+        let json = r#"{
+            "channels": [{"type": "cli"}],
+            "llm_temperature": 0.7
+        }"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(gw.llm_temperature, Some(0.7));
+    }
+
+    #[test]
+    fn test_gateway_llm_temperature_absent_is_none() {
+        // Cloud-safety guarantee (#2172): a config without llm_temperature
+        // yields None, so chat_config() keeps the built-in 0.0 default and the
+        // request is unchanged. Old configs must still parse.
+        let json = r#"{"channels": [{"type": "cli"}]}"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(gw.llm_temperature, None);
     }
 
     #[test]

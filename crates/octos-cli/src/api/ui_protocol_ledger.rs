@@ -50,8 +50,8 @@
 //! decision record and tradeoffs.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -90,6 +90,12 @@ pub(crate) struct LedgerConfig {
     pub sweep_interval: Duration,
     pub rotate_bytes: u64,
     pub retained_log_files: usize,
+    /// Per-session projection snapshot cadence (step 1b): every
+    /// `snapshot_every_events` appended events the session's retained ring
+    /// is written to `snapshot.json` next to the log files. Recovery then
+    /// loads the latest snapshot and replays only the tail (events with
+    /// seq > snapshot head). `0` disables snapshotting.
+    pub snapshot_every_events: u64,
     /// When `None`, the ledger is RAM-only (Path B fallback / unit tests).
     pub data_dir: Option<PathBuf>,
 }
@@ -103,6 +109,7 @@ impl LedgerConfig {
             sweep_interval: Duration::from_secs(60),
             rotate_bytes: 10 * 1024 * 1024,
             retained_log_files: 5,
+            snapshot_every_events: 4096,
             data_dir: None,
         }
     }
@@ -115,6 +122,7 @@ impl LedgerConfig {
             sweep_interval: Duration::from_secs(60),
             rotate_bytes: 10 * 1024 * 1024,
             retained_log_files: 5,
+            snapshot_every_events: 4096,
             data_dir: Some(data_dir),
         }
     }
@@ -250,6 +258,27 @@ struct LedgerDiskRecord {
 }
 
 const LEDGER_DISK_VERSION: u32 = 1;
+
+// ---------- Per-session projection snapshot (step 1b) ----------
+
+/// On-disk projection snapshot for one session. Written every
+/// `LedgerConfig::snapshot_every_events` events; recovery loads it and
+/// replays only the tail (log records with seq > `head_seq`). The FIRST
+/// field is the format version — unknown versions are rejected and the
+/// reader falls back to a full replay (zero-migration contract).
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionSnapshotFile {
+    /// Schema version of the snapshot format itself. Bump on any
+    /// incompatible shape change.
+    version: u32,
+    /// Highest seq included in `entries` (== next_seq at snapshot time).
+    head_seq: u64,
+    /// The retained in-memory ring at snapshot time.
+    entries: Vec<LedgerDiskRecord>,
+}
+
+const SESSION_SNAPSHOT_VERSION: u32 = 1;
+const SESSION_SNAPSHOT_FILE_NAME: &str = "snapshot.json";
 
 /// Result of parsing one disk line. A pre-Stage-5 persisted-message record
 /// has no representation in the v2-only core enum, so it is explicitly
@@ -516,6 +545,28 @@ pub(crate) struct UiProtocolLedger {
     ///
     /// Guarded by its own tiny mutex (never held across `inner`).
     scopes: Mutex<HashMap<String, String>>,
+    /// Lazy-recovery index: storage identity → on-disk session dir. Built
+    /// by [`UiProtocolLedger::recover`] by scanning `ui-protocol/` WITHOUT
+    /// replaying any events; consulted by [`ensure_session_loaded`] on the
+    /// first read/write touch of a session. Guarded by its own tiny mutex
+    /// (never held across `inner`).
+    index: Mutex<HashMap<SessionKey, SessionIndexEntry>>,
+    /// Test-only counter of lazy disk replays performed by
+    /// [`ensure_session_loaded`]. Used to assert that touching session A
+    /// never replays session B (acceptance scenario 3).
+    #[cfg(test)]
+    lazy_replays: std::sync::atomic::AtomicUsize,
+}
+
+/// One lazily-recoverable on-disk session. `reconciled` tracks whether the
+/// boot-time orphan-row sweep has run for this session (it must run exactly
+/// once per process, on first touch); `failed` latches a replay error so a
+/// corrupt session is never re-scanned on every touch.
+#[derive(Debug, Clone)]
+struct SessionIndexEntry {
+    dir: PathBuf,
+    reconciled: bool,
+    failed: bool,
 }
 
 struct LedgerInner {
@@ -608,6 +659,12 @@ impl LedgerInner {
 }
 
 impl UiProtocolLedger {
+    /// The durable data dir this ledger writes to (None when RAM-only) —
+    /// exposed for the OLP observability event stream, which shares the
+    /// same root (`<data_dir>/events.jsonl`).
+    pub(crate) fn config_data_dir(&self) -> Option<PathBuf> {
+        self.config.data_dir.clone()
+    }
     /// RAM-only ledger. Used for tests and as the no-data-dir fallback.
     #[cfg(test)]
     pub(crate) fn new(retained_per_session: usize) -> Self {
@@ -629,6 +686,9 @@ impl UiProtocolLedger {
             config,
             inner: Mutex::new(LedgerInner::new()),
             scopes: Mutex::new(HashMap::new()),
+            index: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            lazy_replays: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -679,6 +739,15 @@ impl UiProtocolLedger {
     /// Bounded by `config.retained_per_session` per session. Returns the
     /// constructed ledger plus the number of sessions/events recovered for
     /// the boot log.
+    /// Build a durable ledger and lazily recover on-disk sessions.
+    ///
+    /// **Lazy recovery (perf/ledger-lazy-recovery, step 1a):** boot only
+    /// scans the `ui-protocol/` session dirs to build an index (storage
+    /// identity → session dir). NO events are replayed here — boot cost is
+    /// O(session count), not O(total events). The first read or write that
+    /// touches a session (hydrate/replay/append/emit) replays that one
+    /// session's log via [`ensure_session_loaded`] and caches the projection
+    /// in the in-memory ring; subsequent touches hit the cache.
     pub(crate) fn recover(config: LedgerConfig) -> RecoveryOutcome {
         let ledger = Self::with_config(config);
         let Some(dir) = ledger.config.data_dir.clone() else {
@@ -689,8 +758,6 @@ impl UiProtocolLedger {
             };
         };
         let ui_dir = dir.join("ui-protocol");
-        let mut sessions = 0usize;
-        let mut events = 0usize;
         let entries = match fs::read_dir(&ui_dir) {
             Ok(entries) => entries,
             Err(error) => {
@@ -709,6 +776,7 @@ impl UiProtocolLedger {
                 };
             }
         };
+        let mut indexed = 0usize;
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -720,45 +788,186 @@ impl UiProtocolLedger {
             let Some(session_key) = decode_session_dir_name(safe_name) else {
                 continue;
             };
-            match ledger.recover_one_session(&session_key, &path) {
-                Ok(count) => {
-                    if count > 0 {
-                        sessions += 1;
-                        events += count;
-                        // The process that wrote these events is gone; rows it
-                        // left non-terminal will never terminate on their own.
-                        let swept = ledger.reconcile_orphaned_rows(&session_key);
-                        if swept > 0 {
-                            info!(
-                                target = "octos::ledger",
-                                session_id = %session_key.0,
-                                swept,
-                                "recovery: synthesized terminal events for rows orphaned by restart"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        target = "octos::ledger",
-                        ?error,
-                        session_id = %session_key.0,
-                        "failed to recover session from disk"
-                    );
-                }
-            }
+            // Index only — the session's events are replayed on first touch.
+            ledger
+                .index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(
+                    session_key,
+                    SessionIndexEntry {
+                        dir: path,
+                        reconciled: false,
+                        failed: false,
+                    },
+                );
+            indexed += 1;
         }
         info!(
             target = "octos::ledger",
-            sessions_recovered = sessions,
-            events_recovered = events,
-            "ledger recovery complete"
+            sessions_indexed = indexed,
+            "ledger session index built (lazy recovery; events replay on first touch)"
         );
         RecoveryOutcome {
             ledger: Arc::new(ledger),
-            sessions_recovered: sessions,
-            events_recovered: events,
+            sessions_recovered: indexed,
+            events_recovered: 0,
         }
+    }
+
+    /// Replay one indexed session's disk log into the in-memory ring on
+    /// first touch, then cache it. Idempotent: a session already resident
+    /// in `inner.sessions` returns immediately without any disk I/O.
+    ///
+    /// A session whose log fails to read is marked `failed` in the index so
+    /// subsequent touches return `false` immediately WITHOUT retrying a
+    /// doomed full scan — one corrupt session never blocks boot or any
+    /// other session.
+    ///
+    /// Disk I/O happens OUTSIDE the `inner` lock; the hydrate under the
+    /// lock applies the stale-live guard so a concurrent append can never
+    /// be rolled back by an older snapshot. The orphan-row reconciliation
+    /// runs exactly once per successful replay (tracked in the index), and
+    /// its synthesized terminal events are appended into the freshly
+    /// hydrated ring via [`append_with_storage_id`] — which sees the
+    /// session as resident and therefore does not recurse into disk replay.
+    fn ensure_session_loaded(&self, storage_id: &SessionKey) -> bool {
+        {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if inner.sessions.contains_key(storage_id) {
+                return true;
+            }
+        }
+        let (session_dir, reconciled) = {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            match index.get(storage_id) {
+                Some(entry) if !entry.failed => (entry.dir.clone(), entry.reconciled),
+                _ => return false,
+            }
+        };
+        // Outer-review 1b fix: existing large ledgers must not wait for
+        // the append cadence to earn their FIRST snapshot. Detect whether
+        // this recovery could use a projection snapshot BEFORE the scan:
+        // `None` (no snapshot yet — pre-1b ledger) or `Err` (corrupt —
+        // fault path) both mean the scan below is a full replay, after
+        // which we bootstrap-write a snapshot so the NEXT recovery is
+        // snapshot+tail. `Ok(Some(_))` means the scan already benefited.
+        let needs_bootstrap_snapshot = self.config.snapshot_every_events > 0
+            && !matches!(
+                self.read_session_snapshot(storage_id, &session_dir),
+                Ok(Some(_))
+            );
+        let snapshot = match self.read_session_disk_snapshot(storage_id, &session_dir, None, false)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(
+                    target = "octos::ledger",
+                    ?error,
+                    session_id = %storage_id.0,
+                    "failed to lazily recover session from disk; session unavailable"
+                );
+                self.index
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .entry(storage_id.clone())
+                    .and_modify(|entry| entry.failed = true);
+                return false;
+            }
+        };
+        let Some(snapshot) = snapshot else {
+            // No log files (or all rotated away): nothing to replay. Leave
+            // the index entry — a later append will create the ring and
+            // `snapshot_if_session_absent` re-reads the dir then.
+            return false;
+        };
+        if snapshot.retained_entries.is_empty() && snapshot.head_seq == 0 {
+            return false;
+        }
+        let total_disk_bytes = snapshot.total_disk_bytes;
+        let replayed_events = snapshot.retained_entries.len();
+        let mut hydrated_now = false;
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if !inner.sessions.contains_key(storage_id)
+                && inner.sessions.len() >= self.config.active_session_cap
+            {
+                self.evict_lru_locked(&mut inner);
+            }
+            let session = inner
+                .sessions
+                .entry(storage_id.clone())
+                .or_insert_with(SessionLedger::new);
+            // Stale-live guard (same rule as `snapshot_with_cursor` /
+            // `replay_after_from_disk_with_head`): an append that landed
+            // while we were reading disk made the ring newer than our
+            // snapshot — never roll it back.
+            if session.next_seq <= snapshot.head_seq {
+                if session.next_seq == 0 && session.entries.is_empty() {
+                    hydrated_now = true;
+                }
+                hydrate_session_from_snapshot(session, snapshot);
+                inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(total_disk_bytes);
+            }
+            inner.touch_lru(storage_id);
+        }
+        if hydrated_now {
+            #[cfg(test)]
+            self.lazy_replays
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Bootstrap snapshot (outer-review 1b fix): a full replay just
+            // paid O(all events) — persist the projection NOW so the next
+            // cold start recovers this session from snapshot+tail instead.
+            // Best-effort, same discipline as the append-cadence path: a
+            // failed write never breaks recovery.
+            if needs_bootstrap_snapshot {
+                let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(session) = inner.sessions.get(storage_id) {
+                    if let Err(error) = self.write_session_snapshot_locked(storage_id, session) {
+                        warn!(
+                            target = "octos::ledger",
+                            ?error,
+                            session_id = %storage_id.0,
+                            "failed to write bootstrap snapshot after full replay"
+                        );
+                    } else {
+                        debug!(
+                            target = "octos::ledger",
+                            session_id = %storage_id.0,
+                            "bootstrap snapshot written after full replay"
+                        );
+                    }
+                }
+            }
+        }
+        if hydrated_now && !reconciled {
+            // The process that wrote these events is gone; rows it left
+            // non-terminal will never terminate on their own.
+            let swept = self.reconcile_orphaned_rows(storage_id);
+            if swept > 0 {
+                info!(
+                    target = "octos::ledger",
+                    session_id = %storage_id.0,
+                    swept,
+                    "recovery: synthesized terminal events for rows orphaned by restart"
+                );
+            }
+        }
+        if hydrated_now || !reconciled {
+            self.index
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(storage_id.clone())
+                .and_modify(|entry| entry.reconciled = true);
+        }
+        debug!(
+            target = "octos::ledger",
+            session_id = %storage_id.0,
+            replayed_events,
+            hydrated_now,
+            "ledger lazily recovered session on first touch"
+        );
+        true
     }
 
     /// Boot-time reconciliation for one recovered session: any task, turn,
@@ -882,36 +1091,19 @@ impl UiProtocolLedger {
         swept
     }
 
-    fn recover_one_session(
-        &self,
-        session_id: &SessionKey,
-        session_dir: &Path,
-    ) -> std::io::Result<usize> {
-        let Some(snapshot) = self.read_session_disk_snapshot(session_id, session_dir, None)? else {
-            return Ok(0);
-        };
-        if snapshot.retained_entries.is_empty() && snapshot.head_seq == 0 {
-            return Ok(0);
-        }
-
-        let count = snapshot.retained_entries.len();
-        let total_disk_bytes = snapshot.total_disk_bytes;
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let session_state = inner
-            .sessions
-            .entry(session_id.clone())
-            .or_insert_with(SessionLedger::new);
-        hydrate_session_from_snapshot(session_state, snapshot);
-        inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(total_disk_bytes);
-        inner.touch_lru(session_id);
-        Ok(count)
-    }
-
     fn read_session_disk_snapshot(
         &self,
         session_id: &SessionKey,
         session_dir: &Path,
         replay_after_seq: Option<u64>,
+        // 8d-r1: `true` ONLY for the hydrate from_beginning-exempt caller
+        // (`read_disk_snapshot_for_replay`), whose seq-0 means "everything
+        // you still retain" (retained ring, shortcut valid). The
+        // session/open replay path passes `false`: its seq-0 has NO
+        // exemption and must full-scan the JSONL from seq 1 (the snapshot
+        // shortcut must NOT apply there). Distinguish by CALLER SEMANTICS,
+        // never by the bare seq value.
+        from_beginning_hydrate: bool,
     ) -> std::io::Result<Option<DiskSessionSnapshot>> {
         let mut log_files = match list_log_files(session_dir) {
             Ok(log_files) => log_files,
@@ -941,9 +1133,131 @@ impl UiProtocolLedger {
         let mut skipped_records = 0u64;
         let cap = self.config.retained_per_session;
 
+        // Step 1b: seed from the projection snapshot when one exists and
+        // validates. Log records with seq <= snapshot head are then
+        // skipped during the scan below, so recovery cost is
+        // O(snapshot + tail) instead of O(all events). A corrupt,
+        // unreadable, or unknown-version snapshot logs a warning and
+        // falls back to a full replay — the log stays the source of
+        // truth (fault-tolerance contract).
+        //
+        // ymote P1 (PR #2114 review): the snapshot shortcut must be
+        // CONDITIONAL on the requested replay range. When the caller asks
+        // to replay from a cursor OLDER than the snapshot's oldest entry
+        // (e.g. cursor 2000 while the snapshot ring only covers
+        // 4097..8192), the retained JSONL still holds the pre-snapshot
+        // records and they MUST be replayed — seeding the bounded ring
+        // and skipping everything ≤ head would silently drop
+        // 2001..4096 AND misreport cursor_out_of_range (oldest_seq taken
+        // from the snapshot ring). So: only skip log records up to the
+        // snapshot head when the requested range is fully covered by the
+        // snapshot; otherwise scan the log from seq 0 (the snapshot ring
+        // still seeds the retained ring, but nothing is skipped).
+        let mut skip_through_seq = 0u64;
+        match self.read_session_snapshot(session_id, session_dir) {
+            Ok(Some(snapshot)) => {
+                head_seq = snapshot.head_seq;
+                let snapshot_oldest = snapshot.entries.first().map(|r| r.seq);
+                // Valid ledger seqs start at 1; a snapshot entry with seq 0 is
+                // corrupt and must degrade to the full-replay path (shortcut
+                // off) — never a debug-build panic (the old bare `oldest - 1`)
+                // and never a shortcut seeded from corrupt data. The additive
+                // form `after + 1 >= oldest` avoids the underflow entirely.
+                let shortcut_ok = match replay_after_seq {
+                    // 8d-r1: seq-0 takes the shortcut ONLY on the hydrate
+                    // from_beginning-exempt path (caller flagged it). On
+                    // the session/open replay path (flag false) seq-0 has
+                    // no exemption → fall through to the full-scan rule
+                    // below, which requires after+1 >= oldest (so seq 0 →
+                    // 1 >= oldest, false for a trimmed ring → full JSONL
+                    // scan from seq 1, the pre-cfa8fb15 behaviour).
+                    Some(0) if from_beginning_hydrate => {
+                        snapshot_oldest.is_some_and(|oldest| oldest >= 1)
+                    }
+                    Some(after) => snapshot_oldest
+                        .is_some_and(|oldest| oldest >= 1 && after.saturating_add(1) >= oldest),
+                    // 8d: a from-beginning replay (`after: None` → seq 0)
+                    // is answered by the RETAINED RING alone (the hydrate
+                    // path treats seq-0 as "everything you still retain",
+                    // exempt from the oldest-cursor range check), NOT by a
+                    // full log replay. The snapshot ring IS that retained
+                    // window, so the shortcut applies whenever the snapshot
+                    // is non-empty and valid (oldest >= 1) — even when the
+                    // ring has since trimmed past seq 1 (oldest > 1). Only
+                    // a corrupt/empty snapshot (oldest == 0, caught by the
+                    // seq-0 hardening above) degrades to a full replay.
+                    None => snapshot_oldest.is_some_and(|oldest| oldest >= 1),
+                };
+                if shortcut_ok {
+                    skip_through_seq = snapshot.head_seq;
+                }
+                // NOTE: when the shortcut is disabled we deliberately do
+                // NOT seed anything from the snapshot (see the loop
+                // below) — the log scan rebuilds the full retained ring
+                // and replay in seq order, so there is nothing to dedupe
+                // and snapshot_seeded_floor/oldest stay 0.
+                for record in snapshot.entries {
+                    oldest_seq.get_or_insert(record.seq);
+                    // ymote P1: only the SHORTCUT path materialises the
+                    // snapshot (retained ring + replay_entries). When the
+                    // shortcut is disabled the FULL state (retained ring
+                    // AND replay) is rebuilt by the log scan below in seq
+                    // order — seeding here would duplicate the tail and
+                    // mis-order the pre-snapshot gap in both.
+                    if shortcut_ok {
+                        if replay_after_seq.is_some_and(|after| record.seq > after) {
+                            replay_entries.push(LedgeredUiProtocolEvent {
+                                cursor: UiCursor {
+                                    stream: session_id.0.clone(),
+                                    seq: record.seq,
+                                },
+                                event: record.event.clone(),
+                                from_connection: None,
+                            });
+                        }
+                        let bytes = approx_event_bytes(&record.event);
+                        retained_entries.push_back(LedgerEntry {
+                            seq: record.seq,
+                            event: record.event,
+                            bytes,
+                        });
+                        while retained_entries.len() > cap {
+                            retained_entries.pop_front();
+                        }
+                    }
+                }
+                if !shortcut_ok {
+                    // Pre-snapshot range requested: the snapshot ring only
+                    // seeds the retained window; oldest_seq must be
+                    // re-derived from the FULL log scan below, so reset it
+                    // (its snapshot-derived value would wrongly bound the
+                    // cursor_out_of_range check to the snapshot window).
+                    oldest_seq = None;
+                }
+                debug!(
+                    target = "octos::ledger",
+                    session_id = %session_id.0,
+                    snapshot_head = snapshot.head_seq,
+                    shortcut_ok,
+                    "session recovery seeded from projection snapshot"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target = "octos::ledger",
+                    ?error,
+                    session_id = %session_id.0,
+                    "session snapshot unusable; falling back to full log replay"
+                );
+            }
+        }
+
         for path in log_files {
-            let file = File::open(&path)?;
-            let reader = BufReader::new(file);
+            // Read the whole file once and iterate borrowed line slices:
+            // with a snapshot seeded, the skip path then costs zero
+            // per-line allocations (the dominant recovery cost).
+            let buf = fs::read(&path)?;
             // Aggregate skip counts per file: emit ONE summary `warn!`
             // after the inner loop instead of one line per record per
             // rescan. `read_session_disk_snapshot` re-reads every log
@@ -954,7 +1268,9 @@ impl UiProtocolLedger {
             let mut skipped_unknown_version = 0u64;
             let mut skipped_legacy_message_persisted = 0u64;
             let mut skipped_malformed = 0u64;
-            for line_result in reader.lines() {
+            for line_bytes in buf.split(|b| *b == b'\n') {
+                let line_result: std::io::Result<&str> = std::str::from_utf8(line_bytes)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
                 let line = match line_result {
                     Ok(line) => line,
                     Err(error) => {
@@ -971,13 +1287,31 @@ impl UiProtocolLedger {
                 if line.trim().is_empty() {
                     continue;
                 }
+                // Snapshot-seeded recovery fast path: records at or below
+                // the snapshot head are already materialised in the ring,
+                // so skip the expensive full event parse. We still extract
+                // the record's `seq` cheaply (a tiny partial JSON scan of
+                // the flat leading fields — the disk writer always emits
+                // `{"v":…,"seq":…,"event":…}` in that order) to keep
+                // `head_seq` advancing; a line whose seq can't be cheaply
+                // extracted falls through to the full parse below, which
+                // re-applies the same skip as a safety net.
+                if skip_through_seq > 0 {
+                    if let Some(seq) = cheap_record_seq(line) {
+                        if seq <= skip_through_seq {
+                            oldest_seq.get_or_insert(seq);
+                            head_seq = head_seq.max(seq);
+                            continue;
+                        }
+                    }
+                }
                 // Dual-read the outer event tag: canonical `record_kind`
                 // first, then the strict legacy `envelope`-tagged shim for
                 // pre-#1358 records (see `parse_ledger_disk_record`). Both
                 // parses are derived + strict — no `serde_json::Value`
                 // round-trip — so duplicate-key corruption is still
                 // rejected on either path.
-                let record = match parse_ledger_disk_record(&line) {
+                let record = match parse_ledger_disk_record(line) {
                     Ok(ParsedLedgerDiskRecord::Record(record))
                         if record.v == LEDGER_DISK_VERSION =>
                     {
@@ -1046,6 +1380,14 @@ impl UiProtocolLedger {
 
                 oldest_seq.get_or_insert(record.seq);
                 head_seq = head_seq.max(record.seq);
+
+                if record.seq <= skip_through_seq {
+                    // Already materialised from the projection snapshot
+                    // (shortcut path only — when the shortcut is disabled
+                    // the log scan rebuilds everything, skip_through_seq
+                    // stays 0 and nothing is skipped here).
+                    continue;
+                }
 
                 if replay_after_seq.is_some_and(|after_seq| record.seq > after_seq) {
                     replay_entries.push(LedgeredUiProtocolEvent {
@@ -1315,6 +1657,7 @@ impl UiProtocolLedger {
         envelope_seq: u64,
     ) -> u64 {
         let storage_id = self.storage_session_id(session_id);
+        self.ensure_session_loaded(&storage_id);
         let inner = self
             .inner
             .lock()
@@ -1359,6 +1702,7 @@ impl UiProtocolLedger {
         before_cursor_seq: u64,
     ) -> u64 {
         let storage_id = self.storage_session_id(session_id);
+        self.ensure_session_loaded(&storage_id);
         let inner = self
             .inner
             .lock()
@@ -2074,6 +2418,24 @@ impl UiProtocolLedger {
 
         inner.dropped_count = inner.dropped_count.saturating_add(dropped_now);
 
+        // Step 1b: snapshot cadence. Every `snapshot_every_events` seqs,
+        // persist the session's retained ring so the next recovery loads
+        // the snapshot and replays only the tail. Best-effort: a failed
+        // snapshot write never fails the append (the log is the source of
+        // truth; recovery falls back to a full replay).
+        let cadence = self.config.snapshot_every_events;
+        if cadence > 0 && cursor.seq % cadence == 0 {
+            if let Err(error) = self.write_session_snapshot_locked(session_id, session) {
+                warn!(
+                    target = "octos::ledger",
+                    ?error,
+                    session_id = %session_id.0,
+                    seq = cursor.seq,
+                    "failed to write session projection snapshot; recovery will full-replay"
+                );
+            }
+        }
+
         AppendLockedOutcome {
             cursor,
             stamped,
@@ -2162,6 +2524,11 @@ impl UiProtocolLedger {
 
     fn snapshot_if_session_absent(&self, session_id: &SessionKey) -> Option<DiskSessionSnapshot> {
         self.config.data_dir.as_ref()?;
+        // Lazy recovery: if this session was indexed at boot, replay it
+        // now (first touch) instead of reading a raw snapshot below.
+        if self.ensure_session_loaded(session_id) {
+            return None;
+        }
         {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if inner.sessions.contains_key(session_id) {
@@ -2175,7 +2542,7 @@ impl UiProtocolLedger {
             .as_ref()?
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        match self.read_session_disk_snapshot(session_id, &session_dir, None) {
+        match self.read_session_disk_snapshot(session_id, &session_dir, None, false) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(
@@ -2248,6 +2615,92 @@ impl UiProtocolLedger {
         // documents this as a deliberate tradeoff.
         session.active_log_bytes = session.active_log_bytes.saturating_add(bytes);
         Ok((bytes, reclaimed))
+    }
+
+    /// Write the session's current retained ring to `snapshot.json` next
+    /// to its log files (atomic via tmp + rename). Callers hold `inner`;
+    /// this does NOT take any lock itself.
+    fn write_session_snapshot_locked(
+        &self,
+        session_id: &SessionKey,
+        session: &SessionLedger,
+    ) -> std::io::Result<()> {
+        let Some(dir) = &self.config.data_dir else {
+            return Ok(());
+        };
+        let session_dir = dir
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session_id));
+        fs::create_dir_all(&session_dir)?;
+        let snapshot = SessionSnapshotFile {
+            version: SESSION_SNAPSHOT_VERSION,
+            head_seq: session.next_seq,
+            entries: session
+                .entries
+                .iter()
+                .map(|entry| LedgerDiskRecord {
+                    v: LEDGER_DISK_VERSION,
+                    seq: entry.seq,
+                    event: entry.event.clone(),
+                })
+                .collect(),
+        };
+        let payload = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
+        let tmp_path = session_dir.join(format!("{SESSION_SNAPSHOT_FILE_NAME}.tmp"));
+        let final_path = session_dir.join(SESSION_SNAPSHOT_FILE_NAME);
+        fs::write(&tmp_path, payload)?;
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Read + validate the session's snapshot file. Returns `Ok(None)`
+    /// when absent (zero-migration: pre-1b ledgers simply have no
+    /// snapshot); returns `Err` on unreadable/corrupt/unknown-version
+    /// content so the caller can log and fall back to a full replay.
+    fn read_session_snapshot(
+        &self,
+        session_id: &SessionKey,
+        session_dir: &Path,
+    ) -> std::io::Result<Option<SessionSnapshotFile>> {
+        let path = session_dir.join(SESSION_SNAPSHOT_FILE_NAME);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let snapshot: SessionSnapshotFile = serde_json::from_slice(&bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("corrupt session snapshot {}: {error}", path.display()),
+            )
+        })?;
+        if snapshot.version != SESSION_SNAPSHOT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unknown session snapshot version {} (expected {SESSION_SNAPSHOT_VERSION})",
+                    snapshot.version
+                ),
+            ));
+        }
+        // Sanity: snapshot entries must be seq-ordered and ≤ head_seq —
+        // anything else means a torn write slipped past the tmp+rename.
+        let mut prev = 0u64;
+        for entry in &snapshot.entries {
+            if entry.seq <= prev || entry.seq > snapshot.head_seq {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "session snapshot {} has out-of-order/overrun seq {}",
+                        path.display(),
+                        entry.seq
+                    ),
+                ));
+            }
+            prev = entry.seq;
+        }
+        let _ = session_id;
+        Ok(Some(snapshot))
     }
 
     /// Rotate the session's active log file and trim retained history.
@@ -2378,6 +2831,24 @@ impl UiProtocolLedger {
         inner.sessions.contains_key(&session_id)
     }
 
+    /// Test helper: number of lazy disk replays performed so far.
+    #[cfg(test)]
+    pub(crate) fn lazy_replay_count_for_test(&self) -> usize {
+        self.lazy_replays.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test helper: is this session's index entry latched as failed?
+    #[cfg(test)]
+    pub(crate) fn index_failed_for_test(&self, session_id: &SessionKey) -> bool {
+        let session_id = self.storage_session_id(session_id);
+        self.index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&session_id)
+            .map(|entry| entry.failed)
+            .unwrap_or(false)
+    }
+
     /// Snapshot of the observability counters. Useful for tests and the
     /// `/metrics` endpoint integration.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2444,6 +2915,10 @@ impl UiProtocolLedger {
             }
         };
         validate_cursor_stream(session_id, after)?;
+
+        // Lazy recovery: first touch of a boot-indexed session replays its
+        // disk log into the ring before we evaluate the preload condition.
+        self.ensure_session_loaded(session_id);
 
         // Pre-load disk snapshot for sessions whose ring has dropped
         // below `after`. We do this before the lock to avoid blocking
@@ -2575,7 +3050,7 @@ impl UiProtocolLedger {
         let session_dir = data_dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        match self.read_session_disk_snapshot(session_id, &session_dir, Some(after.seq)) {
+        match self.read_session_disk_snapshot(session_id, &session_dir, Some(after.seq), true) {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 warn!(
@@ -2617,6 +3092,10 @@ impl UiProtocolLedger {
         // Per-project STORAGE identity (no-op without a registered scope) —
         // see `snapshot_with_cursor`. Callers pass the plain wire id.
         let session_id = &self.storage_session_id(session_id);
+        // Lazy recovery: even a "live only" caller needs the head seq of a
+        // boot-indexed session, so replay-on-first-touch runs before any
+        // branch below reads `next_seq`.
+        self.ensure_session_loaded(session_id);
         let Some(after) = after else {
             // No `after` — caller asked for "live only", no replay history.
             // Pair the empty replay with the current head_seq so the
@@ -2699,7 +3178,7 @@ impl UiProtocolLedger {
         }
 
         let snapshot = self
-            .read_session_disk_snapshot(session_id, &session_dir, Some(after.seq))
+            .read_session_disk_snapshot(session_id, &session_dir, Some(after.seq), false)
             .map_err(|error| {
                 warn!(
                     target = "octos::ledger",
@@ -2973,6 +3452,29 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
 // SessionKey may contain characters illegal on common filesystems
 // (`:`, `/`, etc.). We hex-encode a stable representation so the
 // session dir name is reversible and collision-free.
+
+/// Cheaply extract the top-level `seq` from a ledger disk line WITHOUT
+/// parsing the nested event payload. The writer (`write_record_locked`)
+/// always serialises the flat struct in field order
+/// `{"v":…,"seq":N,"event":…}`, so a byte scan for `"seq":` before the
+/// `"event"` key suffices. Returns `None` for any shape we don't
+/// recognise — callers then fall back to the full strict parse.
+fn cheap_record_seq(line: &str) -> Option<u64> {
+    let seq_key = line.find("\"seq\":")?;
+    let event_key = line.find("\"event\"")?;
+    if seq_key > event_key {
+        return None; // nested/foreign layout — not our writer's shape
+    }
+    let start = seq_key + "\"seq\":".len();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 fn encode_session_dir_name(session_id: &SessionKey) -> String {
     let mut out = String::with_capacity(session_id.0.len() * 2);
@@ -3378,10 +3880,20 @@ mod tests {
             assert_eq!(metrics.sessions_active, 1);
             assert!(metrics.bytes_on_disk > 0);
         }
-        // Second boot: drop the in-memory ledger, recover from disk.
+        // Second boot: drop the in-memory ledger, lazily recover from disk.
+        // Lazy recovery (step 1a): boot indexes the session but replays
+        // NOTHING — the ring is empty until first touch.
         let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
-        assert_eq!(outcome.sessions_recovered, 1);
-        assert_eq!(outcome.events_recovered, 3);
+        assert_eq!(outcome.sessions_recovered, 1, "session indexed at boot");
+        assert_eq!(
+            outcome.events_recovered, 0,
+            "lazy recovery replays no events at boot"
+        );
+        assert!(
+            !outcome.ledger.has_session_in_memory_for_test(&session_id),
+            "indexed session must not be resident before first touch"
+        );
+        // First touch replays this session's log.
         let replay = outcome
             .ledger
             .replay_after(
@@ -3428,7 +3940,10 @@ mod tests {
         let outcome = UiProtocolLedger::recover(config);
 
         assert_eq!(outcome.sessions_recovered, 1);
-        assert_eq!(outcome.events_recovered, 6);
+        assert_eq!(
+            outcome.events_recovered, 0,
+            "lazy recovery indexes rotated logs without replaying them"
+        );
         let replay = outcome
             .ledger
             .replay_after(
@@ -3936,6 +4451,646 @@ mod tests {
             .expect("replay after simulated crash");
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].cursor, returned_cursor);
+    }
+
+    // ---- Lazy recovery (perf/ledger-lazy-recovery, step 1a) -------------
+    // Acceptance scenarios from .octos/OUTER_LOOP_REVIEW.md §1a.
+
+    /// Scenario 1: cold boot that touches nothing replays NOTHING — boot
+    /// only builds the index; no session is resident; zero lazy replays.
+    #[test]
+    fn lazy_recovery_boot_indexes_without_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let s1 = SessionKey("local:lazy-boot-1".into());
+        let s2 = SessionKey("local:lazy-boot-2".into());
+        {
+            let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+            for i in 0..5 {
+                ledger.append_notification(delta(&s1, &format!("a-{i}")));
+                ledger.append_notification(delta(&s2, &format!("b-{i}")));
+            }
+        }
+        let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        assert_eq!(outcome.sessions_recovered, 2, "both sessions indexed");
+        assert_eq!(
+            outcome.events_recovered, 0,
+            "boot must NOT replay any events"
+        );
+        assert_eq!(outcome.ledger.lazy_replay_count_for_test(), 0);
+        assert!(!outcome.ledger.has_session_in_memory_for_test(&s1));
+        assert!(!outcome.ledger.has_session_in_memory_for_test(&s2));
+        let m = outcome.ledger.metrics();
+        assert_eq!(m.sessions_active, 0, "no session resident after boot");
+    }
+
+    /// Scenario 2 (equivalence): hydrate of a lazily-recovered session
+    /// must be field-for-field identical to the eager full-replay
+    /// projection of the same on-disk ledger.
+    #[test]
+    fn lazy_recovery_projection_equivalent_to_eager_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:lazy-equiv".into());
+        {
+            let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+            for i in 0..20 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        // Eager reference path: read the disk snapshot directly (what the
+        // old boot-time recover did) and hydrate a fresh in-memory session.
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        let reference = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+        let snapshot = reference
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
+            .expect("read snapshot")
+            .expect("snapshot exists");
+        let mut reference_session = SessionLedger::new();
+        hydrate_session_from_snapshot(&mut reference_session, snapshot);
+        let reference_entries: Vec<String> = reference_session
+            .entries
+            .iter()
+            .map(|entry| format!("{:?}", entry))
+            .collect();
+
+        // Lazy path: boot-index, then hydrate on first touch.
+        let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        let (events, head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("lazy hydrate");
+        assert_eq!(events.len(), 20);
+        assert_eq!(head.seq, 20);
+        let lazy_entries: Vec<String> = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("second hydrate")
+            .0
+            .iter()
+            .map(|entry| format!("{:?}", entry))
+            .collect();
+        // Both paths must produce the same event payloads in order.
+        let lazy_texts = replay_texts(
+            &outcome
+                .ledger
+                .snapshot_with_cursor(&session_id, None)
+                .unwrap()
+                .0,
+        );
+        let expected: Vec<String> = (0..20).map(|i| format!("ev-{i}")).collect();
+        assert_eq!(lazy_texts, expected);
+        assert_eq!(
+            lazy_entries.len(),
+            reference_entries.len(),
+            "lazy and eager projections must have identical entry counts"
+        );
+        assert!(
+            outcome.ledger.has_session_in_memory_for_test(&session_id),
+            "touched session must be cached in the ring"
+        );
+    }
+
+    /// Scenario 3: touching session A must never replay session B.
+    #[test]
+    fn lazy_recovery_touch_a_does_not_replay_b() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let a = SessionKey("local:lazy-a".into());
+        let b = SessionKey("local:lazy-b".into());
+        {
+            let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+            for i in 0..3 {
+                ledger.append_notification(delta(&a, &format!("a-{i}")));
+            }
+            for i in 0..7 {
+                ledger.append_notification(delta(&b, &format!("b-{i}")));
+            }
+        }
+        let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        assert_eq!(outcome.ledger.lazy_replay_count_for_test(), 0);
+        // Touch A twice.
+        let (events_a, _) = outcome
+            .ledger
+            .snapshot_with_cursor(&a, None)
+            .expect("hydrate A");
+        assert_eq!(replay_texts(&events_a), vec!["a-0", "a-1", "a-2"]);
+        let _ = outcome
+            .ledger
+            .snapshot_with_cursor(&a, None)
+            .expect("A cached");
+        assert_eq!(
+            outcome.ledger.lazy_replay_count_for_test(),
+            1,
+            "exactly one lazy replay (A on first touch; second touch hits cache)"
+        );
+        assert!(
+            !outcome.ledger.has_session_in_memory_for_test(&b),
+            "B must remain untouched on disk"
+        );
+        // Now touch B: one more replay, A unaffected.
+        let (events_b, head_b) = outcome
+            .ledger
+            .snapshot_with_cursor(&b, None)
+            .expect("hydrate B");
+        assert_eq!(events_b.len(), 7);
+        assert_eq!(head_b.seq, 7);
+        assert_eq!(outcome.ledger.lazy_replay_count_for_test(), 2);
+    }
+
+    /// Scenario 4: a corrupt single-session ledger makes ONLY that session
+    /// unavailable — boot and other sessions proceed normally; the failure
+    /// is latched (no rescan storm on repeated touches).
+    #[test]
+    fn lazy_recovery_corrupt_session_isolated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let good = SessionKey("local:lazy-good".into());
+        let bad = SessionKey("local:lazy-bad".into());
+        {
+            let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
+            for i in 0..4 {
+                ledger.append_notification(delta(&good, &format!("g-{i}")));
+            }
+            for i in 0..4 {
+                ledger.append_notification(delta(&bad, &format!("x-{i}")));
+            }
+        }
+        // Corrupt the bad session's log directory: a subdirectory NAMED
+        // like a log file. `list_log_files` only picks `is_file()` entries
+        // on its top-level pass, so a directory alone would be silently
+        // skipped — instead we poison the scan by making `read_dir` itself
+        // fail: remove read permission from the session dir. That makes
+        // `list_log_files` (and any sibling scan) return Err(PermissionDenied),
+        // which `read_session_disk_snapshot` propagates as Err → the index
+        // entry latches `failed`.
+        let bad_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&bad));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bad_dir).expect("meta").permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(&bad_dir, perms).expect("chmod 000");
+        }
+        #[cfg(not(unix))]
+        {
+            // Portable fallback: drop a directory named like the active
+            // log so the sorted-last "active" path cannot be opened as a
+            // file, then remove the real files.
+            for entry in fs::read_dir(&bad_dir).expect("list bad dir").flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    fs::remove_file(&path).expect("remove log");
+                    fs::create_dir(&path).expect("dir named like log");
+                }
+            }
+        }
+        let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        assert_eq!(
+            outcome.sessions_recovered, 2,
+            "boot indexes both sessions; corruption must not block boot"
+        );
+        // Good session fully usable.
+        let (events_good, head_good) = outcome
+            .ledger
+            .snapshot_with_cursor(&good, None)
+            .expect("good session hydrates");
+        assert_eq!(replay_texts(&events_good), vec!["g-0", "g-1", "g-2", "g-3"]);
+        assert_eq!(head_good.seq, 4);
+        // Bad session: read fails, session stays out of memory, failure latched.
+        let (events_bad, _) = outcome
+            .ledger
+            .snapshot_with_cursor(&bad, None)
+            .expect("bad session must not error the whole hydrate path");
+        assert!(events_bad.is_empty());
+        assert!(outcome.ledger.index_failed_for_test(&bad));
+        // Repeated touches do not rescan (failure latched).
+        let _ = outcome.ledger.snapshot_with_cursor(&bad, None);
+        assert_eq!(
+            outcome.ledger.lazy_replay_count_for_test(),
+            1,
+            "only the good session replayed; the bad one never retries"
+        );
+        // Appends to the good session continue unaffected.
+        let next = outcome.ledger.append_notification(delta(&good, "g-4"));
+        assert_eq!(next.cursor.seq, 5);
+    }
+
+    // ---- Per-session snapshots (perf/ledger-snapshot, step 1b) ---------
+    // Acceptance scenarios from .octos/OUTER_LOOP_REVIEW.md §1b.
+
+    fn snapshot_config(data_dir: &Path, every: u64) -> LedgerConfig {
+        let mut config = LedgerConfig::durable(data_dir.into());
+        config.snapshot_every_events = every;
+        config
+    }
+
+    fn snapshot_file_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
+        data_dir
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session_id))
+            .join(SESSION_SNAPSHOT_FILE_NAME)
+    }
+
+    /// #8d — ring already trimmed (oldest > 1) + cold-start hydrate(None):
+    /// the snapshot shortcut MUST apply (no full replay) because
+    /// hydrate(None) is answered by the retained ring alone. And a corrupt
+    /// snapshot whose oldest entry is seq 0 MUST still degrade to a full
+    /// replay.
+    #[test]
+    fn snapshot_shortcut_applies_to_trimmed_ring_from_beginning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:8d-trimmed".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        // ring=2, snapshot_every=2 → snapshot at seq 4 covers seq 3..4
+        // (trimmed past seq 1: oldest=3 > 1).
+        let mut config = snapshot_config(temp.path(), 2);
+        config.retained_per_session = 2;
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for i in 1..=5 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let raw: Value = serde_json::from_slice(
+            &fs::read(snapshot_file_path(temp.path(), &session_id)).expect("snapshot"),
+        )
+        .expect("json");
+        assert_eq!(raw["head_seq"], 4);
+        let oldest_in_snap = raw["entries"][0]["seq"].as_u64().expect("oldest");
+        assert!(oldest_in_snap > 1, "ring must be trimmed (oldest > 1)");
+
+        // Cold-start hydrate(None): read_session_disk_snapshot with
+        // replay_after_seq=None — the shortcut must apply: the snapshot
+        // seeds the ring and the log scan skips everything ≤ snapshot
+        // head (4), replaying only the tail (seq 5). head_seq reflects
+        // snapshot+tail (5), retained ring = snapshot(3,4)+tail(5) capped
+        // to 2 → (4,5). This is the O(snapshot+tail) path, NOT a full
+        // O(all-events) replay — verified by the retained ring coming
+        // from the snapshot seed, not the full log.
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        let snap = ledger
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
+            .expect("read ok")
+            .expect("snapshot");
+        assert_eq!(snap.head_seq, 5, "snapshot head 4 + log tail 5");
+        let ring_seqs: Vec<u64> = snap.retained_entries.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            ring_seqs,
+            vec![4, 5],
+            "retained ring = snapshot seed (3,4) + tail (5), capped to 2"
+        );
+
+        // seq-0 (from-beginning via the replay path) also shortcuts.
+        let ledger2 = UiProtocolLedger::with_config(config.clone());
+        let snap0 = ledger2
+            .read_session_disk_snapshot(&session_id, &session_dir, Some(0), true)
+            .expect("read ok")
+            .expect("snapshot");
+        assert_eq!(snap0.head_seq, 5, "seq-0 from-beginning also shortcuts");
+
+        // Corrupt: a snapshot whose oldest entry is seq 0 MUST degrade to
+        // a full replay (log head 5).
+        let bad = json!({
+            "version": SESSION_SNAPSHOT_VERSION,
+            "head_seq": 4,
+            "entries": [
+                {"v": 1, "seq": 0, "event": raw["entries"][0]["event"]},
+                {"v": 1, "seq": 4, "event": raw["entries"][1]["event"]},
+            ],
+        });
+        fs::write(
+            snapshot_file_path(temp.path(), &session_id),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .expect("write corrupt snapshot");
+        let ledger3 = UiProtocolLedger::with_config(config);
+        let snap_bad = ledger3
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
+            .expect("read ok")
+            .expect("snapshot");
+        assert_eq!(
+            snap_bad.head_seq, 5,
+            "corrupt seq-0 snapshot must degrade to full replay"
+        );
+    }
+
+    /// 8d-r1 ①/② — session/open {after:{seq:0}} on a TRIMMED snapshot
+    /// (oldest>1) with JSONL still holding seq 1: the snapshot shortcut
+    /// must NOT apply (session/open has no from_beginning exemption) →
+    /// full JSONL scan, replay from seq 1, no cursor_out_of_range.
+    /// Meanwhile session/hydrate from-beginning (read_disk_snapshot_for_
+    /// replay, seq-0 exempt) keeps the retained-window shortcut. And
+    /// replay_after_with_head(None) live-only semantics are unaffected.
+    #[test]
+    fn session_open_seq0_full_replays_but_hydrate_shortcuts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:8d-r1".into());
+        // ring=2, snapshot at seq 4 (covers seq 3..4; JSONL holds 1..5).
+        let mut config = snapshot_config(temp.path(), 2);
+        config.retained_per_session = 2;
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for i in 1..=5 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let raw: Value = serde_json::from_slice(
+            &fs::read(snapshot_file_path(temp.path(), &session_id)).expect("snapshot"),
+        )
+        .expect("json");
+        assert!(raw["entries"][0]["seq"].as_u64().expect("oldest") > 1);
+
+        // (a) session/open replay path: replay_after {seq:0} → full JSONL
+        // scan from seq 1 (shortcut OFF), no error.
+        let ledger = UiProtocolLedger::with_config(config.clone());
+        let cursor0 = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 0,
+        };
+        let replay = ledger
+            .replay_after(&session_id, Some(&cursor0))
+            .expect("session/open seq-0 must not be cursor_out_of_range");
+        let seqs: Vec<u64> = replay.iter().map(|e| e.cursor.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5],
+            "session/open seq-0 must full-replay from seq 1"
+        );
+
+        // (b) hydrate from-beginning (read_disk_snapshot_for_replay) keeps
+        // the retained-window shortcut: same data dir, snapshot seeds the
+        // ring and the log scan skips ≤ snapshot head (only the tail 5 is
+        // replayed from disk).
+        let ledger2 = UiProtocolLedger::with_config(config.clone());
+        let (events, head) = ledger2
+            .snapshot_with_cursor(&session_id, None)
+            .expect("hydrate from-beginning");
+        assert_eq!(head.seq, 5);
+        // The hydrate projection comes from the snapshot-seeded ring + tail.
+        let hseqs: Vec<u64> = events.iter().map(|e| e.cursor.seq).collect();
+        assert_eq!(
+            hseqs,
+            vec![4, 5],
+            "hydrate keeps the retained window (snapshot seed 3,4 + tail 5, capped to 2)"
+        );
+
+        // (c) replay_after_with_head(None) live-only: unaffected — on an
+        // already-hydrated session it returns an empty replay paired with
+        // the current head (no full scan, no replayed history).
+        let (live_events, live_head) = ledger2
+            .replay_after_with_head(&session_id, None)
+            .expect("live-only after None");
+        assert!(live_events.is_empty(), "after=None is live-only, no replay");
+        assert_eq!(live_head, 5);
+    }
+
+    /// ymote P1 regression (PR #2114 review): ring=2, snapshot at seq 4 —
+    /// replay after seq 1 MUST return seq 2..5. The snapshot shortcut
+    /// must NOT skip the pre-snapshot range (the retained JSONL still
+    /// holds it), and oldest_seq must come from the full log so the
+    /// cursor is not falsely reported out_of_range. Note the pre-existing
+    /// equivalence test could not catch this hole because it ran with
+    /// snapshot_every_events=0 on the reference path (which disables
+    /// snapshot WRITES but not the snapshot READ being tested here).
+    #[test]
+    fn snapshot_shortcut_replays_pre_snapshot_range() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:ymote-p1".into());
+        let session_dir = temp
+            .path()
+            .join("ui-protocol")
+            .join(encode_session_dir_name(&session_id));
+        // ring=2 (retained_per_session=2), snapshot_every=4 → snapshot at seq 4.
+        let mut config = snapshot_config(temp.path(), 4);
+        config.retained_per_session = 2;
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            for i in 1..=5 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        // Snapshot file exists with head 4, ring covers only seq 3..4
+        // (retained 2); the JSONL log still holds seq 1..5.
+        let raw: Value = serde_json::from_slice(
+            &fs::read(snapshot_file_path(temp.path(), &session_id)).expect("snapshot"),
+        )
+        .expect("snapshot json");
+        assert_eq!(raw["head_seq"], 4, "snapshot at seq 4");
+
+        // Replay after seq 1 → must return seq 2,3,4,5 (NOT 5 only, NOT
+        // cursor_out_of_range). Drive read_session_disk_snapshot directly
+        // with replay_after_seq = Some(1).
+        let ledger = UiProtocolLedger::with_config(config);
+        let snap = ledger
+            .read_session_disk_snapshot(&session_id, &session_dir, Some(1), false)
+            .expect("read ok")
+            .expect("snapshot exists");
+        let seqs: Vec<u64> = snap.replay_entries.iter().map(|e| e.cursor.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 3, 4, 5],
+            "pre-snapshot range must be replayed from the retained log"
+        );
+        // oldest_seq from the FULL log (1), not the snapshot ring (3), so
+        // a cursor at seq 1 is not falsely out_of_range.
+        assert_eq!(snap.oldest_seq, Some(1));
+        assert_eq!(snap.head_seq, 5);
+    }
+
+    /// Scenario 1 (equivalence): snapshot+tail recovery must produce a
+    /// projection field-for-field identical to a full replay of the same
+    /// ledger — and the snapshot file must exist with the right head.
+    #[test]
+    fn snapshot_plus_tail_equivalent_to_full_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-equiv".into());
+        {
+            let ledger = UiProtocolLedger::with_config(snapshot_config(temp.path(), 4));
+            for i in 1..=11 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let snap_path = snapshot_file_path(temp.path(), &session_id);
+        assert!(snap_path.exists(), "snapshot must be written at seq 4 & 8");
+        let raw: Value =
+            serde_json::from_slice(&fs::read(&snap_path).expect("read snapshot")).unwrap();
+        assert_eq!(raw["version"], SESSION_SNAPSHOT_VERSION as u64);
+        assert_eq!(raw["head_seq"], 8, "latest snapshot head after 11 events");
+
+        // Snapshot+tail path (lazy recover then hydrate).
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 4));
+        let (snap_events, snap_head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("snapshot+tail hydrate");
+        // Full-replay reference: snapshotting disabled.
+        let mut full_config = snapshot_config(temp.path(), 4);
+        full_config.snapshot_every_events = 0;
+        let reference = UiProtocolLedger::recover(full_config);
+        let (full_events, full_head) = reference
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("full replay hydrate");
+
+        assert_eq!(snap_head, full_head);
+        let snap_dbg: Vec<String> = snap_events.iter().map(|e| format!("{e:?}")).collect();
+        let full_dbg: Vec<String> = full_events.iter().map(|e| format!("{e:?}")).collect();
+        assert_eq!(
+            snap_dbg, full_dbg,
+            "snapshot+tail projection must equal full-replay projection"
+        );
+        assert_eq!(replay_texts(&snap_events).len(), 11);
+        // Next append continues the seq space correctly.
+        let next = outcome
+            .ledger
+            .append_notification(delta(&session_id, "ev-12"));
+        assert_eq!(next.cursor.seq, 12);
+    }
+
+    /// Scenario 2 (fault tolerance): a corrupt snapshot must NOT lose data
+    /// — recovery logs a warning and falls back to a full replay.
+    #[test]
+    fn corrupt_snapshot_falls_back_to_full_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-corrupt".into());
+        {
+            let ledger = UiProtocolLedger::with_config(snapshot_config(temp.path(), 2));
+            for i in 1..=6 {
+                ledger.append_notification(delta(&session_id, &format!("ev-{i}")));
+            }
+        }
+        let snap_path = snapshot_file_path(temp.path(), &session_id);
+        assert!(snap_path.exists());
+        fs::write(&snap_path, b"{ not json !!").expect("corrupt snapshot");
+
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 2));
+        let (events, head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("corrupt snapshot must not break recovery");
+        assert_eq!(head.seq, 6);
+        assert_eq!(
+            replay_texts(&events),
+            vec!["ev-1", "ev-2", "ev-3", "ev-4", "ev-5", "ev-6"],
+            "full replay must recover everything despite corrupt snapshot"
+        );
+
+        // Unknown-version snapshot also falls back.
+        fs::write(
+            &snap_path,
+            serde_json::to_vec(&json!({
+                "version": 999,
+                "head_seq": 6,
+                "entries": [],
+            }))
+            .unwrap(),
+        )
+        .expect("write unknown-version snapshot");
+        let outcome2 = UiProtocolLedger::recover(snapshot_config(temp.path(), 2));
+        let (events2, head2) = outcome2
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("unknown-version snapshot must fall back");
+        assert_eq!(head2.seq, 6);
+        assert_eq!(replay_texts(&events2).len(), 6);
+    }
+
+    /// Scenario 3 (zero migration): a pre-1b ledger with NO snapshot file
+    /// reads exactly as before.
+    #[test]
+    fn ledger_without_snapshot_reads_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-none".into());
+        {
+            let mut config = snapshot_config(temp.path(), 4);
+            config.snapshot_every_events = 0; // simulate a pre-1b writer
+            let ledger = UiProtocolLedger::with_config(config);
+            for i in 1..=7 {
+                ledger.append_notification(delta(&session_id, &format!("old-{i}")));
+            }
+        }
+        assert!(
+            !snapshot_file_path(temp.path(), &session_id).exists(),
+            "pre-1b ledger has no snapshot file"
+        );
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 4));
+        let (events, head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("legacy ledger must replay fully");
+        assert_eq!(head.seq, 7);
+        assert_eq!(replay_texts(&events).len(), 7);
+        // And once the new writer touches it, snapshots start appearing.
+        for i in 8..=12 {
+            outcome
+                .ledger
+                .append_notification(delta(&session_id, &format!("new-{i}")));
+        }
+        assert!(
+            snapshot_file_path(temp.path(), &session_id).exists(),
+            "snapshot appears at the next cadence boundary (seq 8/12)"
+        );
+    }
+
+    /// Outer-review 1b fix: an existing (pre-1b) ledger with NO snapshot
+    /// must earn a bootstrap snapshot on its first touch (the full-replay
+    /// path), so the SECOND recovery runs snapshot+tail — the operator's
+    /// 45MB main session never waits for the append cadence.
+    #[test]
+    fn existing_ledger_bootstraps_snapshot_on_first_touch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:snap-bootstrap".into());
+        {
+            let mut config = snapshot_config(temp.path(), 4096);
+            config.snapshot_every_events = 0; // pre-1b writer: no snapshots
+            let ledger = UiProtocolLedger::with_config(config);
+            for i in 1..=10 {
+                ledger.append_notification(delta(&session_id, &format!("old-{i}")));
+            }
+        }
+        let snap_path = snapshot_file_path(temp.path(), &session_id);
+        assert!(!snap_path.exists(), "pre-1b ledger has no snapshot");
+
+        // First touch under the 1b writer: full replay happens AND the
+        // bootstrap snapshot is written immediately.
+        let outcome = UiProtocolLedger::recover(snapshot_config(temp.path(), 4096));
+        let (events, head) = outcome
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("first touch hydrates");
+        assert_eq!(head.seq, 10);
+        assert_eq!(replay_texts(&events).len(), 10);
+        assert!(
+            snap_path.exists(),
+            "full replay must bootstrap-write snapshot.json on first touch"
+        );
+        let raw: Value =
+            serde_json::from_slice(&fs::read(&snap_path).expect("read snapshot")).unwrap();
+        assert_eq!(raw["version"], SESSION_SNAPSHOT_VERSION as u64);
+        assert_eq!(raw["head_seq"], 10);
+
+        // Second recovery: projection still equivalent (snapshot+tail
+        // path — the bootstrap snapshot is used, logs only contribute
+        // the empty tail).
+        drop(outcome);
+        let outcome2 = UiProtocolLedger::recover(snapshot_config(temp.path(), 4096));
+        let (events2, head2) = outcome2
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("second recovery hydrates from snapshot+tail");
+        assert_eq!(head2.seq, 10);
+        let dbg1: Vec<String> = events.iter().map(|e| format!("{e:?}")).collect();
+        let dbg2: Vec<String> = events2.iter().map(|e| format!("{e:?}")).collect();
+        assert_eq!(
+            dbg1, dbg2,
+            "snapshot+tail projection must match full replay"
+        );
     }
 
     #[test]
@@ -5126,7 +6281,7 @@ mod tests {
 
         let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         let snapshot = ledger
-            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
             .expect("scan ok");
         // An empty snapshot (`None`) is also acceptable (nothing
         // recovered); when present it must show zero recovered + one skip.
@@ -5169,9 +6324,11 @@ mod tests {
 
         let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
         assert_eq!(
-            outcome.events_recovered, 3,
-            "all 3 legacy `envelope`-tagged records must be recovered, not skipped"
+            outcome.events_recovered, 0,
+            "lazy recovery indexes the legacy session without replaying it"
         );
+        assert_eq!(outcome.sessions_recovered, 1);
+        // First touch replays all 3 legacy `envelope`-tagged records.
         let replay = outcome
             .ledger
             .replay_after(
@@ -5223,7 +6380,7 @@ mod tests {
 
         let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         let snapshot = ledger
-            .read_session_disk_snapshot(&session_id, &session_dir, None)
+            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
             .expect("scan ok")
             .expect("non-empty snapshot");
 

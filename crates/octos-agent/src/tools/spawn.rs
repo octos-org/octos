@@ -968,6 +968,11 @@ async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPay
         // Context injection is a `user_prompt_submit`-only outcome; a spawn
         // lifecycle event never produces it, but the match must be exhaustive.
         HookResult::Context(_) => {}
+        // Feedback is an AfterToolCall-only outcome; spawn lifecycle events
+        // have no tool result to append it to — log and continue.
+        HookResult::Feedback(entries) => {
+            warn!(event = ?event, count = entries.len(), "lifecycle hook produced feedback; ignored");
+        }
         HookResult::Deny(reason) => {
             warn!(
                 event = ?event,
@@ -1030,6 +1035,8 @@ async fn run_before_spawn_verify_hook(
         // `before_spawn_verify` never yields context injection (that is a
         // `user_prompt_submit`-only outcome); treat it like a plain allow.
         HookResult::Context(_) => Ok(default_files),
+        // Feedback is an AfterToolCall-only outcome; never arises here.
+        HookResult::Feedback(_) => Ok(default_files),
         HookResult::Deny(reason) => Err(reason),
         HookResult::Error(error) => {
             warn!(

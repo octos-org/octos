@@ -14,7 +14,8 @@ use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle, resolve_workspace_file_handle,
 };
-#[cfg(test)]
+// `Message` is used by non-test lib code (`dedupe_history_rows` below),
+// so this import must not be test-gated.
 use octos_core::Message;
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
@@ -2164,6 +2165,28 @@ async fn serve_file_impl(
 /// [`standalone_api_session_key_candidates_with_topic`] is for the
 /// process-wide `state.sessions`, where bare keys could theoretically
 /// match a JSONL written by a different tenant.
+/// Refs #2102: collapse exact double-persisted rows (NEW-16 re-entry class)
+/// before they are mapped for a page payload. Adjacent byte-identical rows
+/// (same role, thread_id, content, timestamp) are by construction double
+/// appends — `Message` rows carry no explicit seq field, so tuple identity
+/// within a contiguous run is the durable row identity available here.
+fn dedupe_history_rows(history: &[Message]) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(history.len());
+    for m in history {
+        if let Some(last) = out.last() {
+            if last.role == m.role
+                && last.thread_id == m.thread_id
+                && last.content == m.content
+                && last.timestamp == m.timestamp
+            {
+                continue;
+            }
+        }
+        out.push(m.clone());
+    }
+    out
+}
+
 async fn read_profile_session_messages(
     profile_data_dir: &std::path::Path,
     session_id: &str,
@@ -2188,8 +2211,15 @@ async fn read_profile_session_messages(
         if session.get_history(1).is_empty() {
             continue;
         }
-        let messages: Vec<MessageInfo> = session
-            .get_history(fetch_count)
+        // Refs #2102: collapse exact double-persisted rows (NEW-16 re-entry
+        // class) before the `MessageInfo` mapping. `Message` rows carry no
+        // explicit seq (seq is append-order derived), so byte-identical
+        // consecutive (role, thread_id, content, timestamp) tuples inside one
+        // history window are by construction double-appends. Adjacency is
+        // required so legitimately repeated user text in different turns is
+        // never collapsed.
+        let deduped = dedupe_history_rows(session.get_history(fetch_count));
+        let messages: Vec<MessageInfo> = deduped
             .iter()
             .skip(offset)
             .take(limit)

@@ -74,6 +74,10 @@ impl LlmProvider for SemaphoreThrottledProvider {
         }))
     }
 
+    async fn ensure_ready(&self) {
+        self.inner.ensure_ready().await;
+    }
+
     fn context_window(&self) -> u32 {
         self.inner.context_window()
     }

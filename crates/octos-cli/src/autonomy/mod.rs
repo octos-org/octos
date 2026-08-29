@@ -12,6 +12,7 @@
 //! their `crate::autonomy::…` paths.
 
 pub(crate) mod agent_orchestrator;
+pub(crate) mod escalation_notify;
 pub(crate) mod fleet_wake;
 pub(crate) mod goal_loop_runtime;
 pub(crate) mod human_events;

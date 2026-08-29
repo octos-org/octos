@@ -630,6 +630,43 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with typed execution context.
     ///
+    /// How the model can retrieve output the harness had to truncate.
+    ///
+    /// Returns the advice to append when this tool's result exceeded
+    /// [`octos_core::tool_output_limit`] and was cut. `None` (the default)
+    /// means the tool has no resume path, so no advice is offered rather than
+    /// inventing one.
+    ///
+    /// ## Why this lives on the tool
+    ///
+    /// Truncation happens in the execution loop, at the one point every tool's
+    /// output funnels through — which is also the point that knows the least.
+    /// By then the result is a plain `String`: the helper doing the cutting
+    /// (`truncate_head_tail(s, max_len, head_ratio)`) receives a string and a
+    /// number and cannot know which tool produced it, whether that tool paginates,
+    /// or what the parameter is called.
+    ///
+    /// So the loop knows it truncated but not how to resume; the tool knows how
+    /// to resume but not that it was truncated. This hook is the missing half.
+    ///
+    /// Without it the model is told only `... [47000 bytes omitted] ...` — a
+    /// dead end whose only recovery is re-running the call, which returns the
+    /// same output cut the same way and spends the tokens the cap was meant to
+    /// save.
+    ///
+    /// # Arguments
+    /// * `args` - the arguments this call was made with, so advice can name a
+    ///   concrete next call rather than a generic one.
+    /// * `omitted_bytes` - how much was dropped.
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let _ = (args, omitted_bytes);
+        None
+    }
+
     /// The default implementation delegates to [`Tool::execute`], discarding
     /// the context. Tools that want to read [`ToolContext`] fields override
     /// this and ignore `execute`'s default path. See the module-level doc
@@ -728,6 +765,8 @@ pub trait Tool: Send + Sync {
 }
 
 // Tool registry (extracted to its own module)
+/// Observe-only probe for the read-paging decision (changes no behaviour).
+pub(crate) mod read_paging_probe;
 mod registry;
 pub use registry::ToolRegistry;
 
@@ -778,6 +817,7 @@ pub mod peer_respond;
 pub mod peer_send_input;
 pub mod read_file;
 pub mod read_task_output;
+pub mod recall;
 pub mod recall_memory;
 pub mod record_memory_use;
 pub(crate) mod replacer;
@@ -850,6 +890,7 @@ pub use peer_respond::{
 pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
+pub use recall::{RecallTool, ToolOutputLedger};
 pub use recall_memory::RecallMemoryTool;
 pub use record_memory_use::RecordMemoryUseTool;
 pub use save_memory::SaveMemoryTool;

@@ -118,6 +118,41 @@ impl Tool for ReadFileTool {
         })
     }
 
+    /// `read_file` paginates, so a truncated read has a real next call.
+    ///
+    /// The advice names `offset`/`limit` explicitly and echoes the range that
+    /// was just read, because "output was truncated" alone leaves the model
+    /// re-issuing the identical call.
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let start = args
+            .get("offset")
+            .or_else(|| args.get("start_line"))
+            .and_then(serde_json::Value::as_u64);
+        let limit = args.get("limit").and_then(serde_json::Value::as_u64);
+        Some(match (start, limit) {
+            (Some(start), Some(limit)) => format!(
+                "[{omitted_bytes} bytes omitted] This read started at line {start} with limit \
+                 {limit}. Continue with offset: {} to read on, or lower limit to read less per \
+                 call.",
+                start + limit
+            ),
+            (Some(start), None) => format!(
+                "[{omitted_bytes} bytes omitted] This read started at line {start}. Re-read a \
+                 bounded range with offset and limit (for example limit: 200) instead of the \
+                 whole file."
+            ),
+            _ => format!(
+                "[{omitted_bytes} bytes omitted] Read a bounded range instead: pass offset \
+                 (1-indexed start line) and limit (for example offset: 1, limit: 200), then page \
+                 forward."
+            ),
+        })
+    }
+
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         // M8.1: legacy entry point routes through the typed path with a
         // zero-value context so out-of-band callers still exercise the same
@@ -233,6 +268,29 @@ impl Tool for ReadFileTool {
             }
         }
 
+        // #2131 part 4: budget-aware reads. An UNBOUNDED read of a file larger
+        // than the tool-output budget would be truncated on the way in and then
+        // evicted by compaction — forcing the exact re-read loop #2131 targets.
+        // Return a range hint instead of accept-then-evict, so the model asks
+        // for the slice it needs. A read that already names a range is honored.
+        if start_line.is_none() && end_line.is_none() {
+            let budget = octos_core::tool_output_limit("read_file");
+            if file_size > budget {
+                return Ok(ToolResult {
+                    output: format!(
+                        "{} is {} bytes — larger than the ~{}-byte tool-output budget, so an \
+                         unbounded read would be truncated and then evicted from context \
+                         (forcing a re-read). Read a bounded range instead: pass start_line and \
+                         end_line (e.g. start_line: 1, end_line: 200), or grep for the part you \
+                         need first.",
+                        input.path, file_size, budget
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
         let content = match super::read_no_follow(&path).await {
             Ok(c) => c,
@@ -241,6 +299,25 @@ impl Tool for ReadFileTool {
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
+
+        // Observe-only (#read-paging probe): record what a FORCED window would
+        // have done here. Forcing pages is not a token win — if the model
+        // consumes the whole file anyway, more calls cost more, because each
+        // re-sends the conversation prefix. It wins only when models stop after
+        // page one, and that rate is the number this records. Nothing below
+        // changes; the read returns exactly what it always did.
+        if super::read_paging_probe::enabled() {
+            let bounded = start_line.is_some() || end_line.is_some();
+            let max_line_bytes = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+            super::read_paging_probe::record_read(
+                &path.to_string_lossy(),
+                bounded,
+                start_line,
+                total_lines,
+                content.len(),
+                max_line_bytes,
+            );
+        }
 
         // Apply line range
         let start = start_line.unwrap_or(1).saturating_sub(1);
@@ -1134,5 +1211,77 @@ mod tests {
             second.output
         );
         assert!(second.output.contains("line 7"));
+    }
+
+    /// A truncated read must name the call that continues it.
+    ///
+    /// Without this the model sees only "N bytes omitted" and its sole
+    /// recovery is re-issuing the identical call, which returns the identical
+    /// truncation — spending the tokens the cap existed to save.
+    #[test]
+    fn should_name_the_next_offset_when_a_bounded_read_is_truncated() {
+        let tool = ReadFileTool::new(std::path::Path::new("."));
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "offset": 1, "limit": 200 }), 47_000)
+            .expect("read_file paginates, so it always has a resume path");
+        assert!(advice.contains("47000 bytes omitted"), "{advice}");
+        assert!(
+            advice.contains("offset: 201"),
+            "the advice must name the CONCRETE next call, not just mention offset: {advice}"
+        );
+    }
+
+    #[test]
+    fn should_suggest_bounding_the_read_when_no_range_was_given() {
+        let tool = ReadFileTool::new(std::path::Path::new("."));
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "path": "big.txt" }), 12_345)
+            .expect("still recoverable: the tool takes offset/limit");
+        assert!(advice.contains("offset"), "{advice}");
+        assert!(advice.contains("limit"), "{advice}");
+    }
+
+    /// #2131 part 4: an UNBOUNDED read of a file bigger than the tool-output
+    /// budget returns a range hint (not the body that would be truncated then
+    /// evicted); a read that already names a range is honored.
+    #[tokio::test]
+    async fn oversized_unbounded_read_returns_a_range_hint_not_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = octos_core::tool_output_limit("read_file");
+        // Comfortably over the budget, but well under the 10MB hard cap.
+        let line = "abcdefghij\n";
+        let big = line.repeat(budget / line.len() + 2_000);
+        std::fs::write(dir.path().join("big.rs"), &big).unwrap();
+        let tool = ReadFileTool::new(dir.path());
+
+        // Unbounded → hint, not the body.
+        let r = tool
+            .execute(&serde_json::json!({"path": "big.rs"}))
+            .await
+            .unwrap();
+        assert!(
+            !r.success,
+            "an oversized unbounded read must not dump the body"
+        );
+        assert!(
+            r.output.contains("bounded range"),
+            "the hint must tell the model to read a range: {}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("abcdefghij"),
+            "the body must NOT be returned"
+        );
+
+        // A bounded read of the same file is honored (reads the slice).
+        let r2 = tool
+            .execute(&serde_json::json!({"path": "big.rs", "start_line": 1, "end_line": 3}))
+            .await
+            .unwrap();
+        assert!(r2.success, "a bounded read is honored");
+        assert!(
+            r2.output.contains("abcdefghij"),
+            "the bounded slice returns content"
+        );
     }
 }

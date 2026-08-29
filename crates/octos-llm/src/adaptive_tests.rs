@@ -2455,3 +2455,226 @@ async fn should_not_failover_when_failfast_and_primary_fails() {
         "FailFast must NOT call fallback provider"
     );
 }
+
+/// #2135 round-6 P1: sizing accessors take the minimum across slots
+/// (selection-independent — safe for hedge/probe/failover routing), and
+/// the identity accessors are DETERMINISTIC (best-scored slot, no
+/// stochastic exploration).
+#[tokio::test]
+async fn test_sizing_is_min_across_slots_and_identity_is_deterministic() {
+    let big: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "primary",
+            model: "m1",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        262_144,
+    ));
+    let small: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "fallback",
+            model: "m2",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        32_768,
+    ));
+    let router = AdaptiveRouter::new(
+        vec![big, small],
+        &[],
+        AdaptiveConfig {
+            // Exploration ON: identity must be stable regardless.
+            probe_probability: 0.5,
+            ..Default::default()
+        },
+    );
+    assert_eq!(router.context_window(), 32_768, "min across slots");
+    let first = router.model_id().to_string();
+    for _ in 0..50 {
+        assert_eq!(
+            router.model_id(),
+            first,
+            "identity must not flip stochastically"
+        );
+    }
+    // #2135 round-7 P1: the deterministic selection must pick the BEST
+    // slot (ascending score, same rules as routing) — an earlier cut used
+    // max_by over a lower-is-better score and preferred the worst lane.
+    // With identical cold providers, priority ordering makes the PRIMARY
+    // the correct choice.
+    assert_eq!(first, "m1", "cold identical slots must select the primary");
+}
+
+/// #2143 part 1: INSIDE a turn scope, the sizing accessors resolve to the ONE
+/// pinned route's window (not the conservative min), and the pin is stable for
+/// the whole turn — so a prompt is sized for the exact route the send takes.
+#[tokio::test]
+async fn turn_pin_sizes_for_the_pinned_route_not_the_min() {
+    let big: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "primary",
+            model: "m1",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        262_144,
+    ));
+    let small: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+        Arc::new(MockProvider {
+            name: "fallback",
+            model: "m2",
+            latency_ms: 0,
+            fail: false,
+            error_msg: "",
+        }),
+        32_768,
+    ));
+    let router = Arc::new(AdaptiveRouter::new(
+        vec![big, small],
+        &[],
+        AdaptiveConfig {
+            // No stochastic probe so the pin resolves to the deterministic
+            // primary and the assertion is stable.
+            probe_probability: 0.0,
+            ..Default::default()
+        },
+    ));
+
+    // Outside a turn: the pre-#2143 conservative min-across-slots envelope.
+    assert_eq!(
+        router.context_window(),
+        32_768,
+        "unpinned sizing is the min"
+    );
+
+    // Inside a turn: pinned to the deterministic primary → its full window,
+    // stable across repeated sizing/identity calls.
+    let r = router.clone();
+    with_router_context(RouterContext::default(), async move {
+        assert_eq!(
+            r.context_window(),
+            262_144,
+            "turn sizing must use the pinned route's window"
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                r.context_window(),
+                262_144,
+                "the pin is stable for the turn"
+            );
+        }
+        assert_eq!(r.max_output_tokens(), r.max_output_tokens());
+        assert_eq!(r.model_id(), "m1", "identity resolves to the pinned route");
+        r.ensure_ready().await;
+    })
+    .await;
+
+    // A fresh turn re-resolves the pin (no leakage across turns).
+    let r2 = router.clone();
+    with_router_context(RouterContext::default(), async move {
+        assert_eq!(r2.context_window(), 262_144);
+    })
+    .await;
+}
+
+/// #2135 round-8 P1: every adaptive dispatch passes the route-fit guard —
+/// a lane that resolves too small at dispatch is skipped (its chat never
+/// invoked), failover serves from a fitting lane, and the skip must NOT
+/// poison the skipped lane's circuit breaker.
+#[tokio::test]
+async fn test_unfit_lane_is_skipped_without_breaker_pollution() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct LateSmall {
+        resolved: AtomicBool,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for LateSmall {
+        async fn chat(
+            &self,
+            _m: &[Message],
+            _t: &[ToolSpec],
+            _c: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: Some("from-small".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: crate::StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "m-small"
+        }
+        fn provider_name(&self) -> &str {
+            "local"
+        }
+        fn context_window(&self) -> u32 {
+            if self.resolved.load(Ordering::SeqCst) {
+                1_024
+            } else {
+                131_072
+            }
+        }
+        async fn ensure_ready(&self) {
+            self.resolved.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let small_calls = Arc::new(AtomicUsize::new(0));
+    let router = AdaptiveRouter::new(
+        vec![
+            Arc::new(LateSmall {
+                resolved: AtomicBool::new(false),
+                calls: small_calls.clone(),
+            }),
+            Arc::new(MockProvider {
+                name: "fallback",
+                model: "m2",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            }),
+        ],
+        &[],
+        AdaptiveConfig {
+            probe_probability: 0.0,
+            ..Default::default()
+        },
+    );
+    let big = Message::user("x ".repeat(20_000));
+    for _ in 0..4 {
+        let resp = router
+            .chat(std::slice::from_ref(&big), &[], &ChatConfig::default())
+            .await
+            .expect("the fitting lane must serve the request");
+        assert_eq!(resp.content.unwrap(), "from-fallback");
+    }
+    assert_eq!(
+        small_calls.load(Ordering::SeqCst),
+        0,
+        "unfit lane must never be dispatched for oversized prompts"
+    );
+    // Breaker not poisoned: for a SMALL prompt the lane fits again and —
+    // being the deterministic primary — must serve it. Four unfit skips
+    // above exceed the default failure threshold, so if skips recorded
+    // failures the breaker would be open and this would route to the
+    // fallback instead.
+    let resp = router
+        .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+        .await
+        .expect("small prompt must succeed");
+    assert_eq!(
+        resp.content.unwrap(),
+        "from-small",
+        "skips must not open the unfit lane's breaker"
+    );
+}

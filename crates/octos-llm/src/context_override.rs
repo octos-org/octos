@@ -44,8 +44,22 @@ impl LlmProvider for ContextWindowOverride {
         self.inner.chat_stream(messages, tools, config).await
     }
 
+    async fn ensure_ready(&self) {
+        self.inner.ensure_ready().await;
+    }
+
     fn context_window(&self) -> u32 {
         self.window
+    }
+
+    fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::types::ToolSpec],
+    ) -> u32 {
+        // #2143 part 3: delegate so a concrete provider's request-size override
+        // survives this wrapper (mirrors context_window delegation).
+        self.inner.estimate_request_tokens(messages, tools)
     }
 
     fn model_id(&self) -> &str {

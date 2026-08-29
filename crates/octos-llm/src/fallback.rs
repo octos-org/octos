@@ -98,6 +98,17 @@ impl LlmProvider for FallbackProvider {
                     "primary provider failed, trying fallbacks"
                 );
                 for (i, fb) in self.fallbacks.iter().enumerate() {
+                    // #2135 round-7 P1: the fallback receives the unchanged
+                    // request — resolve its readiness and skip it when the
+                    // prompt cannot fit its (possibly just-resolved) window.
+                    if !crate::context::route_fits_request(fb, messages, tools).await {
+                        warn!(
+                            fallback = fb.model_id(),
+                            window = fb.context_window(),
+                            "skipping fallback: prompt does not fit its context window"
+                        );
+                        continue;
+                    }
                     match fb.chat(messages, tools, config).await {
                         Ok(resp) => {
                             warn!(
@@ -145,6 +156,15 @@ impl LlmProvider for FallbackProvider {
                     "primary stream failed, trying fallbacks"
                 );
                 for fb in &self.fallbacks {
+                    // #2135 round-7 P1: same fit guard as the chat path.
+                    if !crate::context::route_fits_request(fb, messages, tools).await {
+                        warn!(
+                            fallback = fb.model_id(),
+                            window = fb.context_window(),
+                            "skipping fallback: prompt does not fit its context window"
+                        );
+                        continue;
+                    }
                     match fb.chat_stream(messages, tools, config).await {
                         Ok(stream) => return Ok(stream),
                         Err(e) => {
@@ -166,12 +186,28 @@ impl LlmProvider for FallbackProvider {
         self.primary.provider_name()
     }
 
+    // #2135 round-6 P1: the MINIMUM across primary and every fallback —
+    // this wrapper re-sends the SAME messages to a fallback on failure, so
+    // a prompt sized for a probed 256K primary must fit the smallest route
+    // it can take. (The pre-probe catalog value was accidentally safe this
+    // way; per-route resizing before each fallback send is the precise
+    // fix, tracked with the router follow-ups.)
     fn context_window(&self) -> u32 {
-        self.primary.context_window()
+        std::iter::once(self.primary.context_window())
+            .chain(self.fallbacks.iter().map(|fb| fb.context_window()))
+            .min()
+            .unwrap_or_else(|| self.primary.context_window())
+    }
+
+    async fn ensure_ready(&self) {
+        self.primary.ensure_ready().await;
     }
 
     fn max_output_tokens(&self) -> u32 {
-        self.primary.max_output_tokens()
+        std::iter::once(self.primary.max_output_tokens())
+            .chain(self.fallbacks.iter().map(|fb| fb.max_output_tokens()))
+            .min()
+            .unwrap_or_else(|| self.primary.max_output_tokens())
     }
 
     fn report_stream_metrics(&self, output_tokens: u32, stream_duration_us: u64) {
@@ -348,5 +384,98 @@ mod tests {
             1,
             "fallback must be called once"
         );
+    }
+
+    /// #2135 round-7 P1: a fallback whose window resolves SMALL only at
+    /// dispatch time (its probe was unresolved when the prompt was sized)
+    /// must be skipped, not sent an oversized request. The mock reports a
+    /// huge window until ensure_ready(), then the truth: tiny.
+    struct LateSmallProvider {
+        resolved: std::sync::atomic::AtomicBool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for LateSmallProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: Some("from-late-small".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "late-small"
+        }
+
+        fn provider_name(&self) -> &str {
+            "local"
+        }
+
+        fn context_window(&self) -> u32 {
+            if self.resolved.load(Ordering::SeqCst) {
+                1_024
+            } else {
+                131_072
+            }
+        }
+
+        async fn ensure_ready(&self) {
+            self.resolved.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_skip_fallback_that_resolves_too_small_at_dispatch() {
+        let failing_primary: Arc<dyn LlmProvider> = Arc::new(CountingProvider::always_err_500());
+        let small_calls = Arc::new(AtomicUsize::new(0));
+        let late_small: Arc<dyn LlmProvider> = Arc::new(LateSmallProvider {
+            resolved: std::sync::atomic::AtomicBool::new(false),
+            calls: small_calls.clone(),
+        });
+        let big_ok: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(CountingProvider::ok()),
+            131_072,
+        ));
+        let provider = FallbackProvider::new(failing_primary, vec![late_small, big_ok]);
+        // A prompt far larger than the late-resolving 1K window.
+        let big_message = Message::user("x ".repeat(20_000));
+        let response = provider
+            .chat(&[big_message], &[], &ChatConfig::default())
+            .await
+            .expect("second fallback must serve the request");
+        assert_eq!(response.content.unwrap(), "ok");
+        assert_eq!(
+            small_calls.load(Ordering::SeqCst),
+            0,
+            "the too-small fallback must be skipped at dispatch"
+        );
+    }
+
+    /// #2135 round-6 P1: the same messages are re-sent to a fallback on
+    /// failure, so the reported window must fit the SMALLEST possible
+    /// route — a probed 256K primary over a 32K fallback budgets as 32K.
+    #[test]
+    fn should_report_minimum_window_across_routes() {
+        let primary: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(CountingProvider::ok()),
+            262_144,
+        ));
+        let small_fallback: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(CountingProvider::ok()),
+            32_768,
+        ));
+        let provider = FallbackProvider::new(primary, vec![small_fallback]);
+        assert_eq!(provider.context_window(), 32_768);
     }
 }

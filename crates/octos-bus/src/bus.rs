@@ -25,6 +25,16 @@ impl AgentHandle {
         msgs
     }
 
+    /// `clippy::result_large_err` fires here on Rust 1.98+: tokio's
+    /// `SendError<T>` is `T`-sized, and `OutboundMessage` is ~192 bytes.
+    ///
+    /// Allowed rather than boxed, because the size IS the contract. `SendError`
+    /// hands the un-sent message back so a caller can recover or requeue it;
+    /// boxing would force every caller to unbox to reach it, and would change a
+    /// public signature to satisfy a lint about a type this crate does not own.
+    /// The error path is also the rare one — a closed outbound channel — so the
+    /// stack cost it warns about is not paid on the hot path.
+    #[allow(clippy::result_large_err)]
     pub async fn send_outbound(
         &self,
         msg: OutboundMessage,

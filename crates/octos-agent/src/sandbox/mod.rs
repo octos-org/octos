@@ -113,6 +113,26 @@ pub struct SandboxConfig {
     /// Profile name for sandbox isolation (used as AppContainer profile ID on Windows).
     #[serde(default)]
     pub profile_name: Option<String>,
+
+    /// Grant the shell WRITE to the handful of paths a language toolchain
+    /// must touch to function at all (default: `true`).
+    ///
+    /// The motivating failure: with writes confined to the cwd, `cargo build`
+    /// dies before compiling anything — rustup's cargo shim takes a write
+    /// lock on `~/.rustup/settings.toml` ("could not read settings file:
+    /// Operation not permitted"), and cargo itself must populate
+    /// `~/.cargo/registry`. A coding agent that cannot compile writes broken
+    /// code with no feedback loop, so the pragmatic default is on.
+    ///
+    /// The grant is PRECISE, not a blanket toolchain-home write:
+    /// `~/.cargo/bin` (on PATH — a writable shim there is persistence) and
+    /// `~/.rustup/toolchains` (writable compiler binaries) are deliberately
+    /// NOT granted. Deny-wins: a read-only workspace
+    /// (`workspace_write: false`) or a #1976 write fence suppresses these
+    /// grants entirely — a profile that says "this shell writes nothing /
+    /// only these globs" must not quietly regain toolchain caches.
+    #[serde(default = "default_enabled")]
+    pub allow_toolchains: bool,
 }
 
 /// Default system paths that must be readable for shell commands to work.
@@ -144,6 +164,163 @@ pub(crate) const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/dev/random",
 ];
 
+/// The write grants a detected toolchain needs — split by SBPL rule kind:
+/// `literals` are single files, `subpaths` are directory trees.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ToolchainWriteGrants {
+    pub(crate) literals: Vec<String>,
+    pub(crate) subpaths: Vec<String>,
+}
+
+/// The PRECISE write set a Rust build needs inside the sandbox.
+///
+/// Reads of `~/.cargo` and `~/.rustup` are globally allowed, so cached
+/// dependencies, the registry index, and the installed toolchain are all
+/// usable WITHOUT any write grant. The only default write is:
+/// - `<cargo>/.package-cache` — cargo's advisory build lock, opened
+///   write-intent on every invocation (an EPERM here fails the build).
+///
+/// When `allow_network` is set (the operator's explicit trust decision,
+/// which is also what makes fresh fetches possible), the DOWNLOAD-write
+/// set is added: `<cargo>/registry/{index,cache,src}` and `<cargo>/git`.
+/// These hold code cargo executes, so they are writable ONLY under
+/// network-on; the default keeps them read-only to prevent cross-workspace
+/// poisoning.
+///
+/// Nothing under `~/.rustup` is ever granted (a plain build only reads it),
+/// and `<cargo>/bin` / `<rustup>/toolchains` are never writable
+/// (persistence vectors). The sandbox supports BUILDING with cached
+/// dependencies by default; fresh downloads need `allow_network` (see
+/// also the proxy-isolated-fetch follow-up).
+pub(crate) fn toolchain_write_grants(allow_network: bool) -> ToolchainWriteGrants {
+    let mut grants = ToolchainWriteGrants::default();
+    let home = std::env::var("HOME").ok();
+    let resolve = |env_name: &str, conventional: &str| -> Option<PathBuf> {
+        let path = std::env::var(env_name)
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| Path::new(h).join(conventional)))?;
+        if !path.is_dir() {
+            return None;
+        }
+        // #2136 review: seatbelt matches the SYMLINK-RESOLVED path (macos.rs
+        // canonicalizes cwd/git for the same reason). A symlinked HOME or
+        // CARGO_HOME (e.g. /tmp -> /private/tmp) would otherwise emit a rule
+        // that never matches and the write stays denied — fail-closed and
+        // silent. Canonicalize the (existing) home dir; leaf names append
+        // cleanly onto the resolved path.
+        Some(std::fs::canonicalize(&path).unwrap_or(path))
+    };
+    // Cargo, default (network OFF): ONLY the advisory build lock. Reads of
+    // the whole cargo home are globally allowed, so a cached/offline build
+    // reads its deps and index without any write — the reviewer confirmed
+    // a live cached build with the index entirely READ-ONLY. registry
+    // index/cache/src and git stay read-only so nothing can corrupt
+    // dependency resolution or overwrite a crate across workspaces
+    // (#2136 review round 3, P1).
+    if let Some(cargo) = resolve("CARGO_HOME", ".cargo") {
+        push_cargo_grants(&mut grants, &cargo, allow_network);
+    }
+
+    // NO rustup grants (#2136 review round 3, P1): a plain build via the
+    // rustup proxy only READS ~/.rustup (default-toolchain lookup), which
+    // is globally allowed; it does not write settings.toml or the toolchain
+    // dirs. Granting settings.toml write let a sandboxed command
+    // persistently change the user's default toolchain/overrides — removed.
+    // (rustup's original "could not READ settings" symptom was an
+    // octoscode read-restriction, not an octos one.)
+    grants
+}
+
+/// Pure grant-builder for a KNOWN cargo home (no filesystem probe) — the
+/// testable core of [`toolchain_write_grants`]. Default: just the advisory
+/// build lock. With `allow_network`, the download-write set
+/// (registry/{index,cache,src} + git) is added. Never the persistence
+/// vectors (bin, toolchains).
+fn push_cargo_grants(grants: &mut ToolchainWriteGrants, cargo: &Path, allow_network: bool) {
+    grants
+        .literals
+        .push(cargo.join(".package-cache").to_string_lossy().into_owned());
+    if allow_network {
+        for dir in ["registry/index", "registry/cache", "registry/src", "git"] {
+            grants
+                .subpaths
+                .push(cargo.join(dir).to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// The grants a config asks for: the detected set when `allow_toolchains`
+/// is on, nothing otherwise.
+fn configured_toolchain_grants(config: &SandboxConfig) -> ToolchainWriteGrants {
+    if config.allow_toolchains {
+        toolchain_write_grants(config.allow_network)
+    } else {
+        ToolchainWriteGrants::default()
+    }
+}
+
+/// The kernel phrasings a sandbox denial surfaces as, per backend: macOS
+/// seatbelt returns EPERM ("Operation not permitted"), Landlock returns
+/// EACCES ("Permission denied"), bwrap ro-binds and Docker `:ro` mounts
+/// return EROFS ("Read-only file system").
+const DENIAL_PHRASES: &[&str] = &[
+    "Operation not permitted",
+    "Permission denied",
+    "Read-only file system",
+];
+
+/// Explain a sandbox denial the kernel reports as a bare errno string.
+///
+/// Inside the sandbox, a denied access surfaces as the failing program's
+/// own confused error ("could not read settings file: Operation not
+/// permitted"), which reads as a bug in the command — the one party that
+/// knows the sandbox denied it is the harness, so the harness must say so.
+/// Observed cost of not saying so: a coding session whose every `cargo`
+/// invocation died on the rustup settings lock, with the model (and user)
+/// left debugging cargo instead of the sandbox.
+///
+/// Returns a hint ONLY when the command FAILED under a real sandbox and
+/// `scan_text` carries one of the kernel's denial phrases — a successful
+/// command that merely logged the phrase is not a denial. Callers scan the
+/// PRE-truncation text (the denial line may be exactly what truncation
+/// cuts) and append the hint AFTER truncating, so the hint itself survives.
+///
+/// The toolchain-cache pointer is macOS-only on purpose: `allow_toolchains`
+/// grants are implemented in the seatbelt backend today, and advertising
+/// the lever on a backend that ignores it would misstate what is writable.
+pub(crate) fn sandbox_denial_hint(
+    sandboxed: bool,
+    success: bool,
+    scan_text: &str,
+) -> Option<&'static str> {
+    if success || !sandboxed {
+        return None;
+    }
+    if !DENIAL_PHRASES
+        .iter()
+        .any(|phrase| scan_text.contains(phrase))
+    {
+        return None;
+    }
+    if cfg!(target_os = "macos") {
+        Some(
+            "\n[sandbox] This denial usually means the OS sandbox blocked a file access \
+             outside the workspace — not a bug in the command. With \
+             `sandbox.allow_toolchains` on (the default), builds with CACHED \
+             dependencies work; fetching NEW crates is denied unless \
+             `sandbox.allow_network` is also enabled. Other paths need an \
+             explicit allowance in the sandbox config.",
+        )
+    } else {
+        Some(
+            "\n[sandbox] This denial usually means the OS sandbox blocked a file access \
+             outside the workspace — not a bug in the command. Grant the path in the \
+             sandbox config, or run under a less restrictive sandbox mode.",
+        )
+    }
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
@@ -156,6 +333,7 @@ impl Default for SandboxConfig {
             read_allow_paths: Vec::new(),
             write_allow_globs: None,
             profile_name: None,
+            allow_toolchains: true,
         }
     }
 }
@@ -403,6 +581,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             repo_git_write: config.repo_git_write.clone(),
             // #1976: macOS EXPRESSES the fence (per-glob SBPL regex rules).
             write_allow_globs: config.write_allow_globs.clone(),
+            toolchain_write_grants: configured_toolchain_grants(config),
         }),
         SandboxMode::Docker => Box::new(DockerSandbox {
             config: fence_degraded_docker(config),
@@ -479,6 +658,7 @@ fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 repo_git_write: config.repo_git_write.clone(),
                 // #1976: macOS EXPRESSES the fence (per-glob regex rules).
                 write_allow_globs: config.write_allow_globs.clone(),
+                toolchain_write_grants: configured_toolchain_grants(config),
             });
         }
     }
@@ -639,6 +819,7 @@ mod tests {
     #[test]
     fn test_create_sandbox_disabled() {
         let config = SandboxConfig {
+            allow_toolchains: true,
             enabled: false,
             ..SandboxConfig::default()
         };
@@ -784,6 +965,7 @@ mod tests {
     #[test]
     fn test_create_sandbox_mode_none() {
         let config = SandboxConfig {
+            allow_toolchains: true,
             enabled: true,
             mode: SandboxMode::None,
             allow_network: false,
@@ -825,6 +1007,7 @@ mod tests {
         // so a fenced workspace is bound READ-ONLY for the shell (fail
         // closed; granted paths stay writable via the fenced file tools).
         let config = SandboxConfig {
+            allow_toolchains: true,
             mode: SandboxMode::Bwrap,
             workspace_write: true,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
@@ -861,6 +1044,7 @@ mod tests {
         // #1976 honest degradation: Docker mounts are concrete too — a
         // fenced workspace mounts `:ro` (fail closed for the shell).
         let config = SandboxConfig {
+            allow_toolchains: true,
             mode: SandboxMode::Docker,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
             ..SandboxConfig::default()
@@ -888,6 +1072,7 @@ mod tests {
         // macOS is the one backend that EXPRESSES the fence (SBPL regex);
         // create_sandbox must thread the globs through, not degrade them.
         let config = SandboxConfig {
+            allow_toolchains: true,
             mode: SandboxMode::Macos,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
             ..SandboxConfig::default()
@@ -931,10 +1116,12 @@ mod tests {
         // (refuse). This is host-independent.
         for config in [
             SandboxConfig {
+                allow_toolchains: true,
                 enabled: false,
                 ..SandboxConfig::default()
             },
             SandboxConfig {
+                allow_toolchains: true,
                 enabled: true,
                 mode: SandboxMode::None,
                 ..SandboxConfig::default()
@@ -945,5 +1132,73 @@ mod tests {
                 "config {config:?} must produce a no-op sandbox"
             );
         }
+    }
+
+    /// The detected toolchain write set must NEVER include the persistence
+    /// vectors: `<cargo>/bin` is on PATH (a writable shim there outlives the
+    /// sandbox) and `<rustup>/toolchains` holds the compiler binaries. And
+    /// `allow_toolchains: false` must yield nothing at all.
+    #[test]
+    fn toolchain_grants_exclude_persistence_vectors_and_honor_config() {
+        use std::path::Path;
+        // Hermetic: exercise the pure builder against a KNOWN cargo home so
+        // the test does not depend on the runner having ~/.cargo (Windows CI
+        // does not) and uses component-based checks, not `/`-slash strings.
+        let cargo = Path::new("/tmp/octos-test-cargo");
+
+        // DEFAULT (network off): only the cargo lock is writable.
+        let mut default_grants = ToolchainWriteGrants::default();
+        push_cargo_grants(&mut default_grants, cargo, false);
+        assert!(
+            default_grants.subpaths.is_empty(),
+            "no download-write set without network: {:?}",
+            default_grants.subpaths
+        );
+        let lock = cargo.join(".package-cache");
+        assert_eq!(
+            default_grants.literals,
+            vec![lock.to_string_lossy().into_owned()],
+            "the only default grant is the cargo lock"
+        );
+
+        // NETWORK ON: the download-write set is added, but NEVER the
+        // persistence vectors.
+        let mut net_grants = ToolchainWriteGrants::default();
+        push_cargo_grants(&mut net_grants, cargo, true);
+        let net_paths: Vec<&str> = net_grants
+            .literals
+            .iter()
+            .chain(net_grants.subpaths.iter())
+            .map(String::as_str)
+            .collect();
+        assert!(
+            net_paths
+                .iter()
+                .any(|p| Path::new(p).ends_with("registry/cache")),
+            "network-on must allow crate downloads: {net_paths:?}"
+        );
+        for p in &net_paths {
+            let path = Path::new(p);
+            assert!(
+                !path.ends_with(".cargo/bin")
+                    && !path.components().any(|c| c.as_os_str() == "toolchains"),
+                "persistence vector granted even under network: {p}"
+            );
+        }
+
+        // allow_toolchains=false yields nothing regardless of environment.
+        let off = configured_toolchain_grants(&SandboxConfig {
+            allow_toolchains: false,
+            ..SandboxConfig::default()
+        });
+        assert_eq!(off, ToolchainWriteGrants::default());
+    }
+
+    /// An old config JSON that predates `allow_toolchains` must deserialize
+    /// with the pragmatic default (true) — serde default, not Rust default.
+    #[test]
+    fn allow_toolchains_defaults_true_for_old_configs() {
+        let config: SandboxConfig = serde_json::from_str("{}").expect("empty config");
+        assert!(config.allow_toolchains);
     }
 }

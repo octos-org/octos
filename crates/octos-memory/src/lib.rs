@@ -18,4 +18,7 @@ pub use memory_store::{
     UsageMap, UsageStat, estimate_tokens, extract_abstract, is_reserved_memory_name,
     is_valid_entry_id,
 };
-pub use store::{DEFAULT_DIMENSION as EPISODIC_INDEX_DIMENSION, EpisodeStore};
+pub use store::{
+    DEFAULT_DIMENSION as EPISODIC_INDEX_DIMENSION, EpisodeStore, EpisodeStoreLocked,
+    is_episode_store_locked,
+};

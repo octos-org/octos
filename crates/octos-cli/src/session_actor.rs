@@ -65,6 +65,20 @@ use crate::context_manager::{
 };
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
+
+/// #2131: adapts the per-session `ContextManager` to the `RecallTool`'s
+/// ledger read-back trait, so an evicted tool output can be re-materialized by
+/// its `tool_call_id` without re-execution.
+struct SessionToolOutputLedger(Arc<StdMutex<ContextManager>>);
+
+impl octos_agent::tools::ToolOutputLedger for SessionToolOutputLedger {
+    fn fetch(&self, tool_call_id: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tool_output_by_call_id(tool_call_id)
+    }
+}
 use crate::usage_ledger::{PersistentUsageLedger, UsageCostSource, UsageEvent};
 use crate::workflow_runtime::{WorkflowInstance, WorkflowKind};
 
@@ -3479,6 +3493,12 @@ impl ActorFactory {
         // RFC-0 (#1289): LRU tool deferral was removed — `read_task_output`
         // (like every enabled tool) is emitted every turn, so no base-tool
         // pin is needed.
+        // #2131: recall an evicted tool output by its tool_call_id from THIS
+        // session's content-addressed ledger. Registered per-session (like the
+        // task tools above) because the ContextManager is session-scoped.
+        tools.register(octos_agent::tools::RecallTool::new(Arc::new(
+            SessionToolOutputLedger(context_manager.clone()),
+        )));
         tools.register(message_tool);
         tools.register(send_file_tool);
         tools.register(octos_agent::SendAppCardTool::with_context(
@@ -4683,6 +4703,17 @@ impl SessionActor {
             // Context injection is a `user_prompt_submit`-only outcome; these
             // emitted lifecycle events never produce it. Exhaustive-match arm.
             HookResult::Context(_) => {}
+            // Feedback is an AfterToolCall-only outcome (checker diagnostics
+            // appended by the agent's own dispatch sites); these lifecycle
+            // events have no tool result to carry it — log and continue.
+            HookResult::Feedback(entries) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    count = entries.len(),
+                    "lifecycle hook produced feedback; ignored"
+                );
+            }
             HookResult::Deny(reason) => {
                 warn!(
                     session = %self.session_key,
@@ -7473,6 +7504,11 @@ impl SessionActor {
         // M16-D2: capture ContextManager-derived prompt history before
         // persisting this turn's user message, because the agent appends the
         // current user message internally.
+        // #2135 round-3 P1: resolve a lazily-probed context window before
+        // the ContextManager threshold below reads it — a resumed gateway
+        // session must not PERSIST a compaction sized by the stale catalog
+        // value. Immediate no-op for non-probing providers, once resolved.
+        self.agent.llm_provider().ensure_ready().await;
         let history_for_agent: Vec<Message> =
             self.context_history_for_agent("pre_turn_speculative");
 
@@ -9297,6 +9333,9 @@ impl SessionActor {
         // ContextManager. If the active context is over threshold this installs
         // a compacted generation before the model call; raw session history
         // remains durable and unchanged.
+        // #2135 round-3 P1: same readiness requirement as the speculative
+        // path above — the threshold derives from context_window().
+        self.agent.llm_provider().ensure_ready().await;
         let history: Vec<Message> = self.context_history_for_agent("pre_turn");
 
         // Token tracker for status indicator

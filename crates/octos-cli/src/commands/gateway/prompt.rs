@@ -185,6 +185,32 @@ mod tests {
     const PROMPT: &str = include_str!("../../prompts/gateway_default.txt");
 
     #[test]
+    fn should_carry_the_three_phase_coding_output_contract() {
+        // #2141: the coding output contract (octoscode#585) lives in the
+        // server/harness prompt, not the TUI. Pin its load-bearing pieces so
+        // an edit can't silently drop the anti-off-ramp guidance that keeps a
+        // small local model from ending each work turn with a polished
+        // summary INSTEAD of continuing the task.
+        assert!(
+            PROMPT.contains("Output shape for a multi-step coding task"),
+            "prompt is missing the three-phase coding output contract header (#2141)"
+        );
+        for marker in [
+            "THREE output phases",
+            "Task start",  // phase 1: one plan checklist
+            "Work turns",  // phase 2: tool-only + at most one status line
+            "Yield point", // phase 3: the full answer
+            "Session Summary",
+            "never a substitute for continuing", // the anti-off-ramp rule
+        ] {
+            assert!(
+                PROMPT.contains(marker),
+                "coding output contract must keep the phrase {marker:?} (#2141)"
+            );
+        }
+    }
+
+    #[test]
     fn should_have_act_directly_specialist_tools_section() {
         assert!(
             PROMPT.contains("ACT-DIRECTLY for registered specialist tools"),

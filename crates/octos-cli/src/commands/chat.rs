@@ -105,9 +105,10 @@ pub struct ChatCommand {
     /// `--config`, `--provider`, and `--model` still override.
     ///
     /// Defaults to `coding`, the lean core-coding tool surface (files,
-    /// shell, search, memory, spawn, user questions). Use `coding-full`
-    /// for the unfiltered pre-lean tool set (web, research, pipelines,
-    /// bundled skills).
+    /// shell, search, memory, spawn, check, plan tracking, user questions,
+    /// and tool_search). Use `coding-full` for the unfiltered pre-lean tool
+    /// set (web, research, pipelines, bundled skills) that the allow list
+    /// excludes.
     #[arg(long)]
     pub profile: Option<String>,
 
@@ -949,9 +950,17 @@ async fn process_chat_turn(
     history: &[Message],
     approval_requester: Arc<dyn ToolApprovalRequester>,
 ) -> Result<ConversationResponse> {
-    with_chat_approval(
-        approval_requester,
-        agent.process_message(input, history, vec![]),
+    // #2143: scope the whole turn so an AdaptiveRouter pins ONE route for it —
+    // readiness, history sizing, and the send all resolve to the same slot,
+    // instead of sizing for the conservative min-across-slots envelope. The
+    // serve/API paths already wrap their turns this way; the local `octos chat`
+    // coding harness (the local-model path these fixes target) did not.
+    octos_llm::with_router_context(
+        octos_llm::RouterContext::default(),
+        with_chat_approval(
+            approval_requester,
+            agent.process_message(input, history, vec![]),
+        ),
     )
     .await
 }
@@ -1142,6 +1151,16 @@ impl ChatCommand {
         }
         let model_id = base_provider.model_id().to_string();
 
+        // #2142: operator override of the primary's effective context window
+        // (config.llm.primary.context_window). Wraps the probed provider so it
+        // beats both the catalog and the runtime probe through the delegating
+        // stack.
+        let base_provider = crate::qos_catalog::apply_context_window_override(
+            base_provider,
+            config.context_window,
+            "primary",
+        );
+
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
             base_provider
         } else if config.fallback_models.is_empty() {
@@ -1164,7 +1183,15 @@ impl ChatCommand {
                     fb.base_url.clone(),
                     fb.api_type.as_deref(),
                 ) {
-                    Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
+                    Ok(p) => {
+                        // #2142: per-fallback context-window override.
+                        let p = crate::qos_catalog::apply_context_window_override(
+                            p,
+                            fb.context_window,
+                            "fallback",
+                        );
+                        providers.push(Arc::new(RetryProvider::new(p)));
+                    }
                     Err(e) => {
                         tracing::warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
                     }
@@ -1752,6 +1779,7 @@ impl ChatCommand {
             // `--no-session-persistence` (claude parity): skip the episode write.
             save_episodes: !self.no_session_persistence,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
+            chat_temperature: config.gateway.as_ref().and_then(|g| g.llm_temperature),
             // `--effort` (claude/codex parity) overrides `gateway.reasoning_effort`.
             reasoning_effort: self
                 .effort

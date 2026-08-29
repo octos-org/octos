@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use crate::local_context_probe::LocalContextProbe;
 use crate::openai::OpenAIProvider;
 use crate::provider::LlmProvider;
 
@@ -23,6 +24,9 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
 
 fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let http_timeout = p.http_timeout();
+    // The probe authenticates like the provider (`vllm --api-key`
+    // deployments 401 anonymous GETs); capture before the placeholder.
+    let probe_key = p.api_key.clone();
     let key = p.api_key.unwrap_or_else(|| "token".into());
     let model = p
         .model
@@ -39,5 +43,13 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
-    Ok(Arc::new(provider))
+    // Same class of local server as the `local` family: the catalog's
+    // context_window is a guess, the running server knows (vLLM reports
+    // max_model_len on /v1/models) — probe it (see `local_context_probe`).
+    Ok(LocalContextProbe::new(
+        Arc::new(provider),
+        &url,
+        probe_key,
+        http_timeout,
+    ))
 }

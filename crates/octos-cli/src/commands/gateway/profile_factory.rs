@@ -280,6 +280,13 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
     let base_provider = create_provider(&provider_name, config, model, base_url)?;
     let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
 
+    // #2142: operator override of the primary's effective context window.
+    let base_provider = crate::qos_catalog::apply_context_window_override(
+        base_provider,
+        config.context_window,
+        "primary",
+    );
+
     let llm: Arc<dyn LlmProvider> = if no_retry {
         base_provider
     } else if config.fallback_models.is_empty() {
@@ -304,6 +311,12 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
                 fallback.api_type.as_deref(),
             ) {
                 Ok(provider) => {
+                    // #2142: per-fallback context-window override.
+                    let provider = crate::qos_catalog::apply_context_window_override(
+                        provider,
+                        fallback.context_window,
+                        "fallback",
+                    );
                     providers.push(Arc::new(RetryProvider::new(provider)));
                     costs.push(fallback.cost_per_m.unwrap_or(0.0));
                 }

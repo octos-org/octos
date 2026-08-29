@@ -17,6 +17,7 @@ pub mod embedding;
 mod failover;
 mod fallback;
 pub mod lane;
+mod local_context_probe;
 pub mod local_discovery;
 pub mod pricing;
 mod provider;
@@ -75,6 +76,7 @@ pub use lane::{
     LANE_CONTEXT, Lane, LaneContext, LaneRoutingConfig, current_lane_context,
     default_lane_candidates, resolve_lane_for_topic, topic_prefix, with_lane_context,
 };
+pub use local_context_probe::LocalContextProbe;
 pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{

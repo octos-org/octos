@@ -6190,3 +6190,361 @@ fn repeated_identical_failing_command_still_trips_the_retry_limit() {
         recover_shell_retry(&messages, 4).expect("the same command failing repeatedly is a spiral");
     assert!(matches!(recovery.kind, ShellRetryRecoveryKind::RetryLimit));
 }
+
+/// Append-only measurement, end to end through the real loop.
+///
+/// The point of the audit is to answer one question with evidence rather than
+/// argument: does octos already rewrite request history in place? This drives
+/// two real turns on one agent — the second carrying the first's oversized
+/// tool result as history — which is the shape `truncate_old_tool_results`
+/// acts on, and asserts the audit both RAN and reported it.
+///
+/// The `RAN` half matters as much as the finding. An earlier version of this
+/// measurement reported nothing, and the nothing meant only that octos-agent's
+/// lib tests install no `tracing` subscriber, so every `warn!` went nowhere.
+/// A measurement whose silence cannot be distinguished from absence is not a
+/// measurement, so findings are recorded out-of-band and asserted here.
+#[tokio::test]
+async fn append_only_audit_observes_the_in_place_truncation_across_turns() {
+    crate::agent::append_only_audit::arm_for_test();
+    let _ = crate::agent::append_only_audit::drain_findings();
+    let before = crate::agent::append_only_audit::finding_count();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    // Comfortably past the 800-char collapse threshold.
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: BIG_TOOL_OUTPUT,
+    });
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(MultiToolThenEndProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("append-only-audit"), provider, tools, memory);
+
+    let first = agent.process_message("do work", &[], vec![]).await.unwrap();
+    // Second turn carries the first turn's tool results as history, which is
+    // what puts them BEFORE the newest user message.
+    let _second = agent
+        .process_message("and now the next thing", &first.messages, vec![])
+        .await
+        .unwrap();
+
+    let after = crate::agent::append_only_audit::finding_count();
+    let findings = crate::agent::append_only_audit::drain_findings();
+    crate::agent::append_only_audit::disarm_for_test();
+
+    assert!(
+        after > before,
+        "the audit must have RUN; a silent result here means the wiring is dead, \
+         not that octos is append-only (findings: {findings:?})"
+    );
+    assert!(
+        findings.iter().any(|f| f.contains("rewritten in place")),
+        "expected an in-place rewrite across turns; got {findings:?}"
+    );
+}
+
+/// Large enough that `truncate_old_tool_results` collapses it.
+const BIG_TOOL_OUTPUT: &str = concat!(
+    "BEGIN-LARGE-TOOL-RESULT ",
+    include_str!("append_only_audit.rs"),
+);
+
+/// A tool whose output overflows the cap and which knows how to resume.
+struct OverflowingPagedTool;
+
+#[async_trait]
+impl Tool for OverflowingPagedTool {
+    fn name(&self) -> &str {
+        "overflowing_paged"
+    }
+
+    fn description(&self) -> &str {
+        "Return more output than the per-tool cap allows"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        Ok(ToolResult {
+            // Comfortably past the 50_000-byte default cap.
+            output: "y".repeat(120_000),
+            success: true,
+            ..Default::default()
+        })
+    }
+
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let page = args
+            .get("page")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        Some(format!(
+            "[{omitted_bytes} bytes omitted] Continue with page: {}.",
+            page + 1
+        ))
+    }
+}
+
+struct CallsOverflowingToolThenEnds {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for CallsOverflowingToolThenEnds {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_overflow".to_string(),
+                    name: "overflowing_paged".to_string(),
+                    arguments: serde_json::json!({ "page": 0 }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        } else {
+            ChatResponse {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+}
+
+/// The wiring test: a truncated tool result must reach the model carrying its
+/// recovery advice.
+///
+/// The unit tests prove `truncation_recovery` returns good text. They prove
+/// nothing about whether the execution loop ever CALLS it — and an unwired
+/// hook that returns perfect advice into the void is the failure mode this
+/// whole change exists to remove. So this drives the real loop and inspects
+/// the tool message the model actually received.
+#[tokio::test]
+async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(OverflowingPagedTool);
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(CallsOverflowingToolThenEnds {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("truncation-recovery"), provider, tools, memory);
+
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+
+    let tool_message = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("the turn must contain the tool result");
+
+    assert!(
+        tool_message.content.len() < 120_000,
+        "the cap must still apply: got {} bytes",
+        tool_message.content.len()
+    );
+    assert!(
+        tool_message.content.contains("Continue with page: 1."),
+        "the truncated result must carry the tool's recovery advice, otherwise the model is \
+         left at a dead end and can only re-run the same call; tail was: {:?}",
+        &tool_message.content[tool_message.content.len().saturating_sub(200)..]
+    );
+}
+
+// --- build_chat_config: temperature/max_tokens override semantics (#2172) ---
+
+#[test]
+fn build_chat_config_keeps_default_temperature_when_unset() {
+    // Cloud-safety invariant: with no chat_temperature override, the chat
+    // temperature must remain the built-in ChatConfig default (0.0), so cloud
+    // requests are byte-for-byte unchanged.
+    let cfg = AgentConfig {
+        chat_temperature: None,
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg);
+    assert_eq!(chat.temperature, ChatConfig::default().temperature);
+    assert_eq!(chat.temperature, Some(0.0));
+}
+
+#[test]
+fn build_chat_config_applies_temperature_override() {
+    let cfg = AgentConfig {
+        chat_temperature: Some(0.7),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg);
+    assert_eq!(chat.temperature, Some(0.7));
+}
+
+#[test]
+fn build_chat_config_applies_max_tokens_override_independently() {
+    // Overrides compose without clobbering each other.
+    let cfg = AgentConfig {
+        chat_max_tokens: Some(4096),
+        chat_temperature: Some(0.5),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg);
+    assert_eq!(chat.max_tokens, Some(4096));
+    assert_eq!(chat.temperature, Some(0.5));
+}
+
+// --- #2174: conversation-loop recovery from a degenerate empty MaxTokens ---
+
+fn empty_max_tokens_response() -> ChatResponse {
+    // Models the REAL degenerate case: the whole output budget was spent on
+    // reasoning, so `content` is empty and there are no tool calls, but
+    // `reasoning_content` is present. That makes `is_retriable_response` return
+    // false (has_reasoning), so the response is NOT caught by the call-level
+    // empty-retry and instead reaches the conversation-loop MaxTokens branch.
+    ChatResponse {
+        content: None,
+        reasoning_content: Some("(long internal reasoning, no final answer)".to_string()),
+        tool_calls: vec![],
+        stop_reason: StopReason::MaxTokens,
+        usage: LlmTokenUsage {
+            input_tokens: 5,
+            output_tokens: 128,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
+}
+
+async fn run_conversation_content(responses: Vec<ChatResponse>) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("empty-maxtokens"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    agent
+        .process_message("go", &[], vec![])
+        .await
+        .unwrap()
+        .content
+}
+
+#[tokio::test]
+async fn empty_max_tokens_recovers_when_retry_succeeds() {
+    // A degenerate empty MaxTokens (no content, no tool call) must trigger a
+    // nudge-and-retry instead of returning empty; the retry succeeds and its
+    // content is returned — not a silent empty exit.
+    let content = run_conversation_content(vec![
+        empty_max_tokens_response(),
+        end_turn("recovered answer", 4, 6),
+    ])
+    .await;
+    assert_eq!(content, "recovered answer");
+}
+
+/// Always returns the degenerate empty-MaxTokens response, so the loop's
+/// behavior is bounded solely by the recovery cap (not by a fixed script).
+struct AlwaysEmptyMaxTokensProvider;
+
+#[async_trait]
+impl LlmProvider for AlwaysEmptyMaxTokensProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        Ok(empty_max_tokens_response())
+    }
+    fn model_id(&self) -> &str {
+        "always-empty"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn empty_max_tokens_surfaces_error_after_recovery_exhausted() {
+    // A model that keeps returning a degenerate empty MaxTokens: the loop does
+    // two bounded recoveries then surfaces a clear terminal error rather than a
+    // silent empty return. If the recovery counter did NOT persist across
+    // iterations this would instead loop until max_iterations — so this also
+    // pins the bound.
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(AlwaysEmptyMaxTokensProvider);
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("empty-maxtokens"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    // Uses the default (non-FailFast) call policy — the path `octos chat`
+    // takes, where an empty-but-reasoning MaxTokens reaches the conversation
+    // loop rather than being failed fast. (Under FailFast the empty response is
+    // terminal earlier, a different — also non-silent — outcome.)
+    let content = agent
+        .process_message("go", &[], vec![])
+        .await
+        .unwrap()
+        .content;
+    assert_eq!(content, MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE);
+}
+
+#[tokio::test]
+async fn non_empty_max_tokens_returns_content_unchanged() {
+    // Cloud-safety: a MaxTokens response WITH content is returned as-is, with
+    // no retry — behavior unchanged from before #2174.
+    let content = run_conversation_content(vec![ChatResponse {
+        content: Some("partial but real".to_string()),
+        reasoning_content: None,
+        tool_calls: vec![],
+        stop_reason: StopReason::MaxTokens,
+        usage: LlmTokenUsage {
+            input_tokens: 5,
+            output_tokens: 128,
+            ..Default::default()
+        },
+        provider_index: None,
+    }])
+    .await;
+    assert_eq!(content, "partial but real");
+}

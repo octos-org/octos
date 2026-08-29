@@ -434,6 +434,7 @@ impl AcpSharedStores {
             max_iterations,
             save_episodes: true,
             chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
+            chat_temperature: config.gateway.as_ref().and_then(|g| g.llm_temperature),
             reasoning_effort: config.gateway.as_ref().and_then(|g| g.reasoning_effort),
             // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
             format_after_edit: config.format_after_edit,
@@ -2186,13 +2187,25 @@ mod tests {
             "gpt-test",
             &profile,
         );
-        for resurrected in ["workspace_diff", "view_image", "tool_search", "web_search"] {
+        for resurrected in ["workspace_diff", "view_image", "web_search"] {
             assert!(
                 !session.is_tool_visible(resurrected),
                 "{resurrected} must stay excluded in the rebound session registry"
             );
         }
-        for kept in ["read_file", "shell", "grep", "edit_file"] {
+        // #2133: `tool_search`, `check`, and `update_plan` are now in the lean
+        // allow list, and the shells (group:runtime) are kept; all must survive
+        // the rebind re-narrowing.
+        for kept in [
+            "read_file",
+            "bash",
+            "shell",
+            "grep",
+            "edit_file",
+            "tool_search",
+            "check",
+            "update_plan",
+        ] {
             assert!(
                 session.is_tool_visible(kept),
                 "{kept} must survive the rebound session registry"

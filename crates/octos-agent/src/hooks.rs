@@ -4,9 +4,10 @@
 //! Before-hooks can deny operations (exit code 1). Circuit breaker auto-disables
 //! hooks after consecutive failures.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use metrics::counter;
 use serde::{Deserialize, Serialize};
@@ -264,7 +265,23 @@ fn sanitize_payload(
 
     let sanitized_args = arguments.map(|args| {
         if is_sensitive {
-            serde_json::json!({"redacted": true, "reason": "sensitive tool"})
+            // #2129 review round 2, finding 2: a file PATH is not a secret
+            // (the file CONTENT is), and the path_filter matcher reads
+            // `arguments.path` to decide whether a checker fires. Redacting
+            // the whole object silently disabled every path-filtered hook
+            // on write_file (the new-file case). Preserve the path-
+            // identifying keys; redact everything else.
+            let mut kept = serde_json::Map::new();
+            if let Some(obj) = args.as_object() {
+                for key in ["path", "file_path", "filename", "file"] {
+                    if let Some(v @ serde_json::Value::String(_)) = obj.get(key) {
+                        kept.insert(key.to_string(), v.clone());
+                    }
+                }
+            }
+            kept.insert("redacted".into(), serde_json::Value::Bool(true));
+            kept.insert("reason".into(), serde_json::json!("sensitive tool"));
+            serde_json::Value::Object(kept)
         } else {
             truncate_json_value(&args, MAX_PAYLOAD_FIELD_BYTES)
         }
@@ -406,22 +423,34 @@ impl HookPayload {
     ///
     /// Result is sanitized: sensitive tools are redacted, others truncated
     /// to 1 KB to prevent secrets from leaking to hook processes.
+    #[allow(clippy::too_many_arguments)]
     pub fn after_tool(
         name: &str,
         tool_id: &str,
         result: String,
         success: bool,
         duration_ms: u64,
+        arguments: Option<&serde_json::Value>,
+        cwd: Option<&std::path::Path>,
         ctx: Option<&HookContext>,
     ) -> Self {
-        let (_, sanitized_result) = sanitize_payload(Some(name), None, Some(result));
+        // `arguments` is not decoration: the path-filter matcher reads
+        // `arguments.path` and SKIPS any path_filter-bearing hook when it is
+        // absent — an after_tool payload without arguments silently disables
+        // every path-filtered after-hook (#2129 review, finding 1). `cwd` is
+        // where the hook child runs; project-scoped checkers are meaningless
+        // in the daemon's start directory.
+        let (sanitized_args, sanitized_result) =
+            sanitize_payload(Some(name), arguments.cloned(), Some(result));
         let mut p = Self {
             event: HookEvent::AfterToolCall,
             tool_name: Some(name.to_string()),
             tool_id: Some(tool_id.to_string()),
+            arguments: sanitized_args,
             result: sanitized_result,
             success: Some(success),
             duration_ms: Some(duration_ms),
+            cwd: cwd.map(|c| c.to_string_lossy().into_owned()),
             ..Self::empty(HookEvent::AfterToolCall)
         };
         p.apply_context(ctx);
@@ -662,6 +691,39 @@ pub enum HookResult {
     Context(Vec<String>),
     /// A hook encountered an error (does not block).
     Error(String),
+    /// One or more AFTER-hooks exited 1 WITH output — the feedback channel
+    /// working as designed (a checker reporting diagnostics), distinct from
+    /// [`Self::Error`] infrastructure failures (missing binary, timeout,
+    /// exit >= 2) which must NOT be injected into the model conversation.
+    /// One entry per failing hook, in configuration order, so a failing
+    /// operator after-hook cannot overwrite the coding defaults' compile
+    /// errors (#2129 review, findings 8 and 9).
+    Feedback(Vec<String>),
+}
+
+/// Per-session hook state: consecutive-failure counts and last-run instants,
+/// each indexed parallel to `HookExecutor::hooks`.
+///
+/// #2153: this used to be a single `Vec<AtomicU32>` owned by the executor, so
+/// an `Arc<HookExecutor>` shared across every session/workspace under a profile
+/// shared ONE breaker — a genuine infra failure in one workspace counted
+/// toward disabling the hook for ALL sessions. Scoping the state by session
+/// key isolates both the breaker and the debounce window per session.
+#[derive(Debug)]
+struct SessionHookState {
+    /// Consecutive failure count per hook index (the circuit-breaker counter).
+    failures: Vec<u32>,
+    /// When each hook index last actually ran, for the after-event debounce.
+    last_run: Vec<Option<Instant>>,
+}
+
+impl SessionHookState {
+    fn new(hook_count: usize) -> Self {
+        Self {
+            failures: vec![0; hook_count],
+            last_run: vec![None; hook_count],
+        }
+    }
 }
 
 /// Executes hooks with circuit breaker protection.
@@ -673,9 +735,19 @@ pub struct HookExecutor {
     /// time so the matcher loop stays infallible. Hooks with no
     /// `path_filter` keep an empty inner Vec.
     path_filters: Vec<Vec<glob::Pattern>>,
-    /// Per-hook consecutive failure count.
-    failures: Vec<AtomicU32>,
+    /// Per-session breaker + debounce state, keyed by session scope
+    /// (session_id, else workspace cwd, else a shared global bucket). The
+    /// executor is `Arc`-shared across sessions, so this interior-mutable map
+    /// is what keeps one session's failures/throttle from leaking onto
+    /// another (#2153). Entries are created lazily on first use.
+    session_state: Mutex<HashMap<String, SessionHookState>>,
     failure_threshold: u32,
+    /// After-event (advisory) hooks that already ran within this window for
+    /// the same session are SKIPPED, so a burst of edits (e.g. several
+    /// `edit_file` calls in one assistant turn) does not pay one full
+    /// project `cargo check` each. `Duration::ZERO` disables it (the default);
+    /// before-event deny hooks are never debounced. (#2153 finding 2.)
+    after_event_debounce: Duration,
     /// Optional domain-data enricher applied to payloads before serialization.
     enricher: Option<Arc<dyn HookPayloadEnricher>>,
 }
@@ -686,7 +758,6 @@ impl HookExecutor {
     }
 
     pub fn with_threshold(hooks: Vec<HookConfig>, failure_threshold: u32) -> Self {
-        let failures = (0..hooks.len()).map(|_| AtomicU32::new(0)).collect();
         let path_filters = hooks
             .iter()
             .map(|hook| compile_path_filters(&hook.command, &hook.path_filter))
@@ -694,10 +765,132 @@ impl HookExecutor {
         Self {
             hooks,
             path_filters,
-            failures,
+            session_state: Mutex::new(HashMap::new()),
             failure_threshold,
+            after_event_debounce: Duration::ZERO,
             enricher: None,
         }
+    }
+
+    /// Enable after-event hook debouncing (#2153 finding 2): an advisory
+    /// after-event hook that ran within `window` for the same session is
+    /// skipped, coalescing a burst of edits into far fewer full project
+    /// checks. `Duration::ZERO` (the default) leaves every hook running every
+    /// time. Builder-style so the coding-defaults assembly can opt in while
+    /// plain executors stay unthrottled.
+    pub fn with_after_event_debounce(mut self, window: Duration) -> Self {
+        self.after_event_debounce = window;
+        self
+    }
+
+    /// The session-scope key for breaker + debounce state. Prefer the
+    /// session id, fall back to the workspace cwd, and finally a shared
+    /// empty-string bucket for context-free runs (e.g. unit tests). Keying
+    /// on either session or workspace fixes the cross-contamination in
+    /// #2153 — a flaky hook in one scope never disables it in another.
+    fn session_key(payload: &HookPayload) -> String {
+        payload
+            .session_id
+            .clone()
+            .or_else(|| payload.cwd.clone())
+            .unwrap_or_default()
+    }
+
+    /// Read a hook's consecutive-failure count for a session scope.
+    fn breaker_load(&self, key: &str, i: usize) -> u32 {
+        let map = self.session_state.lock().unwrap();
+        map.get(key).map(|s| s.failures[i]).unwrap_or(0)
+    }
+
+    /// Reset a hook's failure count to zero for a session scope.
+    fn breaker_reset(&self, key: &str, i: usize) {
+        let mut map = self.session_state.lock().unwrap();
+        if let Some(state) = map.get(key) {
+            // Avoid allocating an entry just to store a zero into a
+            // never-failed hook.
+            if state.failures[i] == 0 {
+                return;
+            }
+        } else {
+            return;
+        }
+        map.get_mut(key).unwrap().failures[i] = 0;
+    }
+
+    /// Increment a hook's failure count for a session scope, returning the
+    /// new value. Creates the session entry on first failure.
+    fn breaker_incr(&self, key: &str, i: usize) -> u32 {
+        let mut map = self.session_state.lock().unwrap();
+        let state = map
+            .entry(key.to_string())
+            .or_insert_with(|| SessionHookState::new(self.hooks.len()));
+        state.failures[i] = state.failures[i].saturating_add(1);
+        state.failures[i]
+    }
+
+    /// Claim the one-shot "hook disabled" warning for a session scope: returns
+    /// true exactly once, when the count first reaches the threshold, by
+    /// bumping it past the threshold so later calls stay silent.
+    fn breaker_claim_warning(&self, key: &str, i: usize) -> bool {
+        let mut map = self.session_state.lock().unwrap();
+        let Some(state) = map.get_mut(key) else {
+            return false;
+        };
+        if state.failures[i] == self.failure_threshold {
+            state.failures[i] = self.failure_threshold + 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Debounce gate for an after-event hook: true if it last COMPLETED within
+    /// the window for this session (→ skip). The window is measured from the
+    /// previous run's completion, not its start, because the check itself
+    /// (a whole-project `cargo check`) can take far longer than the window —
+    /// stamping at start would never coalesce a burst of edits. With
+    /// sequential inline tool execution this collapses several `edit_file`
+    /// calls in one assistant turn to a single check, while a later edit (a
+    /// new thinking step, arriving after the window) still gets a fresh check.
+    /// `Duration::ZERO` never throttles.
+    fn debounce_should_skip(&self, key: &str, i: usize) -> bool {
+        if self.after_event_debounce.is_zero() {
+            return false;
+        }
+        let map = self.session_state.lock().unwrap();
+        map.get(key)
+            .and_then(|s| s.last_run[i])
+            .is_some_and(|last| last.elapsed() < self.after_event_debounce)
+    }
+
+    /// Stamp an after-event hook's completion time for the debounce window.
+    /// Called after the hook runs (any outcome) so the NEXT edit within the
+    /// window is coalesced away.
+    fn debounce_mark_ran(&self, key: &str, i: usize) {
+        if self.after_event_debounce.is_zero() {
+            return;
+        }
+        let mut map = self.session_state.lock().unwrap();
+        let state = map
+            .entry(key.to_string())
+            .or_insert_with(|| SessionHookState::new(self.hooks.len()));
+        state.last_run[i] = Some(Instant::now());
+    }
+
+    /// Test-only: preset a hook's failure count for a session scope (the
+    /// per-session replacement for poking the old `failures[i]` atomic).
+    #[cfg(test)]
+    fn set_failures_for_test(&self, key: &str, i: usize, n: u32) {
+        let mut map = self.session_state.lock().unwrap();
+        map.entry(key.to_string())
+            .or_insert_with(|| SessionHookState::new(self.hooks.len()))
+            .failures[i] = n;
+    }
+
+    /// Test-only: read a hook's failure count for a session scope.
+    #[cfg(test)]
+    fn failures_for_test(&self, key: &str, i: usize) -> u32 {
+        self.breaker_load(key, i)
     }
 
     /// Attach a synchronous domain-data enricher. Additive: callers that do
@@ -705,6 +898,14 @@ impl HookExecutor {
     pub fn with_enricher(mut self, enricher: Arc<dyn HookPayloadEnricher>) -> Self {
         self.enricher = Some(enricher);
         self
+    }
+
+    /// The hook configurations this executor runs, in run order. Lets a
+    /// host MERGE executors (e.g. coding defaults + operator hooks) without
+    /// forking the runner: rebuild via `HookExecutor::new` from the
+    /// concatenated lists.
+    pub fn configs(&self) -> &[HookConfig] {
+        &self.hooks
     }
 
     /// Run all matching hooks for the given event sequentially.
@@ -746,6 +947,12 @@ impl HookExecutor {
         // matching hooks and returned as `HookResult::Context` at the end so
         // the caller can inject it into the turn before the first LLM call.
         let mut injected_contexts: Vec<String> = Vec::new();
+        let mut feedback: Vec<String> = Vec::new();
+
+        // #2153: breaker + debounce state is scoped to this session key so a
+        // flaky hook (or a rapid edit burst) in one session never disables or
+        // throttles the hook for another session sharing this Arc executor.
+        let session_key = Self::session_key(payload_ref);
 
         for (i, hook) in self.hooks.iter().enumerate() {
             if hook.event != event {
@@ -798,19 +1005,11 @@ impl HookExecutor {
                 continue;
             }
 
-            // Circuit breaker: skip if too many failures
-            let fail_count = self.failures[i].load(Ordering::Relaxed);
+            // Circuit breaker: skip if too many failures for THIS session.
+            let fail_count = self.breaker_load(&session_key, i);
             if fail_count >= self.failure_threshold {
-                // Atomically claim the warning (threshold -> threshold+1) so it fires once
-                if self.failures[i]
-                    .compare_exchange(
-                        self.failure_threshold,
-                        self.failure_threshold + 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
+                // Claim the warning (threshold -> threshold+1) so it fires once
+                if self.breaker_claim_warning(&session_key, i) {
                     warn!(
                         hook_command = ?hook.command,
                         "hook disabled after {} consecutive failures",
@@ -820,9 +1019,33 @@ impl HookExecutor {
                 continue;
             }
 
-            match self.execute_hook(hook, &payload_json).await {
-                Ok((0, stdout)) => {
-                    self.failures[i].store(0, Ordering::Relaxed);
+            // #2153: debounce after-event (advisory) hooks — a burst of edits
+            // in one turn should not pay one full project check each. A
+            // before-event hook can DENY, so it is never throttled.
+            if matches!(event, HookEvent::AfterToolCall)
+                && self.debounce_should_skip(&session_key, i)
+            {
+                continue;
+            }
+
+            let hook_cwd = payload_ref.cwd.as_deref().map(std::path::Path::new);
+            // #2129 review round 2, finding 5: a project-scoped checker
+            // (declares `requires_bin`: cargo/eslint/ruff) is meaningless
+            // without a known workspace root — running it in the daemon's
+            // start directory checks an unrelated project (or exits 101 and
+            // trips the breaker). Skip rather than run in the wrong place.
+            if hook_cwd.is_none() && hook.requires_bin.is_some() {
+                continue;
+            }
+            let hook_result = self.execute_hook(hook, &payload_json, hook_cwd).await;
+            // #2153: stamp the debounce window at COMPLETION (any outcome) so a
+            // subsequent edit within the window is coalesced. After-events only.
+            if matches!(event, HookEvent::AfterToolCall) {
+                self.debounce_mark_ran(&session_key, i);
+            }
+            match hook_result {
+                Ok((0, stdout, _stderr)) => {
+                    self.breaker_reset(&session_key, i);
                     // Context injection (user_prompt_submit): a hook that exits
                     // 0 and prints to stdout contributes that text as extra
                     // per-turn context. Other events ignore exit-0 stdout.
@@ -830,74 +1053,92 @@ impl HookExecutor {
                         injected_contexts.push(stdout);
                     }
                 }
-                Ok((1, stdout)) => {
+                // Exit 2 on a before-modify event = replacement payload.
+                Ok((2, stdout, _stderr))
                     if matches!(
+                        event,
+                        HookEvent::BeforeToolCall | HookEvent::BeforeSpawnVerify
+                    ) =>
+                {
+                    self.breaker_reset(&session_key, i);
+                    match serde_json::from_str::<serde_json::Value>(&stdout) {
+                        Ok(modified_args) => {
+                            tracing::info!(
+                                hook_command = ?hook.command,
+                                ?event,
+                                "hook modified event payload"
+                            );
+                            return HookResult::Modified(modified_args);
+                        }
+                        Err(e) => {
+                            warn!(
+                                hook_command = ?hook.command,
+                                error = %e,
+                                "hook exit 2 but stdout is not valid JSON, treating as error"
+                            );
+                            last_error = Some(format!("hook modified output not valid JSON: {e}"));
+                        }
+                    }
+                }
+                // Any OTHER nonzero exit.
+                Ok((code, stdout, stderr)) => {
+                    let is_before = matches!(
                         event,
                         HookEvent::UserPromptSubmit
                             | HookEvent::BeforeToolCall
                             | HookEvent::BeforeLlmCall
                             | HookEvent::BeforeSpawnVerify
-                    ) {
-                        self.failures[i].store(0, Ordering::Relaxed);
-                        return HookResult::Deny(stdout);
-                    }
-                    // Exit 1 on after-hooks is an error (deny is meaningless for after-events)
-                    let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
-                    let msg = format!(
-                        "hook {:?} exited with code 1 on after-event ({}/{})",
-                        hook.command, new_count, self.failure_threshold
                     );
-                    warn!("{}", msg);
-                    last_error = Some(msg);
-                }
-                Ok((2, stdout)) => {
-                    // Exit 2 = modified input (before-hooks only).
-                    // Stdout contains the replacement JSON payload.
-                    if matches!(
-                        event,
-                        HookEvent::BeforeToolCall | HookEvent::BeforeSpawnVerify
-                    ) {
-                        self.failures[i].store(0, Ordering::Relaxed);
-                        match serde_json::from_str::<serde_json::Value>(&stdout) {
-                            Ok(modified_args) => {
-                                tracing::info!(
-                                    hook_command = ?hook.command,
-                                    ?event,
-                                    "hook modified event payload"
-                                );
-                                return HookResult::Modified(modified_args);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    hook_command = ?hook.command,
-                                    error = %e,
-                                    "hook exit 2 but stdout is not valid JSON, treating as error"
-                                );
-                                last_error =
-                                    Some(format!("hook modified output not valid JSON: {e}"));
-                            }
+                    if is_before {
+                        // Before-events: exit 1 DENIES; anything else is infra.
+                        if code == 1 {
+                            self.breaker_reset(&session_key, i);
+                            return HookResult::Deny(stdout);
                         }
-                    } else {
-                        let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                        let new_count = self.breaker_incr(&session_key, i);
                         let msg = format!(
-                            "hook {:?} exited with code 2 on non-before-tool event ({}/{})",
-                            hook.command, new_count, self.failure_threshold
+                            "hook {:?} exited with code {} on before-event ({}/{})",
+                            hook.command, code, new_count, self.failure_threshold
                         );
                         warn!("{}", msg);
                         last_error = Some(msg);
+                    } else {
+                        // AFTER-events: a checker reporting problems. ANY
+                        // nonzero exit WITH output is FEEDBACK and does NOT
+                        // count toward the breaker — cargo check exits 101
+                        // on compile errors (#2129 review round 2, finding
+                        // 1), eslint/ruff exit 1, tsc 1/2; a model iterating
+                        // on errors legitimately fails many times in a row.
+                        // Empty output on a nonzero exit is indistinguishable
+                        // from a broken hook: infra error, counted.
+                        let mut output = if stderr.is_empty() {
+                            stdout
+                        } else if stdout.is_empty() {
+                            stderr
+                        } else {
+                            format!("{stdout}\n{stderr}")
+                        };
+                        octos_core::truncate_utf8(
+                            &mut output,
+                            2000,
+                            "\n... (hook output truncated)",
+                        );
+                        if output.trim().is_empty() {
+                            let new_count = self.breaker_incr(&session_key, i);
+                            let msg = format!(
+                                "hook {:?} exited with code {} and no output ({}/{})",
+                                hook.command, code, new_count, self.failure_threshold
+                            );
+                            warn!("{}", msg);
+                            last_error = Some(msg);
+                        } else {
+                            self.breaker_reset(&session_key, i);
+                            feedback.push(format!("{:?}:\n{}", hook.command, output));
+                        }
                     }
                 }
-                Ok((code, _stdout)) => {
-                    let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
-                    let msg = format!(
-                        "hook {:?} exited with code {} ({}/{})",
-                        hook.command, code, new_count, self.failure_threshold
-                    );
-                    warn!("{}", msg);
-                    last_error = Some(msg);
-                }
                 Err(e) => {
-                    let new_count = self.failures[i].fetch_add(1, Ordering::Relaxed) + 1;
+                    let new_count = self.breaker_incr(&session_key, i);
                     let msg = format!(
                         "hook {:?} failed: {} ({}/{})",
                         hook.command, e, new_count, self.failure_threshold
@@ -908,7 +1149,11 @@ impl HookExecutor {
             }
         }
 
-        if let Some(err) = last_error {
+        if !feedback.is_empty() {
+            // Feedback outranks infra errors: diagnostics are actionable,
+            // and infra errors are logged above either way.
+            HookResult::Feedback(feedback)
+        } else if let Some(err) = last_error {
             HookResult::Error(err)
         } else if !injected_contexts.is_empty() {
             HookResult::Context(injected_contexts)
@@ -917,12 +1162,14 @@ impl HookExecutor {
         }
     }
 
-    /// Execute a single hook process. Returns (exit_code, stdout).
+    /// Execute a single hook process in `cwd` (when given — the payload's
+    /// workspace root). Returns (exit_code, stdout, stderr).
     async fn execute_hook(
         &self,
         hook: &HookConfig,
         payload_json: &str,
-    ) -> eyre::Result<(i32, String)> {
+        cwd: Option<&std::path::Path>,
+    ) -> eyre::Result<(i32, String, String)> {
         let (program, args) = hook
             .command
             .split_first()
@@ -934,6 +1181,9 @@ impl HookExecutor {
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&expanded_args);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -952,34 +1202,47 @@ impl HookExecutor {
             let _ = stdin.shutdown().await;
         }
 
-        // Take stdout/stderr handles so we can read them after wait
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        // Take stdout/stderr handles and read them CONCURRENTLY with the
+        // wait: reading only after wait() returns deadlocks the moment the
+        // child emits more than the pipe buffer (~64KB) — the child blocks
+        // on write, the parent blocks in wait, and the timeout kills the
+        // exact heavy-diagnostics run the feedback loop exists for (#2129
+        // review, finding 3).
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
+        let drain = async {
+            let mut out_buf = Vec::new();
+            let mut err_buf = Vec::new();
+            let stdout_read = async {
+                if let Some(handle) = stdout_handle.as_mut() {
+                    let _ = handle.read_to_end(&mut out_buf).await;
+                }
+            };
+            let stderr_read = async {
+                if let Some(handle) = stderr_handle.as_mut() {
+                    let _ = handle.read_to_end(&mut err_buf).await;
+                }
+            };
+            let (status, _, _) = tokio::join!(child.wait(), stdout_read, stderr_read);
+            status.map(|status| (status, out_buf, err_buf))
+        };
 
-        // Wait with timeout (use wait() instead of wait_with_output() so child isn't consumed)
         let timeout = Duration::from_millis(hook.timeout_ms);
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                let stdout = if let Some(mut handle) = stdout_handle {
-                    let mut buf = Vec::new();
-                    let _ = handle.read_to_end(&mut buf).await;
-                    String::from_utf8_lossy(&buf).trim().to_string()
-                } else {
-                    String::new()
-                };
-                // Log stderr from the hook process (diagnostic output)
-                if let Some(mut handle) = stderr_handle {
-                    let mut buf = Vec::new();
-                    let _ = handle.read_to_end(&mut buf).await;
-                    let stderr = String::from_utf8_lossy(&buf);
-                    for line in stderr.lines() {
-                        let line = line.trim();
-                        if !line.is_empty() {
-                            tracing::info!(
-                                hook = ?hook.command,
-                                "{line}"
-                            );
-                        }
+        match tokio::time::timeout(timeout, drain).await {
+            Ok(Ok((status, out_buf, err_buf))) => {
+                let stdout = String::from_utf8_lossy(&out_buf).trim().to_string();
+                // Checkers put their diagnostics on stderr (`cargo check
+                // --message-format=short` writes every diagnostic there);
+                // the after-event feedback path surfaces them to the model.
+                // Still logged for operators.
+                let stderr = String::from_utf8_lossy(&err_buf).trim().to_string();
+                for line in stderr.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        tracing::info!(
+                            hook = ?hook.command,
+                            "{line}"
+                        );
                     }
                 }
                 let code = status.code().unwrap_or(2);
@@ -989,7 +1252,7 @@ impl HookExecutor {
                     stdout_len = stdout.len(),
                     "hook executed"
                 );
-                Ok((code, stdout))
+                Ok((code, stdout, stderr))
             }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
@@ -1139,7 +1402,7 @@ mod tests {
     fn should_stamp_current_schema_version_on_every_constructor() {
         let payloads = vec![
             HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None),
-            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None),
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None),
             HookPayload::before_llm("gpt-4", 0, 1, None),
             HookPayload::on_resume(None),
             HookPayload::on_turn_end("done", None),
@@ -1208,7 +1471,8 @@ mod tests {
         assert_eq!(after_llm.session_cost, Some(0.05));
         assert_eq!(after_llm.response_cost, Some(0.01));
 
-        let after_tool = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 42, None);
+        let after_tool =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 42, None, None, None);
         assert_eq!(after_tool.event, HookEvent::AfterToolCall);
         assert_eq!(after_tool.success, Some(true));
         assert_eq!(after_tool.duration_ms, Some(42));
@@ -1371,7 +1635,7 @@ mod tests {
             requires_bin: None,
         }]);
         // Set failures at threshold so circuit breaker trips
-        executor.failures[0].store(3, Ordering::Relaxed);
+        executor.set_failures_for_test("", 0, 3);
 
         let payload = HookPayload {
             schema_version: HOOK_PAYLOAD_SCHEMA_VERSION,
@@ -1564,14 +1828,15 @@ mod tests {
             }],
             3,
         );
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None);
 
         // First two failures: hook still runs (returns Error, not Allow)
         let r1 = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert!(matches!(r1, HookResult::Error(_)));
         let r2 = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert!(matches!(r2, HookResult::Error(_)));
-        assert_eq!(executor.failures[0].load(Ordering::Relaxed), 2);
+        assert_eq!(executor.failures_for_test("", 0), 2);
     }
 
     #[tokio::test]
@@ -1588,7 +1853,8 @@ mod tests {
             }],
             3,
         );
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None);
 
         // Trigger 3 failures to hit threshold
         for _ in 0..3 {
@@ -1598,6 +1864,140 @@ mod tests {
         // Fourth call: hook is disabled (skipped), returns Allow
         let r = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert_eq!(r, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn circuit_breaker_is_scoped_per_session_not_shared() {
+        // #2153 finding 1: one Arc-shared executor must NOT let a hook's
+        // failures in one session/workspace disable it for another. Two
+        // payloads with distinct cwds are two distinct session scopes.
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                // exit 2 with no output = infra failure that counts.
+                command: vec!["sh".into(), "-c".into(), "exit 2".into()],
+                timeout_ms: 5000,
+                tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
+            }],
+            3,
+        );
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let key_a = dir_a.path().to_string_lossy().to_string();
+        let key_b = dir_b.path().to_string_lossy().to_string();
+        let payload_a = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_a.path()),
+            None,
+        );
+        let payload_b = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_b.path()),
+            None,
+        );
+
+        // Trip the breaker for session A only.
+        for _ in 0..3 {
+            executor.run(HookEvent::AfterToolCall, &payload_a).await;
+        }
+        // A is disabled — the 4th run is SKIPPED (Allow, not the Error the
+        // hook would otherwise produce).
+        assert_eq!(
+            executor.run(HookEvent::AfterToolCall, &payload_a).await,
+            HookResult::Allow,
+            "session A's breaker must trip after its own failures"
+        );
+        // B shares the SAME Arc executor but its breaker is untouched: the
+        // hook still RUNS (returns Error from exit 2) and B's counter is
+        // independent — the pre-#2153 shared Vec would have skipped it here.
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload_b).await,
+                HookResult::Error(_)
+            ),
+            "session B must be unaffected by session A's tripped breaker"
+        );
+        assert!(executor.failures_for_test(&key_a, 0) >= 3);
+        assert_eq!(executor.failures_for_test(&key_b, 0), 1);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_event_debounce_coalesces_a_burst_per_session() {
+        // #2153 finding 2: with a debounce window, a second after-event hook
+        // within the window for the SAME session is skipped (so N rapid edits
+        // pay one project check, not N) — but a different session is not.
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                // nonzero WITH output => Feedback (does not count toward breaker).
+                command: vec!["sh".into(), "-c".into(), "echo problem; exit 1".into()],
+                timeout_ms: 5000,
+                tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
+            }],
+            3,
+        )
+        .with_after_event_debounce(std::time::Duration::from_secs(60));
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let payload_a = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_a.path()),
+            None,
+        );
+        let payload_b = HookPayload::after_tool(
+            "shell",
+            "t",
+            "ok".into(),
+            true,
+            1,
+            None,
+            Some(dir_b.path()),
+            None,
+        );
+
+        // First edit in session A: the hook runs and returns Feedback.
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload_a).await,
+                HookResult::Feedback(_)
+            ),
+            "the first edit runs the check"
+        );
+        // Second edit in A within the 60s window: coalesced away (Allow).
+        assert_eq!(
+            executor.run(HookEvent::AfterToolCall, &payload_a).await,
+            HookResult::Allow,
+            "a second edit within the debounce window is coalesced"
+        );
+        // A different session is NOT throttled — its first edit still runs.
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload_b).await,
+                HookResult::Feedback(_)
+            ),
+            "the debounce window is per-session, not global"
+        );
     }
 
     #[tokio::test]
@@ -1616,13 +2016,14 @@ mod tests {
         );
 
         // Simulate 2 prior failures
-        executor.failures[0].store(2, Ordering::Relaxed);
+        executor.set_failures_for_test("", 0, 2);
 
         // Success resets counter
-        let payload = HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("shell", "tc1", "ok".into(), true, 10, None, None, None);
         let r = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert_eq!(r, HookResult::Allow);
-        assert_eq!(executor.failures[0].load(Ordering::Relaxed), 0);
+        assert_eq!(executor.failures_for_test("", 0), 0);
     }
 
     #[test]
@@ -1668,6 +2069,8 @@ mod tests {
             "SECRET_KEY=hunter2\nDB_PASS=abc".into(),
             true,
             10,
+            None,
+            None,
             None,
         );
         let json = serde_json::to_string(&payload).unwrap();
@@ -1721,7 +2124,8 @@ mod tests {
             vec!["**/*.rs"],
         )]);
         // edit_file on a Python path — `**/*.rs` glob should NOT match.
-        let payload = HookPayload::after_tool("edit_file", "tc1", "ok".into(), true, 10, None);
+        let payload =
+            HookPayload::after_tool("edit_file", "tc1", "ok".into(), true, 10, None, None, None);
         let mut payload = payload;
         payload.arguments = Some(serde_json::json!({"path": "scripts/build.py"}));
         let result = executor.run(HookEvent::AfterToolCall, &payload).await;
@@ -2163,5 +2567,293 @@ mod tests {
         let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
         let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
         assert_eq!(result, HookResult::Allow);
+    }
+
+    /// A failing AFTER-hook must carry its child's output — stdout and
+    /// stderr both, since checkers (`cargo check --message-format=short`)
+    /// write diagnostics to stderr. The pre-#2129 message ("exited with
+    /// code 1 on after-event") fed the model nothing actionable.
+    #[tokio::test]
+    async fn after_hook_failure_carries_child_output() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo out-line; echo err-line >&2; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "out".to_string(),
+            true,
+            5,
+            None,
+            None,
+            None,
+        );
+        match executor.run(HookEvent::AfterToolCall, &payload).await {
+            HookResult::Feedback(entries) => {
+                let msg = entries.join("\n");
+                assert!(msg.contains("out-line"), "stdout must surface: {msg}");
+                assert!(msg.contains("err-line"), "stderr must surface: {msg}");
+            }
+            other => panic!("expected Feedback carrying output, got {other:?}"),
+        }
+    }
+
+    /// #2129 review finding 1: the after_tool payload must carry the tool
+    /// ARGUMENTS — the path-filter matcher reads `arguments.path` and skips
+    /// path_filtered hooks without it. Regression test for the
+    /// dead-on-arrival wiring.
+    #[tokio::test]
+    async fn path_filtered_after_hook_fires_when_arguments_carry_the_path() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo diagnostics; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec!["edit_file".to_string()],
+            path_filter: vec!["**/*.rs".to_string()],
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "ok".to_string(),
+            true,
+            5,
+            Some(&args),
+            None,
+            None,
+        );
+        assert!(matches!(
+            executor.run(HookEvent::AfterToolCall, &payload).await,
+            HookResult::Feedback(_)
+        ));
+        let args = serde_json::json!({"path": "README.md"});
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "ok".to_string(),
+            true,
+            5,
+            Some(&args),
+            None,
+            None,
+        );
+        assert!(matches!(
+            executor.run(HookEvent::AfterToolCall, &payload).await,
+            HookResult::Allow
+        ));
+    }
+
+    /// #2129 review finding 2: repeated exit-1-with-output must NOT trip
+    /// the circuit breaker — a model iterating on compile errors fails the
+    /// #2129 review round 2, finding 1: cargo check exits 101 on compile
+    /// errors — its diagnostics must reach the model as Feedback (not the
+    /// discarded infra arm) and must NOT count toward the breaker.
+    #[tokio::test]
+    async fn cargo_style_101_exit_reaches_the_model_as_feedback() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo 'error[E0308]: mismatched types' >&2; exit 101".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        for _ in 0..10 {
+            let payload =
+                HookPayload::after_tool("edit_file", "id", "ok".into(), true, 5, None, None, None);
+            match executor.run(HookEvent::AfterToolCall, &payload).await {
+                HookResult::Feedback(entries) => {
+                    assert!(
+                        entries.join("\n").contains("E0308"),
+                        "diagnostics must surface"
+                    );
+                }
+                other => panic!("cargo 101 must be Feedback, got {other:?}"),
+            }
+        }
+    }
+
+    /// #2129 review round 2, finding 2: write_file is a SENSITIVE_TOOL, but
+    /// its PATH is not a secret — the path must survive redaction so a
+    /// path-filtered checker still fires on new-file creation.
+    #[tokio::test]
+    async fn write_file_path_survives_redaction_so_checkers_fire() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo diag; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec!["write_file".to_string()],
+            path_filter: vec!["**/*.rs".to_string()],
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        // write_file args carry both a path AND file content (a secret-
+        // bearing field). The path must be preserved; the content redacted.
+        let args = serde_json::json!({
+            "path": "src/lib.rs",
+            "content": "const API_KEY: &str = \"sk-secret\";"
+        });
+        let payload = HookPayload::after_tool(
+            "write_file",
+            "id",
+            "ok".into(),
+            true,
+            5,
+            Some(&args),
+            None,
+            None,
+        );
+        // The sanitized payload keeps the path, drops the content.
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("src/lib.rs"), "path must survive: {json}");
+        assert!(
+            !json.contains("sk-secret"),
+            "content must be redacted: {json}"
+        );
+        // And the path-filtered checker fires (matches src/lib.rs).
+        assert!(matches!(
+            executor.run(HookEvent::AfterToolCall, &payload).await,
+            HookResult::Feedback(_)
+        ));
+    }
+
+    /// #2129 review round 2, finding 5: a project-scoped checker
+    /// (requires_bin) must be SKIPPED when the workspace root is unknown
+    /// (cwd None) rather than run in the daemon's directory.
+    #[tokio::test]
+    async fn project_hook_skipped_when_workspace_root_unknown() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo should-not-run; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: Some("sh".to_string()), // present, but cwd is None
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        let payload =
+            HookPayload::after_tool("edit_file", "id", "ok".into(), true, 5, None, None, None);
+        assert!(
+            matches!(
+                executor.run(HookEvent::AfterToolCall, &payload).await,
+                HookResult::Allow
+            ),
+            "project hook must be skipped without a workspace root"
+        );
+    }
+
+    /// check many times in a row, and that is the channel working.
+    #[tokio::test]
+    async fn repeated_check_failures_do_not_trip_the_breaker() {
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo still-broken; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        for i in 0..5 {
+            let payload = HookPayload::after_tool(
+                "edit_file",
+                "id",
+                "ok".to_string(),
+                true,
+                5,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                matches!(
+                    executor.run(HookEvent::AfterToolCall, &payload).await,
+                    HookResult::Feedback(_)
+                ),
+                "attempt {i} must still deliver feedback (breaker must not trip)"
+            );
+        }
+    }
+
+    /// The hook child runs in the payload's cwd (the workspace root) — a
+    /// project-scoped checker is meaningless in the daemon's start dir, and
+    /// carrying cwd on the payload lets ONE profile-level executor serve
+    /// every session (#2129 review, findings 4 and 7).
+    ///
+    /// Unix-gated: it drives `sh -c "pwd"` and matches the output against
+    /// Rust's canonicalized path — on Windows Git Bash's `pwd` emits a
+    /// unix-style path (`/c/...`) that never equals the `C:\...` form, so
+    /// the assertion is inherently POSIX. The cwd-passing behavior is
+    /// platform-independent; only this path-format check is unix-specific.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_child_runs_in_payload_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected = tmp.path().canonicalize().unwrap();
+        let hook = HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "pwd; exit 1".to_string(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![hook]);
+        let payload = HookPayload::after_tool(
+            "edit_file",
+            "id",
+            "out".to_string(),
+            true,
+            5,
+            None,
+            Some(tmp.path()),
+            None,
+        );
+        match executor.run(HookEvent::AfterToolCall, &payload).await {
+            HookResult::Feedback(entries) => assert!(
+                entries
+                    .join("\n")
+                    .contains(&expected.to_string_lossy().to_string()),
+                "child must run in the payload cwd; got: {entries:?}"
+            ),
+            other => panic!("expected Feedback, got {other:?}"),
+        }
     }
 }

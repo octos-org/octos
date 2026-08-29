@@ -49,6 +49,7 @@ pub struct WeComChannel {
 }
 
 impl WeComChannel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         corp_id: &str,
         agent_id: &str,

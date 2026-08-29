@@ -400,6 +400,32 @@ impl LlmProvider for RetryProvider {
         eyre::bail!("retry loop exited unexpectedly")
     }
 
+    // #2135 review P1: without these delegations the trait defaults re-read
+    // the static catalog by model id, silently discarding a probed or
+    // overridden window on the standard runtime path (every session wraps
+    // the base provider in RetryProvider).
+    fn context_window(&self) -> u32 {
+        self.inner.context_window()
+    }
+
+    fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::types::ToolSpec],
+    ) -> u32 {
+        // #2143 part 3: delegate so a concrete provider's request-size override
+        // survives this wrapper (mirrors context_window delegation).
+        self.inner.estimate_request_tokens(messages, tools)
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.inner.max_output_tokens()
+    }
+
+    async fn ensure_ready(&self) {
+        self.inner.ensure_ready().await;
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

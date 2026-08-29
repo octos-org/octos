@@ -913,7 +913,17 @@ context_ledgers/
 /// `write_workspace_policy` (no semantic change to the legacy
 /// function).
 fn bootstrap_session_policy(workspace_root: &Path) -> Result<()> {
-    write_workspace_policy_if_absent(workspace_root, &WorkspacePolicy::for_session())
+    // Audit Gap-1 wiring (#2129): `detect_workspace_policy_kind` and
+    // `WorkspacePolicy::for_coding` were authored for exactly this call
+    // site but never called — every session workspace was bootstrapped as
+    // the generic `for_session()` policy, so a repo full of Rust got the
+    // same contract as a podcast workspace. The detector keys on observable
+    // manifests (Cargo.toml / package.json / pyproject.toml), not LLM input.
+    let policy = match octos_agent::workspace_policy::detect_workspace_policy_kind(workspace_root) {
+        octos_agent::workspace_policy::WorkspacePolicyKind::Coding => WorkspacePolicy::for_coding(),
+        _ => WorkspacePolicy::for_session(),
+    };
+    write_workspace_policy_if_absent(workspace_root, &policy)
         .wrap_err("failed to bootstrap session workspace policy")
 }
 
