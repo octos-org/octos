@@ -2319,6 +2319,7 @@ fn bash_is_filtered_when_policy_denies_runtime_group() {
         allow: vec![],
         deny: vec!["group:runtime".into()],
         require_tags: vec![],
+        bash_file_writes: Default::default(),
     };
     registry.apply_policy(&policy);
     assert!(
@@ -2345,6 +2346,7 @@ fn delegate_is_filtered_when_policy_denies_sessions_group() {
         allow: vec![],
         deny: vec!["group:sessions".into()],
         require_tags: vec![],
+        bash_file_writes: Default::default(),
     };
     registry.apply_policy(&policy);
     assert!(
@@ -2758,6 +2760,163 @@ fn should_declare_element_schema_when_spawn_agent_items_is_array() {
     assert!(items["items"]["properties"]["text"].is_object());
 }
 
+// ---------------------------------------------------------------------------
+// #28c — file-change receipt on the CODING-session bash path (BashTool),
+// reusing the shared 28a module. These tests pin the 28a acceptance set
+// on this link: real edit ⇒ receipt; phantom edit ⇒ 0; non-git ⇒ omitted;
+// default (no knob involvement here) ⇒ unchanged when nothing changed.
+// ---------------------------------------------------------------------------
+mod bash_change_receipt_28c {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::BashTool;
+    use std::sync::Arc;
+
+    fn tool(dir: &std::path::Path) -> BashTool {
+        BashTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+    }
+
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn real_edit_in_git_repo_appends_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(cwd)
+            .status()
+            .expect("git commit");
+        let target = cwd.join("receipt-28c.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "cmd": format!("echo real-edit > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "receipt missing on the coding bash path: {}",
+            out.output
+        );
+    }
+
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn phantom_edit_reports_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        // No write at all — the receipt must be "files_changed: 0" (or absent
+        // if the tree were clean-vs-clean; porcelain empty ⇒ None from
+        // snapshot ⇒ omitted; either way NEVER a nonzero phantom count).
+        let out = tool(cwd)
+            .execute(&json!({ "cmd": "echo phantom-check" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(
+            !out.output.contains("files_changed: 2"),
+            "no phantom count may appear: {}",
+            out.output
+        );
+    }
+
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn non_git_dir_omits_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path(); // never git-init'd
+        let target = cwd.join("plain.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "cmd": format!("echo plain > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            !out.output.contains("files_changed"),
+            "non-git fail-open must omit the receipt: {}",
+            out.output
+        );
+    }
+
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn default_behavior_when_no_tree_change_is_plain_output() {
+        // Zero-difference guarantee for the default path: in a git repo with
+        // an UNCHANGED tree, a read-only command's output carries no
+        // receipt noise beyond the accepted "files_changed: 0" line, which
+        // itself only appears when the tree was ALREADY dirty — pin the
+        // clean-tree case: no receipt at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(cwd)
+            .status()
+            .expect("git commit");
+        let out = tool(cwd)
+            .execute(&json!({ "cmd": "echo zero-diff-28c" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("zero-diff-28c"));
+        // 28a semantics: an empty dirty set yields exactly the single line
+        // "files_changed: 0" (matches ShellTool). No path list, no noise.
+        assert!(
+            out.output.contains("files_changed: 0"),
+            "clean tree ⇒ the single zero line: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("(+"),
+            "no truncation/list noise on a clean tree: {}",
+            out.output
+        );
+    }
+}
+
 /// The sandbox-denial hint fires only on the exact combination that needs
 /// explaining: a FAILED command, under a REAL sandbox, whose output carries
 /// one of the kernel's denial phrases — EPERM (macOS seatbelt), EACCES
@@ -2801,6 +2960,354 @@ fn sandbox_denial_hint_fires_only_on_sandboxed_failures() {
             sandbox_denial_hint(sandboxed, success, body).is_none(),
             "no hint for ({sandboxed}, {success}, {body})"
         );
+    }
+}
+
+mod exec_change_receipt_28c {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::ExecCommandTool;
+    use std::sync::Arc;
+
+    fn tool(dir: &std::path::Path) -> ExecCommandTool {
+        ExecCommandTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+    }
+
+    #[cfg(unix)] // #34d: POSIX shell spawn semantics — repo convention (see bash_change_receipt_28c).
+    #[tokio::test]
+    async fn real_edit_in_git_repo_appends_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        let target = cwd.join("exec-receipt-28c.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "command": format!("echo real-edit > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "receipt missing on the exec_command path: {}",
+            out.output
+        );
+    }
+
+    #[cfg(unix)] // #34d: POSIX shell spawn semantics — repo convention (see bash_change_receipt_28c).
+    #[tokio::test]
+    async fn non_git_dir_omits_receipt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path();
+        let target = cwd.join("plain.txt");
+        let out = tool(cwd)
+            .execute(&json!({
+                "command": format!("echo plain > {:?}", target),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            !out.output.contains("files_changed"),
+            "non-git fail-open must omit the receipt: {}",
+            out.output
+        );
+    }
+}
+
+mod receipt_scope_root_28c_r1 {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::{BashTool, receipt_scope_root};
+    use std::sync::Arc;
+
+    fn git_init(cwd: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+    }
+
+    // Resolver unit pins (ruling ②): literal cd prefix wins; ambiguous
+    // shapes fall back to workdir.
+    // #34e — portable fixtures: the RESOLVER is pure string logic (no POSIX
+    // dependency), but absolute-path literals like "/tmp/x" are NOT absolute
+    // on Windows (no drive prefix), so `is_absolute()` flips the join arm
+    // and the scope assertion fails. Building the literals from a platform
+    // absolute base keeps this test covering the judgment on BOTH platforms
+    // (per the 34e ruling's first option) instead of gating it off.
+    #[test]
+    fn resolver_literal_cd_prefix_wins_and_var_falls_back() {
+        // #34f — the fixture text and the expected path must be built from
+        // the SAME string: on Windows `PathBuf::display()` renders
+        // backslashes, the resolver's literal screen rejects `\` (falls
+        // back to workdir), and the assertion pairs then cross (34e's own
+        // mistake — expected Temp\ws, got Temp\tmp\x). Building both the
+        // command text and the expectation from one forward-slash string
+        // keeps the pairs aligned on every platform; `Path::new` on a
+        // forward-slash string is still absolute on Windows (drive prefix).
+        let base = std::env::temp_dir();
+        let ws = base.join("ws");
+        let base_text = base.to_string_lossy().replace('\\', "/");
+        let target_text = format!("{base_text}/tmp/x");
+        let cd_cmd = format!("cd {target_text} && echo hi > f");
+        let (root, scope) = receipt_scope_root(&ws, &cd_cmd);
+        assert_eq!(root, std::path::PathBuf::from(&target_text));
+        assert_eq!(scope, "cd-target");
+
+        let (root, scope) = receipt_scope_root(&ws, "cd ~/proj && echo hi > f");
+        assert_eq!(scope, "cd-target");
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .expect("HOME/USERPROFILE set");
+        assert!(
+            root.starts_with(std::path::Path::new(&home)),
+            "~ expansion anchors at the platform home: {root:?}"
+        );
+
+        // No cd prefix ⇒ workdir.
+        let (root, scope) = receipt_scope_root(&ws, "echo hi > f");
+        assert_eq!(root, ws.clone());
+        assert_eq!(scope, "workdir");
+
+        // Variable path ⇒ ambiguous ⇒ workdir.
+        let (root, scope) = receipt_scope_root(&ws, "cd $TARGET && echo hi > f");
+        assert_eq!(root, ws.clone());
+        assert_eq!(scope, "workdir");
+
+        // cd without && ⇒ workdir.
+        let (_root, scope) = receipt_scope_root(&ws, "cd /tmp/x");
+        assert_eq!(scope, "workdir");
+
+        // Semicolon chain ⇒ ambiguous ⇒ workdir.
+        let (root, scope) = receipt_scope_root(&ws, "cd /tmp/x; cd /tmp/y && echo hi > f");
+        assert_eq!(scope, "workdir");
+        assert_eq!(root, ws.clone());
+    }
+
+    // Live-shape pin (ruling ④): cd-prefix write reports files_changed: 1
+    // plus the cd-target scope tag — the exact false-phantom regression.
+    #[cfg(unix)] // #34e: POSIX shell spawn semantics (cd && echo >) — same convention as the #34d gates.
+    #[tokio::test]
+    async fn cd_prefix_write_reports_one_with_scope_tag() {
+        let session_ws = tempfile::tempdir().expect("tempdir"); // session workdir: NOT a repo
+        let target = tempfile::tempdir().expect("tempdir"); // cd target: a git repo
+        git_init(target.path());
+        let tool = BashTool::new(session_ws.path(), Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy));
+        let file = target.path().join("r1.txt");
+        let out = tool
+            .execute(&json!({
+                "cmd": format!("cd {} && echo real > {:?}", target.path().display(), file),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "cd-target write must count 1: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("scope: cd-target"),
+            "scope tag missing: {}",
+            out.output
+        );
+    }
+
+    // Variable cd path falls back to workdir (ruling ④): the write happens
+    // inside the workdir repo, but the snapshot root is the workdir — the
+    // count is still correct for a workdir write; the tag says workdir.
+    #[cfg(unix)] // #34e: POSIX shell spawn semantics (cd && echo >) — same convention as the #34d gates.
+    #[tokio::test]
+    async fn variable_cd_path_falls_back_to_workdir_scope() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        git_init(ws.path());
+        let tool = BashTool::new(ws.path(), Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy));
+        let file = ws.path().join("var.txt");
+        // $TARGET is unset in the child, so `cd $TARGET` fails and the write
+        // still lands relative to the workdir via the absolute path — the
+        // receipt must not phantom-zero this.
+        let out = tool
+            .execute(&json!({
+                "cmd": format!("cd $TARGET 2>/dev/null; echo v > {:?} # octos:allow-write", file),
+            }))
+            .await
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "workdir write must count 1: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("scope: workdir"),
+            "fallback scope tag missing: {}",
+            out.output
+        );
+    }
+}
+
+mod bash_file_writes_28d {
+    use super::*;
+    use crate::policy::AllowAllPolicy;
+    use crate::tools::coding_tools::{BashTool, ExecCommandTool};
+    use crate::tools::policy::BashFileWrites;
+    use std::sync::Arc;
+
+    fn bash(dir: &std::path::Path, mode: BashFileWrites) -> BashTool {
+        BashTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+            .with_bash_file_writes(mode)
+    }
+
+    fn exec(dir: &std::path::Path, mode: BashFileWrites) -> ExecCommandTool {
+        ExecCommandTool::new(dir, Arc::new(crate::sandbox::NoSandbox))
+            .with_policy(Arc::new(AllowAllPolicy))
+            .with_bash_file_writes(mode)
+    }
+
+    fn git_init(cwd: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+    }
+
+    // deny: write-shaped command refused, escape hatch honored — on BOTH
+    // coding tools.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn deny_refuses_write_and_escape_hatch_runs_bash_and_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = bash(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "cmd": "echo x > /tmp/never-28d" }))
+            .await
+            .expect("execute");
+        assert!(!out.success);
+        assert!(out.output.contains("bash_file_writes=deny"));
+        // Refusal text only — the command must not have run.
+        let _ = std::path::Path::new("/tmp/never-28d");
+
+        let out = exec(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "command": "echo x > /tmp/never-28d-e" }))
+            .await
+            .expect("execute");
+        assert!(!out.success, "exec deny: {}", out.output);
+        assert!(out.output.contains("bash_file_writes=deny"));
+
+        // Escape hatch: trailing `# octos:allow-write` runs the write.
+        let hatch = dir.path().join("hatch.txt");
+        let out = bash(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "cmd": format!("echo h > {:?} # octos:allow-write", hatch) }))
+            .await
+            .expect("execute");
+        assert!(out.success, "hatch: {}", out.output);
+        assert!(hatch.exists());
+    }
+
+    // deny lets read-only commands through untouched.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn deny_lets_readonly_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = bash(dir.path(), BashFileWrites::Deny)
+            .execute(&json!({ "cmd": "echo readonly-28d" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("readonly-28d"));
+        assert!(!out.output.contains("bash_file_writes"));
+    }
+
+    // warn: nudge only when files actually changed.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn warn_nudges_only_on_change_bash_and_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_init(dir.path());
+        let out = bash(dir.path(), BashFileWrites::Warn)
+            .execute(&json!({ "cmd": "echo nochange" }))
+            .await
+            .expect("execute");
+        assert!(out.success);
+        assert!(!out.output.contains("bash_file_writes=warn"));
+
+        let f = dir.path().join("w.txt");
+        let out = bash(dir.path(), BashFileWrites::Warn)
+            .execute(&json!({ "cmd": format!("echo w > {:?}", f) }))
+            .await
+            .expect("execute");
+        assert!(
+            out.output.contains("bash_file_writes=warn"),
+            "{}",
+            out.output
+        );
+
+        let f2 = dir.path().join("w2.txt");
+        let out = exec(dir.path(), BashFileWrites::Warn)
+            .execute(&json!({ "command": format!("echo w2 > {:?}", f2) }))
+            .await
+            .expect("execute");
+        assert!(
+            out.output.contains("bash_file_writes=warn"),
+            "exec warn: {}",
+            out.output
+        );
+    }
+
+    // allow (default): zero difference — no policy text anywhere.
+    #[cfg(unix)]
+    // #34d: POSIX shell spawn semantics (echo > file, cd &&) — repo convention: gate like bash_kills_grandchildren_via_process_group_on_timeout; the pure-function receipts (diff_to_receipt unit tests in shell.rs) stay ungated.
+    #[tokio::test]
+    async fn allow_is_zero_difference_on_both_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for out in [
+            bash(dir.path(), BashFileWrites::default())
+                .execute(&json!({ "cmd": "echo zd" }))
+                .await
+                .expect("bash"),
+            exec(dir.path(), BashFileWrites::default())
+                .execute(&json!({ "command": "echo zd" }))
+                .await
+                .expect("exec"),
+        ] {
+            assert!(out.success);
+            assert!(out.output.contains("zd"));
+            assert!(!out.output.contains("bash_file_writes"));
+            assert!(!out.output.contains("edit_file / diff_edit"));
+        }
+    }
+
+    // Session-load wiring: EffectivePermissions carries the knob and the
+    // registry constructor injects it into the coding tools.
+    #[test]
+    fn permissions_default_carry_allow_and_registry_injects_knob() {
+        use crate::policy::EffectivePermissions;
+        let perms = EffectivePermissions::default();
+        assert_eq!(perms.bash_file_writes, BashFileWrites::Allow);
+        // with_builtins_and_permissions must not panic and must register the
+        // bash tool (the knob rides inside it; deny behavior is covered by
+        // the tool-level tests above).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = crate::ToolRegistry::with_builtins_and_permissions(
+            dir.path(),
+            Box::new(crate::sandbox::NoSandbox),
+            perms,
+        );
+        assert!(reg.get_tool("bash").is_some());
+        assert!(reg.get_tool("exec_command").is_some());
     }
 }
 

@@ -251,9 +251,25 @@ impl HarnessError {
             // Conversation too large — compaction, not retries, unblocks it.
             HarnessError::ContextOverflow { .. } => RecoveryHint::CompactContext,
 
-            // Non-retryable — surface to operator.
+            // #27b — quota exhaustion (HTTP 402 / 429-with-billing-marker /
+            // 403-with-quota-marker) is PROVIDER-DEGRADED, not fatal: the
+            // provider's billing window is dead for hours-to-days, but the
+            // configured ProviderChain may hold a healthy fallback lane
+            // (profile `llm.fallbacks`). Live evidence (2026-08-26/27): k3's
+            // 7-day-window quota burn surfaced as `variant=authentication
+            // recovery=fail_fast`, the chain's fallback slot never fired, and
+            // the only recovery was hand-editing profile JSON. The chain
+            // already exists (`build_adaptive_provider_chain`); the missing
+            // piece was this recovery hint. `Authentication` (a real 401) is
+            // a DIFFERENT failure — a wrong key fails on every lane, so it
+            // STAYS FailFast (pinned contract, see
+            // `quota_switches_provider_but_401_stays_fail_fast`).
+            HarnessError::Quota { .. } => RecoveryHint::SwitchProvider,
+
+            // Non-retryable — surface to operator. #27b red line: a TRUE 401
+            // (invalid/expired key) fails identically on every fallback lane,
+            // so its FailFast contract must NOT loosen.
             HarnessError::Authentication { .. }
-            | HarnessError::Quota { .. }
             | HarnessError::InvalidRequest { .. }
             | HarnessError::ContentFiltered { .. }
             | HarnessError::DelegateDepthExceeded { .. }
@@ -527,6 +543,31 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// #27b — the pinned contract pair: quota (HTTP 402 / 429-with-billing-
+    /// marker) is provider-DEGRADED and must hint `SwitchProvider` so the
+    /// ProviderChain advances to a healthy fallback lane (live evidence:
+    /// the 2026-08-26/27 k3 7-day-window burn never reached the configured
+    /// fallback slot because the hint said FailFast); a TRUE 401
+    /// authentication failure fails identically on every lane and MUST
+    /// stay `FailFast` — that contract must not loosen.
+    #[test]
+    fn quota_switches_provider_but_401_stays_fail_fast() {
+        let quota = HarnessError::Quota {
+            message: "API error (moonshot-coding@api/k3): 402 quota will reset when the current 7-day window ends".into(),
+        };
+        assert!(
+            matches!(quota.recovery_hint(), RecoveryHint::SwitchProvider),
+            "quota exhaustion must hint SwitchProvider so the chain advances to the fallback slot"
+        );
+        let auth = HarnessError::Authentication {
+            message: "API error: 401 invalid api key".into(),
+        };
+        assert!(
+            matches!(auth.recovery_hint(), RecoveryHint::FailFast),
+            "a true 401 fails on every lane — FailFast is the pinned red line (#27b)"
+        );
+    }
+
     #[test]
     fn variant_name_covers_every_variant() {
         // If you add a variant, add it here. This test keeps variant_name()
@@ -655,7 +696,10 @@ mod tests {
         let llm = LlmError::from_status_with_label(403, body, "MiniMax-M2.5-highspeed");
         let err: HarnessError = llm.into();
         assert_eq!(err.variant_name(), "quota");
-        assert_eq!(err.recovery_hint(), RecoveryHint::FailFast);
+        // #27b — quota is provider-degraded: hint SwitchProvider so the
+        // ProviderChain advances to the fallback lane (was FailFast, which
+        // stranded the configured fallback during the 2026-08-26/27 k3 burn).
+        assert_eq!(err.recovery_hint(), RecoveryHint::SwitchProvider);
         assert!(err.message().contains("MiniMax-M2.5-highspeed"));
         assert!(err.message().contains("top up or switch provider"));
     }

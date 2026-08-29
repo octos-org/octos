@@ -792,6 +792,80 @@ impl SupervisorStore {
         Ok(state)
     }
 
+    /// #26a — goal-scoped view of the stream, folded BY (session, goal) KEY.
+    ///
+    /// `load_state`'s `state.groups` map is keyed by GROUP id, and every goal
+    /// of one session scope shares the SAME `autonomy-goal:<scope>` group — so
+    /// the folded map holds only the NEWEST goal of each scope and a
+    /// superseded goal (goal_01 replaced by goal_02…) vanishes from
+    /// `octos goal list` even though its rows are still in the stream. The
+    /// zombie-cleanup path needs to SEE those superseded goals, so this view
+    /// scans the raw rows directly (snapshot + ledger tail, same read order
+    /// as `load_state`) and folds the LATEST `group_registered` for each
+    /// (session_id, goal_id) pair.
+    ///
+    /// #26a-r1 — the fold key is COMPOSITE: `(session_id, goal_id)`, not the
+    /// bare `goal_id`. #25's contract says duplicate goal ids across sessions
+    /// are REPORTED, never guessed; a single-key fold let a later session's
+    /// registration silently overwrite the earlier one, so `locate_goal`'s
+    /// ambiguity scan could never see two. Folding per (session, goal) keeps
+    /// both registrations in the map, and `locate_goal`'s values() scan then
+    /// counts both and refuses with `ambiguous` as designed. The 26a
+    /// zombie-cleanup semantics are unchanged (a superseded goal of the SAME
+    /// session still has its own key — the view is only MORE complete).
+    ///
+    /// The map key ENCODES the pair as `"<session_id>\u{1}<goal_id>"` (unit
+    /// separator, impossible in either id) so existing `HashMap<String, _>`
+    /// call sites keep compiling; value semantics are per-(session, goal).
+    /// Rows that fail to parse are already skipped by the tolerant
+    /// replay (#26a).
+    pub fn load_goal_groups_by_id(
+        &self,
+    ) -> io::Result<std::collections::HashMap<String, SupervisedGroupRecord>> {
+        let rows = self.read_ledger_rows()?;
+        let snapshot = self.load_snapshot()?;
+        let snapshot_last_sequence = snapshot.as_ref().map_or(0, |s| s.last_sequence);
+        // Fold the snapshot's groups first (they carry sequence context via
+        // `last_sequence`), then overlay newer ledger rows. Key is the
+        // composite (session_id, goal_id) — see the doc comment above for
+        // why the bare goal_id must NOT be the key (#26a-r1).
+        let composite_key = |group: &SupervisedGroupRecord| -> Option<String> {
+            let goal_id = group.metadata.get("goal_id")?.as_str()?;
+            let session_id = group
+                .metadata
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Some(format!("{session_id}\u{1}{goal_id}"))
+        };
+        let mut by_goal: std::collections::HashMap<String, SupervisedGroupRecord> =
+            std::collections::HashMap::new();
+        let mut order: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        if let Some(snapshot) = snapshot.as_ref() {
+            for group in snapshot.state.groups.values() {
+                if let Some(key) = composite_key(group) {
+                    order.insert(key.clone(), snapshot_last_sequence);
+                    by_goal.insert(key, group.clone());
+                }
+            }
+        }
+        for row in rows {
+            if row.sequence <= snapshot_last_sequence {
+                continue;
+            }
+            if let SupervisorEvent::GroupRegistered { group } = &row.event {
+                if let Some(key) = composite_key(group) {
+                    let slot = order.entry(key.clone()).or_insert(0);
+                    if row.sequence >= *slot {
+                        *slot = row.sequence;
+                        by_goal.insert(key, group.clone());
+                    }
+                }
+            }
+        }
+        Ok(by_goal)
+    }
+
     /// Load the snapshot, refusing one written by a NEWER binary: a
     /// `schema_version` above what this build knows means fields we would
     /// silently drop or misread, and a snapshot is the authoritative record
@@ -1126,12 +1200,46 @@ impl SupervisorStore {
     fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
         self.ensure_root_dir()?;
         let created = !self.events_path.exists();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(&self.events_path)?;
-        let len = file.metadata()?.len();
+        // #39 — the ledger append OPEN also sits on the compaction-adjacent
+        // path (the file was just rotated; Windows reopens can hit the same
+        // transient spectrum). Retry-wrapped on Windows, single-shot on unix.
+        #[cfg(windows)]
+        let mut file = fs_retry(
+            &RetryClock::default(),
+            std::time::Duration::from_millis(fs_retry_total_ms()),
+            || {
+                fs_ctx(
+                    "events-append-open",
+                    &self.events_path,
+                    OpenOptions::new()
+                        .read(true)
+                        .create(true)
+                        .append(true)
+                        .open(&self.events_path),
+                )
+            },
+            is_transient_windows_lock,
+        )?;
+        #[cfg(not(windows))]
+        let mut file = fs_ctx(
+            "events-append-open",
+            &self.events_path,
+            OpenOptions::new()
+                .read(true)
+                .create(true)
+                .append(true)
+                .open(&self.events_path),
+        )?;
+        #[cfg(windows)]
+        let len = fs_retry(
+            &RetryClock::default(),
+            std::time::Duration::from_millis(fs_retry_total_ms()),
+            || fs_ctx("events-metadata", &self.events_path, file.metadata()),
+            is_transient_windows_lock,
+        )?
+        .len();
+        #[cfg(not(windows))]
+        let len = fs_ctx("events-metadata", &self.events_path, file.metadata())?.len();
         let mut payload = Vec::with_capacity(256);
         if len > 0 {
             file.seek(SeekFrom::Start(len - 1))?;
@@ -1144,10 +1252,18 @@ impl SupervisorStore {
         serde_json::to_writer(&mut payload, row).map_err(invalid_data)?;
         payload.push(b'\n');
         // O_APPEND: the write lands at EOF regardless of the read seek above.
-        file.write_all(&payload)?;
-        file.flush()?;
+        fs_ctx(
+            "events-row-write",
+            &self.events_path,
+            file.write_all(&payload),
+        )?;
+        fs_ctx("events-row-flush", &self.events_path, file.flush())?;
         if created {
-            fsync_dir(&self.root_dir)?;
+            fs_ctx(
+                "events-create-dir-fsync",
+                &self.root_dir,
+                fsync_dir(&self.root_dir),
+            )?;
         }
         Ok(file)
     }
@@ -1168,10 +1284,22 @@ impl SupervisorStore {
                 cache.appends_since_fsync = 0;
             }
         }
+        // #34f — release the events-file handle BEFORE the caller may
+        // compact: on Windows, renaming a file that still has an open handle
+        // fails, and `append_event`'s auto-compaction below renames exactly
+        // this file. POSIX tolerates the open handle, which is why the five
+        // snapshot tests were green on Linux and Os error 3 on Windows.
         cache.last_sequence = cache.last_sequence.max(row.sequence);
         // Exact length of the file we just extended; nothing else can write
         // while we hold the lock.
         cache.events_len = file.metadata()?.len();
+        // #34f — release the events-file handle BEFORE the caller may
+        // compact (metadata read above must come first): on Windows,
+        // renaming a file that still has an open handle fails, and
+        // `append_event`'s auto-compaction renames exactly this file.
+        // POSIX tolerates the open handle — the five snapshot tests were
+        // green on Linux and Os error 3 on Windows for exactly this reason.
+        drop(file);
         cache.ledger_rows = cache.ledger_rows.saturating_add(1);
         cache.seeded = true;
         Ok(())
@@ -1211,13 +1339,52 @@ impl SupervisorStore {
         self.ensure_root_dir()?;
         let body = serde_json::to_string_pretty(&snapshot).map_err(invalid_data)?;
         let tmp_path = self.snapshot_path.with_extension("json.tmp");
+        // #34g — via rename_replace: on a SECOND snapshot the destination
+        // already exists, and a bare fs::rename fails on Windows (POSIX
+        // replaces). This was the error-2 (B) cluster's primary suspect.
+        // #39 — the tmp write steps also sit on the snapshot path and see
+        // the same transient-lock spectrum (AV/indexer probes on freshly
+        // created files). Route through the retry helper on Windows.
+        #[cfg(windows)]
         {
-            let mut tmp = File::create(&tmp_path)?;
-            tmp.write_all(body.as_bytes())?;
-            tmp.sync_all()?;
+            let tmp_path = &tmp_path;
+            let body_bytes = body.as_bytes();
+            fs_retry(
+                &RetryClock::default(),
+                std::time::Duration::from_millis(fs_retry_total_ms()),
+                || {
+                    fs_ctx("snapshot-tmp-create", tmp_path, File::create(tmp_path)).and_then(
+                        |mut tmp| {
+                            fs_ctx("snapshot-tmp-write", tmp_path, tmp.write_all(body_bytes))
+                                .and_then(|()| {
+                                    fs_ctx("snapshot-tmp-sync", tmp_path, tmp.sync_all())
+                                })
+                        },
+                    )
+                },
+                is_transient_windows_lock,
+            )?;
         }
-        fs::rename(&tmp_path, &self.snapshot_path)?;
-        fsync_dir(&self.root_dir)?;
+        #[cfg(not(windows))]
+        {
+            let mut tmp = fs_ctx("snapshot-tmp-create", &tmp_path, File::create(&tmp_path))?;
+            fs_ctx(
+                "snapshot-tmp-write",
+                &tmp_path,
+                tmp.write_all(body.as_bytes()),
+            )?;
+            fs_ctx("snapshot-tmp-sync", &tmp_path, tmp.sync_all())?;
+        }
+        fs_ctx(
+            "snapshot-rename-replace",
+            &self.snapshot_path,
+            rename_replace(&tmp_path, &self.snapshot_path),
+        )?;
+        fs_ctx(
+            "snapshot-dir-fsync",
+            &self.root_dir,
+            fsync_dir(&self.root_dir),
+        )?;
         Ok(snapshot)
     }
 
@@ -1229,13 +1396,19 @@ impl SupervisorStore {
     fn snapshot_and_compact_locked(&self, cache: &mut SeqCache) -> io::Result<SupervisorSnapshot> {
         let snapshot = self.write_snapshot_locked()?;
         if self.events_path.exists() {
-            match fs::remove_file(&self.rotated_events_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-            fs::rename(&self.events_path, &self.rotated_events_path)?;
-            fsync_dir(&self.root_dir)?;
+            // #34g — rename_replace handles the previous generation
+            // (remove-then-rename; see the helper for the crash-window
+            // analysis).
+            fs_ctx(
+                "events-rotate-rename-replace",
+                &self.rotated_events_path,
+                rename_replace(&self.events_path, &self.rotated_events_path),
+            )?;
+            fs_ctx(
+                "compact-dir-fsync",
+                &self.root_dir,
+                fsync_dir(&self.root_dir),
+            )?;
         }
         cache.seeded = true;
         cache.last_sequence = cache.last_sequence.max(snapshot.last_sequence);
@@ -1371,6 +1544,12 @@ impl SupervisorStore {
         // Open-and-match instead of exists()-then-open: a concurrent
         // compaction may rotate the ledger away between the two, which must
         // read as "no rows", not an error.
+        // #34h — handle-lifetime self-audit: the file handle (and its
+        // BufReader) live ONLY inside this function's scope and drop on
+        // return, so no in-process handle overlaps the rename_replace
+        // window. `load_snapshot` uses `fs::read_to_string`, whose handle
+        // is opened-and-closed inside the call. Kept explicit so a future
+        // refactor that hoists these handles shows up against this comment.
         let file = match File::open(&self.events_path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1378,28 +1557,52 @@ impl SupervisorStore {
         };
         let reader = BufReader::new(file);
         let mut rows = Vec::new();
+        // #26a — tolerant replay: a SINGLE malformed line (a torn write from a
+        // crash, a hand-appended row with a subtly wrong shape, an upgraded
+        // schema's legacy row) must not poison the WHOLE stream — the goals a
+        // CLI/orchestrator can see would silently drop to whatever fallback
+        // path loads (observed live: `octos goal list` on a stream with one
+        // bad row showed only the newest goal). Skip the bad line with a warn
+        // naming its index; a stream whose rows are ALL bad still yields an
+        // empty replay, which callers already handle.
+        let mut skipped = 0usize;
         for (idx, line) in reader.lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let row = serde_json::from_str(&line).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "failed to parse {} line {}: {err}",
-                        self.events_path.display(),
-                        idx + 1
-                    ),
-                )
-            })?;
-            rows.push(row);
+            match serde_json::from_str(&line) {
+                Ok(row) => rows.push(row),
+                Err(err) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        target: "octos::supervisor",
+                        path = %self.events_path.display(),
+                        line = idx + 1,
+                        error = %err,
+                        "skipping malformed supervisor event row (#26a tolerant replay)"
+                    );
+                }
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                target: "octos::supervisor",
+                path = %self.events_path.display(),
+                skipped,
+                loaded = rows.len(),
+                "supervisor event stream replay skipped malformed rows"
+            );
         }
         Ok(rows)
     }
 
     fn ensure_root_dir(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.root_dir)
+        fs_ctx(
+            "ensure-root-dir",
+            &self.root_dir,
+            fs::create_dir_all(&self.root_dir),
+        )
     }
 
     fn acquire_append_lock(&self) -> io::Result<SupervisorAppendLock> {
@@ -1427,6 +1630,216 @@ impl SupervisorStore {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+/// #34g — cross-platform REPLACE-ON-EXISTING rename.
+///
+/// Windows `std::fs::rename` FAILS when the destination exists (POSIX
+/// replaces atomically). Both compaction-rename sites in this store target
+/// files that legitimately already exist on a second cycle (the snapshot
+/// overwrites the previous snapshot; the rotated ledger overwrites the
+/// previous generation), so every rename here goes through this helper:
+/// remove the destination first (tolerating NotFound — the first cycle),
+/// then rename. The remove/rename pair is NOT atomic on either platform,
+/// but both callers write crash-recoverable layouts (a missing snapshot
+/// falls back to full replay; a missing rotation leaves the live ledger),
+/// so the tiny window is absorbed by the recovery paths, not by durability.
+/// #34h — is this error a TRANSIENT Windows file-lock condition worth
+/// retrying? The live winlab spectrum (fifth round): 183 AlreadyExists,
+/// 5 AccessDenied, 3 NotFound during the remove→rename pair — delete-pending
+/// windows and AV/indexer transient locks. Unix never hits these (rename is
+/// atomic replace), so the retry is Windows-only and this predicate is
+/// compiled out elsewhere.
+#[cfg(windows)]
+fn is_transient_windows_lock(err: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    matches!(err.kind(), PermissionDenied | AlreadyExists)
+        || err.raw_os_error().is_some_and(|code| code == 32) // ERROR_SHARING_VIOLATION
+}
+
+/// ###27-B2 — injectable file ops so tests can mechanically pin the
+/// rename_replace error-classification contract (persistent
+/// PermissionDenied is never success-ified; remove's non-NotFound real
+/// error returns immediately; retry exhaustion returns the LAST observed
+/// error). Production uses the real fs; tests swap in scripted outcomes.
+/// #40 — wrap a fallible fs op's error with op name + full path + errno,
+/// so a test panic prints the exact culprit path (winlab forensics: the
+/// victim set moves and the error spectrum alone can't name the offender).
+/// Zero behavior change: only the error TEXT gains context; kinds and
+/// results pass through untouched. `source` is chained for full fidelity.
+fn fs_ctx<T>(op: &'static str, path: &Path, r: io::Result<T>) -> io::Result<T> {
+    r.map_err(|err| {
+        let errno = err
+            .raw_os_error()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        io::Error::new(
+            err.kind(),
+            format!(
+                "[fs:{op}] path={} errno={errno} source={err}",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// #39 — total retry budget, environment-tunable. Default ~2.5s (the
+/// 34h bound); CI's slow runners can raise it (e.g. 10s) via
+/// `OCTOS_FS_RETRY_TOTAL_MS`. Read once per call (cheap env read, no lock).
+#[cfg(windows)]
+fn fs_retry_total_ms() -> u64 {
+    std::env::var("OCTOS_FS_RETRY_TOTAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2_500)
+}
+
+/// #39 — run ONE fallible fs operation under the transient-lock retry
+/// policy (Windows only; unix is single-shot). Used for EVERY fs mutation
+/// on the snapshot/compaction path so the whole path shares one budget
+/// class, not just the two rename sites.
+/// #42 — injectable retry clock: `now` for elapsed-time bookkeeping and
+/// `sleep` for the backoff pause. Production passes the real pair
+/// (semantics unchanged: real Instant + real thread sleep, budget from
+/// OCTOS_FS_RETRY_TOTAL_MS); tests pass a virtual clock so attempt counts
+/// are DERIVED from virtual time, not the machine's speed (the round-8
+/// winlab reds were slow runners eating the 2.5s budget with real sleeps
+/// before the 10th attempt).
+pub(crate) struct RetryClock {
+    pub(crate) now: NowFn,
+    pub(crate) sleep: SleepFn,
+}
+
+impl Default for RetryClock {
+    fn default() -> Self {
+        let start = std::time::Instant::now();
+        Self {
+            now: Box::new(move || start.elapsed()),
+            sleep: Box::new(std::thread::sleep),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn fs_retry<T>(
+    clock: &RetryClock,
+    total: std::time::Duration,
+    op: impl Fn() -> io::Result<T>,
+    is_transient: impl Fn(&io::Error) -> bool,
+) -> io::Result<T> {
+    // #40 — callers wrap `op` with fs_ctx so retries and the final return
+    // both carry op+path+errno context (the transient judge reads the
+    // KIND, which fs_ctx preserves).
+    let start = (clock.now)();
+    let mut delay = 20u64;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(err) if is_transient(&err) => {
+                if (clock.now)().saturating_sub(start) >= total {
+                    return Err(err); // budget exhausted — LAST observed error
+                }
+                (clock.sleep)(std::time::Duration::from_millis(delay));
+                delay = delay.saturating_mul(2);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+type NowFn = Box<dyn Fn() -> std::time::Duration + Send + Sync>;
+type RemoveFn = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+type RenameFn = Box<dyn Fn(&Path, &Path) -> io::Result<()> + Send + Sync>;
+type SleepFn = Box<dyn Fn(std::time::Duration) + Send + Sync>;
+
+pub(crate) struct ReplaceOps {
+    pub(crate) remove: RemoveFn,
+    pub(crate) rename: RenameFn,
+    #[cfg(windows)]
+    pub(crate) is_transient: Box<dyn Fn(&io::Error) -> bool + Send + Sync>,
+    /// #42 — retry clock + budget; default = real clock + env budget
+    /// (production semantics unchanged). Tests inject a virtual clock and
+    /// an explicit budget so counts derive from VIRTUAL time.
+    #[cfg(windows)]
+    pub(crate) clock: RetryClock,
+    #[cfg(windows)]
+    pub(crate) budget: std::time::Duration,
+}
+
+impl Default for ReplaceOps {
+    fn default() -> Self {
+        Self {
+            remove: Box::new(|p: &Path| fs::remove_file(p)),
+            rename: Box::new(|s: &Path, d: &Path| fs::rename(s, d)),
+            #[cfg(windows)]
+            is_transient: Box::new(is_transient_windows_lock),
+            #[cfg(windows)]
+            clock: RetryClock::default(),
+            #[cfg(windows)]
+            budget: std::time::Duration::from_millis(fs_retry_total_ms()),
+        }
+    }
+}
+
+/// #34g/#34h — cross-platform REPLACE-ON-EXISTING rename with a BOUNDED
+/// retry on Windows transient locks.
+///
+/// Windows `std::fs::rename` fails when the destination exists (POSIX
+/// replaces atomically), so the destination is removed first. Fifth-round
+/// winlab evidence showed the remove→rename pair also colliding with
+/// delete-pending windows and transient AV/indexer locks, so on Windows
+/// both steps retry on PermissionDenied / AlreadyExists / os error 32 with
+/// a 20ms-start exponential backoff, at most 10 attempts (~2s total budget;
+/// 20+40+80+160+320+640+1280 = 2540ms worst case) before the original error
+/// is returned. Unix keeps the single-shot semantics — the retry arm is
+/// cfg'd out entirely.
+///
+/// A remove error that is NOT NotFound (and not, on Windows, transient) is
+/// returned immediately — never silently swallowed.
+fn rename_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    replace_with(&ReplaceOps::default(), src, dst)
+}
+
+/// ###27-B2 — the rename_replace core over injectable ops. Windows arms
+/// retry transient locks; the unix arm is single-shot. Retry exhaustion
+/// returns the LAST observed error (not the first — the doc comment on
+/// rename_replace says exactly that).
+#[allow(clippy::too_many_lines)]
+pub(crate) fn replace_with(ops: &ReplaceOps, src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        // #39 — both steps route through fs_retry (shared env-tunable
+        // budget, OCTOS_FS_RETRY_TOTAL_MS; default 2.5s). The injectable
+        // sleep/is_transient keep the ###29 mechanical pins meaningful.
+        let is_t = &ops.is_transient;
+        let remove_result = fs_retry(
+            &ops.clock,
+            ops.budget,
+            || match (ops.remove)(dst) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()), // first cycle
+                Err(err) => Err(err),
+            },
+            |e| is_t(e),
+        );
+        remove_result?;
+        fs_retry(
+            &ops.clock,
+            ops.budget,
+            || (ops.rename)(src, dst),
+            |e| is_t(e),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        match (ops.remove)(dst) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        (ops.rename)(src, dst)
     }
 }
 
@@ -1537,6 +1950,217 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    /// ###27-B2 — rename_replace error-classification pins (unix arm).
+    mod replace_ops_27b2 {
+        #[cfg(windows)]
+        use super::super::RetryClock;
+        use super::super::{RemoveFn, RenameFn, ReplaceOps, replace_with};
+        use std::path::Path;
+        use std::sync::Arc;
+        #[cfg(windows)]
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn err_denied() -> std::io::Error {
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        }
+
+        /// ###27-r1 — CROSS-PLATFORM constructor: `ReplaceOps.is_transient`
+        /// is a `#[cfg(windows)]` REQUIRED field, so every literal in this
+        /// module must go through this helper — a bare 3-field literal
+        /// compiles on Linux and FAILS on Windows (codex pre-commit catch:
+        /// the Linux 4/4 masked it). The Windows arm injects a transient
+        /// judge that classifies PermissionDenied/AlreadyExists as retryable
+        /// — the same classes `is_transient_windows_lock` recognizes.
+        /// #42 — build ReplaceOps with a VIRTUAL clock: `sleep` ADVANCES
+        /// virtual time by the requested delay (zero real sleeping), and
+        /// `now` reads it. Attempt counts then derive from VIRTUAL time —
+        /// identical on any platform, at any runner speed. Production keeps
+        /// the real clock (ReplaceOps::default), semantics unchanged.
+        fn ops_virtual(remove: RemoveFn, rename: RenameFn, budget_ms: u64) -> ReplaceOps {
+            #[cfg(windows)]
+            {
+                let virtual_now = Arc::new(AtomicU64::new(0));
+                let tick = virtual_now.clone();
+                let tick_sleep = virtual_now.clone();
+                ReplaceOps {
+                    remove,
+                    rename,
+                    is_transient: Box::new(|err: &std::io::Error| {
+                        matches!(
+                            err.kind(),
+                            std::io::ErrorKind::PermissionDenied
+                                | std::io::ErrorKind::AlreadyExists
+                        )
+                    }),
+                    clock: RetryClock {
+                        now: Box::new(move || {
+                            std::time::Duration::from_millis(tick.load(Ordering::SeqCst))
+                        }),
+                        sleep: Box::new(move |d: std::time::Duration| {
+                            tick_sleep.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+                        }),
+                    },
+                    budget: std::time::Duration::from_millis(budget_ms),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = budget_ms;
+                ReplaceOps { remove, rename }
+            }
+        }
+
+        /// ###29 — NON-transient remove error returns after exactly ONE
+        /// call on BOTH platforms (windows: InvalidInput is not in the
+        /// transient set, so the retry arm never engages; unix has no
+        /// retry arm at all), rename is never invoked, and the ORIGINAL
+        /// error surfaces. (The PermissionDenied twin above pins the
+        /// transient-exhaustion path instead.)
+        #[test]
+        fn remove_non_transient_error_returns_after_one_call() {
+            let removes = Arc::new(AtomicU32::new(0));
+            let renames = Arc::new(AtomicU32::new(0));
+            let (r2, n2) = (removes.clone(), renames.clone());
+            let ops = ops_virtual(
+                Box::new(move |_p: &Path| {
+                    r2.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "non-transient remove failure",
+                    ))
+                }),
+                Box::new(move |_s: &Path, _d: &Path| {
+                    n2.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                2500,
+            );
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            let err = out.expect_err("non-transient remove error must surface");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "the ORIGINAL error kind surfaces"
+            );
+            assert!(
+                err.to_string().contains("non-transient remove failure"),
+                "the original error payload surfaces: {err}"
+            );
+            assert_eq!(
+                removes.load(Ordering::SeqCst),
+                1,
+                "exactly ONE remove call on both platforms (windows: non-transient never retries)"
+            );
+            assert_eq!(
+                renames.load(Ordering::SeqCst),
+                0,
+                "rename never runs when remove fails"
+            );
+        }
+
+        // remove 非 NotFound 真错误立即返回(不重试,不吞)。
+        #[test]
+        fn remove_real_error_returns_immediately() {
+            let calls = Arc::new(AtomicU32::new(0));
+            let c = calls.clone();
+            let ops = ops_virtual(
+                Box::new(move |_p: &Path| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err(err_denied())
+                }),
+                Box::new(|_s: &Path, _d: &Path| Ok(())),
+                2500,
+            );
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            assert!(out.is_err());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if cfg!(windows) { 8 } else { 1 },
+                "#42: unix single call; windows = VIRTUAL-time-derived count (machine-speed independent)"
+            );
+        }
+
+        // rename 的持久错误不被成功化——返回最后观察到的错误。
+        #[test]
+        fn persistent_rename_error_is_returned_not_swallowed() {
+            let calls = Arc::new(AtomicU32::new(0));
+            let c = calls.clone();
+            let ops = ops_virtual(
+                Box::new(|_p: &Path| Ok(())),
+                Box::new(move |_s: &Path, _d: &Path| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err(err_denied())
+                }),
+                2500,
+            );
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            let err = out.expect_err("persistent error must surface");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if cfg!(windows) { 8 } else { 1 },
+                "#42: windows exhausts the virtual budget then returns the LAST error (count derived from virtual time)"
+            );
+        }
+
+        // 成功路径: remove NotFound 容忍(首周期), rename 成功。
+        #[test]
+        fn remove_not_found_is_tolerated_first_cycle() {
+            let ops = ops_virtual(
+                Box::new(|_p: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+                Box::new(|_s: &Path, _d: &Path| Ok(())),
+                2500,
+            );
+            assert!(replace_with(&ops, Path::new("/a"), Path::new("/b")).is_ok());
+        }
+
+        /// ###27-r1 — EXHAUSTION returns the LAST observed error (not the
+        /// first), pinned with DISTINCT error payloads on Windows: remove
+        /// errors carry their attempt number; after the 10-attempt bound
+        /// the surfaced error must be the FINAL one. Unix has no retry arm
+        /// (single-shot), so the same scenario pins the immediate return.
+        #[test]
+        fn exhaustion_returns_last_error_not_first() {
+            let calls = Arc::new(AtomicU32::new(0));
+            let c = calls.clone();
+            let ops = ops_virtual(
+                Box::new(move |_p: &Path| {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    // Persistent PermissionDenied whose PAYLOAD names the
+                    // attempt — the surfaced error must carry the LAST.
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("attempt-{n}"),
+                    ))
+                }),
+                Box::new(|_s: &Path, _d: &Path| Ok(())),
+                2500,
+            );
+            let out = replace_with(&ops, Path::new("/a"), Path::new("/b"));
+            let err = out.expect_err("persistent remove error must surface");
+            let msg = err.to_string();
+            if cfg!(windows) {
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    8,
+                    "retried to the virtual budget"
+                );
+                assert!(
+                    msg.contains("attempt-7"),
+                    "must return the LAST error, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("attempt-0"),
+                    "must NOT return the first error, got: {msg}"
+                );
+            } else {
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "unix single-shot");
+                assert!(msg.contains("attempt-0"), "unix returns the only error");
+            }
+        }
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
@@ -1556,14 +2180,180 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
+            // #40 — print this test's root ONCE to stderr (captured by the
+            // harness, shown on failure): winlab forensics needs the exact
+            // culprit path when the victim set moves between runs.
+            eprintln!("[#40 TestDir] label={label} root={}", path.display());
             Self { path }
         }
     }
 
     impl Drop for TestDir {
         fn drop(&mut self) {
+            // #41 — remove ONLY this test's own root. The pre-#41 body
+            // removed `self.path.parent()` — i.e. the SHARED %TEMP% parent
+            // — so ANY TestDir's destruction deleted every parallel
+            // neighbor's root (winlab 33168585440: errno-3 victims with
+            // unique roots, sequence ...18,1,2, empty state; git blame
+            // c42b4713). Never touch the parent again.
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// #41 — REGRESSION: two TestDirs share the %TEMP% parent; dropping A
+    /// must NOT remove B's root or its sentinel. The pre-#41 Drop removed
+    /// `self.path.parent()` and erased every parallel neighbor (winlab
+    /// 33168585440 mechanical lock). Cross-platform, non-zero assertions.
+    #[test]
+    fn testdir_drop_removes_only_own_root_not_shared_parent() {
+        let a = TestDir::new("drop-regression-a");
+        let b = TestDir::new("drop-regression-b");
+        let sentinel = b.path.join("sentinel.txt");
+        std::fs::write(&sentinel, "alive").expect("write sentinel");
+        assert_eq!(
+            a.path.parent().map(std::path::Path::to_path_buf),
+            b.path.parent().map(std::path::Path::to_path_buf),
+            "fixture premise: the two roots share one parent"
+        );
+        drop(a);
+        assert!(
+            b.path.is_dir(),
+            "#41: dropping A must not remove B's root: {}",
+            b.path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel readable"),
+            "alive",
+            "#41: B's sentinel must survive A's drop"
+        );
+        drop(b);
+    }
+
+    /// #26a — tolerant replay: a malformed row (torn write, unknown variant
+    /// from an older/newer schema) must be SKIPPED with a warn, never abort
+    /// the whole stream load. Live evidence: the a9c4 instance stream carried
+    /// 3 legacy `goal_state` rows and `octos goal list` was unusable before.
+    #[test]
+    fn malformed_rows_are_skipped_not_fatal() {
+        let dir = TestDir::new("tolerant");
+        let store = SupervisorStore::new(&dir.path);
+
+        let mut group = SupervisedGroupRecord::new("group-1", 100);
+        group.objective = Some("tolerant replay".to_string());
+        group.metadata.insert(
+            "autonomy_record_kind".to_string(),
+            serde_json::json!("goal"),
+        );
+        group
+            .metadata
+            .insert("goal_id".to_string(), serde_json::json!("goal_01"));
+        group
+            .metadata
+            .insert("status".to_string(), serde_json::json!("active"));
+        store.record_group_registered(group).unwrap();
+
+        // Corrupt the stream: one unknown-variant row and one torn JSON line.
+        let mut raw = std::fs::read_to_string(&store.events_path).unwrap();
+        raw.push_str("{\"event\":{\"type\":\"goal_state\",\"payload\":{}}}\n");
+        raw.push_str("{\"torn json…\n");
+        std::fs::write(&store.events_path, raw).unwrap();
+
+        // The good row still loads (malformed rows skipped, not fatal).
+        let state = store.load_state().unwrap();
+        assert!(
+            state.groups.contains_key("group-1"),
+            "the well-formed row must survive malformed siblings"
+        );
+        // The goal-scoped view survives too (no session_id metadata in this
+        // fixture, so the composite key degenerates to "\u{1}goal_01").
+        let by_goal = store.load_goal_groups_by_id().unwrap();
+        assert_eq!(
+            by_goal
+                .get("\u{1}goal_01")
+                .map(|g| g.metadata.get("status")),
+            Some(Some(&serde_json::json!("active")))
+        );
+    }
+
+    /// #26a — the goal-scoped view folds BY GOAL ID, so a superseded goal
+    /// (an earlier goal_NN sharing the newest goal's session-scope group)
+    /// stays visible for zombie cleanup where the group-folded `load_state`
+    /// map would only hold the newest one.
+    #[test]
+    fn goal_scoped_view_keeps_superseded_goals_visible() {
+        let dir = TestDir::new("goal-scoped");
+        let store = SupervisorStore::new(&dir.path);
+
+        let goal_row = |goal_id: &str, status: &str, seq: u64| {
+            let mut group = SupervisedGroupRecord::new("autonomy-goal:scope-1", seq);
+            group.objective = Some(format!("objective {goal_id}"));
+            group.metadata.insert(
+                "autonomy_record_kind".to_string(),
+                serde_json::json!("goal"),
+            );
+            group
+                .metadata
+                .insert("goal_id".to_string(), serde_json::json!(goal_id));
+            group
+                .metadata
+                .insert("profile_id".to_string(), serde_json::json!("octos"));
+            group.metadata.insert(
+                "session_id".to_string(),
+                serde_json::json!("octos:local:tui#coding"),
+            );
+            group
+                .metadata
+                .insert("status".to_string(), serde_json::json!(status));
+            group
+        };
+        // Three goals of the SAME scope group, newest last.
+        store
+            .record_group_registered(goal_row("goal_01", "active", 1))
+            .unwrap();
+        store
+            .record_group_registered(goal_row("goal_02", "complete", 2))
+            .unwrap();
+        store
+            .record_group_registered(goal_row("goal_03", "complete", 3))
+            .unwrap();
+
+        // The group-folded state collapses re-registrations of the SAME
+        // group id (the `group_registered:<group_id>` event id dedupes), so
+        // replay may hold whichever registration survived — exactly why the
+        // goal-scoped view exists. We only assert the group exists here.
+        let state = store.load_state().unwrap();
+        assert!(
+            state.groups.contains_key("autonomy-goal:scope-1"),
+            "the scope group exists in the folded state"
+        );
+
+        // The goal-scoped view keeps ALL THREE visible, each with its own
+        // latest status — the zombie-cleanup requirement. Keys are the
+        // composite (session, goal) since #26a-r1; the three goals share
+        // one session, so the count and statuses are unchanged.
+        let session = "octos:local:tui#coding";
+        let sep = char::from_u32(1).expect("unit separator");
+        let key = |goal_id: &str| format!("{session}{sep}{goal_id}");
+        let by_goal = store.load_goal_groups_by_id().unwrap();
+        assert_eq!(by_goal.len(), 3, "all goals stay visible");
+        assert_eq!(
+            by_goal
+                .get(&key("goal_01"))
+                .and_then(|g| g.metadata.get("status")),
+            Some(&serde_json::json!("active"))
+        );
+        assert_eq!(
+            by_goal
+                .get(&key("goal_02"))
+                .and_then(|g| g.metadata.get("status")),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            by_goal
+                .get(&key("goal_03"))
+                .and_then(|g| g.metadata.get("status")),
+            Some(&serde_json::json!("complete"))
+        );
     }
 
     #[test]
@@ -2368,10 +3158,24 @@ mod tests {
         // cycle can land on an identical length, so length alone must never
         // validate the cursor (the ABA the fast path's content check kills).
         let body = fs::read_to_string(store.events_path()).unwrap();
-        let forged = body.replace("\"sequence\":2", "\"sequence\":7");
+        let forged = body.replace("\"sequence\":2,", "\"sequence\":7,");
         assert_ne!(body, forged, "fixture must actually change the tail");
         assert_eq!(body.len(), forged.len(), "fixture must keep the length");
         fs::write(store.events_path(), forged).unwrap();
+        // #34g-C — explicit, timestamp-independent verification: the two
+        // seeded rows may land in the same millisecond (CI runners do), and
+        // the original implicit "different rows" assumption was a
+        // cross-platform flake source; pin the forge landed on the TAIL.
+        let forged_tail = fs::read_to_string(store.events_path())
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert!(
+            forged_tail.contains("\"sequence\":7"),
+            "tail carries the forged sequence"
+        );
 
         let row = store
             .record_heartbeat(test_ping("g", "c-3", "p-3", 3))

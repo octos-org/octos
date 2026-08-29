@@ -260,9 +260,11 @@ fn should_classify_403_quota_as_quota_with_provider_label() {
         "expected Quota, got {classified:?}"
     );
     assert_eq!(classified.variant_name(), "quota");
-    assert_eq!(classified.recovery_hint(), RecoveryHint::FailFast);
+    // #27b — quota is provider-DEGRADED, not fatal: the hint is
+    // SwitchProvider so the chain advances to the fallback slot instead of
+    // failing the turn (pre-27b this asserted FailFast).
+    assert_eq!(classified.recovery_hint(), RecoveryHint::SwitchProvider);
     assert!(classified.message().contains("MiniMax-M2.5-highspeed"));
-    assert!(classified.message().contains("top up or switch provider"));
 }
 
 #[test]
@@ -301,9 +303,10 @@ fn should_emit_quota_event_with_user_facing_message() {
         panic!("expected Error payload");
     };
     assert_eq!(data.variant, "quota");
-    assert_eq!(data.recovery, "fail_fast");
+    // #27b — the quota event carries the provider-degraded recovery hint
+    // (`switch_provider`), not `fail_fast` (pre-27b contract).
+    assert_eq!(data.recovery, "switch_provider");
     assert!(data.message.contains("lane-A"));
-    assert!(data.message.contains("top up or switch provider"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

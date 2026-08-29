@@ -6384,6 +6384,114 @@ async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// #27d (R4) — malformed tool-call feedback buffer
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A provider whose first N `chat` calls fail with
+/// `StreamError::MalformedArgs` and whose subsequent calls succeed with the
+/// scripted response — models "the model emitted broken tool-call JSON, then
+/// self-corrected after seeing the diagnostic".
+struct MalformedThenOkProvider {
+    malformed_first: StdMutex<usize>,
+    ok_response: ChatResponse,
+}
+
+#[async_trait]
+impl LlmProvider for MalformedThenOkProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let mut guard = self
+            .malformed_first
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *guard > 0 {
+            *guard -= 1;
+            return Err(eyre::Report::new(octos_llm::StreamError::MalformedArgs {
+                tool_id: "call_bad".to_string(),
+                tool_name: "shell".to_string(),
+                error: "expected `,` or `}` at line 1 column 4123".to_string(),
+            }));
+        }
+        Ok(self.ok_response.clone())
+    }
+
+    fn model_id(&self) -> &str {
+        "malformed-then-ok"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+fn plain_text_response(content: &str) -> ChatResponse {
+    ChatResponse {
+        content: Some(content.to_owned()),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        stop_reason: octos_llm::StopReason::EndTurn,
+        usage: octos_llm::TokenUsage {
+            input_tokens: 5,
+            output_tokens: 5,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
+}
+
+/// #27d — a MalformedArgs failure is fed back as a diagnostic message; the
+/// model self-corrects on the next call and the TURN SURVIVES (pre-#27d the
+/// same stream error terminated the turn instantly).
+#[tokio::test]
+async fn malformed_toolcall_feedback_lets_model_self_correct_and_survive() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MalformedThenOkProvider {
+        malformed_first: StdMutex::new(1),
+        ok_response: plain_text_response("recovered: valid tool call emitted"),
+    });
+    let tools = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("malformed-feedback"), provider, tools, memory);
+    let response = agent
+        .process_message("do the thing with a tool", &[], vec![])
+        .await
+        .expect("turn survives the malformed tool call after feedback");
+    assert_eq!(
+        response.content, "recovered: valid tool call emitted",
+        "the model's post-correction reply is the turn's answer"
+    );
+}
+
+/// #27d — after MALFORMED_TOOLCALL_FEEDBACK_LIMIT (3) fed-back diagnostics
+/// the buffer is exhausted and the turn terminates with the error (the
+/// pinned pre-#27d behavior).
+#[tokio::test]
+async fn malformed_toolcall_feedback_exhausts_and_terminates() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MalformedThenOkProvider {
+        malformed_first: StdMutex::new(10), // never self-corrects
+        ok_response: plain_text_response("unreachable"),
+    });
+    let tools = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("malformed-exhaust"), provider, tools, memory);
+    let result = agent
+        .process_message("never produces valid JSON", &[], vec![])
+        .await;
+    let err = result.expect_err("exhausted malformed budget terminates the turn");
+    assert!(
+        err.to_string().contains("MalformedArgs")
+            || err.to_string().contains("malformed")
+            || err.to_string().contains("arguments"),
+        "the terminal error names the malformed-args failure: {err}"
+    );
+}
+
 // --- build_chat_config: temperature/max_tokens override semantics (#2172) ---
 
 #[test]

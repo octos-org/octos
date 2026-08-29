@@ -3,6 +3,10 @@
 mod activity;
 mod append_only_audit;
 mod budget;
+
+/// #27h-r1 — shared result.md ownership judgment (see `budget::result_md_owner_content_is_peer`);
+/// re-exported at the crate surface for the cli-side peer-result writer.
+pub use budget::result_md_owner_content_is_peer;
 mod compaction;
 mod detection;
 mod execution;

@@ -118,6 +118,8 @@ pub(crate) fn xml_escape_untrusted(text: &str) -> String {
 /// codex blocks on the FIRST terminal turn error; three tolerates a
 /// transient provider blip without letting a permanently failing goal
 /// loop forever.
+/// #26b — autonomous-continuation no-progress cap.
+const GOAL_NO_PROGRESS_TURN_LIMIT: u32 = 3;
 const GOAL_MAX_CONSECUTIVE_FAILED_TURNS: u32 = 3;
 const MAX_LOOP_PROMPT_BYTES: usize = 8_192;
 const MAX_LOOPS_PER_SESSION: usize = 16;
@@ -1306,6 +1308,9 @@ fn terminal_settle_authority(
             Some((octos_fleet::TaskSettleAuthority::FinalFailure, true))
         }
         octos_agent::TaskStatus::Spawned | octos_agent::TaskStatus::Running => None,
+        // #27c — a PARKED task carries no settle verdict (it awaits client
+        // re-attachment); rank it with the non-verdict statuses.
+        octos_agent::TaskStatus::Parked => None,
     }
 }
 
@@ -2177,6 +2182,149 @@ impl InProcessAgentOrchestrator {
             }
         }
         paused
+    }
+
+    /// #25 — OPERATOR-owned goal transitions: `reopen` (→ `active`) and
+    /// `archive` (→ `archived`, an irreversible terminal state). This is the
+    /// escape hatch for the blocked/paused deadlock: `MODEL_ALLOWED_TRANSITIONS`
+    /// (goal_tool.rs) deliberately admits only `complete`/`blocked`, and the
+    /// completion gate accepts only `active|budget_limited`, so a `blocked`
+    /// or `paused` goal previously had NO model-reachable way back out —
+    /// and an orphaned goal whose session scope was taken over by a
+    /// replacement had no closing path at all. Only the operator (CLI /
+    /// outer loop) may call this; the model NEVER can (the tool schema does
+    /// not expose these statuses, and this method is not routed through the
+    /// model-actor paths).
+    ///
+    /// Transition rules (enforced under the state lock, before mutation):
+    /// - `reopen`: `blocked|paused|budget_limited` → `active`. Refuses from
+    ///   `complete`/`archived` (terminal) and from an already-`active` goal.
+    ///   A reopen must not resurrect an over-budget goal as `active` (that
+    ///   silently reverts `budget_limited` while still over cap) — raise the
+    ///   budget via `set_goal` first.
+    /// - `archive`: any status → `archived`. Refuses only from `archived`
+    ///   itself (idempotence guard).
+    /// - `archived` is TERMINAL: once archived there is no transition back —
+    ///   neither through this method nor through `set_goal`'s status field
+    ///   (its validation enum does not admit `archived`, so even the user
+    ///   wire path cannot forge it; archiving is only ever produced here).
+    ///
+    /// `session_id` is the session the goal is addressed under (the CLI
+    /// resolves the goal's persisted `session_id` from the supervisor event
+    /// stream); `scoped_goal_key` maps it to the storage key exactly like
+    /// every other goal path. On success the mutation is persisted to the
+    /// supervisor event stream (the AUTHORITATIVE goal-state layer that
+    /// `restore_goal_from_group` replays at boot) and — when
+    /// `ledger_data_dir` is `Some` — synced into the goal-ledger SQLite
+    /// row + decisions (best-effort, outside the state lock).
+    ///
+    /// Returns the post-transition goal JSON snapshot.
+    #[cfg_attr(not(test), allow(dead_code))] // tests exercise it; prod call sites land with the goal UI follow-up
+    pub(crate) fn operator_transition_goal(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        action: &str,
+        reason: &str,
+        ledger_data_dir: Option<&Path>,
+    ) -> Result<Value, String> {
+        let target_status = match action {
+            "reopen" => "active",
+            "archive" => "archived",
+            other => {
+                return Err(format!(
+                    "unknown operator goal action `{other}` (use `reopen` or `archive`)"
+                ));
+            }
+        };
+        let key = self.scoped_goal_key(session_id);
+        let snapshot = {
+            let mut state = self.state();
+            let Some(goal) = state.goals.get_mut(&key) else {
+                return Err(format!(
+                    "no goal is set for session `{session_id}` (check the session id, or pass \
+                     the session under whose scope the goal was created)"
+                ));
+            };
+            if goal.profile_id != profile_id {
+                return Err(format!(
+                    "goal `{}` belongs to profile `{}`, not `{profile_id}`",
+                    goal.goal_id, goal.profile_id
+                ));
+            }
+            let prior_status = goal.status.clone();
+            match action {
+                "reopen" => {
+                    match prior_status.as_str() {
+                        "blocked" | "paused" | "budget_limited" => {}
+                        "active" => {
+                            return Err(format!(
+                                "goal `{}` is already active; nothing to reopen",
+                                goal.goal_id
+                            ));
+                        }
+                        other => {
+                            return Err(format!(
+                                "cannot reopen goal `{gid}` from terminal status `{other}` \
+                                 (reopen is only allowed from blocked|paused|budget_limited)",
+                                gid = goal.goal_id
+                            ));
+                        }
+                    }
+                    // Same over-budget guard as `set_goal`'s reactivation
+                    // guard: never leave an over-budget goal `active`.
+                    if goal.token_budget > 0 && goal.tokens_used >= goal.token_budget {
+                        return Err(format!(
+                            "cannot reopen goal `{}`: it has exhausted its token budget \
+                             ({} >= {}); raise the budget above the tokens already used first",
+                            goal.goal_id, goal.tokens_used, goal.token_budget
+                        ));
+                    }
+                    // Mirror `set_goal`'s reactivation bookkeeping: a fresh
+                    // wrap-up window, forgiven failure streak, restarted
+                    // rate-limit window.
+                    goal.wrap_up_emitted = false;
+                    goal.wrap_up_generation = goal.wrap_up_generation.wrapping_add(1);
+                    goal.consecutive_failed_turns = 0;
+                    let now = now_ms();
+                    goal.rate_window_start_ms = now;
+                    goal.rate_window_count = 0;
+                }
+                "archive" => {
+                    if prior_status == "archived" {
+                        return Err(format!(
+                            "goal `{}` is already archived (terminal)",
+                            goal.goal_id
+                        ));
+                    }
+                }
+                _ => unreachable!("action validated above"),
+            }
+            // Operator-path mutation bumps the ABA revision exactly like the
+            // user wire path, so a verifier snapshot taken before the
+            // operator acted can never be honored after it.
+            goal.revision = goal.revision.wrapping_add(1);
+            goal.status = target_status.to_owned();
+            goal.updated_at_ms = now_ms();
+            let snapshot = goal.clone();
+            if snapshot.status == "active" {
+                enqueue_goal_continuation(&mut state, &key, &snapshot.profile_id, &snapshot);
+            }
+            persist_goal_state(&state, &key, &snapshot, false);
+            snapshot
+        };
+        tracing::info!(
+            session = %key,
+            goal_id = %snapshot.goal_id,
+            action = %action,
+            status = %snapshot.status,
+            reason = %reason,
+            "operator transitioned goal (#25 reopen/archive exit)"
+        );
+        if let Some(data_dir) = ledger_data_dir {
+            self.sync_transition_to_ledger_blocking(data_dir, &snapshot, reason, &key, true, false);
+        }
+        Ok(autonomy_goal_json(&snapshot))
     }
 
     pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Value {
@@ -3583,6 +3731,10 @@ impl InProcessAgentOrchestrator {
             .goals
             .get_mut(session_id)
             .expect("live_chargeable checked the record exists under this lock");
+        // #26b — capture the revision BEFORE the turn's accounting so the
+        // turn-end hook can tell "the model acted" (revision bumped by a
+        // goal_update / status change) from an inert re-read.
+        let prior_revision = goal.revision;
         let wrap_up = record_goal_turn_internal(goal, tokens_consumed, elapsed_seconds, now);
         let goal_snapshot = goal.clone();
         persist_goal_state(&state, session_id, &goal_snapshot, false);
@@ -3595,6 +3747,59 @@ impl InProcessAgentOrchestrator {
             // the wrap-up cannot collide with the normal-continuation
             // key shape.
             enqueue_goal_wrap_up(&mut state, session_id, &goal_snapshot, prompt, now_system);
+        }
+        // #26b — the turn-end continuation hook: while the goal is still
+        // LIVE (active, budget unspent, not terminal), the session keeps
+        // work queued (an active goal means unfinished business), so
+        // re-arm a ZERO-DELAY continuation immediately instead of waiting
+        // for an external driver. Guards (all three = the #26b 防呆):
+        // ①progress gate — a turn that neither spent tokens nor bumped the
+        //   revision made no observable progress; after
+        //   GOAL_NO_PROGRESS_TURN_LIMIT such turns in a row the hook parks
+        //   the goal `blocked` (user-resumable) instead of spinning.
+        // ②budget gate — an exhausted goal already flipped
+        //   budget_limited above; the policy layer would refuse anyway.
+        // ③status-link gate — only an `active` goal of THIS profile
+        //   re-arms (terminal / cleared / foreign goals never do).
+        if goal_snapshot.status == "active"
+            && goal_snapshot.token_budget > 0
+            && goal_snapshot.tokens_used < goal_snapshot.token_budget
+        {
+            let progressed = tokens_consumed > 0 || goal_snapshot.revision != prior_revision;
+            {
+                let live = state
+                    .goals
+                    .get_mut(session_id)
+                    .expect("goal_snapshot was just cloned from this slot");
+                if progressed {
+                    live.no_progress_turns = 0;
+                } else {
+                    live.no_progress_turns = live.no_progress_turns.saturating_add(1);
+                    if live.no_progress_turns >= GOAL_NO_PROGRESS_TURN_LIMIT {
+                        live.revision = live.revision.wrapping_add(1);
+                        live.status = "blocked".to_owned();
+                        tracing::warn!(
+                            goal_id = %live.goal_id,
+                            limit = GOAL_NO_PROGRESS_TURN_LIMIT,
+                            "goal parked: turn-end hook saw no progress — resuming requires the user path"
+                        );
+                        let parked = live.clone();
+                        persist_goal_state(&state, session_id, &parked, false);
+                        return Some(parked);
+                    }
+                }
+            }
+            let live = state
+                .goals
+                .get(session_id)
+                .cloned()
+                .expect("goal re-read under the same lock");
+            if enqueue_goal_continuation(&mut state, session_id, profile_id, &live).is_some() {
+                tracing::info!(
+                    goal_id = %goal_snapshot.goal_id,
+                    "goal turn-end hook re-armed a zero-delay continuation (#26b)"
+                );
+            }
         }
         if matches!(goal_snapshot.status.as_str(), "complete" | "blocked") {
             Some(goal_snapshot)
@@ -3662,6 +3867,163 @@ impl InProcessAgentOrchestrator {
         } else {
             None
         }
+    }
+
+    /// #20a (smart worktree fencing) — the count of this profile's goals
+    /// whose status is `active`, across ALL store keys. Pure in-memory map
+    /// scan (one MutexGuard, no I/O) — cheap enough to evaluate on the
+    /// `peer_handoff` staging path only. Used by the collision predicate:
+    /// more than one active goal in the instance means concurrent work
+    /// streams, so an unspecified peer worktree auto-fences.
+    pub(crate) fn profile_active_goal_count(&self, profile_id: &str) -> usize {
+        let state = self.state();
+        state
+            .goals
+            .values()
+            .filter(|goal| goal.profile_id == profile_id && goal.status == "active")
+            .count()
+    }
+
+    /// #20b — scan `goal-ledgers/` for ANY recorded main-tree owner. The owner
+    /// goal records sovereignty in its OWN ledger, but the shell guard runs for
+    /// whichever goal issued the command — usually NOT the owner — so the owner
+    /// must be discovered by enumeration, not by reading the caller's ledger.
+    /// Returns the first owner found. Best-effort and fail-open: a missing dir,
+    /// an unreadable/corrupt ledger, or no claim anywhere yields `None`, which
+    /// the guard treats as "no owner → never block". This runs only on the shell
+    /// path (one bounded dir scan per command), never a hot loop.
+    pub(crate) fn scan_main_tree_owner(
+        &self,
+        profile_data_dir: &std::path::Path,
+    ) -> Option<String> {
+        let dir = Self::goal_ledger_dir(profile_data_dir);
+        let entries = std::fs::read_dir(&dir).ok()?;
+        // #34c — pick the EARLIEST claim ACROSS ledgers, never the first
+        // directory entry: `read_dir` order is inode/allocation order, so
+        // with two goals each claiming in their OWN ledger (kv_put OR IGNORE
+        // is first-writer-wins only WITHIN one file), the old scan returned
+        // whichever .db the OS listed first — nondeterministic (CI red,
+        // local green). Fix: compare claim timestamps (earliest wins); ties
+        // broken by goal id lexicographic order (a deterministic, documented
+        // tiebreak — identical ms claims are a same-clock race, and a stable
+        // order beats coin-flipping).
+        let mut earliest: Option<(i64, String)> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                continue;
+            }
+            let Ok(ledger) = octos_fleet::GoalLedger::open(&path) else {
+                continue;
+            };
+            let Ok(Some((owner, claimed_at))) =
+                ledger.kv_get_with_time(octos_fleet::GoalLedger::MAIN_TREE_OWNER_KEY)
+            else {
+                continue;
+            };
+            let wins = match &earliest {
+                None => true,
+                Some((best_at, best_owner)) => (claimed_at, &owner) < (*best_at, best_owner),
+            };
+            if wins {
+                earliest = Some((claimed_at, owner));
+            }
+        }
+        earliest.map(|(_, owner)| owner)
+    }
+
+    /// #20b — record `goal_id` as the first goal to land a non-default
+    /// branch on the main tree. First-writer-wins: when the tree already has
+    /// an owner the incumbent's id is kept (and logged), so a second goal
+    /// branching the main tree later cannot silently take sovereignty. The
+    /// claim is persisted through the goal's own ledger, so it is recovered
+    /// by any process that reopens the ledger after a restart.
+    pub(crate) fn claim_main_tree_owner(&self, profile_data_dir: &std::path::Path, goal_id: &str) {
+        let ledger_dir = Self::goal_ledger_dir(profile_data_dir);
+        if let Err(error) = std::fs::create_dir_all(&ledger_dir) {
+            tracing::warn!(%error, "main-tree owner claim: ledger dir create failed (best-effort)");
+            return;
+        }
+        let ledger_path = Self::goal_ledger_path(profile_data_dir, goal_id);
+        let ledger = match octos_fleet::GoalLedger::open(&ledger_path) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(%error, ledger = %ledger_path.display(),
+                    "main-tree owner claim: ledger open failed (best-effort)");
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        match ledger.claim_main_tree_owner(goal_id, now) {
+            Ok(owner) if owner != goal_id => tracing::info!(
+                owner = %owner,
+                claimant = %goal_id,
+                "main tree already owned — claim ignored (first-writer-wins)"
+            ),
+            Ok(_) => tracing::info!(owner = %goal_id, "main-tree owner recorded"),
+            Err(error) => tracing::warn!(%error, "main-tree owner claim failed (best-effort)"),
+        }
+    }
+
+    /// #20b — wire the shell tool's main-tree sovereignty provider for this
+    /// profile. Installed once per profile runtime; the closure is
+    /// process-global (the shell tool consults one provider) so it re-reads
+    /// the main-tree branch and the caller-bound goal's ledger on EVERY shell
+    /// execution, never caching a stale owner or branch. When the main tree
+    /// sits on a non-default branch and the bound goal is not yet the owner,
+    /// this also best-effort CLAIMS the owner for that goal — the "first goal
+    /// to land a branch on the main tree" rule.
+    ///
+    /// `main_tree_root` is the session workspace root (the shared main tree).
+    /// Fail-open throughout: a non-git tree, an unreadable branch, or a
+    /// missing ledger simply yields no owner, and the guard stays out of the
+    /// way — exactly the solo-CLI / single-goal default.
+    pub(crate) fn install_main_tree_sovereignty(
+        profile_data_dir: std::path::PathBuf,
+        main_tree_root: std::path::PathBuf,
+    ) {
+        let profile_data_dir_for_closure = profile_data_dir.clone();
+        octos_agent::tools::shell::set_main_tree_sovereignty_provider(Some(std::sync::Arc::new(
+            move |caller_goal_id: Option<&str>| {
+                let root = main_tree_root.clone();
+                // Read the main tree's CURRENT branch (fail-open on any error).
+                let branch = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                    .filter(|b| !b.is_empty());
+                let orchestrator = default_agent_orchestrator();
+                // If the tree is on a non-default branch and the CALLER's goal
+                // is bound, that goal is the one working the tree — claim it
+                // (first-writer-wins) so later cross-goal checkouts are refused.
+                if let (Some(b), Some(goal)) = (branch.as_deref(), caller_goal_id) {
+                    if b != "main" && b != "master" {
+                        orchestrator.claim_main_tree_owner(&profile_data_dir_for_closure, goal);
+                    }
+                }
+                // The owner is recorded in SOME goal's ledger (whichever goal
+                // first branched the tree) — the caller is usually a DIFFERENT
+                // goal, so reading only the caller's ledger would miss it. Scan
+                // the goal-ledgers dir for any recorded owner (first found
+                // wins; ledger_kv is first-writer-wins per-ledger, and a single
+                // tree has one true owner, so any hit is authoritative).
+                let owner_goal_id =
+                    orchestrator.scan_main_tree_owner(&profile_data_dir_for_closure);
+                Some(octos_agent::tools::shell::MainTreeSovereigntyContext {
+                    main_tree_root: root,
+                    main_tree_branch: branch,
+                    owner_goal_id,
+                    caller_goal_id: caller_goal_id.map(str::to_owned),
+                })
+            },
+        )));
     }
 
     /// #2056 round 2 (H2b) — the goal BOUND to this session, whatever its
@@ -8706,6 +9068,7 @@ impl InProcessAgentOrchestrator {
                 rate_window_count: 0,
                 wrap_up_emitted: false,
                 consecutive_failed_turns: 0,
+                no_progress_turns: 0,
                 fleet_id: Some(fleet_id.to_owned()),
                 controller_workspace_root: None,
                 controller_workspace_has_runtime_hint: None,
@@ -9437,6 +9800,11 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             ));
         }
         let requested_status = request.status.as_deref();
+        // #25 — `archived` is deliberately NOT in this enum: it is a
+        // TERMINAL, operator-only status reachable exclusively through
+        // [`Self::operator_transition_goal`] (the `goal archive` exit), so
+        // neither the model NOR the user wire path can forge an archive (or
+        // un-archive). Every other status is settable here.
         if requested_status.is_some_and(|status| {
             !matches!(
                 status,
@@ -9619,8 +9987,10 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 // the re-budgeted goal can never wrap up again.
                 goal.wrap_up_generation = goal.wrap_up_generation.wrapping_add(1);
                 // Re-activation forgives the failure streak (#1693) —
-                // the user explicitly asked for another attempt.
+                // the user explicitly asked for another attempt. The #26b
+                // no-progress streak forgives with it (same rationale).
                 goal.consecutive_failed_turns = 0;
+                goal.no_progress_turns = 0;
                 if goal.tokens_used < goal.token_budget {
                     // user-driven re-activation also restarts the
                     // sliding rate-limit window so the prior burst
@@ -9690,6 +10060,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 rate_window_count: 0,
                 wrap_up_emitted: false,
                 consecutive_failed_turns: 0,
+                no_progress_turns: 0,
                 // PR 5a — no fleet/root until a live goal turn stashes the root
                 // and the keeper's `goal_plan` decomposes onto a fleet.
                 fleet_id: None,
@@ -11509,6 +11880,16 @@ pub(crate) struct AutonomyGoalRecord {
     /// `blocked` (user-resumable). Reset by any token-consuming turn
     /// and by user re-activation.
     consecutive_failed_turns: u32,
+    /// #26b — consecutive autonomous continuation turns that made NO
+    /// observable progress (goal revision unchanged AND zero tokens charged
+    /// AND no new ledger finding). Distinct from `consecutive_failed_turns`
+    /// (which only tracks zero-token turns): a turn can SPEND tokens and
+    /// still be inert (the model re-reading without acting). At
+    /// [`GOAL_NO_PROGRESS_TURN_LIMIT`] the turn-end hook stops re-arming
+    /// itself and parks the goal `blocked` (user-resumable), so a spinning
+    /// session cannot burn the budget forever. Any revision bump (a real
+    /// goal_update / status change) or any token spend resets it.
+    no_progress_turns: u32,
     /// #1857 PR 5a — the durable fleet this goal drives, once `goal_plan`
     /// has created it (`<goal_id>`). `None` before the keeper decomposes the
     /// objective onto a fleet; set once and treated as idempotent (a second
@@ -12781,7 +13162,16 @@ asserted, it is NOT done.\n\nAnswer with EXACTLY one line:\n`DONE` if the \
 objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     );
     let config = octos_llm::ChatConfig {
-        max_tokens: Some(200),
+        // #23 — 200 was enough for a one-line DONE/NOT_DONE on a NON-reasoning
+        // model, but reasoning models (k3, o-series) spend thinking tokens from
+        // the SAME budget: with max_tokens=200 the model burned all 200 on
+        // reasoning and left ZERO for the visible answer, so the verifier
+        // returned Ok with EMPTY content and goal_update surfaced a bare
+        // "verifier returned: " (the #23 empty-return). 2048 gives reasoning
+        // ample headroom while leaving room for the one-line verdict; for a
+        // non-reasoning model 2048 is just an upper bound, not a target, so
+        // this is regression-free.
+        max_tokens: Some(2048),
         temperature: Some(0.0),
         tool_choice: Default::default(),
         stop_sequences: Vec::new(),
@@ -12793,6 +13183,15 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {
         Ok(response) => (response.content.unwrap_or_default(), response.usage),
         Err(error) => {
+            // #24 — log the failing provider + error so an empty verdict can be
+            // attributed to a layer (call failure vs empty content) instead of
+            // surfacing as a bare "verifier returned: " with no reason.
+            tracing::warn!(
+                provider = %provider.provider_name(),
+                model = %provider.model_id(),
+                error = %error,
+                "goal completion verifier call failed"
+            );
             return (
                 GoalCompletionVerdict::NotDone {
                     reason: format!("verifier call failed: {error}"),
@@ -12806,6 +13205,19 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     // Strip backticks first: the prompt says "`DONE`" (with backticks), so a
     // literally-compliant model returns `DONE` → we must accept that.
     let trimmed = verdict_text.trim().trim_matches('`');
+    // #24 — log the raw verdict so an EMPTY reason (the #23 symptom) is
+    // attributable: a healthy model returns non-empty text; an empty trimmed
+    // verdict here means the provider returned Ok with empty/whitespace
+    // content, which is a different layer than a call error.
+    if trimmed.is_empty() {
+        tracing::warn!(
+            provider = %provider.provider_name(),
+            model = %provider.model_id(),
+            usage_in = usage.input_tokens,
+            usage_out = usage.output_tokens,
+            "goal completion verifier returned EMPTY content (Ok but no text)"
+        );
+    }
     let first_token = trimmed
         .split(|c: char| c.is_whitespace() || c == ':')
         .next()
@@ -13011,6 +13423,8 @@ fn background_task_agent_status(task: &octos_agent::BackgroundTask) -> String {
         octos_agent::TaskStatus::Completed => "completed",
         octos_agent::TaskStatus::Failed => "failed",
         octos_agent::TaskStatus::Cancelled => "interrupted",
+        // #27c — awaiting client re-attach (peer orphan); not a verdict.
+        octos_agent::TaskStatus::Parked => "parked",
     }
     .to_owned()
 }
@@ -13507,6 +13921,7 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
     let goal = AutonomyGoalRecord {
         profile_id: profile_id.to_owned(),
         goal_id: goal_id.to_owned(),
+        no_progress_turns: 0,
         objective: supervisor_metadata_str(&group.metadata, "objective")
             .unwrap_or_default()
             .to_owned(),
@@ -13821,6 +14236,10 @@ fn group_status_for_goal(status: &str) -> GroupStatus {
         "blocked" => GroupStatus::Blocked,
         "budget_limited" => GroupStatus::BudgetLimited,
         "paused" => GroupStatus::Paused,
+        // #25 — `archived` is a TERMINAL goal status (operator-driven,
+        // irreversible); the roster must render it as a clean stop, never
+        // as a failure or a cancellation.
+        "archived" => GroupStatus::Completed,
         // Anything unrecognised is treated conservatively as a stopped,
         // non-running state rather than Running.
         _ => GroupStatus::Cancelled,
@@ -13845,6 +14264,7 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         rate_window_count: 0,
         wrap_up_emitted: false,
         consecutive_failed_turns: 0,
+        no_progress_turns: 0,
         // PR 5a — a cleared goal drives no fleet.
         fleet_id: None,
         controller_workspace_root: None,
@@ -15312,7 +15732,17 @@ fn loop_runtime_wait_error(record: &AutonomyLoopRecord, wait: &WaitUntil) -> Rpc
 /// precedence over user doc, which takes precedence over the built-in
 /// fallback. Bullet 3 of #977.
 fn resolve_maintenance_prompt_at_fire_time() -> MaintenancePromptResolution {
-    let project = std::fs::read_to_string(PROJECT_MAINTENANCE_PROMPT_PATH).ok();
+    // #38 — thin shell over the parameterized core: the PRODUCTION caller
+    // reads the process CWD; tests inject an explicit temp dir instead of
+    // chdir'ing the whole process (a process-global CWD races every
+    // parallel neighbor on Windows — the round-6 error-3 cluster).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_maintenance_prompt_at_fire_time_in(&cwd)
+}
+
+/// #38 — the cwd-parameterized core of the fire-time prompt resolution.
+fn resolve_maintenance_prompt_at_fire_time_in(cwd: &Path) -> MaintenancePromptResolution {
+    let project = std::fs::read_to_string(cwd.join(PROJECT_MAINTENANCE_PROMPT_PATH)).ok();
     let user = expand_home_path(USER_MAINTENANCE_PROMPT_PATH)
         .and_then(|path| std::fs::read_to_string(path).ok());
     // `resolve_maintenance_prompt` only errors when *every* candidate is
@@ -15371,22 +15801,51 @@ pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
 mod tests {
     use super::*;
 
-    /// #1135 codex P2: serialize all cwd-mutating tests in this module
-    /// (currently `maintenance_loop_resolves_prompt_at_fire_time_from_project_doc`
-    /// and `scheduled_maintenance_fire_emits_resolved_prompt_source`).
-    /// Rust runs tests in parallel by default; both tests `chdir` to
-    /// their own tempdir and write `.octos/loop.md` there. Without a
-    /// shared lock the two tests can overlap, with one resolving the
-    /// OTHER's project doc and producing nondeterministic content
-    /// failures. The lock is poisoning-safe — we recover from a poisoned
-    /// lock so an earlier panic doesn't permanently disable the suite.
-    static CWD_MUTATING_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-    fn cwd_mutating_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        CWD_MUTATING_TEST_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// #38 — the cwd-PARAMETERIZED core test: no chdir, no process-global
+    /// CWD mutation, no cross-module guard needed. The end-to-end loop path
+    /// reaches this core through the thin shell (`env::current_dir`), which
+    /// production callers exercise naturally.
+    #[test]
+    fn maintenance_prompt_core_resolves_project_doc_from_injected_cwd() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let octos_dir = temp.path().join(".octos");
+        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
+        std::fs::write(octos_dir.join("loop.md"), "  project maintenance steps\n  ")
+            .expect("write loop.md");
+        let resolution = resolve_maintenance_prompt_at_fire_time_in(temp.path());
+        assert_eq!(
+            resolution.prompt.trim(),
+            "project maintenance steps",
+            "prompt resolved from the INJECTED cwd, no chdir (#38)"
+        );
+        assert_eq!(
+            maintenance_prompt_source_label(resolution.source),
+            "project"
+        );
+    }
+
+    /// #38 — scheduled-path twin: the parameterized core resolves the
+    /// project doc from an injected cwd (the end-to-end scheduled tick
+    /// reaches the same core through the thin shell).
+    #[test]
+    fn scheduled_maintenance_core_resolves_project_doc_from_injected_cwd() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let octos_dir = temp.path().join(".octos");
+        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
+        std::fs::write(
+            octos_dir.join("loop.md"),
+            "scheduled project maintenance steps\n",
+        )
+        .expect("write loop.md");
+        let resolution = resolve_maintenance_prompt_at_fire_time_in(temp.path());
+        assert_eq!(
+            resolution.prompt.trim(),
+            "scheduled project maintenance steps"
+        );
+        assert_eq!(
+            maintenance_prompt_source_label(resolution.source),
+            "project"
+        );
     }
 
     struct NativeMockProvider {
@@ -15425,6 +15884,65 @@ mod tests {
         fn provider_name(&self) -> &str {
             "test"
         }
+    }
+
+    /// #23 — a mock that captures the `max_tokens` the verifier passes, so the
+    /// reasoning-headroom budget (2048, not the old 200) is pinned by test.
+    struct MaxTokensCapturingProvider {
+        seen_max_tokens: std::sync::Mutex<Option<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MaxTokensCapturingProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            *self.seen_max_tokens.lock().unwrap() = config.max_tokens;
+            Ok(octos_llm::ChatResponse {
+                content: Some("DONE".to_owned()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "max-tokens-mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// #23 — pin the verifier's token budget: reasoning models (k3/o-series)
+    /// share one max_tokens budget between thinking and the visible answer, so
+    /// the old 200 let reasoning burn the whole budget and leave an EMPTY
+    /// verdict (the #23 empty-return). The verifier must now request 2048.
+    #[tokio::test]
+    async fn goal_completion_verifier_uses_reasoning_headroom_max_tokens() {
+        let provider = std::sync::Arc::new(MaxTokensCapturingProvider {
+            seen_max_tokens: std::sync::Mutex::new(None),
+        });
+        let (verdict, _usage) =
+            run_goal_completion_verifier_with_usage(provider.clone(), "objective", "evidence")
+                .await;
+        assert!(verdict.is_done(), "mock returns DONE");
+        let seen = *provider.seen_max_tokens.lock().unwrap();
+        assert_eq!(
+            seen,
+            Some(2048),
+            "verifier must request 2048 max_tokens (reasoning headroom), got {seen:?}"
+        );
     }
 
     // ---- PR 5a: goal keeper drives a fleet (dispatch backbone) -------------
@@ -23435,6 +23953,9 @@ mod tests {
             GroupStatus::BudgetLimited
         );
         assert_eq!(group_status_for_goal("paused"), GroupStatus::Paused);
+        // #25 — `archived` is a terminal stop, rendered as a clean
+        // `Completed` (never Running, never a failure/cancellation).
+        assert_eq!(group_status_for_goal("archived"), GroupStatus::Completed);
         // The core regression across every non-active state: NOT Running.
         for stopped in ["budget_limited", "paused", "blocked"] {
             assert_ne!(
@@ -23450,6 +23971,166 @@ mod tests {
         // Unknown states fall back conservatively to a stopped, non-running
         // status.
         assert_eq!(group_status_for_goal("wat"), GroupStatus::Cancelled);
+    }
+
+    /// #25 — the operator reopen exit: a BLOCKED goal (no model-reachable
+    /// way out, since `MODEL_ALLOWED_TRANSITIONS` only admits
+    /// complete/blocked and the complete gate refuses a blocked goal) is
+    /// reopened to `active` via [`Self::operator_transition_goal`], and can
+    /// then be closed through the normal `goal_update` (model complete)
+    /// path — the state machine has a full blocked → active → complete loop.
+    #[tokio::test]
+    async fn operator_reopen_unblocks_goal_then_model_completes() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-reopen");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        // The model blocks the goal (a model-allowed transition).
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "blocked", "stuck", None)
+            .await
+            .expect("block");
+        // A blocked goal has no model exit: goal_update to complete is gated.
+        // The OPERATOR reopens it.
+        let reopened = orchestrator
+            .operator_transition_goal(&session_id, "tenant-a", "reopen", "operator reopened", None)
+            .expect("operator reopen");
+        assert_eq!(reopened["status"], json!("active"));
+        // After reopen the model can close the goal via goal_update.
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect("complete after reopen");
+        let goal = orchestrator
+            .get_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("get goal");
+        assert_eq!(goal["goal"]["status"], json!("complete"));
+    }
+
+    /// #25 — `archived` is a TERMINAL state: once archived, neither reopen
+    /// nor any further operator/model transition can move the goal.
+    #[test]
+    fn operator_archive_is_terminal_and_irreversible() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-archive");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        let archived = orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                "archive",
+                "operator archived",
+                None,
+            )
+            .expect("archive");
+        assert_eq!(archived["status"], json!("archived"));
+        // Reopen from archived is refused.
+        let reopen =
+            orchestrator.operator_transition_goal(&session_id, "tenant-a", "reopen", "nope", None);
+        assert!(reopen.is_err());
+        // A second archive is refused (idempotence guard).
+        let again = orchestrator.operator_transition_goal(
+            &session_id,
+            "tenant-a",
+            "archive",
+            "again",
+            None,
+        );
+        assert!(again.is_err());
+    }
+
+    /// #25 — reopen refuses the TERMINAL states (`complete`/`archived`) and
+    /// an already-active goal, and never resurrects an over-budget goal as
+    /// `active`.
+    #[test]
+    fn operator_reopen_refuses_terminal_active_and_over_budget() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-refuse");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        // Already active -> nothing to reopen.
+        assert!(
+            orchestrator
+                .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+                .is_err()
+        );
+        // Complete -> reopen refused.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "ship the thing".into(),
+                status: Some("complete".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("complete");
+        assert!(
+            orchestrator
+                .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+                .is_err()
+        );
+        // Over-budget reopen refused: burn the budget, block, then reopen.
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "tiny budget".into(),
+                status: Some("active".into()),
+                token_budget: Some(2_000),
+                transition_actor: None,
+            })
+            .expect("set tiny-budget goal");
+        // Force the record over budget, then block it.
+        {
+            let mut state = orchestrator.state();
+            let key = orchestrator.scoped_goal_key(&session_id);
+            let goal = state.goals.get_mut(&key).unwrap();
+            goal.tokens_used = 2_000;
+            goal.status = "blocked".into();
+        }
+        let err = orchestrator
+            .operator_transition_goal(&session_id, "tenant-a", "reopen", "r", None)
+            .unwrap_err();
+        assert!(err.contains("exhausted its token budget"), "{err}");
+    }
+
+    /// #25 钉住实证 — the orchestrator restores goal state from the
+    /// SUPERVISOR EVENT STREAM (`group_registered` metadata.status), NOT from
+    /// the goal-ledger sqlite `goals` table: a blocked goal, persisted, is
+    /// restored as `blocked` on a fresh boot via `configure_supervisor_store`.
+    #[test]
+    fn goal_status_restores_from_supervisor_event_stream() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-25-restore");
+        // Boot 1: set + block a goal (persisted to the event stream).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("configure store");
+        seed_goal(&orchestrator, &session_id, "tenant-a");
+        orchestrator
+            .operator_transition_goal(&session_id, "tenant-a", "archive", "archive it", None)
+            .expect("archive");
+        // Boot 2: a FRESH orchestrator loading the same store restores the
+        // archived status from the event stream.
+        let restored = InProcessAgentOrchestrator::default();
+        restored
+            .configure_supervisor_store(dir.path())
+            .expect("reload store");
+        let goal = restored
+            .get_goal(GoalSessionRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("get restored goal");
+        assert_eq!(
+            goal["goal"]["status"],
+            json!("archived"),
+            "boot replays the supervisor event stream's metadata.status"
+        );
     }
 
     /// Task 2 (mini5 seq-454 over-budget re-activation): a goal that has
@@ -24522,6 +25203,7 @@ mod tests {
             rate_window_count: 0,
             wrap_up_emitted: false,
             consecutive_failed_turns: 0,
+            no_progress_turns: 0,
             fleet_id: None,
             controller_workspace_root: None,
             controller_workspace_has_runtime_hint: None,
@@ -25488,9 +26170,109 @@ mod tests {
         );
     }
 
-    /// #1693 — three consecutive zero-token continuation turns (a
-    /// permanently failing goal charges nothing, so the budget never
-    /// stops it) flip the goal to `blocked`; one token-consuming turn
+    /// #26b — the turn-end hook: while a goal is ACTIVE with budget left,
+    /// `record_goal_turn` re-arms a zero-delay continuation (drain finds it
+    /// ready). Guard: `complete`/`blocked` goals and an exhausted budget
+    /// never re-arm; three consecutive NO-PROGRESS turns (tokens spent but
+    /// revision unchanged, or vice versa) park the goal `blocked`.
+    #[tokio::test]
+    async fn turn_end_hook_rearms_active_goal_and_parks_inert_spins() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-hook");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "ship the hook".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // A PROGRESSING turn (tokens spent) re-arms: the drain finds a
+        // zero-delay continuation for this session.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 10_000, 5);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !drained.is_empty(),
+            "an active goal with budget must re-arm a continuation after a spent turn"
+        );
+
+        // Two more INERT turns (zero tokens, no revision bump) — allowed…
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 0, 1);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 0, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+            "two inert turns do not yet park the goal"
+        );
+        // …the THIRD parks it (防呆 progress gate).
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 0, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("blocked"),
+            "three consecutive no-progress turns park the goal (#26b)"
+        );
+        // A parked goal re-arms nothing.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "a blocked goal must not re-arm continuations"
+        );
+    }
+
+    /// #26b — budget gate: a turn that exhausts the budget flips the goal
+    /// `budget_limited` (existing accountant) and the hook does NOT re-arm.
+    #[tokio::test]
+    async fn turn_end_hook_respects_budget_gate() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "spend it all".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        orchestrator.record_goal_turn(&session_id, "tenant-a", None, 1_000, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "exhausting the budget flips the goal budget_limited"
+        );
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // The budget flip enqueues a one-shot WRAP-UP continuation (existing
+        // #1131 behavior) — the #26b budget gate only forbids the
+        // GoalContinue re-arm. Assert no GoalContinue among the drained.
+        let re_armed = drained
+            .iter()
+            .any(|req| matches!(req.reason, MasterContinuationReason::GoalContinue));
+        assert!(
+            !re_armed,
+            "an exhausted goal must not re-arm a GoalContinue (#26b budget gate) — got {:?}",
+            drained.iter().map(|r| &r.reason).collect::<Vec<_>>()
+        );
+    }
+
     /// resets the streak; user re-activation forgives it.
     #[test]
     fn goal_blocks_after_consecutive_failed_turns_and_resume_forgives() {
@@ -29799,146 +30581,6 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_loop_resolves_prompt_at_fire_time_from_project_doc() {
-        use std::env;
-        // #1135 codex P2: serialize cwd-mutating tests in this module.
-        let _cwd_guard = cwd_mutating_test_guard();
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let cwd_before = env::current_dir().expect("cwd");
-        env::set_current_dir(temp.path()).expect("chdir tmp");
-        let octos_dir = temp.path().join(".octos");
-        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
-        std::fs::write(octos_dir.join("loop.md"), "  project maintenance steps\n  ")
-            .expect("write loop.md");
-
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-maint");
-        let created = orchestrator
-            .create_loop(LoopCreateRequest {
-                session_id: session_id.clone(),
-                profile_id: "tenant-a".into(),
-                prompt: None,
-                command: None,
-                interval_seconds: None,
-                mode: Some("maintenance".into()),
-            })
-            .expect("create maintenance loop");
-        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
-
-        let fired = orchestrator
-            .control_loop(LoopControlRequest {
-                loop_id,
-                session_id: Some(session_id.clone()),
-                profile_id: "tenant-a".into(),
-                kind: LoopControlKind::FireNow,
-            })
-            .expect("fire maintenance loop");
-        assert_eq!(fired["status"], json!("queued"));
-
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &session_id,
-            "tenant-a",
-            MasterContinuationRuntimeState::idle(),
-            1,
-        );
-        env::set_current_dir(&cwd_before).expect("restore cwd");
-        assert_eq!(drained.len(), 1);
-        let prompt_meta = drained[0]
-            .metadata
-            .get("prompt")
-            .cloned()
-            .expect("prompt metadata");
-        assert_eq!(
-            prompt_meta, "project maintenance steps",
-            "maintenance prompt must be resolved at fire time from .octos/loop.md (#977)"
-        );
-        let source = drained[0]
-            .metadata
-            .get("prompt_source")
-            .cloned()
-            .expect("prompt_source metadata");
-        assert_eq!(source, "project");
-    }
-
-    /// #1135 acceptance: the scheduled-due path must also report the
-    /// resolved `prompt_source` (`project` / `user` / `built_in`) and
-    /// not the legacy `"record"` placeholder. The continuation prompt
-    /// must match the file content, proving the resolution actually
-    /// ran for the scheduled tick, not just for `fire_now`.
-    #[test]
-    fn scheduled_maintenance_fire_emits_resolved_prompt_source() {
-        use std::env;
-        // #1135 codex P2: serialize cwd-mutating tests in this module.
-        let _cwd_guard = cwd_mutating_test_guard();
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let cwd_before = env::current_dir().expect("cwd");
-        env::set_current_dir(temp.path()).expect("chdir tmp");
-        let octos_dir = temp.path().join(".octos");
-        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
-        std::fs::write(
-            octos_dir.join("loop.md"),
-            "scheduled project maintenance steps\n",
-        )
-        .expect("write loop.md");
-
-        let orchestrator = InProcessAgentOrchestrator::default();
-        let session_id = SessionKey::with_profile("tenant-a", "api", "sched-loop-maint");
-        let created = orchestrator
-            .create_loop(LoopCreateRequest {
-                session_id: session_id.clone(),
-                profile_id: "tenant-a".into(),
-                prompt: None,
-                command: None,
-                interval_seconds: None,
-                mode: Some("maintenance".into()),
-            })
-            .expect("create maintenance loop");
-        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
-
-        // Force the scheduled-due path: stamp a past `next_run_at_ms`
-        // and tick the scheduler. `fire_now` is NOT involved here.
-        {
-            let mut state = orchestrator.state();
-            let loop_record = state.loops.get_mut(&loop_id).expect("loop record");
-            loop_record.next_run_at_ms = Some(now_ms() - 1);
-        }
-        let ticked = orchestrator.tick_due_loops_for_session(
-            &session_id,
-            "tenant-a",
-            MasterContinuationRuntimeState::idle(),
-        );
-        assert_eq!(ticked, 1, "scheduled maintenance loop should enqueue");
-
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &session_id,
-            "tenant-a",
-            MasterContinuationRuntimeState::idle(),
-            usize::MAX,
-        );
-        env::set_current_dir(&cwd_before).expect("restore cwd");
-        assert_eq!(drained.len(), 1);
-        let prompt_meta = drained[0]
-            .metadata
-            .get("prompt")
-            .cloned()
-            .expect("prompt metadata");
-        assert_eq!(
-            prompt_meta.trim(),
-            "scheduled project maintenance steps",
-            "scheduled maintenance prompt must be resolved from .octos/loop.md (#1135)"
-        );
-        let source = drained[0]
-            .metadata
-            .get("prompt_source")
-            .cloned()
-            .expect("prompt_source metadata");
-        assert_eq!(
-            source, "project",
-            "scheduled fire must carry the resolved MaintenancePromptSource label (#1135)"
-        );
-    }
-
-    #[test]
     fn parse_self_paced_next_delay_recognizes_sentinel_and_falls_back_to_default() {
         // The model emits a sentinel like `<<loop-next-in: 90s>>` after a
         // self-paced fire. The parser extracts the delay; absence yields
@@ -31007,6 +31649,7 @@ mod tests {
             rate_window_count: 0,
             wrap_up_emitted: false,
             consecutive_failed_turns: 0,
+            no_progress_turns: 0,
             fleet_id: None,
             controller_workspace_root: None,
             controller_workspace_has_runtime_hint: None,
@@ -32559,6 +33202,232 @@ mod tests {
         assert!(
             notes.contains("EXPIRED"),
             "note explains the expiry: {notes}"
+        );
+    }
+
+    // ---- #20c — dual-goal main-tree sovereignty install/scan wiring --------
+    //
+    // 20b's shell-side unit tests (octos-agent) prove `tree_sovereignty_denial`
+    // on a HAND-BUILT context; these tests prove the octos-cli side: the
+    // provider installed by `install_main_tree_sovereignty` READS the real
+    // ledger state — `scan_main_tree_owner` enumerates MULTIPLE goals'
+    // ledgers to find the owner, the owner claim rides the branch read, and
+    // the denied/allowed decision falls out of the INSTALLED provider, not a
+    // fixture-shaped stand-in.
+    //
+    // The provider slot is process-global and shared with a running profile
+    // runtime, so each install-test holds this lock for its whole body and
+    // clears the slot on drop (poisoning-safe, like the cwd lock above).
+    static SOVEREIGNTY_PROVIDER_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn sovereignty_provider_guard() -> std::sync::MutexGuard<'static, ()> {
+        SOVEREIGNTY_PROVIDER_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    struct SovereigntyProviderCleanup;
+    impl Drop for SovereigntyProviderCleanup {
+        fn drop(&mut self) {
+            octos_agent::tools::shell::set_main_tree_sovereignty_provider(None);
+        }
+    }
+
+    /// #20c — a real git repo with its HEAD moved to a non-default branch, so
+    /// the installed provider's branch read reports `feat/goal-01-stream`.
+    fn init_repo_on_branch(root: &std::path::Path, branch: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(root)
+                    .args(args)
+                    .status()
+                    .unwrap_or_else(|_| panic!("git {args:?}"))
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "octos-test"]);
+        run(&["config", "user.email", "octos-test@example.invalid"]);
+        std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        run(&["checkout", "-q", "-b", branch]);
+    }
+
+    /// #20c — the installed provider scans MULTIPLE goals' ledgers for the
+    /// owner (goal_01's claim is recorded in goal_01's OWN ledger; goal_02's
+    /// ledger must not hide it), claims first-writer-wins for the caller when
+    /// the tree sits on a non-default branch, and — through the REAL denial
+    /// predicate fed by the INSTALLED provider — refuses goal_02's cross-goal
+    /// checkout while goal_01 (the owner) passes through.
+    /// ###27-B1 — CONTROLLED-timestamp contract pins for the multi-ledger
+    /// sovereignty scan (#34c): the scan must pick the EARLIEST claim, and a
+    /// same-millisecond tie must resolve by goal-id lexicographic order.
+    /// Both use DIRECT kv_put timestamps (not two `now()` calls, which race
+    /// the wall clock and pin nothing).
+    #[test]
+    fn sovereignty_scan_picks_earliest_claim_over_lexicographic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let ledger_dir = profile_data_dir.join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let orchestrator = default_agent_orchestrator();
+
+        // goal_99 claims FIRST (earlier timestamp); goal_01 claims later.
+        // Lexicographic order would pick goal_01 — the timestamp must win.
+        let ledger_99 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_99.db")).unwrap();
+        ledger_99.claim_main_tree_owner("goal_99", 1_000).unwrap();
+        let ledger_01 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_01.db")).unwrap();
+        ledger_01.claim_main_tree_owner("goal_01", 2_000).unwrap();
+
+        assert_eq!(
+            orchestrator
+                .scan_main_tree_owner(&profile_data_dir)
+                .as_deref(),
+            Some("goal_99"),
+            "earlier claim wins over lexicographic goal-id order"
+        );
+    }
+
+    #[test]
+    fn sovereignty_scan_same_millisecond_tie_breaks_by_goal_id_lex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let ledger_dir = profile_data_dir.join("goal-ledgers");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let orchestrator = default_agent_orchestrator();
+
+        // Same millisecond: the tiebreak is goal-id lexicographic (documented
+        // in scan_main_tree_owner), so goal_02 beats goal_10 ("goal_02" <
+        // "goal_10" as STRINGS — the numeric reading would pick 02 anyway;
+        // inverted pair below pins the string order explicitly).
+        let ledger_10 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_10.db")).unwrap();
+        ledger_10.claim_main_tree_owner("goal_10", 5_000).unwrap();
+        let ledger_2 = octos_fleet::GoalLedger::open(ledger_dir.join("goal_02.db")).unwrap();
+        ledger_2.claim_main_tree_owner("goal_02", 5_000).unwrap();
+
+        assert_eq!(
+            orchestrator
+                .scan_main_tree_owner(&profile_data_dir)
+                .as_deref(),
+            Some("goal_02"),
+            "same-ms tie resolves by goal-id lexicographic (goal_02 < goal_10)"
+        );
+    }
+
+    #[test]
+    fn dual_goal_sovereignty_provider_scan_claim_and_denial() {
+        let _serial = sovereignty_provider_guard();
+        let _cleanup = SovereigntyProviderCleanup;
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let main_tree = tmp.path().join("main-tree");
+        init_repo_on_branch(&main_tree, "feat/goal-01-stream");
+        std::fs::create_dir_all(&profile_data_dir).unwrap();
+
+        InProcessAgentOrchestrator::install_main_tree_sovereignty(
+            profile_data_dir.clone(),
+            main_tree.clone(),
+        );
+
+        // goal_01 — bound caller on a non-default branch — is CLAIMED as the
+        // owner by the provider itself (the "first goal to branch the tree"
+        // rule), and sees that claim echoed in its context.
+        let provider = octos_agent::tools::shell::main_tree_sovereignty_provider()
+            .expect("provider installed");
+        let goal_01_ctx = provider(Some("goal_01")).expect("context returned");
+        assert_eq!(
+            goal_01_ctx.main_tree_branch.as_deref(),
+            Some("feat/goal-01-stream"),
+            "live branch read of the main tree"
+        );
+        assert_eq!(goal_01_ctx.main_tree_root, main_tree);
+        assert_eq!(
+            goal_01_ctx.owner_goal_id.as_deref(),
+            Some("goal_01"),
+            "provider claims the bound caller on a non-default branch"
+        );
+        assert_eq!(goal_01_ctx.caller_goal_id.as_deref(), Some("goal_01"));
+
+        // goal_02's ledger ALSO exists (a second active goal with its own
+        // ledger file): the owner scan must enumerate PAST it to goal_01's
+        // ledger and still find goal_01 — goal_02's claim attempt is ignored
+        // first-writer-wins, and goal_02's context names goal_01 as owner.
+        let orchestrator = default_agent_orchestrator();
+        orchestrator.claim_main_tree_owner(&profile_data_dir, "goal_02");
+        assert_eq!(
+            orchestrator
+                .scan_main_tree_owner(&profile_data_dir)
+                .as_deref(),
+            Some("goal_01"),
+            "multi-ledger scan finds the first-writer-wins owner"
+        );
+        let goal_02_ctx = provider(Some("goal_02")).expect("context returned");
+        assert_eq!(goal_02_ctx.owner_goal_id.as_deref(), Some("goal_01"));
+        assert_eq!(goal_02_ctx.caller_goal_id.as_deref(), Some("goal_02"));
+
+        // The REAL denial predicate on the INSTALLED provider's contexts:
+        // goal_02's cross-goal checkout is refused with the fence hint…
+        let denial = octos_agent::tools::shell::tree_sovereignty_denial(
+            "git checkout feat/goal-02-stream",
+            &main_tree,
+            &goal_02_ctx,
+        )
+        .expect("cross-goal checkout refused");
+        assert!(
+            denial.contains("owned by goal 'goal_01'") && denial.contains("fence yourself"),
+            "denial names the owner and the hint: {denial}"
+        );
+        // …while goal_01's own checkout of the same target passes through.
+        assert!(
+            octos_agent::tools::shell::tree_sovereignty_denial(
+                "git checkout feat/goal-02-stream",
+                &main_tree,
+                &goal_01_ctx,
+            )
+            .is_none(),
+            "the owner goal is never blocked on its own tree"
+        );
+    }
+
+    /// #20c — fail-open solo path through the INSTALLED provider: a main
+    /// tree on the DEFAULT branch with no recorded owner yields a context
+    /// with `owner_goal_id: None`, and the denial predicate never blocks —
+    //  the single-goal / solo-CLI default 20b must not regress.
+    #[test]
+    fn sovereignty_provider_fail_open_when_unowned_default_branch() {
+        let _serial = sovereignty_provider_guard();
+        let _cleanup = SovereigntyProviderCleanup;
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let main_tree = tmp.path().join("main-tree");
+        init_repo_on_branch(&main_tree, "main");
+        std::fs::create_dir_all(&profile_data_dir).unwrap();
+
+        InProcessAgentOrchestrator::install_main_tree_sovereignty(
+            profile_data_dir.clone(),
+            main_tree.clone(),
+        );
+        let provider = octos_agent::tools::shell::main_tree_sovereignty_provider()
+            .expect("provider installed");
+        let ctx = provider(Some("goal_01")).expect("context returned");
+        assert_eq!(ctx.main_tree_branch.as_deref(), Some("main"));
+        assert_eq!(
+            ctx.owner_goal_id, None,
+            "no non-default branch → no claim → no owner"
+        );
+        assert!(
+            octos_agent::tools::shell::tree_sovereignty_denial(
+                "git checkout feat/anything",
+                &main_tree,
+                &ctx,
+            )
+            .is_none(),
+            "no owner → never block, even for a branch switch"
         );
     }
 }

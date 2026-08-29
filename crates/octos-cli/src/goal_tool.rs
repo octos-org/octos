@@ -1986,6 +1986,113 @@ impl Tool for MonitorDeleteTool {
 mod tests {
     use super::*;
 
+    /// #24 — REAL-machine capture of the goal-completion verifier call against
+    /// the LIVE main provider (k3 / moonshot-coding), to locate the true layer
+    /// of the "empty verifier return" (#23 symptom). Prints verdict + usage +
+    /// whether the call errored. Run with the main credential in env:
+    ///   KIMI_API_KEY=… cargo test -p octos-cli --lib --features api -- \
+    ///     --ignored --exact goal_tool::tests::capture_live_verifier_call
+    #[tokio::test]
+    #[ignore = "real k3 network call; run explicitly with KIMI_API_KEY in env"]
+    async fn capture_live_verifier_call() {
+        let key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY required");
+        // Build the LIVE main-lane provider exactly as the profile does.
+        let mut config = crate::config::Config {
+            provider: Some("moonshot-coding".to_owned()),
+            api_key_env: Some("KIMI_API_KEY".to_owned()),
+            ..Default::default()
+        };
+        config.env_vars.insert("KIMI_API_KEY".to_owned(), key);
+        let provider = crate::commands::chat::create_provider_with_api_type(
+            "moonshot-coding",
+            &config,
+            Some("k3".to_owned()),
+            Some("https://api.kimi.com/coding/v1".to_owned()),
+            Some("openai"),
+        )
+        .expect("build live k3 provider");
+
+        let (verdict, usage) =
+            crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
+                provider,
+                "Write the number 42 to a file.",
+                "I wrote 42 to /tmp/answer.txt and verified it with cat.",
+            )
+            .await;
+        let is_done = verdict.is_done();
+        let reason = match &verdict {
+            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone { reason } => {
+                reason.clone()
+            }
+            _ => "<done>".to_owned(),
+        };
+        eprintln!(
+            "VERIFIER-LIVE is_done={is_done} reason={reason:?} usage_in={} usage_out={}",
+            usage.input_tokens, usage.output_tokens
+        );
+        // The live verifier returns a NON-EMPTY verdict — this proves the
+        // verifier layer is healthy and the k3 main lane answers the judge
+        // prompt with real content + billed usage. (Whether DONE or NOT_DONE
+        // is the model's judgment; the #23 "empty return" bug is an EMPTY
+        // reason, which a healthy call never produces.)
+        assert!(
+            !reason.is_empty(),
+            "a healthy verifier call must produce a non-empty verdict reason"
+        );
+        assert!(usage.output_tokens > 0, "verifier must bill output tokens");
+    }
+
+    /// #24 — reproduce the EXACT #23 empty-return: a long, ledger-folded
+    /// evidence blob like the real goal_update sends. Captures whether the
+    /// verdict reason comes back EMPTY (the actual symptom).
+    #[tokio::test]
+    #[ignore = "real k3 network call; run explicitly with KIMI_API_KEY in env"]
+    async fn capture_live_verifier_call_long_evidence() {
+        let key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY required");
+        let mut config = crate::config::Config {
+            provider: Some("moonshot-coding".to_owned()),
+            api_key_env: Some("KIMI_API_KEY".to_owned()),
+            ..Default::default()
+        };
+        config.env_vars.insert("KIMI_API_KEY".to_owned(), key);
+        let provider = crate::commands::chat::create_provider_with_api_type(
+            "moonshot-coding",
+            &config,
+            Some("k3".to_owned()),
+            Some("https://api.kimi.com/coding/v1".to_owned()),
+            Some("openai"),
+        )
+        .expect("build live k3 provider");
+
+        // A long, realistic evidence blob mimicking a real goal_update reason.
+        let long_evidence = format!(
+            "#19 已由外环(claude)隔离终验采认收官。{}\n\n{}",
+            "四切片实证齐全。".repeat(40),
+            "1. [peer:s2] (finding) zai lane done\n2. [peer:s4] (finding) docs done\n".repeat(20)
+        );
+        let (verdict, usage) =
+            crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
+                provider,
+                "#19 goal peer 多模型能力 + zai GLM 5.2 接入。切片 S1-S4。",
+                &long_evidence,
+            )
+            .await;
+        let reason = match &verdict {
+            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone { reason } => {
+                reason.clone()
+            }
+            _ => "<done>".to_owned(),
+        };
+        eprintln!(
+            "VERIFIER-LONG is_done={} reason_len={} reason={reason:?} usage_in={} usage_out={}",
+            verdict.is_done(),
+            reason.len(),
+            usage.input_tokens,
+            usage.output_tokens
+        );
+        eprintln!("VERIFIER-LONG-EMPTY-REASON={}", reason.is_empty());
+    }
+
     /// #1935 — a call-counting scripted provider for verifier-lane routing
     /// assertions: replies with a fixed verdict line and fixed token usage.
     struct CountingVerifierProvider {

@@ -30,6 +30,7 @@ use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, FileAccessMode, Fil
 use crate::sandbox::Sandbox;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::{RelaunchOpts, TaskRelaunchError, TaskStatus};
+use crate::tools::policy::BashFileWrites;
 
 const MAX_EXEC_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
@@ -65,6 +66,85 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
     let cap = max_bytes.max(256);
     octos_core::truncate_utf8(&mut output, cap, "\n... (output truncated)");
     output
+}
+
+/// #28c-r1 — resolve the RECEIPT SNAPSHOT ROOT from the command text.
+///
+/// Coding sessions habitually run `cd <target> && <mutate>` with the tool
+/// workdir left at the session workspace root; a receipt snapshotted at the
+/// root then reports `files_changed: 0` for a real write inside the target
+/// — a FALSE phantom signal, worse than no receipt (outer-loop live
+/// verdict, w4). Ruling implementation:
+///   * a SINGLE leading `cd <literal-path> && ...` prefix (one token, no
+///     `$`/backtick/whitespace, optional matching quotes, `~` expanded)
+///     makes that path the snapshot root (`scope: cd-target`);
+///   * anything ambiguous — no cd prefix, cd without `&&`, `;` chains,
+///     variable paths — falls back to the session workdir
+///     (`scope: workdir`), matching the pre-r1 behavior.
+///
+/// #34g-D — the platform home directory (`HOME` on Unix, `USERPROFILE`
+/// fallback on Windows where `HOME` is typically unset). The 34g ruling:
+/// the resolver's tilde expansion must not be Unix-only in a resolver that
+/// otherwise has no POSIX dependency.
+fn platform_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn receipt_scope_root(workdir: &Path, command: &str) -> (PathBuf, &'static str) {
+    let fallback = || (workdir.to_path_buf(), "workdir");
+    let trimmed = command.trim_start();
+    let Some(rest) = trimmed.strip_prefix("cd ") else {
+        return fallback();
+    };
+    let Some((target, _tail)) = rest.split_once("&&") else {
+        return fallback();
+    };
+    let target = target.trim();
+    if target.is_empty() || target.contains(';') {
+        return fallback();
+    }
+    let literal = if target.len() >= 2 {
+        let bytes = target.as_bytes();
+        let (first, last) = (bytes[0], bytes[target.len() - 1]);
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            &target[1..target.len() - 1]
+        } else {
+            target
+        }
+    } else {
+        target
+    };
+    if literal.is_empty()
+        || literal.contains('$')
+        || literal.contains('`')
+        || literal.contains(' ')
+        || literal.contains('\\')
+        || literal.starts_with('-')
+    {
+        return fallback();
+    }
+    let path = if literal == "~" {
+        match platform_home() {
+            Some(home) => home,
+            None => return fallback(),
+        }
+    } else if let Some(sub) = literal.strip_prefix("~/") {
+        match platform_home() {
+            Some(home) => Path::new(&home).join(sub),
+            None => return fallback(),
+        }
+    } else {
+        Path::new(literal).to_path_buf()
+    };
+    let root = if path.is_absolute() {
+        path
+    } else {
+        workdir.join(path)
+    };
+    (root, "cd-target")
 }
 
 use crate::sandbox::sandbox_denial_hint;
@@ -252,6 +332,9 @@ struct ExecCommandInput {
 }
 
 pub struct ExecCommandTool {
+    /// #28d — bash file-writes knob (shared judge/escape-hatch; see
+    /// `super::shell`), loaded ONCE at construction.
+    bash_file_writes: BashFileWrites,
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
     policy: Arc<dyn CommandPolicy>,
@@ -267,7 +350,14 @@ impl ExecCommandTool {
             policy: Arc::new(crate::policy::SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
             sandbox,
+            bash_file_writes: BashFileWrites::default(),
         }
+    }
+
+    /// #28d — set the bash file-writes knob (defaults to `allow`).
+    pub fn with_bash_file_writes(mut self, mode: BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
     }
 
     pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
@@ -374,6 +464,35 @@ impl ExecCommandTool {
             .timeout_secs
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
+        // #28d — deny knob on the CODING bash path: same heuristic judge
+        // and escape hatch as ShellTool (single shared implementation in
+        // `super::shell`), loaded at construction. A refusal happens BEFORE
+        // any spawn/approval/snapshot.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a \
+                         file-writing shell command). Use the edit_file / diff_edit tools for \
+                         code changes instead. If this refusal is a false positive, append the \
+                         comment `# octos:allow-write` to the command line to run it \
+                         explicitly. Command: "
+                    .to_owned()
+                    + &command,
+                success: false,
+                ..Default::default()
+            });
+        }
+        // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
+        // prefix (the coding-session idiom) makes X the root; otherwise the
+        // session workdir. Prevents the false `files_changed: 0` on writes
+        // outside the workspace root (outer-loop live verdict).
+        let (snapshot_root, receipt_scope) = receipt_scope_root(&cwd, &command);
+        // #28c — BEFORE snapshot for the file-change receipt, reusing the
+        // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
+        // omits the receipt.
+        let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Put the child in its own process group so the timeout path can
@@ -421,6 +540,26 @@ impl ExecCommandTool {
                     "\n\nExit code: {}",
                     output.status.code().unwrap_or(-1)
                 ));
+                // #28c — file-change receipt on the coding-session exec
+                // path too (same shared 28a module; same five acceptance
+                // semantics as ShellTool / BashTool).
+                if let Some(receipt) = super::shell::diff_to_receipt(
+                    dirty_before,
+                    super::shell::snapshot_dirty_paths(&snapshot_root),
+                ) {
+                    text.push_str(&receipt);
+                    text.push_str(&format!("\nscope: {receipt_scope}"));
+                    // #28d — warn knob: nudge ONLY when files actually
+                    // changed (same after-snapshot as the receipt; no
+                    // second scan). Zero behavior under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
+                }
                 // Scan BEFORE truncation (the denial line may be what gets
                 // cut), append AFTER (so the hint itself survives the cut).
                 let hint =
@@ -1734,6 +1873,10 @@ pub struct BashTool {
     policy: Arc<dyn CommandPolicy>,
     approval_policy: ApprovalPolicy,
     sandbox: Arc<dyn Sandbox>,
+    /// #28d — the bash-file-writes knob, loaded ONCE at construction from
+    /// the session's ToolPolicy (never re-read per call). Shared
+    /// judge/escape-hatch with ShellTool — see `super::shell`.
+    bash_file_writes: BashFileWrites,
 }
 
 impl BashTool {
@@ -1744,9 +1887,15 @@ impl BashTool {
             policy: Arc::new(crate::policy::SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
             sandbox,
+            bash_file_writes: BashFileWrites::default(),
         }
     }
 
+    /// #28d — set the bash file-writes knob (defaults to `allow`).
+    pub fn with_bash_file_writes(mut self, mode: BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
+    }
     pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
         self.filesystem_scope = filesystem_scope;
         self
@@ -1767,6 +1916,10 @@ impl BashTool {
 impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn description(&self) -> &str {
@@ -1849,6 +2002,36 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
             .clamp(1, MAX_BASH_TIMEOUT_SECS);
 
+        // #28d — deny knob on the CODING bash path: same heuristic judge
+        // and escape hatch as ShellTool (single shared implementation in
+        // `super::shell`), loaded at construction. A refusal happens BEFORE
+        // any spawn/snapshot.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a \
+                         file-writing shell command). Use the edit_file / diff_edit tools for \
+                         code changes instead. If this refusal is a false positive, append the \
+                         comment `# octos:allow-write` to the command line to run it \
+                         explicitly. Command: "
+                    .to_owned()
+                    + &command,
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
+        // prefix (the coding-session idiom) makes X the root; otherwise the
+        // session workdir. Prevents the false `files_changed: 0` on writes
+        // outside the workspace root (outer-loop live verdict).
+        let (snapshot_root, receipt_scope) = receipt_scope_root(&cwd, &command);
+        // #28c — BEFORE snapshot for the file-change receipt, reusing the
+        // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
+        // omits the receipt.
+        let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // codex review (#1172) P2 (follow-up): put the child in its own
@@ -1901,6 +2084,27 @@ impl Tool for BashTool {
                 }
                 let exit_code = output.status.code().unwrap_or(-1);
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
+                // #28c — file-change receipt appended ONCE to THIS result's
+                // tail (28a semantics: prompt-cache stable, never a system
+                // prompt / history rewrite). Non-git fail-open ⇒ None ⇒
+                // omitted (acceptance ④ of the 28a set).
+                if let Some(receipt) = super::shell::diff_to_receipt(
+                    dirty_before,
+                    super::shell::snapshot_dirty_paths(&snapshot_root),
+                ) {
+                    text.push_str(&receipt);
+                    text.push_str(&format!("\nscope: {receipt_scope}"));
+                    // #28d — warn knob: nudge ONLY when files actually
+                    // changed (same after-snapshot as the receipt; no
+                    // second scan). Zero behavior under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
+                }
                 // Scan BEFORE truncation, append AFTER — see run_to_completion.
                 let hint =
                     sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);

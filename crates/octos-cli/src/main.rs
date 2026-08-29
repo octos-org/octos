@@ -23,9 +23,52 @@ fn should_enable_console_logs(has_rolling_file_logs: bool, interactive: bool) ->
     !has_rolling_file_logs || interactive
 }
 
+/// Write a panic report to any `io::Write` without panicking on BrokenPipe.
+///
+/// Extracted as a standalone function so unit tests can inject writers that
+/// return `ErrorKind::BrokenPipe` or other I/O errors.
+pub fn write_panic_report(w: &mut impl std::io::Write, msg: &str) {
+    match w
+        .write_all(msg.as_bytes())
+        .and_then(|()| w.write_all(b"\n"))
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            // Observer left — nothing to report to, just continue.
+        }
+        Err(_) => {
+            // Other I/O error — nothing more we can do.
+        }
+    }
+}
+
+/// Install the production error hooks: color-eyre EyreHook plus a panic
+/// hook whose stderr write goes through [`write_panic_report`] (fallible,
+/// BrokenPipe-swallowing). Shared by `main` and the `--test-panic` harness
+/// entry so integration tests exercise the REAL production hook path.
+pub fn install_error_hooks() -> color_eyre::Result<()> {
+    let (panic_hook, eyre_hook) = color_eyre::config::HookBuilder::default().into_hooks();
+    eyre_hook.install()?;
+    std::panic::set_hook(Box::new(move |pi| {
+        let report = panic_hook.panic_report(pi);
+        let msg = format!("{report}");
+        let mut err = std::io::stderr().lock();
+        write_panic_report(&mut err, &msg);
+    }));
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    // Initialize error handling
-    color_eyre::install()?;
+    install_error_hooks()?;
+
+    // Hidden chaos-test switch (outer-loop blueprint step ②): when
+    // OCTOS_TEST_PANIC_AFTER_BOOT=1, panic immediately AFTER the production
+    // hooks are installed. Integration tests use this to drive the REAL
+    // production panic-hook path under a broken-pipe stderr and assert no
+    // second panic / no SIGABRT. Never set in normal operation.
+    if std::env::var("OCTOS_TEST_PANIC_AFTER_BOOT").as_deref() == Ok("1") {
+        panic!("__test_panic__: intentional panic for production hook verification");
+    }
 
     // Parse into ArgMatches first (this preserves clap's --help/--version/error
     // handling exactly as `Args::parse()` did), materialize the typed Args, then
@@ -172,7 +215,36 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::should_enable_console_logs;
+    use super::*;
+
+    struct BrokenPipeWriter;
+
+    impl std::io::Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pipe closed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_panic_report_broken_pipe_no_panic() {
+        let mut w = BrokenPipeWriter;
+        write_panic_report(&mut w, "panic message");
+        // If we reach here, no panic occurred — test passes.
+    }
+
+    #[test]
+    fn write_panic_report_normal_writer_outputs() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_panic_report(&mut buf, "panic message");
+        assert!(!buf.is_empty());
+        assert!(buf.ends_with(b"\n"));
+    }
 
     #[test]
     fn interactive_tty_with_file_logs_still_gets_console() {

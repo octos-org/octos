@@ -735,6 +735,21 @@ impl ProfileRuntime {
         ));
         let skills_dir_candidate = self.data_dir.join("skills");
 
+        // #20b — install the main-tree sovereignty provider for the shell
+        // tool. The main tree is the process working directory (the tree the
+        // serve/master was launched from); the closure re-reads its branch and
+        // the caller goal's ledger per command, fail-open when solo/unowned.
+        // Process-global: the LAST profile to bootstrap wins the shared slot,
+        // which is correct for the single-profile serve/master loop this
+        // guards; multi-profile hosts re-install the same rule with their own
+        // data dir.
+        if let Ok(cwd) = std::env::current_dir() {
+            crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::install_main_tree_sovereignty(
+                self.data_dir.clone(),
+                cwd,
+            );
+        }
+
         Ok(Arc::new(Self {
             profile_id: self.profile_id.clone(),
             data_dir: self.data_dir.clone(),

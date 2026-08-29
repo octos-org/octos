@@ -21,6 +21,8 @@ Export at least one LLM provider key:
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+Other providers follow the same pattern — e.g. `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, or `ZAI_API_KEY` for Z.AI (GLM); the full optional list lives in [Configuration → Environment Variables](./configuration.md#llm-providers).
+
 Add this to your `~/.bashrc` or `~/.zshrc` for persistence. You can also use `octos auth login --provider openai` for OAuth-based login.
 
 ## 3. Check Setup

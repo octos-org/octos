@@ -18,6 +18,7 @@ use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::TaskSupervisor;
+use crate::tools::policy::BashFileWrites;
 
 /// Monotonic sequence used to synthesise a `tool_call_id` for background shell
 /// tasks when the caller did not thread one through `ToolContext` (e.g. the
@@ -33,6 +34,8 @@ pub struct ShellTool {
     cwd: std::path::PathBuf,
     /// Policy for command approval.
     policy: Arc<dyn CommandPolicy>,
+    /// #28b — loaded ONCE at construction (never re-read per call).
+    bash_file_writes: crate::tools::policy::BashFileWrites,
     /// Runtime approval behavior for commands that request approval.
     approval_policy: ApprovalPolicy,
     /// Sandbox for command isolation.
@@ -73,6 +76,7 @@ impl ShellTool {
             timeout: Duration::from_secs(120),
             cwd: cwd.into(),
             policy: Arc::new(SafePolicy::default()),
+            bash_file_writes: BashFileWrites::default(),
             approval_policy: ApprovalPolicy::Ask,
             sandbox: Arc::new(NoSandbox),
             task_supervisor: None,
@@ -115,6 +119,12 @@ impl ShellTool {
     }
 
     /// Set a custom command policy.
+    /// #28b — set the bash file-writes knob (defaults to `Allow`).
+    pub fn with_bash_file_writes(mut self, mode: crate::tools::policy::BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
+    }
+
     pub fn with_policy(mut self, policy: Arc<dyn CommandPolicy>) -> Self {
         self.policy = policy;
         self
@@ -390,6 +400,215 @@ fn contains_git_invocation(command: &str) -> bool {
     shell_command_segments(command)
         .iter()
         .any(|segment| segment_invokes_git(segment))
+}
+
+// ---------------------------------------------------------------------------
+// #20b — main-tree sovereignty (树主权) checkout guard.
+//
+// The git TOOL is read-only; a branch switch on the MAIN TREE can only arrive
+// through this shell tool. When the main tree (the session's workspace root)
+// is owned by a goal — the first goal to land a non-default branch on it,
+// recorded durably in that goal's ledger by the host via the provider below —
+// a `git checkout` / `git switch` that would move the main tree's HEAD to a
+// DIFFERENT branch, issued by any session that does not belong to the owner
+// goal, is REFUSED with a "fence yourself" hint instead of silently switching.
+//
+// Scope discipline:
+//   - Only fires when the command's effective cwd IS the main tree root —
+//     checkouts inside a fenced peer clone (`peers/<slug>/wt`) pass through.
+//   - Read-only git invocations (status/diff/log/…), plain `git init`, and
+//     pathspec restores (`git checkout -- file`, `git checkout <file-that-
+//     exists>`) never match the HEAD-moving detector.
+//   - Fail-open: no provider wired (solo CLI, tests, hosts that never opted
+//     in), unknown current branch (non-git dir, detached HEAD read failure),
+//     or no recorded owner → the guard stays out of the way.
+// ---------------------------------------------------------------------------
+
+/// Snapshot the host hands the shell tool for the #20b sovereignty decision.
+#[derive(Debug, Clone)]
+pub struct MainTreeSovereigntyContext {
+    /// Canonical main-tree (workspace) root the guard protects.
+    pub main_tree_root: PathBuf,
+    /// The main tree's CURRENT branch; `None` = unknown (non-git / detached /
+    /// read failure) → fail open.
+    pub main_tree_branch: Option<String>,
+    /// Goal that owns the main tree (first goal to branch it off trunk);
+    /// `None` = no owner → never block.
+    pub owner_goal_id: Option<String>,
+    /// Goal the CALLING session belongs to (`ToolContext::goal_id`).
+    pub caller_goal_id: Option<String>,
+}
+
+/// #20b — the boxed sovereignty-provider closure type, extracted so neither
+/// the `static` slot nor the setter signature trips `clippy::type_complexity`.
+/// Called once per shell execution with the calling session's goal id;
+/// returns `None` to disable the guard.
+pub type MainTreeSovereigntyProvider =
+    Arc<dyn Fn(Option<&str>) -> Option<MainTreeSovereigntyContext> + Send + Sync>;
+
+/// Host-wired provider for the #20b guard. Called once per shell execution
+/// with the calling session's goal id; returns `None` to disable the guard
+/// entirely (default). Wired by the serve/runtime layer (octos-cli) where the
+/// profile data dir and workspace root are known; process-global because tool
+/// construction sites vastly outnumber the single boot that knows both paths.
+static MAIN_TREE_SOVEREIGNTY_PROVIDER: std::sync::RwLock<Option<MainTreeSovereigntyProvider>> =
+    std::sync::RwLock::new(None);
+
+/// Install (or clear, with `None`) the #20b main-tree sovereignty provider.
+pub fn set_main_tree_sovereignty_provider(provider: Option<MainTreeSovereigntyProvider>) {
+    let mut slot = MAIN_TREE_SOVEREIGNTY_PROVIDER
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = provider;
+}
+
+/// Snapshot the currently-installed #20b sovereignty provider, if any. The
+/// shell tool itself reads the slot on the execution path; this accessor
+/// exists for host-side wiring tests (octos-cli #20c) that must invoke the
+/// INSTALLED provider — not a re-implemented closure — to prove the
+/// scan/claim/deny wiring end to end.
+pub fn main_tree_sovereignty_provider() -> Option<MainTreeSovereigntyProvider> {
+    MAIN_TREE_SOVEREIGNTY_PROVIDER
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// The HEAD-moving target of a `git checkout` / `git switch` segment:
+/// `Some(Some(branch))` switches to / creates `branch`, `Some(None)` is a
+/// HEAD-moving form with no branch target we can name (treated as
+/// switching), and `None` is anything else (read-only, pathspec restore,
+/// non-checkout git). Reused segment tokenizer honours quotes/`;`/`&&`/`|`.
+fn git_head_move_target(segment: &[String], cwd: &Path) -> Option<Option<String>> {
+    let mut i = 0;
+    // Walk to the `git` token, skipping env assignments and wrappers exactly
+    // like `segment_invokes_git`.
+    loop {
+        let token = segment.get(i)?;
+        if token_invokes_git(token) {
+            i += 1;
+            break;
+        }
+        if looks_like_env_assignment(token) {
+            i += 1;
+            continue;
+        }
+        if is_git_invocation_wrapper(token) {
+            i += 1;
+            while segment
+                .get(i)
+                .is_some_and(|w| w.starts_with('-') || looks_like_env_assignment(w))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        return None;
+    }
+    // Skip git global options; `-C <path>` / `-c <kv>` consume a value.
+    while let Some(token) = segment.get(i) {
+        match token.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" => i += 2,
+            _ if token.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    let sub = segment.get(i)?;
+    let is_checkout = sub.eq_ignore_ascii_case("checkout");
+    let is_switch = sub.eq_ignore_ascii_case("switch");
+    if !is_checkout && !is_switch {
+        return None;
+    }
+    i += 1;
+    let mut positional: Option<&str> = None;
+    let mut after_ddash = false;
+    while let Some(token) = segment.get(i) {
+        if after_ddash {
+            // Everything after `--` is pathspec — restoring files, never a
+            // HEAD move (for the forms we intercept).
+            return None;
+        }
+        match token.as_str() {
+            "--" => after_ddash = true,
+            // Branch-creating forms: HEAD moves to the NEW branch.
+            "-b" | "-B" | "-c" | "-C" | "--orphan" => {
+                let name = segment.get(i + 1);
+                return Some(name.map(|s| s.to_owned()).or(Some(String::new())));
+            }
+            // Value-taking options we must skip over.
+            "--conflict" | "--pathspec-from-file" | "-m" | "--merge" => i += 2,
+            "-d" | "--detach" => {
+                // Detached HEAD: moves HEAD off any branch. The next token is
+                // the ref; a bare detach of the current commit is harmless,
+                // but conservatively treat as a HEAD move with unknown target.
+                return Some(
+                    segment
+                        .get(i + 1)
+                        .map(|s| s.to_owned())
+                        .or(Some(String::new())),
+                );
+            }
+            _ if token.starts_with('-') => i += 1,
+            _ => {
+                positional = Some(token.as_str());
+                break;
+            }
+        }
+        i += 1;
+    }
+    let target = positional?;
+    // `git checkout <path>` (no `--`) is a pathspec restore when the target
+    // exists as a filesystem entry under cwd — git itself prefers the branch
+    // reading, but refusing a file restore would be a false positive on the
+    // common `git checkout some_file` idiom, so only treat as a switch when
+    // no such path exists.
+    if cwd.join(target).exists() {
+        return None;
+    }
+    Some(Some(target.to_owned()))
+}
+
+/// Pure #20b decision: `Some(denial)` when this command must be refused.
+/// `pub` so the octos-cli #20c dual-goal fixture can exercise the real
+/// decision against a real provider-shaped context (cross-goal checkout
+/// refused, owner goal passes through) instead of a re-implemented copy.
+pub fn tree_sovereignty_denial(
+    command: &str,
+    effective_cwd: &Path,
+    ctx: &MainTreeSovereigntyContext,
+) -> Option<String> {
+    // Main-tree scope only: a fenced peer's clone is a DIFFERENT directory.
+    let cwd = octos_core::session_scope::canonicalize_lossy(effective_cwd);
+    let root = octos_core::session_scope::canonicalize_lossy(&ctx.main_tree_root);
+    if cwd != root {
+        return None;
+    }
+    let branch = ctx.main_tree_branch.as_deref()?;
+    let owner = ctx.owner_goal_id.as_deref()?;
+    if ctx.caller_goal_id.as_deref() == Some(owner) {
+        return None;
+    }
+    for segment in shell_command_segments(command) {
+        let Some(target) = git_head_move_target(&segment, effective_cwd) else {
+            continue;
+        };
+        // Switching TO the current branch (or `checkout -b` naming it) is a
+        // no-op on tree state — allow.
+        if target.as_deref() == Some(branch) {
+            continue;
+        }
+        let target_label = target.as_deref().unwrap_or("(detached/unknown)");
+        let caller = ctx.caller_goal_id.as_deref().unwrap_or("(no goal)");
+        return Some(format!(
+            "Command refused by main-tree sovereignty (#20b): the main tree is owned by goal \
+             '{owner}' and currently on branch '{branch}', but this session (goal: {caller}) tried \
+             to switch it to '{target_label}'. The tree was NOT switched. To work on another \
+             branch, fence yourself instead: ask the master to stage a peer (peer_handoff auto-\
+             fences onto a worktree clone under peers/<slug>/wt), or run this work inside your own \
+             worktree — never `git checkout` the shared main tree across branches."
+        ));
+    }
+    None
 }
 
 fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
@@ -698,6 +917,48 @@ impl Tool for ShellTool {
             Some(scope) if scope.workspace() == self.cwd.as_path() => scope.workspace(),
             _ => &self.cwd,
         };
+        // #28b — deny knob: heuristic pre-screen of the command TEXT for
+        // write-shaped shell usage. False negatives are tolerated (the 28a
+        // receipt still shows what actually changed); false positives
+        // escape via a trailing `# octos:allow-write` comment on the
+        // command line (documented escape hatch). The knob was loaded at
+        // construction — no per-call I/O.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !command_allows_write_explicitly(&input.command)
+            && command_looks_like_file_write(&input.command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a file-writing shell command). Use the edit_file / diff_edit tools for code changes instead. If this refusal is a false positive, append the comment `# octos:allow-write` to the command line to run it explicitly. Command: ".to_owned() + &input.command,
+                success: false,
+                ..Default::default()
+            });
+        }
+        // #28a — BEFORE snapshot for the file-change receipt (git-status
+        // level; None on non-git/fail-open omits the receipt entirely).
+        let dirty_before = snapshot_dirty_paths(effective_cwd);
+
+        // #20b — main-tree sovereignty: refuse a cross-branch `git checkout`
+        // / `git switch` on the owned main tree BEFORE policy, approval, or
+        // any execution path (foreground or background). Fail-open when no
+        // provider is wired, no owner is recorded, or the branch is unknown.
+        if let Some(provider) = MAIN_TREE_SOVEREIGNTY_PROVIDER
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            if let Some(sovereignty) = provider(ctx.goal_id.as_deref()) {
+                if let Some(denial) =
+                    tree_sovereignty_denial(&input.command, effective_cwd, &sovereignty)
+                {
+                    tracing::warn!(command = %input.command, "command refused by main-tree sovereignty");
+                    return Ok(ToolResult {
+                        output: format!("{denial}\n\nCommand: {}", input.command),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
 
         // Check policy first
         let decision = self.policy.check(&input.command, effective_cwd);
@@ -892,6 +1153,25 @@ impl Tool for ShellTool {
                     result_text.push_str(hint);
                 }
 
+                // #28a — file-change receipt: AFTER snapshot + diff,
+                // appended ONCE to THIS result's tail (never the system
+                // prompt, never a history rewrite — prompt-cache stable).
+                let receipt = diff_to_receipt(dirty_before, snapshot_dirty_paths(effective_cwd));
+                if let Some(receipt) = receipt.as_deref() {
+                    result_text.push_str(receipt);
+                    // #28b — warn knob: nudge ONLY when files actually
+                    // changed (files_changed > 0), sharing the receipt's
+                    // AFTER snapshot (no second git-status scan). Zero
+                    // behavior change under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        result_text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
+                }
+
                 Ok(ToolResult {
                     output: result_text,
                     success: output.status.success(),
@@ -978,12 +1258,332 @@ mod tests {
     /// Mirrors `spawn_tests::BACKGROUND_DEADLINE`.
     const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
+    // -----------------------------------------------------------------------
+    // #28b — bash_file_writes knob: three positions, escape hatch, and the
+    // zero-difference-under-default guarantee.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bash_file_writes_default_is_allow_and_serializes_round_trip() {
+        // Config round-trip: absent key deserializes to `allow` (zero-diff
+        // default for existing profiles), and all three values survive.
+        #[derive(serde::Deserialize)]
+        struct Cfg {
+            #[serde(default)]
+            bash_file_writes: crate::tools::policy::BashFileWrites,
+        }
+        let absent: Cfg = serde_json::from_str("{}").expect("absent key");
+        assert_eq!(
+            absent.bash_file_writes,
+            crate::tools::policy::BashFileWrites::Allow
+        );
+        for (raw, want) in [
+            ("allow", crate::tools::policy::BashFileWrites::Allow),
+            ("warn", crate::tools::policy::BashFileWrites::Warn),
+            ("deny", crate::tools::policy::BashFileWrites::Deny),
+        ] {
+            let got: Cfg =
+                serde_json::from_str(&format!("{{\"bash_file_writes\": \"{raw}\"}}")).expect(raw);
+            assert_eq!(got.bash_file_writes, want, "value {raw}");
+        }
+    }
+
+    #[test]
+    fn bash_file_writes_heuristic_matches_write_shapes_only() {
+        for cmd in [
+            "echo hi > /tmp/f",
+            "echo hi >> /tmi/f",
+            "cmd 2> /tmp/f",
+            "cmd &> /tmp/f",
+            "cat <<EOF > f\nhi\nEOF",
+            "printf x | tee /tmp/f",
+            "sed -i s/a/b/ file",
+            "cp a b",
+            "mv a b",
+            "rm file",
+            "mkdir d",
+            "touch f",
+            "truncate -s 0 f",
+            "ln -s a b",
+            "python3 -c 'open(\"f\",\"w\")'",
+            "node -e 'fs.writeFileSync(\"f\",1)'",
+            "dd if=/dev/zero of=f",
+            "git apply p.patch",
+        ] {
+            assert!(command_looks_like_file_write(cmd), "should match: {cmd}");
+        }
+        for cmd in [
+            "ls -la",
+            "cat /etc/hosts",
+            "grep -rn foo crates/",
+            "git status",
+            "git diff --stat",
+            "cargo build -p octos-agent",
+            "cargo test -p octos-agent --lib",
+            "echo hello",
+            "rg --files | head",
+            "sed -n 1,3p file",
+            "python3 --version",
+            "ps aux | grep octos",
+        ] {
+            assert!(
+                !command_looks_like_file_write(cmd),
+                "should NOT match: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_file_writes_escape_hatch_allows_explicit_write() {
+        assert!(command_allows_write_explicitly(
+            "sed -i s/a/b/ file # octos:allow-write"
+        ));
+        assert!(command_allows_write_explicitly(
+            "echo x > /tmp/f # octos:allow-write"
+        ));
+        // Only the LAST line's comment counts as the hatch.
+        assert!(!command_allows_write_explicitly(
+            "# octos:allow-write\nsed -i s/a/b/ file"
+        ));
+        assert!(!command_allows_write_explicitly("sed -i s/a/b/ file"));
+    }
+
+    #[test]
+    fn bash_file_writes_deny_refuses_write_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({
+                "command": "echo hi > /tmp/never-created-28b",
+            })))
+            .expect("execute");
+        assert!(!out.success);
+        assert!(out.output.contains("tool_policy.bash_file_writes=deny"));
+        assert!(out.output.contains("edit_file / diff_edit"));
+        assert!(out.output.contains("# octos:allow-write"));
+        assert!(!std::path::Path::new("/tmp/never-created-28b").exists());
+        std::fs::remove_file("/tmp/never-created-28b").ok();
+    }
+
+    #[test]
+    fn bash_file_writes_deny_lets_readonly_command_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": "echo hello" })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("hello"));
+        assert!(!out.output.contains("bash_file_writes"));
+    }
+
+    #[cfg(unix)]
+    // #34e: POSIX shell spawn semantics (echo > file) — same convention as the coding_tools #34d gates.
+    #[test]
+    fn bash_file_writes_escape_hatch_runs_under_deny() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("hatch.txt");
+        let tool = super::ShellTool::new(temp.path())
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
+        let cmd = format!("echo hatch > {:?} # octos:allow-write", target);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": cmd })))
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(target.exists(), "escape hatch must run the write");
+        std::fs::remove_file(&target).ok();
+    }
+
+    #[test]
+    fn bash_file_writes_allow_is_zero_difference() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path());
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({
+                "command": "echo zero-diff",
+            })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(out.output.contains("zero-diff"));
+        // No warn nudge, no deny text, no policy mention at all.
+        assert!(!out.output.contains("bash_file_writes"));
+        assert!(!out.output.contains("edit_file / diff_edit"));
+    }
+
+    #[cfg(unix)]
+    // #34e: POSIX shell spawn semantics (echo > file) — same convention as the coding_tools #34d gates.
+    #[test]
+    fn bash_file_writes_warn_nudges_only_when_files_changed() {
+        // The 28a receipt requires a git repo (fail-open elsewhere), so run
+        // inside an initialized temp repo.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        let tool = super::ShellTool::new(cwd)
+            .with_bash_file_writes(crate::tools::policy::BashFileWrites::Warn);
+        // Read-only: no nudge (receipt may report files_changed: 0).
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": "echo no-change" })))
+            .expect("execute");
+        assert!(out.success);
+        assert!(
+            !out.output.contains("bash_file_writes=warn"),
+            "output: {}",
+            out.output
+        );
+
+        // Write: receipt present (28a) + nudge appended once.
+        let target = cwd.join("warned.txt");
+        let cmd = format!("echo data > {:?}", target);
+        let out = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": cmd })))
+            .expect("execute");
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed: 1"),
+            "receipt should be present: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("bash_file_writes=warn"),
+            "nudge missing: {}",
+            out.output
+        );
+        std::fs::remove_file(&target).ok();
+    }
+
     #[test]
     fn shell_tool_is_exclusive() {
         // Shell must serialize relative to peers (M8.8) — a mutating command
         // should never race with a parallel read_file on the same path.
         let tool = ShellTool::new(std::env::temp_dir());
         assert_eq!(tool.concurrency_class(), ConcurrencyClass::Exclusive);
+    }
+
+    // ---------------------------------------------------------------------
+    // #20b — main-tree sovereignty checkout guard. `tree_sovereignty_denial`
+    // is the pure decision function; these cover every branch of its rule:
+    // scope (main tree only), fail-open (no branch / no owner), the owner
+    // itself, no-op same-branch checkouts, and the cross-branch refusal with
+    // the fence-yourself hint. Read-only git and pathspec restores must never
+    // be refused.
+    // ---------------------------------------------------------------------
+
+    fn sovereignty_ctx(
+        branch: Option<&str>,
+        owner: Option<&str>,
+        caller: Option<&str>,
+    ) -> MainTreeSovereigntyContext {
+        MainTreeSovereigntyContext {
+            main_tree_root: std::env::temp_dir(),
+            main_tree_branch: branch.map(str::to_owned),
+            owner_goal_id: owner.map(str::to_owned),
+            caller_goal_id: caller.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn sovereignty_refuses_cross_branch_checkout_from_other_goal() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        let denial = tree_sovereignty_denial("git checkout feat/b", &cwd, &ctx)
+            .expect("cross-branch checkout by a non-owner goal must be refused");
+        assert!(denial.contains("goal_01"), "names the owner: {denial}");
+        assert!(denial.contains("goal_02"), "names the caller: {denial}");
+        assert!(
+            denial.contains("NOT switched"),
+            "states no switch: {denial}"
+        );
+        assert!(
+            denial.contains("fence"),
+            "points at the fence mechanism: {denial}"
+        );
+    }
+
+    #[test]
+    fn sovereignty_allows_owner_goal_its_own_checkout() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_01"));
+        let cwd = std::env::temp_dir();
+        assert!(
+            tree_sovereignty_denial("git checkout feat/b", &cwd, &ctx).is_none(),
+            "the owner goal may move its own tree"
+        );
+    }
+
+    #[test]
+    fn sovereignty_fail_open_without_owner_or_branch() {
+        let cwd = std::env::temp_dir();
+        // No owner recorded → never block.
+        let no_owner = sovereignty_ctx(Some("feat/a"), None, Some("goal_02"));
+        assert!(tree_sovereignty_denial("git checkout feat/b", &cwd, &no_owner).is_none());
+        // Unknown current branch (detached / non-git) → fail open.
+        let no_branch = sovereignty_ctx(None, Some("goal_01"), Some("goal_02"));
+        assert!(tree_sovereignty_denial("git checkout feat/b", &cwd, &no_branch).is_none());
+    }
+
+    #[test]
+    fn sovereignty_allows_same_branch_noop_checkout() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        assert!(
+            tree_sovereignty_denial("git checkout feat/a", &cwd, &ctx).is_none(),
+            "switching TO the current branch is a no-op — allow"
+        );
+    }
+
+    #[test]
+    fn sovereignty_ignores_read_only_and_pathspec_restore() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        for cmd in [
+            "git status",
+            "git log --oneline -1",
+            "git diff HEAD",
+            "git checkout -- src/lib.rs",
+            "git restore src/lib.rs",
+            "echo hello",
+        ] {
+            assert!(
+                tree_sovereignty_denial(cmd, &cwd, &ctx).is_none(),
+                "read-only / restore must never be refused: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn sovereignty_only_guards_the_main_tree_root() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        // A fenced peer clone lives under a DIFFERENT directory → pass through.
+        let fenced = std::env::temp_dir()
+            .join("peers")
+            .join("some-peer")
+            .join("wt");
+        assert!(
+            tree_sovereignty_denial("git checkout feat/b", &fenced, &ctx).is_none(),
+            "checkouts inside a fenced clone must not be guarded"
+        );
+    }
+
+    #[test]
+    fn sovereignty_switch_command_also_guarded() {
+        let ctx = sovereignty_ctx(Some("feat/a"), Some("goal_01"), Some("goal_02"));
+        let cwd = std::env::temp_dir();
+        assert!(
+            tree_sovereignty_denial("git switch feat/b", &cwd, &ctx).is_some(),
+            "git switch is also a HEAD move and must be guarded"
+        );
     }
 
     #[tokio::test]
@@ -1734,5 +2334,333 @@ mod tests {
             "expected deny, got: {}",
             result.output
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #28b — bash file-writes knob helpers.
+// ---------------------------------------------------------------------------
+
+/// #28b — escape hatch: a trailing `# octos:allow-write` comment on the
+/// command line explicitly authorizes a write-shaped command under `deny`.
+pub(crate) fn command_allows_write_explicitly(command: &str) -> bool {
+    command
+        .lines()
+        .last()
+        .is_some_and(|last| last.contains("# octos:allow-write"))
+}
+
+/// #28b — heuristic: does this command LOOK like it writes files? A
+/// curated WHITELIST of shapes (documented; false negatives tolerated —
+/// the 28a receipt still reports what actually changed):
+///   * shell redirection to a file: `> file`, `>> file`, `2> file`, `&> file`
+///   * `tee file` / `tee -a file`
+///   * in-place editors: `sed -i`, `gawk -i`, `perl -pi`, `ruby -pi`
+///   * `cp`/`mv`/`rm`/`mkdir`/`touch`/`truncate`/`ln` with a non-flag arg
+///   * heredocs: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`
+///   * `python -c`/`python3 -c`/`node -e` whose payload mentions
+///     open(...,"w") / fs.write — the two dominant scripted-write shapes
+///   * `dd of=`, `install`, `patch <`, `git apply`, `unzip -o`, `tar -x`
+pub(crate) fn command_looks_like_file_write(command: &str) -> bool {
+    // Redirections (single-line scan; quotes rarely wrap the target).
+    for token_hint in [">>", " 2> ", "&> ", "> ", ">/"] {
+        if command.contains(token_hint) {
+            return true;
+        }
+    }
+    if command.contains("<<") {
+        return true; // heredoc (covers <<- / <<' / <<" variants).
+    }
+    let lowered = command.to_ascii_lowercase();
+    for kw in [
+        " tee ",
+        "tee -a",
+        "sed -i",
+        "sed --in-place",
+        "gawk -i",
+        "perl -pi",
+        "perl -i",
+        "ruby -pi",
+        "dd of=",
+        " of=",
+        " install ",
+        "patch <",
+        "git apply",
+        "unzip -o",
+        "tar -x",
+    ] {
+        if lowered.contains(kw) {
+            return true;
+        }
+    }
+    // Mutating coreutils with a non-flag argument (flags skipped so
+    // `truncate -s 0 f` matches, while `grep -rn foo` style stays clean —
+    // the keyword list itself disambiguates).
+    for kw in ["cp ", "mv ", "rm ", "mkdir ", "touch ", "truncate ", "ln "] {
+        if let Some((_, rest)) = lowered.split_once(kw) {
+            let has_operand = rest.split_whitespace().any(|w| !w.starts_with('-'));
+            if has_operand {
+                return true;
+            }
+        }
+    }
+    // Scripted writes via `python -c` / `node -e`.
+    if (lowered.contains("python -c")
+        || lowered.contains("python3 -c")
+        || lowered.contains("node -e"))
+        && ((lowered.contains("open(") && lowered.contains("\"w"))
+            || lowered.contains("fs.write")
+            || lowered.contains("writefilesync"))
+    {
+        return true;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// #28a — file-change receipt: a `git status`-level dirty-diff taken before
+// and after the command, appended ONCE to THIS tool result's tail.
+// ---------------------------------------------------------------------------
+
+/// #28a — one entry of the working-tree dirty set (`git status --porcelain`
+/// line, path made repo-relative). No timestamps, no timings, no absolute
+/// paths — the receipt must stay noise-free for the model and for prompt-
+/// cache stability (it lives only in the tool result, never in the system
+/// prompt and never rewriting history).
+#[derive(Debug, Clone)]
+struct ChangeReceipt {
+    files_changed: usize,
+    listed: Vec<String>,
+    truncated: bool,
+}
+
+impl ChangeReceipt {
+    fn render(&self) -> String {
+        let mut out = format!("\nfiles_changed: {}", self.files_changed);
+        for path in &self.listed {
+            out.push_str("\n  ");
+            out.push_str(path);
+        }
+        if self.truncated {
+            out.push_str(&format!(
+                "\n  (+{} more; not listed)",
+                self.files_changed - self.listed.len()
+            ));
+        }
+        out
+    }
+}
+
+/// #28a — snapshot the repo-relative dirty paths (modified + untracked,
+/// i.e. `git status --porcelain` lines) at `git status` cost (ms-scale, no
+/// index refresh beyond what status itself does; no new dependencies).
+/// `None` when the dir is not a git work tree (receipt silently omitted —
+/// acceptance ④) or git is unavailable (fail-open).
+pub(crate) fn snapshot_dirty_paths(cwd: &Path) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // not a git work tree (or git absent) — omit silently.
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Keep the RAW porcelain line ("XY PATH") so the diff can compare status
+    // flips; strip only a rename's "ORIG -> " to keep the destination side.
+    Some(
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let path = line.get(3..).unwrap_or("").trim();
+                match path.split_once(" -> ") {
+                    Some((_, dst)) => format!("{} {}", &line[..2], dst),
+                    None => line.to_owned(),
+                }
+            })
+            .collect(),
+    )
+}
+
+pub(crate) const CHANGE_RECEIPT_MAX_LISTED: usize = 20;
+
+pub(crate) fn diff_to_receipt(
+    before: Option<Vec<String>>,
+    after: Option<Vec<String>>,
+) -> Option<String> {
+    // Either side missing the snapshot ⇒ non-git or fail-open: no receipt.
+    let (before, after) = (before?, after?);
+    let before_set: std::collections::HashSet<&String> = before.iter().collect();
+    // CHANGED = after-line not present verbatim in before (new file OR a
+    // status flip on the same path — both are real tree changes).
+    let mut changed: Vec<String> = after
+        .iter()
+        .filter(|line| !before_set.contains(*line))
+        .map(|line| line.get(3..).unwrap_or(line.as_str()).trim().to_owned())
+        .collect();
+    if changed.is_empty() {
+        return Some("\nfiles_changed: 0".to_owned());
+    }
+    let total = changed.len();
+    changed.sort();
+    changed.dedup();
+    let truncated = total > CHANGE_RECEIPT_MAX_LISTED;
+    let listed: Vec<String> = changed
+        .into_iter()
+        .take(CHANGE_RECEIPT_MAX_LISTED)
+        .collect();
+    Some(
+        ChangeReceipt {
+            files_changed: total,
+            listed,
+            truncated,
+        }
+        .render(),
+    )
+}
+
+#[cfg(test)]
+mod change_receipt_tests {
+    use super::*;
+
+    fn init_repo(dir: &std::path::Path) {
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        // seed + commit so status has a baseline tree.
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["commit", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// ① real edit → receipt lists exactly that file (repo-relative).
+    #[test]
+    fn real_edit_lists_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert!(receipt.contains("files_changed: 1"), "receipt: {receipt}");
+        assert!(
+            receipt.contains("src/lib.rs"),
+            "lists the relative path: {receipt}"
+        );
+        // noise-free: no timestamps/durations/absolute tmp paths.
+        assert!(!receipt.contains(&dir.path().display().to_string()));
+    }
+
+    /// ② phantom edit (zero-match replace) → files_changed: 0.
+    #[test]
+    fn phantom_edit_reports_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        // zero-match replace — touches nothing (no file is read or written).
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert_eq!(receipt.trim(), "files_changed: 0");
+    }
+
+    /// ③ a `target/` build artifact never appears — .gitignore filters it.
+    #[test]
+    fn gitignored_paths_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", ".gitignore"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["commit", "-m", "ignore"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/artifact.bin"), b"x").unwrap();
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert_eq!(
+            receipt.trim(),
+            "files_changed: 0",
+            "target/ excluded: {receipt}"
+        );
+    }
+
+    /// ④ non-git dir → no receipt, no error (snapshot None ⇒ omitted).
+    #[test]
+    fn non_git_dir_omits_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(snapshot_dirty_paths(dir.path()).is_none());
+        assert!(diff_to_receipt(None, None).is_none());
+    }
+
+    /// ⑤ cap: >20 changed files list 20 + "(+N more; not listed)".
+    #[test]
+    fn listing_caps_at_twenty_with_total() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let before = snapshot_dirty_paths(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("many")).unwrap();
+        for i in 0..25 {
+            std::fs::write(dir.path().join(format!("many/f{i}.txt")), "x\n").unwrap();
+        }
+        let after = snapshot_dirty_paths(dir.path()).unwrap();
+        let receipt = diff_to_receipt(Some(before), Some(after)).unwrap();
+        assert!(
+            receipt.contains("files_changed: 25"),
+            "total counted: {receipt}"
+        );
+        assert!(
+            receipt.contains("more; not listed"),
+            "truncation marker: {receipt}"
+        );
+        let listed_count = receipt
+            .lines()
+            .filter(|l| l.trim_start().starts_with("many/"))
+            .count();
+        assert_eq!(listed_count, 20, "exactly 20 listed (cap): {receipt}");
     }
 }

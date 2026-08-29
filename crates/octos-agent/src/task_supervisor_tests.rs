@@ -401,9 +401,11 @@ fn on_terminal_fires_for_cascade_and_orphan_sweep_failures() {
     supervisor2
         .enable_persistence(&temp)
         .expect("enable_persistence");
+    // #27c — parking is peer_handoff-scoped; this fixture's tool keeps
+    // the genuine-Failed verdict, so the terminal sink still fires.
     assert!(
         events2.lock().unwrap().contains(&orphan),
-        "orphan-sweep failure must reach the unified terminal sink"
+        "non-peer orphan failure reaches the unified terminal sink"
     );
 }
 
@@ -576,15 +578,15 @@ fn should_persist_harness_progress_event_for_replay() {
     assert_eq!(detail["workflow_kind"], "deep_research");
     assert_eq!(detail["current_phase"], "fetch");
     assert_eq!(detail["progress_message"], "Fetching 4 pages");
-    // Across restart, the in-flight task has no live worker — the orphan
-    // reaper marks it Failed so callers observe a clean terminal state.
-    // The harness progress detail still survives so operators can inspect
-    // where the task was when the runtime died.
+    // Across restart, the in-flight task has no live worker. #27c: the
+    // #27c — the sweep parks PEER_HANDOFF orphans only; this fixture's
+    // tool is not a peer, so it keeps the legacy genuine-Failed verdict.
+    // The harness progress detail still survives for operator diagnosis.
     assert_eq!(task.status, TaskStatus::Failed);
     assert_eq!(
         task.error.as_deref(),
         Some("orphaned across restart"),
-        "orphan reaper must record a stable error message"
+        "orphan reaper must record a stable park reason"
     );
 }
 
@@ -833,15 +835,15 @@ fn should_restore_running_task_state_after_restart() {
     let tasks = restored.get_all_tasks();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].id, task_id);
-    // The orphan reaper marks non-terminal tasks Failed at startup —
-    // their owning workers are gone. Metadata (lineage, ledger path,
+    // #27c — parking is peer_handoff-scoped; this fixture's tool keeps
+    // the legacy genuine-Failed verdict. Metadata (lineage, ledger path,
     // last-known runtime_detail) is preserved for operator diagnosis.
     assert_eq!(tasks[0].status, TaskStatus::Failed);
     assert_eq!(tasks[0].runtime_state, TaskRuntimeState::Failed);
     assert_eq!(
         tasks[0].error.as_deref(),
         Some("orphaned across restart"),
-        "orphan reaper must mark restored running tasks Failed"
+        "orphan reaper must mark restored running tasks Parked"
     );
     // runtime_detail (the last live progress payload) survives the
     // reap so operators can see where the task was when the worker died.
@@ -3112,7 +3114,7 @@ fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     assert_eq!(
         reaped.status,
         TaskStatus::Failed,
-        "orphan task must be marked Failed at startup"
+        "non-peer orphan keeps the genuine-Failed verdict (#27c scope)"
     );
     assert_eq!(reaped.runtime_state, TaskRuntimeState::Failed);
     let error = reaped.error.as_deref().unwrap_or("");
@@ -3122,7 +3124,7 @@ fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     );
     assert!(
         reaped.completed_at.is_some(),
-        "orphan task must have a completed_at timestamp"
+        "a genuine-Failed orphan carries the terminal completed_at timestamp"
     );
 
     let surviving = restored
@@ -3136,7 +3138,9 @@ fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     assert_eq!(surviving.runtime_state, TaskRuntimeState::Completed);
 
     // Idempotency: a third supervisor replaying the same ledger must see
-    // task_a already terminal (because the reaper appended a Failed event).
+    // task_a still Parked (#27c — the sweep appended a Parked event, which
+    // replays as Parked; a Parked task has no live worker in ANY process,
+    // so re-sweeping is idempotent and leaves it re-attachable).
     let restored_again = TaskSupervisor::new();
     restored_again.enable_persistence(&ledger_path).unwrap();
     let reread = restored_again
@@ -3802,12 +3806,12 @@ fn on_change_installed_before_enable_persistence_observes_orphan_sweep() {
     restored.enable_persistence(&ledger_path).unwrap();
 
     let snapshots = observed.lock().unwrap();
-    let orphan_failure = snapshots
+    let orphan_failed = snapshots
         .iter()
         .find(|t| t.id == id && t.status == TaskStatus::Failed)
-        .expect("on_change MUST observe the orphaned task transition to Failed");
+        .expect("on_change observes the orphaned task's genuine Failed verdict");
     assert_eq!(
-        orphan_failure.error.as_deref(),
+        orphan_failed.error.as_deref(),
         Some("orphaned across restart"),
     );
 }
@@ -3839,7 +3843,7 @@ fn on_change_installed_after_enable_persistence_misses_orphan_sweep() {
         sink.lock().unwrap().push(task.clone());
     });
 
-    // Stored task is Failed (sweep ran), but the callback never saw it.
+    // Stored task is Failed (sweep ran; non-peer scope), callback never saw it.
     assert_eq!(
         restored.get_task(&id).expect("task").status,
         TaskStatus::Failed
@@ -4018,7 +4022,7 @@ fn dead_task_not_in_live_set_is_still_reaped() {
     assert_eq!(
         task.status,
         TaskStatus::Failed,
-        "a dead task absent from the live-set must still be reaped",
+        "a dead task absent from the live-set must still be reaped (#27c parks)",
     );
     assert_eq!(
         task.error.as_deref(),
@@ -4871,4 +4875,71 @@ fn snapshot_excluding_child_supervisor_inherits_registration_observers() {
         "task maps stay per-subtree"
     );
     assert!(child.get_task(&id).is_some());
+}
+
+/// #27c — the full simulated-restart orphan lifecycle: a running task's
+/// process dies; the next supervisor's boot sweep PARKS it (awaiting client
+/// re-attach) instead of failing it; the returning client revives it with
+/// `mark_running` (Parked → Running) and completes it normally. Red lines:
+/// terminal tasks are never re-parked, and Parked never fires the terminal
+/// failure callback (it is not a verdict, it is a pause).
+#[test]
+fn orphan_restart_parks_then_client_reattach_revives_full_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_path = temp.path().join("supervisor.jsonl");
+
+    // Boot 1: the "old process" registers a running task and persists it.
+    let old = TaskSupervisor::new();
+    let task_id = old.register("peer_handoff", "call-27c", Some("octos:local:tui#coding"));
+    old.mark_running(&task_id);
+    old.enable_persistence(&ledger_path).unwrap();
+
+    // Boot 2: a fresh supervisor (restart) — no live worker for the task.
+    // The sweep PARKS it, not fails it.
+    let restarted = TaskSupervisor::new();
+    restarted.enable_persistence(&ledger_path).unwrap();
+    let parked = restarted.get_task(&task_id).expect("task survived restart");
+    assert_eq!(parked.status, TaskStatus::Parked, "orphan must be Parked");
+    assert_eq!(parked.error.as_deref(), Some("orphaned across restart"));
+    assert!(
+        !parked.status.is_terminal(),
+        "Parked is re-attachable, not terminal"
+    );
+    assert!(
+        !parked.status.is_active(),
+        "Parked has no live worker in this process"
+    );
+
+    // Boot 3: the returning client re-attaches — mark_running revives the
+    // SAME task (Parked → Running) and drives it to completion.
+    restarted.mark_running(&task_id);
+    let revived = restarted.get_task(&task_id).expect("revived");
+    assert_eq!(
+        revived.status,
+        TaskStatus::Running,
+        "client re-attach revives Parked → Running"
+    );
+    restarted.mark_completed(&task_id, vec![]);
+    let done = restarted.get_task(&task_id).expect("done");
+    assert_eq!(
+        done.status,
+        TaskStatus::Completed,
+        "revived task completes normally"
+    );
+
+    // Red line 1: mark_parked on a terminal task is a no-op.
+    restarted.mark_parked(&task_id, "late park".into());
+    assert_eq!(
+        restarted.get_task(&task_id).unwrap().status,
+        TaskStatus::Completed,
+        "terminal tasks are never re-parked"
+    );
+
+    // Red line 2: a Parked task never fired the terminal-failure path —
+    // its runtime_state slot still reads the parked detail on the way
+    // through, and completion stamped completed_at only at the REAL end.
+    assert!(
+        done.completed_at.is_some(),
+        "completed_at stamps the real terminal"
+    );
 }

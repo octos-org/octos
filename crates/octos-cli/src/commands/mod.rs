@@ -14,7 +14,9 @@ mod docs;
 mod doctor;
 pub mod gateway;
 mod goal;
+
 mod inbox;
+
 mod init;
 mod ledger;
 pub mod mcp;
@@ -26,6 +28,7 @@ mod peer;
 mod profile;
 #[cfg(feature = "api")]
 mod serve;
+pub mod serve_console;
 pub mod skills;
 mod status;
 mod steer;
@@ -56,7 +59,9 @@ pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
 pub use goal::GoalCommand;
+
 pub use inbox::InboxCommand;
+
 pub use init::InitCommand;
 pub use ledger::LedgerCommand;
 pub use mcp::McpCommand;
@@ -152,10 +157,12 @@ pub enum Command {
     Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
     Gateway(GatewayCommand),
-    /// Read-only goal status (direct ledger read; OLP observability).
+
+    /// Operator goal transitions (reopen a blocked/paused goal, archive a goal terminally).
     Goal(GoalCommand),
     /// Read-only goal-ledger tail (findings/escalations/decisions; OLP).
     Ledger(LedgerCommand),
+
     /// Clean up stale state and cache files.
     Clean(CleanCommand),
     /// Generate shell completions.
@@ -401,6 +408,7 @@ impl Executable for Command {
             Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
+
             Self::Peer(cmd) => cmd.execute(),
         }
     }
