@@ -563,6 +563,32 @@ impl SessionRuntime {
             human_approval_rules: profile.human_approval_rules.clone(),
             // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
             format_after_edit: profile.format_after_edit,
+            // #2172: thread the profile's gateway LLM knobs onto serve /
+            // octoscode sessions, exactly as `octos chat` does. Without this a
+            // profile-driven session silently ran with the built-in defaults
+            // (greedy temperature=0.0, no sampler, 16384 max output) — dropping
+            // the local-model repetition-collapse mitigations. Each is `None`
+            // unless the operator set it, so cloud sessions are unchanged.
+            chat_max_tokens: profile
+                .config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.max_output_tokens),
+            chat_temperature: profile
+                .config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.llm_temperature),
+            chat_sampling_params: profile
+                .config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.llm_sampling_params.clone()),
+            reasoning_effort: profile
+                .config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.reasoning_effort),
             ..Default::default()
         })
         // M11-F regression fix (#891): propagate the pre-assembled
@@ -1237,6 +1263,51 @@ mod tests {
             prompt.contains("Friday again"),
             "read-refresh must pick up post-bootstrap consolidations: {prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn session_agent_threads_profile_gateway_llm_knobs() {
+        // #2172: a serve / octoscode session must honor the profile's gateway
+        // LLM knobs (temperature, sampler, max output) rather than silently
+        // falling back to the greedy 0.0 / 16384 / no-sampler defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = make_profile(dir.path().to_path_buf()).await;
+        let mut sp = serde_json::Map::new();
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        Arc::get_mut(&mut profile).unwrap().config.gateway = Some(crate::config::GatewayConfig {
+            max_output_tokens: Some(32768),
+            llm_temperature: Some(0.7),
+            llm_sampling_params: Some(sp),
+            reasoning_effort: Some(octos_llm::ReasoningEffort::High),
+            ..Default::default()
+        });
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "gw"), None)
+            .await
+            .expect("bootstrap");
+        let cfg = rt.agent.agent_config();
+        assert_eq!(cfg.chat_max_tokens, Some(32768));
+        assert_eq!(cfg.chat_temperature, Some(0.7));
+        assert_eq!(
+            cfg.chat_sampling_params
+                .and_then(|m| m.get("repeat_penalty").cloned()),
+            Some(serde_json::json!(1.1))
+        );
+        assert_eq!(cfg.reasoning_effort, Some(octos_llm::ReasoningEffort::High));
+    }
+
+    #[tokio::test]
+    async fn session_agent_keeps_defaults_when_profile_has_no_gateway_knobs() {
+        // Cloud-safety: a profile without the gateway knobs yields None (the
+        // built-in defaults), so serve behavior is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let profile = make_profile(dir.path().to_path_buf()).await;
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "gw2"), None)
+            .await
+            .expect("bootstrap");
+        let cfg = rt.agent.agent_config();
+        assert_eq!(cfg.chat_max_tokens, None);
+        assert_eq!(cfg.chat_temperature, None);
+        assert_eq!(cfg.chat_sampling_params, None);
     }
 
     #[tokio::test]
