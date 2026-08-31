@@ -151,6 +151,29 @@ impl Tool for WriteFileTool {
         ctx: &ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        let mut result = self.execute_capped_inner(ctx, args).await?;
+        // #2193 R4: ONE release-enforced cap over EVERY armed return (success
+        // and early errors). A caller-controlled `input.path` echoed in a
+        // message can otherwise exceed the loop's blind head/tail cut (#2124)
+        // and get mangled; sizing every armed result under the cap makes the
+        // tool's own cut the only cut.
+        if self.window_armed() {
+            octos_core::truncate_utf8(
+                &mut result.output,
+                octos_core::tool_output_limit(self.name()),
+                "",
+            );
+        }
+        Ok(result)
+    }
+}
+
+impl WriteFileTool {
+    async fn execute_capped_inner(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: WriteFileInput =
             super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
@@ -239,7 +262,9 @@ impl Tool for WriteFileTool {
         if self.window_armed() && path.exists() {
             use super::read_window::{
                 PARTIAL_VIEW_OVERWRITE_PREFIX as PREFIX,
-                REDACTED_VIEW_OVERWRITE_PREFIX as REDACTED_PREFIX, ViewStatus, WINDOW_MAX_BYTES,
+                REDACTED_VIEW_OVERWRITE_PREFIX as REDACTED_PREFIX,
+                TRANSFORMED_VIEW_OVERWRITE_PREFIX as TRANSFORMED_PREFIX, ViewStatus,
+                WINDOW_MAX_BYTES,
             };
             // R4: a missing/empty session key is reachable in production
             // (agents default to None; FFI/fleet workers; plain CLI chat
@@ -256,14 +281,10 @@ impl Tool for WriteFileTool {
             let page_advice = "Page through it with read_file (offset/limit, or byte_offset \
                                for single lines too long for the line window) until you reach \
                                the end, then retry the write.";
-            let current = tokio::fs::metadata(&path).await.ok().and_then(|meta| {
-                meta.modified()
-                    .ok()
-                    .map(|mtime| super::read_window::ViewEpoch {
-                        mtime,
-                        size: meta.len(),
-                    })
-            });
+            let current = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|meta| super::read_window::ViewEpoch::from_metadata(&meta));
             let refusal: Option<String> = if session.is_empty() {
                 // Keyless: cannot track reads, so cannot authorize a big
                 // overwrite. Small files keep today's blind semantics.
@@ -311,6 +332,17 @@ impl Tool for WriteFileTool {
                          rewriting THIS file: make a narrower, in-place change rather than a \
                          whole-file rewrite, or tell the user this file cannot be safely \
                          whole-file-rewritten while windowed reads are enabled.",
+                    )),
+                    // #2193 R4: the view was TEXT decoded from a binary (PDF),
+                    // not the on-disk bytes — paging the extracted text to EOF
+                    // must NOT authorize replacing the original binary.
+                    (ViewStatus::Transformed, _) => Some(format!(
+                        "{TRANSFORMED_PREFIX} write_file refused: read_file showed you TEXT \
+                         extracted from {shown_path} (a PDF or other binary), not the file's \
+                         own bytes — so a whole-file overwrite reconstructed from what you saw \
+                         would replace the original with the extracted text and destroy the \
+                         binary. Make a narrower change, write to a different path, or tell the \
+                         user this file cannot be whole-file-rewritten from a windowed read.",
                     )),
                     (
                         ViewStatus::Partial {
@@ -388,19 +420,77 @@ impl Tool for WriteFileTool {
                     });
                 }
             };
-            if let Err(e) = super::write_grant::confined_write(
-                workspace_root.clone(),
-                rel,
-                input.content.as_bytes().to_vec(),
-                grant.create_only(),
-            )
-            .await
-            {
-                return Ok(ToolResult {
-                    output: grant.map_confined_error(&e, &workspace_root, &input.path, self.name()),
-                    success: false,
-                    ..Default::default()
-                });
+            // #2193 R4: an armed, AUTHORIZED over-window overwrite must bind the
+            // truncating write to the epoch it was authorized against — even on
+            // the fenced path, which otherwise re-opens the leaf with O_TRUNC and
+            // clobbers whatever it resolves to. Only existing-file overwrites
+            // (never create_only) take the checked path.
+            match (grant.create_only(), authorized_epoch) {
+                (false, Some(expected)) => {
+                    match super::write_grant::confined_write_checked(
+                        workspace_root.clone(),
+                        rel,
+                        input.content.as_bytes().to_vec(),
+                        expected,
+                    )
+                    .await
+                    {
+                        Ok(super::CheckedWrite::Written) => {}
+                        Ok(super::CheckedWrite::EpochChanged { found }) => {
+                            if let Some(session) =
+                                ctx.parent_session_key.as_deref().filter(|s| !s.is_empty())
+                            {
+                                super::read_window::forget(session, &path);
+                            }
+                            let shown_path = octos_core::truncated_utf8(&input.path, 200, "...");
+                            return Ok(ToolResult {
+                                output: format!(
+                                    "{} write_file refused: {} changed on disk between your read \
+                                     and this write ({} bytes now), so the overwrite was not \
+                                     applied. Re-read it with read_file, then retry.",
+                                    super::read_window::PARTIAL_VIEW_OVERWRITE_PREFIX,
+                                    shown_path,
+                                    found.size,
+                                ),
+                                success: false,
+                                ..Default::default()
+                            });
+                        }
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                output: grant.map_confined_error(
+                                    &e,
+                                    &workspace_root,
+                                    &input.path,
+                                    self.name(),
+                                ),
+                                success: false,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    if let Err(e) = super::write_grant::confined_write(
+                        workspace_root.clone(),
+                        rel,
+                        input.content.as_bytes().to_vec(),
+                        grant.create_only(),
+                    )
+                    .await
+                    {
+                        return Ok(ToolResult {
+                            output: grant.map_confined_error(
+                                &e,
+                                &workspace_root,
+                                &input.path,
+                                self.name(),
+                            ),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                }
             }
             true
         } else {
@@ -527,7 +617,7 @@ impl Tool for WriteFileTool {
             output: format!(
                 "Successfully wrote {} lines to {}{}",
                 line_count,
-                input.path,
+                octos_core::truncated_utf8(&input.path, 200, "..."),
                 format_note.unwrap_or_default()
             ),
             success: true,
@@ -1662,6 +1752,51 @@ mod tests {
             .await
             .unwrap();
         assert!(allowed.success, "{}", allowed.output);
+    }
+
+    #[tokio::test]
+    async fn should_refuse_overwriting_from_a_transformed_view() {
+        // #2193 R4 (codex H6): paging a large PDF's extracted text must not
+        // authorize replacing the original binary. A Transformed view is a
+        // permanent incompatibility with a whole-file rewrite, like Tainted, and
+        // gets its own typed prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pdf");
+        // Over the window so the guard consults the ledger, not blind-overwrite.
+        std::fs::write(&path, vec![b'%'; 100_000]).unwrap();
+        let session = "transformed-sess";
+        let epoch =
+            crate::tools::read_window::ViewEpoch::from_metadata(&std::fs::metadata(&path).unwrap());
+        crate::tools::read_window::record_view(
+            session, &path, epoch, 0, 100_000, 100_000, false, true,
+        );
+        let ctx = ctx_with_session(session);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+        let refused = write
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "doc.pdf", "content": "rebuilt\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(!refused.success, "{}", refused.output);
+        assert!(
+            refused
+                .output
+                .contains(crate::tools::read_window::TRANSFORMED_VIEW_OVERWRITE_PREFIX),
+            "transformed overwrite must use the DISTINCT typed prefix: {}",
+            refused.output,
+        );
+        assert!(
+            !refused.output.contains("[PARTIAL_VIEW_OVERWRITE]"),
+            "must not reuse the partial-view prefix: {}",
+            refused.output,
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            100_000,
+            "the binary on disk must be untouched",
+        );
     }
 
     #[tokio::test]

@@ -230,6 +230,28 @@ impl Tool for ReadFileTool {
         ctx: &ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        let mut result = self.execute_capped_inner(ctx, args).await?;
+        // #2193 R4: ONE release-enforced cap over every armed return (success
+        // and early errors), so no caller-controlled path or message can slip
+        // past the loop's blind head/tail cut. Byte-mode also clamps to the
+        // tighter window bound inside; this is the uniform outer backstop.
+        if self.window_armed() {
+            octos_core::truncate_utf8(
+                &mut result.output,
+                octos_core::tool_output_limit(self.name()),
+                "",
+            );
+        }
+        Ok(result)
+    }
+}
+
+impl ReadFileTool {
+    async fn execute_capped_inner(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: ReadFileInput =
             super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
 
@@ -391,8 +413,8 @@ impl Tool for ReadFileTool {
         // #2131 refusal (a byte read is bounded by construction).
         if let Some(requested_offset) = input.byte_offset {
             use super::read_window::WINDOW_MAX_BYTES;
-            let content = match super::read_no_follow(&path).await {
-                Ok(c) => c,
+            let (content, read_meta) = match super::read_no_follow_with_meta(&path).await {
+                Ok(cm) => cm,
                 Err(e) => return Ok(super::file_io_error(e, &input.path)),
             };
             let total = content.len();
@@ -441,12 +463,17 @@ impl Tool for ReadFileTool {
             // mangling the footer in a release build.
             output = clamp_armed_return(output);
             let session = ctx.parent_session_key.clone().unwrap_or_default();
-            let epoch = current_mtime.map(|mtime| super::read_window::ViewEpoch {
-                mtime,
-                size: file_size as u64,
-            });
             let tainted = crate::sanitize::sanitize_tool_output(&output) != output;
-            super::read_window::record_view(&session, &path, epoch, start_b, end_b, total, tainted);
+            super::read_window::record_view(
+                &session,
+                &path,
+                read_meta.epoch,
+                start_b,
+                end_b,
+                total,
+                tainted,
+                read_meta.transformed,
+            );
             return Ok(ToolResult {
                 output,
                 success: true,
@@ -480,8 +507,8 @@ impl Tool for ReadFileTool {
         }
 
         // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
-        let content = match super::read_no_follow(&path).await {
-            Ok(c) => c,
+        let (content, read_meta) = match super::read_no_follow_with_meta(&path).await {
+            Ok(cm) => cm,
             Err(e) => return Ok(super::file_io_error(e, &input.path)),
         };
 
@@ -692,10 +719,6 @@ impl Tool for ReadFileTool {
         // placeholders for real content.
         if window_armed {
             let session = ctx.parent_session_key.clone().unwrap_or_default();
-            let epoch = current_mtime.map(|mtime| super::read_window::ViewEpoch {
-                mtime,
-                size: file_size as u64,
-            });
             let byte_start = line_start_byte_offset(&content, start + 1);
             let byte_end = if included_end >= total_lines {
                 content.len()
@@ -706,11 +729,12 @@ impl Tool for ReadFileTool {
             super::read_window::record_view(
                 &session,
                 &path,
-                epoch,
+                read_meta.epoch,
                 byte_start,
                 byte_end,
                 content.len(),
                 tainted,
+                read_meta.transformed,
             );
         }
 

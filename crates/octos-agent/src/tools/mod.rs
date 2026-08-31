@@ -1349,6 +1349,95 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
+/// Open a file read-only, atomically rejecting symlinks (O_NOFOLLOW on Unix).
+///
+/// SECURITY: the flags here MUST match [`read_no_follow`]'s open exactly.
+#[cfg(unix)]
+fn open_no_follow_ro(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow_ro(path: &Path) -> std::io::Result<std::fs::File> {
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "symlink rejected",
+        ));
+    }
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+/// The descriptor-derived facts an armed windowed read needs beyond the bytes.
+pub(crate) struct ReadMeta {
+    /// [`crate::tools::read_window::ViewEpoch`] taken from the SAME descriptor
+    /// the bytes came from — not a separate path stat — so it describes the
+    /// exact inode whose bytes were shown (#2193 R4, read-side TOCTOU).
+    /// `None` only if the descriptor's metadata was unavailable, which never
+    /// authorizes a write.
+    pub epoch: Option<crate::tools::read_window::ViewEpoch>,
+    /// The returned content is a DECODE of the on-disk bytes (PDF text
+    /// extraction), not the bytes themselves — so a whole-file rewrite
+    /// reconstructed from it can never be faithful, and the view must never be
+    /// allowed to reach COMPLETE (#2193 R4, PDF false-COMPLETE).
+    pub transformed: bool,
+}
+
+/// Like [`read_no_follow`] but also returns the [`ReadMeta`] the armed
+/// windowed-read ledger needs. Kept as a distinct entry point so the many
+/// non-armed `read_no_follow` callers pay nothing for the extra `fstat`.
+pub(crate) async fn read_no_follow_with_meta(path: &Path) -> std::io::Result<(String, ReadMeta)> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = open_no_follow_ro(&path)?;
+        // fstat the DESCRIPTOR (not a re-resolution of the path): binds the
+        // epoch to the exact inode these bytes are read from.
+        let epoch = file
+            .metadata()
+            .ok()
+            .and_then(|m| crate::tools::read_window::ViewEpoch::from_metadata(&m));
+        // Same PDF handling as read_no_follow, reading the rest from the SAME
+        // O_NOFOLLOW descriptor (seek back to 0), never by re-opening the path.
+        let mut magic = [0u8; 5];
+        let n = file.read(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if n >= 5 && &magic == b"%PDF-" {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            match pdf_extract::extract_text_from_mem(&bytes) {
+                Ok(text) => Ok((
+                    text,
+                    ReadMeta {
+                        epoch,
+                        transformed: true,
+                    },
+                )),
+                Err(err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pdf extraction failed: {err}"),
+                )),
+            }
+        } else {
+            let mut content = String::with_capacity(n);
+            file.read_to_string(&mut content)?;
+            Ok((
+                content,
+                ReadMeta {
+                    epoch,
+                    transformed: false,
+                },
+            ))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 /// Write content to a file, atomically rejecting symlinks via O_NOFOLLOW on Unix.
 ///
 /// Eliminates the TOCTOU race between `reject_symlink` and `tokio::fs::write`.
@@ -1387,8 +1476,8 @@ pub(crate) enum CheckedWrite {
     /// The opened descriptor matched the authorizing epoch and was truncated
     /// and rewritten.
     Written,
-    /// The opened descriptor's `(mtime, size)` no longer matched what
-    /// authorized the write — nothing was written.
+    /// The opened descriptor's epoch (mtime/size/ctime/inode) no longer
+    /// matched what authorized the write — nothing was written.
     EpochChanged {
         /// The descriptor's actual epoch at open time.
         found: crate::tools::read_window::ViewEpoch,
@@ -1435,12 +1524,12 @@ pub(crate) async fn write_no_follow_checked(
             }
         }
         let mut file = opts.open(&path)?;
-        // fstat the DESCRIPTOR itself (not a re-resolution of the path).
+        // fstat the DESCRIPTOR itself (not a re-resolution of the path). The
+        // epoch binds mtime/size/ctime/inode, so a same-size replacement that
+        // forged mtime is caught by the ctime (or inode) mismatch.
         let meta = file.metadata()?;
-        let found = crate::tools::read_window::ViewEpoch {
-            mtime: meta.modified()?,
-            size: meta.len(),
-        };
+        let found = crate::tools::read_window::ViewEpoch::from_metadata(&meta)
+            .ok_or_else(|| std::io::Error::other("descriptor metadata unavailable"))?;
         if found != expected {
             return Ok(CheckedWrite::EpochChanged { found });
         }
@@ -1503,16 +1592,71 @@ mod nofollow_tests {
     // external replacement in the narrow authorize→truncate window is caught
     // on the exact opened object, not a re-resolved path.
     #[tokio::test]
+    async fn checked_write_refuses_a_same_size_same_mtime_content_swap() {
+        // #2193 R4 (codex H2): the (mtime,size)-only epoch authorized an
+        // overwrite of content the model never saw when a replacement kept the
+        // size and FORGED the mtime back. The epoch now also binds ctime, and
+        // forging mtime with `set_modified` is itself what bumps ctime — so the
+        // swap is caught. Under the old epoch this returned `Written` (RED).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, b"AAAAAAAAAA").unwrap(); // 10 bytes
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta.modified().unwrap();
+        let authorized = crate::tools::read_window::ViewEpoch::from_metadata(&meta).unwrap();
+
+        std::fs::write(&path, b"BBBBBBBBBB").unwrap(); // same size, new content
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let now = std::fs::metadata(&path).unwrap();
+        assert_eq!(now.len(), authorized.size, "size still matches");
+        assert_eq!(now.modified().unwrap(), mtime, "mtime forged back to match");
+
+        let result = write_no_follow_checked(&path, b"CCCCCCCCCC", authorized)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, CheckedWrite::EpochChanged { .. }),
+            "same-size, same-mtime content swap must be refused (ctime binding)",
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"BBBBBBBBBB",
+            "the swapped-in bytes must be intact — never blind-clobbered",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_with_meta_reports_untransformed_epoch_from_the_read_fd() {
+        // #2193 R4 (codex H2b/H6): the armed ledger needs the epoch taken from
+        // the READ descriptor (not a separate path stat), and transformed=false
+        // for ordinary text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, b"hello world\n").unwrap();
+        let (content, meta) = read_no_follow_with_meta(&path).await.unwrap();
+        assert_eq!(content, "hello world\n");
+        assert!(!meta.transformed, "plain text is not a transform");
+        let epoch = meta.epoch.expect("descriptor epoch");
+        assert_eq!(epoch.size, 12);
+        let independent =
+            crate::tools::read_window::ViewEpoch::from_metadata(&std::fs::metadata(&path).unwrap())
+                .unwrap();
+        assert_eq!(epoch, independent, "epoch describes the exact inode read");
+    }
+
+    #[tokio::test]
     async fn write_no_follow_checked_writes_when_epoch_matches() {
         use crate::tools::read_window::ViewEpoch;
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("f.txt");
         std::fs::write(&file, "original").unwrap();
         let meta = std::fs::metadata(&file).unwrap();
-        let epoch = ViewEpoch {
-            mtime: meta.modified().unwrap(),
-            size: meta.len(),
-        };
+        let epoch = ViewEpoch::from_metadata(&meta).unwrap();
 
         let outcome = write_no_follow_checked(&file, b"rebuilt", epoch)
             .await
@@ -1531,10 +1675,7 @@ mod nofollow_tests {
         let file = dir.path().join("f.txt");
         std::fs::write(&file, "original small").unwrap();
         let meta = std::fs::metadata(&file).unwrap();
-        let authorized = ViewEpoch {
-            mtime: meta.modified().unwrap(),
-            size: meta.len(),
-        };
+        let authorized = ViewEpoch::from_metadata(&meta).unwrap();
 
         // The file is replaced (new size ⇒ new epoch) in the window between
         // the guard authorizing against `authorized` and this write opening

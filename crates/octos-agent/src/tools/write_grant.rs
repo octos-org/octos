@@ -511,6 +511,41 @@ pub async fn confined_write(
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
+/// Confined overwrite of an EXISTING leaf, bound to `expected` (#2193 R4).
+///
+/// The fenced write path otherwise re-opens the leaf with `O_TRUNC` and
+/// destroys whatever it resolves to — so an armed, *authorized* over-window
+/// overwrite must instead open the confined leaf WITHOUT truncating, `fstat`
+/// the descriptor, and truncate + rewrite only when its epoch still equals the
+/// one the read ledger authorized. Same binding as
+/// [`crate::tools::write_no_follow_checked`], but via the ancestor-safe
+/// `openat` walk so the write fence still holds. Only for existing files
+/// (`OpenExistingRw`), so it is never used under a `create_only` grant.
+pub(crate) async fn confined_write_checked(
+    workspace_root: PathBuf,
+    rel: PathBuf,
+    content: Vec<u8>,
+    expected: crate::tools::read_window::ViewEpoch,
+) -> std::io::Result<crate::tools::CheckedWrite> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = open_confined(&workspace_root, &rel, ConfinedLeaf::OpenExistingRw)?;
+        // fstat the walked descriptor and bind to the authorizing epoch before
+        // destroying any content.
+        let meta = file.metadata()?;
+        let found = crate::tools::read_window::ViewEpoch::from_metadata(&meta)
+            .ok_or_else(|| std::io::Error::other("descriptor metadata unavailable"))?;
+        if found != expected {
+            return Ok(crate::tools::CheckedWrite::EpochChanged { found });
+        }
+        file.set_len(0)?;
+        file.write_all(&content)?;
+        Ok(crate::tools::CheckedWrite::Written)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 /// Confined edit — phase 1: open the existing leaf `O_RDWR` via
 /// [`open_confined`] and read its contents, returning BOTH the open handle and
 /// the bytes. The SAME handle is handed to [`confined_rewrite`] for the
@@ -586,6 +621,61 @@ fn validate_pattern(pattern: &str) -> eyre::Result<()> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn confined_write_checked_refuses_a_changed_leaf() {
+        // #2193 R4 (codex H2c): the fenced write path used to O_TRUNC the leaf
+        // blind. It must now bind to the authorizing epoch, catching a same-size,
+        // same-mtime content swap exactly like the non-fenced checked writer.
+        let ws = tempfile::tempdir().unwrap();
+        let path = ws.path().join("card.txt");
+        std::fs::write(&path, b"AAAAAAAAAA").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta.modified().unwrap();
+        let authorized = crate::tools::read_window::ViewEpoch::from_metadata(&meta).unwrap();
+
+        std::fs::write(&path, b"BBBBBBBBBB").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        let result = confined_write_checked(
+            ws.path().to_path_buf(),
+            std::path::PathBuf::from("card.txt"),
+            b"CCCCCCCCCC".to_vec(),
+            authorized,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, crate::tools::CheckedWrite::EpochChanged { .. }),
+            "fenced checked write must refuse a changed leaf",
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"BBBBBBBBBB");
+    }
+
+    #[tokio::test]
+    async fn confined_write_checked_writes_an_unchanged_leaf() {
+        let ws = tempfile::tempdir().unwrap();
+        let path = ws.path().join("card.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let authorized =
+            crate::tools::read_window::ViewEpoch::from_metadata(&std::fs::metadata(&path).unwrap())
+                .unwrap();
+        let result = confined_write_checked(
+            ws.path().to_path_buf(),
+            std::path::PathBuf::from("card.txt"),
+            b"world!!".to_vec(),
+            authorized,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, crate::tools::CheckedWrite::Written));
+        assert_eq!(std::fs::read(&path).unwrap(), b"world!!");
+    }
 
     fn grant(patterns: &[&str], create_only: bool) -> WritePathGrant {
         let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();

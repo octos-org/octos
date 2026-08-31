@@ -157,6 +157,12 @@ pub(crate) const PARTIAL_VIEW_OVERWRITE_PREFIX: &str = "[PARTIAL_VIEW_OVERWRITE]
 /// THIS file, rather than the partial-view "page through it" advice.
 pub(crate) const REDACTED_VIEW_OVERWRITE_PREFIX: &str = "[REDACTED_VIEW_OVERWRITE]";
 
+/// Typed prefix for the DISTINCT transformed-view refusal (#2193 R4): the
+/// model was shown TEXT decoded from a binary (PDF extraction), never the
+/// file's own bytes, so — like a redacted view — paging can never deliver the
+/// bytes whole. Its own prefix and a message that says so.
+pub(crate) const TRANSFORMED_VIEW_OVERWRITE_PREFIX: &str = "[TRANSFORMED_VIEW_OVERWRITE]";
+
 /// Whether window enforcement is armed by the environment.
 ///
 /// Mirrors the #2126 probe's gate shape (`OCTOS_READ_PAGING_PROBE=1`). The
@@ -170,16 +176,62 @@ pub(crate) fn armed_from_env() -> bool {
     std::env::var("OCTOS_READ_WINDOW").is_ok_and(|value| value == "1")
 }
 
-/// The identity of one on-disk generation of a file.
+/// The identity of one on-disk generation of a file (#2193 R4).
 ///
-/// mtime alone is not identity — same-second replacement preserves it on
-/// coarse filesystems — so size is checked too. (A same-mtime same-size
-/// rewrite still passes; closing that needs a content hash, which the M8.4
-/// cache also does not spend on this.)
+/// mtime and size alone are NOT identity — a same-size replacement that forges
+/// mtime (`utimensat`) compares equal and would authorize an overwrite of
+/// content the model never saw. So the epoch also binds:
+/// - `ctime`: the inode change time. Userspace has no API to set it backwards;
+///   any in-place rewrite bumps it to "now". This defeats the same-size,
+///   same-mtime replacement outright on every modern filesystem (nanosecond
+///   ctime); only a coarse-granularity FS leaves a sub-tick residual.
+/// - `inode`: the inode number, so a rename-over swap to a different inode with
+///   the same (mtime, size) is a distinct generation and is refused.
+///
+/// Both are `None` off Unix (where the windowed-read flag is secondary and the
+/// sandbox degrades anyway); there the guarantee falls back to (mtime, size).
+/// Build via [`ViewEpoch::from_metadata`], ideally from an ALREADY-OPEN
+/// descriptor's `fstat`, so the epoch describes the exact inode whose bytes
+/// were read rather than a racy re-resolution of the path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ViewEpoch {
     pub(crate) mtime: SystemTime,
     pub(crate) size: u64,
+    pub(crate) ctime: Option<SystemTime>,
+    pub(crate) inode: Option<u64>,
+}
+
+impl ViewEpoch {
+    /// Build the epoch from a file's metadata — pass the metadata of an
+    /// already-open descriptor (`file.metadata()`) so it binds to that exact
+    /// inode, not a re-resolved path.
+    pub(crate) fn from_metadata(meta: &std::fs::Metadata) -> Option<ViewEpoch> {
+        let mtime = meta.modified().ok()?;
+        let (ctime, inode) = ctime_and_inode(meta);
+        Some(ViewEpoch {
+            mtime,
+            size: meta.len(),
+            ctime,
+            inode,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn ctime_and_inode(meta: &std::fs::Metadata) -> (Option<SystemTime>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    let secs = meta.ctime();
+    let nsecs = meta.ctime_nsec();
+    // ctime is seconds since the epoch; real files are post-1970 (secs >= 0).
+    let ctime = u64::try_from(secs).ok().map(|s| {
+        SystemTime::UNIX_EPOCH + std::time::Duration::new(s, nsecs.clamp(0, 999_999_999) as u32)
+    });
+    (ctime, Some(meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn ctime_and_inode(_meta: &std::fs::Metadata) -> (Option<SystemTime>, Option<u64>) {
+    (None, None)
 }
 
 /// What the ledger knows about one `(session, path)`.
@@ -196,6 +248,12 @@ pub(crate) enum ViewStatus {
     /// Bytes were redacted by the sanitizer before reaching the model; no
     /// amount of further paging makes a faithful whole-file rewrite possible.
     Tainted,
+    /// The bytes shown were a DECODE of the on-disk file (e.g. PDF text
+    /// extraction), not the file's own bytes. Like `Tainted`, paging can never
+    /// deliver the on-disk bytes whole, so a faithful whole-file rewrite is
+    /// impossible — but for a different reason (transform, not redaction), so
+    /// it gets its own status and write-side message.
+    Transformed,
     /// Every byte of this epoch reached the model unredacted.
     Complete { epoch: ViewEpoch },
 }
@@ -213,6 +271,9 @@ struct ViewRecord {
     total_bytes: usize,
     /// Sticky per epoch: some shown bytes were altered by the sanitizer.
     tainted: bool,
+    /// Sticky per epoch: the shown bytes were a decode of the on-disk file
+    /// (PDF extraction), never the file's own bytes.
+    transformed: bool,
 }
 
 #[derive(Default)]
@@ -266,6 +327,11 @@ fn ledger_key(session: &str, path: &Path) -> (String, PathBuf) {
 /// view alone. Callers gate on arming — this function itself does not
 /// consult the env, so tests can drive it through per-instance-armed tools
 /// without touching process state.
+// Eight cohesive facts about one read (who, which file+generation, the
+// byte span shown, and the two INDEPENDENT non-authorizing flags — a view
+// can be both sanitizer-redacted AND a binary decode). Bundling them would
+// obscure more than it saves.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_view(
     session: &str,
     path: &Path,
@@ -274,6 +340,7 @@ pub(crate) fn record_view(
     byte_end: usize,
     total_bytes: usize,
     tainted: bool,
+    transformed: bool,
 ) {
     // R4: a missing/empty session key must never share a bucket with another
     // keyless task, so keyless tasks record NOTHING — they can then never
@@ -289,11 +356,11 @@ pub(crate) fn record_view(
     let ledger = guard.get_or_insert_with(Ledger::default);
     // Coverage and taint carry over only within one known epoch; `None`
     // epochs never match (unknown is not evidence).
-    let (carried, carried_taint) = match ledger.entries.get(&key) {
+    let (carried, carried_taint, carried_transformed) = match ledger.entries.get(&key) {
         Some(prev) if prev.epoch.is_some() && prev.epoch == epoch => {
-            (prev.seen_through, prev.tainted)
+            (prev.seen_through, prev.tainted, prev.transformed)
         }
-        _ => (0, false),
+        _ => (0, false, false),
     };
     // Half-open [byte_start, byte_end): contiguous means starting at or
     // before the high-water mark; a view past it leaves a gap and the mark
@@ -310,6 +377,7 @@ pub(crate) fn record_view(
             seen_through,
             total_bytes,
             tainted: carried_taint || tainted,
+            transformed: carried_transformed || transformed,
         },
     );
     ledger.touch_and_evict(key);
@@ -326,6 +394,9 @@ pub(crate) fn view_status(session: &str, path: &Path) -> ViewStatus {
     };
     if record.tainted {
         return ViewStatus::Tainted;
+    }
+    if record.transformed {
+        return ViewStatus::Transformed;
     }
     match record.epoch {
         // Full contiguous coverage of a validatable generation.
@@ -350,12 +421,9 @@ pub(crate) fn note_full_write(session: &str, path: &Path, written_bytes: usize) 
     if session.is_empty() {
         return;
     }
-    let epoch = std::fs::metadata(path).ok().and_then(|meta| {
-        meta.modified().ok().map(|mtime| ViewEpoch {
-            mtime,
-            size: meta.len(),
-        })
-    });
+    let epoch = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| ViewEpoch::from_metadata(&meta));
     match epoch {
         // R1 second half: only mark COMPLETE when the bytes on disk are the
         // bytes we wrote. A size disagreement means a replacement landed in
@@ -374,6 +442,7 @@ pub(crate) fn note_full_write(session: &str, path: &Path, written_bytes: usize) 
                     seen_through: written_bytes,
                     total_bytes: written_bytes,
                     tainted: false,
+                    transformed: false,
                 },
             );
             ledger.touch_and_evict(key);
@@ -424,10 +493,30 @@ mod tests {
     // never observe each other (#2077/#2126: never assert on process-global
     // aggregates).
 
+    #[test]
+    fn transformed_view_never_completes_even_at_full_coverage() {
+        // #2193 R4 (codex H6): a PDF read shows extracted TEXT, not the on-disk
+        // bytes. Even paging that text to EOF must report Transformed, never
+        // Complete — else it authorizes overwriting the binary the model never
+        // actually saw.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pdf");
+        std::fs::write(&path, "x").unwrap();
+        let epoch = epoch_at(0, 500);
+        record_view("s", &path, epoch, 0, 500, 500, false, true);
+        assert_eq!(
+            view_status("s", &path),
+            ViewStatus::Transformed,
+            "full coverage of a transformed view must NOT be Complete",
+        );
+    }
+
     fn epoch_at(secs_ago: u64, size: u64) -> Option<ViewEpoch> {
         Some(ViewEpoch {
             mtime: SystemTime::now() - Duration::from_secs(secs_ago),
             size,
+            ctime: None,
+            inode: None,
         })
     }
 
@@ -453,7 +542,7 @@ mod tests {
         std::fs::write(&path, "x").unwrap();
         let epoch = epoch_at(0, 5000);
 
-        record_view("s", &path, epoch, 0, 2000, 5000, false);
+        record_view("s", &path, epoch, 0, 2000, 5000, false, false);
         assert_eq!(
             view_status("s", &path),
             ViewStatus::Partial {
@@ -463,7 +552,7 @@ mod tests {
             "a windowed view is partial"
         );
 
-        record_view("s", &path, epoch, 2000, 4000, 5000, false);
+        record_view("s", &path, epoch, 2000, 4000, 5000, false, false);
         assert_eq!(
             view_status("s", &path),
             ViewStatus::Partial {
@@ -473,7 +562,7 @@ mod tests {
             "contiguous pages extend the high-water mark"
         );
 
-        record_view("s", &path, epoch, 4000, 5000, 5000, false);
+        record_view("s", &path, epoch, 4000, 5000, 5000, false, false);
         assert_eq!(
             view_status("s", &path),
             ViewStatus::Complete {
@@ -491,8 +580,8 @@ mod tests {
         std::fs::write(&path, "x").unwrap();
         let epoch = epoch_at(0, 5000);
 
-        record_view("s", &path, epoch, 0, 2000, 5000, false);
-        record_view("s", &path, epoch, 2500, 5000, 5000, false); // bytes 2000..2500 never seen
+        record_view("s", &path, epoch, 0, 2000, 5000, false, false);
+        record_view("s", &path, epoch, 2500, 5000, 5000, false, false); // bytes 2000..2500 never seen
         assert_eq!(
             view_status("s", &path),
             ViewStatus::Partial {
@@ -509,9 +598,18 @@ mod tests {
         let path = dir.path().join("edited.txt");
         std::fs::write(&path, "x").unwrap();
 
-        record_view("s", &path, epoch_at(60, 5000), 0, 2000, 5000, false);
+        record_view("s", &path, epoch_at(60, 5000), 0, 2000, 5000, false, false);
         // Same mtime second, DIFFERENT size — still a different epoch.
-        record_view("s", &path, epoch_at(60, 6000), 2000, 4000, 6000, false);
+        record_view(
+            "s",
+            &path,
+            epoch_at(60, 6000),
+            2000,
+            4000,
+            6000,
+            false,
+            false,
+        );
         assert_eq!(
             view_status("s", &path),
             ViewStatus::Partial {
@@ -530,8 +628,8 @@ mod tests {
         std::fs::write(&path, "x").unwrap();
         let epoch = epoch_at(0, 100);
 
-        record_view("s", &path, epoch, 0, 50, 100, true); // sanitizer altered this view
-        record_view("s", &path, epoch, 50, 100, 100, false);
+        record_view("s", &path, epoch, 0, 50, 100, true, false); // sanitizer altered this view
+        record_view("s", &path, epoch, 50, 100, 100, false, false);
         assert_eq!(
             view_status("s", &path),
             ViewStatus::Tainted,
@@ -540,7 +638,7 @@ mod tests {
         );
 
         // A new epoch starts clean.
-        record_view("s", &path, epoch_at(0, 101), 0, 101, 101, false);
+        record_view("s", &path, epoch_at(0, 101), 0, 101, 101, false, false);
         assert!(
             matches!(view_status("s", &path), ViewStatus::Complete { .. }),
             "an untainted re-read of a new epoch completes"
@@ -553,7 +651,7 @@ mod tests {
         let path = dir.path().join("no_meta.txt");
         std::fs::write(&path, "x").unwrap();
 
-        record_view("s", &path, None, 0, 100, 100, false);
+        record_view("s", &path, None, 0, 100, 100, false, false);
         assert_eq!(
             view_status("s", &path),
             ViewStatus::Partial {
@@ -575,7 +673,7 @@ mod tests {
         let path = dir.path().join("keyless.txt");
         std::fs::write(&path, "0123456789").unwrap();
 
-        record_view("", &path, epoch_at(0, 10), 0, 10, 10, false);
+        record_view("", &path, epoch_at(0, 10), 0, 10, 10, false, false);
         assert_eq!(
             view_status("", &path),
             ViewStatus::Unknown,
@@ -597,7 +695,7 @@ mod tests {
         let path = dir.path().join("scoped.txt");
         std::fs::write(&path, "x").unwrap();
 
-        record_view("session-a", &path, epoch_at(0, 10), 0, 10, 10, false);
+        record_view("session-a", &path, epoch_at(0, 10), 0, 10, 10, false, false);
         assert!(matches!(
             view_status("session-a", &path),
             ViewStatus::Complete { .. }
@@ -615,7 +713,7 @@ mod tests {
         let path = dir.path().join("forgotten.txt");
         std::fs::write(&path, "x").unwrap();
 
-        record_view("s", &path, epoch_at(0, 10), 0, 5, 10, false);
+        record_view("s", &path, epoch_at(0, 10), 0, 5, 10, false, false);
         assert!(matches!(
             view_status("s", &path),
             ViewStatus::Partial { .. }
@@ -662,6 +760,8 @@ mod tests {
                 epoch: ViewEpoch {
                     mtime: std::fs::metadata(&path).unwrap().modified().unwrap(),
                     size: 10,
+                    ctime: None,
+                    inode: None,
                 },
             },
             "a size disagreement must not be recorded as COMPLETE"
@@ -683,7 +783,7 @@ mod tests {
         let path_of = |i: usize| dir.path().join(format!("f{i}.txt"));
 
         for i in 0..MAX_LEDGER_ENTRIES + 1 {
-            record_view(&session, &path_of(i), epoch, 0, 1, 1, false);
+            record_view(&session, &path_of(i), epoch, 0, 1, 1, false, false);
         }
         assert_eq!(
             view_status(&session, &path_of(0)),
@@ -711,7 +811,7 @@ mod tests {
         std::fs::write(&real, "x").unwrap();
         let canonical = real.canonicalize().unwrap();
 
-        record_view("s", &real, epoch_at(0, 10), 0, 5, 10, false);
+        record_view("s", &real, epoch_at(0, 10), 0, 5, 10, false, false);
         assert!(
             matches!(view_status("s", &canonical), ViewStatus::Partial { .. }),
             "the canonical form must see coverage recorded via the raw form"
