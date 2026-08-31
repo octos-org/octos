@@ -20292,7 +20292,31 @@ fn parse_git_history_line(line: &str) -> Option<UiGitHistoryItem> {
 }
 
 fn should_skip_pane_dir(label: &str) -> bool {
-    matches!(label, ".git" | "target" | "node_modules")
+    matches!(label, ".git" | "target" | "node_modules" | ".octos")
+}
+
+#[cfg(test)]
+mod artifact_pane_exclusion_tests {
+    use super::should_skip_pane_dir;
+
+    /// `.octos` is the harness's workspace-local data dir — sessions,
+    /// validator outcomes, and #1638 shell output spools (complete command
+    /// output). The workspace/artifact panes enumerate every file under the
+    /// workspace recursively; surfacing that internal state (and offering
+    /// spools as openable artifacts) leaks working data the user never
+    /// produced. Runs in CI via the `artifact_pane` filter step (api-gated
+    /// module — an unmatched filter never runs, #2029).
+    #[test]
+    fn should_skip_octos_internal_dir_when_walking_panes() {
+        assert!(should_skip_pane_dir(".octos"));
+        // The existing exclusions stay.
+        assert!(should_skip_pane_dir(".git"));
+        assert!(should_skip_pane_dir("target"));
+        assert!(should_skip_pane_dir("node_modules"));
+        // Real project content still walks.
+        assert!(!should_skip_pane_dir("src"));
+        assert!(!should_skip_pane_dir("docs"));
+    }
 }
 
 fn format_size(bytes: u64) -> String {

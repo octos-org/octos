@@ -25,6 +25,13 @@ pub struct LinuxContainerSandbox {
 }
 
 impl Sandbox for LinuxContainerSandbox {
+    fn workspace_scratch_writable(&self) -> bool {
+        // A #1976 fence already degraded `workspace_write` to `false` at
+        // construction (`fence_degraded_workspace_write`), so this single
+        // flag covers both the read-only profile and the fenced one.
+        self.workspace_write
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let Some(helper_path) = find_sandbox_helper_path() else {
             tracing::error!("octos-sandbox helper not found, refusing unsandboxed Linux command");

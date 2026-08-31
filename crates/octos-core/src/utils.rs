@@ -1,5 +1,34 @@
 //! Shared utility functions.
 
+/// Workspace-relative components of the shell tool's full-output spool
+/// directory (#1638): `<workspace>/.octos/tmp/shell`.
+pub const SHELL_SPOOL_COMPONENTS: [&str; 3] = [".octos", "tmp", "shell"];
+
+/// True when `path` contains the shell spool directory component run
+/// (`.octos/tmp/shell`) anywhere along it.
+///
+/// Spool files hold complete (sanitized) command output and exist ONLY so
+/// the model can grep past its own output cap — they are internal working
+/// state, not user artifacts. Every surface that sweeps workspace files
+/// outward (the `send_file` allowlist, artifact-contract globbing, the UI
+/// artifact pane) uses this predicate to keep them out of outbound bundles.
+/// Component-wise matching is separator- and canonicalization-independent,
+/// so the same check holds on Windows paths and on partially resolved ones.
+pub fn is_shell_spool_path(path: &std::path::Path) -> bool {
+    let names: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    names.windows(SHELL_SPOOL_COMPONENTS.len()).any(|w| {
+        w.iter()
+            .zip(SHELL_SPOOL_COMPONENTS.iter())
+            .all(|(seen, want)| *seen == std::ffi::OsStr::new(want))
+    })
+}
+
 /// Truncate a string in-place at a UTF-8 safe boundary, appending a suffix.
 ///
 /// Does nothing if `s.len() <= max_len`.
@@ -226,6 +255,25 @@ mod tests {
         // Should not panic or produce invalid UTF-8
         assert!(result.is_char_boundary(0));
         assert!(result.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn should_match_spool_component_run_when_checking_shell_spool_paths() {
+        use std::path::Path;
+        assert!(is_shell_spool_path(Path::new(
+            "/ws/.octos/tmp/shell/output-1-0.log"
+        )));
+        assert!(is_shell_spool_path(Path::new(".octos/tmp/shell/x.log")));
+        assert!(is_shell_spool_path(Path::new(
+            "/deep/nested/ws/.octos/tmp/shell"
+        )));
+        // Partial runs and lookalikes do not match.
+        assert!(!is_shell_spool_path(Path::new(
+            "/ws/.octos/tmp/other/x.log"
+        )));
+        assert!(!is_shell_spool_path(Path::new("/ws/.octos/shell/x.log")));
+        assert!(!is_shell_spool_path(Path::new("/ws/tmp/shell/x.log")));
+        assert!(!is_shell_spool_path(Path::new("/ws/src/main.rs")));
     }
 
     #[test]
