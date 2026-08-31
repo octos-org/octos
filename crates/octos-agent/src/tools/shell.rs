@@ -67,6 +67,13 @@ pub struct ShellTool {
     /// deadline. `None` = no extra cap (only the outer `[1, 600]s` clamp
     /// applies) — unchanged behaviour for every existing caller.
     max_timeout: Option<Duration>,
+    /// Recent output spools, newest first: `(command, spool path)` for the
+    /// last [`SPOOL_KEEP`] commands whose output exceeded the per-tool cap
+    /// and was written to a full-output file (#1638). Consulted by
+    /// [`Tool::truncation_recovery`] so that if the execution-loop backstop
+    /// still cuts a result, the recovery advice can name the exact file
+    /// holding the complete output.
+    spools: std::sync::Mutex<std::collections::VecDeque<(String, PathBuf)>>,
 }
 
 impl ShellTool {
@@ -84,7 +91,18 @@ impl ShellTool {
             task_ledger_path: None,
             background_allowed: true,
             max_timeout: None,
+            spools: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Record a freshly written spool for `command` (newest first, bounded to
+    /// [`SPOOL_KEEP`] entries; a re-run of the same command replaces its
+    /// older entry).
+    fn remember_spool(&self, command: &str, path: PathBuf) {
+        let mut spools = self.spools.lock().unwrap_or_else(|p| p.into_inner());
+        spools.retain(|(c, _)| c != command);
+        spools.push_front((command.to_owned(), path));
+        spools.truncate(SPOOL_KEEP);
     }
 
     /// Cap the effective per-command timeout at `cap_secs` (a hard CEILING).
@@ -834,6 +852,197 @@ fn background_label(command: &str) -> String {
     label
 }
 
+// ---------------------------------------------------------------------------
+// Output spooling (#1638)
+//
+// A `shell` result over `octos_core::tool_output_limit("shell")` used to be
+// head/tail-cut with `[N bytes omitted]` — the omitted middle (where `cargo
+// test` / `npm test` failures live) was gone forever, and the model's only
+// recovery was re-running the command, paying the run AND the tokens again.
+// Instead, the FULL combined stream is written to a workspace-local spool
+// file and the inline result becomes head + tail + a footer naming the exact
+// line ranges shown, the total, and the file — so the model can grep/read
+// the file instead of re-running.
+//
+// Placement: `<workspace>/.octos/tmp/shell/`. The workspace is the ONE
+// location every sandbox backend lets the model's follow-up shell command
+// read: bwrap tmpfs-shadows host /tmp (`--tmpfs /tmp`), the macOS
+// restricted-read profile and Landlock grant the cwd, and NoSandbox reads
+// anything. `.octos/` inside the workspace is already established
+// harness-write territory (sessions, `.octos/work`, validator outcomes), and
+// a `*` gitignore inside the spool dir keeps the files out of `git status`
+// and out of the #28a change receipt. (Docker with a mounted workspace
+// remaps the path to `/workspace`; the harness-side `grep`/`read_file`
+// tools still resolve the host path.)
+//
+// Lifecycle: newest SPOOL_KEEP files per workspace; older ones are deleted
+// on the next spool write. No daemon.
+// ---------------------------------------------------------------------------
+
+/// Byte budget reserved for everything appended after the inline view (exit
+/// code suffix, sandbox-denial hint, #28a change receipt, warn nudge) so the
+/// assembled result stays within the execution loop's per-tool cap and the
+/// backstop never re-cuts the spool footer away.
+const SPOOL_TAIL_RESERVE: usize = 2_048;
+
+/// Retention bound: newest spool files kept per workspace.
+const SPOOL_KEEP: usize = 16;
+
+/// Monotonic per-process suffix so two spools written within the same
+/// millisecond cannot collide on a filename.
+static SHELL_SPOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Workspace-local directory holding full-output spool files.
+fn spool_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".octos").join("tmp").join("shell")
+}
+
+/// Write `full` to a fresh spool file under [`spool_dir`], pruning the dir to
+/// [`SPOOL_KEEP`] files. Returns `None` on any I/O failure (unwritable
+/// filesystem): the caller falls back to the historic truncate-only path.
+fn write_spool(cwd: &Path, full: &str) -> Option<PathBuf> {
+    let dir = spool_dir(cwd);
+    std::fs::create_dir_all(&dir).ok()?;
+    // Keep spools invisible to `git status` (and thereby to the #28a change
+    // receipt): a `*` gitignore inside the dir ignores everything in it,
+    // itself included.
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        let _ = std::fs::write(&gitignore, "*\n");
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = SHELL_SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Fixed-width stamp: lexicographic filename order == recency order, which
+    // is what `prune_spools` sorts by.
+    let path = dir.join(format!("output-{millis:013}-{seq:04}.log"));
+    // `create_new`: never write through a pre-existing file or symlink.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    std::io::Write::write_all(&mut file, full.as_bytes()).ok()?;
+    prune_spools(&dir);
+    Some(path)
+}
+
+/// Delete the oldest `output-*.log` files beyond [`SPOOL_KEEP`].
+fn prune_spools(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<std::ffi::OsString> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|n| {
+            let n = n.to_string_lossy();
+            n.starts_with("output-") && n.ends_with(".log")
+        })
+        .collect();
+    if names.len() <= SPOOL_KEEP {
+        return;
+    }
+    names.sort();
+    let excess = names.len() - SPOOL_KEEP;
+    for name in names.into_iter().take(excess) {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+}
+
+/// Count lines the way `str::lines` does: a trailing newline does not open a
+/// final empty line.
+fn count_lines(s: &str) -> usize {
+    if s.is_empty() {
+        return 0;
+    }
+    let newlines = s.bytes().filter(|&b| b == b'\n').count();
+    newlines + usize::from(!s.ends_with('\n'))
+}
+
+/// Head + tail view of a spooled output, within `budget` bytes, ending in a
+/// pi-style footer that names the exact line ranges shown, the total, and
+/// the spool file holding the complete stream.
+///
+/// Head and tail are cut on line boundaries whenever one fits, so the footer
+/// ranges are exact; when a single line overflows its budget the cut is
+/// byte-based and the footer switches to a byte-range form rather than
+/// reporting line numbers that would be lies.
+fn spooled_view(full: &str, budget: usize, spool_path: &Path) -> String {
+    let total_lines = count_lines(full);
+    let path_disp = spool_path.display().to_string();
+    // Conservative allowance for the omission marker + footer (digits
+    // included): marker ≤ 40B, footer ≤ 120B + path.
+    let overhead = 160 + path_disp.len();
+    let avail = budget.saturating_sub(overhead);
+    let head_budget = avail * 7 / 10;
+    let tail_budget = avail - head_budget;
+
+    // Head: largest prefix within budget, preferring to end on a line
+    // boundary (newline included).
+    let mut head_end = head_budget.min(full.len());
+    while head_end > 0 && !full.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let head_aligned = match full[..head_end].rfind('\n') {
+        Some(i) => {
+            head_end = i + 1;
+            true
+        }
+        None => false,
+    };
+
+    // Tail: largest suffix within budget, preferring to start at a line
+    // start.
+    let mut tail_start = full.len().saturating_sub(tail_budget).max(head_end);
+    while tail_start < full.len() && !full.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let tail_aligned = if tail_start == 0 || full[..tail_start].ends_with('\n') {
+        true
+    } else {
+        match full[tail_start..].find('\n') {
+            // Skip past the partial first line — unless that newline is the
+            // very last byte (the whole tail slice was one partial line).
+            Some(i) if tail_start + i + 1 < full.len() => {
+                tail_start += i + 1;
+                true
+            }
+            _ => false,
+        }
+    };
+
+    let head = &full[..head_end];
+    let tail = &full[tail_start..];
+    let omitted = tail_start - head_end;
+
+    let footer = if head_aligned && tail_aligned && !head.is_empty() && !tail.is_empty() {
+        // Both cuts landed on line boundaries: head shows complete lines
+        // 1..=head_lines, tail shows the last tail_lines lines.
+        let head_lines = count_lines(head);
+        let tail_lines = count_lines(tail);
+        let tail_first = total_lines - tail_lines + 1;
+        format!(
+            "\n\n[Showing lines 1-{head_lines} and {tail_first}-{total_lines} of {total_lines}. Full output: {path_disp}]"
+        )
+    } else {
+        format!(
+            "\n\n[Showing first {head_end} and last {} bytes of {} ({total_lines} lines). Full output: {path_disp}]",
+            tail.len(),
+            full.len()
+        )
+    };
+
+    let mut view = String::with_capacity(head.len() + tail.len() + footer.len() + 48);
+    view.push_str(head);
+    view.push_str(&format!("\n\n... [{omitted} bytes omitted] ...\n\n"));
+    view.push_str(tail);
+    view.push_str(&footer);
+    view
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -841,7 +1050,43 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return the output. Use this to run tests, build code, or interact with the filesystem."
+        // The spool contract is part of the tool contract (pi's bash wording
+        // as the model): warned up front, the model greps the named file
+        // instead of re-running a big command.
+        static DESC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "Execute a shell command and return the output. Use this to run tests, build code, or interact with the filesystem. Output over {}KB is truncated to head and tail; when that happens the full output is saved to a temp file named in the result footer — grep or read that file instead of re-running the command.",
+                octos_core::tool_output_limit("shell") / 1000
+            )
+        });
+        &DESC
+    }
+
+    /// Belt-and-braces for the execution loop's truncation backstop (#2124):
+    /// the tool already keeps its own result under the cap by spooling, but
+    /// if the backstop still fires (e.g. a large #28a receipt pushed the
+    /// total over), the advice names the spool file holding the complete
+    /// output. Without a recorded spool the honest resume path is a re-run
+    /// redirected to a file.
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let command = args.get("command").and_then(serde_json::Value::as_str)?;
+        let spools = self.spools.lock().unwrap_or_else(|p| p.into_inner());
+        Some(match spools.iter().find(|(c, _)| c == command) {
+            Some((_, path)) => format!(
+                "[{omitted_bytes} bytes omitted] The complete output of this command was saved \
+                 to {} — grep or read_file that file instead of re-running the command.",
+                path.display()
+            ),
+            None => format!(
+                "[{omitted_bytes} bytes omitted] Re-run with output redirected to a file (e.g. \
+                 `<command> > out.log 2>&1`), then grep or read the file instead of re-running \
+                 for the full output."
+            ),
+        })
     }
 
     fn tags(&self) -> &[&str] {
@@ -1139,14 +1384,35 @@ impl Tool for ShellTool {
                     &result_text,
                 );
 
-                // Truncate if too long (reserve space for exit code suffix)
                 let exit_suffix = format!("\n\nExit code: {exit_code}");
-                const MAX_OUTPUT: usize = 50000;
-                octos_core::truncate_utf8(
-                    &mut result_text,
-                    MAX_OUTPUT - exit_suffix.len(),
-                    "\n... (output truncated)",
-                );
+
+                // #1638 — over the per-tool cap the middle of the output (where
+                // test failures live) used to be gone forever. Spool the FULL
+                // stream to a workspace-local file and return head + tail + a
+                // footer naming the file, sized so the execution loop's
+                // backstop never re-cuts the result. If the spool cannot be
+                // written (unwritable filesystem), fall back to the historic
+                // in-tool tail cut and let the backstop apply as before.
+                let limit = octos_core::tool_output_limit(self.name());
+                if result_text.len() > limit {
+                    match write_spool(effective_cwd, &result_text) {
+                        Some(spool_path) => {
+                            let budget =
+                                limit.saturating_sub(exit_suffix.len() + SPOOL_TAIL_RESERVE);
+                            let view = spooled_view(&result_text, budget, &spool_path);
+                            self.remember_spool(&input.command, spool_path);
+                            result_text = view;
+                        }
+                        None => {
+                            const MAX_OUTPUT: usize = 50000;
+                            octos_core::truncate_utf8(
+                                &mut result_text,
+                                MAX_OUTPUT - exit_suffix.len(),
+                                "\n... (output truncated)",
+                            );
+                        }
+                    }
+                }
 
                 result_text.push_str(&exit_suffix);
                 if let Some(hint) = denial_hint {
@@ -2662,5 +2928,280 @@ mod change_receipt_tests {
             .filter(|l| l.trim_start().starts_with("many/"))
             .count();
         assert_eq!(listed_count, 20, "exactly 20 listed (cap): {receipt}");
+    }
+}
+
+#[cfg(test)]
+mod spool_tests {
+    use super::*;
+
+    fn run(tool: &ShellTool, command: &str) -> ToolResult {
+        tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(tool.execute(&serde_json::json!({ "command": command })))
+            .expect("execute")
+    }
+
+    /// Extract the spool path named by the footer's `Full output: <path>]`.
+    fn footer_path(output: &str) -> std::path::PathBuf {
+        let marker = "Full output: ";
+        let start = output
+            .rfind(marker)
+            .expect("footer must name the spool file")
+            + marker.len();
+        let rest = &output[start..];
+        let end = rest.find(']').expect("footer must close with ]");
+        std::path::PathBuf::from(&rest[..end])
+    }
+
+    #[cfg(unix)]
+    // POSIX shell command shapes (awk) — same convention as the #34e gates above.
+    #[test]
+    fn should_spool_full_output_with_footer_when_output_exceeds_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        // Deterministic >cap output: 12000 numbered lines (~130KB vs the 30KB cap).
+        let cmd = "awk 'BEGIN { for (i = 1; i <= 12000; i++) print \"line \" i }'";
+        let out = run(&tool, cmd);
+        assert!(out.success, "output: {}", out.output);
+
+        // The inline view fits the per-tool cap so the loop backstop never
+        // re-cuts it (which would bury the footer under `[bytes omitted]`).
+        let limit = octos_core::tool_output_limit("shell");
+        assert!(
+            out.output.len() <= limit,
+            "inline view must fit the {limit}B cap, got {}",
+            out.output.len()
+        );
+
+        // Head and tail both survive the cut.
+        assert!(
+            out.output.contains("line 1\n"),
+            "head lost: {}",
+            &out.output[..200]
+        );
+        assert!(out.output.contains("line 12000"), "tail lost");
+
+        // pi-style footer: exact line ranges shown, the total, and the file.
+        assert!(
+            out.output.contains("[Showing lines 1-"),
+            "footer must name the shown ranges: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains(" of 12000. Full output: "),
+            "footer must name the total line count: {}",
+            out.output
+        );
+
+        // The named file exists and holds the COMPLETE stream byte-for-byte.
+        let path = footer_path(&out.output);
+        assert!(path.exists(), "spool file must exist: {}", path.display());
+        let expected: String = (1..=12000).map(|i| format!("line {i}\n")).collect();
+        let spooled = std::fs::read_to_string(&path).expect("read spool");
+        assert_eq!(
+            spooled, expected,
+            "spool must hold the full untruncated output"
+        );
+
+        // Inside the workspace: the one location every sandbox backend lets a
+        // follow-up sandboxed shell command read (bwrap tmpfs-shadows host
+        // /tmp; macOS/Landlock restricted profiles always grant the cwd).
+        assert!(
+            path.starts_with(temp.path()),
+            "spool must live under the workspace: {}",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_report_line_ranges_matching_shown_content_when_spooled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        let out = run(
+            &tool,
+            "awk 'BEGIN { for (i = 1; i <= 12000; i++) print \"line \" i }'",
+        );
+        assert!(out.success, "output: {}", out.output);
+
+        // Parse `[Showing lines 1-H and T-12000 of 12000. Full output: ...]`.
+        let tag = "[Showing lines 1-";
+        let at = out.output.rfind(tag).expect("line-range footer") + tag.len();
+        let rest = &out.output[at..];
+        let h: usize = rest[..rest.find(' ').expect("space after head range")]
+            .parse()
+            .expect("head end line number");
+        let rest = &rest[rest.find("and ").expect("and") + 4..];
+        let t: usize = rest[..rest.find('-').expect("dash")]
+            .parse()
+            .expect("tail start line number");
+
+        // The ranges must be TRUE: the head really ends at line H (marker
+        // follows) and the tail really resumes at line T.
+        assert!(
+            out.output.contains(&format!("line {h}\n\n\n... [")),
+            "head must end exactly at line {h}: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains(&format!("] ...\n\nline {t}\n")),
+            "tail must resume exactly at line {t}: {}",
+            out.output
+        );
+        assert!(h < t && t <= 12000, "sane ranges: h={h} t={t}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_return_output_unchanged_and_no_spool_when_output_under_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        let out = run(&tool, "echo hi");
+        assert!(out.success);
+        // Byte-identical to the historic small-output shape (stdout keeps its
+        // trailing newline, then the exit-code suffix): no footer, no marker,
+        // nothing appended.
+        assert_eq!(out.output, "hi\n\n\nExit code: 0");
+        // And no spool artifacts created for it.
+        assert!(
+            !temp.path().join(".octos").exists(),
+            "small output must not create a spool dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_name_spool_path_in_truncation_recovery_when_backstop_fires() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        let cmd = "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"row \" i }'";
+        let out = run(&tool, cmd);
+        let path = footer_path(&out.output);
+
+        // Belt-and-braces (#2124 hook): if the loop backstop still cuts the
+        // result, the advice names the spool holding the full output.
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "command": cmd }), 4321)
+            .expect("shell must offer recovery advice after spooling");
+        assert!(
+            advice.contains(&path.display().to_string()),
+            "advice must name the spool path: {advice}"
+        );
+        assert!(
+            advice.contains("4321"),
+            "advice names omitted bytes: {advice}"
+        );
+    }
+
+    #[test]
+    fn should_advise_rerun_with_redirect_when_no_spool_recorded_for_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "command": "echo hi" }), 100)
+            .expect("generic advice when no spool exists");
+        assert!(
+            advice.contains("2>&1"),
+            "fallback advice suggests redirecting to a file: {advice}"
+        );
+        assert!(
+            advice.contains("100"),
+            "advice names omitted bytes: {advice}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_prune_spool_dir_to_capacity_when_spools_accumulate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Seed the spool dir with MORE than the retention cap of old spools
+        // (all created by THIS test in its own tempdir).
+        let dir = temp.path().join(".octos").join("tmp").join("shell");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for i in 0..20 {
+            std::fs::write(
+                dir.join(format!("output-0000000000000-{i:04}.log")),
+                "old\n",
+            )
+            .expect("seed spool");
+        }
+        let tool = ShellTool::new(temp.path());
+        let out = run(
+            &tool,
+            "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"p \" i }'",
+        );
+        let new_path = footer_path(&out.output);
+        assert!(new_path.exists(), "fresh spool must survive pruning");
+        let count = std::fs::read_dir(&dir)
+            .expect("read spool dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("output-") && n.ends_with(".log")
+            })
+            .count();
+        // Retention bound: keep the newest 16 spools per workspace.
+        assert!(
+            count <= 16,
+            "spool dir must stay bounded, got {count} files"
+        );
+    }
+
+    #[test]
+    fn should_use_byte_footer_when_single_line_exceeds_budget() {
+        // One giant unterminated line: no line boundary fits either budget,
+        // so line numbers would be lies — the footer must switch to the
+        // byte-range form and the view must still respect the budget.
+        let spool = std::path::Path::new("/tmp/spool-under-test.log");
+        let full = "x".repeat(100_000);
+        let view = spooled_view(&full, 5_000, spool);
+        assert!(
+            view.contains("[Showing first "),
+            "byte-form footer expected: {view}"
+        );
+        assert!(
+            view.contains("bytes of 100000 (1 lines). Full output: "),
+            "byte-form footer names totals: {view}"
+        );
+        assert!(!view.contains("[Showing lines"), "no fake line ranges");
+        assert!(
+            view.len() <= 5_000,
+            "view must fit budget, got {}",
+            view.len()
+        );
+    }
+
+    #[test]
+    fn should_keep_view_within_budget_when_line_data_spooled() {
+        let spool = std::path::Path::new("/tmp/spool-under-test.log");
+        let full: String = (1..=5_000).map(|i| format!("entry number {i}\n")).collect();
+        let budget = 8_000;
+        let view = spooled_view(&full, budget, spool);
+        assert!(
+            view.len() <= budget,
+            "view must fit budget {budget}, got {}",
+            view.len()
+        );
+        assert!(view.starts_with("entry number 1\n"), "head preserved");
+        assert!(view.contains("entry number 5000"), "tail preserved");
+        assert!(
+            view.contains(" of 5000. Full output: "),
+            "line footer: {view}"
+        );
+    }
+
+    #[test]
+    fn should_state_spool_contract_in_description() {
+        let tool = ShellTool::new("/tmp");
+        let desc = tool.description();
+        assert!(
+            desc.contains("truncated"),
+            "description warns about truncation: {desc}"
+        );
+        assert!(
+            desc.contains("full output is saved"),
+            "description states the spool contract: {desc}"
+        );
     }
 }
