@@ -150,6 +150,10 @@ impl AnthropicProvider {
         if cache.is_some() {
             apply_message_cache_breakpoint(&mut api_messages);
         }
+        let thinking = config
+            .reasoning_effort
+            .and_then(|effort| build_anthropic_thinking(effort, max_tokens));
+        let (temperature, top_p, top_k) = self.sampling_fields(config);
         AnthropicRequest {
             model: &self.model,
             max_tokens,
@@ -199,12 +203,141 @@ impl AnthropicProvider {
                         .collect(),
                 )
             },
-            thinking: config
-                .reasoning_effort
-                .and_then(|effort| build_anthropic_thinking(effort, max_tokens)),
+            thinking,
             context_management: config.context_management.as_ref(),
+            temperature,
+            top_p,
+            top_k,
         }
     }
+
+    /// Resolve the request's sampling fields (`temperature`, `top_p`,
+    /// `top_k`) from the config, **model-capability-aware** (#2172 — before
+    /// this, the whole Anthropic protocol path silently ignored both knobs;
+    /// a first cut then over-corrected and forwarded them to every model,
+    /// which 400s modern first-party Claude).
+    ///
+    /// Which knobs a model accepts is decided by [`model_accepts_sampling`],
+    /// a default-DENY GLM allowlist: GLM via z.ai (`zai` / `zai-coding`)
+    /// accepts the standard sampler set — the repetition-collapse knobs this
+    /// change exists to deliver — while every other model accepts nothing on
+    /// this path, including first-party Claude (Opus 4.7+/Sonnet 5 REMOVED
+    /// `temperature`/`top_p`/`top_k` and 400 on them; we ship
+    /// `claude-opus-4-7`) and any custom endpoint pointed here. A model that
+    /// rejects a sampler never receives it.
+    ///
+    /// Within an accepting model:
+    /// - `temperature` rides through only when non-zero. `Some(0.0)` is the
+    ///   plumbing's built-in default (see the `build_chat_config` invariant
+    ///   in octos-agent), indistinguishable from "unset" here, so it stays
+    ///   off the wire and no-override requests remain byte-identical to the
+    ///   pre-#2172 shape (prompt-cache prefixes depend on it). Near-greedy
+    ///   decoding is available via e.g. `0.01`.
+    /// - From `sampling_params`, only `top_p` / `top_k` exist on the
+    ///   Anthropic Messages API; every other key (`repeat_penalty`,
+    ///   `frequency_penalty`, `min_p`, …) is dropped with a `warn` naming it,
+    ///   so operators learn why the knob did nothing. `sampling_params` is
+    ///   operator-config-only (stock/internal flows leave it `None`), so the
+    ///   warn never cries wolf.
+    ///
+    /// Rejecting-model suppression is logged at `debug`, not `warn`: stock
+    /// octos reaches it without operator input (compaction and rich_output
+    /// both set `temperature: 0.2` and can target a Claude model), so a warn
+    /// would fire on ordinary turns.
+    fn sampling_fields<'a>(
+        &self,
+        config: &'a ChatConfig,
+    ) -> (
+        Option<f32>,
+        Option<&'a serde_json::Value>,
+        Option<&'a serde_json::Value>,
+    ) {
+        let accepts = model_accepts_sampling(&self.model);
+
+        // 0.0 is the built-in default sentinel; never emit it (see doc).
+        let temperature = config.temperature.filter(|t| *t != 0.0);
+        let mut top_p = None;
+        let mut top_k = None;
+        let mut dropped: Vec<&str> = Vec::new();
+        if let Some(params) = &config.sampling_params {
+            for (key, value) in params {
+                // The guard folds capability into the match: on a rejecting
+                // model `accepts` is false, so `top_p`/`top_k` fall through to
+                // the drop arm exactly like an unknown key — a rejected
+                // sampler can never reach the wire.
+                match key.as_str() {
+                    "top_p" if accepts => top_p = Some(value),
+                    "top_k" if accepts => top_k = Some(value),
+                    other => dropped.push(other),
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            tracing::warn!(
+                provider = %self.provider_label,
+                model = %self.model,
+                dropped_keys = ?dropped,
+                accepts_sampling = accepts,
+                "sampling_params keys not accepted by this model on the \
+                 Anthropic Messages API were dropped (first-party Claude \
+                 accepts none; GLM via z.ai accepts only top_p / top_k)"
+            );
+        }
+
+        if accepts {
+            (temperature, top_p, top_k)
+        } else {
+            if temperature.is_some() {
+                tracing::debug!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    temperature = ?temperature,
+                    "model does not accept sampling params on the Anthropic \
+                     Messages API: suppressing temperature (reverts to the \
+                     pre-#2172 no-sampling wire)"
+                );
+            }
+            (None, None, None)
+        }
+    }
+}
+
+/// Whether `model` accepts the standard sampler set (`temperature`, `top_p`,
+/// `top_k`) on the Anthropic Messages API protocol (#2172).
+///
+/// **Default-DENY with a GLM allowlist.** The only class reached by this
+/// provider that is known to accept sampling is GLM via z.ai (the `zai` /
+/// `zai-coding` families, bare model `glm-*` — the repetition-collapse knobs
+/// this change exists to deliver). Everything else returns `false`:
+/// - **first-party Claude** (`anthropic`, and `r9s` claude-* proxies).
+///   Modern Claude (Opus 4.7+, Sonnet 5, …) REMOVED `temperature`/`top_p`/
+///   `top_k` from the Messages API and returns a hard 400 on them; we ship
+///   `claude-opus-4-7` in `model_catalog.json`. Reverting Claude to the
+///   pre-#2172 no-sampling wire is the safe direction — this PR was never
+///   about tuning first-party sampling.
+/// - **any other model an operator might point at this provider** — a
+///   non-GLM OpenAI-path model, a self-hosted endpoint, the empty string.
+///   origin/main forwarded nothing to any of them, so default-deny keeps
+///   them no-worse-than-today (a default-ACCEPT gate would newly 400 a
+///   custom endpoint that rejects sampling).
+///
+/// Matched on the normalized last path segment (lowercased; the segment after
+/// the final `/`, since a custom base_url can pass a family-qualified
+/// `anthropic/claude-*` or `vendor/glm-*`). Default-deny closes the qualified
+/// bypass for free: only an affirmative `glm-` prefix accepts, so a
+/// `claude-*` anywhere in the string — prefix or after a `/` — gets nothing.
+/// The registry strips the catalog's `<family>/` prefix before construction
+/// (`registry::mod` `split_once('/')`), so in practice the model arrives bare;
+/// the segment split only guards the custom-base_url case.
+///
+/// Follow-ups deliberately out of scope (kept minimal and safe): a per-model
+/// Claude carve-out to re-enable sampling on ≤4.6, a broader allowlist for
+/// other Anthropic-compatible endpoints that accept sampling, and any
+/// narrowing of the GLM set under extended thinking (GLM is treated as
+/// accepting the full set; see the PR's stated assumption).
+fn model_accepts_sampling(model: &str) -> bool {
+    let leaf = model.rsplit('/').next().unwrap_or(model);
+    leaf.trim().to_ascii_lowercase().starts_with("glm-")
 }
 
 #[async_trait]
@@ -401,6 +534,18 @@ struct AnthropicRequest<'a> {
     /// non-null and the caller opted in via the builder.
     #[serde(skip_serializing_if = "Option::is_none")]
     context_management: Option<&'a serde_json::Value>,
+    /// Operator temperature override (#2172). `None` both when unset and
+    /// when the config carries the built-in `0.0` default sentinel — absent
+    /// keeps the no-override wire byte-identical to the pre-#2172 shape.
+    /// See [`AnthropicProvider::sampling_fields`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    /// `top_p` from `ChatConfig::sampling_params`, forwarded verbatim (#2172).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<&'a serde_json::Value>,
+    /// `top_k` from `ChatConfig::sampling_params`, forwarded verbatim (#2172).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<&'a serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -1927,5 +2072,334 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         let blocks = msgs.last().unwrap()["content"].as_array().unwrap();
         assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+    }
+    // --- sampling params on the Anthropic protocol path (#2172) ---
+    //
+    // Emission is MODEL-CAPABILITY-AWARE: first-party Claude (claude-*, incl.
+    // Opus 4.7 which we ship) rejects sampling on the Messages API and must
+    // receive NONE (reverting to the pre-#2172 wire); GLM via z.ai accepts
+    // temperature/top_p/top_k. The `model_accepts_sampling` gate below is
+    // pinned from both sides so a "forward to all" mutation fails the Claude
+    // tests and a "forward to none" mutation fails the GLM tests.
+
+    /// Pre-change golden serialization of a representative request (caching
+    /// ON: system + tool + user message, `ChatConfig::default()`), captured
+    /// on the rev before sampling support was added. The no-override wire
+    /// must stay byte-identical — prompt-cache prefixes and Anthropic-
+    /// compatible proxies depend on the exact shape.
+    const NO_OVERRIDE_GOLDEN: &str = r#"{"model":"claude-test","max_tokens":16384,"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}],"system":[{"type":"text","text":"system prompt","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"alpha","description":"first tool","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}]}"#;
+
+    fn fixture_for(model: &str) -> (AnthropicProvider, Vec<ToolSpec>, Vec<Message>) {
+        // Pin caching ON so the wire shape is hermetic w.r.t. an ambient
+        // `OCTOS_PROMPT_CACHING=0` (builder override wins over the env
+        // default), and so the goldens cover cache_control placement.
+        let provider = AnthropicProvider::new("test-key", model).with_prompt_caching(true);
+        let tools = vec![tool_spec("alpha", "first tool")];
+        let messages = vec![
+            msg(MessageRole::System, "system prompt"),
+            msg(MessageRole::User, "hello"),
+        ];
+        (provider, tools, messages)
+    }
+
+    /// First-party Claude, rejects sampling. `claude-opus-4-7` is a real
+    /// `model_catalog.json` entry whose API contract removed the sampler set.
+    fn claude_fixture() -> (AnthropicProvider, Vec<ToolSpec>, Vec<Message>) {
+        fixture_for("claude-opus-4-7")
+    }
+
+    /// GLM via z.ai (the `zai` / `zai-coding` families), accepts sampling.
+    fn glm_fixture() -> (AnthropicProvider, Vec<ToolSpec>, Vec<Message>) {
+        fixture_for("glm-5.3")
+    }
+
+    #[test]
+    fn should_accept_only_glm_and_reject_everything_else() {
+        // The capability gate is DEFAULT-DENY: GLM via z.ai is the sole
+        // affirmatively-accepting class; everything else — first-party Claude
+        // (bare AND family-qualified), other OpenAI-path models that could be
+        // pointed here, custom endpoints, and the empty string — gets
+        // nothing (safe direction; also matches origin/main, which forwarded
+        // no sampling to any Anthropic-path model). Pinned so a forward-to-all
+        // or forward-to-none regression is caught here before the
+        // request-shape tests.
+        for accept in [
+            // every GLM suffix the zai / zai-coding constructors can send
+            // (bare model, after the registry strips the `<family>/` prefix)
+            "glm-4.5-air",
+            "glm-4.7",
+            "glm-5-turbo",
+            "glm-5.1",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "GLM-5.3",        // case-insensitive
+            "zai/glm-4.7",    // family-qualified (custom base_url)
+            "vendor/glm-5.3", // any leading path segment
+        ] {
+            assert!(
+                model_accepts_sampling(accept),
+                "{accept} must be classified as ACCEPTING sampling"
+            );
+        }
+        for reject in [
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-3-5-haiku-20241022",
+            "claude-test",
+            "Claude-Opus-4-7",           // case-insensitive
+            "anthropic/claude-opus-4-7", // family-qualified claude (H1 bypass)
+            "r9s/claude-opus-4-7",       // proxied claude (H1 bypass)
+            "kimi-k2",                   // OpenAI-path model, not GLM
+            "minimax-m2.1",
+            "my-local-model", // unknown custom endpoint
+            "glmini",         // "glm" without the hyphen is not GLM
+            "",               // empty string
+        ] {
+            assert!(
+                !model_accepts_sampling(reject),
+                "{reject} must be classified as REJECTING sampling"
+            );
+        }
+    }
+
+    #[test]
+    fn should_serialize_byte_identical_golden_when_no_sampling_override_configured() {
+        let (provider, tools, messages) = fixture_for("claude-test");
+        // The agent loop's no-override shape: `ChatConfig::default()` carries
+        // the built-in `temperature: Some(0.0)` sentinel (see the #2172
+        // invariant in octos-agent's `build_chat_config`) and no
+        // sampling_params.
+        let config = ChatConfig::default();
+        let wire =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(wire, NO_OVERRIDE_GOLDEN);
+
+        // An explicitly-unset temperature must produce the very same bytes.
+        let config_none = ChatConfig {
+            temperature: None,
+            ..ChatConfig::default()
+        };
+        let wire_none =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config_none))
+                .unwrap();
+        assert_eq!(wire_none, NO_OVERRIDE_GOLDEN);
+    }
+
+    #[test]
+    fn should_emit_no_sampling_fields_on_accepting_model_when_no_override_configured() {
+        // Byte-identity's sibling on the ACCEPTING path: even a GLM model
+        // adds nothing when the operator configured no override (0.0
+        // sentinel, no sampling_params) — so cloud GLM requests are unchanged
+        // until an operator opts in.
+        let (provider, tools, messages) = glm_fixture();
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &ChatConfig::default()))
+                .unwrap();
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
+        assert!(body.get("top_k").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_forward_temperature_top_p_and_top_k_to_glm_when_operator_overrides() {
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        sp.insert("top_k".to_string(), serde_json::json!(40));
+        let config = ChatConfig {
+            // 0.5 is exactly representable in f32, so the f32 -> f64 widening
+            // in `serde_json::to_value` cannot skew the equality check.
+            temperature: Some(0.5),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(body["temperature"], serde_json::json!(0.5), "{body}");
+        assert_eq!(body["top_p"], serde_json::json!(0.9), "{body}");
+        assert_eq!(body["top_k"], serde_json::json!(40), "{body}");
+    }
+
+    #[test]
+    fn should_serialize_temperature_shortest_form_on_glm_wire() {
+        // The non-streaming path serializes the f32 directly (ryu shortest),
+        // so 0.7 reaches the wire as `0.7`, not the widened `0.699999…`.
+        let (provider, tools, messages) = glm_fixture();
+        let config = ChatConfig {
+            temperature: Some(0.7),
+            ..ChatConfig::default()
+        };
+        let wire =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(
+            wire.contains("\"temperature\":0.7"),
+            "temperature override must reach the wire with its exact value: {wire}"
+        );
+    }
+
+    #[test]
+    fn should_treat_zero_temperature_as_unset_sentinel_even_on_accepting_model() {
+        // 0.0 is the plumbing's built-in default (#2172); it is
+        // indistinguishable from "unset" and must never be emitted, even to a
+        // model that WOULD accept a real temperature.
+        let (provider, tools, messages) = glm_fixture();
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "the 0.0 default sentinel must stay off the wire: {body}"
+        );
+    }
+
+    #[test]
+    fn should_forward_top_p_top_k_and_drop_openai_only_keys_on_glm() {
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.95));
+        sp.insert("top_k".to_string(), serde_json::json!(40));
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        sp.insert("frequency_penalty".to_string(), serde_json::json!(0.5));
+        let config = ChatConfig {
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(body["top_p"], serde_json::json!(0.95), "{body}");
+        assert_eq!(body["top_k"], serde_json::json!(40), "{body}");
+        // OpenAI-only sampler knobs are NOT part of the Anthropic Messages
+        // API — they must be dropped (and logged), never forwarded verbatim.
+        assert!(body.get("repeat_penalty").is_none(), "{body}");
+        assert!(body.get("frequency_penalty").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_drop_modeled_keys_when_smuggled_via_sampling_params_on_glm() {
+        // Defense-in-depth, mirroring the OpenAI path (#2172): keys octos
+        // models with dedicated fields cannot sneak in through
+        // sampling_params and emit duplicate/divergent top-level keys.
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("temperature".to_string(), serde_json::json!(1.9));
+        sp.insert("max_tokens".to_string(), serde_json::json!(9));
+        let config = ChatConfig {
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "smuggled temperature must not reach the wire: {body}"
+        );
+        assert_eq!(
+            body["max_tokens"],
+            serde_json::json!(crate::context::default_max_tokens()),
+            "dedicated max_tokens field must win: {body}"
+        );
+    }
+
+    #[test]
+    fn should_keep_cache_breakpoints_unchanged_when_sampling_forwarded_to_glm() {
+        // #1640 interaction: sampling fields are top-level request fields and
+        // must not disturb cache_control placement (system block, LAST tool,
+        // last user content block — exactly three markers). Exercised on the
+        // ACCEPTING path so the sampling fields are actually present.
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        let config = ChatConfig {
+            temperature: Some(0.7),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let wire =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(
+            wire.matches("\"cache_control\"").count(),
+            3,
+            "exactly three breakpoints (system, last tool, last user block): {wire}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["tools"].as_array().unwrap().last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+        let blocks = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert!(body.get("temperature").is_some(), "{body}");
+        assert_eq!(body["top_p"], serde_json::json!(0.9), "{body}");
+    }
+
+    #[test]
+    fn should_not_send_any_sampling_to_first_party_claude_when_operator_overrides() {
+        // H3 core regression: without the model gate, an operator temperature
+        // (and any sampling_params) reach first-party Claude and 400 on
+        // Opus 4.7+. No thinking here — this must hold on the plain path too.
+        let (provider, tools, messages) = claude_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        sp.insert("top_k".to_string(), serde_json::json!(40));
+        let config = ChatConfig {
+            temperature: Some(0.7),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
+        assert!(body.get("top_k").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_not_send_any_sampling_to_opus_4_7_when_thinking_omitted_for_small_max_tokens() {
+        // H3 explicit: the small-max_tokens path drops `thinking` (no valid
+        // budget fits), which is exactly where the first cut leaked ALL
+        // sampling to Opus 4.7. The model gate must still suppress everything.
+        let (provider, tools, messages) = claude_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        let config = ChatConfig {
+            max_tokens: Some(1_000),
+            temperature: Some(0.7),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(body.get("thinking").is_none(), "budget cannot fit: {body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
+        assert!(body.get("top_k").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_not_send_top_p_to_first_party_claude_even_when_thinking_enabled() {
+        // H4: `thinking + top_p` 400s first-party Claude (top_p is only
+        // conditionally allowed under thinking, and not at all on 4.7+). The
+        // gate drops top_p regardless of the thinking block.
+        let (provider, tools, messages) = claude_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        let config = ChatConfig {
+            max_tokens: Some(32_768),
+            reasoning_effort: Some(ReasoningEffort::High),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled", "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
     }
 }

@@ -9,6 +9,14 @@ pub struct ChatConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// Temperature for sampling (0.0 = deterministic, 1.0 = creative).
+    ///
+    /// On the Anthropic protocol path, `Some(0.0)` — the built-in default —
+    /// is treated as "unset" and stays off the wire (the `#2172` invariant:
+    /// no-override requests must be byte-identical), and any value is
+    /// suppressed for every model except GLM via z.ai (a default-deny
+    /// allowlist: first-party Claude — Opus 4.7+/Sonnet 5 — and custom
+    /// endpoints reject sampling; GLM accepts it). Use e.g. `0.01` for
+    /// near-greedy decoding on GLM.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// How the model should choose tools.
@@ -39,6 +47,12 @@ pub struct ChatConfig {
     /// `min_p`, `frequency_penalty`, `presence_penalty`, …). `None` → nothing is
     /// added, so cloud requests are unchanged. Do not put `temperature` /
     /// `max_tokens` here — use their dedicated fields. See issue #2172.
+    ///
+    /// On the Anthropic protocol path only `top_p` / `top_k` exist in the
+    /// Messages API, and they are forwarded only to GLM via z.ai (a
+    /// default-deny allowlist); every other key — and everything, on any
+    /// non-GLM model (first-party Claude, custom endpoints), which rejects
+    /// sampling — is dropped with a warning naming the dropped keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
 }
