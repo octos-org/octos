@@ -291,6 +291,12 @@ jobs:
       - name: Test octos-fleet
         run: cargo test -p octos-fleet
 
+      # Same #2055 failure mode one crate over: octos-fleet-worker was absent
+      # from this list, so its suite (worker attempt gates — including the
+      # sandbox fail-closed terminations — pool, escalation) never ran in CI.
+      - name: Test octos-fleet-worker
+        run: cargo test -p octos-fleet-worker
+
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
 
