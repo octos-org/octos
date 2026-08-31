@@ -380,8 +380,8 @@ fn is_terminal(supervisor: &TaskSupervisor, task_id: &str) -> bool {
     }
 }
 
-/// #2194 review — the snapshot + summary a watcher last EMITTED, kept per
-/// watcher loop so an idle tick can be answered without an LLM call.
+/// #2194 review — the rendered prompt + summary a watcher last EMITTED,
+/// kept per watcher loop so an idle tick can be answered without an LLM call.
 ///
 /// An idle sub-agent rebuilds the byte-identical prompt every 30s tick
 /// (deterministic [`build_prompt`] over an unchanged activity tail). Dedupe
@@ -389,9 +389,18 @@ fn is_terminal(supervisor: &TaskSupervisor, task_id: &str) -> bool {
 /// prompt, a reused summary bills nothing — and it leaves every prompt that
 /// DOES reach the provider genuinely fresh, which is what justifies
 /// [`fetch_summary`]'s cache-write opt-out.
+///
+/// Round 2: the dedupe key is the CANONICAL RENDERED PROMPT, not the raw
+/// activity lines. `build_prompt` truncates each line to 400 chars, so two
+/// snapshots that differ only past char 400 produce the same prompt — the
+/// only correct key is the exact string that would hit the provider.
 struct LastTickSummary {
-    lines: Vec<String>,
+    prompt: String,
     summary: String,
+    /// When the summary was actually PRODUCED (the model call that emitted
+    /// it). Reused on deduped ticks so the event's `at` never lies about
+    /// production time; tick_seq alone conveys that the watcher is live.
+    produced_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,22 +416,32 @@ async fn summarize_tick(
     last: &mut Option<LastTickSummary>,
 ) -> Option<String> {
     let lines = activity.snapshot(task_id, window);
+    // Render the prompt FIRST: it is both the dedupe key and the exact bytes
+    // the provider would receive, so post-truncation-identical snapshots
+    // dedupe correctly.
+    let prompt = build_prompt(&lines);
 
-    // Unchanged snapshot => identical prompt => identical answer. Re-emit the
-    // previous summary (so runtime_detail's tick/at stay live) and skip the
-    // LLM round trip entirely. A changed snapshot, an LLM failure, or an
-    // empty summary all fall through to a real call — failures never latch.
+    // Unchanged rendered prompt => identical answer. Re-emit the previous
+    // summary with its ORIGINAL production timestamp (tick_seq still advances
+    // to show the watcher is live) and skip the LLM round trip entirely. A
+    // changed prompt, an LLM failure, or an empty summary all fall through to
+    // a real call — failures never latch.
     if let Some(prev) = last.as_ref()
-        && prev.lines == lines
+        && prev.prompt == prompt
     {
         let summary = prev.summary.clone();
-        emit_progress(supervisor, session_id, task_id, &summary, tick_seq);
+        emit_progress(
+            supervisor,
+            session_id,
+            task_id,
+            &summary,
+            tick_seq,
+            prev.produced_at,
+        );
         return Some(summary);
     }
 
-    let prompt = build_prompt(&lines);
-
-    let summary = match fetch_summary(Arc::clone(&provider), prompt, llm_timeout).await {
+    let summary = match fetch_summary(Arc::clone(&provider), prompt.clone(), llm_timeout).await {
         Ok(s) => s,
         Err(error) => {
             tracing::warn!(
@@ -440,11 +459,20 @@ async fn summarize_tick(
         return None;
     }
 
+    let produced_at = Utc::now();
     *last = Some(LastTickSummary {
-        lines,
+        prompt,
         summary: trimmed.clone(),
+        produced_at,
     });
-    emit_progress(supervisor, session_id, task_id, &trimmed, tick_seq);
+    emit_progress(
+        supervisor,
+        session_id,
+        task_id,
+        &trimmed,
+        tick_seq,
+        produced_at,
+    );
     Some(trimmed)
 }
 
@@ -454,13 +482,14 @@ fn emit_progress(
     task_id: &str,
     summary: &str,
     tick_seq: u32,
+    produced_at: chrono::DateTime<chrono::Utc>,
 ) {
     let event = HarnessEvent::subagent_progress(
         session_id.to_string(),
         task_id.to_string(),
         summary.to_string(),
         tick_seq,
-        Utc::now(),
+        produced_at,
     );
     if let Err(error) = supervisor.apply_harness_event(task_id, &event) {
         tracing::debug!(
@@ -804,6 +833,113 @@ mod tests {
         assert!(
             detail["tick"].as_u64().unwrap() > 1,
             "the watcher must keep ticking (re-stamping) while deduping: {detail}"
+        );
+
+        supervisor.mark_completed(&id, vec![]);
+        for _ in 0..2 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(110)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn should_keep_original_production_timestamp_on_a_deduped_tick() {
+        // #2194 review round 2: the public `at` field means "when the summary
+        // was PRODUCED". A deduped tick re-emits an EARLIER summary, so it
+        // must carry that summary's original production time — NOT Utc::now()
+        // — or a consumer reads "produced just now" for a 10-tick-old summary.
+        // tick_seq (a separate field) alone conveys that the watcher is live.
+        //
+        // Timing-free by construction: we seed the dedupe state with a fixed
+        // 2020 production timestamp and a prompt that the next snapshot
+        // re-renders exactly, then assert the emitted `at` is that 2020
+        // value. A reused Utc::now() would land in 2026 and fail.
+        let (mock, calls) = MockProvider::new("unused on the dedupe path");
+        let supervisor = TaskSupervisor::new();
+        let id = register_running_task(&supervisor);
+        let activity = fixed_activity(&["installing deps"]);
+
+        let produced_at = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut last = Some(LastTickSummary {
+            // Exactly what the next snapshot will render, so the tick dedupes.
+            prompt: build_prompt(&["installing deps".to_string()]),
+            summary: "installing dependencies".to_string(),
+            produced_at,
+        });
+
+        let out = summarize_tick(
+            Arc::new(mock),
+            Duration::from_secs(1),
+            activity,
+            &supervisor,
+            "api:session",
+            &id,
+            9,
+            DEFAULT_SUBAGENT_SUMMARY_WINDOW,
+            &mut last,
+        )
+        .await;
+
+        assert_eq!(out.as_deref(), Some("installing dependencies"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a deduped tick must not call the LLM"
+        );
+        let task = supervisor.get_task(&id).unwrap();
+        let detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["tick"], 9, "tick_seq advances to show liveness");
+        let emitted_at = chrono::DateTime::parse_from_rfc3339(detail["at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            emitted_at, produced_at,
+            "a reused summary keeps its ORIGINAL production time, not now()"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn should_dedupe_on_the_rendered_prompt_not_the_pre_truncation_lines() {
+        // #2194 review round 2: build_prompt truncates each activity line to
+        // 400 chars, so two snapshots that differ ONLY after char 400 render
+        // the SAME prompt. Deduping on the raw lines would re-send that
+        // byte-identical prompt with caching disabled — the exact
+        // "identical prompt never re-sent" invariant the opt-out relies on.
+        // The dedupe key must be the canonical rendered prompt.
+        let (mock, calls) = MockProvider::new("linking objects");
+        let supervisor = TaskSupervisor::new();
+        let id = register_running_task(&supervisor);
+        // One activity line: 400 identical chars + a per-tick tail that the
+        // 400-char truncation drops. Raw lines differ every tick; the
+        // rendered prompt does not.
+        let head = "a".repeat(400);
+        let buf = Arc::new(Mutex::new(vec![format!("{head}0")]));
+        let generator = AgentSummaryGenerator::with_activity_source(
+            Arc::new(mock),
+            Arc::new(ActivitySource::Fixed(Arc::clone(&buf))),
+            supervisor.clone(),
+        )
+        .with_tick(Duration::from_millis(100))
+        .with_min_runtime(Duration::from_millis(0))
+        .with_llm_timeout(Duration::from_secs(1));
+
+        assert!(generator.spawn_watcher("api:session", &id));
+        for i in 1..8 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(110)).await;
+            // Replace (not append) so the snapshot stays a single line whose
+            // first 400 chars are constant and whose tail alone changes.
+            *buf.lock().unwrap() = vec![format!("{head}{i}")];
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "snapshots differing only past the 400-char prompt truncation render \
+             an identical prompt and must NOT trigger another LLM call"
         );
 
         supervisor.mark_completed(&id, vec![]);
