@@ -364,10 +364,10 @@ impl ApplyPatchTool {
 
             let change = match op {
                 PatchOp::Add { path, content } => {
-                    let resolved = self.resolve_patch_path(ctx, path).map_err(&fail)?;
+                    let resolved = self.resolve_patch_path(ctx, path).map_err(fail)?;
                     if overlay_entry_exists(&overlay, &resolved)
                         .await
-                        .map_err(&fail)?
+                        .map_err(fail)?
                     {
                         return Err(fail(
                             "file already exists (Add File requires the path to be absent)"
@@ -383,11 +383,11 @@ impl ApplyPatchTool {
                     }
                 }
                 PatchOp::Delete { path } => {
-                    let resolved = self.resolve_patch_path(ctx, path).map_err(&fail)?;
+                    let resolved = self.resolve_patch_path(ctx, path).map_err(fail)?;
                     match overlay.get(&resolved) {
                         Some(Some(_)) => {}
                         Some(None) => return Err(fail("file not found".to_string())),
-                        None => match disk_entry(&resolved).await.map_err(&fail)? {
+                        None => match disk_entry(&resolved).await.map_err(fail)? {
                             DiskEntry::File => {}
                             DiskEntry::Absent => return Err(fail("file not found".to_string())),
                             DiskEntry::Symlink => {
@@ -409,11 +409,11 @@ impl ApplyPatchTool {
                     move_to,
                     hunks,
                 } => {
-                    let resolved = self.resolve_patch_path(ctx, path).map_err(&fail)?;
+                    let resolved = self.resolve_patch_path(ctx, path).map_err(fail)?;
                     let current = match overlay.get(&resolved) {
                         Some(Some(content)) => content.clone(),
                         Some(None) => return Err(fail("file not found".to_string())),
-                        None => match disk_entry(&resolved).await.map_err(&fail)? {
+                        None => match disk_entry(&resolved).await.map_err(fail)? {
                             DiskEntry::File => super::read_no_follow(&resolved)
                                 .await
                                 .map_err(|e| fail(format!("failed to read file: {e}")))?,
@@ -426,12 +426,12 @@ impl ApplyPatchTool {
                             }
                         },
                     };
-                    let updated = apply_codex_hunks(&current, hunks).map_err(&fail)?;
+                    let updated = apply_codex_hunks(&current, hunks).map_err(fail)?;
                     // A move to the source path is a plain in-place update.
                     let dest = match move_to.as_deref() {
                         Some(dest_display) => {
                             let dest_resolved =
-                                self.resolve_patch_path(ctx, dest_display).map_err(&fail)?;
+                                self.resolve_patch_path(ctx, dest_display).map_err(fail)?;
                             (dest_resolved != resolved)
                                 .then_some((dest_resolved, dest_display.to_string()))
                         }
@@ -441,7 +441,7 @@ impl ApplyPatchTool {
                         Some((to_resolved, to_display)) => {
                             if overlay_entry_exists(&overlay, &to_resolved)
                                 .await
-                                .map_err(&fail)?
+                                .map_err(fail)?
                             {
                                 return Err(fail(format!(
                                     "move destination already exists: {to_display}"

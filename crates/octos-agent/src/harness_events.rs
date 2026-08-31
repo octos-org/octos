@@ -1091,8 +1091,7 @@ impl HarnessEvent {
     pub fn from_json_line(line: &str) -> HarnessResult<Self> {
         if line.len() > MAX_HARNESS_EVENT_LINE_BYTES {
             return Err(HarnessEventError(format!(
-                "harness event line exceeded {} bytes",
-                MAX_HARNESS_EVENT_LINE_BYTES
+                "harness event line exceeded {MAX_HARNESS_EVENT_LINE_BYTES} bytes"
             )));
         }
 

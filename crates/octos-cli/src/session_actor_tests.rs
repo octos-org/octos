@@ -747,8 +747,7 @@ async fn spawn_child_context_fork_uses_pre_spawn_parent_snapshot() {
         captured_user_contents
             .iter()
             .any(|content| content.contains(PRE_SPAWN_CONTENT)),
-        "child fork should retain the pre-spawn user turn; observed user contents: {:?}",
-        captured_user_contents
+        "child fork should retain the pre-spawn user turn; observed user contents: {captured_user_contents:?}"
     );
 
     // The critical assertion: the post-spawn user message MUST
@@ -758,8 +757,7 @@ async fn spawn_child_context_fork_uses_pre_spawn_parent_snapshot() {
             .iter()
             .any(|content| content.contains(POST_SPAWN_CONTENT)),
         "child fork must NOT include the post-spawn user message (issue #1125); \
-             observed user contents: {:?}",
-        captured_user_contents
+             observed user contents: {captured_user_contents:?}"
     );
 }
 
@@ -3415,8 +3413,7 @@ async fn test_cron_timezone_reset_regression_chinese_transcript() {
     };
     assert!(
         first_at_ms >= before_first_add + 600_000 && first_at_ms <= after_first_add + 603_000,
-        "first at_ms out of expected range: {}",
-        first_at_ms
+        "first at_ms out of expected range: {first_at_ms}"
     );
 
     tx.send(make_inbound("列出提醒")).await.unwrap();
@@ -3456,8 +3453,7 @@ async fn test_cron_timezone_reset_regression_chinese_transcript() {
     assert!(second_at_ms > first_at_ms);
     assert!(
         second_at_ms >= before_second_add + 600_000 && second_at_ms <= after_second_add + 603_000,
-        "second at_ms out of expected range: {}",
-        second_at_ms
+        "second at_ms out of expected range: {second_at_ms}"
     );
 
     assert_eq!(provider.call_count.load(Ordering::SeqCst), 7);
@@ -3582,14 +3578,9 @@ async fn test_speculative_overflow_concurrent() {
 
     assert!(
         has_overflow,
-        "overflow response not found in: {:?}",
-        responses
+        "overflow response not found in: {responses:?}"
     );
-    assert!(
-        has_primary,
-        "primary response not found in: {:?}",
-        responses
-    );
+    assert!(has_primary, "primary response not found in: {responses:?}");
 
     // ── Phase 4: Verify history is sorted by timestamp ──
     {
@@ -3723,21 +3714,18 @@ async fn should_emit_session_result_metadata_for_overflow_reply() {
     );
     assert!(
         session_result.get("seq").and_then(|v| v.as_u64()).is_some(),
-        "session_result must include committed seq, got {}",
-        session_result
+        "session_result must include committed seq, got {session_result}"
     );
     assert!(
         session_result
             .get("content")
             .and_then(|v| v.as_str())
             .is_some_and(|s| s.contains("FA12") || s.contains("overflow")),
-        "session_result.content must match reply content, got {}",
-        session_result
+        "session_result.content must match reply content, got {session_result}"
     );
     assert!(
         session_result.get("timestamp").is_some(),
-        "session_result must include rfc3339 timestamp, got {}",
-        session_result
+        "session_result must include rfc3339 timestamp, got {session_result}"
     );
     assert!(
         overflow
@@ -4457,13 +4445,11 @@ async fn test_speculative_within_patience_serves_both() {
     // Overflow finishes first (fast), primary finishes second (5s)
     assert!(
         responses.iter().any(|r| r.contains("overflow done")),
-        "expected overflow response, got: {:?}",
-        responses
+        "expected overflow response, got: {responses:?}"
     );
     assert!(
         responses.iter().any(|r| r.contains("primary done")),
-        "expected primary response, got: {:?}",
-        responses
+        "expected primary response, got: {responses:?}"
     );
 
     drop(tx);
@@ -4537,14 +4523,9 @@ async fn test_speculative_handles_background_result() {
 
     assert!(
         has_bg_notification,
-        "background result notification not found in: {:?}",
-        responses
+        "background result notification not found in: {responses:?}"
     );
-    assert!(
-        has_primary,
-        "primary response not found in: {:?}",
-        responses
-    );
+    assert!(has_primary, "primary response not found in: {responses:?}");
 
     // Verify background result is in session history
     {
@@ -4614,13 +4595,11 @@ async fn test_followup_background_result_notifies_without_rewrite_turn() {
         responses
             .iter()
             .any(|r| r.contains("research") && r.contains("completed")),
-        "background notification not found in: {:?}",
-        responses
+        "background notification not found in: {responses:?}"
     );
     assert!(
         responses.iter().any(|r| r.contains("primary done")),
-        "primary response not found in: {:?}",
-        responses
+        "primary response not found in: {responses:?}"
     );
 
     let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));
@@ -5234,22 +5213,19 @@ async fn test_attachment_hints_do_not_persist_in_session_history() {
 
     assert!(
         contents.contains(&"[User sent attachments]"),
-        "generic attachment placeholder missing from history: {:?}",
-        contents
+        "generic attachment placeholder missing from history: {contents:?}"
     );
     assert!(
         contents
             .iter()
             .all(|content| !content.contains("[Attached files]")),
-        "transient attachment prompt leaked into history: {:?}",
-        contents
+        "transient attachment prompt leaked into history: {contents:?}"
     );
     assert!(
         contents
             .iter()
             .all(|content| !content.contains("report.pdf")),
-        "attachment filename leaked into history: {:?}",
-        contents
+        "attachment filename leaked into history: {contents:?}"
     );
 
     drop(tx);
@@ -5315,16 +5291,14 @@ async fn test_queue_mode_collect_batches() {
         // First user msg: "first message"
         assert!(
             user_messages.contains(&"first message"),
-            "first message not found: {:?}",
-            user_messages
+            "first message not found: {user_messages:?}"
         );
         // Second user msg: combined "second message\n---\nQueued #1: third message"
         assert!(
             user_messages
                 .iter()
                 .any(|m| m.contains("second message") && m.contains("third message")),
-            "batched message not found: {:?}",
-            user_messages
+            "batched message not found: {user_messages:?}"
         );
     }
 
@@ -5394,13 +5368,11 @@ async fn test_queue_mode_latest_keeps_newest() {
             .collect();
         assert!(
             user_messages.iter().any(|m| m.contains("third message")),
-            "steered (newest) message not found: {:?}",
-            user_messages
+            "steered (newest) message not found: {user_messages:?}"
         );
         assert!(
             !user_messages.iter().any(|m| m.contains("second message")),
-            "discarded message should not be in history: {:?}",
-            user_messages
+            "discarded message should not be in history: {user_messages:?}"
         );
     }
 
@@ -5609,8 +5581,7 @@ async fn test_auto_escalation_on_degradation() {
     let found_escalation = all_responses.iter().any(|r| r.contains("⚡"));
     assert!(
         found_escalation,
-        "expected ⚡ escalation notification in responses: {:?}",
-        all_responses
+        "expected ⚡ escalation notification in responses: {all_responses:?}"
     );
     assert_eq!(
         router.mode(),
@@ -5744,8 +5715,7 @@ async fn test_auto_escalation_single_provider_flips_queue_mode() {
     // No router → no "⚡" notification (legacy behavior preserved).
     assert!(
         !all_responses.iter().any(|r| r.contains("⚡")),
-        "single-provider sessions must not emit the ⚡ message: {:?}",
-        all_responses
+        "single-provider sessions must not emit the ⚡ message: {all_responses:?}"
     );
     // queue_mode flip can't be asserted directly from the outside,
     // but we can prove the side effect ran by inspecting the actor
@@ -6112,8 +6082,7 @@ async fn test_dispatch_profile_and_main_create_separate_actors() {
     assert_eq!(
         keys.len(),
         2,
-        "different profile_ids should create separate actors, got keys: {:?}",
-        keys
+        "different profile_ids should create separate actors, got keys: {keys:?}"
     );
     assert!(
         keys.iter().any(|k| k.starts_with("weather:")),
@@ -6848,8 +6817,7 @@ async fn should_enqueue_synthetic_recovery_turn_with_error_message() {
         responses
             .iter()
             .any(|c| c.contains("acknowledging recovery")),
-        "expected LLM to produce recovery response, got: {:?}",
-        responses
+        "expected LLM to produce recovery response, got: {responses:?}"
     );
 
     // Verify the synthetic recovery prompt actually landed in history.
@@ -7155,8 +7123,7 @@ async fn supervisor_failure_signal_generates_recovery_continuation_end_to_end() 
     }
     assert!(
         responses.iter().any(|c| c.contains("recovery-handled")),
-        "expected recovery turn to drive an LLM response, got: {:?}",
-        responses
+        "expected recovery turn to drive an LLM response, got: {responses:?}"
     );
 
     let session_handle = SessionHandle::open(dir.path(), &test_session_key(dir.path()));

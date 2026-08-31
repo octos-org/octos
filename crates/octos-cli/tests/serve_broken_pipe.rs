@@ -189,7 +189,7 @@ mod imp {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&data_dir);
-            panic!("serve did not listen on {} within 45s", port);
+            panic!("serve did not listen on {port} within 45s");
         }
 
         // Banner barrier: read piped stdout until the banner appears…
@@ -258,17 +258,12 @@ mod imp {
         assert_eq!(
             code,
             Some(0),
-            "serve must exit 0 under broken-pipe shutdown; code={:?} signal={:?} stderr:\n{}",
-            code,
-            termsig,
-            stderr_log
+            "serve must exit 0 under broken-pipe shutdown; code={code:?} signal={termsig:?} stderr:\n{stderr_log}"
         );
         assert!(
             tracing_log.contains("stopping all gateway child processes")
                 || tracing_log.contains("gateways stopped"),
-            "cleanup marker missing from tracing log (data_dir/logs), log:\n{}\nstderr:\n{}",
-            tracing_log,
-            stderr_log
+            "cleanup marker missing from tracing log (data_dir/logs), log:\n{tracing_log}\nstderr:\n{stderr_log}"
         );
     }
 
@@ -297,7 +292,7 @@ mod imp {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&data_dir);
-            panic!("serve did not listen on {} within 45s", port);
+            panic!("serve did not listen on {port} within 45s");
         }
 
         let banner = wait_for_file_contains(
@@ -319,26 +314,19 @@ mod imp {
         let code = status.code().unwrap_or(-1);
         assert_eq!(
             code, 0,
-            "serve should exit 0, stdout:\n{}\nstderr:\n{}",
-            stdout_log, stderr_log
+            "serve should exit 0, stdout:\n{stdout_log}\nstderr:\n{stderr_log}"
         );
         // ORDER assertion: graceful marker BEFORE stop_all marker.
         let shutdown_pos = stdout_log.find("Shutting down server...");
         let stop_pos = stdout_log.find("Stopping gateways...");
         assert!(
             shutdown_pos.is_some(),
-            "graceful marker missing:\n{}",
-            stdout_log
+            "graceful marker missing:\n{stdout_log}"
         );
-        assert!(
-            stop_pos.is_some(),
-            "stop_all marker missing:\n{}",
-            stdout_log
-        );
+        assert!(stop_pos.is_some(), "stop_all marker missing:\n{stdout_log}");
         assert!(
             shutdown_pos.unwrap() < stop_pos.unwrap(),
-            "shutdown order violated: 'Shutting down' must precede 'Stopping gateways':\n{}",
-            stdout_log
+            "shutdown order violated: 'Shutting down' must precede 'Stopping gateways':\n{stdout_log}"
         );
     }
 
@@ -379,8 +367,7 @@ mod imp {
         assert!(running, "serve died during startup with broken stdout");
         assert!(
             ready,
-            "serve did not listen on {} within 45s with broken stdout",
-            port
+            "serve did not listen on {port} within 45s with broken stdout"
         );
     }
 

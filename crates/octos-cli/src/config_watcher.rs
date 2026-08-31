@@ -458,10 +458,7 @@ mod tests {
         // Should NOT trigger RestartRequired for provider-only change
         // None or HotReload is fine; provider-only changes must not restart.
         if let Some(ConfigChange::RestartRequired(fields)) = change {
-            panic!(
-                "provider change should not require restart, got fields: {:?}",
-                fields
-            );
+            panic!("provider change should not require restart, got fields: {fields:?}");
         }
     }
 

@@ -163,7 +163,7 @@ impl Tool for WebFetchTool {
         if let Some(len) = response.content_length() {
             if len > MAX_BODY_BYTES as u64 {
                 return Ok(ToolResult {
-                    output: format!("Response too large ({} bytes, max {})", len, MAX_BODY_BYTES),
+                    output: format!("Response too large ({len} bytes, max {MAX_BODY_BYTES})"),
                     success: false,
                     ..Default::default()
                 });

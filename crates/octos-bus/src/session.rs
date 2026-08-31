@@ -1887,7 +1887,7 @@ impl SessionManager {
                 writeln!(file, "{}", serde_json::to_string(&meta)?)?;
             }
 
-            writeln!(file, "{}", msg_json)?;
+            writeln!(file, "{msg_json}")?;
             Ok::<_, eyre::Report>(())
         })
         .await
@@ -3048,7 +3048,7 @@ impl SessionHandle {
                 writeln!(file, "{}", serde_json::to_string(&meta)?)?;
             }
 
-            writeln!(file, "{}", msg_json)?;
+            writeln!(file, "{msg_json}")?;
             Ok::<_, eyre::Report>(())
         })
         .await

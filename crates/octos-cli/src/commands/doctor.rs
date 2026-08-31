@@ -2191,7 +2191,7 @@ mod tests {
             .expect("key check present");
         assert_eq!(key.status, CheckStatus::Pass);
         assert!(
-            !format!("{:?}", key).contains("sekrit-value"),
+            !format!("{key:?}").contains("sekrit-value"),
             "the key value must never appear in the check"
         );
 
@@ -2922,7 +2922,7 @@ mod tests {
     fn should_append_models_segment_after_url_parsing() {
         let (tx, rx) = std::sync::mpsc::channel();
         let base = serve_one_status("200 OK", r#"{"data":[]}"#.to_string(), Some(tx));
-        let with_query = format!("{}?key=x", base);
+        let with_query = format!("{base}?key=x");
         let _ = local_server_checks("local", Some(&with_query), None, None);
         let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(

@@ -274,7 +274,7 @@ fn page_slug(url: &reqwest::Url, index: usize) -> String {
     };
     // Truncate long slugs and prefix with index for ordering
     let truncated = if slug.len() > 80 { &slug[..80] } else { &slug };
-    format!("{:03}_{truncated}", index)
+    format!("{index:03}_{truncated}")
 }
 
 #[async_trait]
@@ -498,7 +498,7 @@ impl Tool for DeepCrawlTool {
             let filename = file_url
                 .as_ref()
                 .map(|u| format!("{}.md", page_slug(u, i)))
-                .unwrap_or_else(|| format!("{:03}_page.md", i));
+                .unwrap_or_else(|| format!("{i:03}_page.md"));
             let file_path = crawl_dir.join(&filename);
 
             let file_content = if let Some(ref err) = crawled.error {

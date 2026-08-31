@@ -2853,8 +2853,7 @@ async fn session_handle_append_returns_err_when_at_size_cap() {
 
     assert!(
         result.is_err(),
-        "add_message_with_seq must return Err when file at size cap; got {:?}",
-        result
+        "add_message_with_seq must return Err when file at size cap; got {result:?}"
     );
     // In-memory state must NOT advance on a refused append.
     assert_eq!(

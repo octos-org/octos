@@ -990,13 +990,11 @@ mod tests {
         let visible: Vec<String> = registry.specs().into_iter().map(|s| s.name).collect();
         assert!(
             !visible.contains(&"mofa_slides".to_string()),
-            "mofa_slides must NOT appear in LLM-visible specs after defer; got {:?}",
-            visible
+            "mofa_slides must NOT appear in LLM-visible specs after defer; got {visible:?}"
         );
         assert!(
             !visible.contains(&"mofa_cards".to_string()),
-            "mofa_cards must NOT appear in LLM-visible specs after defer; got {:?}",
-            visible
+            "mofa_cards must NOT appear in LLM-visible specs after defer; got {visible:?}"
         );
 
         // BUT `registry.get(name)` must still resolve — that's how the
@@ -1045,13 +1043,11 @@ mod tests {
         let desc = dispatcher.description();
         assert!(
             desc.contains("Per-profile slides description"),
-            "dispatcher description must surface the shadowing entry: {}",
-            desc
+            "dispatcher description must surface the shadowing entry: {desc}"
         );
         assert!(
             !desc.contains("Global slides description"),
-            "dispatcher description must NOT carry the shadowed entry: {}",
-            desc
+            "dispatcher description must NOT carry the shadowed entry: {desc}"
         );
     }
 }

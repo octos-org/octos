@@ -2087,8 +2087,7 @@ impl Config {
         if let (Some(provider), Some(model)) = (&self.provider, &self.model) {
             if !is_valid_model_for_provider(provider, model) {
                 warnings.push(format!(
-                    "Model '{}' may not be valid for provider '{}'. Check provider docs.",
-                    model, provider
+                    "Model '{model}' may not be valid for provider '{provider}'. Check provider docs."
                 ));
             }
         }
@@ -2096,7 +2095,7 @@ impl Config {
         // Check base_url format
         if let Some(ref url) = self.base_url {
             if !(url.starts_with("http://") || url.starts_with("https://")) || url.contains(' ') {
-                warnings.push(format!("base_url '{}' is not a valid URL", url));
+                warnings.push(format!("base_url '{url}' is not a valid URL"));
             }
         }
 
@@ -2152,7 +2151,7 @@ impl Config {
                     .map(String::from)
                     .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
             });
-            warnings.push(format!("{} environment variable not set", env_var));
+            warnings.push(format!("{env_var} environment variable not set"));
         }
 
         warnings

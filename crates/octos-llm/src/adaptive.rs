@@ -1443,7 +1443,7 @@ impl AdaptiveRouter {
         for slot in &self.slots {
             let pname = slot.provider.provider_name();
             let model = slot.provider.model_id();
-            let slot_key = format!("{}/{}", pname, model);
+            let slot_key = format!("{pname}/{model}");
 
             if let Some(entry) = entries
                 .iter()

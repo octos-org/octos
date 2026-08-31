@@ -722,13 +722,11 @@ impl Agent {
                         );
                         let deny_msg = if reason.is_empty() {
                             format!(
-                                "[HOOK DENIED] Tool '{}' was blocked by a lifecycle hook. Do not retry.",
-                                tc_name
+                                "[HOOK DENIED] Tool '{tc_name}' was blocked by a lifecycle hook. Do not retry."
                             )
                         } else {
                             format!(
-                                "[HOOK DENIED] Tool '{}' was blocked: {}. Do not retry.",
-                                tc_name, reason
+                                "[HOOK DENIED] Tool '{tc_name}' was blocked: {reason}. Do not retry."
                             )
                         };
                         // Clear the activity chip: this early-return skips the
@@ -797,8 +795,7 @@ impl Agent {
                             "provider policy denied spawn_only tool at intercept"
                         );
                         let deny_msg = format!(
-                            "[POLICY DENIED] Tool '{}' is blocked by provider policy ({}). Do not retry.",
-                            tc_name, reason
+                            "[POLICY DENIED] Tool '{tc_name}' is blocked by provider policy ({reason}). Do not retry."
                         );
                         // Clear the activity chip: this early-return skips the
                         // normal completion paths, so emit the matching
@@ -1029,7 +1026,7 @@ impl Agent {
                 // the pre-spawn local — `self` cannot cross into the 'static
                 // task.
                 let bg_format_after_edit = format_after_edit;
-                let bg_session_id_for_watcher = format!("agent:{}", tc_id);
+                let bg_session_id_for_watcher = format!("agent:{tc_id}");
                 // M10 Phase 4: keep a copy of the task_id so the synthesized
                 // tool-result message returned to the LLM (built after this
                 // `tokio::spawn` moves `task_id` into the closure) can carry
@@ -1479,8 +1476,7 @@ impl Agent {
                                         }
                                     } else {
                                         let err_msg = format!(
-                                            "verified outputs for {} but failed to persist background result",
-                                            bg_name
+                                            "verified outputs for {bg_name} but failed to persist background result"
                                         );
                                         tracing::warn!(
                                             tool = %bg_name,
@@ -1500,10 +1496,10 @@ impl Agent {
                                     if let Some(ref sender) = bg_sender {
                                         let content = match notify_user {
                                             Some(message) => {
-                                                format!("✗ {}: {}", message, error)
+                                                format!("✗ {message}: {error}")
                                             }
                                             None => {
-                                                format!("✗ {} failed: {}", bg_name, error)
+                                                format!("✗ {bg_name} failed: {error}")
                                             }
                                         };
                                         let _ = sender(BackgroundResultPayload {
@@ -1530,18 +1526,14 @@ impl Agent {
                                     if required {
                                         let err_msg = reason.unwrap_or_else(|| {
                                             format!(
-                                                "workspace contract is required for {} but not configured",
-                                                bg_name
+                                                "workspace contract is required for {bg_name} but not configured"
                                             )
                                         });
                                         bg_supervisor.mark_failed(&task_id, err_msg.clone());
                                         if let Some(ref sender) = bg_sender {
                                             let _ = sender(BackgroundResultPayload {
                                                 task_label: bg_name.clone(),
-                                                content: format!(
-                                                    "✗ {} failed: {}",
-                                                    bg_name, err_msg
-                                                ),
+                                                content: format!("✗ {bg_name} failed: {err_msg}"),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
                                                 envelope_media: vec![],
@@ -1644,8 +1636,7 @@ impl Agent {
                                             let _ = sender(BackgroundResultPayload {
                                                 task_label: bg_name.clone(),
                                                 content: format!(
-                                                    "✗ {} failed: no output files produced",
-                                                    bg_name
+                                                    "✗ {bg_name} failed: no output files produced"
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
@@ -1680,7 +1671,7 @@ impl Agent {
                                     bg_supervisor.mark_runtime_state(
                                         &task_id,
                                         TaskRuntimeState::DeliveringOutputs,
-                                        Some(format!("deliver outputs for {}", bg_name)),
+                                        Some(format!("deliver outputs for {bg_name}")),
                                     );
                                     let mut sent_files = Vec::new();
                                     let mut delivery_failed = false;
@@ -1778,10 +1769,7 @@ impl Agent {
                                         if let Some(ref sender) = bg_sender {
                                             let _ = sender(BackgroundResultPayload {
                                                 task_label: bg_name.clone(),
-                                                content: format!(
-                                                    "✗ {} failed: {}",
-                                                    bg_name, err_msg
-                                                ),
+                                                content: format!("✗ {bg_name} failed: {err_msg}"),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
                                                 envelope_media: vec![],
@@ -1867,7 +1855,7 @@ impl Agent {
                                                 // containing just "\n" instead
                                                 // of the "✓ completed" notice.
                                                 let bubble_content = if r.output.trim().is_empty() {
-                                                    format!("✓ {} completed{}", bg_name, file_info)
+                                                    format!("✓ {bg_name} completed{file_info}")
                                                 } else {
                                                     r.output.clone()
                                                 };
@@ -2016,7 +2004,7 @@ impl Agent {
                             if let Some(ref sender) = bg_sender {
                                 let _ = sender(BackgroundResultPayload {
                                     task_label: bg_name.clone(),
-                                    content: format!("✗ {} error: {}", bg_name, e),
+                                    content: format!("✗ {bg_name} error: {e}"),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
                                     envelope_media: vec![],
@@ -3286,7 +3274,7 @@ mod tests {
     fn spawn_only_failure_arm_bubble_format_pins_pipeline_timeout_text() {
         let bg_name = "run_pipeline";
         let pipeline_output = "pipeline timed out after 1200s";
-        let bubble = format!("✗ {} failed: {}", bg_name, pipeline_output);
+        let bubble = format!("✗ {bg_name} failed: {pipeline_output}");
         assert_eq!(
             bubble, "✗ run_pipeline failed: pipeline timed out after 1200s",
             "the bubble surface text the WS client renders on a \

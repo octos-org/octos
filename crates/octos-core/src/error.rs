@@ -94,8 +94,7 @@ impl Error {
             env_var: env_var.clone(),
         })
         .with_suggestion(format!(
-            "Set the API key:\n    export {}=your-api-key\n  Or add to .octos/config.json:\n    {{\"api_key_env\": \"{}\"}}",
-            env_var, env_var
+            "Set the API key:\n    export {env_var}=your-api-key\n  Or add to .octos/config.json:\n    {{\"api_key_env\": \"{env_var}\"}}"
         ))
     }
 
@@ -176,52 +175,48 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Main message
         match &self.kind {
-            ErrorKind::TaskNotFound(id) => write!(f, "Task not found: {}", id)?,
-            ErrorKind::AgentNotFound(id) => write!(f, "Agent not found: {}", id)?,
+            ErrorKind::TaskNotFound(id) => write!(f, "Task not found: {id}")?,
+            ErrorKind::AgentNotFound(id) => write!(f, "Agent not found: {id}")?,
             ErrorKind::InvalidStateTransition { from, to } => {
-                write!(f, "Invalid state transition: {} -> {}", from, to)?
+                write!(f, "Invalid state transition: {from} -> {to}")?
             }
-            ErrorKind::LlmError { provider, message } => {
-                write!(f, "{} error: {}", provider, message)?
-            }
+            ErrorKind::LlmError { provider, message } => write!(f, "{provider} error: {message}")?,
             ErrorKind::ApiError {
                 provider,
                 status,
                 body,
             } => {
-                write!(f, "{} API error ({})", provider, status)?;
+                write!(f, "{provider} API error ({status})")?;
                 if !body.is_empty() {
                     write!(f, ": {}", crate::truncated_utf8(body, 200, "..."))?;
                 }
             }
-            ErrorKind::ToolError { tool, message } => {
-                write!(f, "Tool '{}' failed: {}", tool, message)?
-            }
-            ErrorKind::ConfigError(msg) => write!(f, "Config error: {}", msg)?,
+            ErrorKind::ToolError { tool, message } => write!(f, "Tool '{tool}' failed: {message}")?,
+            ErrorKind::ConfigError(msg) => write!(f, "Config error: {msg}")?,
             ErrorKind::ApiKeyNotSet { provider, env_var } => {
-                write!(f, "{} API key not set ({})", provider, env_var)?
+                write!(f, "{provider} API key not set ({env_var})")?
             }
-            ErrorKind::UnknownProvider(p) => write!(f, "Unknown provider: {}", p)?,
+            ErrorKind::UnknownProvider(p) => write!(f, "Unknown provider: {p}")?,
             ErrorKind::Timeout { operation, seconds } => {
-                write!(f, "{} timed out after {}s", operation, seconds)?
+                write!(f, "{operation} timed out after {seconds}s")?
             }
             ErrorKind::ChannelError { channel, message } => {
-                write!(f, "Channel '{}' error: {}", channel, message)?
+                write!(f, "Channel '{channel}' error: {message}")?
             }
-            ErrorKind::SessionError(msg) => write!(f, "Session error: {}", msg)?,
-            ErrorKind::IoError(e) => write!(f, "IO error: {}", e)?,
-            ErrorKind::SerializationError(msg) => write!(f, "Serialization error: {}", msg)?,
-            ErrorKind::Other(e) => write!(f, "{}", e)?,
+            ErrorKind::SessionError(msg) => write!(f, "Session error: {msg}")?,
+            ErrorKind::IoError(e) => write!(f, "IO error: {e}")?,
+            ErrorKind::SerializationError(msg) => write!(f, "Serialization error: {msg}")?,
+            ErrorKind::Other(e) => write!(f, "{e}")?,
         }
 
         // Context
         if let Some(ctx) = &self.context {
-            write!(f, "\n  Context: {}", ctx)?;
+            write!(f, "\n  Context: {ctx}")?;
         }
 
         // Suggestion
         if let Some(sug) = &self.suggestion {
-            write!(f, "\n  Suggestion: {}", sug)?;
+            write!(f, "\n  Suggestion: {sug}")?;
         }
 
         Ok(())

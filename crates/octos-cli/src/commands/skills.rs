@@ -555,7 +555,7 @@ fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
 
     if filtered.is_empty() {
         if let Some(q) = query {
-            println!("  No packages matching '{}'", q);
+            println!("  No packages matching '{q}'");
         } else {
             println!("  Registry is empty.");
         }
@@ -917,7 +917,7 @@ fn cmd_install_all(skills_dir: &Path, force: bool, branch: &str) -> Result<()> {
             total_failed.len()
         );
         for (name, err) in &total_failed {
-            println!("    - {}: {}", name, err);
+            println!("    - {name}: {err}");
         }
     }
     if total_installed.is_empty() && total_skipped.is_empty() && total_failed.is_empty() {

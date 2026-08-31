@@ -485,10 +485,7 @@ fn offer_api_key_capture(provider: &str, api_key_env: &str, interactive: bool) {
 
     let captured = match store {
         Ok(mut s) if interactive && std::io::stdin().is_terminal() && !provider.is_empty() => {
-            println!(
-                "Paste your {} API key now to save it securely (Enter to skip):",
-                provider
-            );
+            println!("Paste your {provider} API key now to save it securely (Enter to skip):");
             print!("> ");
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
@@ -512,7 +509,7 @@ fn offer_api_key_capture(provider: &str, api_key_env: &str, interactive: bool) {
             println!();
             println!("Set it later with:");
             println!("  octos auth login --provider {provider}");
-            println!("  # or: export {}=your-api-key", api_key_env);
+            println!("  # or: export {api_key_env}=your-api-key");
             println!();
         }
     }
@@ -541,7 +538,7 @@ fn write_init_files(
     println!("{} {}", "Created:".green(), config_path.display());
     println!();
     println!("{}", "Config:".cyan());
-    println!("{}", config_str);
+    println!("{config_str}");
     println!();
 
     // Credential check. Resolution order at runtime is auth store first,
@@ -963,11 +960,11 @@ impl Executable for InitCommand {
                     println!("Available models for {} (from catalog):", info.display);
                     for (i, m) in models.iter().enumerate() {
                         let rec = if i == 0 { " (recommended)" } else { "" };
-                        println!("  - {}{}", m, rec);
+                        println!("  - {m}{rec}");
                     }
                     let default_model = models[0].clone();
                     println!();
-                    print!("Model [{}]: ", default_model);
+                    print!("Model [{default_model}]: ");
                     io::stdout().flush()?;
 
                     let mut input = String::new();

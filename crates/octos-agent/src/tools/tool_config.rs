@@ -72,7 +72,7 @@ impl ConfigValueType {
                     .as_i64()
                     .ok_or_else(|| "expected an integer value".to_string())?;
                 if n < *min || n > *max {
-                    return Err(format!("value {} out of range [{}, {}]", n, min, max));
+                    return Err(format!("value {n} out of range [{min}, {max}]"));
                 }
                 Ok(())
             }
@@ -464,7 +464,7 @@ impl ToolConfigStore {
 
         let configs = self.configs.read().await;
         let current = configs.get(tool);
-        let mut out = format!("{} settings:\n\n", tool);
+        let mut out = format!("{tool} settings:\n\n");
 
         for field in fields {
             let override_val = current.and_then(|m| m.get(field.key)).map(format_value);
@@ -524,31 +524,28 @@ impl ToolConfigStore {
             ConfigValueType::Integer { .. } => match raw_value.parse::<i64>() {
                 Ok(n) => Value::from(n),
                 Err(_) => {
-                    return format!("Expected integer for {}.{}, got '{}'", tool, key, raw_value);
+                    return format!("Expected integer for {tool}.{key}, got '{raw_value}'");
                 }
             },
             ConfigValueType::Boolean => match raw_value {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
                 _ => {
-                    return format!(
-                        "Expected true/false for {}.{}, got '{}'",
-                        tool, key, raw_value
-                    );
+                    return format!("Expected true/false for {tool}.{key}, got '{raw_value}'");
                 }
             },
         };
 
         // Validate range/allowed values
         if let Err(msg) = field.value_type.validate(&value) {
-            return format!("Invalid value for {}.{}: {}", tool, key, msg);
+            return format!("Invalid value for {tool}.{key}: {msg}");
         }
 
         if let Err(e) = self.set(tool, key, value).await {
             return format!("Failed to save: {e}");
         }
 
-        format!("Set {}.{} = {}", tool, key, raw_value)
+        format!("Set {tool}.{key} = {raw_value}")
     }
 
     async fn cmd_reset(&self, tool: &str, key: &str) -> String {
@@ -687,7 +684,7 @@ impl Tool for ConfigureToolTool {
                     .await
             }
             other => Ok(ToolResult {
-                output: format!("Unknown action '{}'. Valid: list, get, set, reset", other),
+                output: format!("Unknown action '{other}'. Valid: list, get, set, reset"),
                 success: false,
                 ..Default::default()
             }),
@@ -701,7 +698,7 @@ impl ConfigureToolTool {
 
         for &tool_name in CONFIGURABLE_TOOLS {
             let fields = configurable_fields(tool_name).unwrap();
-            output.push_str(&format!("## {}\n", tool_name));
+            output.push_str(&format!("## {tool_name}\n"));
 
             let current = self.store.get_all(tool_name).await;
 
@@ -722,7 +719,7 @@ impl ConfigureToolTool {
                         format!("string: {}", opts.join("|"))
                     }
                     ConfigValueType::String { allowed: None } => "string".to_string(),
-                    ConfigValueType::Integer { min, max } => format!("int: {}–{}", min, max),
+                    ConfigValueType::Integer { min, max } => format!("int: {min}–{max}"),
                     ConfigValueType::Boolean => "bool".to_string(),
                 };
 
@@ -731,7 +728,7 @@ impl ConfigureToolTool {
                     field.key, type_info, field.description, field.default_display
                 ));
                 if let Some(ref val) = current_val {
-                    output.push_str(&format!(" **(current: {})**", val));
+                    output.push_str(&format!(" **(current: {val})**"));
                 }
                 output.push('\n');
             }
@@ -773,7 +770,7 @@ impl ConfigureToolTool {
         };
 
         let current = self.store.get_all(tool).await;
-        let mut output = format!("# {} settings\n\n", tool);
+        let mut output = format!("# {tool} settings\n\n");
 
         for field in fields {
             let current_val = current.as_ref().and_then(|m| m.get(field.key));
@@ -870,7 +867,7 @@ impl ConfigureToolTool {
 
         if let Err(msg) = field.value_type.validate(value) {
             return Ok(ToolResult {
-                output: format!("Invalid value for {}.{}: {}", tool, key, msg),
+                output: format!("Invalid value for {tool}.{key}: {msg}"),
                 success: false,
                 ..Default::default()
             });

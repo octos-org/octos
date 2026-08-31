@@ -27,7 +27,7 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
         .arg(dir)
         .args(args)
         .output()
-        .wrap_err_with(|| format!("failed to run git {:?}", args))?;
+        .wrap_err_with(|| format!("failed to run git {args:?}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

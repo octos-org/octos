@@ -50,8 +50,6 @@ fn octos_sbpl(workspace: &str, allow_network: bool) -> String {
 (allow file-write* (subpath "{workspace}"))
 {network}
 "#,
-        workspace = workspace,
-        network = network,
     )
 }
 
@@ -210,10 +208,9 @@ fn should_allow_tmp_write_with_explicit_tmp_allowance() {
 (allow process-fork)
 (allow sysctl-read)
 (allow file-read*)
-(allow file-write* (subpath "{workspace}"))
+(allow file-write* (subpath "{real_workspace}"))
 (allow file-write* (subpath "/private/tmp"))
 "#,
-        workspace = real_workspace,
     );
     let (code, _stdout, _stderr) = run_sandboxed(
         &profile,
@@ -302,7 +299,6 @@ fn should_allow_python_write_inside_workspace() {
 open('{workspace}/output.txt', 'w').write('allowed')
 print('OK')
 ""#,
-            workspace = workspace,
         ),
     );
     assert_eq!(code, 0, "Python should write inside workspace");
@@ -346,7 +342,6 @@ with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp', delete=False) as f:
     print(f'TMPDIR_OK:{{inside}}')
     print(f'PATH:{{f.name}}')
 ""#,
-            workspace = workspace,
         ),
     );
     assert_eq!(code, 0, "tempfile should work with TMPDIR redirect");

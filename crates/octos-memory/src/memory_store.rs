@@ -368,7 +368,7 @@ impl MemoryStore {
             .open(&path)
             .await
             .wrap_err("failed to open today's notes for append")?;
-        file.write_all(format!("\n## {}\n\n{}\n", heading, content).as_bytes())
+        file.write_all(format!("\n## {heading}\n\n{content}\n").as_bytes())
             .await
             .wrap_err("failed to append to today's notes")?;
         file.flush().await.wrap_err("failed to flush today's notes")

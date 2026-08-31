@@ -1345,7 +1345,7 @@ fn expand_tilde(path: &str) -> String {
         #[cfg(windows)]
         return format!("{}\\{}{}", home_base, username, suffix);
         #[cfg(not(windows))]
-        return format!("{}/{}{}", home_base, username, suffix);
+        return format!("{home_base}/{username}{suffix}");
     }
     path.to_string()
 }
@@ -2146,8 +2146,7 @@ mod tests {
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert!(
             matches!(result, HookResult::Deny(_)),
-            "matching glob should fire the hook (got {:?})",
-            result
+            "matching glob should fire the hook (got {result:?})"
         );
     }
 
@@ -2174,8 +2173,7 @@ mod tests {
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert!(
             matches!(result, HookResult::Deny(_)),
-            "empty path_filter should fall through to today's behaviour (got {:?})",
-            result
+            "empty path_filter should fall through to today's behaviour (got {result:?})"
         );
     }
 
@@ -2207,8 +2205,7 @@ mod tests {
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
         assert!(
             matches!(result, HookResult::Deny(_)),
-            "second glob should match .ts file (got {:?})",
-            result
+            "second glob should match .ts file (got {result:?})"
         );
     }
 

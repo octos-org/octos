@@ -168,7 +168,7 @@ fn geocode(client: &reqwest::blocking::Client, city: &str) -> GeoLocation {
         }
     }
 
-    fail(&format!("City '{}' not found. Please retry with the English/romanized city name (e.g. 'Saratoga' instead of '萨拉托加', 'Tokyo' instead of '東京').", city));
+    fail(&format!("City '{city}' not found. Please retry with the English/romanized city name (e.g. 'Saratoga' instead of '萨拉托加', 'Tokyo' instead of '東京')."));
 }
 
 fn weather_description(code: u32) -> &'static str {
@@ -395,7 +395,7 @@ fn urlencoded(s: &str) -> String {
                 result.push(b as char);
             }
             _ => {
-                result.push_str(&format!("%{:02X}", b));
+                result.push_str(&format!("%{b:02X}"));
             }
         }
     }

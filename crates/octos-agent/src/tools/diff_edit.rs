@@ -295,7 +295,7 @@ fn parse_hunk_header(line: &str) -> Result<usize> {
         .unwrap_or("1");
     let start: usize = start_str
         .parse()
-        .wrap_err_with(|| format!("invalid line number in hunk header: {}", line))?;
+        .wrap_err_with(|| format!("invalid line number in hunk header: {line}"))?;
     Ok(start)
 }
 

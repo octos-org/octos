@@ -4134,8 +4134,7 @@ fn should_return_none_when_all_managed_repos_are_ready() {
     let failures = inspect_workspace_contract_failures(tmp.path());
     assert!(
         failures.is_none(),
-        "ready workspace should not produce contract failure summary: {:?}",
-        failures
+        "ready workspace should not produce contract failure summary: {failures:?}"
     );
 }
 
@@ -4149,13 +4148,11 @@ fn should_return_failure_summary_when_managed_repo_is_not_ready() {
         .expect("broken workspace must produce contract failure summary");
     assert!(
         failures.contains("slides/broken"),
-        "summary should name the failing repo:\n{}",
-        failures
+        "summary should name the failing repo:\n{failures}"
     );
     assert!(
         failures.contains("completion failed") || failures.contains("artifact missing"),
-        "summary should describe what failed:\n{}",
-        failures
+        "summary should describe what failed:\n{failures}"
     );
 }
 
@@ -4173,8 +4170,7 @@ fn should_return_failure_summary_with_mixed_repos() {
     // ready-deck is not in the failing set.
     assert!(
         !failures.contains("ready-deck") || failures.contains("broken-deck"),
-        "ready-deck should not appear as a failure:\n{}",
-        failures
+        "ready-deck should not appear as a failure:\n{failures}"
     );
 }
 

@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(cloned.token_usage.input_tokens, 10);
 
         // Debug trait works
-        let debug = format!("{:?}", cloned);
+        let debug = format!("{cloned:?}");
         assert!(debug.contains("ConversationResponse"));
     }
 }
@@ -619,7 +619,7 @@ pub(super) fn checkpoint_budget_exhaustion(
         );
     }
     // ③ the distinct terminal marker.
-    Some(format!("budget_exhausted:{}", limit))
+    Some(format!("budget_exhausted:{limit}"))
 }
 
 #[cfg(test)]

@@ -256,10 +256,7 @@ impl Sandbox for MacosSandbox {
             // file-read-data (actual content reads) still requires subpath rules.
             rules.push("(allow file-read-metadata)".to_string());
             // Always allow reading the workspace (use canonical path for SBPL)
-            rules.push(format!(
-                "(allow file-read* (subpath \"{cwd}\"))",
-                cwd = real_cwd
-            ));
+            rules.push(format!("(allow file-read* (subpath \"{real_cwd}\"))"));
             // Add configured read paths -- validate each for SBPL metacharacters
             // to prevent sandbox profile injection (same check as cwd above).
             for path in &self.read_allow_paths {
@@ -307,7 +304,7 @@ impl Sandbox for MacosSandbox {
         // - neither (read-only profile): OMIT the grant so `(deny default)`
         //   denies the write. `/dev/null` stays writable regardless so shell
         //   redirections and git internals still function.
-        let cwd_write_rule = format!("(allow file-write* (subpath \"{cwd}\"))\n", cwd = real_cwd);
+        let cwd_write_rule = format!("(allow file-write* (subpath \"{real_cwd}\"))\n");
         // Toolchain write rules (rustup settings/scratch, cargo caches).
         // Built here, appended ONLY in the full-workspace-write arms below:
         // under a #1976 fence or a read-only workspace the profile said
@@ -462,10 +459,6 @@ impl Sandbox for MacosSandbox {
 (allow file-write* (literal "/dev/null"))
 {workspace_write_rule}{external_tmp_write_rule}{network_rule}
 "#,
-            read_rules = read_rules,
-            workspace_write_rule = workspace_write_rule,
-            external_tmp_write_rule = external_tmp_write_rule,
-            network_rule = network_rule,
         );
 
         let mut cmd = Command::new("sandbox-exec");

@@ -1443,8 +1443,8 @@ mod tests {
     fn test_compact_budget_enforcement() {
         let mut messages = Vec::new();
         for i in 0..50 {
-            messages.push(user_msg(&format!("Message number {} with some content", i)));
-            messages.push(assistant_msg(&format!("Response number {} here", i)));
+            messages.push(user_msg(&format!("Message number {i} with some content")));
+            messages.push(assistant_msg(&format!("Response number {i} here")));
         }
 
         let summary = compact_messages(&messages, 200);
@@ -1488,24 +1488,20 @@ mod tests {
         let mut messages = vec![system_msg("system prompt")];
         for i in 0..5 {
             messages.push(user_msg(&format!(
-                "question {} with enough text to use tokens",
-                i
+                "question {i} with enough text to use tokens"
             )));
             messages.push(assistant_msg(&format!(
-                "answer {} with enough text to use tokens",
-                i
+                "answer {i} with enough text to use tokens"
             )));
         }
         messages.push(assistant_tool_call("read_file", "tc1"));
         messages.push(tool_result("tc1", "file content here"));
         for i in 5..10 {
             messages.push(user_msg(&format!(
-                "question {} with enough text to use tokens",
-                i
+                "question {i} with enough text to use tokens"
             )));
             messages.push(assistant_msg(&format!(
-                "answer {} with enough text to use tokens",
-                i
+                "answer {i} with enough text to use tokens"
             )));
         }
 

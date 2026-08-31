@@ -971,7 +971,7 @@ fn run_git(project_root: &Path, args: &[&str]) -> Result<()> {
             .arg(project_root)
             .args(args)
             .output()
-            .wrap_err_with(|| format!("failed to spawn git {:?}", args))?;
+            .wrap_err_with(|| format!("failed to spawn git {args:?}"))?;
 
         if output.status.success() {
             return Ok(());

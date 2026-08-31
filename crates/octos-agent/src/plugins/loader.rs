@@ -3494,9 +3494,7 @@ path = "src/main.rs"
         for name in &skill_entries {
             assert!(
                 !name.ends_with("_verified") && name != ".main_verified",
-                "skill source dir should not contain verified-copy file '{}' (full list: {:?})",
-                name,
-                skill_entries,
+                "skill source dir should not contain verified-copy file '{name}' (full list: {skill_entries:?})",
             );
         }
     }
@@ -3795,15 +3793,13 @@ path = "src/main.rs"
         assert!(
             !visible.contains(&"mofa_slides".to_string()),
             "mofa_slides must NOT appear in LLM-visible specs after RFC-1 \
-             internal-hidden registration; got {:?}",
-            visible
+             internal-hidden registration; got {visible:?}"
         );
 
         // The dispatcher itself IS visible.
         assert!(
             visible.contains(&"mofa_make".to_string()),
-            "mofa_make dispatcher must be visible; got {:?}",
-            visible
+            "mofa_make dispatcher must be visible; got {visible:?}"
         );
     }
 

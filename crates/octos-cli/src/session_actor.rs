@@ -2207,13 +2207,9 @@ pub(crate) fn build_recovery_prompt_body(
         .map(|input| format!("\nOriginal input: {input}"))
         .unwrap_or_default();
     format!(
-        "[system-internal] Your previous `{tool}` call failed.\n\
-         Error: {err}{input}{alts}\n\
+        "[system-internal] Your previous `{tool_name}` call failed.\n\
+         Error: {error_message}{input_block}{alternatives_block}\n\
          Respond to the user with a path forward — offer the alternatives, or try the safest one yourself if appropriate. Do not just report failure.",
-        tool = tool_name,
-        err = error_message,
-        input = input_block,
-        alts = alternatives_block,
     )
 }
 
@@ -3847,7 +3843,7 @@ impl ActorFactory {
         } else {
             self.llm.clone()
         };
-        let agent_id = AgentId::new(format!("session-{}", session_key));
+        let agent_id = AgentId::new(format!("session-{session_key}"));
         // Pre/post-memory split: the memory segment must keep its
         // pre-refactor slot (after bootstrap/soul, BEFORE skills/tool
         // guidance) — see GatewayPromptParts. Per-session tails (slides
@@ -6375,7 +6371,7 @@ impl SessionActor {
         };
 
         self.queue_mode = mode;
-        self.send_reply(&format!("Queue mode set to: {:?}", mode))
+        self.send_reply(&format!("Queue mode set to: {mode:?}"))
             .await;
     }
 

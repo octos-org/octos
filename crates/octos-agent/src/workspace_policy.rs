@@ -3064,8 +3064,7 @@ ignore = []
         let rendered = toml::to_string(&policy).unwrap();
         assert!(
             rendered.contains("kind = \"coding\""),
-            "expected kebab-case 'coding' in serialized policy:\n{}",
-            rendered
+            "expected kebab-case 'coding' in serialized policy:\n{rendered}"
         );
     }
 

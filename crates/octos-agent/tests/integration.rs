@@ -254,7 +254,7 @@ async fn test_context_trimming() {
     let history: Vec<Message> = (0..30)
         .map(|i| Message {
             role: octos_core::MessageRole::User,
-            content: format!("This is message number {} with some padding text to make it longer for token estimation purposes.", i),
+            content: format!("This is message number {i} with some padding text to make it longer for token estimation purposes."),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,

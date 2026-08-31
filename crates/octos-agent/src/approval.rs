@@ -306,7 +306,7 @@ impl PendingApprovalStore {
 pub fn digest_tool_args(args: &serde_json::Value) -> String {
     let encoded = serde_json::to_vec(args).unwrap_or_default();
     let digest = Sha256::digest(encoded);
-    format!("sha256:{:x}", digest)
+    format!("sha256:{digest:x}")
 }
 
 fn approval_title_for_tool(tool_name: &str) -> String {

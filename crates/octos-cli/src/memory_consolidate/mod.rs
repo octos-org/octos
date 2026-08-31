@@ -3811,7 +3811,7 @@ mod tests {
             "forget something vague",
             false,
             "[]",
-            &format!("{}T10:00:00+00:00", TODAY),
+            &format!("{TODAY}T10:00:00+00:00"),
         );
 
         let provider = ScriptedProvider::new(&[]);

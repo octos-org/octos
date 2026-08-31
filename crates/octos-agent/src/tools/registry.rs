@@ -2964,13 +2964,11 @@ mod profile_filter_tests {
         let visible: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
         assert!(
             !visible.contains(&"mofa_slides".to_string()),
-            "internal-hidden mofa_slides must NOT appear in specs; got {:?}",
-            visible
+            "internal-hidden mofa_slides must NOT appear in specs; got {visible:?}"
         );
         assert!(
             visible.contains(&"mofa_cards".to_string()),
-            "non-hidden mofa_cards must remain visible in specs; got {:?}",
-            visible
+            "non-hidden mofa_cards must remain visible in specs; got {visible:?}"
         );
         // Still reachable via get() for internal dispatcher forwarding.
         assert!(
@@ -3064,8 +3062,7 @@ mod profile_filter_tests {
         assert_eq!(
             post.len(),
             1,
-            "catalog must be pruned to surviving targets; got {:?}",
-            post
+            "catalog must be pruned to surviving targets; got {post:?}"
         );
         assert_eq!(post[0].content_type, "slides");
 
@@ -3169,8 +3166,7 @@ mod profile_filter_tests {
         assert_eq!(
             session_post.len(),
             1,
-            "slides session catalog must be pruned; got {:?}",
-            session_post
+            "slides session catalog must be pruned; got {session_post:?}"
         );
         assert_eq!(session_post[0].content_type, "slides");
 
@@ -3197,8 +3193,7 @@ mod profile_filter_tests {
         for required in ["slides", "cards", "comic", "site"] {
             assert!(
                 base_types.contains(required),
-                "base catalog lost {required:?} after slides session retain; got {:?}",
-                base_types
+                "base catalog lost {required:?} after slides session retain; got {base_types:?}"
             );
         }
 
@@ -3294,8 +3289,7 @@ mod profile_filter_tests {
         for required in ["slides", "cards", "comic"] {
             assert!(
                 b_types.contains(required),
-                "session B lost {required:?}; got {:?}",
-                b_types
+                "session B lost {required:?}; got {b_types:?}"
             );
         }
     }
@@ -3368,8 +3362,7 @@ mod profile_filter_tests {
             assert_eq!(
                 session_entries,
                 vec!["slides".to_string()],
-                "every session must end with only slides; got {:?}",
-                session_entries
+                "every session must end with only slides; got {session_entries:?}"
             );
         }
 
