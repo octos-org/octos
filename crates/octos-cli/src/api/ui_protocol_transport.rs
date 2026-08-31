@@ -12175,18 +12175,13 @@ async fn raw_profile_llm_upsert(
     // schema (`cost_per_m`, `strong` — owned by routing research / QoS) must
     // not be silently destroyed by an endpoint edit: carry the prior
     // same-address values forward instead of resetting them.
-    if let Some(prior) = profile
-        .config
-        .llm
-        .as_ref()
-        .map(|llm| {
-            llm.fallbacks
-                .iter()
-                .chain(llm.primary.iter())
-                .find(|existing| same_llm_selection_address(existing, &selection))
-        })
-        .flatten()
-    {
+    let prior_same_address = profile.config.llm.as_ref().and_then(|llm| {
+        llm.fallbacks
+            .iter()
+            .chain(llm.primary.iter())
+            .find(|existing| same_llm_selection_address(existing, &selection))
+    });
+    if let Some(prior) = prior_same_address {
         selection.cost_per_m = prior.cost_per_m;
         selection.strong = prior.strong;
     }
