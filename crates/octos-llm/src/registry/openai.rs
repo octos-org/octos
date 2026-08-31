@@ -18,6 +18,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     requires_base_url: false,
     requires_model: false,
     detect_patterns: &["gpt"],
+    model_discovery: crate::discovery::OPENAI_MODELS,
     create,
 };
 

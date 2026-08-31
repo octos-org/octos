@@ -18,6 +18,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     requires_model: false,
     // Nvidia NIM hosts many models — no simple detect pattern.
     detect_patterns: &[],
+    model_discovery: crate::discovery::OPENAI_MODELS,
     create,
 };
 

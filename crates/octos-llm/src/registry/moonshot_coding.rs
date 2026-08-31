@@ -26,6 +26,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     // `kimi-for-coding`) must not be silently routed to the regular `moonshot`
     // endpoint, which would reject a coding-plan key.
     detect_patterns: &[],
+    model_discovery: crate::discovery::OPENAI_MODELS,
     create,
 };
 

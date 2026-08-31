@@ -8626,7 +8626,7 @@ async fn profile_llm_fetch_models_requires_family_id() {
 }
 
 #[tokio::test]
-async fn profile_llm_fetch_models_returns_empty_with_reason_when_provider_unreachable() {
+async fn profile_llm_fetch_models_returns_typed_reason_when_provider_unreachable() {
     let state = Arc::new(AppState::empty_for_tests());
     let request = RpcRequest::new(
         "1",
@@ -8649,7 +8649,253 @@ async fn profile_llm_fetch_models_returns_empty_with_reason_when_provider_unreac
         .expect("fetch_models result");
 
     assert_eq!(result["models"], json!([]));
-    assert_eq!(result["reason"], json!("provider_unavailable"));
+    // Typed, distinguishable failure — not the old collapsed
+    // `provider_unavailable` that hid auth/protocol/manual-entry differences.
+    assert_eq!(result["status"], json!("endpoint_unreachable"));
+    assert_eq!(result["reason"], json!("endpoint_unreachable"));
+    assert!(result["message"].is_string());
+}
+
+/// One captured discovery request: path plus the auth-relevant headers.
+struct CapturedDiscoveryRequest {
+    path: String,
+    authorization: Option<String>,
+    x_api_key: Option<String>,
+}
+
+/// Raw-TCP loopback fixture for fetch_models: serves a fixed JSON status/body
+/// for every request and records path + auth headers, so tests can pin the
+/// EXACT wire behavior (no Bearer on Anthropic-protocol families, no
+/// duplicated version segments on versioned roots).
+async fn spawn_discovery_fixture(
+    status_line: &'static str,
+    body: &'static str,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<CapturedDiscoveryRequest>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            // Read until the END OF HEADERS — a single read can return a
+            // partial request, and answering before the client finished
+            // sending makes the close reset the connection mid-request.
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        raw.extend_from_slice(&chunk[..read]);
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&raw).to_string();
+            let mut lines = request.split("\r\n");
+            let request_line = lines.next().unwrap_or_default().to_string();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            let header = |name: &str| -> Option<String> {
+                lines.clone().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+            };
+            recorded.lock().await.push(CapturedDiscoveryRequest {
+                path,
+                authorization: header("authorization"),
+                x_api_key: header("x-api-key"),
+            });
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    (format!("http://{address}"), captured)
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
+    let (root, captured) = spawn_discovery_fixture(
+        "200 OK",
+        r#"{"data":[{"id":"glm-5.2"},{"id":"glm-4.7"}]}"#,
+    )
+    .await;
+    let state = Arc::new(AppState::empty_for_tests());
+    // Saved AppUI routes default api_type to "openai" — exactly the shape
+    // that used to force the Bearer /v1/models probe onto zai.
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "zai",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/api/anthropic"),
+                    "api_type": "openai"
+                }
+            },
+            "api_key": "zai-secret-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    assert_eq!(result["models"], json!(["glm-4.7", "glm-5.2"]));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/anthropic/v1/models");
+    assert!(
+        requests[0].authorization.is_none(),
+        "zai speaks the Anthropic Messages protocol — never a Bearer probe"
+    );
+    assert_eq!(requests[0].x_api_key.as_deref(), Some("zai-secret-key"));
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_does_not_duplicate_version_segments_on_v4_roots() {
+    let (root, captured) = spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "zhipu",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/api/paas/v4")
+                }
+            },
+            "api_key": "zhipu-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    let requests = captured.lock().await;
+    assert_eq!(requests[0].path, "/api/paas/v4/models");
+    assert_ne!(requests[0].path, "/api/paas/v4/v1/models");
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_reports_unsupported_for_manual_only_families() {
+    let (root, captured) = spawn_discovery_fixture("200 OK", r#"{"data":[]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "vertex",
+                "route": {
+                    "route_id": "official",
+                    "base_url": root
+                }
+            },
+            "api_key": "sa-json-credential"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("unsupported"));
+    assert_eq!(result["models"], json!([]));
+    assert!(
+        result["message"].as_str().is_some_and(|m| m.contains("manually")),
+        "unsupported must point at manual model-id entry"
+    );
+    assert!(
+        captured.lock().await.is_empty(),
+        "manual-only families must never be probed"
+    );
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_distinguishes_auth_failures_from_unavailability() {
+    let (root, _) = spawn_discovery_fixture("401 Unauthorized", r#"{"error":{}}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "custom",
+                "route": {
+                    "route_id": "custom",
+                    "base_url": format!("{root}/v1"),
+                    "api_type": "openai"
+                }
+            },
+            "api_key": "sk-wrong"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["models"], json!([]));
+    assert_eq!(result["status"], json!("authentication_failed"));
+    assert_eq!(result["reason"], json!("authentication_failed"));
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_keeps_empty_catalogs_distinguishable_from_failures() {
+    let (root, _) = spawn_discovery_fixture("200 OK", r#"{"data":[]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "custom",
+                "route": {
+                    "route_id": "custom",
+                    "base_url": format!("{root}/v1"),
+                    "api_type": "openai"
+                }
+            },
+            "api_key": "sk-fine"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    // An empty successful catalog is data, not `provider_unavailable`.
+    assert_eq!(result["status"], json!("discovered"));
+    assert_eq!(result["models"], json!([]));
+    assert!(result.get("reason").is_none());
+    assert!(result.get("message").is_none());
 }
 
 #[tokio::test]

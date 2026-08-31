@@ -12322,6 +12322,10 @@ async fn raw_profile_llm_fetch_models(
     let family_id = nonempty(params.selection.family_id)
         .ok_or_else(|| RpcError::invalid_params("selection.family_id is required"))?;
     let base_url = nonempty(params.selection.route.base_url);
+    // The route's protocol override feeds strategy resolution — ignoring it
+    // here is what forced Anthropic-protocol families onto the OpenAI/Bearer
+    // /v1/models probe.
+    let api_type = nonempty(params.selection.route.api_type);
     let api_key_env = nonempty(params.selection.route.api_key_env)
         .or_else(|| dashboard_family_api_key_env(&family_id));
 
@@ -12343,28 +12347,47 @@ async fn raw_profile_llm_fetch_models(
             return Ok(json!({
                 "profile_id": profile_id,
                 "family_id": family_id,
+                "api_type": api_type,
                 "models": [],
+                "status": "no_api_key",
                 "reason": "no_api_key",
             }));
         }
     };
 
-    let models =
-        crate::api::admin::fetch_provider_models(&family_id, &api_key, base_url.as_deref())
-            .await
-            .unwrap_or_default();
-    let reason = if models.is_empty() {
-        Some("provider_unavailable")
-    } else {
-        None
-    };
+    // Protocol-aware discovery, shared verbatim with the admin REST
+    // `/api/my/provider-models` surface: the strategy resolves from the route
+    // (api_type override, then the family's declared protocol), and the typed
+    // outcome keeps "enter the model id manually" distinguishable from
+    // "credential/endpoint invalid" — instead of collapsing every failure
+    // into an empty list + `provider_unavailable`.
+    let discovery = octos_llm::discovery::resolve_model_discovery(
+        Some(&family_id),
+        api_type.as_deref(),
+    );
+    let outcome = octos_llm::discovery::discover_models(
+        discovery,
+        &api_key,
+        base_url.as_deref(),
+        Some(&family_id),
+    )
+    .await;
+    let status = outcome.status_label();
     let mut result = json!({
         "profile_id": profile_id,
         "family_id": family_id,
-        "models": models,
+        "api_type": api_type,
+        "models": outcome.models().unwrap_or(&[]),
+        // Typed status: discovered | unsupported | authentication_failed |
+        // endpoint_unreachable | invalid_response | rate_limited.
+        "status": status,
     });
-    if let (Some(reason), Value::Object(object)) = (reason, &mut result) {
-        object.insert("reason".into(), Value::String(reason.into()));
+    if let Some(message) = outcome.message() {
+        // Safe, redacted provider message (never contains the credential).
+        result["message"] = Value::String(message.to_string());
+        // `reason` mirrors `status` on failures for clients still reading the
+        // old collapsed field.
+        result["reason"] = Value::String(status.to_string());
     }
     Ok(result)
 }
