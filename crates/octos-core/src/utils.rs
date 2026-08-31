@@ -29,17 +29,105 @@ pub fn truncated_utf8(s: &str, max_len: usize, suffix: &str) -> String {
     format!("{}{}", &s[..limit], suffix)
 }
 
+/// Which limit cut the output in a [`TruncationReport`].
+///
+/// Modeled on pi's `TruncationResult.truncatedBy` (`"lines" | "bytes" |
+/// null`, `packages/coding-agent/src/core/tools/truncate.ts`).
+/// [`truncate_head_tail_report`] cuts purely by bytes, so today it only ever
+/// emits [`TruncatedBy::Bytes`]; [`TruncatedBy::Lines`] is declared for
+/// future line-count-based truncation helpers rather than invented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncatedBy {
+    /// The byte limit (`max_len`) was hit.
+    Bytes,
+    /// A line-count limit was hit. Not produced by any octos-core helper
+    /// yet — see the enum-level doc.
+    Lines,
+}
+
+/// Structured result of a head/tail truncation, modeled on pi's
+/// `TruncationResult` (`packages/coding-agent/src/core/tools/truncate.ts`).
+///
+/// [`truncate_head_tail`] keeps only [`TruncationReport::content`] and throws
+/// the rest away; callers that need to ADVISE the model about the cut (how
+/// much is gone, which limit fired) use [`truncate_head_tail_report`] and
+/// read it from here instead of re-deriving it from string lengths — the
+/// re-derivation `total - content.len()` undercounts by the elision marker's
+/// own length.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TruncationReport {
+    /// The (possibly truncated) output. When truncated this embeds the
+    /// `\n\n... [N bytes omitted] ...\n\n` elision marker between the kept
+    /// head and tail.
+    pub content: String,
+    /// Whether any input bytes were dropped.
+    pub truncated: bool,
+    /// Which limit fired; `None` when not truncated. Only
+    /// [`TruncatedBy::Bytes`] is reachable from
+    /// [`truncate_head_tail_report`].
+    pub truncated_by: Option<TruncatedBy>,
+    /// Byte length of the original input.
+    pub total_bytes: usize,
+    /// Byte length of `content`. When truncated this INCLUDES the elision
+    /// marker, so `output_bytes != total_bytes - omitted_bytes` — the marker
+    /// adds ~30 bytes. In the degenerate `max_len`-below-marker-overhead
+    /// regime it can even exceed `max_len` (pre-existing
+    /// [`truncate_head_tail`] behaviour, unchanged).
+    pub output_bytes: usize,
+    /// Exact number of input bytes dropped between head and tail — the same
+    /// `N` printed in the elision marker. `0` when not truncated.
+    pub omitted_bytes: usize,
+    /// pi's `firstLineExceedsLimit` flags the head-truncation case where not
+    /// even the FIRST LINE fits the byte budget. A head/tail byte split has
+    /// no lines, so the honest analogue reported here: `true` when
+    /// truncation kept ZERO head bytes — `max_len` (minus the marker
+    /// overhead reservation) was too small for even one leading char to
+    /// survive, and `content` is effectively just the marker.
+    pub first_segment_exceeds_limit: bool,
+    /// The applied byte limit, as passed.
+    pub max_len: usize,
+    /// The applied head fraction, after clamping to `[0.1, 0.9]`.
+    pub head_ratio: f32,
+}
+
 /// Truncate output with head/tail split, preserving both ends.
 ///
 /// When `s` exceeds `max_len`, keeps `head_ratio` fraction from the start and
 /// the remainder from the end, joined by a separator line showing omitted bytes.
 /// Both split points are UTF-8 safe.
+///
+/// Thin wrapper over [`truncate_head_tail_report`] keeping the legacy
+/// `String` surface — one implementation, two surfaces.
 pub fn truncate_head_tail(s: &str, max_len: usize, head_ratio: f32) -> String {
-    if s.len() <= max_len {
-        return s.to_string();
-    }
+    truncate_head_tail_report(s, max_len, head_ratio).content
+}
 
+/// [`truncate_head_tail`] returning a structured [`TruncationReport`]
+/// instead of a bare `String`.
+///
+/// The `content` field is byte-identical to what [`truncate_head_tail`]
+/// returns for the same inputs; the rest of the report tells the caller what
+/// the cut did (`omitted_bytes`, `truncated_by`, the applied limits) without
+/// re-deriving it from string lengths.
+pub fn truncate_head_tail_report(s: &str, max_len: usize, head_ratio: f32) -> TruncationReport {
+    let total_bytes = s.len();
     let head_ratio = head_ratio.clamp(0.1, 0.9);
+
+    let untruncated = |content: String| TruncationReport {
+        content,
+        truncated: false,
+        truncated_by: None,
+        total_bytes,
+        output_bytes: total_bytes,
+        omitted_bytes: 0,
+        first_segment_exceeds_limit: false,
+        max_len,
+        head_ratio,
+    };
+
+    if s.len() <= max_len {
+        return untruncated(s.to_string());
+    }
 
     // Estimate separator overhead conservatively (handles large omitted counts)
     // "\n\n... [99999 bytes omitted] ...\n\n" is ~40 bytes max
@@ -59,14 +147,27 @@ pub fn truncate_head_tail(s: &str, max_len: usize, head_ratio: f32) -> String {
         tail_start += 1;
     }
 
-    // Avoid overlap
+    // Defensive overlap guard: the budgets cannot overlap by construction
+    // (head + tail <= max_len - 50 < s.len() here), but if they ever did the
+    // input passes through whole — reported honestly as "not truncated".
     if head_end >= tail_start {
-        return s.to_string();
+        return untruncated(s.to_string());
     }
 
     let omitted = tail_start - head_end;
     let sep = format!("\n\n... [{omitted} bytes omitted] ...\n\n");
-    format!("{}{}{}", &s[..head_end], sep, &s[tail_start..])
+    let content = format!("{}{}{}", &s[..head_end], sep, &s[tail_start..]);
+    TruncationReport {
+        output_bytes: content.len(),
+        content,
+        truncated: true,
+        truncated_by: Some(TruncatedBy::Bytes),
+        total_bytes,
+        omitted_bytes: omitted,
+        first_segment_exceeds_limit: head_end == 0,
+        max_len,
+        head_ratio,
+    }
 }
 
 /// Default per-tool output limits (max chars). Tools not listed use the global default.
@@ -219,6 +320,20 @@ mod tests {
         assert!(result.len() <= 150); // 100 + separator overhead
     }
 
+    /// Characterization pin: the exact legacy string emitted by
+    /// `truncate_head_tail`, captured BEFORE the structured-report refactor.
+    /// The refactor must keep the wrapper byte-identical.
+    #[test]
+    fn should_emit_exact_legacy_marker_when_truncating() {
+        let s = format!("{}{}", "h".repeat(100), "t".repeat(100));
+        let expect = format!(
+            "{}\n\n... [150 bytes omitted] ...\n\n{}",
+            "h".repeat(25),
+            "t".repeat(25)
+        );
+        assert_eq!(truncate_head_tail(&s, 100, 0.5), expect);
+    }
+
     #[test]
     fn test_head_tail_preserves_utf8() {
         let s = format!("{}{}", "\u{4F60}".repeat(50), "\u{597D}".repeat(50));
@@ -348,5 +463,134 @@ mod tests {
     #[test]
     fn should_return_placeholder_when_input_empty() {
         assert_eq!(safe_filename(""), "_");
+    }
+
+    // ── structured truncation report (pi TruncationResult port) ──────────
+
+    #[test]
+    fn should_report_untruncated_when_input_at_exact_limit() {
+        let s = "a".repeat(100);
+        let r = truncate_head_tail_report(&s, 100, 0.7);
+        assert!(!r.truncated);
+        assert_eq!(r.truncated_by, None);
+        assert_eq!(r.content, s);
+        assert_eq!(r.total_bytes, 100);
+        assert_eq!(r.output_bytes, 100);
+        assert_eq!(r.omitted_bytes, 0);
+        assert!(!r.first_segment_exceeds_limit);
+        assert_eq!(r.max_len, 100);
+    }
+
+    #[test]
+    fn should_report_bytes_truncation_when_one_byte_over_limit() {
+        let s = "a".repeat(101);
+        let r = truncate_head_tail_report(&s, 100, 0.7);
+        assert!(r.truncated);
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert_eq!(r.total_bytes, 101);
+        assert_eq!(r.max_len, 100);
+        assert_eq!(r.output_bytes, r.content.len());
+        assert!(r.omitted_bytes > 0);
+        assert!(
+            r.content
+                .contains(&format!("... [{} bytes omitted] ...", r.omitted_bytes)),
+            "report and inline marker must agree on the omitted count: {}",
+            r.content
+        );
+        assert!(!r.first_segment_exceeds_limit);
+    }
+
+    #[test]
+    fn should_report_untruncated_when_input_empty() {
+        let r = truncate_head_tail_report("", 0, 0.7);
+        assert!(!r.truncated);
+        assert_eq!(r.truncated_by, None);
+        assert_eq!(r.content, "");
+        assert_eq!(r.total_bytes, 0);
+        assert_eq!(r.output_bytes, 0);
+        assert_eq!(r.omitted_bytes, 0);
+    }
+
+    #[test]
+    fn should_keep_utf8_boundaries_when_multibyte_chars_straddle_the_cut() {
+        // 4-byte scalars; the byte budgets land mid-char, so both split points
+        // must back off to char boundaries instead of panicking.
+        let s = "\u{1F980}".repeat(200); // 800 bytes
+        let r = truncate_head_tail_report(&s, 101, 0.7);
+        assert!(r.truncated);
+        let marker = format!("\n\n... [{} bytes omitted] ...\n\n", r.omitted_bytes);
+        let (head, tail) = r
+            .content
+            .split_once(&marker)
+            .expect("truncated content must contain the elision marker");
+        assert!(
+            head.chars().all(|c| c == '\u{1F980}'),
+            "head must hold only whole chars: {head:?}"
+        );
+        assert!(
+            tail.chars().all(|c| c == '\u{1F980}'),
+            "tail must hold only whole chars: {tail:?}"
+        );
+        assert_eq!(r.total_bytes, 800);
+        assert_eq!(r.output_bytes, r.content.len());
+        // Whole chars only: kept payload + omitted covers the input exactly.
+        assert_eq!(head.len() + tail.len() + r.omitted_bytes, r.total_bytes);
+    }
+
+    /// Wrapper equivalence: `truncate_head_tail` must be a thin projection of
+    /// the report — one implementation, two surfaces. Property-style over
+    /// fixtures crossing the limit from both sides, multi-byte content, and
+    /// out-of-range ratios.
+    #[test]
+    fn should_match_wrapper_content_when_report_and_wrapper_share_inputs() {
+        let fixtures: Vec<String> = vec![
+            String::new(),
+            "short".to_string(),
+            "a".repeat(99),
+            "a".repeat(100),
+            "a".repeat(101),
+            "x".repeat(10_000),
+            "\u{1F980}".repeat(400),
+            "\u{4F60}\u{597D}\u{4E16}\u{754C}".repeat(500),
+            format!("head\n{}\ntail", "mid ".repeat(2_000)),
+        ];
+        for s in &fixtures {
+            for max_len in [0usize, 10, 49, 50, 51, 100, 1_000, 30_000] {
+                for ratio in [0.0f32, 0.3, 0.5, 0.7, 0.9, 1.5] {
+                    let report = truncate_head_tail_report(s, max_len, ratio);
+                    assert_eq!(
+                        truncate_head_tail(s, max_len, ratio),
+                        report.content,
+                        "wrapper and report must share one implementation \
+                         (len={}, max_len={max_len}, ratio={ratio})",
+                        s.len(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn should_flag_first_segment_exceeds_limit_when_budget_below_marker_overhead() {
+        // max_len below the separator overhead: no payload byte survives and
+        // the emitted content is only the elision marker — the head/tail
+        // analogue of pi's firstLineExceedsLimit (see the field doc).
+        let s = "z".repeat(100);
+        let r = truncate_head_tail_report(&s, 10, 0.7);
+        assert!(r.truncated);
+        assert!(r.first_segment_exceeds_limit);
+        assert_eq!(r.omitted_bytes, 100);
+        assert_eq!(r.content, "\n\n... [100 bytes omitted] ...\n\n");
+        assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+    }
+
+    #[test]
+    fn should_clamp_reported_head_ratio_when_ratio_out_of_range() {
+        let s = "a".repeat(300);
+        let hi = truncate_head_tail_report(&s, 100, 5.0);
+        assert_eq!(hi.head_ratio, 0.9);
+        assert_eq!(hi.content, truncate_head_tail(&s, 100, 5.0));
+        let lo = truncate_head_tail_report(&s, 100, -1.0);
+        assert_eq!(lo.head_ratio, 0.1);
     }
 }

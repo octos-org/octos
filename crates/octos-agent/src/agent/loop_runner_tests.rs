@@ -6380,6 +6380,64 @@ async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
     );
 }
 
+/// Every `<digits> bytes omitted` count in `content`, in order of appearance.
+fn omitted_byte_counts(content: &str) -> Vec<u64> {
+    let mut counts = Vec::new();
+    for (idx, _) in content.match_indices(" bytes omitted") {
+        let digits: Vec<char> = content[..idx]
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let digits: String = digits.into_iter().rev().collect();
+        if !digits.is_empty() {
+            counts.push(digits.parse().expect("ascii digits"));
+        }
+    }
+    counts
+}
+
+/// The backstop's inline marker (`... [N bytes omitted] ...`) and the
+/// recovery advice the tool composes (`[N bytes omitted] Continue...`) are
+/// two tellings of the SAME cut and must carry the same byte count.
+///
+/// The legacy loop recomputed the recovery count as
+/// `untruncated_len - content.len()`, which undercounts by the length of the
+/// elision marker itself — the model was shown two numbers that never agreed.
+/// The structured `truncate_head_tail_report` hands both consumers the one
+/// `omitted_bytes` the split actually measured.
+#[tokio::test]
+async fn should_agree_on_omitted_bytes_between_marker_and_recovery_when_backstop_truncates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(OverflowingPagedTool);
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(CallsOverflowingToolThenEnds {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("truncation-agree"), provider, tools, memory);
+
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+    let tool_message = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("the turn must contain the tool result");
+
+    let counts = omitted_byte_counts(&tool_message.content);
+    assert_eq!(
+        counts.len(),
+        2,
+        "expected the elision marker and the recovery advice to each name a count; tail: {:?}",
+        &tool_message.content[tool_message.content.len().saturating_sub(300)..]
+    );
+    assert_eq!(
+        counts[0], counts[1],
+        "marker and recovery advice must agree on how much was omitted"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // #27d (R4) — malformed tool-call feedback buffer
 // ─────────────────────────────────────────────────────────────────────────

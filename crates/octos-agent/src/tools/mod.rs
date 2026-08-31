@@ -642,7 +642,7 @@ pub trait Tool: Send + Sync {
     /// Truncation happens in the execution loop, at the one point every tool's
     /// output funnels through — which is also the point that knows the least.
     /// By then the result is a plain `String`: the helper doing the cutting
-    /// (`truncate_head_tail(s, max_len, head_ratio)`) receives a string and a
+    /// (`truncate_head_tail_report(s, max_len, head_ratio)`) receives a string and a
     /// number and cannot know which tool produced it, whether that tool paginates,
     /// or what the parameter is called.
     ///

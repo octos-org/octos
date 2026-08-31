@@ -50,6 +50,6 @@ pub use types::{
 };
 pub use ui_protocol::{EventEnvelope, TurnContext};
 pub use utils::{
-    SAFE_FILENAME_MAX_BYTES, safe_filename, tool_output_limit, truncate_head_tail, truncate_utf8,
-    truncated_utf8,
+    SAFE_FILENAME_MAX_BYTES, TruncatedBy, TruncationReport, safe_filename, tool_output_limit,
+    truncate_head_tail, truncate_head_tail_report, truncate_utf8, truncated_utf8,
 };

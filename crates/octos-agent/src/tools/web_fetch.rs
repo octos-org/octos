@@ -71,7 +71,15 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL and extract its content as markdown or plain text."
+        static DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "Fetch a URL and extract its content as markdown or plain text. Output beyond \
+                 {} bytes is truncated with a '[N bytes omitted]' middle marker, regardless of \
+                 max_chars.",
+                octos_core::tool_output_limit("web_fetch")
+            )
+        });
+        &DESCRIPTION
     }
 
     fn tags(&self) -> &[&str] {
@@ -468,6 +476,19 @@ mod tests {
             result.output.contains("allowlist"),
             "refusal must be the allowlist (no network hit): {}",
             result.output,
+        );
+    }
+
+    /// pi-style truncation contract: the model is warned about the output cap
+    /// UP FRONT, in the tool description, using the real limit.
+    #[test]
+    fn should_state_truncation_contract_in_description_when_web_fetch() {
+        let tool = WebFetchTool::new();
+        let desc = tool.description();
+        let limit = octos_core::tool_output_limit("web_fetch");
+        assert!(
+            desc.contains(&limit.to_string()),
+            "description must carry the real output cap ({limit}): {desc}"
         );
     }
 }

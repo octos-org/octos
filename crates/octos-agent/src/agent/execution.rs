@@ -2383,22 +2383,28 @@ impl Agent {
             //
             // The cut is a BACKSTOP: it is the one point every tool's output
             // funnels through, which is also the point that knows the least —
-            // `truncate_head_tail` receives a string and a number. On its own it
-            // leaves the model with `... [N bytes omitted] ...` and no way to
-            // reach what it lost, so the only recovery is re-running the call,
-            // which returns the same output cut the same way and spends the
-            // tokens the cap was meant to save.
+            // `truncate_head_tail_report` receives a string and a number. On
+            // its own it leaves the model with `... [N bytes omitted] ...` and
+            // no way to reach what it lost, so the only recovery is re-running
+            // the call, which returns the same output cut the same way and
+            // spends the tokens the cap was meant to save.
             //
             // `Tool::truncation_recovery` is the missing half: the tool still
             // knows its own arguments and whether it paginates, so it can name a
             // concrete next call. Tools with no resume path return None and get
             // no invented advice.
+            //
+            // The hook is handed `omitted_bytes` from the structured report —
+            // the same N the inline marker prints — instead of the legacy
+            // `untruncated_len - content.len()` re-derivation, which
+            // undercounted by the marker's own length and told the model two
+            // disagreeing numbers about one cut.
             let limit = octos_core::tool_output_limit(&tc_name);
-            let untruncated_len = content.len();
-            let mut content = octos_core::truncate_head_tail(&content, limit, 0.7);
-            if content.len() < untruncated_len {
+            let report = octos_core::truncate_head_tail_report(&content, limit, 0.7);
+            let mut content = report.content;
+            if report.truncated {
                 if let Some(recovery) = tools.get(&tc_name).and_then(|tool| {
-                    tool.truncation_recovery(&effective_args, untruncated_len - content.len())
+                    tool.truncation_recovery(&effective_args, report.omitted_bytes)
                 }) {
                     content.push('\n');
                     content.push_str(&recovery);
