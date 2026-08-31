@@ -41,6 +41,41 @@ pub struct ChatConfig {
     /// `max_tokens` here — use their dedicated fields. See issue #2172.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Per-request prompt-cache retention preference.
+    ///
+    /// [`CacheRetention::None`] asks the provider to skip prompt-cache
+    /// WRITES for this one request — on Anthropic that means emitting NO
+    /// `cache_control` breakpoints, since every breakpoint both reads and
+    /// writes and an unread write still bills the 1.25x premium. Set it on
+    /// one-shot calls (compaction summaries, sub-agent digests) whose
+    /// prefix is never sent again; the agent loop, whose prefix IS replayed
+    /// every iteration, must stay on [`CacheRetention::Default`]. Mirrors
+    /// pi's `cacheRetention: "none"` on its summarization requests.
+    /// Providers without explicit cache breakpoints ignore this field.
+    #[serde(default, skip_serializing_if = "CacheRetention::is_default")]
+    pub cache_retention: CacheRetention,
+}
+
+/// Prompt-cache retention for a single request. See
+/// [`ChatConfig::cache_retention`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    /// The provider's configured caching behavior (on Anthropic: the three
+    /// ephemeral `cache_control` breakpoints, unless the provider was built
+    /// with caching disabled).
+    #[default]
+    Default,
+    /// Do not write this request's prefix to the provider's prompt cache.
+    None,
+}
+
+impl CacheRetention {
+    /// `skip_serializing_if` hook: an unset preference stays off the wire so
+    /// persisted `ChatConfig` JSON keeps its pre-field shape.
+    pub fn is_default(&self) -> bool {
+        matches!(self, CacheRetention::Default)
+    }
 }
 
 /// Structured output format for chat responses.
@@ -94,6 +129,7 @@ impl Default for ChatConfig {
             response_format: None,
             context_management: None,
             sampling_params: None,
+            cache_retention: CacheRetention::Default,
         }
     }
 }
@@ -146,6 +182,34 @@ mod tests {
     }
 
     #[test]
+    fn should_default_cache_retention_to_provider_default_when_unset() {
+        assert_eq!(
+            ChatConfig::default().cache_retention,
+            CacheRetention::Default
+        );
+    }
+
+    #[test]
+    fn should_keep_cache_retention_off_the_wire_when_default() {
+        // Persisted ChatConfig JSON must keep its pre-field byte shape for a
+        // config that never touches the preference.
+        let json = serde_json::to_value(ChatConfig::default()).unwrap();
+        assert!(json.get("cache_retention").is_none());
+    }
+
+    #[test]
+    fn should_round_trip_cache_retention_none_as_snake_case() {
+        let config = ChatConfig {
+            cache_retention: CacheRetention::None,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["cache_retention"], "none");
+        let decoded: ChatConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.cache_retention, CacheRetention::None);
+    }
+
+    #[test]
     fn test_chat_config_serde_roundtrip() {
         let config = ChatConfig {
             max_tokens: Some(2048),
@@ -156,6 +220,7 @@ mod tests {
             response_format: None,
             context_management: None,
             sampling_params: None,
+            cache_retention: CacheRetention::Default,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ChatConfig = serde_json::from_str(&json).unwrap();
@@ -176,6 +241,7 @@ mod tests {
             response_format: None,
             context_management: None,
             sampling_params: None,
+            cache_retention: CacheRetention::Default,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("max_tokens").is_none());

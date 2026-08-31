@@ -13266,6 +13266,9 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         response_format: None,
         context_management: None,
         sampling_params: None,
+        // One-shot: each verdict prompt embeds its own objective + evidence
+        // and is never replayed, so skip prompt-cache writes.
+        cache_retention: octos_llm::CacheRetention::None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
     let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {

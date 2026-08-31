@@ -477,6 +477,9 @@ async fn fetch_summary(
         response_format: None,
         context_management: None,
         sampling_params: None,
+        // One-shot: each digest prompt is fresh activity, sent exactly once
+        // — opt out of the 1.25x cache-write premium.
+        cache_retention: octos_llm::CacheRetention::None,
     };
     let messages = vec![Message::user(prompt)];
     let fut = async move { provider.chat(&messages, &[], &config).await };
@@ -501,6 +504,9 @@ mod tests {
     struct MockProvider {
         output: String,
         calls: Arc<AtomicU32>,
+        /// Cache-retention preference of the last request, so tests can pin
+        /// the one-shot digest's opt-out at the call site.
+        seen_retention: Arc<std::sync::Mutex<Option<octos_llm::CacheRetention>>>,
     }
 
     impl MockProvider {
@@ -510,6 +516,7 @@ mod tests {
                 Self {
                     output: output.into(),
                     calls: Arc::clone(&calls),
+                    seen_retention: Arc::new(std::sync::Mutex::new(None)),
                 },
                 calls,
             )
@@ -522,9 +529,10 @@ mod tests {
             &self,
             _messages: &[Message],
             _tools: &[ToolSpec],
-            _config: &ChatConfig,
+            config: &ChatConfig,
         ) -> eyre::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.seen_retention.lock().unwrap() = Some(config.cache_retention);
             Ok(ChatResponse {
                 content: Some(self.output.clone()),
                 reasoning_content: None,
@@ -643,6 +651,30 @@ mod tests {
         assert_eq!(detail["summary"], "parsing response");
         assert_eq!(detail["tick"], 7);
         assert!(detail["at"].is_string());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn should_opt_out_of_cache_writes_when_fetching_subagent_digest() {
+        // Each 64-token digest call sends a fresh activity prompt exactly
+        // once — a cache write on it is pure 1.25x premium, never read back.
+        let (mock, _) = MockProvider::new("parsing response");
+        let seen = Arc::clone(&mock.seen_retention);
+        let supervisor = TaskSupervisor::new();
+        let id = register_running_task(&supervisor);
+        let generator = AgentSummaryGenerator::with_activity_source(
+            Arc::new(mock),
+            fixed_activity(&["fetch", "parse"]),
+            supervisor.clone(),
+        )
+        .with_llm_timeout(Duration::from_secs(1));
+
+        let _ = generator.summarize_once("api:session", &id, 1).await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot sub-agent digests must not request cache writes"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

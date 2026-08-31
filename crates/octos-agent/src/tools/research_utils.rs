@@ -160,6 +160,9 @@ pub async fn extract_findings(
     let config = ChatConfig {
         max_tokens: Some(8192),
         temperature: Some(0.0),
+        // One-shot: each map-reduce prompt is unique and sent exactly once —
+        // opt out of the 1.25x cache-write premium.
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
 
@@ -228,6 +231,9 @@ pub async fn merge_findings(
     let config = ChatConfig {
         max_tokens: Some(8192),
         temperature: Some(0.0),
+        // One-shot: each map-reduce prompt is unique and sent exactly once —
+        // opt out of the 1.25x cache-write premium.
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
 
@@ -359,6 +365,80 @@ pub fn truncate_to_limit(files: Vec<(String, String)>) -> Vec<(String, String)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RetentionProbeProvider {
+        seen: std::sync::Mutex<Option<octos_llm::CacheRetention>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RetentionProbeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            config: &ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            *self.seen.lock().unwrap() = Some(config.cache_retention);
+            Ok(octos_llm::ChatResponse {
+                content: Some("findings".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<octos_llm::ChatStream> {
+            unimplemented!("probe does not stream")
+        }
+
+        fn model_id(&self) -> &str {
+            "retention-probe"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_cache_writes_when_extracting_findings() {
+        // Each map-reduce batch prompt is unique (its own slice of sources)
+        // and sent exactly once — cache writes on it are never read back.
+        let probe = RetentionProbeProvider {
+            seen: std::sync::Mutex::new(None),
+        };
+        let files = vec![("a.md".to_string(), "content".to_string())];
+        extract_findings(&probe, "q", None, &files, &[0], 1, 1)
+            .await
+            .expect("probe provider yields findings");
+        assert_eq!(
+            *probe.seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot research batch analysis must not request cache writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_cache_writes_when_merging_findings() {
+        let probe = RetentionProbeProvider {
+            seen: std::sync::Mutex::new(None),
+        };
+        merge_findings(&probe, "q", None, &["partial one".to_string()], 1)
+            .await
+            .expect("probe provider yields a merged report");
+        assert_eq!(
+            *probe.seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot research synthesis must not request cache writes"
+        );
+    }
 
     #[test]
     fn test_partition_batches_single() {

@@ -225,6 +225,9 @@ impl PersonaService {
             response_format: None,
             context_management: None,
             sampling_params: None,
+            // One-shot persona generation; the prompt is never replayed
+            // within a cache TTL, so skip cache writes.
+            cache_retention: octos_llm::CacheRetention::None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {
@@ -388,6 +391,9 @@ impl PersonaService {
             response_format: None,
             context_management: None,
             sampling_params: None,
+            // One-shot status-words generation; never replayed within a
+            // cache TTL, so skip cache writes.
+            cache_retention: octos_llm::CacheRetention::None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {

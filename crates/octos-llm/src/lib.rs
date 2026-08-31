@@ -55,7 +55,7 @@ pub use adaptive::{
 };
 pub use call_policy::{LlmCallPolicy, current_llm_call_policy, with_llm_call_policy};
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
-pub use config::{ChatConfig, ReasoningEffort, ResponseFormat, ToolChoice};
+pub use config::{CacheRetention, ChatConfig, ReasoningEffort, ResponseFormat, ToolChoice};
 pub use content_classifier::{
     ClassificationDecision, ContentClassifier, HarnessRoutingDecisionPayload, ModelTier,
     RoutingConfig,

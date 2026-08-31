@@ -1193,6 +1193,9 @@ pub fn llm_compaction_summary(
             max_tokens: Some(provider.max_output_tokens()),
             // Low but non-zero: a factual handoff summary, lightly deterministic.
             temperature: Some(0.2),
+            // One-shot: the transcript is summarized exactly once and its
+            // prefix never replayed, so cache writes would be pure premium.
+            cache_retention: octos_llm::CacheRetention::None,
             ..Default::default()
         };
         let request = vec![
@@ -1314,6 +1317,68 @@ mod tests {
             result: Ok("unused".into()),
         });
         assert!(llm_compaction_summary(&provider, &[], Duration::from_secs(5)).is_none());
+    }
+
+    /// Captures the `ChatConfig` the summary call sends so the cache-economics
+    /// contract is pinned at the call site, not just in the provider.
+    struct RetentionProbeProvider {
+        seen: Arc<std::sync::Mutex<Option<octos_llm::CacheRetention>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RetentionProbeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            *self.seen.lock().unwrap() = Some(config.cache_retention);
+            Ok(octos_llm::ChatResponse {
+                content: Some("one-shot summary".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatStream> {
+            unimplemented!("probe does not stream")
+        }
+
+        fn model_id(&self) -> &str {
+            "retention-probe"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_opt_out_of_cache_writes_when_summarizing_one_shot() {
+        // The compaction summary sends its transcript exactly once — the
+        // prefix is never replayed, so marking cache breakpoints would pay
+        // the 1.25x write premium for nothing. The request must opt out.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let provider: Arc<dyn LlmProvider> = Arc::new(RetentionProbeProvider {
+            seen: Arc::clone(&seen),
+        });
+        let messages = vec![Message::user("do X"), Message::assistant("did Y")];
+        let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
+        assert!(out.is_some(), "probe provider returns a summary");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot compaction summaries must not request cache writes"
+        );
     }
 
     #[tokio::test] // current_thread runtime (the default, no `flavor`)

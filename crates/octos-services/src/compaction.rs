@@ -137,6 +137,9 @@ pub async fn maybe_compact_with_config(
     let chat_config = ChatConfig {
         max_tokens: Some(768),
         temperature: Some(0.0),
+        // One-shot: the transcript is summarized exactly once (then replaced
+        // by the summary), so cache writes would be pure 1.25x premium.
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
 
@@ -271,6 +274,9 @@ pub async fn maybe_compact_handle(
     let chat_config = ChatConfig {
         max_tokens: Some(768),
         temperature: Some(0.0),
+        // One-shot: the transcript is summarized exactly once (then replaced
+        // by the summary), so cache writes would be pure 1.25x premium.
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
 

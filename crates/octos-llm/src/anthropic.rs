@@ -145,7 +145,13 @@ impl AnthropicProvider {
         config: &'a ChatConfig,
     ) -> AnthropicRequest<'a> {
         let max_tokens = config.max_tokens.unwrap_or(4096);
-        let cache = self.prompt_caching.then_some(EPHEMERAL_CACHE_CONTROL);
+        // Provider default AND the request did not opt out: a one-shot call
+        // (`ChatConfig.cache_retention: None`) pays the 1.25x cache-write
+        // premium on a prefix it never sends again, so it gets the exact
+        // pre-caching wire shape instead (mirrors pi's `cacheRetention:
+        // "none"` on summarization requests).
+        let cache = (self.prompt_caching && config.cache_retention != crate::CacheRetention::None)
+            .then_some(EPHEMERAL_CACHE_CONTROL);
         let mut api_messages = build_anthropic_messages(messages);
         if cache.is_some() {
             apply_message_cache_breakpoint(&mut api_messages);
@@ -1805,6 +1811,80 @@ mod tests {
         assert!(
             !body.to_string().contains("cache_control"),
             "no cache_control key may appear anywhere when caching is off: {body}"
+        );
+    }
+
+    #[test]
+    fn should_not_emit_cache_control_anywhere_when_request_opts_out_of_cache_writes() {
+        // A one-shot request (`ChatConfig.cache_retention: None`) must not
+        // pay the 1.25x cache-write premium: with caching enabled on the
+        // PROVIDER, the opted-out REQUEST still serializes to the exact
+        // pre-caching wire shape — plain-string system, verbatim tools, no
+        // cache_control key anywhere.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
+        let tools = vec![
+            tool_spec("alpha", "first tool"),
+            tool_spec("omega", "last tool"),
+        ];
+        let messages = vec![
+            msg(MessageRole::System, "system prompt"),
+            msg(MessageRole::User, "hello"),
+        ];
+        let opted_out = ChatConfig {
+            cache_retention: crate::CacheRetention::None,
+            ..Default::default()
+        };
+        let body =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &opted_out)).unwrap();
+        assert!(
+            !body.contains("cache_control"),
+            "an opted-out request must carry zero cache_control blocks: {body}"
+        );
+
+        // Byte-identical to the shape a caching-disabled provider emits —
+        // the opt-out and the provider-level kill switch are the same wire
+        // contract.
+        let disabled = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(false);
+        let disabled_body = serde_json::to_string(&disabled.build_request(
+            &messages,
+            &tools,
+            &ChatConfig::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            body, disabled_body,
+            "opted-out request must match the caching-disabled wire shape byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn should_keep_default_request_byte_identical_when_cache_retention_unset() {
+        // The opt-out is strictly per-request: a config that never touches
+        // `cache_retention` (and one that sets it to `Default` explicitly)
+        // must keep the exact cached wire shape, breakpoints included.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
+        let tools = vec![tool_spec("alpha", "first tool")];
+        let messages = vec![
+            msg(MessageRole::System, "system prompt"),
+            msg(MessageRole::User, "hello"),
+        ];
+        let unset = serde_json::to_string(&provider.build_request(
+            &messages,
+            &tools,
+            &ChatConfig::default(),
+        ))
+        .unwrap();
+        let explicit_default = ChatConfig {
+            cache_retention: crate::CacheRetention::Default,
+            ..Default::default()
+        };
+        let explicit =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &explicit_default))
+                .unwrap();
+        assert_eq!(unset, explicit);
+        assert!(
+            unset.contains("cache_control"),
+            "the default request must keep its cache breakpoints: {unset}"
         );
     }
 

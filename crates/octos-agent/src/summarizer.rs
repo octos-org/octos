@@ -300,6 +300,10 @@ rather than appending duplicates.\n\n",
             }),
             context_management: None,
             sampling_params: None,
+            // One-shot: every iterative-summarizer prompt differs (prior
+            // summary + new turns) and is sent exactly once — opt out of the
+            // 1.25x cache-write premium.
+            cache_retention: octos_llm::CacheRetention::None,
         };
         let messages = vec![Message::user(prompt)];
         // Bridge the async LLM call to the synchronous Summarizer contract.
@@ -616,6 +620,66 @@ mod tests {
             .expect("summarize should succeed");
         assert!(summary.contains("Conversation Summary"));
         assert!(summary.contains("> User: hello"));
+    }
+
+    struct RetentionProbeProvider {
+        seen: Arc<std::sync::Mutex<Option<octos_llm::CacheRetention>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RetentionProbeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            *self.seen.lock().unwrap() = Some(config.cache_retention);
+            Ok(octos_llm::ChatResponse {
+                content: Some(r#"{"goal":"ship the feature"}"#.into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatStream> {
+            unimplemented!("probe does not stream")
+        }
+
+        fn model_id(&self) -> &str {
+            "retention-probe"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_cache_writes_when_folding_iterative_summary() {
+        // Every iterative-summarizer call sends a different prompt (prior
+        // summary + the new turns) exactly once — no prefix is ever replayed,
+        // so the request must not pay for cache writes.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let summarizer = LlmIterativeSummarizer::new(Arc::new(RetentionProbeProvider {
+            seen: Arc::clone(&seen),
+        }));
+        summarizer
+            .summarize(&[user("turn one")], 2_000)
+            .expect("probe provider yields a valid SessionSummary");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot iterative summaries must not request cache writes"
+        );
     }
 
     #[test]
