@@ -160,22 +160,20 @@ impl Agent {
                             let latency_ms = call_start.elapsed().as_millis() as u64;
                             let cum_in = total_usage.input_tokens + response.usage.input_tokens;
                             let cum_out = total_usage.output_tokens + response.usage.output_tokens;
-                            let cum_cache_read =
-                                total_usage.cache_read_tokens + response.usage.cache_read_tokens;
-                            let cum_cache_write =
-                                total_usage.cache_write_tokens + response.usage.cache_write_tokens;
-                            let pricing = octos_llm::pricing::model_pricing(self.llm.model_id());
-                            let session_cost = pricing.map(|p| {
-                                p.cost_with_cache(cum_in, cum_out, cum_cache_read, cum_cache_write)
-                            });
-                            let response_cost = pricing.map(|p| {
-                                p.cost_with_cache(
-                                    response.usage.input_tokens,
-                                    response.usage.output_tokens,
-                                    response.usage.cache_read_tokens,
-                                    response.usage.cache_write_tokens,
-                                )
-                            });
+                            // #2194 review: the payload carries the ATTRIBUTED
+                            // spend — each attempt priced at the slot that
+                            // produced it — never a reprice of the merged
+                            // usage at `self.llm.model_id()`, which misprices
+                            // cross-provider retries. `turn` has not recorded
+                            // THIS response yet, so its spend is exactly the
+                            // turn's prior responses; without a figure for
+                            // this call the turn's prior attributed spend is
+                            // still the honest cumulative.
+                            let response_cost = attributed_cost;
+                            let session_cost = match attributed_cost {
+                                Some(cost) => Some(turn.spend_usd() + cost),
+                                None => turn.priced_spend(),
+                            };
                             let payload = HookPayload::after_llm(
                                 self.llm.model_id(),
                                 iteration,
@@ -666,6 +664,124 @@ mod tests {
 
     fn turn() -> LoopTurnState {
         LoopTurnState::new(Instant::now())
+    }
+
+    /// One clean streamed tool-call response with cache-bearing usage, on a
+    /// priced model under an anthropic label — for hook payload cost tests.
+    struct PricedGoodStreamProvider;
+
+    #[async_trait]
+    impl LlmProvider for PricedGoodStreamProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            eyre::bail!("non-streaming fallback should not be reached in this test")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            let events = vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("read_file_1".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments_delta: "{\"path\":\"a.md\"}".to_string(),
+                },
+                StreamEvent::Usage(LlmTokenUsage {
+                    input_tokens: 100_000,
+                    output_tokens: 10_000,
+                    cache_read_tokens: 10_000,
+                    cache_write_tokens: 2_000,
+                    ..Default::default()
+                }),
+                StreamEvent::Done(StopReason::ToolUse),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+
+        fn model_id(&self) -> &str {
+            "claude-opus-4"
+        }
+
+        fn provider_name(&self) -> &str {
+            "anthropic"
+        }
+    }
+
+    /// #2194 review: `attributed_cost` prices each attempt at its actual
+    /// provider slot, but the after-LLM hook payload used to REPRICE the
+    /// merged usage at `self.llm.model_id()` — wrong for anything the
+    /// attribution already priced differently. The payload must carry the
+    /// attributed figures: response_cost = this call's attributed spend,
+    /// session_cost = the turn's previously attributed spend + this call's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_report_attributed_spend_in_after_llm_hook_payload() {
+        use crate::hooks::{HookConfig, HookExecutor};
+
+        let capture_dir = tempfile::tempdir().unwrap();
+        let capture = capture_dir.path().join("after_llm_payload.json");
+        let hook = HookConfig {
+            event: crate::hooks::HookEvent::AfterLlmCall,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("cat > {}", capture.display()),
+            ],
+            timeout_ms: 5_000,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        };
+
+        let (agent, _dir) = build_agent(Arc::new(PricedGoodStreamProvider)).await;
+        let agent = agent.with_hooks(Arc::new(HookExecutor::new(vec![hook])));
+
+        // Prior turn spend recorded with a DELIBERATELY off-catalog figure:
+        // the hook's cumulative cost must be built from this attribution,
+        // never from repricing the cumulative tokens at the current model.
+        let mut turn = turn();
+        turn.record_usage(5_000, 1_000, 0, 0, None, Some(0.005));
+        let total_usage = turn.total_usage().clone();
+
+        let (_response, _streamed, attributed) = agent
+            .call_llm_with_hooks(
+                &msgs(),
+                &[],
+                &ChatConfig::default(),
+                1,
+                &total_usage,
+                &mut turn,
+            )
+            .await
+            .expect("clean streamed response");
+        let attributed = attributed.expect("claude-opus-4 has catalog pricing");
+
+        let raw = std::fs::read_to_string(&capture).expect("hook captured the payload");
+        let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let response_cost = payload["response_cost"]
+            .as_f64()
+            .expect("response_cost present");
+        let session_cost = payload["session_cost"]
+            .as_f64()
+            .expect("session_cost present");
+        assert!(
+            (response_cost - attributed).abs() < 1e-12,
+            "hook response_cost must be the attributed spend, got {response_cost} vs {attributed}"
+        );
+        assert!(
+            (session_cost - (0.005 + attributed)).abs() < 1e-12,
+            "hook session_cost must be prior attributed turn spend + this call's, \
+             got {session_cost} vs {}",
+            0.005 + attributed
+        );
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
