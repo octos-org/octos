@@ -4,8 +4,9 @@
 //! [`WINDOW_MAX_LINES`] lines and at most [`WINDOW_MAX_BYTES`] bytes of
 //! formatted output — whichever limit is hit first — with a footer naming the
 //! limit that fired, the range actually returned, the file's totals, and the
-//! exact next call. Unarmed behaviour is byte-identical to before this module
-//! existed.
+//! exact next call. A `byte_offset`/`byte_limit` raw mode pages content that
+//! line offsets cannot reach (single lines larger than the window). Unarmed
+//! behaviour is byte-identical to before this module existed.
 //!
 //! ## Parameter provenance
 //!
@@ -28,46 +29,80 @@
 //!    does not. 48 KiB (49,152) plus a [`FOOTER_RESERVE`]-byte footer does.
 //!
 //! A tripwire test pins `WINDOW_MAX_BYTES + FOOTER_RESERVE <=
-//! tool_output_limit("read_file")` so lowering the loop budget cannot silently
-//! re-expose windowed reads to the blind backstop.
+//! tool_output_limit("read_file")` so lowering the loop budget cannot
+//! silently re-expose windowed reads to the blind backstop, and every armed
+//! return path carries a `debug_assert` against the same bound (none of them
+//! interpolates unbounded caller input — path spellings can be arbitrarily
+//! long, so model-facing messages clamp them).
 //!
-//! ## The partial-view ledger
+//! ## Why raw byte paging instead of a shell fallback
 //!
-//! The second half of this module tracks, per absolute path, how much of the
-//! file the model has actually been shown — so `write_file` (armed) can refuse
-//! to overwrite a file wholesale from a partial view. The patch tools
-//! (`edit_file`, `diff_edit`, `apply_patch`) are safe — they re-read the whole
-//! file themselves — but `write_file` reconstructs from whatever the model
-//! saw, and the slides workflow mandates exactly read → rebuild → `write_file`.
+//! pi's answer to a line larger than the window is a `sed | head -c` shell
+//! fallback. That is self-defeating under OUR constraints, twice over: the
+//! shell tool's own output cap is 30,000 bytes
+//! (`octos_core::tool_output_limit("shell")`), so the advised `head -c 49152`
+//! can never arrive intact; and the loop sanitizer redacts exactly the
+//! content giant lines are made of (base64 data URIs, long hex —
+//! `sanitize.rs`), so what survives the cap is then redacted. Hence the
+//! in-tool `byte_offset`/`byte_limit` mode: raw slices, no gutter, footer
+//! naming the next `byte_offset`, and the bytes count toward the same
+//! coverage ledger as line reads.
 //!
-//! Coverage is a contiguous-from-line-1 high-water mark, keyed by mtime:
-//! paging 1..2000, 2001..4000, 4001..EOF under one mtime marks the path
-//! COMPLETE (so the refusal's "page through it first" advice is truthful);
-//! any mtime change resets coverage to the new read alone. Reading out of
-//! order (tail before head) under-counts and stays partial — conservative in
-//! the safe direction, and the refusal always offers the patch tools as the
-//! unconditional escape hatch.
+//! ## The view ledger: fail-closed overwrite protection
 //!
-//! The ledger is a process-global map, NOT threaded through `ToolContext`:
-//! the guard is a data-loss check and must hold on every entry path,
+//! The second half of this module tracks, per `(session, path)`, how much of
+//! the file the model has actually been shown — so `write_file` (armed) can
+//! refuse to reconstruct a file wholesale from a view the model does not
+//! have. The slides workflow mandates exactly read → rebuild → `write_file`,
+//! and its prompt forbids the patch tools, so this guard is the only thing
+//! between a windowed read and a truncated script.
+//!
+//! The rule is **fail-closed** (codex review of the first draft, which was
+//! fail-open on four axes): overwriting an EXISTING file larger than
+//! [`WINDOW_MAX_BYTES`] requires a COMPLETE mark from THIS session; no entry
+//! means refuse-and-read-first. Absence being the refusing state makes a
+//! process restart safe by construction (the model must re-read, which is
+//! correct anyway), makes bounded eviction safe (evicting can only cause a
+//! re-read, never an unseen overwrite), and closes the giant-first-line hole
+//! (the advice branch records nothing, and nothing now means NO). Files at
+//! or under the byte window can still be blind-overwritten exactly as today
+//! — a file that size is returned whole by a single unbounded read, so there
+//! is no partial-view illusion to protect against; but once ANY armed read
+//! recorded a view of it, that record is honoured (a partial or tainted or
+//! stale view refuses regardless of size).
+//!
+//! Coverage is tracked in BYTES — one coordinate system for line-mode reads
+//! (converted to their byte spans) and raw byte-mode reads, so paging past a
+//! giant line stitches naturally. The mark is a contiguous-from-byte-0
+//! high-water line keyed by an epoch of `(mtime, size)`: any epoch change
+//! resets coverage to the new read alone, and `write_file` re-validates the
+//! recorded epoch against the CURRENT file at write time, so a file replaced
+//! after reading refuses as stale instead of trusting dead coverage.
+//! Same-mtime-same-size replacement is not detectable by this scheme (no
+//! content hash in the epoch); it is also not detectable by the M8.4
+//! file-state cache today.
+//!
+//! A view only counts if the model actually received the bytes: the recorded
+//! output is checked against `sanitize_tool_output` (the exact function the
+//! execution loop applies afterwards), and a view the sanitizer would alter
+//! is recorded TAINTED — the epoch can then never reach COMPLETE, because a
+//! whole-file rewrite would replace redacted content with redaction
+//! placeholders. Reads that fit no ledger (metadata unavailable) record an
+//! epoch-less entry that likewise never completes.
+//!
+//! The ledger is a process-global map, NOT threaded through `ToolContext`
+//! state: the guard is a data-loss check and must hold on every entry path,
 //! including legacy `Tool::execute` calls that carry a zero context (the
 //! `FileStateCache` on `ToolContext` is optional and absent on those paths,
-//! which is why it was not reused). It records only when armed, so the
-//! unarmed process pays nothing. This is deliberately NOT the #2126 probe's
-//! `LAST_READ` map — that one is observe-only, keyed to the probe's own env
-//! flag and 500/24KiB canary, and its per-path counters are `cfg(test)`.
-//!
-//! ## Known limitation: a single line larger than the window
-//!
-//! `read_file` has no byte-offset parameter, so it cannot page WITHIN a line
-//! (matching pi, which ships the same limitation and points at a shell
-//! fallback instead — `read.ts`'s `firstLineExceedsLimit` branch). A giant
-//! line is delivered via the advice footer's `sed | head -c` command, which
-//! the ledger cannot observe — so a file containing one can never reach
-//! COMPLETE through `read_file` alone, and a whole-file overwrite of it stays
-//! refused. The refusal's `edit_file`/`apply_patch` escape hatch covers that
-//! case; a `byte_offset` continuation parameter is the future fix if the
-//! probe's `unpageable_long_line` counter ever shows it matters.
+//! which is why it was not reused). Entries are keyed by the context's
+//! `parent_session_key` (empty for zero contexts) so one session's COMPLETE
+//! never authorizes another session's overwrite, values are keyed by
+//! canonicalized path so `read_file` and `write_file` cannot miss each other
+//! over path aliases (`/var` vs `/private/var`), and the map is bounded at
+//! [`MAX_LEDGER_ENTRIES`] (oldest-recorded evicted first — safe, because
+//! absence refuses). This is deliberately NOT the #2126 probe's `LAST_READ`
+//! map — that one is observe-only, keyed to the probe's own env flag and
+//! 500/24KiB canary, and its per-path counters are `cfg(test)`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -87,6 +122,20 @@ pub(crate) const WINDOW_MAX_BYTES: usize = 48 * 1024;
 /// Bytes reserved above [`WINDOW_MAX_BYTES`] for the window footer.
 pub(crate) const FOOTER_RESERVE: usize = 400;
 
+/// Ledger capacity. Eviction is oldest-recorded-first and SAFE by the
+/// fail-closed rule: a missing entry refuses an over-window overwrite (one
+/// re-read), it can never authorize one.
+pub(crate) const MAX_LEDGER_ENTRIES: usize = 512;
+
+/// Which window limit clamped an armed read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowClamp {
+    /// [`WINDOW_MAX_LINES`] fired first.
+    Lines,
+    /// [`WINDOW_MAX_BYTES`] fired first.
+    Bytes,
+}
+
 /// Typed prefix on the armed `write_file` refusal, so the model (and any
 /// harness) can match it structurally — same convention as
 /// `[FILE_UNCHANGED]`.
@@ -105,37 +154,80 @@ pub(crate) fn armed_from_env() -> bool {
     std::env::var("OCTOS_READ_WINDOW").is_ok_and(|value| value == "1")
 }
 
-/// How much of one path the model has been shown, contiguously from line 1.
+/// The identity of one on-disk generation of a file.
+///
+/// mtime alone is not identity — same-second replacement preserves it on
+/// coarse filesystems — so size is checked too. (A same-mtime same-size
+/// rewrite still passes; closing that needs a content hash, which the M8.4
+/// cache also does not spend on this.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ViewCoverage {
-    /// Lines 1..=`seen_through` have been shown under `mtime`.
-    pub(crate) seen_through: usize,
-    /// Total lines the file had when last read.
-    pub(crate) total_lines: usize,
+pub(crate) struct ViewEpoch {
+    pub(crate) mtime: SystemTime,
+    pub(crate) size: u64,
 }
 
-/// One path's ledger record.
+/// What the ledger knows about one `(session, path)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewStatus {
+    /// Never read in this session (or evicted / restarted): the fail-closed
+    /// default for over-window files.
+    Unknown,
+    /// Some bytes seen, contiguously from 0 up to `seen_through` (exclusive).
+    Partial {
+        seen_through: usize,
+        total_bytes: usize,
+    },
+    /// Bytes were redacted by the sanitizer before reaching the model; no
+    /// amount of further paging makes a faithful whole-file rewrite possible.
+    Tainted,
+    /// Every byte of this epoch reached the model unredacted.
+    Complete { epoch: ViewEpoch },
+}
+
+/// One `(session, path)`'s record.
 #[derive(Clone, Copy, Debug)]
 struct ViewRecord {
-    /// mtime the coverage was accumulated under; `None` = unknown (never
-    /// stitches).
-    mtime: Option<SystemTime>,
+    /// Epoch coverage was accumulated under; `None` = metadata was
+    /// unavailable at read time, which can never validate at write time and
+    /// therefore never completes.
+    epoch: Option<ViewEpoch>,
+    /// Bytes `0..seen_through` have been shown under `epoch`.
     seen_through: usize,
-    total_lines: usize,
+    /// Raw content length when last read.
+    total_bytes: usize,
+    /// Sticky per epoch: some shown bytes were altered by the sanitizer.
+    tainted: bool,
 }
 
-/// Per-path record of what the model has been shown. See the module docs for
-/// why this is process-global rather than `ToolContext`-threaded.
-static LAST_VIEW: Mutex<Option<HashMap<PathBuf, ViewRecord>>> = Mutex::new(None);
-
-/// Which window limit clamped an armed read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WindowClamp {
-    /// [`WINDOW_MAX_LINES`] fired first.
-    Lines,
-    /// [`WINDOW_MAX_BYTES`] fired first.
-    Bytes,
+#[derive(Default)]
+struct Ledger {
+    entries: HashMap<(String, PathBuf), ViewRecord>,
+    /// Insertion/update order, oldest first, for bounded eviction.
+    order: Vec<(String, PathBuf)>,
 }
+
+impl Ledger {
+    /// Move `key` to the freshest end of the order and evict the oldest
+    /// entries past [`MAX_LEDGER_ENTRIES`]. Eviction is safe by the
+    /// fail-closed rule: absence refuses.
+    fn touch_and_evict(&mut self, key: (String, PathBuf)) {
+        self.order.retain(|existing| existing != &key);
+        self.order.push(key);
+        while self.entries.len() > MAX_LEDGER_ENTRIES {
+            if self.order.is_empty() {
+                // entries/order desynchronized — clear rather than loop.
+                self.entries.clear();
+                break;
+            }
+            let oldest = self.order.remove(0);
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+/// See the module docs for why this is process-global rather than
+/// `ToolContext`-threaded.
+static LEDGER: Mutex<Option<Ledger>> = Mutex::new(None);
 
 /// The key both sides of the ledger agree on.
 ///
@@ -144,81 +236,150 @@ pub(crate) enum WindowClamp {
 /// keyed the raw spellings the guard would silently never match. Falls back
 /// to the raw path when canonicalization fails (file deleted between check
 /// and record) — both sides then fail the same way.
-fn ledger_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+fn ledger_key(session: &str, path: &Path) -> (String, PathBuf) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    (session.to_string(), canonical)
 }
 
-/// Record one armed `read_file` view of `path`: lines `start..=end`
-/// (1-indexed, inclusive) of a `total_lines`-line file at `mtime`.
+/// Record one armed `read_file` view: bytes `byte_start..byte_end`
+/// (half-open) of a `total_bytes` file at `epoch`, `tainted` when the
+/// sanitizer would have altered the returned output.
 ///
-/// Same-mtime views extend the contiguous-from-1 high-water mark; a changed
-/// (or unknown) mtime resets coverage to this view alone, because coverage
-/// stitched across an on-disk edit would claim the model has seen content
-/// that no longer exists. Callers gate on arming — this function itself does
-/// not consult the env, so tests can drive it through per-instance-armed
-/// tools without touching process state.
+/// Same-epoch views extend the contiguous-from-0 high-water mark and OR
+/// their taint; an epoch change (or `None` epoch) resets coverage to this
+/// view alone. Callers gate on arming — this function itself does not
+/// consult the env, so tests can drive it through per-instance-armed tools
+/// without touching process state.
 pub(crate) fn record_view(
+    session: &str,
     path: &Path,
-    mtime: Option<SystemTime>,
-    start: usize,
-    end: usize,
-    total_lines: usize,
+    epoch: Option<ViewEpoch>,
+    byte_start: usize,
+    byte_end: usize,
+    total_bytes: usize,
+    tainted: bool,
 ) {
-    let key = ledger_key(path);
-    let mut guard = LAST_VIEW
+    let key = ledger_key(session, path);
+    let mut guard = LEDGER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    // Coverage carries over only within one mtime epoch; `None` mtimes never
-    // match (unknown is not evidence).
-    let carried = match map.get(&key) {
-        Some(prev) if prev.mtime.is_some() && prev.mtime == mtime => prev.seen_through,
-        _ => 0,
+    let ledger = guard.get_or_insert_with(Ledger::default);
+    // Coverage and taint carry over only within one known epoch; `None`
+    // epochs never match (unknown is not evidence).
+    let (carried, carried_taint) = match ledger.entries.get(&key) {
+        Some(prev) if prev.epoch.is_some() && prev.epoch == epoch => {
+            (prev.seen_through, prev.tainted)
+        }
+        _ => (0, false),
     };
-    let seen_through = if start <= carried.saturating_add(1) {
-        carried.max(end)
+    // Half-open [byte_start, byte_end): contiguous means starting at or
+    // before the high-water mark; a view past it leaves a gap and the mark
+    // stays.
+    let seen_through = if byte_start <= carried {
+        carried.max(byte_end)
     } else {
-        // A view past the high-water mark leaves a gap; the mark stays.
         carried
     };
-    map.insert(
-        key,
+    ledger.entries.insert(
+        key.clone(),
         ViewRecord {
-            mtime,
+            epoch,
             seen_through,
-            total_lines,
+            total_bytes,
+            tainted: carried_taint || tainted,
         },
     );
+    ledger.touch_and_evict(key);
 }
 
-/// The coverage record for `path` when the model's most recent knowledge of
-/// it is PARTIAL, or `None` when the path is unknown or fully seen.
-pub(crate) fn partial_view_of(path: &Path) -> Option<ViewCoverage> {
-    let key = ledger_key(path);
-    let guard = LAST_VIEW
+/// What this session knows about `path`.
+pub(crate) fn view_status(session: &str, path: &Path) -> ViewStatus {
+    let key = ledger_key(session, path);
+    let guard = LEDGER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.as_ref()?.get(&key).and_then(|record| {
-        if record.seen_through >= record.total_lines {
-            None
-        } else {
-            Some(ViewCoverage {
-                seen_through: record.seen_through,
-                total_lines: record.total_lines,
-            })
+    let Some(record) = guard.as_ref().and_then(|ledger| ledger.entries.get(&key)) else {
+        return ViewStatus::Unknown;
+    };
+    if record.tainted {
+        return ViewStatus::Tainted;
+    }
+    match record.epoch {
+        // Full contiguous coverage of a validatable generation.
+        Some(epoch) if record.seen_through >= record.total_bytes => ViewStatus::Complete { epoch },
+        // An epoch-less view can never be validated at write time, so full
+        // coverage of it still reports (and refuses as) Partial.
+        _ => ViewStatus::Partial {
+            seen_through: record.seen_through,
+            total_bytes: record.total_bytes,
+        },
+    }
+}
+
+/// Note a successful, unformatted whole-file `write_file`: the on-disk
+/// content is now exactly what the model supplied, so the session's view of
+/// it is COMPLETE at the post-write epoch. (The fail-closed rule would
+/// otherwise refuse the model's own next overwrite of a big file it just
+/// authored.) When the post-write stat fails, the entry is forgotten —
+/// absence refuses, which is the safe direction.
+pub(crate) fn note_full_write(session: &str, path: &Path, written_bytes: usize) {
+    let epoch = std::fs::metadata(path).ok().and_then(|meta| {
+        meta.modified().ok().map(|mtime| ViewEpoch {
+            mtime,
+            size: meta.len(),
+        })
+    });
+    match epoch {
+        Some(epoch) => {
+            let key = ledger_key(session, path);
+            let mut guard = LEDGER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ledger = guard.get_or_insert_with(Ledger::default);
+            ledger.entries.insert(
+                key.clone(),
+                ViewRecord {
+                    epoch: Some(epoch),
+                    seen_through: written_bytes,
+                    total_bytes: written_bytes,
+                    tainted: false,
+                },
+            );
+            ledger.touch_and_evict(key);
         }
-    })
+        // Post-write stat failed: nothing validatable to record — forget,
+        // because absence refuses (the safe direction).
+        None => forget(session, path),
+    }
 }
 
-/// Note a successful whole-file `write_file` of `path`: the on-disk content
-/// is now exactly what the model supplied, so any partial mark is obsolete.
-pub(crate) fn note_full_write(path: &Path) {
-    let key = ledger_key(path);
-    let mut guard = LAST_VIEW
+/// Forget one `(session, path)` — used when the on-disk content diverged
+/// from what the model supplied (post-write formatter rewrote the file).
+pub(crate) fn forget(session: &str, path: &Path) {
+    let key = ledger_key(session, path);
+    let mut guard = LEDGER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(map) = guard.as_mut() {
-        map.remove(&key);
+    if let Some(ledger) = guard.as_mut() {
+        ledger.entries.remove(&key);
+        ledger.order.retain(|existing| existing != &key);
+    }
+}
+
+/// Drop every entry of one session — simulates a process restart for that
+/// session in tests. (The real restart clears all sessions at once, but a
+/// whole-ledger clear from one test would wipe parallel tests' entries
+/// mid-flight — the same cross-test blast radius that rules out global
+/// arming. Restart semantics are per-entry absence, which this preserves
+/// exactly for the session under test.)
+#[cfg(test)]
+pub(crate) fn reset_session_for_test(session: &str) {
+    let mut guard = LEDGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(ledger) = guard.as_mut() {
+        ledger.entries.retain(|key, _| key.0 != session);
+        ledger.order.retain(|key| key.0 != session);
     }
 }
 
@@ -227,9 +388,17 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    // The ledger is process-global and keyed by path; each test uses paths
-    // under its own tempdir so parallel tests never observe each other
-    // (#2077/#2126: never assert on process-global aggregates).
+    // The ledger is process-global, keyed by (session, path); each test uses
+    // its own tempdir paths and its own session strings, so parallel tests
+    // never observe each other (#2077/#2126: never assert on process-global
+    // aggregates).
+
+    fn epoch_at(secs_ago: u64, size: u64) -> Option<ViewEpoch> {
+        Some(ViewEpoch {
+            mtime: SystemTime::now() - Duration::from_secs(secs_ago),
+            size,
+        })
+    }
 
     #[test]
     fn window_plus_footer_must_fit_under_the_loop_backstop() {
@@ -251,32 +420,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("paged.txt");
         std::fs::write(&path, "x").unwrap();
-        let mtime = Some(SystemTime::now());
+        let epoch = epoch_at(0, 5000);
 
-        record_view(&path, mtime, 1, 2000, 5000);
+        record_view("s", &path, epoch, 0, 2000, 5000, false);
         assert_eq!(
-            partial_view_of(&path),
-            Some(ViewCoverage {
+            view_status("s", &path),
+            ViewStatus::Partial {
                 seen_through: 2000,
-                total_lines: 5000
-            }),
+                total_bytes: 5000
+            },
             "a windowed view is partial"
         );
 
-        record_view(&path, mtime, 2001, 4000, 5000);
+        record_view("s", &path, epoch, 2000, 4000, 5000, false);
         assert_eq!(
-            partial_view_of(&path),
-            Some(ViewCoverage {
+            view_status("s", &path),
+            ViewStatus::Partial {
                 seen_through: 4000,
-                total_lines: 5000
-            }),
+                total_bytes: 5000
+            },
             "contiguous pages extend the high-water mark"
         );
 
-        record_view(&path, mtime, 4001, 5000, 5000);
+        record_view("s", &path, epoch, 4000, 5000, 5000, false);
         assert_eq!(
-            partial_view_of(&path),
-            None,
+            view_status("s", &path),
+            ViewStatus::Complete {
+                epoch: epoch.unwrap()
+            },
             "paging through to EOF completes the view — the refusal's advice \
              must be truthful"
         );
@@ -287,56 +458,158 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gappy.txt");
         std::fs::write(&path, "x").unwrap();
-        let mtime = Some(SystemTime::now());
+        let epoch = epoch_at(0, 5000);
 
-        record_view(&path, mtime, 1, 2000, 5000);
-        record_view(&path, mtime, 2500, 5000, 5000); // lines 2001-2499 never seen
+        record_view("s", &path, epoch, 0, 2000, 5000, false);
+        record_view("s", &path, epoch, 2500, 5000, 5000, false); // bytes 2000..2500 never seen
         assert_eq!(
-            partial_view_of(&path),
-            Some(ViewCoverage {
+            view_status("s", &path),
+            ViewStatus::Partial {
                 seen_through: 2000,
-                total_lines: 5000
-            }),
+                total_bytes: 5000
+            },
             "a gap means the view is still partial at the gap"
         );
     }
 
     #[test]
-    fn should_reset_coverage_when_the_mtime_changes() {
+    fn should_reset_coverage_when_the_epoch_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edited.txt");
         std::fs::write(&path, "x").unwrap();
-        let old = Some(SystemTime::now() - Duration::from_secs(60));
-        let new = Some(SystemTime::now());
 
-        record_view(&path, old, 1, 2000, 5000);
-        // The file changed on disk; earlier coverage is no longer evidence.
-        record_view(&path, new, 2001, 4000, 5000);
+        record_view("s", &path, epoch_at(60, 5000), 0, 2000, 5000, false);
+        // Same mtime second, DIFFERENT size — still a different epoch.
+        record_view("s", &path, epoch_at(60, 6000), 2000, 4000, 6000, false);
         assert_eq!(
-            partial_view_of(&path),
-            Some(ViewCoverage {
+            view_status("s", &path),
+            ViewStatus::Partial {
                 seen_through: 0,
-                total_lines: 5000
-            }),
-            "coverage accumulated under a different mtime must not survive"
+                total_bytes: 6000
+            },
+            "coverage accumulated under a different (mtime, size) must not \
+             survive — same-second replacement included"
         );
     }
 
     #[test]
-    fn should_forget_a_path_after_a_full_write() {
+    fn should_never_complete_a_tainted_epoch() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rewritten.txt");
+        let path = dir.path().join("secrets.txt");
+        std::fs::write(&path, "x").unwrap();
+        let epoch = epoch_at(0, 100);
+
+        record_view("s", &path, epoch, 0, 50, 100, true); // sanitizer altered this view
+        record_view("s", &path, epoch, 50, 100, 100, false);
+        assert_eq!(
+            view_status("s", &path),
+            ViewStatus::Tainted,
+            "full coverage with redacted bytes is NOT a faithful view — \
+             taint is sticky for the epoch"
+        );
+
+        // A new epoch starts clean.
+        record_view("s", &path, epoch_at(0, 101), 0, 101, 101, false);
+        assert!(
+            matches!(view_status("s", &path), ViewStatus::Complete { .. }),
+            "an untainted re-read of a new epoch completes"
+        );
+    }
+
+    #[test]
+    fn should_never_complete_without_an_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_meta.txt");
         std::fs::write(&path, "x").unwrap();
 
-        record_view(&path, Some(SystemTime::now()), 1, 10, 5000);
-        assert!(partial_view_of(&path).is_some());
-
-        note_full_write(&path);
+        record_view("s", &path, None, 0, 100, 100, false);
         assert_eq!(
-            partial_view_of(&path),
-            None,
-            "after write_file succeeds the on-disk content is exactly what \
-             the model supplied — no partial mark may linger"
+            view_status("s", &path),
+            ViewStatus::Partial {
+                seen_through: 100,
+                total_bytes: 100
+            },
+            "an epoch-less view can never be validated at write time, so it \
+             must never report Complete"
+        );
+    }
+
+    #[test]
+    fn should_scope_views_to_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scoped.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        record_view("session-a", &path, epoch_at(0, 10), 0, 10, 10, false);
+        assert!(matches!(
+            view_status("session-a", &path),
+            ViewStatus::Complete { .. }
+        ));
+        assert_eq!(
+            view_status("session-b", &path),
+            ViewStatus::Unknown,
+            "one session's COMPLETE must never vouch for another session"
+        );
+    }
+
+    #[test]
+    fn should_forget_and_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forgotten.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        record_view("s", &path, epoch_at(0, 10), 0, 5, 10, false);
+        assert!(matches!(
+            view_status("s", &path),
+            ViewStatus::Partial { .. }
+        ));
+        forget("s", &path);
+        assert_eq!(view_status("s", &path), ViewStatus::Unknown);
+    }
+
+    #[test]
+    fn should_mark_complete_after_note_full_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authored.txt");
+        std::fs::write(&path, "0123456789").unwrap();
+
+        note_full_write("s", &path, 10);
+        match view_status("s", &path) {
+            ViewStatus::Complete { epoch } => {
+                assert_eq!(epoch.size, 10, "epoch is the post-write stat");
+            }
+            other => panic!(
+                "the model authored every byte it just wrote — must be \
+                 Complete, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn should_bound_the_ledger_and_evict_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unique session name so parallel tests cannot interleave entries
+        // into this session's eviction accounting.
+        let session = format!("evict-{}", std::process::id());
+        let epoch = epoch_at(0, 1);
+        // Paths need not exist — ledger_key falls back to the raw path.
+        let path_of = |i: usize| dir.path().join(format!("f{i}.txt"));
+
+        for i in 0..MAX_LEDGER_ENTRIES + 1 {
+            record_view(&session, &path_of(i), epoch, 0, 1, 1, false);
+        }
+        assert_eq!(
+            view_status(&session, &path_of(0)),
+            ViewStatus::Unknown,
+            "the oldest entry is evicted once the cap is crossed — safe, \
+             because absence refuses"
+        );
+        assert!(
+            matches!(
+                view_status(&session, &path_of(MAX_LEDGER_ENTRIES)),
+                ViewStatus::Complete { .. }
+            ),
+            "the newest entry survives"
         );
     }
 
@@ -351,9 +624,9 @@ mod tests {
         std::fs::write(&real, "x").unwrap();
         let canonical = real.canonicalize().unwrap();
 
-        record_view(&real, Some(SystemTime::now()), 1, 10, 5000);
+        record_view("s", &real, epoch_at(0, 10), 0, 5, 10, false);
         assert!(
-            partial_view_of(&canonical).is_some(),
+            matches!(view_status("s", &canonical), ViewStatus::Partial { .. }),
             "the canonical form must see coverage recorded via the raw form"
         );
     }

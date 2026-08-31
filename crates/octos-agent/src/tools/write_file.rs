@@ -210,38 +210,99 @@ impl Tool for WriteFileTool {
             }
         }
 
-        // #1638 (c): armed partial-view overwrite guard. When windowed reads
-        // are armed, `read_file` can have shown the model only PART of this
-        // file — and write_file reconstructs from whatever the model saw, so
-        // a whole-file overwrite from a partial view destroys the tail nobody
-        // saw (the slides workflow does exactly read → rebuild → write_file).
-        // The patch tools are safe (they re-read the full file themselves),
-        // which is exactly the escape hatch the refusal names. Sits BEFORE
-        // the write fence and any disk mutation; the #2126 probe block above
-        // stays observe-only and untouched.
+        // #1638 (c): armed FAIL-CLOSED overwrite guard. write_file
+        // reconstructs a file from whatever the model saw, so overwriting an
+        // existing over-window file requires a COMPLETE, current-epoch,
+        // untainted view from THIS session — no ledger entry means refuse
+        // and read first (which makes restart and eviction safe by
+        // construction: absence can only cost a re-read, never an unseen
+        // overwrite). Files at or under the byte window can still be
+        // blind-overwritten exactly as today, but any recorded view of them
+        // is honoured. The advice names only read_file — the calling context
+        // may forbid every other tool (the slides prompt allows nothing but
+        // read_file/write_file for authoring). Sits BEFORE the write fence
+        // and any disk mutation; the #2126 probe block above stays
+        // observe-only and untouched (an armed refusal still increments its
+        // attempt counter — the probe measures intent, not damage).
         if self.window_armed() && path.exists() {
-            if let Some(partial) = super::read_window::partial_view_of(&path) {
-                let coverage = if partial.seen_through > 0 {
-                    format!(
-                        "lines 1-{} of {} contiguously",
-                        partial.seen_through, partial.total_lines
-                    )
-                } else {
-                    format!("a fragment of its {} lines", partial.total_lines)
-                };
-                return Ok(ToolResult {
-                    output: format!(
-                        "{} write_file refused: read_file has shown you only part of {} ({}), \
-                         and overwriting the whole file from a partial view would destroy the \
-                         part you have not seen. Either finish reading it first (read_file with \
-                         offset until you have seen line {}) and then retry, or make targeted \
-                         changes with edit_file / diff_edit / apply_patch, which read the full \
-                         file themselves.",
+            use super::read_window::{ViewStatus, WINDOW_MAX_BYTES};
+            let session = ctx.parent_session_key.clone().unwrap_or_default();
+            // The path shown to the model is clamped: path SPELLINGS are
+            // caller-controlled and can be arbitrarily long, and a refusal
+            // that overflows the loop's output cap gets blind-truncated into
+            // useless advice.
+            let shown_path = octos_core::truncated_utf8(&input.path, 200, "...");
+            let page_advice = "Page through it with read_file (offset/limit, or byte_offset \
+                               for single lines too long for the line window) until you reach \
+                               the end, then retry the write.";
+            let current = tokio::fs::metadata(&path).await.ok().and_then(|meta| {
+                meta.modified()
+                    .ok()
+                    .map(|mtime| super::read_window::ViewEpoch {
+                        mtime,
+                        size: meta.len(),
+                    })
+            });
+            let refusal = match (super::read_window::view_status(&session, &path), current) {
+                // The one allowed overwrite: complete, untainted, and the
+                // file on disk is still the generation the model read.
+                (ViewStatus::Complete { epoch }, Some(now)) if epoch == now => None,
+                (ViewStatus::Complete { .. }, _) => Some(format!(
+                    "{} write_file refused: {} has changed on disk since you last read it (or \
+                     its current state could not be validated). Re-read it with read_file, \
+                     then retry the write.",
+                    super::read_window::PARTIAL_VIEW_OVERWRITE_PREFIX,
+                    shown_path,
+                )),
+                (ViewStatus::Tainted, _) => Some(format!(
+                    "{} write_file refused: parts of {} were redacted from your view (embedded \
+                     data or credentials), so writing the whole file back would replace them \
+                     with redaction placeholders. Make a narrower change instead of a \
+                     whole-file rewrite.",
+                    super::read_window::PARTIAL_VIEW_OVERWRITE_PREFIX,
+                    shown_path,
+                )),
+                (
+                    ViewStatus::Partial {
+                        seen_through,
+                        total_bytes,
+                    },
+                    _,
+                ) => Some(format!(
+                    "{} write_file refused: read_file has shown you only part of {} (the first \
+                     {seen_through} of its {total_bytes} bytes), and overwriting the whole \
+                     file from a partial view would destroy the part you have not seen. {}",
+                    super::read_window::PARTIAL_VIEW_OVERWRITE_PREFIX,
+                    shown_path,
+                    page_advice,
+                )),
+                (ViewStatus::Unknown, Some(now)) if now.size as usize > WINDOW_MAX_BYTES => {
+                    Some(format!(
+                        "{} write_file refused: {} is {} bytes — larger than the \
+                         {WINDOW_MAX_BYTES}-byte read window — and you have not read it in \
+                         this session. {}",
                         super::read_window::PARTIAL_VIEW_OVERWRITE_PREFIX,
-                        input.path,
-                        coverage,
-                        partial.total_lines,
-                    ),
+                        shown_path,
+                        now.size,
+                        page_advice,
+                    ))
+                }
+                // Existing file whose metadata cannot be read: size cannot
+                // be validated, so fail closed rather than guess.
+                (ViewStatus::Unknown, None) => Some(format!(
+                    "{} write_file refused: {} has changed on disk since you last read it (or \
+                     its current state could not be validated). Re-read it with read_file, \
+                     then retry the write.",
+                    super::read_window::PARTIAL_VIEW_OVERWRITE_PREFIX,
+                    shown_path,
+                )),
+                // Never-read file at or under the window: blind overwrite is
+                // today's documented write_file semantics.
+                (ViewStatus::Unknown, Some(_)) => None,
+            };
+            if let Some(output) = refusal {
+                return Ok(ToolResult {
+                    output,
                     success: false,
                     ..Default::default()
                 });
@@ -351,11 +412,21 @@ impl Tool for WriteFileTool {
         }
 
         // #1638 (c): a successful whole-file write makes the on-disk content
-        // exactly what the model supplied — any partial-view mark for the
-        // path is obsolete, and keeping it would refuse the model's next
-        // legitimate overwrite of its own content.
+        // exactly what the model supplied, so record the view COMPLETE at
+        // the post-write epoch — under the fail-closed rule, merely
+        // forgetting the path would refuse the model's next overwrite of a
+        // big file it authored one call ago. Exception: when the post-edit
+        // formatter rewrote the file, the on-disk bytes are no longer what
+        // the model supplied (the note echoes at most a truncated preview),
+        // so the path is forgotten instead — absence refuses, and the model
+        // re-reads the formatted result, which is correct.
         if self.window_armed() {
-            super::read_window::note_full_write(&path);
+            let session = ctx.parent_session_key.clone().unwrap_or_default();
+            if format_note.is_none() {
+                super::read_window::note_full_write(&session, &path, input.content.len());
+            } else {
+                super::read_window::forget(&session, &path);
+            }
         }
 
         let line_count = input.content.lines().count();
@@ -1034,14 +1105,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #1638 (c): the partial-view overwrite guard, armed with windowed reads.
+    // #1638 (c): the fail-closed overwrite guard, armed with windowed reads.
     // Both tools are armed per instance (never process-globally); every test
-    // asserts on files it created itself.
+    // asserts on files it created itself, under its own session keys.
     // -----------------------------------------------------------------------
 
     use crate::tools::read_file::ReadFileTool;
 
-    /// 1500 x 100-byte lines — windows at 450 lines per page when armed.
+    /// 1500 x 100-byte lines, 151,500 content bytes — well over the 48KiB
+    /// window; line mode pages it at ~450 lines per page when armed.
     fn big_rows(dir: &std::path::Path, name: &str) -> String {
         let content = (1..=1500)
             .map(|i| format!("row {i:06}{}", "z".repeat(90)))
@@ -1051,19 +1123,59 @@ mod tests {
         content
     }
 
+    /// 700 x 100-byte lines, ~70,700 content bytes — over-window, but only
+    /// two pages, for tests that page through repeatedly.
+    fn medium_rows(dir: &std::path::Path, name: &str) {
+        let content = (1..=700)
+            .map(|i| format!("row {i:06}{}", "z".repeat(90)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join(name), &content).unwrap();
+    }
+
+    fn ctx_with_session(session: &str) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.to_string());
+        ctx
+    }
+
+    /// Follow the window footers from `offset` until the file has no
+    /// continuation left — exactly what the refusal tells the model to do.
+    async fn page_through(read: &ReadFileTool, ctx: &ToolContext, path: &str, mut next: usize) {
+        for _ in 0..12 {
+            let page = read
+                .execute_with_context(ctx, &serde_json::json!({"path": path, "offset": next}))
+                .await
+                .unwrap();
+            assert!(page.success, "{}", page.output);
+            match page
+                .output
+                .split("offset: ")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(n) => next = n,
+                None => return, // no continuation footer — EOF reached
+            }
+        }
+        panic!("paging did not converge");
+    }
+
     #[tokio::test]
     async fn should_refuse_whole_overwrite_after_partial_read_then_allow_after_paging_through() {
         // The slides workflow reads a script, reconstructs it whole, and
-        // write_files it back. Under a windowed read that becomes a
-        // destructive partial overwrite of a tail the model never saw — the
-        // guard must refuse it, and its "page through first" advice must be
-        // truthful: after paging to EOF the same write must succeed.
+        // write_files it back — and its prompt permits ONLY
+        // read_file/write_file for authoring, so the refusal advice must be
+        // followable with read_file alone, and following it must unlock the
+        // write.
         let dir = tempfile::tempdir().unwrap();
         let original = big_rows(dir.path(), "script.js");
         let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
         let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+        let ctx = ToolContext::zero();
 
-        // Windowed read: the model has seen lines 1-450 of 1500.
+        // Windowed read: the model has seen page one only.
         let page1 = read
             .execute(&serde_json::json!({"path": "script.js"}))
             .await
@@ -1086,13 +1198,20 @@ mod tests {
             refused.output
         );
         assert!(
-            refused.output.contains("edit_file") && refused.output.contains("apply_patch"),
-            "the refusal must name the safe alternatives: {}",
+            refused.output.contains("only part of"),
+            "the refusal must say what the model has actually seen: {}",
             refused.output
         );
         assert!(
-            refused.output.contains("offset"),
-            "the refusal must tell the model how to finish reading: {}",
+            refused.output.contains("read_file") && refused.output.contains("offset"),
+            "the advice must be followable in a context that allows ONLY \
+             read_file/write_file (the slides prompt forbids the patch \
+             tools): {}",
+            refused.output
+        );
+        assert!(
+            !refused.output.contains("edit_file") && !refused.output.contains("apply_patch"),
+            "naming forbidden tools deadlocks the slides flow: {}",
             refused.output
         );
         // ...and must not have touched the file.
@@ -1102,27 +1221,9 @@ mod tests {
             "a refused overwrite must leave the file intact"
         );
 
-        // Page through to EOF the way the refusal advises.
-        let mut next = 451usize;
-        for _ in 0..10 {
-            let page = read
-                .execute(&serde_json::json!({"path": "script.js", "offset": next}))
-                .await
-                .unwrap();
-            assert!(page.success, "{}", page.output);
-            match page
-                .output
-                .split("offset: ")
-                .nth(1)
-                .and_then(|rest| rest.split('.').next())
-                .and_then(|n| n.parse::<usize>().ok())
-            {
-                Some(n) => next = n,
-                None => break, // no continuation footer — EOF reached
-            }
-        }
-
-        // Now the model has seen the whole file; the same write must pass.
+        // Page through to EOF the way the refusal advises; the same write
+        // must then pass.
+        page_through(&read, &ctx, "script.js", 451).await;
         let allowed = write
             .execute(&serde_json::json!({"path": "script.js", "content": "rebuilt\n"}))
             .await
@@ -1136,6 +1237,396 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("script.js")).unwrap(),
             "rebuilt\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_refuse_overwriting_a_big_never_read_file_when_armed() {
+        // THE fail-closed default: no ledger entry for an over-window file
+        // means REFUSE — closing the giant-first-line hole (where the
+        // advice branch records nothing), the restart hole (empty ledger),
+        // and the eviction hole, all of which were fail-open when "no entry"
+        // meant "allow".
+        let dir = tempfile::tempdir().unwrap();
+        let original = big_rows(dir.path(), "unread.js");
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let refused = write
+            .execute(&serde_json::json!({"path": "unread.js", "content": "blind rebuild\n"}))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success,
+            "an over-window file never read this session must not be \
+             overwritten: {}",
+            refused.output
+        );
+        assert!(
+            refused.output.contains("[PARTIAL_VIEW_OVERWRITE]")
+                && refused.output.contains("have not read it in this session"),
+            "the refusal must say WHY and what to do: {}",
+            refused.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("unread.js")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn should_allow_overwriting_a_never_read_small_file_when_armed() {
+        // A file at or under the byte window is returned whole by a single
+        // unbounded read — there is no partial-view illusion to protect
+        // against, so blind overwrite stays exactly today's semantics.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blind.txt"), "old\n").unwrap();
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let w = write
+            .execute(&serde_json::json!({"path": "blind.txt", "content": "new\n"}))
+            .await
+            .unwrap();
+        assert!(w.success, "{}", w.output);
+    }
+
+    #[tokio::test]
+    async fn should_not_earn_completeness_from_an_unarmed_read() {
+        // An UNARMED read records nothing — so even a full-range unarmed
+        // read must not vouch for an armed write later (evidence gathered
+        // while the feature was off is not evidence).
+        let dir = tempfile::tempdir().unwrap();
+        big_rows(dir.path(), "untracked.js");
+        let read = ReadFileTool::new(dir.path()); // unarmed
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let full = read
+            .execute(
+                &serde_json::json!({"path": "untracked.js", "start_line": 1, "end_line": 1500}),
+            )
+            .await
+            .unwrap();
+        assert!(full.success);
+
+        let refused = write
+            .execute(&serde_json::json!({"path": "untracked.js", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success && refused.output.contains("have not read it in this session"),
+            "unarmed reads must leave no trace the armed guard would trust: {}",
+            refused.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_refuse_when_the_file_changed_on_disk_after_a_complete_read() {
+        // Epoch validation at WRITE time: coverage is only as good as the
+        // generation it was read from. A different (mtime, size) on disk
+        // means the model's COMPLETE view is of a dead generation.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("moving.txt"), "v1\n").unwrap();
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let r = read
+            .execute(&serde_json::json!({"path": "moving.txt"}))
+            .await
+            .unwrap();
+        assert!(r.success && r.output.contains("v1"));
+
+        // Replace the file with different-sized content — even an equal
+        // mtime second cannot mask a size change.
+        std::fs::write(dir.path().join("moving.txt"), "version-two-longer\n").unwrap();
+
+        let refused = write
+            .execute(&serde_json::json!({"path": "moving.txt", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success && refused.output.contains("changed on disk"),
+            "stale coverage must refuse with re-read advice: {}",
+            refused.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_recover_after_a_shrink_between_pages() {
+        // H6: a file that shrinks between pages must not leave a stale
+        // refusal forever — a fresh read of the new generation resets
+        // coverage and unlocks the write.
+        let dir = tempfile::tempdir().unwrap();
+        big_rows(dir.path(), "shrinky.txt");
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let page1 = read
+            .execute(&serde_json::json!({"path": "shrinky.txt"}))
+            .await
+            .unwrap();
+        assert!(page1.success && page1.output.contains("showing lines 1-450 of 1500"));
+
+        // The file shrinks to a single small line.
+        std::fs::write(dir.path().join("shrinky.txt"), "tiny now\n").unwrap();
+
+        let refused = write
+            .execute(&serde_json::json!({"path": "shrinky.txt", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success,
+            "coverage of the old generation must not authorize a write: {}",
+            refused.output
+        );
+
+        // A fresh read of the (now small) file completes in one call...
+        let fresh = read
+            .execute(&serde_json::json!({"path": "shrinky.txt"}))
+            .await
+            .unwrap();
+        assert!(fresh.success && fresh.output.contains("tiny now"));
+
+        // ...and the write goes through.
+        let allowed = write
+            .execute(&serde_json::json!({"path": "shrinky.txt", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            allowed.success,
+            "a fresh read of the current generation must recover: {}",
+            allowed.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_refuse_across_sessions_even_after_a_complete_read() {
+        // The ledger is keyed by (session, path): session A's COMPLETE must
+        // never authorize session B's overwrite of content B has not seen.
+        let dir = tempfile::tempdir().unwrap();
+        medium_rows(dir.path(), "shared.js");
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+        let ctx_a = ctx_with_session("xsession-a");
+        let ctx_b = ctx_with_session("xsession-b");
+
+        // Session A pages the file through to completion.
+        let page1 = read
+            .execute_with_context(&ctx_a, &serde_json::json!({"path": "shared.js"}))
+            .await
+            .unwrap();
+        assert!(page1.success, "{}", page1.output);
+        page_through(&read, &ctx_a, "shared.js", 451).await;
+
+        // Session B has seen nothing and must be refused.
+        let refused = write
+            .execute_with_context(
+                &ctx_b,
+                &serde_json::json!({"path": "shared.js", "content": "rebuilt by b\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !refused.success && refused.output.contains("have not read it in this session"),
+            "another session's coverage is not this session's: {}",
+            refused.output
+        );
+
+        // Session A's own write is allowed (positive control).
+        let allowed = write
+            .execute_with_context(
+                &ctx_a,
+                &serde_json::json!({"path": "shared.js", "content": "rebuilt by a\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(allowed.success, "{}", allowed.output);
+    }
+
+    #[tokio::test]
+    async fn should_refuse_after_a_restart_until_reread() {
+        // Restart safety by construction: the in-memory ledger is empty
+        // after a restart, and absence REFUSES over-window overwrites, so a
+        // fresh process can never silently trust pre-restart coverage.
+        // (Simulated per session rather than clearing the whole ledger — a
+        // global clear would wipe parallel tests' entries mid-flight.)
+        let dir = tempfile::tempdir().unwrap();
+        medium_rows(dir.path(), "reboot.js");
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+        let ctx = ctx_with_session("restart-sim");
+
+        let page1 = read
+            .execute_with_context(&ctx, &serde_json::json!({"path": "reboot.js"}))
+            .await
+            .unwrap();
+        assert!(page1.success, "{}", page1.output);
+        page_through(&read, &ctx, "reboot.js", 451).await;
+
+        // "Restart": this session's ledger entries are gone.
+        crate::tools::read_window::reset_session_for_test("restart-sim");
+
+        let refused = write
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "reboot.js", "content": "rebuilt\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !refused.success && refused.output.contains("have not read it in this session"),
+            "post-restart, the model must re-read before overwriting: {}",
+            refused.output
+        );
+
+        // Re-reading re-earns the write.
+        let again = read
+            .execute_with_context(&ctx, &serde_json::json!({"path": "reboot.js"}))
+            .await
+            .unwrap();
+        assert!(again.success, "{}", again.output);
+        page_through(&read, &ctx, "reboot.js", 451).await;
+        let allowed = write
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "reboot.js", "content": "rebuilt\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(allowed.success, "{}", allowed.output);
+    }
+
+    #[tokio::test]
+    async fn should_refuse_when_redacted_content_never_reached_the_model() {
+        // H1b: the ledger records what the TOOL returned, but the loop
+        // sanitizer rewrites afterwards — a view it would alter never
+        // reaches the model as-is, so it must record TAINTED and a
+        // whole-file rewrite must refuse (the model would write redaction
+        // placeholders over real content).
+        let dir = tempfile::tempdir().unwrap();
+        let secret = format!("before\n{}\nafter\n", "a".repeat(64)); // 64+ hex chars => redacted
+        std::fs::write(dir.path().join("secrets.env"), &secret).unwrap();
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        // The whole file fits one window — coverage is FULL, and that must
+        // still not count as a faithful view.
+        let r = read
+            .execute(&serde_json::json!({"path": "secrets.env"}))
+            .await
+            .unwrap();
+        assert!(r.success, "{}", r.output);
+
+        let refused = write
+            .execute(&serde_json::json!({"path": "secrets.env", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success && refused.output.contains("redacted from your view"),
+            "full coverage of redacted bytes is not knowledge: {}",
+            refused.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("secrets.env")).unwrap(),
+            secret,
+            "the refusal must leave the secret-bearing file intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_complete_via_byte_paging_and_allow_the_write() {
+        // The giant-FIRST-line family end to end: line mode can only advise,
+        // the fail-closed default refuses the blind write, raw byte paging
+        // earns completeness, and the write then passes.
+        let dir = tempfile::tempdir().unwrap();
+        let giant = "G".repeat(60_000);
+        std::fs::write(dir.path().join("one_line.min.js"), &giant).unwrap();
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        // Line mode: advice only (and no ledger entry).
+        let advice = read
+            .execute(&serde_json::json!({"path": "one_line.min.js"}))
+            .await
+            .unwrap();
+        assert!(advice.success, "{}", advice.output);
+        assert!(
+            advice.output.contains("byte_offset: 0"),
+            "the advice names the byte-mode continuation: {}",
+            advice.output
+        );
+
+        // Fail-closed: advice is not a view; the write refuses.
+        let refused = write
+            .execute(&serde_json::json!({"path": "one_line.min.js", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success && refused.output.contains("have not read it in this session"),
+            "a giant-first-line file with no real view must refuse — this \
+             was the fail-open hole in the first draft: {}",
+            refused.output
+        );
+
+        // Byte-page the whole line: two slabs.
+        let mut next = 0usize;
+        for _ in 0..4 {
+            let slab = read
+                .execute(&serde_json::json!({"path": "one_line.min.js", "byte_offset": next}))
+                .await
+                .unwrap();
+            assert!(slab.success, "{}", slab.output);
+            match slab
+                .output
+                .split("byte_offset: ")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(n) => next = n,
+                None => break, // no footer — EOF
+            }
+        }
+
+        let allowed = write
+            .execute(&serde_json::json!({"path": "one_line.min.js", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            allowed.success,
+            "byte paging to EOF must earn the write: {}",
+            allowed.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("one_line.min.js")).unwrap(),
+            "rebuilt\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_allow_a_second_overwrite_of_a_file_the_model_just_wrote() {
+        // A successful write records the view COMPLETE at the post-write
+        // epoch — merely forgetting the path (the redesign as first
+        // proposed) would refuse the model's next overwrite of a big file
+        // it authored one call ago.
+        let dir = tempfile::tempdir().unwrap();
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+        let big_content = format!("created big\n{}\n", "x".repeat(60_000));
+
+        // Creating a new file is always allowed...
+        let first = write
+            .execute(&serde_json::json!({"path": "authored.txt", "content": big_content}))
+            .await
+            .unwrap();
+        assert!(first.success, "{}", first.output);
+
+        // ...and overwriting one's own just-written over-window content too.
+        let second = write
+            .execute(&serde_json::json!({"path": "authored.txt", "content": "second version\n"}))
+            .await
+            .unwrap();
+        assert!(
+            second.success,
+            "the author of the current content must not be locked out: {}",
+            second.output
         );
     }
 
@@ -1182,18 +1673,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_allow_overwriting_a_never_read_file_when_armed() {
-        // The guard requires partial-READ evidence; a blind overwrite of an
-        // existing file is today's documented write_file semantics.
+    async fn should_clamp_pathological_paths_in_the_refusal() {
+        // H4: refusal messages interpolate the caller's path SPELLING, which
+        // is unbounded — a 50KB spelling must not push the refusal past the
+        // loop's output cap (a blind head/tail cut there would mangle the
+        // advice).
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("blind.txt"), "old\n").unwrap();
+        big_rows(dir.path(), "deep.js");
         let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+        let pathological = format!("{}deep.js", "./".repeat(25_000));
 
-        let w = write
-            .execute(&serde_json::json!({"path": "blind.txt", "content": "new\n"}))
+        let refused = write
+            .execute(&serde_json::json!({"path": pathological, "content": "rebuilt\n"}))
             .await
             .unwrap();
-        assert!(w.success, "{}", w.output);
+        assert!(!refused.success, "{}", refused.output);
+        assert!(
+            refused.output.contains("[PARTIAL_VIEW_OVERWRITE]"),
+            "still the typed refusal: {}",
+            octos_core::truncated_utf8(&refused.output, 200, "...")
+        );
+        assert!(
+            refused.output.len() <= octos_core::tool_output_limit("write_file"),
+            "the refusal must clamp the path so the loop backstop cannot \
+             mangle the advice: {} bytes",
+            refused.output.len()
+        );
     }
 
     #[tokio::test]
@@ -1217,33 +1722,5 @@ mod tests {
             .unwrap();
         assert!(w.success, "the unarmed path must not change: {}", w.output);
         assert!(w.output.contains("Successfully wrote"));
-    }
-
-    #[tokio::test]
-    async fn should_not_track_views_when_the_read_is_unarmed() {
-        // An UNARMED read must record nothing — otherwise an armed writer
-        // elsewhere in the process would start refusing on evidence gathered
-        // while the feature was off (the probe's "disarmed records nothing"
-        // rule, applied to the ledger).
-        let dir = tempfile::tempdir().unwrap();
-        big_rows(dir.path(), "untracked.txt");
-        let read = ReadFileTool::new(dir.path()); // unarmed
-        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
-
-        let r = read
-            .execute(&serde_json::json!({"path": "untracked.txt", "start_line": 1, "end_line": 5}))
-            .await
-            .unwrap();
-        assert!(r.success);
-
-        let w = write
-            .execute(&serde_json::json!({"path": "untracked.txt", "content": "rebuilt\n"}))
-            .await
-            .unwrap();
-        assert!(
-            w.success,
-            "no armed read happened, so there is no partial-view evidence: {}",
-            w.output
-        );
     }
 }
