@@ -12,6 +12,21 @@ use std::sync::{Arc, Mutex};
 
 pub struct GoalLedger {
     conn: Arc<Mutex<Connection>>,
+    /// #2085 — latched POSITIVE result of [`Self::goals_has_time_column`]
+    /// for this connection, so `get_goal` stops paying a
+    /// `pragma_table_info` round trip before every point lookup once the
+    /// column has been observed. The capability is MONOTONE per connection:
+    /// `ALTER TABLE … ADD COLUMN` is the only schema transition and nothing
+    /// ever drops the column, so a committed "yes" can never become "no" in
+    /// a later snapshot. A NEGATIVE result is deliberately never latched —
+    /// an unmigrated file can migrate mid-connection through a writer's
+    /// in-transaction [`Self::ensure_goals_time_column`], and a reader that
+    /// latched "no" would synthesize `time_used_seconds: 0` forever.
+    goals_time_column_seen: std::sync::atomic::AtomicBool,
+    /// #2085 — number of `pragma_table_info` probes `get_goal` actually
+    /// executed. Lets tests pin "the probe is skipped once latched"
+    /// structurally instead of by timing.
+    goals_time_probe_count: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +301,8 @@ impl GoalLedger {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            goals_time_column_seen: std::sync::atomic::AtomicBool::new(false),
+            goals_time_probe_count: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -945,10 +962,31 @@ impl GoalLedger {
     /// acquires only a shared read lock, and only on first access, so this
     /// still runs no DDL and takes no write lock. It is rolled back on drop,
     /// which for a read is a no-op.
+    ///
+    /// #2085 — once one probe has answered "yes", later calls skip the
+    /// `pragma_table_info` round trip via `goals_time_column_seen` (see the
+    /// field doc). That does NOT reopen the torn-read window above: the
+    /// window was probe-says-NO in one state + SELECT in a later state; a
+    /// latched YES means the column existed in a COMMITTED state this
+    /// connection already observed, and column existence is monotone, so it
+    /// exists in this transaction's snapshot too and the SELECT reads the
+    /// real value. While the answer is still "no", the probe continues to
+    /// run — inside the same DEFERRED transaction as the SELECT, exactly as
+    /// before.
     pub fn get_goal(&self, goal_id: &str) -> Result<Option<Goal>> {
+        use std::sync::atomic::Ordering;
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        let has_time = Self::goals_has_time_column(&tx)?;
+        let has_time = if self.goals_time_column_seen.load(Ordering::Acquire) {
+            true
+        } else {
+            self.goals_time_probe_count.fetch_add(1, Ordering::Relaxed);
+            let probed = Self::goals_has_time_column(&tx)?;
+            if probed {
+                self.goals_time_column_seen.store(true, Ordering::Release);
+            }
+            probed
+        };
         let sql = if has_time {
             "SELECT goal_id, objective, status, tokens_used, token_budget, continuations_used, \
              revision, created_at_ms, updated_at_ms, time_used_seconds
@@ -977,6 +1015,15 @@ impl GoalLedger {
             rows.next().transpose()?
         };
         Ok(goal)
+    }
+
+    /// #2085 test seam — how many `pragma_table_info` probes [`Self::get_goal`]
+    /// has actually run on this ledger. Structural pin for "the probe is
+    /// skipped once a positive has been latched" without timing assertions.
+    #[cfg(test)]
+    pub(crate) fn time_column_probe_count(&self) -> u64 {
+        self.goals_time_probe_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// #2055 review round 5 — the authority rank a freshly CREATED row
@@ -5354,6 +5401,109 @@ mod digest_integration_tests {
                 torn.map(|g| g.tokens_used).unwrap_or_default(),
             );
         }
+    }
+
+    /// #2085 — a NEGATIVE probe result must never be cached: an unmigrated
+    /// file can migrate mid-connection through a writer's in-transaction
+    /// `ensure_goals_time_column`, so a reader that latched "no column" would
+    /// synthesize `time_used_seconds: 0` forever. Every read of an
+    /// unmigrated file re-probes, and the read AFTER the migration commits
+    /// sees the real column value through a fresh probe.
+    #[test]
+    fn should_reprobe_time_column_when_file_still_unmigrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reprobe.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            create_legacy_schema(&conn, "");
+        }
+        let reader = GoalLedger::open(&path).unwrap();
+
+        // Unmigrated: the probe answers "no" on every read and is never
+        // latched — one probe per get_goal.
+        for expected_probes in 1..=2u64 {
+            let goal = reader.get_goal("g1").unwrap().unwrap();
+            assert_eq!(goal.time_used_seconds, 0, "legacy shape reports zero");
+            assert_eq!(
+                reader.time_column_probe_count(),
+                expected_probes,
+                "a negative probe result must not be cached"
+            );
+        }
+
+        // A DIFFERENT connection migrates the file mid-(reader-)connection
+        // and writes both cost dimensions non-zero.
+        let writer = GoalLedger::open_with_busy_retry(&path).unwrap();
+        writer
+            .upsert_goal(&Goal {
+                goal_id: "g1".into(),
+                objective: "ship".into(),
+                status: "active".into(),
+                tokens_used: 4_242,
+                token_budget: 1_000,
+                time_used_seconds: 77,
+                continuations_used: 0,
+                revision: 1,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        // The reader's next probe is FRESH, so it observes the migration and
+        // reads the real value instead of synthesizing 0.
+        let goal = reader.get_goal("g1").unwrap().unwrap();
+        assert_eq!(
+            goal.time_used_seconds, 77,
+            "a fresh probe must observe the mid-connection migration"
+        );
+        assert_eq!(goal.tokens_used, 4_242);
+        assert_eq!(reader.time_column_probe_count(), 3);
+    }
+
+    /// #2085 — the capability is MONOTONE per connection (a committed column
+    /// never disappears), so once one probe has answered "yes" every later
+    /// `get_goal` on the same ledger skips the `pragma_table_info` round
+    /// trip entirely. Pinned via a probe counter, not timing.
+    #[test]
+    fn should_skip_time_column_probe_when_positive_already_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skip.db");
+        // Current-schema file: the very first read probes positively.
+        let ledger = GoalLedger::open_with_busy_retry(&path).unwrap();
+        ledger
+            .upsert_goal(&Goal {
+                goal_id: "g1".into(),
+                objective: "ship".into(),
+                status: "active".into(),
+                tokens_used: 10,
+                token_budget: 1_000,
+                time_used_seconds: 5,
+                continuations_used: 0,
+                revision: 1,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        let goal = ledger.get_goal("g1").unwrap().unwrap();
+        assert_eq!(goal.time_used_seconds, 5);
+        assert_eq!(
+            ledger.time_column_probe_count(),
+            1,
+            "the first read pays exactly one schema probe"
+        );
+
+        // Every later read skips the probe and still returns full rows.
+        for _ in 0..3 {
+            let goal = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(goal.time_used_seconds, 5);
+            assert_eq!(goal.tokens_used, 10);
+        }
+        assert_eq!(
+            ledger.time_column_probe_count(),
+            1,
+            "a positive probe result is latched for the connection's lifetime"
+        );
     }
 
     /// #2068 — a ledger FILE created before the time column existed migrates
