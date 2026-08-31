@@ -408,9 +408,9 @@ pub(crate) fn append_monitor_note(
     // inside a bullet).
     let line = format!("{timestamp} {}\n", message.replace('\n', " "));
     // fs2::FileExt (MSRV 1.85; std's flock methods are 1.89+) — see the
-    // goal-notes twin for the full serialization rationale.
-    #[allow(unused_imports)]
-    use fs2::FileExt as _;
+    // goal-notes twin for the full serialization rationale. Calls are fully
+    // qualified (`fs2::FileExt::...`) so they never resolve to the newer
+    // same-named std::fs::File methods.
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -422,9 +422,7 @@ pub(crate) fn append_monitor_note(
                 lock_path.display()
             )
         })?;
-    #[allow(clippy::incompatible_msrv)]
-    lock_file
-        .lock_shared()
+    fs2::FileExt::lock_shared(&lock_file)
         .map_err(|e| format!("failed to lock monitor notes {}: {e}", lock_path.display()))?;
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -436,8 +434,7 @@ pub(crate) fn append_monitor_note(
         file.write_all(line.as_bytes())
             .map_err(|e| format!("failed to append monitor note {}: {e}", note_path.display()))
     })();
-    #[allow(clippy::incompatible_msrv)]
-    let _ = lock_file.unlock();
+    let _ = fs2::FileExt::unlock(&lock_file);
     result
 }
 
@@ -472,20 +469,17 @@ pub(crate) fn read_and_clear_monitor_notes(
             return None;
         }
     }
-    use fs2::FileExt as _;
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&lock_path)
         .ok()?;
-    #[allow(clippy::incompatible_msrv)]
-    lock_file.lock_exclusive().ok()?;
+    fs2::FileExt::lock_exclusive(&lock_file).ok()?;
     struct LockGuard<'a>(&'a std::fs::File);
     impl Drop for LockGuard<'_> {
         fn drop(&mut self) {
-            #[allow(clippy::incompatible_msrv)]
-            let _ = self.0.unlock();
+            let _ = fs2::FileExt::unlock(self.0);
         }
     }
     let _guard = LockGuard(&lock_file);
