@@ -24123,6 +24123,21 @@ const BTW_TIMEOUT_SECS: u64 = 30;
 /// context shape is unit-testable: transcript tail (already limited by the
 /// caller) + a short live-activity digest + the question. The system prompt
 /// carries the restrictions: no tools, brief answer, ephemeral exchange.
+/// The `ChatConfig` for a `session/btw` aside — split out so its cache
+/// economics are pinnable in isolation.
+fn btw_chat_config() -> octos_llm::ChatConfig {
+    octos_llm::ChatConfig {
+        max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
+        temperature: Some(0.2),
+        tool_choice: octos_llm::ToolChoice::None,
+        // #2194 review: ONE restricted LLM call per aside — the prompt
+        // (transcript tail + activity tail + question) is never replayed, so
+        // a cache write is pure premium.
+        cache_retention: octos_llm::CacheRetention::None,
+        ..Default::default()
+    }
+}
+
 fn build_btw_messages(
     transcript_tail: &[Message],
     activity_lines: &[String],
@@ -24454,12 +24469,7 @@ async fn handle_session_btw(
             &live_draft_tail,
             &question,
         );
-        let config = octos_llm::ChatConfig {
-            max_tokens: Some(BTW_ANSWER_MAX_TOKENS),
-            temperature: Some(0.2),
-            tool_choice: octos_llm::ToolChoice::None,
-            ..Default::default()
-        };
+        let config = btw_chat_config();
         // `&[]` tool specs IS the "no tools" restriction — the model cannot
         // call what it is never offered.
         let response = match tokio::time::timeout(
@@ -29275,12 +29285,7 @@ async fn model_join_review_summary(
             timestamp: Utc::now(),
         },
     ];
-    let config = octos_llm::ChatConfig {
-        max_tokens: Some(1800),
-        temperature: Some(0.0),
-        tool_choice: octos_llm::ToolChoice::None,
-        ..Default::default()
-    };
+    let config = review_join_chat_config();
     match llm.chat(&messages, &[], &config).await {
         Ok(response) => response
             .content
@@ -29312,6 +29317,21 @@ fn requested_final_marker(objective: &str) -> Option<String> {
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .find(|token| token.ends_with("_FINAL_LINE"))?;
     (!marker.is_empty()).then(|| marker.to_owned())
+}
+
+/// The `ChatConfig` for the final code-review join — split out so its cache
+/// economics are pinnable in isolation.
+fn review_join_chat_config() -> octos_llm::ChatConfig {
+    octos_llm::ChatConfig {
+        max_tokens: Some(1800),
+        temperature: Some(0.0),
+        tool_choice: octos_llm::ToolChoice::None,
+        // #2194 review: the join runs once per review with a prompt unique
+        // to that join (objective + target + specialist outputs) — never
+        // replayed, so a cache write is pure premium.
+        cache_retention: octos_llm::CacheRetention::None,
+        ..Default::default()
+    }
 }
 
 fn fallback_join_review_summary(target: &str, results: &[NativeCodeReviewResult]) -> String {

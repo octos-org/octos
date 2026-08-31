@@ -824,6 +824,12 @@ async fn extract_one_session(
     ];
     let config = ChatConfig {
         max_tokens: Some(2_000),
+        // #2194 review: one extraction call per session transcript — the
+        // prompt embeds that session's rendered transcript and is never
+        // replayed, so a cache write is pure premium. (The consolidation
+        // pass is different: its corrective re-ask APPENDS to the original
+        // messages, genuinely reusing the prefix, so it keeps caching.)
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
     let response = provider.chat(&messages, &[], &config).await?;
@@ -959,6 +965,73 @@ mod tests {
         msg.role = MessageRole::Assistant;
         msg.content = "ok".to_string();
         mgr.add_message(&key, msg).await.unwrap();
+    }
+
+    struct RetentionProbeProvider {
+        response: String,
+        seen: std::sync::Mutex<Option<octos_llm::CacheRetention>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RetentionProbeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            *self.seen.lock().unwrap() = Some(config.cache_retention);
+            Ok(ChatResponse {
+                content: Some(self.response.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatStream> {
+            unimplemented!("probe does not stream")
+        }
+
+        fn model_id(&self) -> &str {
+            "retention-probe"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_cache_writes_when_extracting_session_memory() {
+        // #2194 review: extraction sends one per-session transcript prompt,
+        // never replayed — it must not pay for cache writes.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "tg:200", "I prefer tabs over spaces").await;
+
+        let provider = RetentionProbeProvider {
+            response: r#"{"items":[{"kind":"fact","content":"prefers tabs","evidence":[0]}]}"#
+                .to_string(),
+            seen: std::sync::Mutex::new(None),
+        };
+        let knobs = knobs_for_test();
+        let report = run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        assert_eq!(report.extracted, 1, "probe extraction must go through");
+        assert_eq!(
+            *provider.seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot memory extraction must not request cache writes"
+        );
     }
 
     #[tokio::test]

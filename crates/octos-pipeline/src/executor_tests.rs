@@ -5,6 +5,66 @@ use crate::handler::Handler;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+struct RetentionProbeProvider {
+    seen: Mutex<Option<octos_llm::CacheRetention>>,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for RetentionProbeProvider {
+    async fn chat(
+        &self,
+        _messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        *self.seen.lock().unwrap() = Some(config.cache_retention);
+        Ok(octos_llm::ChatResponse {
+            content: Some(r#"[{"task": "search for X", "label": "X"}]"#.into()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: octos_llm::TokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatStream> {
+        unimplemented!("probe does not stream")
+    }
+
+    fn model_id(&self) -> &str {
+        "retention-probe"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn should_opt_out_of_cache_writes_when_planning_dynamic_tasks() {
+    // #2194 review: dynamic-node planning is ONE call per dynamic node with a
+    // prompt built from that node's planning_prompt + the user query — never
+    // replayed, so it must not pay for cache writes.
+    let probe = RetentionProbeProvider {
+        seen: Mutex::new(None),
+    };
+    let (tasks, _usage) = plan_dynamic_tasks(&probe, "plan the research", "rust caching", 3)
+        .await
+        .expect("probe returns a valid task array");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        *probe.seen.lock().unwrap(),
+        Some(octos_llm::CacheRetention::None),
+        "one-shot dynamic planning must not request cache writes"
+    );
+}
+
 #[test]
 fn sanitize_label_for_filename_yields_a_deterministic_fs_safe_token() {
     // deep_research workers write `findings-{label}.md`; the substituted token

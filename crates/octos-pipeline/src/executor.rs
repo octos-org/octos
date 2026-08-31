@@ -1199,6 +1199,10 @@ async fn plan_dynamic_tasks(
 
     let config = ChatConfig {
         max_tokens: Some(4096),
+        // #2194 review: ONE planning call per dynamic node, its prompt built
+        // from that node's planning_prompt + the user query — never replayed,
+        // so a cache write is pure premium.
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
 

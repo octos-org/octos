@@ -36951,6 +36951,37 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
 /// `cached_input_tokens`, without which an operator cannot tell whether prompt
 /// caching is working.
 #[test]
+fn should_opt_out_of_cache_writes_when_building_btw_config() {
+    // #2194 review: `session/btw` is ONE restricted LLM call per aside — its
+    // prompt (transcript tail + activity tail + question) is never replayed,
+    // so the request must not pay for cache writes. The aside's other
+    // restrictions (no tools, small answer cap) must survive.
+    let config = btw_chat_config();
+    assert_eq!(
+        config.cache_retention,
+        octos_llm::CacheRetention::None,
+        "btw asides must not request cache writes"
+    );
+    assert_eq!(config.max_tokens, Some(BTW_ANSWER_MAX_TOKENS));
+    assert!(matches!(config.tool_choice, octos_llm::ToolChoice::None));
+}
+
+#[test]
+fn should_opt_out_of_cache_writes_when_building_review_join_config() {
+    // #2194 review: the final code-review join runs once per review with a
+    // prompt unique to that join (objective + target + specialist outputs) —
+    // never replayed, so it must not pay for cache writes.
+    let config = review_join_chat_config();
+    assert_eq!(
+        config.cache_retention,
+        octos_llm::CacheRetention::None,
+        "the review join must not request cache writes"
+    );
+    assert_eq!(config.max_tokens, Some(1800));
+    assert!(matches!(config.tool_choice, octos_llm::ToolChoice::None));
+}
+
+#[test]
 fn should_report_cache_read_tokens_in_session_usage_status() {
     let totals = UsageTotals {
         run_count: 2,

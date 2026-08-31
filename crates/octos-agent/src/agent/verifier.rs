@@ -533,17 +533,7 @@ impl Agent {
                 timestamp: chrono::Utc::now(),
             },
         ];
-        let verifier_config = ChatConfig {
-            max_tokens: Some(VERIFIER_MAX_TOKENS),
-            temperature: Some(0.0),
-            tool_choice: ToolChoice::None,
-            response_format: Some(ResponseFormat::JsonSchema {
-                name: "octos_verifier_verdict".to_string(),
-                schema: verifier_schema(),
-                strict: true,
-            }),
-            ..Default::default()
-        };
+        let verifier_config = verifier_chat_config();
         let response = octos_llm::with_lane_context(
             config.lane_context.clone(),
             config.provider.chat(&messages, &[], &verifier_config),
@@ -586,6 +576,27 @@ impl Agent {
         });
         ledger.record_verdict(iteration, verdict.clone(), &config.model_label);
         Ok(verdict)
+    }
+}
+
+/// The `ChatConfig` for one verifier verdict call, split out so its cache
+/// economics are pinnable in isolation.
+fn verifier_chat_config() -> ChatConfig {
+    ChatConfig {
+        max_tokens: Some(VERIFIER_MAX_TOKENS),
+        temperature: Some(0.0),
+        tool_choice: ToolChoice::None,
+        response_format: Some(ResponseFormat::JsonSchema {
+            name: "octos_verifier_verdict".to_string(),
+            schema: verifier_schema(),
+            strict: true,
+        }),
+        // #2194 review: the only stable prefix is a one-sentence system block
+        // (below any cacheable minimum); the breakpoint-marked last user
+        // block carries the rolling TurnLedger, which differs every round —
+        // a cache write here is never read back.
+        cache_retention: octos_llm::CacheRetention::None,
+        ..Default::default()
     }
 }
 
@@ -733,6 +744,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn should_opt_out_of_cache_writes_when_building_verifier_config() {
+        // #2194 review: the verifier's stable prefix is a single system
+        // sentence (below any cacheable minimum); the breakpoint-marked last
+        // user block carries the rolling TurnLedger, which differs every
+        // round — so a cache write is never read back. The verdict call must
+        // opt out, while keeping its strict-JSON response contract intact.
+        let config = verifier_chat_config();
+        assert_eq!(
+            config.cache_retention,
+            octos_llm::CacheRetention::None,
+            "verifier verdict calls must not request cache writes"
+        );
+        match config.response_format {
+            Some(ResponseFormat::JsonSchema {
+                ref name, strict, ..
+            }) => {
+                assert_eq!(name, "octos_verifier_verdict");
+                assert!(strict);
+            }
+            other => panic!("verifier must keep its JSON-schema contract, got {other:?}"),
+        }
+        assert!(matches!(config.tool_choice, ToolChoice::None));
+    }
 
     #[test]
     fn ledger_marks_repeating_only_when_caller_reports_repeating() {

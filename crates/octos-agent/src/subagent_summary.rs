@@ -303,6 +303,8 @@ impl AgentSummaryGenerator {
             task_id,
             tick_seq,
             self.summary_window,
+            // One-off invocation: no cross-tick state, so it always calls.
+            &mut None,
         )
         .await
     }
@@ -343,6 +345,8 @@ async fn run_watcher_loop(
     }
 
     let mut tick_seq: u32 = 0;
+    // #2194 review: per-watcher dedupe state — see [`LastTickSummary`].
+    let mut last_emitted: Option<LastTickSummary> = None;
     loop {
         tick_seq = tick_seq.saturating_add(1);
         let _ = summarize_tick(
@@ -354,6 +358,7 @@ async fn run_watcher_loop(
             &task_id,
             tick_seq,
             window,
+            &mut last_emitted,
         )
         .await;
 
@@ -375,6 +380,20 @@ fn is_terminal(supervisor: &TaskSupervisor, task_id: &str) -> bool {
     }
 }
 
+/// #2194 review — the snapshot + summary a watcher last EMITTED, kept per
+/// watcher loop so an idle tick can be answered without an LLM call.
+///
+/// An idle sub-agent rebuilds the byte-identical prompt every 30s tick
+/// (deterministic [`build_prompt`] over an unchanged activity tail). Dedupe
+/// beats caching here: a prompt-cache hit would still bill ~0.1x of the
+/// prompt, a reused summary bills nothing — and it leaves every prompt that
+/// DOES reach the provider genuinely fresh, which is what justifies
+/// [`fetch_summary`]'s cache-write opt-out.
+struct LastTickSummary {
+    lines: Vec<String>,
+    summary: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn summarize_tick(
     provider: Arc<dyn LlmProvider>,
@@ -385,8 +404,22 @@ async fn summarize_tick(
     task_id: &str,
     tick_seq: u32,
     window: usize,
+    last: &mut Option<LastTickSummary>,
 ) -> Option<String> {
     let lines = activity.snapshot(task_id, window);
+
+    // Unchanged snapshot => identical prompt => identical answer. Re-emit the
+    // previous summary (so runtime_detail's tick/at stay live) and skip the
+    // LLM round trip entirely. A changed snapshot, an LLM failure, or an
+    // empty summary all fall through to a real call — failures never latch.
+    if let Some(prev) = last.as_ref()
+        && prev.lines == lines
+    {
+        let summary = prev.summary.clone();
+        emit_progress(supervisor, session_id, task_id, &summary, tick_seq);
+        return Some(summary);
+    }
+
     let prompt = build_prompt(&lines);
 
     let summary = match fetch_summary(Arc::clone(&provider), prompt, llm_timeout).await {
@@ -407,10 +440,25 @@ async fn summarize_tick(
         return None;
     }
 
+    *last = Some(LastTickSummary {
+        lines,
+        summary: trimmed.clone(),
+    });
+    emit_progress(supervisor, session_id, task_id, &trimmed, tick_seq);
+    Some(trimmed)
+}
+
+fn emit_progress(
+    supervisor: &TaskSupervisor,
+    session_id: &str,
+    task_id: &str,
+    summary: &str,
+    tick_seq: u32,
+) {
     let event = HarnessEvent::subagent_progress(
         session_id.to_string(),
         task_id.to_string(),
-        trimmed.clone(),
+        summary.to_string(),
         tick_seq,
         Utc::now(),
     );
@@ -421,7 +469,6 @@ async fn summarize_tick(
             "subagent summary event could not be applied to supervisor"
         );
     }
-    Some(trimmed)
 }
 
 fn build_prompt(lines: &[String]) -> String {
@@ -477,8 +524,10 @@ async fn fetch_summary(
         response_format: None,
         context_management: None,
         sampling_params: None,
-        // One-shot: each digest prompt is fresh activity, sent exactly once
-        // — opt out of the 1.25x cache-write premium.
+        // Every prompt that reaches the provider is genuinely fresh: the
+        // watcher dedupes unchanged-snapshot ticks BEFORE calling (see
+        // [`LastTickSummary`]), so an identical prompt is never re-sent and
+        // a cache write would be pure 1.25x premium.
         cache_retention: octos_llm::CacheRetention::None,
     };
     let messages = vec![Message::user(prompt)];
@@ -682,9 +731,13 @@ mod tests {
         let (mock, calls) = MockProvider::new("working hard");
         let supervisor = TaskSupervisor::new();
         let id = register_running_task(&supervisor);
+        // The activity CHANGES between ticks — an active sub-agent — so every
+        // tick carries a fresh snapshot and must reach the LLM (the unchanged-
+        // snapshot dedupe is pinned separately below).
+        let buf = Arc::new(Mutex::new(vec!["doing something".to_string()]));
         let generator = AgentSummaryGenerator::with_activity_source(
             Arc::new(mock),
-            fixed_activity(&["doing something"]),
+            Arc::new(ActivitySource::Fixed(Arc::clone(&buf))),
             supervisor.clone(),
         )
         .with_tick(Duration::from_millis(100))
@@ -695,10 +748,12 @@ mod tests {
         assert!(spawned);
 
         // Drive the watcher a few times so multiple ticks fire. We alternate
-        // time advance + yield so the spawned task actually runs.
-        for _ in 0..10 {
+        // time advance + yield so the spawned task actually runs, and push a
+        // new activity line per round so each snapshot differs.
+        for i in 0..10 {
             tokio::task::yield_now().await;
             tokio::time::advance(Duration::from_millis(110)).await;
+            buf.lock().unwrap().push(format!("step {i}"));
         }
         supervisor.mark_completed(&id, vec![]);
         for _ in 0..4 {
@@ -708,6 +763,54 @@ mod tests {
 
         let observed = calls.load(Ordering::SeqCst);
         assert!(observed >= 2, "expected multiple ticks, got {observed}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn should_skip_llm_call_when_activity_snapshot_unchanged() {
+        // #2194 review: an IDLE sub-agent rebuilds the byte-identical prompt
+        // every 30s tick. Re-asking the model (cached or not) buys nothing —
+        // the watcher must reuse the previous summary without an LLM call,
+        // while still re-stamping runtime_detail so tick/at stay live.
+        let (mock, calls) = MockProvider::new("compiling code");
+        let supervisor = TaskSupervisor::new();
+        let id = register_running_task(&supervisor);
+        let generator = AgentSummaryGenerator::with_activity_source(
+            Arc::new(mock),
+            fixed_activity(&["doing something"]),
+            supervisor.clone(),
+        )
+        .with_tick(Duration::from_millis(100))
+        .with_min_runtime(Duration::from_millis(0))
+        .with_llm_timeout(Duration::from_secs(1));
+
+        assert!(generator.spawn_watcher("api:session", &id));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(110)).await;
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an unchanged activity snapshot must not trigger another LLM call"
+        );
+        let task = supervisor.get_task(&id).unwrap();
+        let detail: serde_json::Value =
+            serde_json::from_str(task.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            detail["summary"], "compiling code",
+            "deduped ticks re-emit the previous summary"
+        );
+        assert!(
+            detail["tick"].as_u64().unwrap() > 1,
+            "the watcher must keep ticking (re-stamping) while deduping: {detail}"
+        );
+
+        supervisor.mark_completed(&id, vec![]);
+        for _ in 0..2 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(110)).await;
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
