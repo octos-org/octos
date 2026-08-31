@@ -8734,11 +8734,8 @@ async fn spawn_discovery_fixture(
 
 #[tokio::test]
 async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
-    let (root, captured) = spawn_discovery_fixture(
-        "200 OK",
-        r#"{"data":[{"id":"glm-5.2"},{"id":"glm-4.7"}]}"#,
-    )
-    .await;
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"},{"id":"glm-4.7"}]}"#).await;
     let state = Arc::new(AppState::empty_for_tests());
     // Saved AppUI routes default api_type to "openai" — exactly the shape
     // that used to force the Bearer /v1/models probe onto zai.
@@ -8776,7 +8773,8 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
 
 #[tokio::test]
 async fn profile_llm_fetch_models_does_not_duplicate_version_segments_on_v4_roots() {
-    let (root, captured) = spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"}]}"#).await;
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"}]}"#).await;
     let state = Arc::new(AppState::empty_for_tests());
     let request = RpcRequest::new(
         "1",
@@ -8829,7 +8827,9 @@ async fn profile_llm_fetch_models_reports_unsupported_for_manual_only_families()
     assert_eq!(result["status"], json!("unsupported"));
     assert_eq!(result["models"], json!([]));
     assert!(
-        result["message"].as_str().is_some_and(|m| m.contains("manually")),
+        result["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("manually")),
         "unsupported must point at manual model-id entry"
     );
     assert!(

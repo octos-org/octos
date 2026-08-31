@@ -12361,10 +12361,8 @@ async fn raw_profile_llm_fetch_models(
     // outcome keeps "enter the model id manually" distinguishable from
     // "credential/endpoint invalid" — instead of collapsing every failure
     // into an empty list + `provider_unavailable`.
-    let discovery = octos_llm::discovery::resolve_model_discovery(
-        Some(&family_id),
-        api_type.as_deref(),
-    );
+    let discovery =
+        octos_llm::discovery::resolve_model_discovery(Some(&family_id), api_type.as_deref());
     let outcome = octos_llm::discovery::discover_models(
         discovery,
         &api_key,

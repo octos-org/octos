@@ -1205,10 +1205,8 @@ pub async fn provider_models(
     // fetch_models` surface — the strategy resolves from the route (api_type
     // override, then the family's declared protocol), never from the literal
     // family id, so the two clients cannot drift.
-    let discovery = octos_llm::discovery::resolve_model_discovery(
-        Some(&req.provider),
-        req.api_type.as_deref(),
-    );
+    let discovery =
+        octos_llm::discovery::resolve_model_discovery(Some(&req.provider), req.api_type.as_deref());
     let outcome = octos_llm::discovery::discover_models(
         discovery,
         &api_key,
