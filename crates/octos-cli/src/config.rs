@@ -45,6 +45,25 @@ pub struct Config {
     #[serde(default)]
     pub context_window: Option<u32>,
 
+    /// #2166: the configured PRIMARY model's typed inference defaults,
+    /// flattened out of `LlmModelSelectionConfig` by `config_from_profile`
+    /// so session bootstrap can compose them AHEAD of the profile-gateway
+    /// knobs (`gateway.llm_temperature` / `gateway.reasoning_effort` /
+    /// `gateway.llm_sampling_params`). Ownership stays with the durable
+    /// model selection; these are read-only projections. `None` = inherit.
+    /// Range validation lives on the AppUI wire schema (#2166).
+    #[serde(default)]
+    pub model_temperature: Option<f32>,
+    /// #2166: primary model default `top_p`. At runtime it overrides a
+    /// same-named `top_p` key in `gateway.llm_sampling_params` (#2176);
+    /// every other sampler key in that map is untouched.
+    #[serde(default)]
+    pub model_top_p: Option<f32>,
+    /// #2166: primary model default reasoning effort. Precedence:
+    /// session/turn override → this → `gateway.reasoning_effort` → none.
+    #[serde(default)]
+    pub model_reasoning_effort: Option<octos_llm::ReasoningEffort>,
+
     /// Custom base URL for the API endpoint.
     #[serde(default)]
     pub base_url: Option<String>,

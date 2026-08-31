@@ -840,6 +840,27 @@ pub struct LlmModelSelectionConfig {
     /// Whether this is considered a strong model for large tool-heavy runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strong: Option<bool>,
+    /// Per-model default sampling temperature (#2166 AppUI typed inference
+    /// schema). `None` = inherit: the runtime falls through to the profile
+    /// gateway `llm_temperature`, then the provider's own default.
+    /// Validated on the AppUI wire (finite, 0.0..=2.0) before persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Per-model default `top_p` (nucleus sampling) (#2166). `None` =
+    /// inherit. Unlike `temperature` there is no typed `ChatConfig` field
+    /// yet, so at runtime it rides the sampler passthrough channel: it
+    /// overrides a same-named `top_p` key in the profile gateway
+    /// `llm_sampling_params` map (#2176). Validated on the AppUI wire
+    /// (finite, 0.0..=1.0) before persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Per-model default reasoning effort for thinking models (#2166). This
+    /// is the *model default* tier of the documented reasoning-precedence
+    /// chain: a per-session/turn override
+    /// (`ui_protocol_reasoning_effort.rs`) wins over it, and it in turn wins
+    /// over the profile gateway `reasoning_effort`. `None` = inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
     /// Operator override for the effective context window, in tokens. When
     /// set it takes precedence over BOTH the static catalog and the runtime
     /// probe (#2135): the provider is wrapped in `ContextWindowOverride` as
@@ -848,7 +869,8 @@ pub struct LlmModelSelectionConfig {
     /// a server advertises (e.g. cap a 262K llama-server at 16384 to bound
     /// KV/compaction) or to correct a mis-probed backend. `None` = defer to
     /// probe/catalog. Applies to the primary and to each fallback
-    /// independently. (#2142, split from #2127.)
+    /// independently. (#2142, split from #2127.) Exposed through the AppUI
+    /// typed inference schema by #2166.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
 }
@@ -1222,6 +1244,11 @@ impl LlmModelSelectionConfig {
             // #2142: a selection that pins ONLY a context_window override is
             // meaningful — it must not be collapsed as "empty" and dropped.
             && self.context_window.is_none()
+            // #2166: same for the typed inference defaults — a selection
+            // carrying only sampling/reasoning defaults is meaningful.
+            && self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.reasoning_effort.is_none()
     }
 }
 
@@ -2765,6 +2792,12 @@ pub(crate) fn config_from_profile(
         model: primary.and_then(|selection| selection.model_id.clone()),
         // #2142: operator override of the primary's effective context window.
         context_window: primary.and_then(|selection| selection.context_window),
+        // #2166: primary model's typed inference defaults (sampling /
+        // reasoning), projected for the session-bootstrap precedence chain:
+        // model default → profile-gateway knob → provider default.
+        model_temperature: primary.and_then(|selection| selection.temperature),
+        model_top_p: primary.and_then(|selection| selection.top_p),
+        model_reasoning_effort: primary.and_then(|selection| selection.reasoning_effort),
         base_url: primary.and_then(|selection| {
             selection
                 .route
@@ -4066,6 +4099,10 @@ mod tests {
                         strong: Some(true),
                         // #2142: operator window override on the primary.
                         context_window: Some(16_384),
+                        // #2166: typed inference defaults (unset here).
+                        temperature: None,
+                        top_p: None,
+                        reasoning_effort: None,
                     }),
                     fallbacks: vec![LlmModelSelectionConfig {
                         family_id: Some("minimax".into()),
@@ -4089,6 +4126,10 @@ mod tests {
                         // #2142: a DIFFERENT per-fallback window override —
                         // must project independently of the primary's.
                         context_window: Some(8_192),
+                        // #2166: typed inference defaults (unset here).
+                        temperature: None,
+                        top_p: None,
+                        reasoning_effort: None,
                     }],
                 }),
                 ..Default::default()

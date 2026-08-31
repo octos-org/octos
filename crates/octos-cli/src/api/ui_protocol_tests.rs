@@ -1160,6 +1160,403 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
     );
 }
 
+// ===========================================================================
+// #2166 — typed AppUI inference-parameter schema (reject / round-trip /
+// ownership). The old schema silently DROPPED any extra field the client
+// sent (temperature, top_p, max_output_tokens, context_window, nested
+// reasoning objects) while answering `applied: true`.
+// ===========================================================================
+
+/// Unknown fields on `profile/llm/upsert` must be rejected with EVERY
+/// rejected field named by its dotted path — never accepted with
+/// `applied: true` while the values are silently discarded — and the prior
+/// configuration must be left untouched.
+#[tokio::test]
+async fn llm_upsert_rejects_unknown_fields_and_names_every_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let error = raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-unknown".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": {
+                        "route_id": "fixture",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_type": "openai",
+                        "bogus_route_key": true
+                    },
+                    "inference": { "temperature": 0.2 },
+                    "temperature2": 0.5
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("unknown fields must be rejected, not silently dropped");
+    let data = error.data.as_ref().expect("typed error data");
+    assert_eq!(data["kind"], json!("llm_unknown_fields"));
+    let rejected = data["rejected_fields"].as_array().expect("field list");
+    for expected in [
+        "selection.temperature2",
+        "selection.inference",
+        "selection.route.bogus_route_key",
+    ] {
+        assert!(
+            rejected.iter().any(|value| *value == json!(expected)),
+            "rejected_fields must name {expected}: {data}"
+        );
+    }
+    // The rejection happens BEFORE any store mutation: the profile is not
+    // even created.
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .is_none(),
+        "a rejected upsert must not create or mutate the profile"
+    );
+}
+
+/// `max_output_tokens` is REAL but owned by the profile-gateway contract —
+/// it gets a dedicated typed error pointing at the owner instead of a
+/// generic "unknown field".
+#[tokio::test]
+async fn llm_upsert_rejects_max_output_tokens_as_owned_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let error = raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-foreign".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" },
+                    "max_output_tokens": 4096
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("max_output_tokens is owned by the gateway contract");
+    let data = error.data.as_ref().expect("typed error data");
+    assert_eq!(data["kind"], json!("llm_param_owned_elsewhere"));
+    assert_eq!(
+        data["rejected_fields"][0],
+        json!("selection.max_output_tokens")
+    );
+    let owner = data["owners"][0]["owner"].as_str().unwrap();
+    assert!(
+        owner.contains("gateway") && owner.contains("max_output_tokens"),
+        "the error must point at the owning contract: {owner}"
+    );
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .is_none(),
+        "a foreign-field rejection must not create or mutate the profile"
+    );
+}
+
+/// Out-of-range and non-finite typed values return a typed
+/// `llm_param_out_of_range` / `llm_param_non_finite` without mutating the
+/// prior configuration.
+#[tokio::test]
+async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    for (field, value, kind) in [
+        ("temperature", json!(3.5), "llm_param_out_of_range"),
+        ("temperature", json!(-0.1), "llm_param_out_of_range"),
+        ("top_p", json!(1.5), "llm_param_out_of_range"),
+        ("context_window", json!(0), "llm_param_out_of_range"),
+    ] {
+        let error = raw_profile_llm_upsert(
+            &state,
+            &RpcRequest::new(
+                "u-range".to_string(),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "custom",
+                        "model_id": "fixture-model",
+                        "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" },
+                        field: value
+                    },
+                    "set_primary": true
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("{field}={value} must be rejected");
+        let data = error.data.as_ref().expect("typed error data");
+        assert_eq!(data["kind"], json!(kind), "{field}={value}");
+        assert_eq!(data["field"], json!(format!("selection.{field}")));
+    }
+    // Non-finite guard: exercised directly (JSON cannot carry NaN/Inf).
+    let error = validate_llm_inference_fields(&RawLlmSelection {
+        temperature: Some(f64::NAN),
+        ..Default::default()
+    })
+    .expect_err("NaN temperature must be rejected");
+    assert_eq!(
+        error.data.as_ref().unwrap()["kind"],
+        json!("llm_param_non_finite")
+    );
+}
+
+/// Known typed inference fields round-trip: upsert → durable store →
+/// list/read; a re-upsert WITHOUT them clears the prior override
+/// (`absent ≡ null ≡ inherit`), and routing metadata outside the schema
+/// (`cost_per_m`/`strong`) survives the same-address edit.
+#[tokio::test]
+async fn llm_upsert_round_trips_typed_inference_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let route = json!({ "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" });
+    raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-rt1".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": route,
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "context_window": 16384,
+                    "reasoning_effort": "high",
+                    "model_hints": { "uses_completion_tokens": true }
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("typed upsert");
+    // Routing metadata arrives OUTSIDE the RPC (QoS/routing research owns
+    // it) — written straight to the durable selection.
+    let mut profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    {
+        let primary = profile
+            .config
+            .llm
+            .as_mut()
+            .unwrap()
+            .primary
+            .as_mut()
+            .unwrap();
+        primary.cost_per_m = Some(1.5);
+        primary.strong = Some(true);
+    }
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .expect("seed routing metadata");
+
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    let primary = profile
+        .config
+        .llm
+        .as_ref()
+        .unwrap()
+        .primary
+        .as_ref()
+        .unwrap();
+    assert_eq!(primary.temperature, Some(0.2));
+    assert_eq!(primary.top_p, Some(0.9));
+    assert_eq!(primary.context_window, Some(16384));
+    assert_eq!(
+        primary.reasoning_effort,
+        Some(octos_llm::ReasoningEffort::High)
+    );
+    assert!(primary.model_hints.as_ref().unwrap().uses_completion_tokens);
+
+    // The list projection round-trips every configured field — and stays
+    // truthful: a client must be able to tell saved values from inherited.
+    let listed = profile_llm_list_result(&state, "dev", Some(&profile));
+    let primary_json = listed["primary"].as_object().expect("primary object");
+    assert_eq!(primary_json["context_window"], json!(16384));
+    assert!(
+        primary_json["temperature"].as_f64().unwrap() - 0.2 < 1e-6,
+        "got {}",
+        primary_json["temperature"]
+    );
+    assert!(
+        primary_json["top_p"].as_f64().unwrap() - 0.9 < 1e-6,
+        "got {}",
+        primary_json["top_p"]
+    );
+    assert_eq!(primary_json["reasoning_effort"], json!("high"));
+    assert_eq!(
+        primary_json["model_hints"]["uses_completion_tokens"],
+        json!(true)
+    );
+    assert_eq!(primary_json["cost_per_m"], json!(1.5));
+
+    // Re-upsert the same address WITHOUT the inference fields: absent ≡
+    // inherit, so the overrides clear — but the out-of-schema routing
+    // metadata (cost_per_m/strong) survives the edit.
+    raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-rt2".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": route
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("clearing re-upsert");
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    let primary = profile
+        .config
+        .llm
+        .as_ref()
+        .unwrap()
+        .primary
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        primary.temperature, None,
+        "absent ≡ inherit: override cleared"
+    );
+    assert_eq!(primary.top_p, None);
+    assert_eq!(primary.context_window, None);
+    assert_eq!(primary.reasoning_effort, None);
+    assert_eq!(primary.cost_per_m, Some(1.5), "routing metadata survives");
+    assert_eq!(primary.strong, Some(true));
+    let listed = profile_llm_list_result(&state, "dev", Some(&profile));
+    assert!(
+        listed["primary"].get("temperature").is_none(),
+        "an unconfigured field must be absent (not null) so list output is \
+         unchanged for unconfigured users"
+    );
+}
+
+/// Each configured model carries its OWN parameter set: a fallback's
+/// inference defaults are independent of the primary's, so a
+/// primary/fallback switch cannot leak parameters across models.
+#[tokio::test]
+async fn llm_upsert_keeps_inference_params_per_model_without_leakage() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let upsert = |id: &str, model: &str, extra: Value| {
+        let mut selection = json!({
+            "family_id": "custom",
+            "model_id": model,
+            "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" }
+        });
+        let extra = extra.as_object().unwrap().clone();
+        for (key, value) in extra {
+            selection[key] = value;
+        }
+        RpcRequest::new(
+            id.to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": selection,
+                "set_primary": id == "primary",
+            }),
+        )
+    };
+    raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "primary",
+            "model-a",
+            json!({ "temperature": 0.2, "context_window": 8192 }),
+        ),
+        None,
+    )
+    .await
+    .expect("primary upsert");
+    raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "fallback",
+            "model-b",
+            json!({ "temperature": 0.9, "reasoning_effort": "max" }),
+        ),
+        None,
+    )
+    .await
+    .expect("fallback upsert");
+
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    let llm = profile.config.llm.as_ref().unwrap();
+    assert_eq!(llm.primary.as_ref().unwrap().temperature, Some(0.2));
+    assert_eq!(llm.primary.as_ref().unwrap().context_window, Some(8192));
+    assert_eq!(llm.primary.as_ref().unwrap().reasoning_effort, None);
+    assert_eq!(llm.fallbacks[0].temperature, Some(0.9));
+    assert_eq!(
+        llm.fallbacks[0].reasoning_effort,
+        Some(octos_llm::ReasoningEffort::Max)
+    );
+    assert_eq!(llm.fallbacks[0].context_window, None, "no cross-model leak");
+}
+
 /// Key requirement mirrors the runtime factory, not just the registry
 /// flag: an `anthropic`/`responses` api_type override needs a key even
 /// on a registry-keyless family, and a family the registry doesn't know
@@ -28903,7 +29300,13 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
         .opened
         .workspace_root
         .expect("Tier-3 workspace root is still exposed for tools and UI");
-    assert_ne!(workspace_root, profile_runtime.data_dir);
+    // `workspace_root` is a `String` on the wire and `data_dir` a `PathBuf`:
+    // compare in the same domain (pre-existing compile break that blocked all
+    // `--features api` local test runs; surfaced while adding #2166 tests).
+    assert_ne!(
+        std::path::PathBuf::from(&workspace_root),
+        profile_runtime.data_dir
+    );
 
     let sessions = resolve_sessions_for_lookup(&state, None, Some(profile_id), &session_id)
         .await

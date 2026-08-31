@@ -7773,7 +7773,12 @@ struct RawProfileSkillsRemoveParams {
     name: String,
 }
 
+/// One provider route on the AppUI `profile/llm/*` wire (#2166 typed
+/// schema). Unknown keys are rejected by [`reject_unknown_llm_upsert_fields`]
+/// before serde sees them (so the error lists EVERY rejected field), and
+/// `deny_unknown_fields` here is the belt-and-braces second layer.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLlmRoute {
     #[serde(default)]
     route_id: Option<String>,
@@ -7787,7 +7792,29 @@ struct RawLlmRoute {
     api_type: Option<String>,
 }
 
+/// The typed main-model selection + inference-parameter schema shared by
+/// `profile/llm/upsert`, `profile/llm/test`, and `profile/llm/fetch_models`
+/// (#2166). Test and Save parse the identical shape, so a payload that
+/// probes successfully is byte-for-byte the payload that persists.
+///
+/// Absent/null semantics for every optional inference field: `absent ≡
+/// null ≡ inherit` (clear any prior override — the upsert payload is the
+/// COMPLETE inference configuration for the addressed selection); an
+/// explicit value is an override. Omitted fields always mean "defer to the
+/// next tier of the precedence chain", never "silently keep serving a value
+/// the caller cannot see in the list response".
+///
+/// Ownership (what this schema deliberately does NOT accept):
+/// - `max_output_tokens` → owned by the profile gateway contract
+///   (`[gateway] max_output_tokens`); rejected with
+///   `kind: "llm_param_owned_elsewhere"`.
+/// - Per-session reasoning overrides → owned by the durable
+///   session/turn contract (`ui_protocol_reasoning_effort.rs`); this schema
+///   only sets the per-MODEL default tier.
+/// - Arbitrary provider request-body keys → owned by the gateway
+///   `llm_sampling_params` passthrough (#2176); rejected here as unknown.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLlmSelection {
     #[serde(default)]
     family_id: Option<String>,
@@ -7795,9 +7822,29 @@ struct RawLlmSelection {
     model_id: Option<String>,
     #[serde(default)]
     route: RawLlmRoute,
+    /// Typed compatibility metadata (mirrors
+    /// [`octos_llm::openai::ModelHints`]) — never a request-body bag.
+    #[serde(default)]
+    model_hints: Option<octos_llm::openai::ModelHints>,
+    /// Local runtime context budget override (#2142). Reaches the runtime
+    /// `ContextWindowOverride` via the durable selection; NOT an upstream
+    /// request field.
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// Per-model default sampling temperature (finite, 0.0..=2.0).
+    #[serde(default)]
+    temperature: Option<f64>,
+    /// Per-model default nucleus-sampling ceiling (finite, 0.0..=1.0).
+    #[serde(default)]
+    top_p: Option<f64>,
+    /// Per-model default reasoning effort (the session/turn override tier
+    /// wins over this).
+    #[serde(default)]
+    reasoning_effort: Option<octos_llm::ReasoningEffort>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawProfileLlmSelectParams {
     #[serde(default)]
     profile_id: Option<String>,
@@ -7811,7 +7858,11 @@ struct RawProfileLlmSelectParams {
     route_id: Option<String>,
 }
 
+/// Typed AppUI `profile/llm/upsert` / `test` / `fetch_models` params
+/// (#2166). Unknown keys are rejected with their full dotted paths —
+/// `never return applied:true after discarding requested settings`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawProfileLlmUpsertParams {
     #[serde(default)]
     profile_id: Option<String>,
@@ -7820,6 +7871,211 @@ struct RawProfileLlmUpsertParams {
     api_key: Option<Value>,
     #[serde(default)]
     set_primary: bool,
+}
+
+/// Known keys per container level of the AppUI LLM schema (#2166). The
+/// pre-pass in [`reject_unknown_llm_upsert_fields`] walks these so ONE
+/// error can name every rejected field instead of only the first.
+const LLM_UPSERT_KNOWN_TOP: &[&str] = &["profile_id", "selection", "api_key", "set_primary"];
+const LLM_SELECTION_KNOWN: &[&str] = &[
+    "family_id",
+    "model_id",
+    "route",
+    "model_hints",
+    "context_window",
+    "temperature",
+    "top_p",
+    "reasoning_effort",
+];
+const LLM_ROUTE_KNOWN: &[&str] = &["route_id", "label", "base_url", "api_key_env", "api_type"];
+const LLM_MODEL_HINTS_KNOWN: &[&str] = &[
+    "uses_completion_tokens",
+    "fixed_temperature",
+    "lacks_vision",
+    "merge_system_messages",
+    "reasoning_style",
+];
+/// Fields a client may plausibly send on this RPC that are REAL but owned
+/// by a different contract tier. They get a dedicated typed error pointing
+/// at the owner instead of a generic "unknown field".
+const LLM_FOREIGN_FIELDS: &[(&str, &str)] = &[
+    (
+        "selection.max_output_tokens",
+        "profile gateway `max_output_tokens` ([gateway] max_output_tokens in the \
+         profile config) — a per-model output cap is not part of the AppUI model \
+         schema",
+    ),
+    (
+        "max_output_tokens",
+        "profile gateway `max_output_tokens` ([gateway] max_output_tokens in the \
+         profile config)",
+    ),
+];
+
+/// Pre-pass for the AppUI LLM mutation RPCs (#2166): collect EVERY unknown
+/// field (with its dotted path) and every foreign-owned field BEFORE any
+/// store mutation, so the caller gets one typed `invalid_params` naming all
+/// of them and the prior configuration is untouched. serde's
+/// `deny_unknown_fields` (on the structs above) remains as the second
+/// layer for shapes this walk does not model.
+fn reject_unknown_llm_upsert_fields(params: &Value) -> Result<(), RpcError> {
+    let Some(obj) = params.as_object() else {
+        return Ok(()); // non-object falls through to serde's own type error
+    };
+    let selection_obj = obj.get("selection").and_then(Value::as_object);
+    let contains_foreign = |path: &str| match path.split_once('.') {
+        Some(("selection", key)) => {
+            selection_obj.is_some_and(|selection| selection.contains_key(key))
+        }
+        _ => obj.contains_key(path),
+    };
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|key| !LLM_UPSERT_KNOWN_TOP.contains(&key.as_str()))
+        .filter(|key| {
+            !LLM_FOREIGN_FIELDS
+                .iter()
+                .any(|(path, _)| *path == key.as_str())
+        })
+        .map(String::clone)
+        .collect();
+
+    if let Some(selection) = selection_obj {
+        for key in selection.keys() {
+            let path = format!("selection.{key}");
+            if LLM_FOREIGN_FIELDS.iter().any(|(known, _)| *known == path) {
+                continue;
+            }
+            if !LLM_SELECTION_KNOWN.contains(&key.as_str()) {
+                unknown.push(path);
+            }
+        }
+        if let Some(route) = selection.get("route").and_then(Value::as_object) {
+            unknown.extend(
+                route
+                    .keys()
+                    .filter(|key| !LLM_ROUTE_KNOWN.contains(&key.as_str()))
+                    .map(|key| format!("selection.route.{key}")),
+            );
+        }
+        if let Some(hints) = selection.get("model_hints").and_then(Value::as_object) {
+            unknown.extend(
+                hints
+                    .keys()
+                    .filter(|key| !LLM_MODEL_HINTS_KNOWN.contains(&key.as_str()))
+                    .map(|key| format!("selection.model_hints.{key}")),
+            );
+        }
+    }
+
+    let foreign: Vec<&str> = LLM_FOREIGN_FIELDS
+        .iter()
+        .filter(|(path, _)| contains_foreign(path))
+        .map(|(path, _)| *path)
+        .collect();
+
+    if !foreign.is_empty() {
+        let owners: Vec<Value> = foreign
+            .iter()
+            .map(|path| {
+                let owner = LLM_FOREIGN_FIELDS
+                    .iter()
+                    .find(|(known, _)| known == path)
+                    .map(|(_, owner)| *owner)
+                    .unwrap_or("another configuration contract");
+                json!({ "field": path, "owner": owner })
+            })
+            .collect();
+        return Err(RpcError::invalid_params(format!(
+            "field(s) {} belong to a different configuration contract and are not \
+             accepted by profile/llm/upsert",
+            foreign.join(", ")
+        ))
+        .with_data(json!({
+            "kind": "llm_param_owned_elsewhere",
+            "rejected_fields": foreign,
+            "owners": owners,
+        })));
+    }
+
+    if !unknown.is_empty() {
+        unknown.sort();
+        return Err(RpcError::invalid_params(format!(
+            "unknown field(s): {} — profile/llm/upsert accepts a typed schema and \
+             never silently discards fields",
+            unknown.join(", ")
+        ))
+        .with_data(json!({
+            "kind": "llm_unknown_fields",
+            "rejected_fields": unknown,
+        })));
+    }
+    Ok(())
+}
+
+/// Range/finite validation for the typed inference fields (#2166): runs
+/// BEFORE any store mutation, so an invalid value leaves the prior
+/// configuration untouched. (JSON cannot carry NaN/Inf, but the guard keeps
+/// the invariant local to the schema instead of trusting the transport.)
+fn validate_llm_inference_fields(selection: &RawLlmSelection) -> Result<(), RpcError> {
+    fn check_f64_range(
+        value: Option<f64>,
+        field: &str,
+        range: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<(), RpcError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        if !value.is_finite() {
+            return Err(RpcError::invalid_params(format!(
+                "selection.{field} must be a finite number"
+            ))
+            .with_data(json!({
+                "kind": "llm_param_non_finite",
+                "field": format!("selection.{field}"),
+            })));
+        }
+        if !(min..=max).contains(&value) {
+            return Err(RpcError::invalid_params(format!(
+                "selection.{field} must be in {range}, got {value}"
+            ))
+            .with_data(json!({
+                "kind": "llm_param_out_of_range",
+                "field": format!("selection.{field}"),
+                "range": range,
+            })));
+        }
+        Ok(())
+    }
+    check_f64_range(selection.temperature, "temperature", "0.0..=2.0", 0.0, 2.0)?;
+    check_f64_range(selection.top_p, "top_p", "0.0..=1.0", 0.0, 1.0)?;
+    if selection.context_window == Some(0) {
+        return Err(
+            RpcError::invalid_params("selection.context_window must be >= 1 token").with_data(
+                json!({
+                    "kind": "llm_param_out_of_range",
+                    "field": "selection.context_window",
+                    "range": ">=1",
+                }),
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Shared param pipeline for `profile/llm/upsert` / `test` /
+/// `fetch_models`: unknown-field pre-pass → typed deserialize (with
+/// `deny_unknown_fields`) → range validation. One place so Test and Save
+/// can never drift.
+fn parse_llm_selection_params(
+    request: &RpcRequest<Value>,
+) -> Result<RawProfileLlmUpsertParams, RpcError> {
+    reject_unknown_llm_upsert_fields(&request.params)?;
+    let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
+    validate_llm_inference_fields(&params.selection)?;
+    Ok(params)
 }
 
 /// `profile/llm/delete`: remove one configured model (primary or fallback) by
@@ -9008,7 +9264,7 @@ fn configured_provider_json(
     let model_id = selection.model_id.clone();
     let route_id = route.route_id.clone();
     let api_key_env = route.api_key_env.clone();
-    json!({
+    let mut provider = json!({
         "provider": family_id.clone().unwrap_or_default(),
         "model": model_id.clone().unwrap_or_default(),
         "family_id": family_id,
@@ -9022,7 +9278,38 @@ fn configured_provider_json(
             .is_some_and(|key| env_vars.get(key).is_some_and(|value| !value.is_empty())),
         "selected": selected,
         "available": true,
-    })
+    });
+    // #2166 typed inference schema round-trip: echo back every configured
+    // inference/routing field so a client can distinguish "saved" from
+    // "inherited". Keys are added ONLY when configured — a selection with no
+    // overrides serializes exactly as before #2166 (unconfigured default
+    // behavior unchanged), and `null` on the wire always means the same as
+    // an absent key: inherit.
+    let object = provider
+        .as_object_mut()
+        .expect("configured_provider_json builds an object");
+    if let Some(context_window) = selection.context_window {
+        object.insert("context_window".into(), json!(context_window));
+    }
+    if let Some(temperature) = selection.temperature {
+        object.insert("temperature".into(), json!(temperature));
+    }
+    if let Some(top_p) = selection.top_p {
+        object.insert("top_p".into(), json!(top_p));
+    }
+    if let Some(reasoning_effort) = selection.reasoning_effort {
+        object.insert("reasoning_effort".into(), json!(reasoning_effort));
+    }
+    if let Some(model_hints) = selection.model_hints.clone() {
+        object.insert("model_hints".into(), json!(model_hints));
+    }
+    if let Some(cost_per_m) = selection.cost_per_m {
+        object.insert("cost_per_m".into(), json!(cost_per_m));
+    }
+    if let Some(strong) = selection.strong {
+        object.insert("strong".into(), json!(strong));
+    }
+    provider
 }
 
 fn permission_profile_supported_selections(
@@ -11840,7 +12127,7 @@ async fn raw_profile_llm_upsert(
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
-    let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
+    let params: RawProfileLlmUpsertParams = parse_llm_selection_params(request)?;
     let profile_id =
         raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let store = profile_store(state)?;
@@ -11868,12 +12155,41 @@ async fn raw_profile_llm_upsert(
         profile.config.env_vars.insert(api_key_env.clone(), api_key);
     }
 
-    let selection = crate::profiles::LlmModelSelectionConfig {
+    // #2166 typed inference schema: the upsert payload is the COMPLETE
+    // inference configuration for the addressed selection — every optional
+    // field is `absent ≡ null ≡ inherit` (a re-upsert without it CLEARS a
+    // prior override), an explicit value is an override. Rejected/unknown
+    // fields never reach this point (parse_llm_selection_params).
+    let mut selection = crate::profiles::LlmModelSelectionConfig {
         family_id: Some(family_id),
         model_id: Some(model_id),
         route: Some(route),
+        model_hints: params.selection.model_hints,
+        context_window: params.selection.context_window,
+        temperature: params.selection.temperature.map(|value| value as f32),
+        top_p: params.selection.top_p.map(|value| value as f32),
+        reasoning_effort: params.selection.reasoning_effort,
         ..Default::default()
     };
+    // #2166: routing/QoS metadata that is deliberately OUTSIDE the AppUI
+    // schema (`cost_per_m`, `strong` — owned by routing research / QoS) must
+    // not be silently destroyed by an endpoint edit: carry the prior
+    // same-address values forward instead of resetting them.
+    if let Some(prior) = profile
+        .config
+        .llm
+        .as_ref()
+        .map(|llm| {
+            llm.fallbacks
+                .iter()
+                .chain(llm.primary.iter())
+                .find(|existing| same_llm_selection_address(existing, &selection))
+        })
+        .flatten()
+    {
+        selection.cost_per_m = prior.cost_per_m;
+        selection.strong = prior.strong;
+    }
 
     let mut llm = profile.config.llm.take().unwrap_or_default();
     if params.set_primary || llm.primary.is_none() {
@@ -12160,7 +12476,7 @@ async fn raw_profile_llm_test(
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
-    let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
+    let params: RawProfileLlmUpsertParams = parse_llm_selection_params(request)?;
     let profile_id =
         raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let profile = state
@@ -12300,7 +12616,7 @@ async fn raw_profile_llm_fetch_models(
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
-    let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
+    let params: RawProfileLlmUpsertParams = parse_llm_selection_params(request)?;
     let profile_id =
         raw_scoped_llm_profile_id(params.profile_id.clone(), None, connection_profile_id)?;
     let profile = state

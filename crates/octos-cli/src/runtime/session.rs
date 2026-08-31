@@ -569,26 +569,51 @@ impl SessionRuntime {
             // (greedy temperature=0.0, no sampler, 16384 max output) — dropping
             // the local-model repetition-collapse mitigations. Each is `None`
             // unless the operator set it, so cloud sessions are unchanged.
+            //
+            // #2166 precedence (documented contract): the CONFIGURED MODEL's
+            // typed inference defaults win over the profile-gateway knobs,
+            // which win over the provider defaults —
+            //   session/turn override → model default → gateway knob → none.
+            // The session/turn tier is applied per turn in the AppUI turn
+            // path (ui_protocol_reasoning_effort.rs) and sits on top of
+            // whatever this bootstrap composition produced.
             chat_max_tokens: profile
                 .config
                 .gateway
                 .as_ref()
                 .and_then(|g| g.max_output_tokens),
-            chat_temperature: profile
-                .config
-                .gateway
-                .as_ref()
-                .and_then(|g| g.llm_temperature),
-            chat_sampling_params: profile
-                .config
-                .gateway
-                .as_ref()
-                .and_then(|g| g.llm_sampling_params.clone()),
-            reasoning_effort: profile
-                .config
-                .gateway
-                .as_ref()
-                .and_then(|g| g.reasoning_effort),
+            chat_temperature: profile.config.model_temperature.or_else(|| {
+                profile
+                    .config
+                    .gateway
+                    .as_ref()
+                    .and_then(|g| g.llm_temperature)
+            }),
+            chat_sampling_params: {
+                let mut sampling = profile
+                    .config
+                    .gateway
+                    .as_ref()
+                    .and_then(|g| g.llm_sampling_params.clone());
+                // #2166 × #2176 coordination: the typed per-model `top_p`
+                // default overrides a same-named `top_p` key in the gateway
+                // sampler passthrough map; every OTHER passthrough key
+                // (`repeat_penalty`, …) is untouched. The passthrough stays
+                // the escape hatch for params octos does not model.
+                if let Some(top_p) = profile.config.model_top_p {
+                    sampling
+                        .get_or_insert_with(serde_json::Map::new)
+                        .insert("top_p".into(), serde_json::json!(top_p));
+                }
+                sampling
+            },
+            reasoning_effort: profile.config.model_reasoning_effort.or_else(|| {
+                profile
+                    .config
+                    .gateway
+                    .as_ref()
+                    .and_then(|g| g.reasoning_effort)
+            }),
             ..Default::default()
         })
         // M11-F regression fix (#891): propagate the pre-assembled
@@ -1293,6 +1318,71 @@ mod tests {
             Some(serde_json::json!(1.1))
         );
         assert_eq!(cfg.reasoning_effort, Some(octos_llm::ReasoningEffort::High));
+    }
+
+    #[tokio::test]
+    async fn session_agent_prefers_model_inference_defaults_over_gateway_knobs() {
+        // #2166 precedence, pinned: the CONFIGURED PRIMARY model's typed
+        // inference defaults win over the profile-gateway knobs —
+        //   session/turn override → model default → gateway knob → none —
+        // and the #2176 gateway sampler passthrough stays intact except for
+        // the same-named `top_p` key, which the typed model default
+        // overrides. (The session/turn tier is applied per turn on top of
+        // this composition by ui_protocol_reasoning_effort.rs.)
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = make_profile(dir.path().to_path_buf()).await;
+        {
+            let cfg = Arc::get_mut(&mut profile).unwrap();
+            cfg.config.model_temperature = Some(0.4);
+            cfg.config.model_top_p = Some(0.9);
+            cfg.config.model_reasoning_effort = Some(octos_llm::ReasoningEffort::High);
+            let mut sp = serde_json::Map::new();
+            sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+            sp.insert("top_p".to_string(), serde_json::json!(0.8));
+            cfg.config.gateway = Some(crate::config::GatewayConfig {
+                max_output_tokens: Some(32768),
+                llm_temperature: Some(0.7),
+                llm_sampling_params: Some(sp),
+                reasoning_effort: Some(octos_llm::ReasoningEffort::Low),
+                ..Default::default()
+            });
+        }
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "gw3"), None)
+            .await
+            .expect("bootstrap");
+        let cfg = rt.agent.agent_config();
+        // Model default beats the gateway knob.
+        assert_eq!(
+            cfg.chat_temperature,
+            Some(0.4),
+            "model default must win over gateway llm_temperature"
+        );
+        assert_eq!(
+            cfg.reasoning_effort,
+            Some(octos_llm::ReasoningEffort::High),
+            "model default must win over gateway reasoning_effort"
+        );
+        // Typed model top_p overrides the same-named passthrough key…
+        let top_p = cfg
+            .chat_sampling_params
+            .as_ref()
+            .and_then(|m| m.get("top_p"))
+            .and_then(|value| value.as_f64())
+            .expect("typed top_p rides the sampler map");
+        assert!(
+            (top_p - 0.9).abs() < 1e-6,
+            "typed model top_p must win over the gateway passthrough key: {top_p}"
+        );
+        // …while UNRELATED passthrough keys are untouched.
+        assert_eq!(
+            cfg.chat_sampling_params
+                .as_ref()
+                .and_then(|m| m.get("repeat_penalty").cloned()),
+            Some(serde_json::json!(1.1)),
+            "the #2176 passthrough stays intact for params octos does not model"
+        );
+        // Gateway-only fields still thread through unchanged.
+        assert_eq!(cfg.chat_max_tokens, Some(32768));
     }
 
     #[tokio::test]

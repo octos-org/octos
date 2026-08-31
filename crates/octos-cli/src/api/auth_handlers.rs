@@ -4586,6 +4586,10 @@ mod tests {
                 model_hints: None,
                 cost_per_m: None,
                 strong: None,
+                // #2166 typed inference defaults (unset here).
+                temperature: None,
+                top_p: None,
+                reasoning_effort: None,
                 context_window: None,
             }),
             fallbacks: vec![],
