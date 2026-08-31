@@ -677,16 +677,27 @@ pub enum UnconfinedReason {
 /// Typed refusal: the configured sandbox cannot be honored on this host, and
 /// the resolution refuses to run commands unconfined instead of degrading.
 ///
-/// The text is written for whoever hits it — including a model reading a
-/// refused tool result — so it names the mismatch, concrete per-OS
-/// remediations, and the explicit opt-outs.
+/// Two audiences, deliberately split (#2196 review MUST-FIX):
+/// - `Display` is the MODEL-FACING text — it flows verbatim into refused
+///   tool results, wrap-time stderr, mcp-serve session errors, and fleet
+///   termination reasons. It names the mismatch and points at the operator,
+///   and it deliberately does NOT name the config keys that remove
+///   confinement (`enabled=false` / `mode="none"` / danger-full-access):
+///   advice that teaches a confined model the exact keys that disable its
+///   sandbox is itself an escape vector, because config files stay editable
+///   through the (unaffected) file tools even while the shell refuses.
+/// - [`Self::remediation`] is the OPERATOR-FACING text (concrete per-OS
+///   installs plus the explicit opt-outs). It is surfaced only via the
+///   creation-time `tracing::error!` and doctor-adjacent surfaces — never
+///   through `Display`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxUnavailable {
     /// The requested mode, in config spelling (e.g. `"bwrap"`, `"auto"`).
     pub requested: String,
     /// Why it cannot be honored on this host.
     pub reason: String,
-    /// Concrete remediations for this OS, ending with the explicit opt-outs.
+    /// OPERATOR-facing remediation for this OS (installs + explicit
+    /// opt-outs). Excluded from `Display` on purpose — see the struct docs.
     pub remediation: String,
 }
 
@@ -694,8 +705,12 @@ impl std::fmt::Display for SandboxUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "sandbox unavailable (mode \"{}\"): {}. Refusing to run commands unconfined. {}",
-            self.requested, self.reason, self.remediation
+            "sandbox unavailable (mode \"{}\"): {}. Refusing to run commands unconfined. \
+             This cannot be fixed from inside the session: an operator must repair the \
+             sandbox configuration or install a sandbox backend on this host (`octos \
+             doctor` shows host-specific remediation). Shell/exec commands will keep \
+             refusing until then.",
+            self.requested, self.reason
         )
     }
 }
@@ -889,7 +904,8 @@ pub fn decide_sandbox(
 /// command — it substitutes one that prints the refusal to stderr and exits 1
 /// (mirroring the Landlock backend's helper-missing refusal). Exec-shaped
 /// tools short-circuit even earlier via [`Sandbox::refusal`] and return the
-/// full remediation text without spawning anything.
+/// model-facing refusal text (`Display` — operator remediation stays in the
+/// logs) without spawning anything.
 pub struct RefusingSandbox {
     /// Why the configured sandbox cannot be honored on this host.
     pub error: SandboxUnavailable,
@@ -1001,8 +1017,11 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             Box::new(NoSandbox)
         }
         SandboxDecision::Refuse(error) => {
+            // The OPERATOR-facing remediation is logged here (and only here /
+            // doctor): `Display` is model-facing and deliberately omits it.
             tracing::error!(
                 %error,
+                remediation = %error.remediation,
                 "sandbox unavailable; failing closed — commands will refuse to run"
             );
             Box::new(RefusingSandbox { error })
@@ -1950,8 +1969,13 @@ mod tests {
             .expect("an unhonorable explicit mode must resolve to a refusing sandbox");
         assert!(
             refusal.remediation.contains("sandbox.enabled=false"),
-            "refusal names the explicit opt-out: {}",
+            "the OPERATOR-facing remediation field names the explicit opt-out: {}",
             refusal.remediation
+        );
+        let model_text = refusal.to_string();
+        assert!(
+            !model_text.contains("enabled=false") && !model_text.contains("mode=\"none\""),
+            "the model-facing Display must not name the disable keys: {model_text}"
         );
         assert!(
             !sb.is_noop(),
@@ -2044,6 +2068,101 @@ mod tests {
                     "refusal text must not trip the denial scanner: {phrase}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn confining_backends_never_report_noop_or_refusal() {
+        // #2196 review MUST-FIX invariant: `is_noop()` is a CONSTRUCTION-TIME
+        // property. A backend built from a `Confine` decision must never
+        // (dynamically or otherwise) report no-op — `is_noop() == true` is
+        // the exact transition validators.rs / tools/check.rs use to run
+        // argv DIRECTLY on the host, so a confining backend that flips to
+        // no-op converts fail-closed paths into raw host execution. (The
+        // Windows AppContainer half of this — whose old override re-probed
+        // the helper per call — is cfg(windows) and asserted in
+        // sandbox/windows.rs; this locks the buildable-anywhere backends.)
+        let config = SandboxConfig::default();
+        for choice in [
+            SandboxBackendChoice::Macos,
+            SandboxBackendChoice::Bwrap,
+            SandboxBackendChoice::Docker,
+        ] {
+            let sb = build_backend(choice, &config);
+            assert!(
+                !sb.is_noop(),
+                "confining backend {choice:?} must never report no-op"
+            );
+            assert!(
+                sb.refusal().is_none(),
+                "confining backend {choice:?} must not carry a refusal"
+            );
+        }
+        // The inverse stays true: NoSandbox is the one honest no-op.
+        assert!(NoSandbox.is_noop());
+    }
+
+    #[test]
+    fn refusal_display_never_names_the_disable_keys() {
+        // Codex MUST-FIX (#2196 review): the Display text flows VERBATIM into
+        // model-visible tool results (shell/exec refusal guards, wrap-time
+        // stderr, mcp-serve session errors, fleet termination reasons). Text
+        // that names the config keys that remove confinement is itself an
+        // escape vector -- a confined model can still edit config files. The
+        // operator-facing remediation (which legitimately names the explicit
+        // opt-outs) lives in the `remediation` FIELD, surfaced only via the
+        // creation-time error log and doctor-adjacent surfaces.
+        let mut displays: Vec<String> = Vec::new();
+        for os in ALL_OSES {
+            // Explicit-mode refusals (wrong OS / missing backend) ...
+            for mode in [
+                SandboxMode::Bwrap,
+                SandboxMode::Landlock,
+                SandboxMode::Macos,
+                SandboxMode::AppContainer,
+                SandboxMode::Docker,
+            ] {
+                if let SandboxDecision::Refuse(error) =
+                    decide_sandbox(&mode_config(mode.clone()), os, &NO_BACKENDS)
+                {
+                    displays.push(error.to_string());
+                }
+            }
+            // ... and the auto+fail_closed refusal.
+            let config = SandboxConfig {
+                fail_closed: true,
+                ..SandboxConfig::default()
+            };
+            if let SandboxDecision::Refuse(error) = decide_sandbox(&config, os, &NO_BACKENDS) {
+                displays.push(error.to_string());
+            }
+        }
+        assert!(
+            displays.len() >= ALL_OSES.len(),
+            "matrix must produce refusals to inspect"
+        );
+        for text in &displays {
+            for banned in [
+                "enabled=false",
+                "mode=\"none\"",
+                "mode = \"none\"",
+                "danger-full-access",
+            ] {
+                assert!(
+                    !text.contains(banned),
+                    "model-visible refusal must not name the disable keys ({banned:?}): {text}"
+                );
+            }
+            for phrase in DENIAL_PHRASES {
+                assert!(
+                    !text.contains(phrase),
+                    "model-visible refusal must not trip the denial scanner: {phrase}"
+                );
+            }
+            assert!(
+                text.contains("operator"),
+                "model-visible refusal points at the operator, not at config keys: {text}"
+            );
         }
     }
 

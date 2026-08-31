@@ -157,6 +157,63 @@ async fn should_block_ready_when_required_command_validator_fails() {
     assert!(!outcomes.iter().all(|o| o.required_gate_passed()));
 }
 
+/// #2196 review MUST-FIX regression: a REAL `AppContainerSandbox` whose
+/// helper is gone (true on CI runners — octos-sandbox.exe is absent) must
+/// land on the Windows cannot-wrap ERROR — never the `is_noop` ->
+/// direct-spawn transition, which executed the validator argv RAW on the
+/// host (the old dynamic `is_noop()` re-probe did exactly that, and MCP
+/// completion validators reach this same path). The marker file proves no
+/// spawn happened: the direct path would have created it.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_command_validator_fails_closed_when_appcontainer_helper_vanished() {
+    let dir = tempdir().unwrap();
+    let marker = dir.path().join("bare-host-spawn-marker");
+    let runner = ValidatorRunner::new(registry_with_tools(), dir.path().to_path_buf())
+        .with_sandbox(Arc::new(octos_agent::sandbox::AppContainerSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            profile_name: None,
+            workspace_write: true,
+        }));
+
+    let marker_str = marker.to_string_lossy().to_string();
+    let validators = vec![command_validator(
+        "win_fail_closed",
+        "cmd",
+        &["/C", "copy", "NUL", &marker_str],
+    )];
+
+    let invocation = ValidatorInvocation {
+        phase: ValidatorPhase::Completion,
+        workspace_root: dir.path().to_path_buf(),
+        repo_label: "sandbox/appcontainer".into(),
+        input_args: None,
+        tool_output: None,
+        spawn_only_files: Vec::new(),
+    };
+    let outcomes = runner.run_all(&invocation, &validators).await;
+
+    assert_eq!(outcomes.len(), 1);
+    let outcome = &outcomes[0];
+    assert_eq!(
+        outcome.status,
+        ValidatorStatus::Error,
+        "helper-vanished AppContainer must fail closed, got {outcome:?}"
+    );
+    assert!(
+        outcome
+            .reason
+            .contains("not supported under the active sandbox backend"),
+        "the cannot-wrap refusal explains itself: {}",
+        outcome.reason
+    );
+    assert!(
+        !marker.exists(),
+        "the validator argv must NEVER be spawned raw on the host"
+    );
+}
+
 #[tokio::test]
 async fn should_warn_but_not_block_when_optional_validator_fails() {
     let dir = tempdir().unwrap();

@@ -44,19 +44,20 @@ const WINDOWS_READ_ALLOW_PATHS: &[&str] = &[
 ];
 
 impl Sandbox for AppContainerSandbox {
-    /// Report no-op enforcement when the `octos-sandbox` helper is unavailable.
-    ///
-    /// Without the helper, [`Self::wrap_command`] REFUSES to run the command
-    /// (fail closed — it never passes argv through to an unsandboxed
-    /// `cmd /C`), so strictly speaking the backend is not a no-op. But
-    /// fail-closed callers (e.g. the `mcp-serve` path and the fleet gates)
-    /// key off `is_noop()` to mean "the configured sandbox cannot actually
-    /// confine here", and a helper that vanished after selection is exactly
-    /// that — so keep reporting `true`, matching how the Linux Landlock
-    /// backend is treated when its helper is missing.
-    fn is_noop(&self) -> bool {
-        find_sandbox_helper().is_none()
-    }
+    // NO `is_noop` override — the trait default (`false`) is load-bearing
+    // (#2196 review MUST-FIX). This backend is only constructed after
+    // `decide_sandbox` probed the helper, so construction-time confinement is
+    // `true`; a sandbox created as confining must NEVER dynamically report
+    // no-op, because `is_noop() == true` is the transition consumers
+    // (validators.rs, tools/check.rs) use to run argv DIRECTLY on the host.
+    // The old dynamic `find_sandbox_helper().is_none()` re-check meant a
+    // helper that vanished after selection converted those paths into raw
+    // host execution, bypassing the wrap-time refusal below. With the
+    // constant, a vanished helper now lands on the fail-closed paths
+    // instead: validators hit their Windows cannot-wrap error, `check`
+    // reports its sandbox-unsupported skip, and everything else reaches
+    // [`Self::wrap_command`]'s refusal. (Matches `LinuxContainerSandbox`,
+    // which never overrode `is_noop` and refuses at wrap time.)
 
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         // Find the helper binary next to our own executable
@@ -237,6 +238,32 @@ mod tests {
                 "read-only profile must pass --readonly-cwd, args: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn is_noop_is_construction_time_not_a_dynamic_helper_probe() {
+        // #2196 review MUST-FIX regression: with the helper ABSENT (true on
+        // CI runners — octos-sandbox.exe is not installed there), the old
+        // dynamic `find_sandbox_helper().is_none()` override reported
+        // `is_noop() == true`, which validators.rs / tools/check.rs treat as
+        // "no sandbox" and then spawn argv DIRECTLY on the host — raw
+        // unconfined execution, bypassing the wrap-time refusal below.
+        // Confinement is a construction-time property: this backend is only
+        // ever selected behind a successful helper probe, so it must report
+        // non-noop forever and let wrap_command refuse if the helper is gone.
+        // (On a dev box that HAS the helper on PATH both old and new code
+        // return false — the mutation is caught on helperless hosts, i.e.
+        // check-windows.)
+        let sandbox = AppContainerSandbox {
+            allow_network: false,
+            read_allow_paths: vec![],
+            profile_name: None,
+            workspace_write: true,
+        };
+        assert!(
+            !sandbox.is_noop(),
+            "a created-as-confining AppContainer must never dynamically report no-op"
+        );
     }
 
     #[test]

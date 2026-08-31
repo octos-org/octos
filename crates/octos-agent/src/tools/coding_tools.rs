@@ -493,10 +493,11 @@ impl ExecCommandTool {
         // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
         // omits the receipt.
         // Fail closed on an unhonorable sandbox config BEFORE spawning
-        // anything: the typed refusal (with its per-OS remediation) IS the
-        // tool result. The wrap-level refusal command would also fail, but a
-        // background command discards its stderr, and the model deserves the
-        // full remediation text, not a truncated stderr line.
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
         if let Some(refusal) = self.sandbox.refusal() {
             return Ok(ToolResult {
                 output: refusal.to_string(),
@@ -616,10 +617,11 @@ impl ExecCommandTool {
         input: ExecCommandInput,
     ) -> Result<ToolResult> {
         // Fail closed on an unhonorable sandbox config BEFORE spawning
-        // anything: the typed refusal (with its per-OS remediation) IS the
-        // tool result. The wrap-level refusal command would also fail, but a
-        // background command discards its stderr, and the model deserves the
-        // full remediation text, not a truncated stderr line.
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
         if let Some(refusal) = self.sandbox.refusal() {
             return Ok(ToolResult {
                 output: refusal.to_string(),
@@ -2058,10 +2060,11 @@ impl Tool for BashTool {
         // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
         // omits the receipt.
         // Fail closed on an unhonorable sandbox config BEFORE spawning
-        // anything: the typed refusal (with its per-OS remediation) IS the
-        // tool result. The wrap-level refusal command would also fail, but a
-        // background command discards its stderr, and the model deserves the
-        // full remediation text, not a truncated stderr line.
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
         if let Some(refusal) = self.sandbox.refusal() {
             return Ok(ToolResult {
                 output: refusal.to_string(),

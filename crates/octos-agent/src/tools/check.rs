@@ -1292,6 +1292,45 @@ vet: helper.go:4:6: undefined: missingFn
         );
     }
 
+    /// #2196 review MUST-FIX regression: a REAL `AppContainerSandbox` whose
+    /// helper is gone (true on CI runners — octos-sandbox.exe is absent)
+    /// must take the same sandbox-unsupported SKIP as the mock above — never
+    /// the `is_noop` -> direct-spawn transition, which would execute the
+    /// workspace checker (build.rs / proc-macros: project-controlled code)
+    /// raw on the host. The old dynamic `is_noop()` re-probe did exactly
+    /// that. A direct spawn of the fake resolver path would surface as a
+    /// spawn error, not this skip text.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_check_skips_when_appcontainer_helper_vanished() {
+        let dir = tempdir();
+        touch(dir.path(), "Cargo.toml");
+        let tool = CheckTool::new(dir.path())
+            .with_binary_resolver(Arc::new(|name, _| {
+                (name == "cargo").then(|| PathBuf::from("C:/fake/cargo.exe"))
+            }))
+            .with_shared_sandbox(Arc::new(crate::sandbox::AppContainerSandbox {
+                allow_network: false,
+                read_allow_paths: vec![],
+                profile_name: None,
+                workspace_write: true,
+            }));
+
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(
+            result.success,
+            "sandbox-unsupported skip is a valid answer: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("not supported under the active sandbox backend"),
+            "helper-vanished AppContainer must skip, never spawn directly: {}",
+            result.output
+        );
+    }
+
     // ---- execute: timeout kills the whole checker process tree ----
 
     /// Review #1772 (high): without `process_group(0)` before spawn, the

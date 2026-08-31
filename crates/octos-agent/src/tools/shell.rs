@@ -1061,10 +1061,11 @@ impl Tool for ShellTool {
         // spawn it detached through the same sandbox, and return immediately
         // without waiting. Foreground commands (no `&`) are unchanged.
         // Fail closed on an unhonorable sandbox config BEFORE spawning
-        // anything: the typed refusal (with its per-OS remediation) IS the
-        // tool result. The wrap-level refusal command would also fail, but a
-        // background command discards its stderr, and the model deserves the
-        // full remediation text, not a truncated stderr line.
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
         if let Some(refusal) = self.sandbox.refusal() {
             return Ok(ToolResult {
                 output: refusal.to_string(),
@@ -1295,8 +1296,14 @@ mod tests {
             .expect("execute");
         assert!(!out.success, "refusal must fail the tool call");
         assert!(
-            out.output.contains("sandbox unavailable") && out.output.contains("install a backend"),
-            "refusal carries the remediation text: {}",
+            out.output.contains("sandbox unavailable") && out.output.contains("test refusal"),
+            "refusal carries the mode/reason: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("operator") && !out.output.contains("install a backend"),
+            "the tool result is the MODEL-facing text — operator remediation stays in \
+             the logs: {}",
             out.output
         );
         assert!(
