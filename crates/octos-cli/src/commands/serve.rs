@@ -50,7 +50,14 @@ const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
 ///
 /// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
-    !octos_agent::sandbox::create_sandbox(sandbox_cfg).is_noop()
+    let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
+    // A refusing resolution (explicit mode unhonorable on this host, or
+    // sandbox.fail_closed with no backend) is fail-closed but useless to a
+    // pool: every worker command would refuse. Treat it like a missing
+    // backend — the pool is not installed — matching the pre-refusal
+    // behaviour where these configs resolved to `NoSandbox` and were caught
+    // by `is_noop()`.
+    !sandbox.is_noop() && sandbox.refusal().is_none()
 }
 
 /// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
@@ -2095,6 +2102,33 @@ mod tests {
         assert!(
             !fleet_sandbox_is_isolating(&none_mode),
             "SandboxMode::None must NOT be treated as isolating",
+        );
+    }
+
+    /// Fail-closed twin: a config whose resolution REFUSES (an explicit mode
+    /// unhonorable on this host) is fail-closed but useless to a pool — every
+    /// worker command would refuse — so the boot gate must not install the
+    /// pool behind it, matching the old behaviour where the same configs
+    /// degraded to `NoSandbox` and were caught by `is_noop()`. The refusing
+    /// resolution reports `is_noop() == false`, so without the dedicated
+    /// `refusal()` check this would regress to installing a dead pool.
+    #[test]
+    fn fleet_pool_rejects_a_refusing_sandbox_resolution() {
+        use octos_agent::sandbox::{SandboxConfig, SandboxMode};
+        // Unhonorable on every host this test runs on: landlock requires
+        // Linux (and, on Linux, the octos-sandbox helper, absent in unit-test
+        // runners); appcontainer requires Windows.
+        let unhonorable = SandboxConfig {
+            mode: if cfg!(windows) {
+                SandboxMode::Landlock
+            } else {
+                SandboxMode::AppContainer
+            },
+            ..Default::default()
+        };
+        assert!(
+            !fleet_sandbox_is_isolating(&unhonorable),
+            "a refusing sandbox resolution must NOT install the fleet pool",
         );
     }
 

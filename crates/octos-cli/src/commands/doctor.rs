@@ -1834,7 +1834,9 @@ fn sandbox_check() -> Check {
             CAT_SANDBOX,
             "sandbox backend",
             format!("Auto → {kind}"),
-            "install a backend (macOS: sandbox-exec · Linux: bubblewrap · any: Docker)",
+            "install a backend (macOS: sandbox-exec · Linux: bubblewrap · Windows: the \
+             octos-sandbox helper · any: Docker), or set sandbox.fail_closed=true to \
+             refuse instead of running unconfined",
         )
     }
 }

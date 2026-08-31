@@ -1060,6 +1060,19 @@ impl Tool for ShellTool {
         // supervisor task (so it surfaces in `/ps` and the sub-agent dock),
         // spawn it detached through the same sandbox, and return immediately
         // without waiting. Foreground commands (no `&`) are unchanged.
+        // Fail closed on an unhonorable sandbox config BEFORE spawning
+        // anything: the typed refusal (with its per-OS remediation) IS the
+        // tool result. The wrap-level refusal command would also fail, but a
+        // background command discards its stderr, and the model deserves the
+        // full remediation text, not a truncated stderr line.
+        if let Some(refusal) = self.sandbox.refusal() {
+            return Ok(ToolResult {
+                output: refusal.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         if is_background_command(&input.command, input.background) {
             return Ok(self
                 .execute_background(ctx, &input.command, effective_cwd)
@@ -1257,6 +1270,65 @@ mod tests {
     /// run nothing, and a genuinely broken run still fails — just later.
     /// Mirrors `spawn_tests::BACKGROUND_DEADLINE`.
     const BACKGROUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // -----------------------------------------------------------------------
+    // Fail-closed sandbox refusal: the pre-spawn guard is the tool result.
+    // -----------------------------------------------------------------------
+
+    fn refusing_sandbox() -> Box<dyn crate::sandbox::Sandbox> {
+        Box::new(crate::sandbox::RefusingSandbox {
+            error: crate::sandbox::SandboxUnavailable {
+                requested: "landlock".to_string(),
+                reason: "test refusal".to_string(),
+                remediation: "install a backend".to_string(),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn shell_refuses_with_typed_message_when_sandbox_unavailable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path()).with_sandbox(refusing_sandbox());
+        let out = tool
+            .execute(&serde_json::json!({"command": "touch should-not-exist"}))
+            .await
+            .expect("execute");
+        assert!(!out.success, "refusal must fail the tool call");
+        assert!(
+            out.output.contains("sandbox unavailable") && out.output.contains("install a backend"),
+            "refusal carries the remediation text: {}",
+            out.output
+        );
+        assert!(
+            !temp.path().join("should-not-exist").exists(),
+            "the command must never run"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_shell_refuses_when_sandbox_unavailable() {
+        // Background commands discard stdout/stderr entirely, so without the
+        // pre-spawn guard a refusal would be invisible (a "running" task that
+        // silently failed). The guard makes it the tool result instead.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = super::ShellTool::new(temp.path()).with_sandbox(refusing_sandbox());
+        let out = tool
+            .execute(
+                &serde_json::json!({"command": "touch bg-should-not-exist", "background": true}),
+            )
+            .await
+            .expect("execute");
+        assert!(!out.success, "background refusal must fail the tool call");
+        assert!(
+            out.output.contains("sandbox unavailable"),
+            "background refusal carries the message: {}",
+            out.output
+        );
+        assert!(
+            !temp.path().join("bg-should-not-exist").exists(),
+            "the background command must never run"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // #28b — bash_file_writes knob: three positions, escape hatch, and the

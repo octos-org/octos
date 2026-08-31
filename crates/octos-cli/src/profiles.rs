@@ -2296,6 +2296,12 @@ fn merge_sandbox_defaults(
     // workspace mandated by the defaults can never be lifted by a profile.
     eff.workspace_write = eff.workspace_write && defaults.workspace_write;
 
+    // fail_closed: restrictive `true` (type default `false`). An operator
+    // defaults file that mandates refuse-over-unconfined is inherited by
+    // profiles that omit the field and can never be loosened back to
+    // degrading by one that sets `false` (deny-wins, like workspace_write).
+    eff.fail_closed = eff.fail_closed || defaults.fail_closed;
+
     // read_allow_paths: a non-empty defaults list restricts reads to those
     // roots. A profile may only narrow to a subset (paths at/under an operator
     // root); paths outside every root are dropped, and emptying the list back
@@ -6432,6 +6438,39 @@ mod tests {
         assert!(
             !eff.sandbox.workspace_write,
             "omitted workspace_write must inherit the default read-only floor"
+        );
+        // fail_closed mirrors the same deny-wins floor: an operator defaults
+        // file that mandates refuse-over-unconfined is inherited by a profile
+        // that omits the field and cannot be loosened by one that sets false.
+        assert!(
+            merge_sandbox_defaults(
+                &octos_agent::SandboxConfig::default(),
+                &octos_agent::SandboxConfig {
+                    fail_closed: true,
+                    ..Default::default()
+                },
+            )
+            .fail_closed,
+            "defaults fail_closed=true must be inherited by an omitting profile"
+        );
+        assert!(
+            merge_sandbox_defaults(
+                &octos_agent::SandboxConfig {
+                    fail_closed: true,
+                    ..Default::default()
+                },
+                &octos_agent::SandboxConfig::default(),
+            )
+            .fail_closed,
+            "a profile may tighten fail_closed over permissive defaults"
+        );
+        assert!(
+            !merge_sandbox_defaults(
+                &octos_agent::SandboxConfig::default(),
+                &octos_agent::SandboxConfig::default(),
+            )
+            .fail_closed,
+            "fail_closed stays off when neither side sets it"
         );
         assert!(
             eff.sandbox.allow_network,

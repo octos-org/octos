@@ -65,9 +65,9 @@ All tools implement `Tool` trait (`spec() -> ToolSpec`, `execute(&Value) -> Tool
 
 **Tool Policies** (`tools/policy.rs`): Allow/deny lists with deny-wins semantics, wildcard matching (`exec*`), and named groups (`group:fs`, `group:runtime`, `group:search`, `group:web`, `group:sessions`). Provider-specific policies via `tools.byProvider` in config.
 
-### Sandbox (`octos-agent/src/sandbox.rs`)
+### Sandbox (`octos-agent/src/sandbox/`)
 
-Three sandbox backends: `Bwrap` (Linux), `Macos` (sandbox-exec), `Docker`. On Windows, falls back to `NoSandbox` (uses `cmd /C`) or Docker if available. Auto-detection in `SandboxMode::Auto`. Shared `BLOCKED_ENV_VARS` constant (18 env vars) across all backends and MCP server spawning. Docker supports mount modes (none/ro/rw), resource limits (CPU/memory/PIDs), network isolation. Path validation rejects injection characters (`:`, `\0`, `\n`, `\r` for Docker; control chars, `(`, `)`, `\`, `"` for macOS SBPL).
+Five sandbox backends: `Bwrap` (Linux), `Landlock` (Linux, octos-sandbox helper), `Macos` (sandbox-exec), `AppContainer` (Windows, octos-sandbox.exe helper), `Docker` (any OS). Resolution is a pure decision layer (`decide_sandbox` over `HostOs` + `HostBackendProbe` — every platform's matrix unit-tested from any host): an explicit mode that cannot be honored on this host FAILS CLOSED with a typed `SandboxUnavailable` refusal (`RefusingSandbox` — every command refuses with per-OS remediation; never a silent `NoSandbox`, never a blind ENOENT backend). `SandboxMode::Auto` picks the best available backend; with none it degrades to `NoSandbox` loudly (warned once per process, surfaced by `octos doctor`) unless `sandbox.fail_closed = true` (default false) turns the degradation into a refusal. `enabled = false` / `mode = "none"` remain the explicit unconfined opt-outs and beat `fail_closed`. Shared `BLOCKED_ENV_VARS` constant (18 env vars) across all backends and MCP server spawning. Docker supports mount modes (none/ro/rw), resource limits (CPU/memory/PIDs), network isolation. Path validation rejects injection characters (`:`, `\0`, `\n`, `\r` for Docker; control chars, `(`, `)`, `\`, `"` for macOS SBPL).
 
 ### MCP (`octos-agent/src/mcp.rs`)
 

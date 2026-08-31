@@ -43,6 +43,20 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub mode: SandboxMode,
 
+    /// Fail closed when `mode = "auto"` resolves to NO backend (default:
+    /// `false`).
+    ///
+    /// `Auto` means "best available", so by default a host with no backend
+    /// degrades to unconfined execution — loudly (warned once per process),
+    /// never silently. Operators who would rather have every command REFUSE
+    /// to run than ever run unconfined set this to `true` and get a typed
+    /// [`SandboxUnavailable`] refusal instead. The explicit opt-outs
+    /// (`enabled = false`, `mode = "none"`) still win over this knob.
+    /// Explicit backend modes are unaffected: an explicit mode that cannot
+    /// be honored on this host ALWAYS refuses, knob or no knob.
+    #[serde(default)]
+    pub fail_closed: bool,
+
     /// Allow network access inside the sandbox.
     #[serde(default)]
     pub allow_network: bool,
@@ -326,6 +340,7 @@ impl Default for SandboxConfig {
         Self {
             enabled: true,
             mode: SandboxMode::Auto,
+            fail_closed: false,
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
@@ -437,6 +452,17 @@ pub trait Sandbox: Send + Sync {
         false
     }
 
+    /// Typed refusal carried by a fail-closed resolution ([`RefusingSandbox`]):
+    /// `Some` means EVERY command must refuse to run — the operator requested
+    /// confinement that cannot be honored on this host. Exec-shaped tools
+    /// short-circuit on this and return the remediation text instead of
+    /// spawning; fail-closed gates (mcp-serve sessions, the fleet pool and
+    /// worker) treat it like a missing backend. Real backends and
+    /// [`NoSandbox`] inherit `None`.
+    fn refusal(&self) -> Option<&SandboxUnavailable> {
+        None
+    }
+
     /// Whether this backend is the Docker container sandbox.
     ///
     /// #1607 (codex-review follow-up): Docker bind-mounts the workspace at a
@@ -492,6 +518,418 @@ impl Sandbox for NoSandbox {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sandbox resolution — the OS-agnostic decision layer.
+//
+// `create_sandbox` used to interleave `cfg!`-gated probing with construction,
+// which made the resolution matrix untestable off-host and let two explicit
+// modes silently degrade to no confinement. The decision is now a pure
+// function over (config, host OS, backend availability): every platform's
+// matrix is exercised from any host, and construction is a thin projection.
+// ---------------------------------------------------------------------------
+
+/// The operating system a resolution runs on — data, not `cfg!`, so the FULL
+/// platform matrix is testable from any host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOs {
+    /// Linux (bwrap and the Landlock/seccomp helper are candidates).
+    Linux,
+    /// macOS (sandbox-exec is a candidate).
+    Macos,
+    /// Windows (the AppContainer helper is a candidate).
+    Windows,
+    /// Any other OS: Docker is the only candidate backend.
+    Other,
+}
+
+impl HostOs {
+    /// The OS this binary was built for.
+    pub fn current() -> Self {
+        if cfg!(target_os = "linux") {
+            HostOs::Linux
+        } else if cfg!(target_os = "macos") {
+            HostOs::Macos
+        } else if cfg!(windows) {
+            HostOs::Windows
+        } else {
+            HostOs::Other
+        }
+    }
+
+    /// Human-readable name for refusal messages.
+    fn label(self) -> &'static str {
+        match self {
+            HostOs::Linux => "Linux",
+            HostOs::Macos => "macOS",
+            HostOs::Windows => "Windows",
+            HostOs::Other => "this OS",
+        }
+    }
+}
+
+/// Host backend availability, probed LAZILY: [`decide_sandbox`] calls each
+/// method only when the mode/OS combination actually considers that backend,
+/// preserving the probe order (and probe count) `SandboxMode::Auto` always
+/// had. Tests substitute a fixed table to exercise every platform's matrix.
+pub trait HostBackendProbe {
+    /// macOS `sandbox-exec` is on PATH.
+    fn sandbox_exec(&self) -> bool;
+    /// Linux bubblewrap WORKS (the probe actually runs `bwrap`, not a PATH scan).
+    fn bwrap(&self) -> bool;
+    /// The `octos-sandbox` Landlock/seccomp helper answers `--probe-linux`.
+    fn linux_container_helper(&self) -> bool;
+    /// The `octos-sandbox.exe` AppContainer helper is present.
+    fn windows_container_helper(&self) -> bool;
+    /// `docker` is on PATH.
+    fn docker(&self) -> bool;
+}
+
+/// The production probe: real host checks; `false` for backends whose probe
+/// helpers the build target does not even compile.
+struct RealHostProbe;
+
+impl HostBackendProbe for RealHostProbe {
+    fn sandbox_exec(&self) -> bool {
+        which_exists("sandbox-exec")
+    }
+
+    fn bwrap(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            bwrap_works()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    fn linux_container_helper(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            linux_container_sandbox_available()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    fn windows_container_helper(&self) -> bool {
+        #[cfg(windows)]
+        {
+            has_sandbox_helper()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    fn docker(&self) -> bool {
+        which_exists("docker")
+    }
+}
+
+/// Which concrete backend a resolution selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxBackendChoice {
+    /// macOS Seatbelt via `sandbox-exec`.
+    Macos,
+    /// Linux bubblewrap.
+    Bwrap,
+    /// Linux Landlock/seccomp via the `octos-sandbox` helper.
+    Landlock,
+    /// Windows AppContainer via the `octos-sandbox.exe` helper.
+    AppContainer,
+    /// Docker container isolation (any OS).
+    Docker,
+}
+
+impl SandboxBackendChoice {
+    /// Stable human-readable label (`octos doctor`'s sandbox row).
+    fn label(self) -> &'static str {
+        match self {
+            SandboxBackendChoice::Macos => "macOS Seatbelt (sandbox-exec)",
+            SandboxBackendChoice::Bwrap => "bubblewrap (bwrap)",
+            SandboxBackendChoice::Landlock => "Linux container helper (Landlock/seccomp)",
+            SandboxBackendChoice::AppContainer => "Windows AppContainer",
+            SandboxBackendChoice::Docker => "Docker",
+        }
+    }
+}
+
+/// Why a resolution yielded NO confinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnconfinedReason {
+    /// `sandbox.enabled = false` — the operator's explicit opt-out
+    /// (`--danger-full-access` sets this). Beats `fail_closed`.
+    Disabled,
+    /// `sandbox.mode = "none"` — the equally explicit opt-out. Beats
+    /// `fail_closed`.
+    ExplicitNone,
+    /// `SandboxMode::Auto` ("best available" by contract) found no backend
+    /// and `sandbox.fail_closed` is unset: the one LEGAL degradation —
+    /// warned once per process, never silent.
+    AutoNoBackend,
+}
+
+/// Typed refusal: the configured sandbox cannot be honored on this host, and
+/// the resolution refuses to run commands unconfined instead of degrading.
+///
+/// The text is written for whoever hits it — including a model reading a
+/// refused tool result — so it names the mismatch, concrete per-OS
+/// remediations, and the explicit opt-outs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxUnavailable {
+    /// The requested mode, in config spelling (e.g. `"bwrap"`, `"auto"`).
+    pub requested: String,
+    /// Why it cannot be honored on this host.
+    pub reason: String,
+    /// Concrete remediations for this OS, ending with the explicit opt-outs.
+    pub remediation: String,
+}
+
+impl std::fmt::Display for SandboxUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sandbox unavailable (mode \"{}\"): {}. Refusing to run commands unconfined. {}",
+            self.requested, self.reason, self.remediation
+        )
+    }
+}
+
+impl std::error::Error for SandboxUnavailable {}
+
+impl SandboxUnavailable {
+    /// One-line rendering safe to embed in a `sh -c` / `cmd /C` echo: only
+    /// shell-inert characters survive, so no quoting bug can ever turn the
+    /// refusal back into command execution.
+    fn stderr_line(&self) -> String {
+        let line = format!(
+            "sandbox unavailable, mode {}: {} Refusing to run the command unconfined. \
+             Fix the sandbox config or run octos doctor.",
+            self.requested, self.reason
+        );
+        line.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || " ./:_=,-".contains(c) {
+                    c
+                } else {
+                    ' '
+                }
+            })
+            .collect()
+    }
+}
+
+/// The outcome of resolving a [`SandboxConfig`] against a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxDecision {
+    /// Confine with this backend.
+    Confine(SandboxBackendChoice),
+    /// Run without confinement, for this reason (always logged, never silent).
+    Unconfined(UnconfinedReason),
+    /// Fail closed: every command must refuse to run.
+    Refuse(SandboxUnavailable),
+}
+
+/// The per-OS remediation block every refusal carries.
+fn remediation_for(os: HostOs) -> String {
+    let install = match os {
+        HostOs::Linux => {
+            "Install bubblewrap (e.g. `apt install bubblewrap`) or the octos-sandbox \
+             Landlock helper, or install Docker."
+        }
+        HostOs::Macos => "sandbox-exec ships with macOS — restore it on PATH, or install Docker.",
+        HostOs::Windows => {
+            "Install the octos-sandbox.exe AppContainer helper next to the octos binary, \
+             or install Docker Desktop (a native no-helper Windows runner is tracked in \
+             octos-org/octos issue 2195)."
+        }
+        HostOs::Other => "Install Docker (the only supported backend on this OS).",
+    };
+    format!(
+        "{install} To accept running UNCONFINED instead, set sandbox.enabled=false or \
+         sandbox.mode=\"none\" (the explicit opt-outs)."
+    )
+}
+
+/// Refusal for an explicit mode that requires a different OS.
+fn refuse_wrong_os(requested: &str, needs: &str, os: HostOs) -> SandboxDecision {
+    SandboxDecision::Refuse(SandboxUnavailable {
+        requested: requested.to_string(),
+        reason: format!(
+            "sandbox.mode=\"{requested}\" requires {needs}; this host is {}",
+            os.label()
+        ),
+        remediation: remediation_for(os),
+    })
+}
+
+/// Refusal for an explicit mode whose backend is missing/broken on this host.
+fn refuse_missing(requested: &str, missing: &str, os: HostOs) -> SandboxDecision {
+    SandboxDecision::Refuse(SandboxUnavailable {
+        requested: requested.to_string(),
+        reason: format!("sandbox.mode=\"{requested}\" is set but {missing}"),
+        remediation: remediation_for(os),
+    })
+}
+
+/// Resolve a [`SandboxConfig`] against a host: which backend to use, whether
+/// to run unconfined, or whether to refuse. Pure — all host facts arrive as
+/// arguments — so every OS's matrix is tested from any development host.
+///
+/// The contract:
+/// - `enabled = false` and `mode = "none"` are explicit opt-outs: unconfined,
+///   and they beat `fail_closed`.
+/// - An EXPLICIT backend mode that cannot be honored on this host (wrong OS,
+///   or the backend is missing/broken) REFUSES — it never silently degrades
+///   to no confinement, and never constructs a backend whose every spawn
+///   would fail with a bare ENOENT.
+/// - `Auto` picks the best available backend (native first, then Docker).
+///   With none available it degrades to unconfined — warned, never silent —
+///   unless `fail_closed` is set, which turns the degradation into a refusal.
+pub fn decide_sandbox(
+    config: &SandboxConfig,
+    os: HostOs,
+    probe: &dyn HostBackendProbe,
+) -> SandboxDecision {
+    if !config.enabled {
+        return SandboxDecision::Unconfined(UnconfinedReason::Disabled);
+    }
+    match &config.mode {
+        SandboxMode::None => SandboxDecision::Unconfined(UnconfinedReason::ExplicitNone),
+        SandboxMode::Bwrap => {
+            if os != HostOs::Linux {
+                refuse_wrong_os("bwrap", "Linux", os)
+            } else if !probe.bwrap() {
+                refuse_missing(
+                    "bwrap",
+                    "the bubblewrap availability probe failed on this host (bwrap is \
+                     missing or cannot create namespaces here)",
+                    os,
+                )
+            } else {
+                SandboxDecision::Confine(SandboxBackendChoice::Bwrap)
+            }
+        }
+        SandboxMode::Landlock => {
+            if os != HostOs::Linux {
+                refuse_wrong_os("landlock", "Linux", os)
+            } else if !probe.linux_container_helper() {
+                refuse_missing(
+                    "landlock",
+                    "the octos-sandbox Landlock/seccomp helper is not available",
+                    os,
+                )
+            } else {
+                SandboxDecision::Confine(SandboxBackendChoice::Landlock)
+            }
+        }
+        SandboxMode::Macos => {
+            if os != HostOs::Macos {
+                refuse_wrong_os("macos", "macOS (sandbox-exec)", os)
+            } else if !probe.sandbox_exec() {
+                refuse_missing("macos", "sandbox-exec was not found on PATH", os)
+            } else {
+                SandboxDecision::Confine(SandboxBackendChoice::Macos)
+            }
+        }
+        SandboxMode::Docker => {
+            if probe.docker() {
+                SandboxDecision::Confine(SandboxBackendChoice::Docker)
+            } else {
+                refuse_missing("docker", "docker was not found on PATH", os)
+            }
+        }
+        SandboxMode::AppContainer => {
+            if os != HostOs::Windows {
+                refuse_wrong_os("appcontainer", "Windows", os)
+            } else if !probe.windows_container_helper() {
+                refuse_missing(
+                    "appcontainer",
+                    "the octos-sandbox.exe AppContainer helper was not found next to \
+                     the octos binary or on PATH",
+                    os,
+                )
+            } else {
+                SandboxDecision::Confine(SandboxBackendChoice::AppContainer)
+            }
+        }
+        SandboxMode::Auto => {
+            let native = match os {
+                HostOs::Macos if probe.sandbox_exec() => Some(SandboxBackendChoice::Macos),
+                HostOs::Linux if probe.bwrap() => Some(SandboxBackendChoice::Bwrap),
+                HostOs::Linux if probe.linux_container_helper() => {
+                    Some(SandboxBackendChoice::Landlock)
+                }
+                HostOs::Windows if probe.windows_container_helper() => {
+                    Some(SandboxBackendChoice::AppContainer)
+                }
+                _ => None,
+            };
+            match native.or_else(|| probe.docker().then_some(SandboxBackendChoice::Docker)) {
+                Some(choice) => SandboxDecision::Confine(choice),
+                None if config.fail_closed => SandboxDecision::Refuse(SandboxUnavailable {
+                    requested: "auto".to_string(),
+                    reason: "sandbox.fail_closed=true and mode \"auto\" found no sandbox \
+                             backend on this host"
+                        .to_string(),
+                    remediation: remediation_for(os),
+                }),
+                None => SandboxDecision::Unconfined(UnconfinedReason::AutoNoBackend),
+            }
+        }
+    }
+}
+
+/// Fail-closed sandbox: [`Sandbox::wrap_command`] NEVER runs the requested
+/// command — it substitutes one that prints the refusal to stderr and exits 1
+/// (mirroring the Landlock backend's helper-missing refusal). Exec-shaped
+/// tools short-circuit even earlier via [`Sandbox::refusal`] and return the
+/// full remediation text without spawning anything.
+pub struct RefusingSandbox {
+    /// Why the configured sandbox cannot be honored on this host.
+    pub error: SandboxUnavailable,
+}
+
+impl Sandbox for RefusingSandbox {
+    fn refusal(&self) -> Option<&SandboxUnavailable> {
+        Some(&self.error)
+    }
+
+    fn wrap_command(&self, _shell_command: &str, cwd: &Path) -> Command {
+        let line = self.error.stderr_line();
+        #[cfg(windows)]
+        {
+            // Space-free tokens are passed UNQUOTED by std's command-line
+            // builder, so cmd.exe sees the redirect/&/exit metacharacters
+            // unquoted and honors them. The original command is never passed
+            // at all, so no quoting subtlety can resurrect it.
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg("echo");
+            for token in line.split_whitespace() {
+                cmd.arg(token);
+            }
+            cmd.arg("1>&2").arg("&").arg("exit").arg("/b").arg("1");
+            cmd.current_dir(cwd);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            // `stderr_line` strips quotes and metacharacters, so the
+            // single-quoted embed below cannot be escaped from.
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(format!("echo '{line}' >&2; exit 1"))
+                .current_dir(cwd);
+            cmd
+        }
+    }
+}
+
 /// #1976 — the effective `workspace_write` for a backend that CANNOT express
 /// a per-path write fence (bwrap/Landlock/AppContainer binds and grants are
 /// concrete paths; a glob — or a create-target that does not exist yet —
@@ -538,24 +976,104 @@ fn warn_fence_unenforced(config: &SandboxConfig) {
 }
 
 /// Create a sandbox from config.
+///
+/// Resolution is [`decide_sandbox`] over the real host; this projects the
+/// decision into a backend:
+/// - `Confine` constructs the chosen backend.
+/// - `Unconfined` yields [`NoSandbox`] — logged per reason (the Auto
+///   degradation warns once per process; the explicit opt-outs stay quiet).
+/// - `Refuse` yields [`RefusingSandbox`]: the signature stays infallible for
+///   the many construction sites, but every command run under the result
+///   refuses with the typed [`SandboxUnavailable`] instead of running
+///   unconfined (fail closed).
 pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
-    if !config.enabled {
-        tracing::info!("sandbox disabled, shell commands run without isolation");
-        warn_fence_unenforced(config);
-        return Box::new(NoSandbox);
-    }
-
-    match &config.mode {
-        SandboxMode::None => {
+    match decide_sandbox(config, HostOs::current(), &RealHostProbe) {
+        SandboxDecision::Confine(choice) => build_backend(choice, config),
+        SandboxDecision::Unconfined(reason) => {
+            match reason {
+                UnconfinedReason::Disabled => {
+                    tracing::info!("sandbox disabled, shell commands run without isolation");
+                }
+                UnconfinedReason::ExplicitNone => {}
+                UnconfinedReason::AutoNoBackend => warn_auto_unconfined_once(),
+            }
             warn_fence_unenforced(config);
             Box::new(NoSandbox)
         }
-        SandboxMode::Bwrap => Box::new(BwrapSandbox {
+        SandboxDecision::Refuse(error) => {
+            tracing::error!(
+                %error,
+                "sandbox unavailable; failing closed — commands will refuse to run"
+            );
+            Box::new(RefusingSandbox { error })
+        }
+    }
+}
+
+/// `Auto` degraded to no confinement: warn ONCE per process. Every sandbox
+/// construction on this host repeats the same fact, and constructions happen
+/// per session/registry — the old per-construction warning was log spam in
+/// multi-session gateways, which is exactly how it came to be tuned out.
+/// Never silent: `octos doctor` reports the same resolution on demand
+/// ([`auto_sandbox_kind`]), and `sandbox.fail_closed` upgrades this
+/// degradation to a refusal.
+fn warn_auto_unconfined_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "no sandbox backend found (bwrap, Landlock/seccomp helper, sandbox-exec, \
+             AppContainer helper, or docker): shell commands run WITHOUT isolation. \
+             Install a backend (Linux: bubblewrap · macOS: sandbox-exec · Windows: the \
+             octos-sandbox helper · any OS: Docker), set sandbox.fail_closed=true to \
+             refuse instead of degrading, or set sandbox.enabled=false to accept \
+             unconfined runs. Warned once per process; `octos doctor` shows the \
+             resolved backend."
+        );
+    });
+}
+
+/// Which backend [`SandboxMode::Auto`] would select on this host — a stable
+/// human-readable label plus whether that selection actually sandboxes
+/// (`false` = [`NoSandbox`]). Runs the SAME resolution as [`create_sandbox`]
+/// over a default config (on Linux the bwrap probe actually runs
+/// `bwrap --version`), reported instead of instantiated. Used by
+/// `octos doctor` so its sandbox row reflects the real runtime selection
+/// rather than a PATH existence guess; the boolean keeps callers from
+/// sniffing the label text for status.
+pub fn auto_sandbox_kind() -> (&'static str, bool) {
+    match decide_sandbox(&SandboxConfig::default(), HostOs::current(), &RealHostProbe) {
+        SandboxDecision::Confine(choice) => (choice.label(), true),
+        SandboxDecision::Unconfined(_) | SandboxDecision::Refuse(_) => {
+            ("none — shell commands would run UNSANDBOXED", false)
+        }
+    }
+}
+
+/// Construct the decided backend. The Landlock/AppContainer types only exist
+/// on their build targets; [`decide_sandbox`] never selects them off-target,
+/// and the defensive off-target arms fail closed rather than panic if that
+/// invariant is ever broken.
+fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dyn Sandbox> {
+    match choice {
+        SandboxBackendChoice::Macos => Box::new(MacosSandbox {
+            allow_network: config.allow_network,
+            read_allow_paths: config.read_allow_paths.clone(),
+            workspace_write: config.workspace_write,
+            repo_git_write: config.repo_git_write.clone(),
+            // #1976: macOS EXPRESSES the fence (per-glob SBPL regex rules).
+            write_allow_globs: config.write_allow_globs.clone(),
+            toolchain_write_grants: configured_toolchain_grants(config),
+        }),
+        SandboxBackendChoice::Bwrap => Box::new(BwrapSandbox {
             allow_network: config.allow_network,
             workspace_write: fence_degraded_workspace_write(config, "bwrap"),
             repo_git_write: config.repo_git_write.clone(),
         }),
-        SandboxMode::Landlock => {
+        SandboxBackendChoice::Docker => Box::new(DockerSandbox {
+            config: fence_degraded_docker(config),
+            allow_network: config.allow_network,
+        }),
+        SandboxBackendChoice::Landlock => {
             #[cfg(target_os = "linux")]
             {
                 Box::new(LinuxContainerSandbox {
@@ -567,27 +1085,10 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                tracing::warn!(
-                    "Landlock/seccomp is only available on Linux, falling back to NoSandbox"
-                );
-                warn_fence_unenforced(config);
-                Box::new(NoSandbox)
+                build_backend_unbuildable("landlock")
             }
         }
-        SandboxMode::Macos => Box::new(MacosSandbox {
-            allow_network: config.allow_network,
-            read_allow_paths: config.read_allow_paths.clone(),
-            workspace_write: config.workspace_write,
-            repo_git_write: config.repo_git_write.clone(),
-            // #1976: macOS EXPRESSES the fence (per-glob SBPL regex rules).
-            write_allow_globs: config.write_allow_globs.clone(),
-            toolchain_write_grants: configured_toolchain_grants(config),
-        }),
-        SandboxMode::Docker => Box::new(DockerSandbox {
-            config: fence_degraded_docker(config),
-            allow_network: config.allow_network,
-        }),
-        SandboxMode::AppContainer => {
+        SandboxBackendChoice::AppContainer => {
             #[cfg(windows)]
             {
                 Box::new(AppContainerSandbox {
@@ -599,115 +1100,22 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             }
             #[cfg(not(windows))]
             {
-                tracing::warn!(
-                    "AppContainer is only available on Windows, falling back to NoSandbox"
-                );
-                warn_fence_unenforced(config);
-                Box::new(NoSandbox)
+                build_backend_unbuildable("appcontainer")
             }
         }
-        SandboxMode::Auto => create_auto_sandbox(config),
     }
 }
 
-/// Which backend [`SandboxMode::Auto`] would select on this host — a stable
-/// human-readable label plus whether that selection actually sandboxes
-/// (`false` = [`NoSandbox`]). Runs the SAME availability probes as
-/// [`create_auto_sandbox`] (on Linux `bwrap_works` actually runs
-/// `bwrap --version`), reported instead of instantiated. Used by
-/// `octos doctor` so its sandbox row reflects the real runtime selection
-/// rather than a PATH existence guess; the boolean keeps callers from
-/// sniffing the label text for status.
-pub fn auto_sandbox_kind() -> (&'static str, bool) {
-    #[cfg(target_os = "macos")]
-    {
-        if which_exists("sandbox-exec") {
-            return ("macOS Seatbelt (sandbox-exec)", true);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if bwrap_works() {
-            return ("bubblewrap (bwrap)", true);
-        }
-        if linux_container_sandbox_available() {
-            return ("Linux container helper (Landlock/seccomp)", true);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if has_sandbox_helper() {
-            return ("Windows AppContainer", true);
-        }
-    }
-    if which_exists("docker") {
-        ("Docker", true)
-    } else {
-        ("none — shell commands would run UNSANDBOXED", false)
-    }
-}
-
-fn create_auto_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
-    #[cfg(target_os = "macos")]
-    {
-        if which_exists("sandbox-exec") {
-            return Box::new(MacosSandbox {
-                allow_network: config.allow_network,
-                read_allow_paths: config.read_allow_paths.clone(),
-                workspace_write: config.workspace_write,
-                repo_git_write: config.repo_git_write.clone(),
-                // #1976: macOS EXPRESSES the fence (per-glob regex rules).
-                write_allow_globs: config.write_allow_globs.clone(),
-                toolchain_write_grants: configured_toolchain_grants(config),
-            });
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if bwrap_works() {
-            return Box::new(BwrapSandbox {
-                allow_network: config.allow_network,
-                workspace_write: fence_degraded_workspace_write(config, "bwrap"),
-                repo_git_write: config.repo_git_write.clone(),
-            });
-        }
-        if linux_container_sandbox_available() {
-            return Box::new(LinuxContainerSandbox {
-                allow_network: config.allow_network,
-                read_allow_paths: config.read_allow_paths.clone(),
-                profile_name: config.profile_name.clone(),
-                workspace_write: fence_degraded_workspace_write(config, "landlock"),
-            });
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if has_sandbox_helper() {
-            return Box::new(AppContainerSandbox {
-                allow_network: config.allow_network,
-                read_allow_paths: config.read_allow_paths.clone(),
-                profile_name: config.profile_name.clone(),
-                workspace_write: fence_degraded_workspace_write(config, "appcontainer"),
-            });
-        }
-    }
-
-    if which_exists("docker") {
-        Box::new(DockerSandbox {
-            config: fence_degraded_docker(config),
-            allow_network: config.allow_network,
-        })
-    } else {
-        tracing::warn!(
-            "no sandbox backend found (bwrap, Landlock/seccomp, sandbox-exec, docker, or AppContainer). \
-             Shell commands will run WITHOUT isolation. \
-             Install a sandbox backend or set sandbox.enabled = false to silence this warning."
-        );
-        warn_fence_unenforced(config);
-        Box::new(NoSandbox)
-    }
+/// Defensive fail-closed for a backend this build target cannot construct
+/// (unreachable while [`decide_sandbox`] holds its OS invariants).
+fn build_backend_unbuildable(requested: &str) -> Box<dyn Sandbox> {
+    let error = SandboxUnavailable {
+        requested: requested.to_string(),
+        reason: format!("internal: the {requested} backend is not compiled into this build"),
+        remediation: remediation_for(HostOs::current()),
+    };
+    tracing::error!(%error, "sandbox resolution invariant broken; failing closed");
+    Box::new(RefusingSandbox { error })
 }
 
 #[cfg(target_os = "linux")]
@@ -968,6 +1376,7 @@ mod tests {
             allow_toolchains: true,
             enabled: true,
             mode: SandboxMode::None,
+            fail_closed: false,
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
@@ -1008,12 +1417,11 @@ mod tests {
         // closed; granted paths stay writable via the fenced file tools).
         let config = SandboxConfig {
             allow_toolchains: true,
-            mode: SandboxMode::Bwrap,
             workspace_write: true,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
             ..SandboxConfig::default()
         };
-        let sb = create_sandbox(&config);
+        let sb = build_backend(SandboxBackendChoice::Bwrap, &config);
         let dir = tempfile::tempdir().unwrap();
         let cmd = sb.wrap_command("echo hi", dir.path());
         let args: Vec<String> = cmd
@@ -1045,11 +1453,10 @@ mod tests {
         // fenced workspace mounts `:ro` (fail closed for the shell).
         let config = SandboxConfig {
             allow_toolchains: true,
-            mode: SandboxMode::Docker,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
             ..SandboxConfig::default()
         };
-        let sb = create_sandbox(&config);
+        let sb = build_backend(SandboxBackendChoice::Docker, &config);
         let dir = tempfile::tempdir().unwrap();
         let cmd = sb.wrap_command("echo hi", dir.path());
         let args: Vec<String> = cmd
@@ -1073,11 +1480,10 @@ mod tests {
         // create_sandbox must thread the globs through, not degrade them.
         let config = SandboxConfig {
             allow_toolchains: true,
-            mode: SandboxMode::Macos,
             write_allow_globs: Some(vec!["exemplar.card".to_string()]),
             ..SandboxConfig::default()
         };
-        let sb = create_sandbox(&config);
+        let sb = build_backend(SandboxBackendChoice::Macos, &config);
         let dir = tempfile::tempdir().unwrap();
         let cmd = sb.wrap_command("echo hi", dir.path());
         let args: Vec<String> = cmd
@@ -1200,5 +1606,466 @@ mod tests {
     fn allow_toolchains_defaults_true_for_old_configs() {
         let config: SandboxConfig = serde_json::from_str("{}").expect("empty config");
         assert!(config.allow_toolchains);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sandbox resolution decision matrix (pure — every OS tested from any
+    // host). These lock the fail-closed contract: explicit modes never
+    // silently degrade, Auto degrades loudly unless `fail_closed` refuses.
+    // -----------------------------------------------------------------------
+
+    /// A fixed backend-availability table standing in for the host probes.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct FakeProbe {
+        sandbox_exec: bool,
+        bwrap: bool,
+        linux_helper: bool,
+        windows_helper: bool,
+        docker: bool,
+    }
+
+    impl HostBackendProbe for FakeProbe {
+        fn sandbox_exec(&self) -> bool {
+            self.sandbox_exec
+        }
+        fn bwrap(&self) -> bool {
+            self.bwrap
+        }
+        fn linux_container_helper(&self) -> bool {
+            self.linux_helper
+        }
+        fn windows_container_helper(&self) -> bool {
+            self.windows_helper
+        }
+        fn docker(&self) -> bool {
+            self.docker
+        }
+    }
+
+    const NO_BACKENDS: FakeProbe = FakeProbe {
+        sandbox_exec: false,
+        bwrap: false,
+        linux_helper: false,
+        windows_helper: false,
+        docker: false,
+    };
+
+    const ALL_BACKENDS: FakeProbe = FakeProbe {
+        sandbox_exec: true,
+        bwrap: true,
+        linux_helper: true,
+        windows_helper: true,
+        docker: true,
+    };
+
+    const ALL_OSES: [HostOs; 4] = [HostOs::Linux, HostOs::Macos, HostOs::Windows, HostOs::Other];
+
+    fn auto_config() -> SandboxConfig {
+        SandboxConfig::default()
+    }
+
+    fn mode_config(mode: SandboxMode) -> SandboxConfig {
+        SandboxConfig {
+            mode,
+            ..SandboxConfig::default()
+        }
+    }
+
+    #[test]
+    fn should_confine_via_native_backend_when_auto_matches_host_os() {
+        // Auto prefers the native backend over Docker on every OS; selection
+        // order on Linux is bwrap first, then the Landlock helper.
+        let cases = [
+            (HostOs::Macos, ALL_BACKENDS, SandboxBackendChoice::Macos),
+            (HostOs::Linux, ALL_BACKENDS, SandboxBackendChoice::Bwrap),
+            (
+                HostOs::Linux,
+                FakeProbe {
+                    bwrap: false,
+                    ..ALL_BACKENDS
+                },
+                SandboxBackendChoice::Landlock,
+            ),
+            (
+                HostOs::Windows,
+                ALL_BACKENDS,
+                SandboxBackendChoice::AppContainer,
+            ),
+            (HostOs::Other, ALL_BACKENDS, SandboxBackendChoice::Docker),
+        ];
+        for (os, probe, expected) in cases {
+            assert_eq!(
+                decide_sandbox(&auto_config(), os, &probe),
+                SandboxDecision::Confine(expected),
+                "auto on {os:?} with {probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_fall_back_to_docker_when_auto_has_no_native_backend() {
+        for os in ALL_OSES {
+            let probe = FakeProbe {
+                docker: true,
+                ..NO_BACKENDS
+            };
+            assert_eq!(
+                decide_sandbox(&auto_config(), os, &probe),
+                SandboxDecision::Confine(SandboxBackendChoice::Docker),
+                "auto on {os:?} must fall back to docker"
+            );
+        }
+    }
+
+    #[test]
+    fn should_degrade_loudly_not_refuse_when_auto_finds_no_backend() {
+        // The compat constraint: a default config (Auto, fail_closed unset) on
+        // a backend-less host — Windows without the AppContainer helper or
+        // Docker being the canonical case — keeps WORKING unconfined. The
+        // degradation is a warned Unconfined resolution, never a refusal.
+        for os in ALL_OSES {
+            assert_eq!(
+                decide_sandbox(&auto_config(), os, &NO_BACKENDS),
+                SandboxDecision::Unconfined(UnconfinedReason::AutoNoBackend),
+                "default config on a backend-less {os:?} host must stay unconfined"
+            );
+        }
+    }
+
+    #[test]
+    fn should_refuse_when_auto_finds_no_backend_and_fail_closed_set() {
+        for os in ALL_OSES {
+            let config = SandboxConfig {
+                fail_closed: true,
+                ..SandboxConfig::default()
+            };
+            match decide_sandbox(&config, os, &NO_BACKENDS) {
+                SandboxDecision::Refuse(error) => {
+                    assert_eq!(error.requested, "auto", "refusal names the mode ({os:?})");
+                    assert!(
+                        error.reason.contains("fail_closed"),
+                        "refusal explains the knob that turned degradation into refusal \
+                         ({os:?}): {}",
+                        error.reason
+                    );
+                }
+                other => panic!("auto+fail_closed on backend-less {os:?} must refuse: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn should_confine_when_auto_finds_backend_even_with_fail_closed() {
+        // Mutation-proofing the knob's other edge: fail_closed must NOT
+        // over-refuse — a host with any working backend confines normally.
+        let config = SandboxConfig {
+            fail_closed: true,
+            ..SandboxConfig::default()
+        };
+        let probe = FakeProbe {
+            docker: true,
+            ..NO_BACKENDS
+        };
+        for os in ALL_OSES {
+            assert_eq!(
+                decide_sandbox(&config, os, &probe),
+                SandboxDecision::Confine(SandboxBackendChoice::Docker),
+                "fail_closed must not refuse when a backend exists ({os:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn should_refuse_when_explicit_mode_is_on_wrong_os() {
+        // An explicit backend mode on the wrong OS REFUSES — the pre-existing
+        // behaviours were both wrong: landlock/appcontainer silently degraded
+        // to NO confinement, and bwrap/macos constructed a backend whose every
+        // spawn died with a bare ENOENT.
+        let cases = [
+            (SandboxMode::Bwrap, "bwrap", HostOs::Macos),
+            (SandboxMode::Bwrap, "bwrap", HostOs::Windows),
+            (SandboxMode::Landlock, "landlock", HostOs::Macos),
+            (SandboxMode::Landlock, "landlock", HostOs::Windows),
+            (SandboxMode::Macos, "macos", HostOs::Linux),
+            (SandboxMode::Macos, "macos", HostOs::Windows),
+            (SandboxMode::AppContainer, "appcontainer", HostOs::Linux),
+            (SandboxMode::AppContainer, "appcontainer", HostOs::Macos),
+        ];
+        for (mode, label, os) in cases {
+            match decide_sandbox(&mode_config(mode.clone()), os, &ALL_BACKENDS) {
+                SandboxDecision::Refuse(error) => {
+                    assert_eq!(error.requested, label, "refusal names the mode");
+                    assert!(
+                        error.reason.contains(os.label()),
+                        "refusal names the mismatching host OS: {}",
+                        error.reason
+                    );
+                }
+                other => panic!("explicit {mode:?} on {os:?} must refuse, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn should_refuse_when_explicit_mode_backend_is_missing_on_right_os() {
+        // Right OS, but the backend is not actually available: refuse with the
+        // typed error instead of constructing a backend that ENOENTs per spawn
+        // (bwrap/macos/docker) or degrades at wrap time (landlock/appcontainer).
+        let cases = [
+            (SandboxMode::Bwrap, "bwrap", HostOs::Linux),
+            (SandboxMode::Landlock, "landlock", HostOs::Linux),
+            (SandboxMode::Macos, "macos", HostOs::Macos),
+            (SandboxMode::AppContainer, "appcontainer", HostOs::Windows),
+            (SandboxMode::Docker, "docker", HostOs::Linux),
+            (SandboxMode::Docker, "docker", HostOs::Macos),
+            (SandboxMode::Docker, "docker", HostOs::Windows),
+        ];
+        for (mode, label, os) in cases {
+            match decide_sandbox(&mode_config(mode.clone()), os, &NO_BACKENDS) {
+                SandboxDecision::Refuse(error) => {
+                    assert_eq!(error.requested, label, "refusal names the mode");
+                }
+                other => {
+                    panic!(
+                        "explicit {mode:?} with backend missing on {os:?} must refuse: {other:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn should_confine_when_explicit_mode_matches_available_backend() {
+        let cases = [
+            (
+                SandboxMode::Bwrap,
+                HostOs::Linux,
+                SandboxBackendChoice::Bwrap,
+            ),
+            (
+                SandboxMode::Landlock,
+                HostOs::Linux,
+                SandboxBackendChoice::Landlock,
+            ),
+            (
+                SandboxMode::Macos,
+                HostOs::Macos,
+                SandboxBackendChoice::Macos,
+            ),
+            (
+                SandboxMode::AppContainer,
+                HostOs::Windows,
+                SandboxBackendChoice::AppContainer,
+            ),
+            (
+                SandboxMode::Docker,
+                HostOs::Linux,
+                SandboxBackendChoice::Docker,
+            ),
+            (
+                SandboxMode::Docker,
+                HostOs::Other,
+                SandboxBackendChoice::Docker,
+            ),
+        ];
+        for (mode, os, expected) in cases {
+            assert_eq!(
+                decide_sandbox(&mode_config(mode.clone()), os, &ALL_BACKENDS),
+                SandboxDecision::Confine(expected),
+                "explicit {mode:?} on {os:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_stay_unconfined_when_opted_out_even_with_fail_closed() {
+        // The explicit opt-outs beat fail_closed: `enabled=false` (which
+        // --danger-full-access sets via apply_to_sandbox) and `mode="none"`.
+        let disabled = SandboxConfig {
+            enabled: false,
+            fail_closed: true,
+            ..SandboxConfig::default()
+        };
+        let none = SandboxConfig {
+            mode: SandboxMode::None,
+            fail_closed: true,
+            ..SandboxConfig::default()
+        };
+        for os in ALL_OSES {
+            assert_eq!(
+                decide_sandbox(&disabled, os, &NO_BACKENDS),
+                SandboxDecision::Unconfined(UnconfinedReason::Disabled),
+                "enabled=false beats fail_closed ({os:?})"
+            );
+            assert_eq!(
+                decide_sandbox(&none, os, &NO_BACKENDS),
+                SandboxDecision::Unconfined(UnconfinedReason::ExplicitNone),
+                "mode=none beats fail_closed ({os:?})"
+            );
+        }
+        // --danger-full-access flows through apply_to_sandbox to the same
+        // Disabled opt-out even when the inherited config set fail_closed.
+        let dangerous = crate::policy::EffectivePermissions::danger_full_access().apply_to_sandbox(
+            &SandboxConfig {
+                fail_closed: true,
+                ..SandboxConfig::default()
+            },
+        );
+        assert_eq!(
+            decide_sandbox(&dangerous, HostOs::Windows, &NO_BACKENDS),
+            SandboxDecision::Unconfined(UnconfinedReason::Disabled),
+            "danger-full-access must stay an unconfined opt-out under fail_closed"
+        );
+    }
+
+    #[test]
+    fn should_default_fail_closed_to_false_for_legacy_configs() {
+        // Every pre-existing config parses with the compatible default; the
+        // knob only ever takes effect by explicit opt-in.
+        let legacy: SandboxConfig = serde_json::from_str("{}").expect("empty config");
+        assert!(!legacy.fail_closed, "serde default must be false");
+        assert!(
+            !SandboxConfig::default().fail_closed,
+            "Rust default must be false"
+        );
+        let opted: SandboxConfig =
+            serde_json::from_str(r#"{"fail_closed": true}"#).expect("explicit opt-in");
+        assert!(opted.fail_closed, "explicit true must parse");
+    }
+
+    #[test]
+    fn should_produce_refusing_sandbox_from_create_sandbox_when_mode_unhonorable() {
+        // End-to-end through the real constructor: pick a mode that is
+        // guaranteed unhonorable on the RUNNING host (landlock off-Linux,
+        // macos seatbelt off-macOS), and require the fail-closed backend —
+        // not a silent NoSandbox, not a blind ENOENT backend.
+        let mode = if cfg!(target_os = "macos") || cfg!(windows) {
+            SandboxMode::Landlock
+        } else {
+            SandboxMode::Macos
+        };
+        let sb = create_sandbox(&mode_config(mode));
+        let refusal = sb
+            .refusal()
+            .expect("an unhonorable explicit mode must resolve to a refusing sandbox");
+        assert!(
+            refusal.remediation.contains("sandbox.enabled=false"),
+            "refusal names the explicit opt-out: {}",
+            refusal.remediation
+        );
+        assert!(
+            !sb.is_noop(),
+            "a refusing sandbox is not a no-op passthrough — nothing runs at all"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn refusing_sandbox_command_refuses_and_never_runs_the_original() {
+        // The wrap-level fail-closed guarantee for consumers that do not check
+        // `refusal()`: the produced command exits non-zero, prints the refusal
+        // to stderr, and never contains (or executes) the original command.
+        let sb = RefusingSandbox {
+            error: SandboxUnavailable {
+                requested: "bwrap".to_string(),
+                reason: "sandbox.mode=\"bwrap\" requires Linux; this host is macOS".to_string(),
+                remediation: remediation_for(HostOs::Macos),
+            },
+        };
+        let marker = "echo sandbox-escape-proof-marker";
+        let mut cmd = sb.wrap_command(marker, &std::env::temp_dir());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().all(|arg| !arg.contains("escape-proof-marker")),
+            "the original command must never be passed through: {args:?}"
+        );
+        let output = cmd.output().await.expect("refusal command spawns");
+        assert!(
+            !output.status.success(),
+            "refusal command must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("sandbox unavailable"),
+            "refusal reaches stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("sandbox-escape-proof-marker"),
+            "the original command must not run: {stderr}"
+        );
+    }
+
+    #[test]
+    fn should_never_refuse_a_default_config_on_any_host() {
+        // Byte-identical compat for default configs: whatever backend (or
+        // NoSandbox degradation) Auto resolves to on the running host, it is
+        // never a refusal with fail_closed unset.
+        let sb = create_sandbox(&SandboxConfig::default());
+        assert!(
+            sb.refusal().is_none(),
+            "a default config must never fail closed"
+        );
+    }
+
+    #[test]
+    fn refusal_text_names_per_os_remediations_and_avoids_denial_phrases() {
+        // The message is model-readable remediation, per OS…
+        let windows = remediation_for(HostOs::Windows);
+        assert!(
+            windows.contains("octos-sandbox.exe") && windows.contains("Docker"),
+            "windows remediation names the AppContainer helper and Docker: {windows}"
+        );
+        let linux = remediation_for(HostOs::Linux);
+        assert!(
+            linux.contains("bubblewrap") && linux.contains("Docker"),
+            "linux remediation names bubblewrap and Docker: {linux}"
+        );
+        let macos = remediation_for(HostOs::Macos);
+        assert!(
+            macos.contains("sandbox-exec"),
+            "macos remediation names sandbox-exec: {macos}"
+        );
+        for os in ALL_OSES {
+            let text = remediation_for(os);
+            assert!(
+                text.contains("sandbox.enabled=false") && text.contains("\"none\""),
+                "every remediation names the explicit opt-outs: {text}"
+            );
+            // …and must never contain a kernel denial phrase, or the
+            // sandbox_denial_hint scanner would append a misleading
+            // "the OS sandbox blocked a file access" hint to a refusal.
+            for phrase in DENIAL_PHRASES {
+                assert!(
+                    !text.contains(phrase),
+                    "refusal text must not trip the denial scanner: {phrase}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refusal_stderr_line_is_shell_inert() {
+        let error = SandboxUnavailable {
+            requested: "auto".to_string(),
+            reason: "tricky 'quote' \"double\" & meta | chars ; $(sub) `tick`".to_string(),
+            remediation: remediation_for(HostOs::Windows),
+        };
+        let line = error.stderr_line();
+        for banned in [
+            '\'', '"', '&', '|', '<', '>', '^', '%', '(', ')', ';', '$', '`',
+        ] {
+            assert!(
+                !line.contains(banned),
+                "stderr line must stay shell-inert, found {banned:?} in: {line}"
+            );
+        }
+        assert!(
+            line.contains("sandbox unavailable"),
+            "sanitizing keeps the message recognizable: {line}"
+        );
     }
 }
