@@ -469,6 +469,13 @@ jobs:
       - name: serve wiring guards (octos-cli)
         run: cargo test -p octos-cli --features api commands::serve::tests
 
+      # The workspace/artifact pane exclusion list lives in the `api`-gated
+      # transport module (same reason as the §6 guard) — without an explicit
+      # filter this guard never runs (#2029). It pins `.octos` (sessions,
+      # #1638 shell output spools) out of the recursive pane walks.
+      - name: Artifact pane exclusions (octos-cli)
+        run: cargo test -p octos-cli --features api artifact_pane
+
       # The goal-completion verifier's ledger-evidence fold lives in the
       # `api`-gated goal_tool module, so the unfeatured runs above never compile
       # it. Guards the peer-goal convergence fix (#1989): a genuinely-complete

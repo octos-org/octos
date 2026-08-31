@@ -183,6 +183,14 @@ pub struct MacosSandbox {
 }
 
 impl Sandbox for MacosSandbox {
+    fn workspace_scratch_writable(&self) -> bool {
+        // Same predicate as `workspace_scratch_writable` in `wrap_command`
+        // (#1976): a read-only workspace or a write fence means the shell
+        // was promised an immutable tree outside the grants — the harness
+        // must not spool into it either.
+        self.workspace_write && self.write_allow_globs.is_none()
+    }
+
     fn supports_repo_git_write(&self) -> bool {
         // A `(subpath "<repo>/.git")` rule grants the `.git` WRITE, but
         // `git commit` must also READ `<repo>/.git`. That read only holds under an

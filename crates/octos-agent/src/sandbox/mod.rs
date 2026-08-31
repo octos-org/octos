@@ -466,6 +466,30 @@ pub trait Sandbox: Send + Sync {
     fn supports_repo_git_write(&self) -> bool {
         false
     }
+
+    /// Whether the HARNESS may create scratch files inside the workspace on
+    /// this profile (#1638 shell output spools).
+    ///
+    /// `false` when the profile promises the shell a read-only workspace
+    /// (`workspace_write: false`) or fences writes to an allowlist (#1976
+    /// `write_allow_globs`): the operator declared the tree immutable
+    /// outside the grants, and the harness must not mutate what the sandbox
+    /// forbids the shell to — a host-side spool write would do exactly that.
+    /// Real backends override from their own write posture; the default
+    /// `true` matches [`NoSandbox`] and custom sandboxes (no promise made).
+    fn workspace_scratch_writable(&self) -> bool {
+        true
+    }
+
+    /// The path at which SHELL COMMANDS see the workspace root, when this
+    /// backend remaps it — Docker bind-mounts the cwd at a fixed
+    /// in-container path (`/workspace`), so a host-absolute path in a tool
+    /// result is unusable by the model's next command there. `None` (the
+    /// default, every non-remapping backend) = commands see host paths
+    /// unchanged.
+    fn workspace_remap_root(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// No-op sandbox: executes commands directly.

@@ -6380,6 +6380,134 @@ async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
     );
 }
 
+/// Scripted provider: one `shell` call with the given command, then EndTurn.
+struct CallsShellThenEnds {
+    calls: AtomicUsize,
+    command: &'static str,
+}
+
+#[async_trait]
+impl LlmProvider for CallsShellThenEnds {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_shell".to_string(),
+                    name: "shell".to_string(),
+                    arguments: serde_json::json!({ "command": self.command }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        } else {
+            ChatResponse {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+}
+
+/// Drive the REAL loop path (dispatch → sanitize → backstop) for one shell
+/// command and return the tool message the model received.
+#[cfg(unix)]
+async fn shell_tool_message_through_loop(command: &'static str) -> (tempfile::TempDir, Message) {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let provider: Arc<dyn LlmProvider> = Arc::new(CallsShellThenEnds {
+        calls: AtomicUsize::new(0),
+        command,
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("shell-spool-loop"), provider, tools, memory);
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+    let message = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("the turn must contain the shell tool result")
+        .clone();
+    (dir, message)
+}
+
+/// #1638 golden through the REAL loop: a small shell output must reach the
+/// model byte-identical — sanitize is a no-op on clean text and the backstop
+/// must not touch it. The in-tool unit golden proves the tool; this proves
+/// the sanitize+backstop interplay around it.
+#[cfg(unix)]
+#[tokio::test]
+async fn small_shell_output_reaches_the_model_byte_identical_through_the_loop() {
+    let (_dir, tool_message) = shell_tool_message_through_loop("echo hi").await;
+    assert_eq!(
+        tool_message.content, "hi\n\n\nExit code: 0",
+        "small shell output must arrive unchanged through dispatch + sanitize + backstop"
+    );
+}
+
+/// #1638 golden through the REAL loop: a spooled shell result must arrive
+/// with its footer intact — under the cap (so the loop backstop never fired)
+/// and without any backstop recovery advice appended.
+#[cfg(unix)]
+#[tokio::test]
+async fn spooled_shell_output_reaches_the_model_with_footer_intact_through_the_loop() {
+    let (dir, tool_message) = shell_tool_message_through_loop(
+        "awk 'BEGIN { for (i = 1; i <= 12000; i++) print \"line \" i }'",
+    )
+    .await;
+    let limit = octos_core::tool_output_limit("shell");
+    assert!(
+        tool_message.content.len() <= limit,
+        "the assembled result must fit the {limit}B cap, got {}",
+        tool_message.content.len()
+    );
+    assert!(
+        tool_message.content.contains("Full output: "),
+        "the spool footer must survive the loop: {}",
+        &tool_message.content[tool_message.content.len().saturating_sub(300)..]
+    );
+    // Backstop-fired evidence must be ABSENT: the tool sized its result so
+    // the loop never re-cut it and never appended recovery advice.
+    assert!(
+        !tool_message
+            .content
+            .contains("Re-run with output redirected"),
+        "backstop recovery advice implies the loop re-cut the result"
+    );
+    assert!(
+        !tool_message.content.contains("was saved to"),
+        "backstop recovery advice implies the loop re-cut the result"
+    );
+    // The spool named by the footer exists inside the workspace.
+    let marker = "Full output: ";
+    let start = tool_message.content.rfind(marker).unwrap() + marker.len();
+    let rest = &tool_message.content[start..];
+    let path = std::path::PathBuf::from(&rest[..rest.find(']').unwrap()]);
+    assert!(path.starts_with(dir.path()), "spool inside the workspace");
+    assert!(path.exists(), "footer must name a real file");
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // #27d (R4) — malformed tool-call feedback buffer
 // ─────────────────────────────────────────────────────────────────────────

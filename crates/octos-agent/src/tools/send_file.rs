@@ -244,6 +244,30 @@ impl Tool for SendFileTool {
             raw_path.to_path_buf()
         };
 
+        // #1638 — shell output spools (`.octos/tmp/shell/`) are internal
+        // working state: the complete sanitized output of a command, kept
+        // only so the model can grep past its own output cap. They are
+        // never deliverables, so refuse BEFORE any allowlist logic — the
+        // allowlist would otherwise admit them as ordinary workspace files.
+        // Checked on both the lexical path and its canonical form (a
+        // symlink must not disguise a spool as something else, nor vice
+        // versa); applies with or without a configured `base_dir`.
+        let canonical_probe = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if octos_core::is_shell_spool_path(&path)
+            || octos_core::is_shell_spool_path(&canonical_probe)
+        {
+            return Ok(ToolResult {
+                output: format!(
+                    "Refusing to send '{}': shell output spool files (.octos/tmp/shell/) are \
+                     internal working state, not deliverables. If the user needs this content, \
+                     copy the relevant part into a new file and send that instead.",
+                    path.display()
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Step 2: containment check against the send_file allowlist
         // (base_dir + /tmp/ + extra_allowed_dirs). The unified resolver
         // already verified containment for `up/...`/`pf/...` handles
@@ -428,6 +452,50 @@ mod tests {
         assert_eq!(msg.content, "Here is the file");
         assert_eq!(msg.media.len(), 1);
         assert_eq!(msg.media[0], path);
+    }
+
+    #[tokio::test]
+    async fn should_refuse_send_when_path_is_shell_spool() {
+        let (tx, _rx) = mpsc::channel(16);
+        let base = tempfile::tempdir().unwrap();
+        let spool_dir = base.path().join(".octos").join("tmp").join("shell");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let spool = spool_dir.join("output-0000000000001-0000.log");
+        std::fs::write(&spool, "full command output\n").unwrap();
+
+        let tool = SendFileTool::new(tx).with_base_dir(base.path());
+        tool.set_context("telegram", "12345");
+
+        // Spool files are internal working state (complete command output
+        // kept only so the model can grep past its cap) — never outbound.
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": spool.to_string_lossy(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "shell spool files must not be sendable: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("spool"),
+            "refusal should say why: {}",
+            result.output
+        );
+
+        // Control: a sibling file outside the spool subtree still sends —
+        // the deny is targeted, not a blanket workspace block.
+        let report = base.path().join("report.txt");
+        std::fs::write(&report, "report\n").unwrap();
+        let ok = tool
+            .execute(&serde_json::json!({
+                "file_path": report.to_string_lossy(),
+            }))
+            .await
+            .unwrap();
+        assert!(ok.success, "non-spool file must still send: {}", ok.output);
     }
 
     #[tokio::test]

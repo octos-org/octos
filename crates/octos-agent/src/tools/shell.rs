@@ -67,13 +67,17 @@ pub struct ShellTool {
     /// deadline. `None` = no extra cap (only the outer `[1, 600]s` clamp
     /// applies) — unchanged behaviour for every existing caller.
     max_timeout: Option<Duration>,
-    /// Recent output spools, newest first: `(command, spool path)` for the
-    /// last [`SPOOL_KEEP`] commands whose output exceeded the per-tool cap
-    /// and was written to a full-output file (#1638). Consulted by
+    /// Recent output spools, newest first: `(command, host path, display
+    /// path)` for the last [`SPOOL_KEEP`] commands whose LATEST invocation
+    /// exceeded the per-tool cap and was spooled (#1638). Consulted by
     /// [`Tool::truncation_recovery`] so that if the execution-loop backstop
-    /// still cuts a result, the recovery advice can name the exact file
-    /// holding the complete output.
-    spools: std::sync::Mutex<std::collections::VecDeque<(String, PathBuf)>>,
+    /// still cuts a result, the advice can name the exact file holding the
+    /// complete output. Every new invocation of a command first FORGETS its
+    /// entry ([`Self::forget_spool`]) so a stale spool from a previous run
+    /// is never offered as this run's output; the host path is re-checked
+    /// for existence at advice time (another session sharing the workspace
+    /// may have pruned the file).
+    spools: std::sync::Mutex<std::collections::VecDeque<(String, PathBuf, String)>>,
 }
 
 impl ShellTool {
@@ -97,12 +101,25 @@ impl ShellTool {
 
     /// Record a freshly written spool for `command` (newest first, bounded to
     /// [`SPOOL_KEEP`] entries; a re-run of the same command replaces its
-    /// older entry).
-    fn remember_spool(&self, command: &str, path: PathBuf) {
+    /// older entry). `display` is the path as commands see it
+    /// ([`command_visible_path`] — remapped under Docker), used verbatim in
+    /// recovery advice; `host` is what existence checks run against.
+    fn remember_spool(&self, command: &str, host: PathBuf, display: String) {
         let mut spools = self.spools.lock().unwrap_or_else(|p| p.into_inner());
-        spools.retain(|(c, _)| c != command);
-        spools.push_front((command.to_owned(), path));
+        spools.retain(|(c, _, _)| c != command);
+        // Tidy entries whose files another session's prune already removed.
+        spools.retain(|(_, h, _)| h.exists());
+        spools.push_front((command.to_owned(), host, display));
         spools.truncate(SPOOL_KEEP);
+    }
+
+    /// Drop any recorded spool for `command`. Called at the start of every
+    /// new foreground invocation: whatever a previous run spooled no longer
+    /// describes THIS run, so recovery advice must never name it (the run
+    /// may end small, time out, or fail to spawn — none of which re-spool).
+    fn forget_spool(&self, command: &str) {
+        let mut spools = self.spools.lock().unwrap_or_else(|p| p.into_inner());
+        spools.retain(|(c, _, _)| c != command);
     }
 
     /// Cap the effective per-command timeout at `cap_secs` (a hard CEILING).
@@ -872,65 +889,155 @@ fn background_label(command: &str) -> String {
 // harness-write territory (sessions, `.octos/work`, validator outcomes), and
 // a `*` gitignore inside the spool dir keeps the files out of `git status`
 // and out of the #28a change receipt. (Docker with a mounted workspace
-// remaps the path to `/workspace`; the harness-side `grep`/`read_file`
-// tools still resolve the host path.)
+// remaps the path — the footer and recovery advice print the in-container
+// view via `Sandbox::workspace_remap_root`; the harness-side `grep`/
+// `read_file` tools still resolve the host path.)
 //
-// Lifecycle: newest SPOOL_KEEP files per workspace; older ones are deleted
-// on the next spool write. No daemon.
+// Security posture (codex review round 2):
+// - The stream is SANITIZED before persisting: the spool holds the same
+//   redacted bytes the model sees, never the raw secrets the loop-level
+//   sanitizer exists to destroy.
+// - The spool is NOT written at all when the sandbox profile promises a
+//   read-only or write-fenced workspace (`Sandbox::workspace_scratch_writable`)
+//   — the harness must not mutate from the host what the sandbox forbids
+//   the shell to mutate.
+// - File creation goes through the #1976 `open_confined` component-wise
+//   O_NOFOLLOW walk (dir 0700 / file 0600 on Unix; on Windows there is no
+//   mode bit story — content protection is the workspace's own ACLs, and
+//   the non-Unix walk degrades to open_confined's documented ancestor-scan
+//   fallback).
+// - Outbound sweep surfaces (send_file, artifact-contract globs, the UI
+//   panes) exclude the spool subtree via `octos_core::is_shell_spool_path`.
+//
+// Lifecycle: newest SPOOL_KEEP files per workspace directory; older ones are
+// deleted on the next spool write, never the file just written. No daemon.
 // ---------------------------------------------------------------------------
 
-/// Byte budget reserved for everything appended after the inline view (exit
-/// code suffix, sandbox-denial hint, #28a change receipt, warn nudge) so the
-/// assembled result stays within the execution loop's per-tool cap and the
-/// backstop never re-cuts the spool footer away.
-const SPOOL_TAIL_RESERVE: usize = 2_048;
-
-/// Retention bound: newest spool files kept per workspace.
+/// Retention bound: spool files kept per workspace (the freshly written one
+/// included).
 const SPOOL_KEEP: usize = 16;
 
+/// Minimum inline-view budget worth spooling for. If the assembled suffixes
+/// (receipt, hint, exit code) leave less room than this, a head+tail view
+/// would be useless — fall back to the historic cut instead.
+const SPOOL_MIN_VIEW: usize = 1_024;
+
 /// Monotonic per-process suffix so two spools written within the same
-/// millisecond cannot collide on a filename.
+/// millisecond cannot collide on a filename (and so a cross-process
+/// `create_new` collision can retry with the next number).
 static SHELL_SPOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Workspace-local directory holding full-output spool files.
-fn spool_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".octos").join("tmp").join("shell")
+/// Workspace-relative spool directory (`.octos/tmp/shell` — the components
+/// [`octos_core::SHELL_SPOOL_COMPONENTS`], which the outbound sweep
+/// exclusions match on).
+fn spool_rel_dir() -> PathBuf {
+    let [a, b, c] = octos_core::SHELL_SPOOL_COMPONENTS;
+    Path::new(a).join(b).join(c)
 }
 
-/// Write `full` to a fresh spool file under [`spool_dir`], pruning the dir to
-/// [`SPOOL_KEEP`] files. Returns `None` on any I/O failure (unwritable
-/// filesystem): the caller falls back to the historic truncate-only path.
-fn write_spool(cwd: &Path, full: &str) -> Option<PathBuf> {
-    let dir = spool_dir(cwd);
-    std::fs::create_dir_all(&dir).ok()?;
-    // Keep spools invisible to `git status` (and thereby to the #28a change
-    // receipt): a `*` gitignore inside the dir ignores everything in it,
-    // itself included.
-    let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        let _ = std::fs::write(&gitignore, "*\n");
+/// The spool path as SHELL COMMANDS will see it: remapped under
+/// [`Sandbox::workspace_remap_root`] when the backend mounts the workspace
+/// elsewhere (Docker: `/workspace`), the host path otherwise. Remapped paths
+/// join with `/` — they name an in-container Unix path even from a Windows
+/// host.
+fn command_visible_path(sandbox: &dyn Sandbox, spool: &Path, cwd: &Path) -> String {
+    if let Some(remap) = sandbox.workspace_remap_root() {
+        if let Ok(rel) = spool.strip_prefix(cwd) {
+            let mut s = remap.to_string_lossy().into_owned();
+            for comp in rel.components() {
+                s.push('/');
+                s.push_str(&comp.as_os_str().to_string_lossy());
+            }
+            return s;
+        }
     }
+    spool.display().to_string()
+}
+
+/// Write the (already sanitized) `full` stream to a fresh spool file under
+/// `<cwd>/.octos/tmp/shell/`, pruning the directory to [`SPOOL_KEEP`] files.
+/// Returns `None` on any I/O failure — including a symlinked path component
+/// — and the caller falls back to the historic truncate-only path.
+///
+/// Every create goes through the #1976 [`open_confined`] component-wise
+/// `O_NOFOLLOW` walk: intermediate dirs are created from the parent's fd and
+/// never through a symlink, so a pre-planted `.octos/tmp/shell` symlink
+/// fails `ELOOP` instead of redirecting the write outside the workspace.
+/// (Non-Unix uses open_confined's documented ancestor-scan fallback.)
+fn write_spool(cwd: &Path, full: &str) -> Option<PathBuf> {
+    use crate::tools::write_grant::{ConfinedLeaf, open_confined};
+
+    let rel_dir = spool_rel_dir();
+
+    // `*` gitignore first (its walk also creates the dir chain): keeps
+    // spools out of `git status` and thereby out of the #28a change receipt.
+    match open_confined(cwd, &rel_dir.join(".gitignore"), ConfinedLeaf::CreateNew) {
+        Ok(mut file) => {
+            let _ = std::io::Write::write_all(&mut file, b"*\n");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Owner-only spool dir. A path-based chmod could follow a swapped-in
+        // symlink, so re-check it is a real dir first — the same residual
+        // race class as open_confined's non-Unix fallback; the CREATE path
+        // above remains the race-free boundary.
+        let dir = cwd.join(&rel_dir);
+        if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir()) {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let seq = SHELL_SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Fixed-width stamp: lexicographic filename order == recency order, which
-    // is what `prune_spools` sorts by.
-    let path = dir.join(format!("output-{millis:013}-{seq:04}.log"));
-    // `create_new`: never write through a pre-existing file or symlink.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .ok()?;
-    std::io::Write::write_all(&mut file, full.as_bytes()).ok()?;
-    prune_spools(&dir);
-    Some(path)
+    // Fixed-width stamp: lexicographic filename order == recency order,
+    // which is what `prune_spools` sorts by.
+    for _ in 0..4 {
+        let seq = SHELL_SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rel = rel_dir.join(format!("output-{millis:013}-{seq:04}.log"));
+        let mut file = match open_confined(cwd, &rel, ConfinedLeaf::CreateNew) {
+            Ok(file) => file,
+            // Another octos process on the same workspace took this name:
+            // retry with the next sequence number rather than silently
+            // disabling the spool.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // fchmod on the open handle — race-free owner-only file.
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        if std::io::Write::write_all(&mut file, full.as_bytes()).is_err() {
+            return None;
+        }
+        let path = cwd.join(&rel);
+        prune_spools(&cwd.join(&rel_dir), &path);
+        return Some(path);
+    }
+    None
 }
 
-/// Delete the oldest `output-*.log` files beyond [`SPOOL_KEEP`].
-fn prune_spools(dir: &Path) {
+/// Delete the oldest `output-*.log` files beyond [`SPOOL_KEEP`] — never
+/// `keep`, the spool just written. Excluding `keep` from the candidates
+/// means a directory crowded with future-stamped names (which sort "newer"
+/// than any honest stamp) can never make this call delete the file whose
+/// path the caller is about to hand back. Runs only right after
+/// [`open_confined`] validated the directory chain; the remaining swap
+/// window matches open_confined's documented non-Unix residual, and the
+/// re-check below refuses to operate through a symlinked dir at all.
+fn prune_spools(dir: &Path, keep: &Path) {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir()) {
+        return;
+    }
+    let keep_name = keep.file_name();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -938,15 +1045,19 @@ fn prune_spools(dir: &Path) {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name())
         .filter(|n| {
+            if keep_name == Some(n.as_os_str()) {
+                return false;
+            }
             let n = n.to_string_lossy();
             n.starts_with("output-") && n.ends_with(".log")
         })
         .collect();
-    if names.len() <= SPOOL_KEEP {
+    let others_keep = SPOOL_KEEP.saturating_sub(1);
+    if names.len() <= others_keep {
         return;
     }
     names.sort();
-    let excess = names.len() - SPOOL_KEEP;
+    let excess = names.len() - others_keep;
     for name in names.into_iter().take(excess) {
         let _ = std::fs::remove_file(dir.join(name));
     }
@@ -970,12 +1081,12 @@ fn count_lines(s: &str) -> usize {
 /// ranges are exact; when a single line overflows its budget the cut is
 /// byte-based and the footer switches to a byte-range form rather than
 /// reporting line numbers that would be lies.
-fn spooled_view(full: &str, budget: usize, spool_path: &Path) -> String {
+fn spooled_view(full: &str, budget: usize, footer_path: &str) -> String {
     let total_lines = count_lines(full);
-    let path_disp = spool_path.display().to_string();
+    let path_disp = footer_path;
     // Conservative allowance for the omission marker + footer (digits
-    // included): marker ≤ 40B, footer ≤ 120B + path.
-    let overhead = 160 + path_disp.len();
+    // included): marker ≤ 50B, footer ≤ 140B + path.
+    let overhead = 220 + path_disp.len();
     let avail = budget.saturating_sub(overhead);
     let head_budget = avail * 7 / 10;
     let tail_budget = avail - head_budget;
@@ -1055,7 +1166,7 @@ impl Tool for ShellTool {
         // instead of re-running a big command.
         static DESC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             format!(
-                "Execute a shell command and return the output. Use this to run tests, build code, or interact with the filesystem. Output over {}KB is truncated to head and tail; when that happens the full output is saved to a temp file named in the result footer — grep or read that file instead of re-running the command.",
+                "Execute a shell command and return the output. Use this to run tests, build code, or interact with the filesystem. Output over {}KB is truncated to head and tail; when that happens the full output is saved to a file under the workspace (.octos/tmp/shell/) named in the result footer — grep or read that file instead of re-running the command.",
                 octos_core::tool_output_limit("shell") / 1000
             )
         });
@@ -1063,25 +1174,32 @@ impl Tool for ShellTool {
     }
 
     /// Belt-and-braces for the execution loop's truncation backstop (#2124):
-    /// the tool already keeps its own result under the cap by spooling, but
-    /// if the backstop still fires (e.g. a large #28a receipt pushed the
-    /// total over), the advice names the spool file holding the complete
-    /// output. Without a recorded spool the honest resume path is a re-run
-    /// redirected to a file.
+    /// the tool sizes its own result to fit the cap, but if the backstop
+    /// still fires the advice names the spool file holding the complete
+    /// output — provided that spool was written by THIS invocation
+    /// (`forget_spool` clears stale entries at the start of every run) and
+    /// still exists on disk (another session sharing the workspace may have
+    /// pruned it). Otherwise the honest resume path is a re-run redirected
+    /// to a file.
     fn truncation_recovery(
         &self,
         args: &serde_json::Value,
         omitted_bytes: usize,
     ) -> Option<String> {
         let command = args.get("command").and_then(serde_json::Value::as_str)?;
-        let spools = self.spools.lock().unwrap_or_else(|p| p.into_inner());
-        Some(match spools.iter().find(|(c, _)| c == command) {
-            Some((_, path)) => format!(
+        let recorded = {
+            let spools = self.spools.lock().unwrap_or_else(|p| p.into_inner());
+            spools
+                .iter()
+                .find(|(c, _, _)| c == command)
+                .map(|(_, host, display)| (host.clone(), display.clone()))
+        };
+        Some(match recorded {
+            Some((host, display)) if host.exists() => format!(
                 "[{omitted_bytes} bytes omitted] The complete output of this command was saved \
-                 to {} — grep or read_file that file instead of re-running the command.",
-                path.display()
+                 to {display} — grep or read_file that file instead of re-running the command."
             ),
-            None => format!(
+            _ => format!(
                 "[{omitted_bytes} bytes omitted] Re-run with output redirected to a file (e.g. \
                  `<command> > out.log 2>&1`), then grep or read the file instead of re-running \
                  for the full output."
@@ -1326,6 +1444,13 @@ impl Tool for ShellTool {
             timeout_duration = timeout_duration.min(cap);
         }
 
+        // A NEW invocation of this command starts here: whatever spool an
+        // earlier run recorded no longer describes it. Forget first; a fresh
+        // spool (in the completion arm) re-records. This keeps
+        // `truncation_recovery` from naming a stale file when this run ends
+        // small, times out, or fails to spawn.
+        self.forget_spool(&input.command);
+
         // Execute command (through sandbox).
         // Spawn the child, grab its PID, then timeout on wait_with_output().
         // If timeout fires, kill by PID to prevent orphaned processes.
@@ -1375,56 +1500,43 @@ impl Tool for ShellTool {
                     result_text = "(no output)".to_string();
                 }
 
-                // Sandbox-denial scan runs on the FULL text (the denial line
-                // may be exactly what truncation cuts); the hint is appended
-                // after truncation so it survives the cut.
+                // Sandbox-denial scan runs on the FULL raw text (the denial
+                // line may be exactly what truncation cuts); the hint is part
+                // of the suffixes below so it always survives the cut.
                 let denial_hint = crate::sandbox::sandbox_denial_hint(
                     !self.sandbox.is_noop(),
                     output.status.success(),
                     &result_text,
                 );
 
-                let exit_suffix = format!("\n\nExit code: {exit_code}");
+                // Sanitize the FULL stream ONCE, here, so the spool file and
+                // every derived view hold the same redacted bytes — the
+                // loop's own sanitize pass is a no-op on already-redacted
+                // text. Without this the model-visible copy was redacted
+                // while the on-disk spool durably kept the secrets the
+                // sanitizer exists to destroy (codex review round 2), and
+                // the footer's byte offsets described a string the loop was
+                // about to rewrite.
+                let mut result_text = crate::sanitize::sanitize_tool_output(&result_text);
 
-                // #1638 — over the per-tool cap the middle of the output (where
-                // test failures live) used to be gone forever. Spool the FULL
-                // stream to a workspace-local file and return head + tail + a
-                // footer naming the file, sized so the execution loop's
-                // backstop never re-cuts the result. If the spool cannot be
-                // written (unwritable filesystem), fall back to the historic
-                // in-tool tail cut and let the backstop apply as before.
-                let limit = octos_core::tool_output_limit(self.name());
-                if result_text.len() > limit {
-                    match write_spool(effective_cwd, &result_text) {
-                        Some(spool_path) => {
-                            let budget =
-                                limit.saturating_sub(exit_suffix.len() + SPOOL_TAIL_RESERVE);
-                            let view = spooled_view(&result_text, budget, &spool_path);
-                            self.remember_spool(&input.command, spool_path);
-                            result_text = view;
-                        }
-                        None => {
-                            const MAX_OUTPUT: usize = 50000;
-                            octos_core::truncate_utf8(
-                                &mut result_text,
-                                MAX_OUTPUT - exit_suffix.len(),
-                                "\n... (output truncated)",
-                            );
-                        }
-                    }
-                }
-
-                result_text.push_str(&exit_suffix);
+                // Assemble EVERY suffix before any size decision: exit code,
+                // sandbox-denial hint, #28a change receipt, #28b warn nudge.
+                // The spool/truncation decision is then made on the FINAL
+                // assembled size, so a large receipt can never push the
+                // result back over the cap behind the decision's back and
+                // wake the loop backstop. (The receipt's AFTER snapshot runs
+                // before the spool write; the spool dir is gitignored, so it
+                // never appears in a receipt either way.)
+                let mut suffixes = format!("\n\nExit code: {exit_code}");
                 if let Some(hint) = denial_hint {
-                    result_text.push_str(hint);
+                    suffixes.push_str(hint);
                 }
-
-                // #28a — file-change receipt: AFTER snapshot + diff,
-                // appended ONCE to THIS result's tail (never the system
-                // prompt, never a history rewrite — prompt-cache stable).
+                // #28a — file-change receipt: AFTER snapshot + diff, appended
+                // ONCE to THIS result's tail (never the system prompt, never
+                // a history rewrite — prompt-cache stable).
                 let receipt = diff_to_receipt(dirty_before, snapshot_dirty_paths(effective_cwd));
                 if let Some(receipt) = receipt.as_deref() {
-                    result_text.push_str(receipt);
+                    suffixes.push_str(receipt);
                     // #28b — warn knob: nudge ONLY when files actually
                     // changed (files_changed > 0), sharing the receipt's
                     // AFTER snapshot (no second git-status scan). Zero
@@ -1432,11 +1544,51 @@ impl Tool for ShellTool {
                     if self.bash_file_writes == BashFileWrites::Warn
                         && !receipt.trim_end().ends_with("files_changed: 0")
                     {
-                        result_text.push_str(
+                        suffixes.push_str(
                             "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
                         );
                     }
                 }
+
+                // #1638 — over the per-tool cap the middle of the output
+                // (where test failures live) used to be gone forever. Spool
+                // the full sanitized stream to a workspace-local file and
+                // return head + tail + a footer naming the file, sized so
+                // view + suffixes fit the cap exactly and the loop backstop
+                // never re-cuts the result. No spool when the profile
+                // promises a read-only/fenced workspace, when the suffixes
+                // leave no useful room, or when the write fails — those fall
+                // back to the historic in-tool tail cut (loop backstop still
+                // applies, and `truncation_recovery` then gives the honest
+                // re-run-redirected advice: `forget_spool` above cleared any
+                // stale entry for this command).
+                let limit = octos_core::tool_output_limit(self.name());
+                let budget = limit.saturating_sub(suffixes.len());
+                if result_text.len() > budget {
+                    let mut spooled = false;
+                    if budget >= SPOOL_MIN_VIEW && self.sandbox.workspace_scratch_writable() {
+                        if let Some(spool_path) = write_spool(effective_cwd, &result_text) {
+                            let display = command_visible_path(
+                                self.sandbox.as_ref(),
+                                &spool_path,
+                                effective_cwd,
+                            );
+                            result_text = spooled_view(&result_text, budget, &display);
+                            self.remember_spool(&input.command, spool_path, display);
+                            spooled = true;
+                        }
+                    }
+                    if !spooled {
+                        const MAX_OUTPUT: usize = 50000;
+                        octos_core::truncate_utf8(
+                            &mut result_text,
+                            MAX_OUTPUT.saturating_sub(suffixes.len()),
+                            "\n... (output truncated)",
+                        );
+                    }
+                }
+
+                result_text.push_str(&suffixes);
 
                 Ok(ToolResult {
                     output: result_text,
@@ -3153,7 +3305,7 @@ mod spool_tests {
         // One giant unterminated line: no line boundary fits either budget,
         // so line numbers would be lies — the footer must switch to the
         // byte-range form and the view must still respect the budget.
-        let spool = std::path::Path::new("/tmp/spool-under-test.log");
+        let spool = "/tmp/spool-under-test.log";
         let full = "x".repeat(100_000);
         let view = spooled_view(&full, 5_000, spool);
         assert!(
@@ -3174,7 +3326,7 @@ mod spool_tests {
 
     #[test]
     fn should_keep_view_within_budget_when_line_data_spooled() {
-        let spool = std::path::Path::new("/tmp/spool-under-test.log");
+        let spool = "/tmp/spool-under-test.log";
         let full: String = (1..=5_000).map(|i| format!("entry number {i}\n")).collect();
         let budget = 8_000;
         let view = spooled_view(&full, budget, spool);
@@ -3203,5 +3355,318 @@ mod spool_tests {
             desc.contains("full output is saved"),
             "description states the spool contract: {desc}"
         );
+    }
+
+    // ── codex review round 2 ────────────────────────────────────────────
+
+    /// Sandbox stub for profiles that promise a read-only workspace: runs
+    /// commands directly (like NoSandbox) but reports scratch unwritable.
+    struct ReadOnlyWorkspaceSandbox;
+
+    impl crate::sandbox::Sandbox for ReadOnlyWorkspaceSandbox {
+        fn wrap_command(&self, shell_command: &str, cwd: &Path) -> tokio::process::Command {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(shell_command).current_dir(cwd);
+            cmd
+        }
+        fn workspace_scratch_writable(&self) -> bool {
+            false
+        }
+    }
+
+    /// Sandbox stub for backends that remap the workspace for commands
+    /// (Docker mounts the cwd at /workspace).
+    struct RemappingSandbox;
+
+    impl crate::sandbox::Sandbox for RemappingSandbox {
+        fn wrap_command(&self, shell_command: &str, cwd: &Path) -> tokio::process::Command {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(shell_command).current_dir(cwd);
+            cmd
+        }
+        fn workspace_remap_root(&self) -> Option<&Path> {
+            Some(Path::new("/workspace"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_sanitize_stream_before_persisting_spool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        // A credential in the stream followed by >cap filler. Loop-level
+        // sanitization redacts what reaches the model; the spool must hold
+        // the SAME redacted stream — persisting the raw one would durably
+        // keep the secret the sanitizer exists to destroy.
+        let cmd = "echo sk-testsecretsecretsecret12345; awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"fill \" i }'";
+        let out = run(&tool, cmd);
+        assert!(out.success, "output: {}", out.output);
+        let path = footer_path(&out.output);
+        let spooled = std::fs::read_to_string(&path).expect("read spool");
+        assert!(
+            !spooled.contains("sk-testsecretsecretsecret12345"),
+            "raw credential persisted to disk — the spool must store the sanitized stream"
+        );
+        assert!(
+            spooled.contains("[credential-redacted]"),
+            "spool must carry the redaction marker: {}",
+            &spooled[..200]
+        );
+        assert!(
+            !out.output.contains("sk-testsecretsecretsecret12345"),
+            "inline view must be redacted too"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_restrict_spool_permissions_when_persisting() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        let out = run(
+            &tool,
+            "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"perm \" i }'",
+        );
+        let path = footer_path(&out.output);
+        let file_mode = std::fs::metadata(&path)
+            .expect("spool metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            file_mode & 0o777,
+            0o600,
+            "spool file must be owner-only (0600), got {:o}",
+            file_mode & 0o777
+        );
+        let dir_mode = std::fs::metadata(path.parent().expect("spool dir"))
+            .expect("dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "spool dir must be owner-only (0700), got {:o}",
+            dir_mode & 0o777
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_spool_when_workspace_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path()).with_sandbox(Box::new(ReadOnlyWorkspaceSandbox));
+        let out = run(
+            &tool,
+            "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"ro \" i }'",
+        );
+        assert!(out.success, "output: {}", out.output);
+        // The profile promised the model a read-only workspace: the harness
+        // must not mutate it from the host either. Historic cut instead.
+        assert!(
+            !temp.path().join(".octos").exists(),
+            "read-only workspace must not gain a spool dir"
+        );
+        assert!(
+            !out.output.contains("Full output:"),
+            "no footer without a spool: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("(output truncated)"),
+            "historic in-tool cut must apply: {}",
+            out.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_include_receipt_in_budget_when_receipt_present() {
+        // A large #28a receipt (20 long paths) must be part of the size the
+        // spool decision is made on — otherwise the execution loop's backstop
+        // re-cuts the assembled result and buries the footer.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd)
+            .status()
+            .expect("git init");
+        let tool = ShellTool::new(cwd);
+        let long = "f".repeat(120);
+        let cmd = format!(
+            "i=1; while [ $i -le 20 ]; do echo x > {long}$i.txt; i=$((i+1)); done; \
+             awk 'BEGIN {{ for (i = 1; i <= 9000; i++) print \"z \" i }}'"
+        );
+        let out = run(&tool, &cmd);
+        assert!(out.success, "output: {}", out.output);
+        assert!(
+            out.output.contains("files_changed:"),
+            "receipt present: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("Full output: "),
+            "footer present: {}",
+            out.output
+        );
+        let limit = octos_core::tool_output_limit("shell");
+        assert!(
+            out.output.len() <= limit,
+            "assembled result (view + receipt + suffixes) must fit the {limit}B cap so the \
+             loop backstop never re-cuts it, got {}",
+            out.output.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_fall_back_to_generic_advice_when_spool_file_deleted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path());
+        let cmd = "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"del \" i }'";
+        let out = run(&tool, cmd);
+        let path = footer_path(&out.output);
+        std::fs::remove_file(&path).expect("delete spool");
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "command": cmd }), 77)
+            .expect("advice");
+        assert!(
+            !advice.contains(&path.display().to_string()),
+            "advice must never name a deleted file: {advice}"
+        );
+        assert!(
+            advice.contains("2>&1"),
+            "fallback to the honest re-run advice: {advice}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_forget_stale_spool_when_command_reruns_without_spooling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let big: String = (1..=9000).map(|i| format!("data {i}\n")).collect();
+        std::fs::write(temp.path().join("data.txt"), &big).expect("seed data");
+        let tool = ShellTool::new(temp.path());
+        let cmd = "cat data.txt";
+
+        // First run spools.
+        let out = run(&tool, cmd);
+        let path = footer_path(&out.output);
+        assert!(path.exists());
+
+        // Re-run the SAME command with small output: the latest invocation
+        // did not spool, so the old entry no longer describes this command.
+        std::fs::write(temp.path().join("data.txt"), "small\n").expect("shrink data");
+        let out2 = run(&tool, cmd);
+        assert!(!out2.output.contains("Full output:"), "{}", out2.output);
+        let advice = tool
+            .truncation_recovery(&serde_json::json!({ "command": cmd }), 55)
+            .expect("advice");
+        assert!(
+            !advice.contains(&path.display().to_string()),
+            "advice must not name a previous invocation's spool: {advice}"
+        );
+        assert!(advice.contains("2>&1"), "generic advice expected: {advice}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_keep_fresh_spool_when_future_stamped_files_crowd_the_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join(".octos").join("tmp").join("shell");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Future-stamped names sort NEWER than any real stamp: a
+        // lexicographic prune that trusts names would delete the fresh spool
+        // it is about to hand back.
+        for i in 0..16 {
+            std::fs::write(
+                dir.join(format!("output-9999999999999-{i:04}.log")),
+                "crowd\n",
+            )
+            .expect("seed");
+        }
+        let tool = ShellTool::new(temp.path());
+        let out = run(
+            &tool,
+            "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"keep \" i }'",
+        );
+        let path = footer_path(&out.output);
+        assert!(
+            path.exists(),
+            "the fresh spool must survive its own prune: {}",
+            path.display()
+        );
+        let expected: String = (1..=9000).map(|i| format!("keep {i}\n")).collect();
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read spool"),
+            expected,
+            "the surviving file must be THIS run's output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_spool_when_spool_dir_is_symlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::fs::create_dir_all(temp.path().join(".octos").join("tmp")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            temp.path().join(".octos").join("tmp").join("shell"),
+        )
+        .expect("plant symlink");
+        let tool = ShellTool::new(temp.path());
+        let out = run(
+            &tool,
+            "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"sym \" i }'",
+        );
+        assert!(out.success, "output: {}", out.output);
+        // Nothing may be written through the planted symlink, and with no
+        // spool there is no footer — the historic cut applies.
+        assert_eq!(
+            std::fs::read_dir(outside.path())
+                .expect("read outside")
+                .count(),
+            0,
+            "a planted spool-dir symlink must not redirect writes outside the workspace"
+        );
+        assert!(
+            !out.output.contains("Full output:"),
+            "no footer without a spool: {}",
+            out.output
+        );
+        assert!(out.output.contains("(output truncated)"), "{}", out.output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_emit_remapped_footer_path_when_sandbox_remaps_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tool = ShellTool::new(temp.path()).with_sandbox(Box::new(RemappingSandbox));
+        let out = run(
+            &tool,
+            "awk 'BEGIN { for (i = 1; i <= 9000; i++) print \"map \" i }'",
+        );
+        assert!(out.success, "output: {}", out.output);
+        // The footer must name the path AS COMMANDS SEE IT (Docker mounts
+        // the cwd at /workspace); a host-absolute path is unusable there.
+        assert!(
+            out.output
+                .contains("Full output: /workspace/.octos/tmp/shell/output-"),
+            "footer must use the remapped path: {}",
+            out.output
+        );
+        // The spool itself still lands on the host, under the workspace.
+        let host_dir = temp.path().join(".octos").join("tmp").join("shell");
+        let spool_count = std::fs::read_dir(&host_dir)
+            .expect("spool dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("output-") && n.ends_with(".log")
+            })
+            .count();
+        assert_eq!(spool_count, 1, "exactly this run's spool on the host");
     }
 }

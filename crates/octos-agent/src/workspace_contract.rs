@@ -395,6 +395,13 @@ fn resolve_glob_matches(
         if !path.is_file() {
             continue;
         }
+        // #1638 — shell output spools are internal working state (complete
+        // command output kept so the model can grep past its cap), never
+        // deliverable artifacts. Globbing ignores gitignore, so a broad
+        // pattern like `**/*.log` would otherwise bundle them.
+        if octos_core::is_shell_spool_path(&path) {
+            continue;
+        }
         if started_at.is_some() {
             let modified = std::fs::metadata(&path)
                 .and_then(|meta| meta.modified())
@@ -870,6 +877,28 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::{Tool, ToolRegistry, ToolResult, WorkspacePolicy, write_workspace_policy};
+
+    #[test]
+    fn should_exclude_shell_spool_files_from_artifact_globs() {
+        // Spool files hold complete command output (#1638) and are internal
+        // working state; a contract glob like `**/*.log` must never surface
+        // them as deliverable artifacts.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("keep.log"), "artifact\n").unwrap();
+        let spool_dir = ws.path().join(".octos").join("tmp").join("shell");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(spool_dir.join("output-0000000000001-0000.log"), "spool\n").unwrap();
+
+        let matches = resolve_glob_matches(ws.path(), "**/*.log", None).expect("glob");
+        assert!(
+            matches.iter().any(|p| p.ends_with("keep.log")),
+            "real artifacts still match: {matches:?}"
+        );
+        assert!(
+            matches.iter().all(|p| !octos_core::is_shell_spool_path(p)),
+            "shell spool files must not surface as artifacts: {matches:?}"
+        );
+    }
 
     #[derive(Clone, Default)]
     struct CaptureSendFileTool {

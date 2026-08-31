@@ -38,6 +38,24 @@ impl Sandbox for DockerSandbox {
         true
     }
 
+    fn workspace_scratch_writable(&self) -> bool {
+        // `:ro` mounts promise the shell a read-only workspace (a #1976
+        // fence degrades ReadWrite to ReadOnly at construction —
+        // `fence_degraded_docker`), so the harness must not spool into it.
+        // `None` never mounts the workspace at all: nothing was promised
+        // about the host tree, which other tools keep writing normally.
+        self.config.mount_mode != MountMode::ReadOnly
+    }
+
+    fn workspace_remap_root(&self) -> Option<&Path> {
+        // Commands see the cwd bind-mounted at /workspace (`wrap_command`);
+        // with no mount there is no in-container view at all.
+        match self.config.mount_mode {
+            MountMode::ReadWrite | MountMode::ReadOnly => Some(Path::new("/workspace")),
+            MountMode::None => None,
+        }
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let mut cmd = Command::new("docker");
         cmd.arg("run").arg("--rm");

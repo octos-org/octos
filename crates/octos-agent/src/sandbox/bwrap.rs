@@ -27,6 +27,13 @@ pub struct BwrapSandbox {
 }
 
 impl Sandbox for BwrapSandbox {
+    fn workspace_scratch_writable(&self) -> bool {
+        // A #1976 fence already degraded `workspace_write` to `false` at
+        // construction (`fence_degraded_workspace_write`), so this single
+        // flag covers both the read-only profile and the fenced one.
+        self.workspace_write
+    }
+
     fn supports_repo_git_write(&self) -> bool {
         // bwrap can `--bind <repo>/.git <repo>/.git` (rw) and read-binds the
         // system dirs, so a Host-granted worker gets both the `.git` write AND the
