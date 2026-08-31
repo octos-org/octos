@@ -1963,6 +1963,19 @@
       "ds_output": 0
     },
     {
+      "provider": "zai/glm-5.3-flash",
+      "type": "fast",
+      "cost_in": 0.15,
+      "cost_out": 0.5,
+      "context_window": 1000000,
+      "max_output": 131072,
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0
+    },
+    {
       "provider": "zhipu/glm-4-air",
       "type": "fast",
       "stability": 1.0,
@@ -2088,6 +2101,27 @@
       "provider": "zai-coding/glm-5.3",
       "type": "strong",
       "default": true,
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 200000,
+      "max_output": 131072,
+      "endpoints": [
+        {
+          "id": "zai-coding",
+          "label": "GLM Coding Plan",
+          "base_url": "https://api.z.ai/api/anthropic",
+          "api_key_env": "ZAI_API_KEY"
+        }
+      ]
+    },
+    {
+      "provider": "zai-coding/glm-5.3-flash",
+      "type": "fast",
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
