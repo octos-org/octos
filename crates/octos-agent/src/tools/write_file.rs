@@ -22,6 +22,10 @@ pub struct WriteFileTool {
     /// #1976 — optional per-path write fence. `None` (default, every
     /// pre-#1976 construction) = writes governed by scope/access alone.
     write_grant: Option<WritePathGrant>,
+    /// Partial-view overwrite guard (#1638), armed with windowed reads.
+    /// `None` = the `OCTOS_READ_WINDOW` env flag decides (production);
+    /// `Some` = explicit, for tests.
+    window_enforcement: Option<bool>,
 }
 
 impl WriteFileTool {
@@ -32,7 +36,23 @@ impl WriteFileTool {
             filesystem_scope: FilesystemScope::Workspace,
             file_access: FileAccessMode::ReadWrite,
             write_grant: None,
+            window_enforcement: None,
         }
+    }
+
+    /// Test-only arming override for the partial-view overwrite guard — see
+    /// `ReadFileTool::with_window_enforcement` for why this is per-instance
+    /// rather than process-global.
+    #[cfg(test)]
+    pub(crate) fn with_window_enforcement(mut self, armed: bool) -> Self {
+        self.window_enforcement = Some(armed);
+        self
+    }
+
+    /// Whether the partial-view overwrite guard is armed for this instance.
+    fn window_armed(&self) -> bool {
+        self.window_enforcement
+            .unwrap_or_else(super::read_window::armed_from_env)
     }
 
     /// Set the effective filesystem scope.
@@ -75,8 +95,13 @@ impl Tool for WriteFileTool {
         "write_file"
     }
 
+    // #1638 (d): mode-neutral guidance — reconstructing a partially-read file
+    // is destructive in every mode; the armed guard merely enforces what this
+    // sentence advises.
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, or overwrites if it does."
+        "Write content to a file. Creates the file if it doesn't exist, or overwrites if it \
+         does. Overwrites the ENTIRE file: never write back a file you have only partially \
+         read — finish reading it first, or use edit_file/apply_patch for targeted changes."
     }
 
     fn tags(&self) -> &[&str] {
@@ -185,6 +210,44 @@ impl Tool for WriteFileTool {
             }
         }
 
+        // #1638 (c): armed partial-view overwrite guard. When windowed reads
+        // are armed, `read_file` can have shown the model only PART of this
+        // file — and write_file reconstructs from whatever the model saw, so
+        // a whole-file overwrite from a partial view destroys the tail nobody
+        // saw (the slides workflow does exactly read → rebuild → write_file).
+        // The patch tools are safe (they re-read the full file themselves),
+        // which is exactly the escape hatch the refusal names. Sits BEFORE
+        // the write fence and any disk mutation; the #2126 probe block above
+        // stays observe-only and untouched.
+        if self.window_armed() && path.exists() {
+            if let Some(partial) = super::read_window::partial_view_of(&path) {
+                let coverage = if partial.seen_through > 0 {
+                    format!(
+                        "lines 1-{} of {} contiguously",
+                        partial.seen_through, partial.total_lines
+                    )
+                } else {
+                    format!("a fragment of its {} lines", partial.total_lines)
+                };
+                return Ok(ToolResult {
+                    output: format!(
+                        "{} write_file refused: read_file has shown you only part of {} ({}), \
+                         and overwriting the whole file from a partial view would destroy the \
+                         part you have not seen. Either finish reading it first (read_file with \
+                         offset until you have seen line {}) and then retry, or make targeted \
+                         changes with edit_file / diff_edit / apply_patch, which read the full \
+                         file themselves.",
+                        super::read_window::PARTIAL_VIEW_OVERWRITE_PREFIX,
+                        input.path,
+                        coverage,
+                        partial.total_lines,
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         // #1976 — per-path write fence. SECURITY ROUND (codex): the allowlist
         // decision and the actual open must target the SAME resolved object,
         // or an attacker who swaps a checked ancestor dir for a symlink
@@ -285,6 +348,14 @@ impl Tool for WriteFileTool {
                     "workspace git snapshot failed after write_file"
                 );
             }
+        }
+
+        // #1638 (c): a successful whole-file write makes the on-disk content
+        // exactly what the model supplied — any partial-view mark for the
+        // path is obsolete, and keeping it would refuse the model's next
+        // legitimate overwrite of its own content.
+        if self.window_armed() {
+            super::read_window::note_full_write(&path);
         }
 
         let line_count = input.content.lines().count();
@@ -960,5 +1031,219 @@ mod tests {
             "write_file must invalidate the cached entry"
         );
         assert_eq!(cache.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1638 (c): the partial-view overwrite guard, armed with windowed reads.
+    // Both tools are armed per instance (never process-globally); every test
+    // asserts on files it created itself.
+    // -----------------------------------------------------------------------
+
+    use crate::tools::read_file::ReadFileTool;
+
+    /// 1500 x 100-byte lines — windows at 450 lines per page when armed.
+    fn big_rows(dir: &std::path::Path, name: &str) -> String {
+        let content = (1..=1500)
+            .map(|i| format!("row {i:06}{}", "z".repeat(90)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join(name), &content).unwrap();
+        content
+    }
+
+    #[tokio::test]
+    async fn should_refuse_whole_overwrite_after_partial_read_then_allow_after_paging_through() {
+        // The slides workflow reads a script, reconstructs it whole, and
+        // write_files it back. Under a windowed read that becomes a
+        // destructive partial overwrite of a tail the model never saw — the
+        // guard must refuse it, and its "page through first" advice must be
+        // truthful: after paging to EOF the same write must succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let original = big_rows(dir.path(), "script.js");
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        // Windowed read: the model has seen lines 1-450 of 1500.
+        let page1 = read
+            .execute(&serde_json::json!({"path": "script.js"}))
+            .await
+            .unwrap();
+        assert!(page1.success && page1.output.contains("showing lines 1-450 of 1500"));
+
+        // Whole-file overwrite from that partial view must be refused...
+        let refused = write
+            .execute(&serde_json::json!({"path": "script.js", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            !refused.success,
+            "overwriting from a partial view must be refused: {}",
+            refused.output
+        );
+        assert!(
+            refused.output.contains("[PARTIAL_VIEW_OVERWRITE]"),
+            "the refusal must be typed: {}",
+            refused.output
+        );
+        assert!(
+            refused.output.contains("edit_file") && refused.output.contains("apply_patch"),
+            "the refusal must name the safe alternatives: {}",
+            refused.output
+        );
+        assert!(
+            refused.output.contains("offset"),
+            "the refusal must tell the model how to finish reading: {}",
+            refused.output
+        );
+        // ...and must not have touched the file.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("script.js")).unwrap(),
+            original,
+            "a refused overwrite must leave the file intact"
+        );
+
+        // Page through to EOF the way the refusal advises.
+        let mut next = 451usize;
+        for _ in 0..10 {
+            let page = read
+                .execute(&serde_json::json!({"path": "script.js", "offset": next}))
+                .await
+                .unwrap();
+            assert!(page.success, "{}", page.output);
+            match page
+                .output
+                .split("offset: ")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(n) => next = n,
+                None => break, // no continuation footer — EOF reached
+            }
+        }
+
+        // Now the model has seen the whole file; the same write must pass.
+        let allowed = write
+            .execute(&serde_json::json!({"path": "script.js", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            allowed.success,
+            "after paging through the file, the guard's own advice must \
+             unlock the write: {}",
+            allowed.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("script.js")).unwrap(),
+            "rebuilt\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_allow_overwrite_after_a_complete_unbounded_read_when_armed() {
+        // A file that fits the window is returned whole; overwriting it is
+        // exactly as safe as before.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), "one\ntwo\nthree\n").unwrap();
+        let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let r = read
+            .execute(&serde_json::json!({"path": "small.txt"}))
+            .await
+            .unwrap();
+        assert!(r.success && r.output.contains("three"));
+
+        let w = write
+            .execute(&serde_json::json!({"path": "small.txt", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            w.success,
+            "a fully-seen file must remain overwritable: {}",
+            w.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_allow_creating_a_new_file_when_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let w = write
+            .execute(&serde_json::json!({"path": "brand_new.txt", "content": "hello\n"}))
+            .await
+            .unwrap();
+        assert!(
+            w.success,
+            "creating a new file is never a partial overwrite"
+        );
+        assert!(dir.path().join("brand_new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn should_allow_overwriting_a_never_read_file_when_armed() {
+        // The guard requires partial-READ evidence; a blind overwrite of an
+        // existing file is today's documented write_file semantics.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blind.txt"), "old\n").unwrap();
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let w = write
+            .execute(&serde_json::json!({"path": "blind.txt", "content": "new\n"}))
+            .await
+            .unwrap();
+        assert!(w.success, "{}", w.output);
+    }
+
+    #[tokio::test]
+    async fn should_not_guard_when_unarmed_even_after_a_partial_read() {
+        // Unarmed behaviour is byte-identical to before: a ranged read
+        // followed by a whole overwrite goes through untouched.
+        let dir = tempfile::tempdir().unwrap();
+        big_rows(dir.path(), "dormant.txt");
+        let read = ReadFileTool::new(dir.path());
+        let write = WriteFileTool::new(dir.path());
+
+        let r = read
+            .execute(&serde_json::json!({"path": "dormant.txt", "start_line": 1, "end_line": 5}))
+            .await
+            .unwrap();
+        assert!(r.success);
+
+        let w = write
+            .execute(&serde_json::json!({"path": "dormant.txt", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(w.success, "the unarmed path must not change: {}", w.output);
+        assert!(w.output.contains("Successfully wrote"));
+    }
+
+    #[tokio::test]
+    async fn should_not_track_views_when_the_read_is_unarmed() {
+        // An UNARMED read must record nothing — otherwise an armed writer
+        // elsewhere in the process would start refusing on evidence gathered
+        // while the feature was off (the probe's "disarmed records nothing"
+        // rule, applied to the ledger).
+        let dir = tempfile::tempdir().unwrap();
+        big_rows(dir.path(), "untracked.txt");
+        let read = ReadFileTool::new(dir.path()); // unarmed
+        let write = WriteFileTool::new(dir.path()).with_window_enforcement(true);
+
+        let r = read
+            .execute(&serde_json::json!({"path": "untracked.txt", "start_line": 1, "end_line": 5}))
+            .await
+            .unwrap();
+        assert!(r.success);
+
+        let w = write
+            .execute(&serde_json::json!({"path": "untracked.txt", "content": "rebuilt\n"}))
+            .await
+            .unwrap();
+        assert!(
+            w.success,
+            "no armed read happened, so there is no partial-view evidence: {}",
+            w.output
+        );
     }
 }
