@@ -28,6 +28,9 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     requires_base_url: false,
     requires_model: false,
     detect_patterns: &[],
+    model_discovery: crate::discovery::ModelDiscovery::Unsupported(
+        "Vertex AI lists models through project-scoped, service-account APIs - enter the model id manually",
+    ),
     create,
 };
 

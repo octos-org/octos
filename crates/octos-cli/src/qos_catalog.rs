@@ -925,8 +925,7 @@ mod tests {
         assert_eq!(
             lane_keys.len(),
             2,
-            "broken fallback should be skipped via warn!, leaving 2 lanes; got {:?}",
-            lane_keys
+            "broken fallback should be skipped via warn!, leaving 2 lanes; got {lane_keys:?}"
         );
         let stub_key = lane_keys
             .iter()

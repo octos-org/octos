@@ -19,6 +19,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     requires_model: false,
     // Ollama hosts user-pulled models — no detect pattern.
     detect_patterns: &[],
+    model_discovery: crate::discovery::OPENAI_MODELS,
     create,
 };
 

@@ -57,8 +57,7 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> Result<Pa
     if !memory_path.exists() {
         let today = chrono::Utc::now().format("%Y-%m-%d");
         let memory = format!(
-            "# {} -- Slides Project\n\n## Style decisions\n\n## User preferences\n\n## Current state\n- Created: {}\n- Slides: 0\n",
-            project_name, today
+            "# {project_name} -- Slides Project\n\n## Style decisions\n\n## User preferences\n\n## Current state\n- Created: {today}\n- Slides: 0\n"
         );
         std::fs::write(&memory_path, &memory)
             .map_err(|e| format!("write slides memory.md failed: {e}"))?;

@@ -13,6 +13,7 @@ pub mod content_classifier;
 pub mod context;
 mod context_override;
 pub mod credential_pool;
+pub mod discovery;
 pub mod embedding;
 mod failover;
 mod fallback;

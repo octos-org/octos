@@ -315,8 +315,7 @@ async fn should_kill_child_process_on_validator_timeout() {
 
     assert!(
         elapsed < Duration::from_secs(10),
-        "runner must kill child and return before sleep finishes; elapsed = {:?}",
-        elapsed
+        "runner must kill child and return before sleep finishes; elapsed = {elapsed:?}"
     );
 
     let outcome = &outcomes[0];

@@ -74,10 +74,7 @@ impl Updater {
 
     /// Check the latest release on GitHub.
     pub async fn check_latest(&self) -> Result<ReleaseInfo> {
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            GITHUB_REPO
-        );
+        let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
         let resp: serde_json::Value = self
             .github_get(&url)
             .send()
@@ -93,10 +90,7 @@ impl Updater {
 
     /// Fetch a specific release by tag (e.g. "v0.2.0").
     pub async fn check_version(&self, tag: &str) -> Result<ReleaseInfo> {
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/tags/{}",
-            GITHUB_REPO, tag
-        );
+        let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}");
         let resp: serde_json::Value = self
             .github_get(&url)
             .send()

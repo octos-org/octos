@@ -1794,11 +1794,11 @@ impl ValidatorRunner {
         let path = self.evidence_root.join(filename);
 
         let mut buffer = String::new();
-        buffer.push_str(&format!("validator_id={}\n", validator_id));
+        buffer.push_str(&format!("validator_id={validator_id}\n"));
         buffer.push_str(&format!("phase={}\n", invocation.phase.as_str()));
         buffer.push_str(&format!("repo_label={}\n", invocation.repo_label));
         if let Some(code) = exit_code {
-            buffer.push_str(&format!("exit_code={}\n", code));
+            buffer.push_str(&format!("exit_code={code}\n"));
         }
         buffer.push_str("---stdout---\n");
         buffer.push_str(&truncate_tail(stdout, MAX_EVIDENCE_BYTES / 2));

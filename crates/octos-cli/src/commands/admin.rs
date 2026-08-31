@@ -164,7 +164,7 @@ impl Executable for AdminCommand {
                 println!("  ID:         {}", tenant.id);
                 println!("  Subdomain:  {}.{}", tenant.subdomain, domain);
                 println!("  SSH port:   {}", tenant.ssh_port);
-                println!("  Auth token: {}", auth_token);
+                println!("  Auth token: {auth_token}");
                 println!();
                 println!("Bootstrap the Mac Mini:");
                 println!(
@@ -174,7 +174,7 @@ impl Executable for AdminCommand {
                 println!();
                 println!("Dashboard will be at:");
                 println!("  http://{}.{}", tenant.subdomain, domain);
-                println!("  Auth token: {}", auth_token);
+                println!("  Auth token: {auth_token}");
 
                 Ok(())
             }
@@ -459,7 +459,7 @@ fn render_collection_section(output: &mut String, summary: &serde_json::Value) {
             .get(key)
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        writeln!(output, "  {:<28} {}", label, value).unwrap();
+        writeln!(output, "  {label:<28} {value}").unwrap();
     }
 
     let partial = collection
@@ -535,8 +535,7 @@ fn render_source_activity_section(output: &mut String, summary: &serde_json::Val
 
         writeln!(
             output,
-            "  {:<24} pid={} api={} scrape={} samples={} uptime={} {}",
-            label, pid, api_port, scrape_status, sample_count, uptime, totals
+            "  {label:<24} pid={pid} api={api_port} scrape={scrape_status} samples={sample_count} uptime={uptime} {totals}"
         )
         .unwrap();
 
@@ -598,7 +597,7 @@ fn render_breakdown_section(
             .map(|(name, value)| format!("{name}={}", value.as_str().unwrap_or("unknown")))
             .collect::<Vec<_>>()
             .join(", ");
-        writeln!(output, "  {:<48} {}", dims, count).unwrap();
+        writeln!(output, "  {dims:<48} {count}").unwrap();
     }
 }
 

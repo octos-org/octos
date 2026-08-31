@@ -358,12 +358,7 @@ impl Tool for ReadFileTool {
 
         for (idx, line) in lines[start..end].iter().enumerate() {
             let line_num = start + idx + 1;
-            output.push_str(&format!(
-                "{:>width$}│ {}\n",
-                line_num,
-                line,
-                width = line_num_width
-            ));
+            output.push_str(&format!("{line_num:>line_num_width$}│ {line}\n"));
         }
 
         // Add file info

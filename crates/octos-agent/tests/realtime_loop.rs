@@ -252,8 +252,7 @@ async fn should_abort_iteration_when_heartbeat_stalled() {
     let agent_err = err.downcast_ref::<AgentError>();
     assert!(
         matches!(agent_err, Some(AgentError::HeartbeatStalled { .. })),
-        "expected HeartbeatStalled error, got {:?}",
-        err
+        "expected HeartbeatStalled error, got {err:?}"
     );
 }
 

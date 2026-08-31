@@ -607,8 +607,7 @@ async fn test_context_window_override_subagent() {
         .map(|i| Message {
             role: octos_core::MessageRole::User,
             content: format!(
-                "This is message number {} with padding text to consume tokens in context window.",
-                i
+                "This is message number {i} with padding text to consume tokens in context window."
             ),
             media: vec![],
             tool_calls: None,

@@ -1201,10 +1201,39 @@ pub async fn provider_models(
             "base_url targets a link-local/metadata address".into(),
         ));
     }
-    let models = fetch_provider_models(&req.provider, &api_key, req.base_url.as_deref())
-        .await
-        .unwrap_or_default();
-    Ok(Json(models))
+    // Protocol-aware discovery shared with the AppUI `profile/llm/
+    // fetch_models` surface — the strategy resolves from the route (api_type
+    // override, then the family's declared protocol), never from the literal
+    // family id, so the two clients cannot drift.
+    let discovery =
+        octos_llm::discovery::resolve_model_discovery(Some(&req.provider), req.api_type.as_deref());
+    let outcome = octos_llm::discovery::discover_models(
+        discovery,
+        &api_key,
+        req.base_url.as_deref(),
+        Some(&req.provider),
+    )
+    .await;
+    match outcome {
+        // Success — including an empty catalog, which is data, not an error.
+        octos_llm::discovery::DiscoveryOutcome::Discovered(models) => Ok(Json(models)),
+        // Advisory: this family has no model-list endpoint. Not an error —
+        // manual model-id entry, Test, and Save stay fully available, and the
+        // dashboard treats an empty list as "nothing to suggest".
+        octos_llm::discovery::DiscoveryOutcome::Unsupported(_) => Ok(Json(Vec::new())),
+        other => Err((
+            if other.status_label() == "rate_limited" {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            format!(
+                "{}: {}",
+                other.status_label(),
+                other.message().unwrap_or_default()
+            ),
+        )),
+    }
 }
 
 /// Fetch available models from a provider's /v1/models endpoint.
@@ -1232,49 +1261,6 @@ fn base_url_targets_link_local(base_url: &str) -> bool {
         }
         Err(_) => false,
     }
-}
-
-pub(crate) async fn fetch_provider_models(
-    provider: &str,
-    api_key: &str,
-    base_url: Option<&str>,
-) -> Option<Vec<String>> {
-    let base = base_url
-        .map(|u| u.trim_end_matches('/').to_string())
-        .or_else(|| {
-            octos_llm::registry::lookup(provider)
-                .and_then(|e| e.default_base_url.map(|u| u.to_string()))
-        })?;
-    let base_trimmed = base.trim_end_matches("/v1").trim_end_matches("/v1/");
-    let url = if provider == "anthropic" {
-        format!("{base}/v1/models")
-    } else {
-        format!("{base_trimmed}/v1/models")
-    };
-    let client = reqwest::Client::new();
-    let mut req = client.get(&url).timeout(std::time::Duration::from_secs(10));
-    if provider == "anthropic" {
-        req = req
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
-    } else if !api_key.is_empty() {
-        // Keyless families pass an empty key — suppress the header instead of
-        // sending a literal `Bearer ` (mirrors test_provider's factory path).
-        req = req.header("Authorization", format!("Bearer {api_key}"));
-    }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("data").and_then(|d| d.as_array()).map(|arr| {
-        let mut ids: Vec<String> = arr
-            .iter()
-            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .collect();
-        ids.sort();
-        ids
-    })
 }
 
 /// Merge a request body's `config` object into an existing profile config.
@@ -1400,6 +1386,10 @@ pub struct TestProviderRequest {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Route protocol override for model discovery (`"anthropic"` switches the
+    /// listing strategy); absent means the family's declared protocol.
+    #[serde(default)]
+    pub api_type: Option<String>,
     #[serde(default)]
     pub profile_id: Option<String>,
 }

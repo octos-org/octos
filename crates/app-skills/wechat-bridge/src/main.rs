@@ -47,7 +47,7 @@ struct Args {
 
 /// Emit a JSON event to stdout (read by ProcessManager).
 fn emit(event: &serde_json::Value) {
-    println!("{}", event);
+    println!("{event}");
 }
 
 struct BridgeState {

@@ -4348,7 +4348,6 @@ async fn spawn_falls_back_to_legacy_cwd_when_no_scope() {
     let captured = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(
         captured.is_none(),
-        "without a parent scope the child Agent must NOT synthesise one; observed={:?}",
-        captured
+        "without a parent scope the child Agent must NOT synthesise one; observed={captured:?}"
     );
 }

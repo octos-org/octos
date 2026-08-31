@@ -248,7 +248,7 @@ impl Tool for GrepTool {
             })
         } else {
             let truncated = if count >= limit {
-                format!(" (limited to {})", limit)
+                format!(" (limited to {limit})")
             } else {
                 String::new()
             };
@@ -282,14 +282,14 @@ fn run_grep(
 
     // Compile regex.
     let regex_pattern = if ignore_case {
-        format!("(?i){}", pattern_str)
+        format!("(?i){pattern_str}")
     } else {
         pattern_str.clone()
     };
     let regex = RegexBuilder::new(&regex_pattern)
         .size_limit(1 << 20) // 1 MB compiled regex limit (prevents ReDoS)
         .build()
-        .wrap_err_with(|| format!("invalid regex: {}", pattern_str))?;
+        .wrap_err_with(|| format!("invalid regex: {pattern_str}"))?;
 
     // Compile the file-name glob once and fail loudly on an invalid pattern.
     // Previously an uncompilable glob was silently ignored, causing grep to
@@ -396,7 +396,7 @@ fn run_grep(
                     let start = line_num.saturating_sub(context);
                     let end = (line_num + context + 1).min(lines.len());
 
-                    let mut ctx_output = format!("{}:\n", rel_path);
+                    let mut ctx_output = format!("{rel_path}:\n");
                     for (i, ctx_line) in lines[start..end].iter().enumerate() {
                         let actual_line = start + i;
                         let marker = if actual_line == line_num { ">" } else { " " };

@@ -945,18 +945,15 @@ mod tests {
             .collect();
         assert!(
             kept_ids.contains(&"call_a"),
-            "resolved call_a must survive: kept_ids={:?}",
-            kept_ids
+            "resolved call_a must survive: kept_ids={kept_ids:?}"
         );
         assert!(
             kept_ids.contains(&"call_b"),
-            "retry-pinned call_b must survive: kept_ids={:?}",
-            kept_ids
+            "retry-pinned call_b must survive: kept_ids={kept_ids:?}"
         );
         assert!(
             !kept_ids.contains(&"call_c"),
-            "unresolved call_c must be removed: kept_ids={:?}",
-            kept_ids
+            "unresolved call_c must be removed: kept_ids={kept_ids:?}"
         );
         let tool_results: Vec<&Message> = filtered
             .iter()

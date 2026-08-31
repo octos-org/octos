@@ -12019,42 +12019,28 @@ async fn raw_profile_llm_select(
     }
     profile.config.llm = Some(llm);
 
-    if !already_primary {
+    // The switch must take effect on the NEXT turn, not the next restart:
+    // cached SessionRuntimes embed the old provider chain and the dynamic
+    // ProfileRuntime caches forever, so run the SAME post-commit transition
+    // as upsert/delete (#2164) — evict both caches (generation-guarded) and
+    // rebuild. `applied` stays persistence-only; the runtime disposition is
+    // stamped onto the result separately.
+    let transition = if !already_primary {
         profile.updated_at = Utc::now();
         store
             .save_with_merge(&mut profile)
             .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
-
-        // The switch must take effect on the NEXT turn, not the next restart:
-        // cached SessionRuntimes embed the old provider chain and the dynamic
-        // ProfileRuntime caches forever, so evict both and re-bootstrap.
-        state.session_cache.invalidate_profile(&profile_id).await;
-        if let Some(key) = dynamic_profile_runtime_key(state, &profile_id) {
-            dynamic_profile_runtimes()
-                .write()
-                .map_err(|err| {
-                    RpcError::internal_error(format!(
-                        "dynamic profile runtime cache lock poisoned: {err}"
-                    ))
-                })?
-                .remove(&key);
-        }
-        if state.profiles.contains_key(&profile_id) {
-            // Startup-config profiles live in an immutable map — the saved
-            // selection persists but cannot rebuild without a restart.
-            tracing::warn!(
-                profile_id = %profile_id,
-                "profile/llm/select saved, but this startup-config profile's runtime \
-                 rebuilds on restart only"
-            );
-        } else if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
-            tracing::warn!(
-                profile_id = %profile_id,
-                error = %error.message,
-                "profile/llm/select saved; runtime bootstrap deferred to the next turn",
-            );
-        }
-    }
+        Some(
+            commit_profile_llm_runtime_transition(
+                state,
+                &profile_id,
+                Some(profile.updated_at.to_rfc3339()),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     let session_id = params
         .session_id
@@ -12082,10 +12068,18 @@ async fn raw_profile_llm_select(
             Some(&refreshed),
         ),
     });
+    stamp_profile_llm_runtime_transition(
+        &mut result,
+        transition
+            .as_ref()
+            .unwrap_or(&ProfileLlmRuntimeTransition::unchanged()),
+    );
     if state.profiles.contains_key(&profile_id) {
         // Startup-pinned runtime: the selection is saved but turns keep the
         // boot snapshot until restart (the stamp above says so too). Tell
-        // the caller instead of letting the switch silently not take.
+        // the caller instead of letting the switch silently not take —
+        // including for an idempotent re-select of the already-active
+        // primary, which performs no transition of its own.
         result["restart_required"] = json!(true);
     }
     Ok(result)
@@ -12221,19 +12215,20 @@ async fn raw_profile_llm_upsert(
     store
         .save_with_merge(&mut profile)
         .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
-    if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
-        tracing::warn!(
-            profile_id = %profile_id,
-            error = %error.message,
-            "profile/llm/upsert saved provider config but runtime bootstrap is not ready yet",
-        );
-    }
-    Ok(profile_llm_mutation_result(
+    // #2164: a saved-but-still-cached provider chain used to serve the next
+    // turn (ensure returned the existing dynamic or startup runtime
+    // immediately). Run the shared post-commit transition instead: evict the
+    // cached SessionRuntimes + ProfileRuntime (generation-guarded), then
+    // rebuild or report restart_required / persisted_but_not_live.
+    let transition = commit_profile_llm_runtime_transition(
         state,
         &profile_id,
-        Some(&profile),
-        true,
-    ))
+        Some(profile.updated_at.to_rfc3339()),
+    )
+    .await;
+    let mut result = profile_llm_mutation_result(state, &profile_id, Some(&profile), true);
+    stamp_profile_llm_runtime_transition(&mut result, &transition);
+    Ok(result)
 }
 
 /// `profile/llm/delete`: remove one configured model — primary or fallback —
@@ -12242,7 +12237,10 @@ async fn raw_profile_llm_upsert(
 /// so the profile keeps a working model whenever one exists; deleting the
 /// last model leaves `llm.primary` empty (recoverable via `/model` → Add).
 /// A non-matching address returns the unchanged state with `applied: false`.
-fn raw_profile_llm_delete(
+/// On a successful commit it runs the SAME post-commit transition as
+/// select/upsert (#2164): evict the cached runtimes and rebuild — deleting
+/// the active primary used to leave the old chain serving the next turn.
+async fn raw_profile_llm_delete(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
@@ -12255,7 +12253,12 @@ fn raw_profile_llm_delete(
         .get(&profile_id)
         .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
     else {
-        return Ok(profile_llm_mutation_result(state, &profile_id, None, false));
+        let mut result = profile_llm_mutation_result(state, &profile_id, None, false);
+        stamp_profile_llm_runtime_transition(
+            &mut result,
+            &ProfileLlmRuntimeTransition::unchanged(),
+        );
+        return Ok(result);
     };
 
     let family_id = nonempty(Some(params.family_id))
@@ -12275,12 +12278,12 @@ fn raw_profile_llm_delete(
     };
 
     let Some(mut llm) = profile.config.llm.take() else {
-        return Ok(profile_llm_mutation_result(
-            state,
-            &profile_id,
-            Some(&profile),
-            false,
-        ));
+        let mut result = profile_llm_mutation_result(state, &profile_id, Some(&profile), false);
+        stamp_profile_llm_runtime_transition(
+            &mut result,
+            &ProfileLlmRuntimeTransition::unchanged(),
+        );
+        return Ok(result);
     };
 
     let applied = if llm
@@ -12305,24 +12308,32 @@ fn raw_profile_llm_delete(
     profile.config.llm = Some(llm);
 
     if !applied {
-        return Ok(profile_llm_mutation_result(
-            state,
-            &profile_id,
-            Some(&profile),
-            false,
-        ));
+        // #2164: a miss persists nothing and must NOT evict a healthy
+        // runtime — report the unchanged disposition explicitly.
+        let mut result = profile_llm_mutation_result(state, &profile_id, Some(&profile), false);
+        stamp_profile_llm_runtime_transition(
+            &mut result,
+            &ProfileLlmRuntimeTransition::unchanged(),
+        );
+        return Ok(result);
     }
 
     profile.updated_at = Utc::now();
     store
         .save_with_merge(&mut profile)
         .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
-    Ok(profile_llm_mutation_result(
+    // #2164: the shared post-commit transition — deletion used to return
+    // `applied: true` while every cached runtime kept serving the deleted
+    // model (or the pre-promotion primary) until a restart.
+    let transition = commit_profile_llm_runtime_transition(
         state,
         &profile_id,
-        Some(&profile),
-        true,
-    ))
+        Some(profile.updated_at.to_rfc3339()),
+    )
+    .await;
+    let mut result = profile_llm_mutation_result(state, &profile_id, Some(&profile), true);
+    stamp_profile_llm_runtime_transition(&mut result, &transition);
+    Ok(result)
 }
 
 fn upsert_llm_fallback(
@@ -12622,6 +12633,10 @@ async fn raw_profile_llm_fetch_models(
     let family_id = nonempty(params.selection.family_id)
         .ok_or_else(|| RpcError::invalid_params("selection.family_id is required"))?;
     let base_url = nonempty(params.selection.route.base_url);
+    // The route's protocol override feeds strategy resolution — ignoring it
+    // here is what forced Anthropic-protocol families onto the OpenAI/Bearer
+    // /v1/models probe.
+    let api_type = nonempty(params.selection.route.api_type);
     let api_key_env = nonempty(params.selection.route.api_key_env)
         .or_else(|| dashboard_family_api_key_env(&family_id));
 
@@ -12643,28 +12658,45 @@ async fn raw_profile_llm_fetch_models(
             return Ok(json!({
                 "profile_id": profile_id,
                 "family_id": family_id,
+                "api_type": api_type,
                 "models": [],
+                "status": "no_api_key",
                 "reason": "no_api_key",
             }));
         }
     };
 
-    let models =
-        crate::api::admin::fetch_provider_models(&family_id, &api_key, base_url.as_deref())
-            .await
-            .unwrap_or_default();
-    let reason = if models.is_empty() {
-        Some("provider_unavailable")
-    } else {
-        None
-    };
+    // Protocol-aware discovery, shared verbatim with the admin REST
+    // `/api/my/provider-models` surface: the strategy resolves from the route
+    // (api_type override, then the family's declared protocol), and the typed
+    // outcome keeps "enter the model id manually" distinguishable from
+    // "credential/endpoint invalid" — instead of collapsing every failure
+    // into an empty list + `provider_unavailable`.
+    let discovery =
+        octos_llm::discovery::resolve_model_discovery(Some(&family_id), api_type.as_deref());
+    let outcome = octos_llm::discovery::discover_models(
+        discovery,
+        &api_key,
+        base_url.as_deref(),
+        Some(&family_id),
+    )
+    .await;
+    let status = outcome.status_label();
     let mut result = json!({
         "profile_id": profile_id,
         "family_id": family_id,
-        "models": models,
+        "api_type": api_type,
+        "models": outcome.models().unwrap_or(&[]),
+        // Typed status: discovered | unsupported | authentication_failed |
+        // endpoint_unreachable | invalid_response | rate_limited.
+        "status": status,
     });
-    if let (Some(reason), Value::Object(object)) = (reason, &mut result) {
-        object.insert("reason".into(), Value::String(reason.into()));
+    if let Some(message) = outcome.message() {
+        // Safe, redacted provider message (never contains the credential).
+        result["message"] = Value::String(message.to_string());
+        // `reason` mirrors `status` on failures for clients still reading the
+        // old collapsed field.
+        result["reason"] = Value::String(status.to_string());
     }
     Ok(result)
 }
@@ -12718,6 +12750,162 @@ fn profile_llm_mutation_result(
         object.insert("applied".into(), Value::Bool(applied));
     }
     result
+}
+
+/// Post-commit runtime disposition of a Profile LLM mutation (#2164):
+/// `applied` only ever means PERSISTED — this is the separate live-runtime
+/// truth, uniform across `profile/llm/select`, `upsert`, and `delete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileRuntimeDisposition {
+    /// Dynamic profile: caches evicted and the ProfileRuntime rebuilt from the
+    /// committed file — the next turn serves the new provider chain.
+    Reloaded,
+    /// Dynamic profile: caches evicted, no runtime bootstrapped right now
+    /// (disabled profile, or no model left after deleting the last one) — the
+    /// next turn deterministically re-derives, reporting typed
+    /// runtime-unavailable truth when the selection is gone.
+    Deferred,
+    /// Startup-pinned profile: the boot snapshot keeps serving until restart.
+    RestartRequired,
+    /// Dynamic profile: caches evicted but the rebuild FAILED — the next turn
+    /// retries the bootstrap (retry/restart recovers). Reported explicitly on
+    /// the wire, never collapsed into a warn-only server log.
+    PersistedButNotLive,
+    /// Nothing was persisted (applied:false): no runtime transition happened,
+    /// a healthy runtime stays healthy.
+    Unchanged,
+}
+
+impl ProfileRuntimeDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reloaded => "reloaded",
+            Self::Deferred => "deferred",
+            Self::RestartRequired => "restart_required",
+            Self::PersistedButNotLive => "persisted_but_not_live",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// The runtime transition a committed Profile LLM mutation performed, stamped
+/// onto the wire result next to `applied` (#2164).
+#[derive(Debug, Clone)]
+struct ProfileLlmRuntimeTransition {
+    disposition: ProfileRuntimeDisposition,
+    /// Persisted profile revision (`updated_at`) the runtime was — or was
+    /// demonstrably not — synced to.
+    config_revision: Option<String>,
+    /// Rebuild failure detail for `persisted_but_not_live`.
+    error: Option<String>,
+}
+
+impl ProfileLlmRuntimeTransition {
+    fn unchanged() -> Self {
+        Self {
+            disposition: ProfileRuntimeDisposition::Unchanged,
+            config_revision: None,
+            error: None,
+        }
+    }
+}
+
+/// The ONE post-commit transition shared by `profile/llm/select`, `upsert`,
+/// and `delete` (#2164): evict every cached SessionRuntime for the profile,
+/// bump the dynamic-runtime generation and drop the cached ProfileRuntime,
+/// then either rebuild it (dynamic profile) or report `restart_required`
+/// (startup-pinned boot snapshot). A caller whose persistence FAILED must not
+/// reach this — a healthy runtime stays healthy.
+async fn commit_profile_llm_runtime_transition(
+    state: &AppState,
+    profile_id: &str,
+    config_revision: Option<String>,
+) -> ProfileLlmRuntimeTransition {
+    let startup_pinned = state.profiles.contains_key(profile_id);
+    // Evict FIRST, generation before removal: the session cache bumps its own
+    // guard inside `invalidate_profile`, and the dynamic map's guard must be
+    // bumped before the drop so an in-flight bootstrap that read the
+    // pre-commit file is refused at insert time.
+    state.session_cache.invalidate_profile(profile_id).await;
+    if let Some(key) = dynamic_profile_runtime_key(state, profile_id) {
+        bump_profile_runtime_generation(&key);
+        dynamic_profile_runtimes()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+
+    if startup_pinned {
+        // Startup-config profiles live in an immutable map — the saved
+        // mutation persists but cannot rebuild without a restart.
+        tracing::warn!(
+            profile_id = %profile_id,
+            "profile LLM mutation saved, but this startup-config profile's runtime \
+             rebuilds on restart only"
+        );
+        return ProfileLlmRuntimeTransition {
+            disposition: ProfileRuntimeDisposition::RestartRequired,
+            config_revision,
+            error: None,
+        };
+    }
+
+    match ensure_session_profile_runtime(state, Some(profile_id)).await {
+        Ok(Some(_runtime)) => ProfileLlmRuntimeTransition {
+            disposition: ProfileRuntimeDisposition::Reloaded,
+            config_revision,
+            error: None,
+        },
+        Ok(None) => ProfileLlmRuntimeTransition {
+            disposition: ProfileRuntimeDisposition::Deferred,
+            config_revision,
+            error: None,
+        },
+        Err(error) => {
+            tracing::warn!(
+                profile_id = %profile_id,
+                error = %error.message,
+                "profile LLM mutation saved but runtime rebuild failed; the next turn \
+                 retries the bootstrap"
+            );
+            ProfileLlmRuntimeTransition {
+                disposition: ProfileRuntimeDisposition::PersistedButNotLive,
+                config_revision,
+                error: Some(error.message),
+            }
+        }
+    }
+}
+
+/// Stamp the uniform post-commit runtime truth (#2164) onto a profile-LLM
+/// mutation result. `applied` stays persistence-only; `restart_required` is
+/// always present so clients never parse presence as the signal.
+fn stamp_profile_llm_runtime_transition(
+    result: &mut Value,
+    transition: &ProfileLlmRuntimeTransition,
+) {
+    if let Value::Object(object) = result {
+        object.insert(
+            "runtime_disposition".into(),
+            json!(transition.disposition.as_str()),
+        );
+        if let Some(config_revision) = &transition.config_revision {
+            object.insert("config_revision".into(), json!(config_revision));
+        }
+        object.insert(
+            "restart_required".into(),
+            json!(matches!(
+                transition.disposition,
+                ProfileRuntimeDisposition::RestartRequired
+            )),
+        );
+        if transition.disposition != ProfileRuntimeDisposition::Unchanged {
+            object.insert("effective_from".into(), json!("next_turn"));
+        }
+        if let Some(error) = &transition.error {
+            object.insert("runtime_error".into(), json!(error));
+        }
+    }
 }
 
 fn sub_provider_json(sp: &crate::config::SubProviderConfig) -> Value {
@@ -16753,7 +16941,7 @@ async fn handle_raw_appui_rpc(
             raw_profile_llm_select(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_DELETE => {
-            raw_profile_llm_delete(state, request, connection_profile_id)
+            raw_profile_llm_delete(state, request, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => {
             raw_profile_llm_fetch_models(state, request, connection_profile_id).await
@@ -19501,6 +19689,52 @@ fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<Str
     ))
 }
 
+/// Generation guard for the dynamic ProfileRuntime cache (#2164): the
+/// post-commit Profile LLM transition bumps the generation BEFORE dropping
+/// the cached runtime, so an in-flight bootstrap that read the PRE-commit
+/// profile file is refused at insert time and cannot repopulate the cache
+/// with a stale provider chain (mirrors `SessionRuntimeCache::generations`).
+fn profile_runtime_generations() -> &'static std::sync::RwLock<HashMap<String, u64>> {
+    static GENERATIONS: OnceLock<std::sync::RwLock<HashMap<String, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+fn current_profile_runtime_generation(key: &str) -> u64 {
+    profile_runtime_generations()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn bump_profile_runtime_generation(key: &str) -> u64 {
+    let mut generations = profile_runtime_generations()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = generations.entry(key.to_owned()).or_insert(0);
+    *generation += 1;
+    *generation
+}
+
+/// Insert `runtime` under `key` only while `generation` is still current.
+/// Returns `false` — leaving the cache untouched — when a post-commit
+/// invalidation bumped the generation while this bootstrap was in flight.
+fn insert_profile_runtime_if_current(
+    key: &str,
+    generation: u64,
+    runtime: Arc<crate::runtime::ProfileRuntime>,
+) -> bool {
+    let mut runtimes = dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current_profile_runtime_generation(key) != generation {
+        return false;
+    }
+    runtimes.entry(key.to_owned()).or_insert(runtime);
+    true
+}
+
 async fn ensure_session_profile_runtime(
     state: &AppState,
     active_profile_id: Option<&str>,
@@ -19525,59 +19759,72 @@ async fn ensure_session_profile_runtime(
         return Ok(Some(runtime.clone()));
     }
 
-    let profile = store
-        .get(profile_id)
-        .map_err(|error| runtime_unavailable_error(format!("failed to read profile: {error}")))?;
-    let Some(profile) = profile else {
-        return Ok(None);
-    };
-    let profile_data_dir = store.resolve_data_dir(&profile);
-    // Restart recovery belongs exclusively to `octos serve` startup, which
-    // scans every persisted profile before runtimes are bootstrapped. This
-    // helper also runs for live cache replacement (for example
-    // `profile/llm/select`), where marking active jobs abandoned would lie
-    // about work still executing in this process.
-    if !profile.enabled || profile.parent_id.is_some() || !profile.config.has_llm_selection() {
-        return Ok(None);
-    }
-
-    // Lazily-created profiles must honour host-level policy too — without
-    // host_memory, a host opt-out of (default-on) memory refresh would not
-    // bind profiles created after startup.
-    let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
-        &profile,
-        &profile_data_dir,
-        Some(store.octos_home_dir()),
-        crate::runtime::BootstrapRole::Serve,
-        None,
-        None,
-        state.host_memory.as_ref(),
-    )
-    .await
-    .map_err(|error| {
-        // Lock contention is a config mistake with a concrete fix, so it gets
-        // its own typed kind and a sentence the operator can act on. Anything
-        // else stays `runtime_unavailable` — but formatted with `{error:#}`
-        // so the eyre chain survives to the client. Plain `{error}` prints
-        // only the outermost context, which is how "failed to open episode
-        // store for profile 'x'" used to reach the TUI with its actual cause
-        // (and its remedy) silently dropped.
-        if octos_memory::is_episode_store_locked(&error) {
-            data_dir_locked_error(profile_id, &error)
-        } else {
-            runtime_unavailable_error(format!(
-                "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error:#}"
-            ))
+    // #2164: a profile/llm select/upsert/delete that commits while this
+    // bootstrap is in flight bumps the generation and must not be undone by
+    // this insert — a runtime built from the PRE-commit file would silently
+    // serve the old provider chain for the next turn. Capture the generation
+    // up front, verify it at insert time, and on a lost race retry once from
+    // the freshly committed file.
+    for attempt in 0..2 {
+        let generation = current_profile_runtime_generation(&key);
+        let profile = store.get(profile_id).map_err(|error| {
+            runtime_unavailable_error(format!("failed to read profile: {error}"))
+        })?;
+        let Some(profile) = profile else {
+            return Ok(None);
+        };
+        let profile_data_dir = store.resolve_data_dir(&profile);
+        // Restart recovery belongs exclusively to `octos serve` startup, which
+        // scans every persisted profile before runtimes are bootstrapped. This
+        // helper also runs for live cache replacement (for example
+        // `profile/llm/select`), where marking active jobs abandoned would lie
+        // about work still executing in this process.
+        if !profile.enabled || profile.parent_id.is_some() || !profile.config.has_llm_selection() {
+            return Ok(None);
         }
-    })?;
-    let mut runtimes = dynamic_profile_runtimes()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let runtime = runtimes
-        .entry(key)
-        .or_insert_with(|| runtime.clone())
-        .clone();
-    Ok(Some(runtime))
+
+        // Lazily-created profiles must honour host-level policy too — without
+        // host_memory, a host opt-out of (default-on) memory refresh would not
+        // bind profiles created after startup.
+        let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
+            &profile,
+            &profile_data_dir,
+            Some(store.octos_home_dir()),
+            crate::runtime::BootstrapRole::Serve,
+            None,
+            None,
+            state.host_memory.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            // Lock contention is a config mistake with a concrete fix, so it gets
+            // its own typed kind and a sentence the operator can act on. Anything
+            // else stays `runtime_unavailable` — but formatted with `{error:#}`
+            // so the eyre chain survives to the client. Plain `{error}` prints
+            // only the outermost context, which is how "failed to open episode
+            // store for profile 'x'" used to reach the TUI with its actual cause
+            // (and its remedy) silently dropped.
+            if octos_memory::is_episode_store_locked(&error) {
+                data_dir_locked_error(profile_id, &error)
+            } else {
+                runtime_unavailable_error(format!(
+                    "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error:#}"
+                ))
+            }
+        })?;
+        if insert_profile_runtime_if_current(&key, generation, runtime.clone()) {
+            return Ok(Some(runtime));
+        }
+        tracing::debug!(
+            profile_id = %profile_id,
+            attempt,
+            "profile runtime bootstrap raced a profile/llm commit; retrying from the committed file"
+        );
+    }
+    Err(runtime_unavailable_error(format!(
+        "profile '{profile_id}' configuration changed while its runtime was bootstrapping; \
+         retry the turn"
+    )))
 }
 
 async fn rebuild_profile_runtime_after_skill_mutation(

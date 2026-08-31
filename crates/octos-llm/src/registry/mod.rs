@@ -141,6 +141,12 @@ pub struct ProviderEntry {
     pub requires_model: bool,
     /// Substrings in a model name that identify this provider (for auto-detection).
     pub detect_patterns: &'static [&'static str],
+    /// Declared model-discovery capability: which protocol-specific listing
+    /// strategy the family speaks, or that it has no model-list endpoint and
+    /// only accepts manual model ids. Consumed by
+    /// [`crate::discovery::resolve_model_discovery`] — the protocol is never
+    /// inferred from the family id string.
+    pub model_discovery: crate::discovery::ModelDiscovery,
     /// Factory function with full control over provider construction.
     pub create: fn(CreateParams) -> Result<Arc<dyn LlmProvider>>,
 }

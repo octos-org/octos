@@ -5204,7 +5204,7 @@ mod tests {
                 assert!(fields.contains(&"deep_crawl".into()));
                 assert!(fields.contains(&"apps".into()));
             }
-            other => panic!("expected RestartRequired, got {:?}", other),
+            other => panic!("expected RestartRequired, got {other:?}"),
         }
     }
 
@@ -5764,7 +5764,7 @@ mod tests {
             ProfileChange::RestartRequired(fields) => {
                 assert!(fields.contains(&"parent_id".into()));
             }
-            other => panic!("expected RestartRequired, got {:?}", other),
+            other => panic!("expected RestartRequired, got {other:?}"),
         }
     }
 

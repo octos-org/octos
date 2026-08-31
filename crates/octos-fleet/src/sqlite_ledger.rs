@@ -2537,7 +2537,7 @@ mod tests {
         for i in 1..=5 {
             let finding = Finding {
                 rowid: None,
-                finding_id: format!("f{}", i),
+                finding_id: format!("f{i}"),
                 seq: i, // Will be overwritten by store
                 task_id: None,
                 goal_id: "g1".to_string(),
@@ -2545,7 +2545,7 @@ mod tests {
                 lifecycle: "verified".to_string(),
                 confidence: "high".to_string(),
                 review_state: "peer_reviewed".to_string(),
-                assertion: format!("assertion {}", i),
+                assertion: format!("assertion {i}"),
                 evidence: None,
                 config_version: None,
                 derived_from: None,
@@ -3705,9 +3705,9 @@ mod digest_integration_tests {
         for i in 1..=5 {
             // Create task first (required by FK validation)
             let task = Task {
-                task_id: format!("task-{}", i),
+                task_id: format!("task-{i}"),
                 goal_id: "g1".to_string(),
-                title: format!("task {}", i),
+                title: format!("task {i}"),
                 detail: "test".to_string(),
                 status: "pending".to_string(),
                 assigned_peer: None,
@@ -3718,15 +3718,15 @@ mod digest_integration_tests {
 
             let finding = Finding {
                 rowid: None,
-                finding_id: format!("f{}", i),
+                finding_id: format!("f{i}"),
                 seq: i,
-                task_id: Some(format!("task-{}", i)),
+                task_id: Some(format!("task-{i}")),
                 goal_id: "g1".to_string(),
                 kind: "observation".to_string(),
                 lifecycle: "verified".to_string(),
                 confidence: "high".to_string(),
                 review_state: "peer_reviewed".to_string(),
-                assertion: format!("claim {}", i),
+                assertion: format!("claim {i}"),
                 evidence: None,
                 config_version: None,
                 derived_from: None,
@@ -3799,8 +3799,7 @@ mod digest_integration_tests {
             let records_finding: crate::records::Finding = (&finding).into();
             assert_eq!(
                 records_finding.status, expected_status,
-                "lifecycle '{}' should map to {:?}",
-                lifecycle, expected_status
+                "lifecycle '{lifecycle}' should map to {expected_status:?}"
             );
         }
     }

@@ -211,7 +211,7 @@ async fn should_kill_child_when_step_timeout_exceeded() {
     let pid: i32 = pid_text
         .trim()
         .parse()
-        .unwrap_or_else(|e| panic!("pid file {:?} not an integer: {e}", pid_text));
+        .unwrap_or_else(|e| panic!("pid file {pid_text:?} not an integer: {e}"));
 
     // Poll `kill -0 $pid` for up to 500ms; expect it to start returning
     // non-zero (ESRCH) once the child is reaped. NOTE: when tokio kills

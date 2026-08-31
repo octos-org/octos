@@ -155,7 +155,7 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
         } else {
             "missing".dimmed().to_string()
         };
-        println!("  {:<16} {}", name, status);
+        println!("  {name:<16} {status}");
     }
 
     // Gateway config

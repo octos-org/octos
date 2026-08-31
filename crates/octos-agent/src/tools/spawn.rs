@@ -2317,15 +2317,13 @@ async fn run_task_with_m8_9_recovery(
 fn build_spawn_recovery_prompt(task_desc: &str, error_message: &str) -> String {
     format!(
         "[system-internal] Your previous attempt at the task below failed.\n\
-         Original task: {task}\n\
-         Failure: {err}\n\n\
+         Original task: {task_desc}\n\
+         Failure: {error_message}\n\n\
          Re-attempt the task. Diagnose the root cause from the failure text, \
          pick a different strategy if appropriate (different tool, different inputs, \
          a smaller scope), and either complete the task or end with a clear \
          explanation of why the task cannot be completed. Do not repeat the same \
          failing step verbatim.",
-        task = task_desc,
-        err = error_message,
     )
 }
 
@@ -5270,8 +5268,7 @@ impl Tool for SpawnTool {
                         r.output
                     ),
                     Err(e) => format!(
-                        "[Subagent {} failed]\nTask: {}\nError: {e}\n\nPlease inform the user about this failure.",
-                        wid, task_desc
+                        "[Subagent {wid} failed]\nTask: {task_desc}\nError: {e}\n\nPlease inform the user about this failure."
                     ),
                 };
 

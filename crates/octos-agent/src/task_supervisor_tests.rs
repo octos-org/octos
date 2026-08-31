@@ -2595,10 +2595,8 @@ fn register_task_refuses_201st_child_for_same_parent() {
     // Every still-active child of the runaway parent should have
     // been force-marked `Failed` with the structured reason so the
     // cascade collapses instead of waiting on each child to finish.
-    let expected_reason = format!(
-        "child fanout exceeded ({} of {})",
-        MAX_CHILDREN_PER_PARENT, MAX_CHILDREN_PER_PARENT
-    );
+    let expected_reason =
+        format!("child fanout exceeded ({MAX_CHILDREN_PER_PARENT} of {MAX_CHILDREN_PER_PARENT})");
     let tasks = supervisor.get_tasks_for_session(parent_session);
     let any_active = tasks.iter().any(|t| t.status.is_active());
     assert!(

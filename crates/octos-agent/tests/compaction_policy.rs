@@ -252,8 +252,7 @@ fn should_preserve_declared_artifacts_through_compaction() {
         .expect("preservation check");
     assert!(
         ledger.all_preserved(),
-        "declared artifact path should survive compaction ({:?})",
-        ledger
+        "declared artifact path should survive compaction ({ledger:?})"
     );
     assert!(outcome.performed || outcome.messages_dropped == 0);
 }

@@ -333,7 +333,7 @@ fn run_glob_scoped(scope: &SessionScope, pattern: String, limit: usize) -> Resul
         let glob = GlobBuilder::new(&glob_pattern)
             .literal_separator(true)
             .build()
-            .wrap_err_with(|| format!("invalid glob pattern: {}", glob_pattern))?;
+            .wrap_err_with(|| format!("invalid glob pattern: {glob_pattern}"))?;
         let mut builder = GlobSetBuilder::new();
         builder.add(glob);
         Some(builder.build().wrap_err("globset build failed")?)
@@ -502,7 +502,7 @@ fn run_glob_legacy(
     let glob = GlobBuilder::new(&glob_pattern)
         .literal_separator(true)
         .build()
-        .wrap_err_with(|| format!("invalid glob pattern: {}", glob_pattern))?;
+        .wrap_err_with(|| format!("invalid glob pattern: {glob_pattern}"))?;
     let mut builder = GlobSetBuilder::new();
     builder.add(glob);
     let glob_set = builder.build().wrap_err("globset build failed")?;

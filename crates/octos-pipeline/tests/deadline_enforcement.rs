@@ -189,8 +189,7 @@ async fn should_abort_node_when_deadline_exceeded() {
     assert!(res.is_err(), "abort variant must return an error");
     assert!(
         elapsed < Duration::from_millis(1_500),
-        "abort must fire within 1.5s (got {:?})",
-        elapsed
+        "abort must fire within 1.5s (got {elapsed:?})"
     );
     assert!(
         counter.load(Ordering::Relaxed) >= 1,
@@ -232,8 +231,7 @@ async fn should_skip_node_when_deadline_action_is_skip() {
     );
     assert!(
         elapsed < Duration::from_millis(1_500),
-        "skip must fire within 1.5s (got {:?})",
-        elapsed
+        "skip must fire within 1.5s (got {elapsed:?})"
     );
     assert_eq!(counter.load(Ordering::Relaxed), 1);
     assert_eq!(
@@ -276,8 +274,7 @@ async fn should_retry_node_up_to_max_attempts() {
     // 3 × 1s ≈ 3s; allow generous slack for scheduling.
     assert!(
         elapsed < Duration::from_millis(4_500),
-        "retry must bound total time (got {:?})",
-        elapsed
+        "retry must bound total time (got {elapsed:?})"
     );
     assert_eq!(
         deadline_exceeded_count("retry"),
@@ -338,8 +335,7 @@ async fn should_fire_spawn_failure_hook_when_deadline_action_is_escalate() {
     assert!(res.is_err(), "escalate variant must still error");
     assert!(
         elapsed < Duration::from_millis(3_500),
-        "escalate must fire quickly (got {:?})",
-        elapsed
+        "escalate must fire quickly (got {elapsed:?})"
     );
     assert_eq!(counter.load(Ordering::Relaxed), 1);
     assert_eq!(

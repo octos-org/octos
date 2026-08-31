@@ -118,9 +118,8 @@ impl LoopDetector {
         for cycle_len in 1..=3 {
             if check_len >= cycle_len * 3 && Self::is_repeating(window, cycle_len) {
                 return Some(format!(
-                    "[LOOP DETECTED] The last {} tool calls follow a repeating pattern \
-                     (cycle length {cycle_len}). Try a different approach or break the cycle.",
-                    check_len
+                    "[LOOP DETECTED] The last {check_len} tool calls follow a repeating pattern \
+                     (cycle length {cycle_len}). Try a different approach or break the cycle."
                 ));
             }
         }

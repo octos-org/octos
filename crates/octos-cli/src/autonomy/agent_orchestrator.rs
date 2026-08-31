@@ -4616,8 +4616,7 @@ impl InProcessAgentOrchestrator {
         .with_metadata("outcome".to_owned(), outcome.to_owned())
         .with_metadata("content_summary".to_owned(), content_summary.to_owned())
         .with_dedupe_key(format!(
-            "goal-progress:{}:{}:{}:{}",
-            master_session, goal_id, peer_slug, turn_count
+            "goal-progress:{master_session}:{goal_id}:{peer_slug}:{turn_count}"
         ));
         let mut state = self.state();
         state.continuations.enqueue(request)
@@ -4769,7 +4768,7 @@ impl InProcessAgentOrchestrator {
             MasterContinuationReason::External(STEER_EXTERNAL_KIND.to_owned()),
             SystemTime::now(),
         )
-        .with_dedupe_key(format!("steer:{}", target_session));
+        .with_dedupe_key(format!("steer:{target_session}"));
         let mut state = self.state();
         state.continuations.enqueue(request)
     }
@@ -14713,7 +14712,7 @@ fn ensure_monitor_scope(
 }
 
 fn autonomy_goal_group_id(session_id: &SessionKey) -> String {
-    format!("autonomy-goal:{}", session_id)
+    format!("autonomy-goal:{session_id}")
 }
 
 fn autonomy_loop_group_id(loop_record: &AutonomyLoopRecord) -> String {
@@ -15335,7 +15334,7 @@ fn redact_artifact_secrets(input: &str) -> std::borrow::Cow<'_, str> {
 
     fn redact(text: &str) -> String {
         let prefix: String = text.chars().take(4).collect();
-        format!("{}...[credential-redacted]", prefix)
+        format!("{prefix}...[credential-redacted]")
     }
 
     let after_anth = ANTHROPIC_KEY_RE

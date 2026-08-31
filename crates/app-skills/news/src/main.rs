@@ -450,7 +450,7 @@ fn fetch_hackernews(client: &Client) -> Result<FetchResult, String> {
             title
         ));
         if !item_url.is_empty() {
-            text.push_str(&format!(" ({})", item_url));
+            text.push_str(&format!(" ({item_url})"));
             urls.push((title.clone(), item_url));
         }
         text.push('\n');

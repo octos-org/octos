@@ -1307,8 +1307,7 @@ async fn heartbeat_emits_periodic_progress_with_current_node() {
     assert_eq!(
         messages.len(),
         events.len(),
-        "heartbeat must emit ToolProgress events only — got: {:?}",
-        events,
+        "heartbeat must emit ToolProgress events only — got: {events:?}",
     );
 
     let combined = messages.join("\n");

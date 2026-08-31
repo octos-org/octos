@@ -1971,8 +1971,7 @@ async fn tool_search_reflects_post_builtins_registrations() {
         matches
             .iter()
             .any(|m| m["name"] == json!("post_builtin_xyz_unique")),
-        "tool_search must reflect post-builtins registrations (got {:?})",
-        matches,
+        "tool_search must reflect post-builtins registrations (got {matches:?})",
     );
 }
 

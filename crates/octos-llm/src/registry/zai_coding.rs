@@ -26,6 +26,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     // Selected explicitly by family — not auto-detected from a bare `glm-*`
     // model, which the regular `zai`/`zhipu` families already handle.
     detect_patterns: &[],
+    model_discovery: crate::discovery::ANTHROPIC_MODELS,
     create,
 };
 

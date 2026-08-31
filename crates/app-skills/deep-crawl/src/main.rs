@@ -647,7 +647,7 @@ fn page_slug(url: &Url, index: usize) -> String {
     } else {
         &slug
     };
-    format!("{:03}_{truncated}", index)
+    format!("{index:03}_{truncated}")
 }
 
 /// Truncate a string to max_len at a UTF-8 safe boundary.
@@ -1109,7 +1109,7 @@ async fn run() -> Output {
         let filename = file_url
             .as_ref()
             .map(|u| format!("{}.md", page_slug(u, i)))
-            .unwrap_or_else(|| format!("{:03}_page.md", i));
+            .unwrap_or_else(|| format!("{i:03}_page.md"));
         let file_path = crawl_dir.join(&filename);
 
         let file_content = if let Some(ref err) = crawled.error {

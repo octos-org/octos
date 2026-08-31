@@ -240,7 +240,7 @@ impl ConsoleReporter {
 
     fn cyan(&self, s: &str) -> String {
         if self.use_colors {
-            format!("\x1b[36m{}\x1b[0m", s)
+            format!("\x1b[36m{s}\x1b[0m")
         } else {
             s.to_string()
         }
@@ -248,7 +248,7 @@ impl ConsoleReporter {
 
     fn green(&self, s: &str) -> String {
         if self.use_colors {
-            format!("\x1b[32m{}\x1b[0m", s)
+            format!("\x1b[32m{s}\x1b[0m")
         } else {
             s.to_string()
         }
@@ -256,7 +256,7 @@ impl ConsoleReporter {
 
     fn yellow(&self, s: &str) -> String {
         if self.use_colors {
-            format!("\x1b[33m{}\x1b[0m", s)
+            format!("\x1b[33m{s}\x1b[0m")
         } else {
             s.to_string()
         }
@@ -264,7 +264,7 @@ impl ConsoleReporter {
 
     fn red(&self, s: &str) -> String {
         if self.use_colors {
-            format!("\x1b[31m{}\x1b[0m", s)
+            format!("\x1b[31m{s}\x1b[0m")
         } else {
             s.to_string()
         }
@@ -272,7 +272,7 @@ impl ConsoleReporter {
 
     fn dim(&self, s: &str) -> String {
         if self.use_colors {
-            format!("\x1b[2m{}\x1b[0m", s)
+            format!("\x1b[2m{s}\x1b[0m")
         } else {
             s.to_string()
         }
@@ -280,7 +280,7 @@ impl ConsoleReporter {
 
     fn bold(&self, s: &str) -> String {
         if self.use_colors {
-            format!("\x1b[1m{}\x1b[0m", s)
+            format!("\x1b[1m{s}\x1b[0m")
         } else {
             s.to_string()
         }
@@ -299,7 +299,7 @@ impl ProgressReporter for ConsoleReporter {
                 print!(
                     "\r{} {}",
                     self.yellow("⟳"),
-                    self.dim(&format!("Thinking... (iteration {})", iteration))
+                    self.dim(&format!("Thinking... (iteration {iteration})"))
                 );
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
@@ -315,7 +315,7 @@ impl ProgressReporter for ConsoleReporter {
                     // Show first few lines of response
                     let preview: String = content.lines().take(3).collect::<Vec<_>>().join("\n");
                     let truncated = if content.lines().count() > 3 {
-                        format!("{}...", preview)
+                        format!("{preview}...")
                     } else {
                         preview
                     };
@@ -339,7 +339,7 @@ impl ProgressReporter for ConsoleReporter {
                 print!(
                     "\r{} {}",
                     self.yellow("⚙"),
-                    self.dim(&format!("Running {}...", name))
+                    self.dim(&format!("Running {name}..."))
                 );
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
@@ -370,7 +370,7 @@ impl ProgressReporter for ConsoleReporter {
                     "{} {} {}",
                     status,
                     self.bold(&name),
-                    self.dim(&format!("({})", duration_str))
+                    self.dim(&format!("({duration_str})"))
                 );
 
                 // Show truncated output if verbose
@@ -398,7 +398,7 @@ impl ProgressReporter for ConsoleReporter {
                                 Some("in_progress") => self.dim("▸"),
                                 _ => self.dim("◼"),
                             };
-                            println!("  {} {}", glyph, title);
+                            println!("  {glyph} {title}");
                         }
                     }
                 }
@@ -437,14 +437,14 @@ impl ProgressReporter for ConsoleReporter {
                 println!();
                 println!(
                     "{} State saved. Run 'octos resume' to continue.",
-                    self.yellow(&format!("⚠ Interrupted after {} iterations.", iterations))
+                    self.yellow(&format!("⚠ Interrupted after {iterations} iterations."))
                 );
             }
             ProgressEvent::MaxIterationsReached { limit } => {
                 println!();
                 println!(
                     "{} Increase with --max-iterations",
-                    self.yellow(&format!("⚠ Reached max iterations limit ({}).", limit))
+                    self.yellow(&format!("⚠ Reached max iterations limit ({limit})."))
                 );
             }
             ProgressEvent::TokenBudgetExceeded { used, limit } => {
@@ -452,8 +452,7 @@ impl ProgressReporter for ConsoleReporter {
                 println!(
                     "{} Increase with --max-tokens",
                     self.yellow(&format!(
-                        "⚠ Token budget exceeded ({} used, {} limit).",
-                        used, limit
+                        "⚠ Token budget exceeded ({used} used, {limit} limit)."
                     ))
                 );
             }
@@ -475,7 +474,7 @@ impl ProgressReporter for ConsoleReporter {
             ProgressEvent::StreamChunk { text, .. } => {
                 use std::io::Write;
                 if let Ok(mut buf) = self.stdout.lock() {
-                    let _ = write!(buf, "{}", text);
+                    let _ = write!(buf, "{text}");
                     // Flush only on newlines to reduce syscalls
                     if text.contains('\n') {
                         let _ = buf.flush();
@@ -502,7 +501,7 @@ impl ProgressReporter for ConsoleReporter {
             } => {
                 if self.verbose {
                     let cost_str = match session_cost {
-                        Some(c) => format!("${:.4}", c),
+                        Some(c) => format!("${c:.4}"),
                         None => "N/A".to_string(),
                     };
                     println!(

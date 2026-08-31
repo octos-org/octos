@@ -1389,7 +1389,7 @@ mod tests {
         let target = temp.path().join("hatch.txt");
         let tool = super::ShellTool::new(temp.path())
             .with_bash_file_writes(crate::tools::policy::BashFileWrites::Deny);
-        let cmd = format!("echo hatch > {:?} # octos:allow-write", target);
+        let cmd = format!("echo hatch > {target:?} # octos:allow-write");
         let out = tokio::runtime::Runtime::new()
             .expect("rt")
             .block_on(tool.execute(&serde_json::json!({ "command": cmd })))
@@ -1445,7 +1445,7 @@ mod tests {
 
         // Write: receipt present (28a) + nudge appended once.
         let target = cwd.join("warned.txt");
-        let cmd = format!("echo data > {:?}", target);
+        let cmd = format!("echo data > {target:?}");
         let out = tokio::runtime::Runtime::new()
             .expect("rt")
             .block_on(tool.execute(&serde_json::json!({ "command": cmd })))

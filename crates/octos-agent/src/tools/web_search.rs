@@ -596,7 +596,7 @@ impl WebSearchTool {
         for (i, r) in results.iter().enumerate() {
             output.push_str(&format!("{}. {}\n   {}\n", i + 1, r.title, r.url));
             let snippet = octos_core::truncated_utf8(&r.content, 300, "...");
-            output.push_str(&format!("   {}\n\n", snippet));
+            output.push_str(&format!("   {snippet}\n\n"));
         }
 
         Ok(ToolResult {
@@ -661,13 +661,13 @@ impl WebSearchTool {
             output.push_str(&format!("{}. {}\n   {}\n", i + 1, title, r.url));
 
             if let Some(ref date) = r.published_date {
-                output.push_str(&format!("   Published: {}\n", date));
+                output.push_str(&format!("   Published: {date}\n"));
             }
 
             for highlight in &r.highlights {
                 let trimmed = highlight.trim();
                 if !trimmed.is_empty() {
-                    output.push_str(&format!("   {}\n", trimmed));
+                    output.push_str(&format!("   {trimmed}\n"));
                 }
             }
 
@@ -792,7 +792,7 @@ impl WebSearchTool {
             // Include first snippet if available (richer than description)
             if let Some(snippet) = r.snippets.first() {
                 let truncated = octos_core::truncated_utf8(snippet, 300, "...");
-                output.push_str(&format!("   {}\n", truncated));
+                output.push_str(&format!("   {truncated}\n"));
             }
             output.push('\n');
         }

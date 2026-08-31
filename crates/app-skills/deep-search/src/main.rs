@@ -1064,9 +1064,9 @@ async fn serper_search(
 
     if let Some(kg) = data.get("knowledgeGraph") {
         if let Some(title) = kg["title"].as_str() {
-            output.push_str(&format!("**{}**", title));
+            output.push_str(&format!("**{title}**"));
             if let Some(desc) = kg["description"].as_str() {
-                output.push_str(&format!(": {}", desc));
+                output.push_str(&format!(": {desc}"));
             }
             output.push_str("\n\n");
         }
@@ -2386,7 +2386,7 @@ fn extract_bing_results(text: &str) -> Vec<String> {
             }
             s
         };
-        results.push(format!("- {}\n  {}", title, url));
+        results.push(format!("- {title}\n  {url}"));
     }
     results
 }

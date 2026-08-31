@@ -36,6 +36,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     requires_model: false,
     // User-loaded models — nothing to pattern-match.
     detect_patterns: &[],
+    model_discovery: crate::discovery::OPENAI_MODELS,
     create,
 };
 
