@@ -544,11 +544,13 @@ impl Agent {
     /// `provider_index: None` to price at the active slot — used for
     /// tool-reported usage that has no per-response attribution.
     ///
-    /// Cache-aware (#1640 follow-up): reads bill at 0.1x and writes at
-    /// 1.25x the input rate, and `TokenUsage`'s crate-wide contract is
-    /// DISJOINT accounting (inclusive wire formats are normalized at each
-    /// provider's parse boundary), so the three counts can be priced
-    /// independently without double-billing.
+    /// Cache-aware (#1640 follow-up, provider-aware per #2194 review): the
+    /// resolved slot's PROVIDER picks the cache rate card
+    /// (`cache_rates_for_provider` — Anthropic 0.1x/1.25x, Gemini 0.25x/0,
+    /// unknown 1.0x/0), and `TokenUsage`'s crate-wide contract is DISJOINT
+    /// accounting (inclusive wire formats are normalized at each provider's
+    /// parse boundary), so the three counts price independently without
+    /// double-billing.
     pub(super) fn response_usage_cost(
         &self,
         input_tokens: u32,
@@ -559,7 +561,8 @@ impl Agent {
     ) -> Option<f64> {
         let metadata = self.llm.provider_metadata_for_index(provider_index);
         octos_llm::pricing::model_pricing(&metadata.model).map(|p| {
-            p.cost_with_cache(
+            p.cost_with_cache_for_provider(
+                &metadata.provider,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -594,7 +597,8 @@ impl Agent {
         let pricing = octos_llm::pricing::model_pricing(&metadata.model);
         let response_cost = attributed_cost.or_else(|| {
             pricing.map(|p| {
-                p.cost_with_cache(
+                p.cost_with_cache_for_provider(
+                    &metadata.provider,
                     response_usage.input_tokens,
                     response_usage.output_tokens,
                     response_usage.cache_read_tokens,
@@ -772,9 +776,12 @@ mod tests {
         }
     }
 
-    /// Provider that never answers but reports a model with catalog pricing,
-    /// so cost plumbing can be exercised without a network call.
-    struct PricedNoopProvider;
+    /// Provider that never answers but reports a model with catalog pricing
+    /// under a configurable provider label, so cost plumbing (including the
+    /// per-provider cache rate card) can be exercised without a network call.
+    struct PricedNoopProvider {
+        provider: &'static str,
+    }
 
     #[async_trait]
     impl LlmProvider for PricedNoopProvider {
@@ -792,24 +799,32 @@ mod tests {
         }
 
         fn provider_name(&self) -> &str {
-            "mock"
+            self.provider
         }
     }
 
-    #[tokio::test]
-    async fn should_price_cache_reads_and_writes_at_multiplier_rates_when_usage_reports_them() {
-        // #1640 follow-up: runtime pricing must charge cache reads at 0.1x
-        // and cache writes at 1.25x the input rate instead of ignoring both
-        // — otherwise caching experiments are unpriceable after the fact.
+    async fn priced_agent(provider_label: &'static str) -> (Agent, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-        let provider: Arc<dyn LlmProvider> = Arc::new(PricedNoopProvider);
+        let provider: Arc<dyn LlmProvider> = Arc::new(PricedNoopProvider {
+            provider: provider_label,
+        });
         let agent = Agent::new(
             AgentId::new("pricing-test"),
             provider,
             ToolRegistry::new(),
             memory,
         );
+        (agent, dir)
+    }
+
+    #[tokio::test]
+    async fn should_price_cache_reads_and_writes_at_multiplier_rates_when_usage_reports_them() {
+        // #1640 follow-up: on an ANTHROPIC-labeled slot, runtime pricing
+        // must charge cache reads at 0.1x and cache writes at 1.25x the
+        // input rate instead of ignoring both — otherwise caching
+        // experiments are unpriceable after the fact.
+        let (agent, _dir) = priced_agent("anthropic").await;
 
         let priced = agent
             .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
@@ -834,6 +849,33 @@ mod tests {
         assert!(
             (priced - (naive + premium)).abs() < 1e-12,
             "premium must be 0.1x reads + 1.25x writes on the input rate"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_price_cache_at_provider_rate_card_when_slot_is_not_anthropic() {
+        // #2194 review: the multipliers are a PROVIDER property. The same
+        // usage on an openai-labeled slot must bill reads at the full input
+        // rate with no write premium — NOT at Anthropic's 0.1x/1.25x.
+        let (agent, _dir) = priced_agent("openai").await;
+        let priced = agent
+            .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
+            .expect("claude-opus-4 has catalog pricing");
+
+        let pricing = octos_llm::pricing::model_pricing("claude-opus-4").unwrap();
+        let expected = pricing.cost(100_000 + 10_000, 10_000);
+        assert!(
+            (priced - expected).abs() < 1e-12,
+            "unknown-rate providers bill reads at the full input rate, writes free (got {priced})"
+        );
+
+        let (anthropic_agent, _dir2) = priced_agent("anthropic").await;
+        let anthropic_priced = anthropic_agent
+            .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
+            .unwrap();
+        assert!(
+            (priced - anthropic_priced).abs() > 1e-9,
+            "the provider label must change the cache pricing"
         );
     }
 

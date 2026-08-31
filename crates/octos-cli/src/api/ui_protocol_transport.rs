@@ -24512,7 +24512,8 @@ async fn handle_session_btw(
                     let model = (!metadata.model.is_empty()).then(|| metadata.model.clone());
                     let estimated_cost_usd =
                         model.as_deref().and_then(model_pricing).map(|pricing| {
-                            pricing.cost_with_cache(
+                            pricing.cost_with_cache_for_provider(
+                                &metadata.provider,
                                 response.usage.input_tokens,
                                 response.usage.output_tokens,
                                 response.usage.cache_read_tokens,
@@ -33577,7 +33578,8 @@ async fn run_standalone_turn(
                     // #1632 P1); the reprice fallback covers legacy paths.
                     let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
                         model.as_deref().and_then(model_pricing).map(|pricing| {
-                            pricing.cost_with_cache(
+                            pricing.cost_with_cache_for_provider(
+                                provider.as_deref().unwrap_or(""),
                                 response.token_usage.input_tokens,
                                 response.token_usage.output_tokens,
                                 response.token_usage.cache_read_tokens,

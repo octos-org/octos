@@ -544,18 +544,18 @@ impl Agent {
         // also handles verifier-side failover). `config.model_label` is a
         // DISPLAY label ("session-cheap-verifier" when no explicit
         // OCTOS_AGENT_VERIFIER_MODEL is set) and misses the catalog.
-        let verifier_model = config
+        let verifier_metadata = config
             .provider
-            .provider_metadata_for_index(response.provider_index)
-            .model;
+            .provider_metadata_for_index(response.provider_index);
         turn.record_usage(
             response.usage.input_tokens,
             response.usage.output_tokens,
             response.usage.cache_read_tokens,
             response.usage.cache_write_tokens,
             tracker,
-            octos_llm::pricing::model_pricing(&verifier_model).map(|p| {
-                p.cost_with_cache(
+            octos_llm::pricing::model_pricing(&verifier_metadata.model).map(|p| {
+                p.cost_with_cache_for_provider(
+                    &verifier_metadata.provider,
                     response.usage.input_tokens,
                     response.usage.output_tokens,
                     response.usage.cache_read_tokens,

@@ -4626,7 +4626,8 @@ impl SessionActor {
         // fallback reprice covers legacy paths that predate the field.
         let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
             model.as_deref().and_then(model_pricing).map(|pricing| {
-                pricing.cost_with_cache(
+                pricing.cost_with_cache_for_provider(
+                    provider.as_deref().unwrap_or(""),
                     response.token_usage.input_tokens,
                     response.token_usage.output_tokens,
                     response.token_usage.cache_read_tokens,
@@ -8858,11 +8859,17 @@ impl SessionActor {
                     .as_ref()
                     .map(|meta| meta.model.clone());
                 let overflow_cost = conv_response.estimated_spend_usd.or_else(|| {
+                    let overflow_provider = conv_response
+                        .provider_metadata
+                        .as_ref()
+                        .map(|meta| meta.provider.as_str())
+                        .unwrap_or("");
                     overflow_model
                         .as_deref()
                         .and_then(model_pricing)
                         .map(|pricing| {
-                            pricing.cost_with_cache(
+                            pricing.cost_with_cache_for_provider(
+                                overflow_provider,
                                 conv_response.token_usage.input_tokens,
                                 conv_response.token_usage.output_tokens,
                                 conv_response.token_usage.cache_read_tokens,
