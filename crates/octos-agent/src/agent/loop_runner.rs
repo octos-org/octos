@@ -3145,7 +3145,13 @@ impl Agent {
             tracker,
             // Tool-reported usage has no per-response provider attribution;
             // price it at the active slot as the closest estimate.
-            self.response_usage_cost(tool_tokens.input_tokens, tool_tokens.output_tokens, None),
+            self.response_usage_cost(
+                tool_tokens.input_tokens,
+                tool_tokens.output_tokens,
+                tool_tokens.cache_read_tokens,
+                tool_tokens.cache_write_tokens,
+                None,
+            ),
         );
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit

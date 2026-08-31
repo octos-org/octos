@@ -142,6 +142,8 @@ impl Agent {
                         let final_cost = self.response_usage_cost(
                             response.usage.input_tokens,
                             response.usage.output_tokens,
+                            response.usage.cache_read_tokens,
+                            response.usage.cache_write_tokens,
                             response.provider_index,
                         );
                         let attributed_cost = match (retry_spend, final_cost) {
@@ -158,10 +160,21 @@ impl Agent {
                             let latency_ms = call_start.elapsed().as_millis() as u64;
                             let cum_in = total_usage.input_tokens + response.usage.input_tokens;
                             let cum_out = total_usage.output_tokens + response.usage.output_tokens;
+                            let cum_cache_read =
+                                total_usage.cache_read_tokens + response.usage.cache_read_tokens;
+                            let cum_cache_write =
+                                total_usage.cache_write_tokens + response.usage.cache_write_tokens;
                             let pricing = octos_llm::pricing::model_pricing(self.llm.model_id());
-                            let session_cost = pricing.map(|p| p.cost(cum_in, cum_out));
+                            let session_cost = pricing.map(|p| {
+                                p.cost_with_cache(cum_in, cum_out, cum_cache_read, cum_cache_write)
+                            });
                             let response_cost = pricing.map(|p| {
-                                p.cost(response.usage.input_tokens, response.usage.output_tokens)
+                                p.cost_with_cache(
+                                    response.usage.input_tokens,
+                                    response.usage.output_tokens,
+                                    response.usage.cache_read_tokens,
+                                    response.usage.cache_write_tokens,
+                                )
                             });
                             let payload = HookPayload::after_llm(
                                 self.llm.model_id(),
@@ -219,6 +232,8 @@ impl Agent {
                                 let final_cost = self.response_usage_cost(
                                     fallback_resp.usage.input_tokens,
                                     fallback_resp.usage.output_tokens,
+                                    fallback_resp.usage.cache_read_tokens,
+                                    fallback_resp.usage.cache_write_tokens,
                                     fallback_resp.provider_index,
                                 );
                                 let attributed_cost = match (retry_spend, final_cost) {
@@ -256,6 +271,8 @@ impl Agent {
                     if let Some(cost) = self.response_usage_cost(
                         response.usage.input_tokens,
                         response.usage.output_tokens,
+                        response.usage.cache_read_tokens,
+                        response.usage.cache_write_tokens,
                         response.provider_index,
                     ) {
                         retry_spend = Some(retry_spend.unwrap_or(0.0) + cost);
@@ -378,6 +395,8 @@ impl Agent {
                                 let final_cost = self.response_usage_cost(
                                     resp.usage.input_tokens,
                                     resp.usage.output_tokens,
+                                    resp.usage.cache_read_tokens,
+                                    resp.usage.cache_write_tokens,
                                     resp.provider_index,
                                 );
                                 let attributed_cost = match (retry_spend, final_cost) {

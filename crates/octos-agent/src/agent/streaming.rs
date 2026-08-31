@@ -543,15 +543,29 @@ impl Agent {
     /// `None` when that model has no catalog pricing. Pass
     /// `provider_index: None` to price at the active slot — used for
     /// tool-reported usage that has no per-response attribution.
+    ///
+    /// Cache-aware (#1640 follow-up): reads bill at 0.1x and writes at
+    /// 1.25x the input rate, and `TokenUsage`'s crate-wide contract is
+    /// DISJOINT accounting (inclusive wire formats are normalized at each
+    /// provider's parse boundary), so the three counts can be priced
+    /// independently without double-billing.
     pub(super) fn response_usage_cost(
         &self,
         input_tokens: u32,
         output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
         provider_index: Option<usize>,
     ) -> Option<f64> {
         let metadata = self.llm.provider_metadata_for_index(provider_index);
-        octos_llm::pricing::model_pricing(&metadata.model)
-            .map(|p| p.cost(input_tokens, output_tokens))
+        octos_llm::pricing::model_pricing(&metadata.model).map(|p| {
+            p.cost_with_cache(
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            )
+        })
     }
 
     /// `attributed_cost` is the caller's per-attempt-priced cost for
@@ -579,7 +593,14 @@ impl Agent {
             .provider_metadata_for_index(response.provider_index);
         let pricing = octos_llm::pricing::model_pricing(&metadata.model);
         let response_cost = attributed_cost.or_else(|| {
-            pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens))
+            pricing.map(|p| {
+                p.cost_with_cache(
+                    response_usage.input_tokens,
+                    response_usage.output_tokens,
+                    response_usage.cache_read_tokens,
+                    response_usage.cache_write_tokens,
+                )
+            })
         });
         // Session figures = completed-runs base + this turn so far.
         //
@@ -749,6 +770,71 @@ mod tests {
         fn provider_name(&self) -> &str {
             "mock"
         }
+    }
+
+    /// Provider that never answers but reports a model with catalog pricing,
+    /// so cost plumbing can be exercised without a network call.
+    struct PricedNoopProvider;
+
+    #[async_trait]
+    impl LlmProvider for PricedNoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            eyre::bail!("chat() unused in pricing tests")
+        }
+
+        fn model_id(&self) -> &str {
+            "claude-opus-4"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_price_cache_reads_and_writes_at_multiplier_rates_when_usage_reports_them() {
+        // #1640 follow-up: runtime pricing must charge cache reads at 0.1x
+        // and cache writes at 1.25x the input rate instead of ignoring both
+        // — otherwise caching experiments are unpriceable after the fact.
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let provider: Arc<dyn LlmProvider> = Arc::new(PricedNoopProvider);
+        let agent = Agent::new(
+            AgentId::new("pricing-test"),
+            provider,
+            ToolRegistry::new(),
+            memory,
+        );
+
+        let priced = agent
+            .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
+            .expect("claude-opus-4 has catalog pricing");
+
+        let pricing = octos_llm::pricing::model_pricing("claude-opus-4").unwrap();
+        let naive = pricing.cost(100_000, 10_000);
+        let expected = pricing.cost_with_cache(100_000, 10_000, 10_000, 2_000);
+        assert!(
+            (priced - expected).abs() < 1e-12,
+            "cache-aware figure expected {expected}, got {priced}"
+        );
+        assert!(
+            (priced - naive).abs() > 1e-9,
+            "cache tokens must move the price off the naive input/output figure ({naive})"
+        );
+        // The exact premium: 10_000 reads at 0.1x + 2_000 writes at 1.25x of
+        // the input rate.
+        let input_rate = pricing.input_per_million;
+        let premium = (10_000.0 / 1_000_000.0) * input_rate * 0.1
+            + (2_000.0 / 1_000_000.0) * input_rate * 1.25;
+        assert!(
+            (priced - (naive + premium)).abs() < 1e-12,
+            "premium must be 0.1x reads + 1.25x writes on the input rate"
+        );
     }
 
     /// Build a bare `Agent` whose backing provider is unused — the streaming

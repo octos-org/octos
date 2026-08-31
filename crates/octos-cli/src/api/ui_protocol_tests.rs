@@ -36957,6 +36957,7 @@ fn should_report_cache_read_tokens_in_session_usage_status() {
         input_tokens: 105,
         output_tokens: 20,
         cache_read_tokens: 95,
+        cache_write_tokens: 0,
         estimated_cost_usd: 0.25,
     };
     let usage = usage_status_json(&totals);
@@ -36981,6 +36982,7 @@ fn should_omit_cost_when_no_run_was_priced() {
         input_tokens: 100,
         output_tokens: 10,
         cache_read_tokens: 0,
+        cache_write_tokens: 0,
         estimated_cost_usd: 0.0,
     };
     let usage = usage_status_json(&totals);
@@ -36999,6 +37001,7 @@ fn should_report_zero_cache_reads_explicitly_on_a_cold_session() {
         input_tokens: 13_302,
         output_tokens: 76,
         cache_read_tokens: 0,
+        cache_write_tokens: 0,
         estimated_cost_usd: 0.0,
     };
     let usage = usage_status_json(&totals);

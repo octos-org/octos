@@ -4626,9 +4626,11 @@ impl SessionActor {
         // fallback reprice covers legacy paths that predate the field.
         let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
             model.as_deref().and_then(model_pricing).map(|pricing| {
-                pricing.cost(
+                pricing.cost_with_cache(
                     response.token_usage.input_tokens,
                     response.token_usage.output_tokens,
+                    response.token_usage.cache_read_tokens,
+                    response.token_usage.cache_write_tokens,
                 )
             })
         });
@@ -4671,7 +4673,8 @@ impl SessionActor {
             self.channel.clone(),
             attribution.map(ToOwned::to_owned),
         )
-        .with_cache_read_tokens(u64::from(response.token_usage.cache_read_tokens));
+        .with_cache_read_tokens(u64::from(response.token_usage.cache_read_tokens))
+        .with_cache_write_tokens(u64::from(response.token_usage.cache_write_tokens));
         if let Err(error) = usage_ledger.record(event).await {
             warn!(
                 session = %self.session_key,
@@ -8859,9 +8862,11 @@ impl SessionActor {
                         .as_deref()
                         .and_then(model_pricing)
                         .map(|pricing| {
-                            pricing.cost(
+                            pricing.cost_with_cache(
                                 conv_response.token_usage.input_tokens,
                                 conv_response.token_usage.output_tokens,
+                                conv_response.token_usage.cache_read_tokens,
+                                conv_response.token_usage.cache_write_tokens,
                             )
                         })
                 });
@@ -8895,7 +8900,10 @@ impl SessionActor {
                         channel.clone(),
                         Some("speculative_overflow".to_string()),
                     )
-                    .with_cache_read_tokens(u64::from(conv_response.token_usage.cache_read_tokens));
+                    .with_cache_read_tokens(u64::from(conv_response.token_usage.cache_read_tokens))
+                    .with_cache_write_tokens(u64::from(
+                        conv_response.token_usage.cache_write_tokens,
+                    ));
                     if let Err(error) = ledger.record(event).await {
                         warn!(
                             session = %session_key,

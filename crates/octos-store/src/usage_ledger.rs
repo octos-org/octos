@@ -72,6 +72,19 @@ pub struct UsageEvent {
     /// uncached run and needs no migration.
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// Prompt tokens WRITTEN to the provider's cache (Anthropic
+    /// `cache_creation_input_tokens`). Disjoint from `input_tokens` and
+    /// `cache_read_tokens` under the same `TokenUsage` contract — the full
+    /// prompt is `input + cache_read + cache_write`. Cache writes bill at a
+    /// 1.25x premium on the input rate, so without this field the ledger
+    /// could answer the cache-READ half of a caching experiment but never
+    /// the write-side cost it paid for it.
+    ///
+    /// `#[serde(default)]`: rows written before this field existed decode
+    /// as 0 — indistinguishable from a run with no cache writes, so no
+    /// migration is needed.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     #[serde(default)]
@@ -111,6 +124,7 @@ impl UsageEvent {
             input_tokens,
             output_tokens,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated_cost_usd,
             cost_source,
             channel: channel.into(),
@@ -126,6 +140,14 @@ impl UsageEvent {
     #[must_use]
     pub fn with_cache_read_tokens(mut self, cache_read_tokens: u64) -> Self {
         self.cache_read_tokens = cache_read_tokens;
+        self
+    }
+
+    /// Record the cache-write portion of this run's prompt. Same builder
+    /// shape (and rationale) as [`Self::with_cache_read_tokens`].
+    #[must_use]
+    pub fn with_cache_write_tokens(mut self, cache_write_tokens: u64) -> Self {
+        self.cache_write_tokens = cache_write_tokens;
         self
     }
 }
@@ -148,6 +170,10 @@ pub struct UsageTotals {
     /// means every round paid full price for its prefix.
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// Cache-WRITTEN prompt tokens (see [`UsageEvent::cache_write_tokens`]),
+    /// the 1.25x-premium side of the same ledger dimension.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub estimated_cost_usd: f64,
 }
 
@@ -159,6 +185,9 @@ impl UsageTotals {
         self.cache_read_tokens = self
             .cache_read_tokens
             .saturating_add(event.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(event.cache_write_tokens);
         if let Some(cost) = event.estimated_cost_usd {
             self.estimated_cost_usd += cost;
         }
@@ -171,6 +200,9 @@ impl UsageTotals {
         self.cache_read_tokens = self
             .cache_read_tokens
             .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
         self.estimated_cost_usd += other.estimated_cost_usd;
     }
 }
@@ -600,6 +632,71 @@ mod tests {
         let decoded: UsageEvent = serde_json::from_value(legacy).expect("legacy record decodes");
         assert_eq!(decoded.cache_read_tokens, 0);
         assert_eq!(decoded.input_tokens, 100);
+    }
+
+    /// Rows written before `cache_write_tokens` existed (including rows that
+    /// DO carry `cache_read_tokens` — the shape every deployment wrote
+    /// between the two fields landing) must keep decoding, with the write
+    /// side defaulting to 0.
+    #[test]
+    fn should_decode_rows_predating_cache_write_field_as_zero_writes() {
+        let pre_cache_write = serde_json::json!({
+            "schema_version": USAGE_EVENT_SCHEMA_VERSION,
+            "event_id": "e2",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "profile_id": "p",
+            "session_id": "s",
+            "run_id": "r",
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cache_read_tokens": 640,
+            "cost_source": "unavailable",
+            "channel": "test"
+        });
+        let decoded: UsageEvent =
+            serde_json::from_value(pre_cache_write).expect("pre-cache-write record decodes");
+        assert_eq!(decoded.cache_write_tokens, 0);
+        assert_eq!(decoded.cache_read_tokens, 640);
+        assert_eq!(decoded.input_tokens, 100);
+    }
+
+    #[test]
+    fn should_round_trip_cache_write_tokens_when_recorded() {
+        let event = UsageEvent::completed_run(
+            "p",
+            "s",
+            "r",
+            None,
+            None,
+            None,
+            100,
+            10,
+            None,
+            UsageCostSource::Unavailable,
+            "test",
+            None,
+        )
+        .with_cache_read_tokens(10_000)
+        .with_cache_write_tokens(2_000);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["cache_write_tokens"], 2_000);
+        let decoded: UsageEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.cache_write_tokens, 2_000);
+    }
+
+    #[test]
+    fn should_accumulate_cache_write_tokens_across_events_and_merges() {
+        let mut totals = UsageTotals::default();
+        totals.add_event(&cache_event(10, 40).with_cache_write_tokens(15));
+        totals.add_event(&cache_event(20, 55).with_cache_write_tokens(25));
+        assert_eq!(totals.cache_write_tokens, 40);
+
+        let mut other = UsageTotals::default();
+        other.add_event(&cache_event(5, 5).with_cache_write_tokens(60));
+        totals.merge(&other);
+        assert_eq!(totals.cache_write_tokens, 100);
+        assert_eq!(totals.cache_read_tokens, 100);
     }
 
     #[allow(clippy::too_many_arguments)]

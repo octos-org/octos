@@ -24502,7 +24502,12 @@ async fn handle_session_btw(
                     let model = (!metadata.model.is_empty()).then(|| metadata.model.clone());
                     let estimated_cost_usd =
                         model.as_deref().and_then(model_pricing).map(|pricing| {
-                            pricing.cost(response.usage.input_tokens, response.usage.output_tokens)
+                            pricing.cost_with_cache(
+                                response.usage.input_tokens,
+                                response.usage.output_tokens,
+                                response.usage.cache_read_tokens,
+                                response.usage.cache_write_tokens,
+                            )
                         });
                     let cost_source = if estimated_cost_usd.is_some() {
                         UsageCostSource::CatalogEstimate
@@ -24525,7 +24530,8 @@ async fn handle_session_btw(
                         "appui_btw",
                         None,
                     )
-                    .with_cache_read_tokens(u64::from(response.usage.cache_read_tokens));
+                    .with_cache_read_tokens(u64::from(response.usage.cache_read_tokens))
+                    .with_cache_write_tokens(u64::from(response.usage.cache_write_tokens));
                     if let Err(error) = usage_ledger.record(event).await {
                         warn!(
                             session = %session_id.0,
@@ -33551,9 +33557,11 @@ async fn run_standalone_turn(
                     // #1632 P1); the reprice fallback covers legacy paths.
                     let estimated_cost_usd = response.estimated_spend_usd.or_else(|| {
                         model.as_deref().and_then(model_pricing).map(|pricing| {
-                            pricing.cost(
+                            pricing.cost_with_cache(
                                 response.token_usage.input_tokens,
                                 response.token_usage.output_tokens,
+                                response.token_usage.cache_read_tokens,
+                                response.token_usage.cache_write_tokens,
                             )
                         })
                     });
@@ -33578,7 +33586,8 @@ async fn run_standalone_turn(
                         "appui",
                         None,
                     )
-                    .with_cache_read_tokens(u64::from(response.token_usage.cache_read_tokens));
+                    .with_cache_read_tokens(u64::from(response.token_usage.cache_read_tokens))
+                    .with_cache_write_tokens(u64::from(response.token_usage.cache_write_tokens));
                     if let Err(error) = usage_ledger.record(event).await {
                         warn!(
                             session = %usage_session_id_for_result,
