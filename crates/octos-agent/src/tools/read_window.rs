@@ -31,9 +31,10 @@
 //! A tripwire test pins `WINDOW_MAX_BYTES + FOOTER_RESERVE <=
 //! tool_output_limit("read_file")` so lowering the loop budget cannot
 //! silently re-expose windowed reads to the blind backstop, and every armed
-//! return path carries a `debug_assert` against the same bound (none of them
-//! interpolates unbounded caller input — path spellings can be arbitrarily
-//! long, so model-facing messages clamp them).
+//! return path is clamped to `WINDOW_MAX_BYTES + FOOTER_RESERVE` at RUNTIME
+//! (not a `debug_assert`, which release builds drop). None of the armed
+//! returns interpolates unbounded caller input — path spellings can be
+//! arbitrarily long, so model-facing messages clamp them.
 //!
 //! ## Why raw byte paging instead of a shell fallback
 //!
@@ -94,15 +95,23 @@
 //! state: the guard is a data-loss check and must hold on every entry path,
 //! including legacy `Tool::execute` calls that carry a zero context (the
 //! `FileStateCache` on `ToolContext` is optional and absent on those paths,
-//! which is why it was not reused). Entries are keyed by the context's
-//! `parent_session_key` (empty for zero contexts) so one session's COMPLETE
-//! never authorizes another session's overwrite, values are keyed by
-//! canonicalized path so `read_file` and `write_file` cannot miss each other
-//! over path aliases (`/var` vs `/private/var`), and the map is bounded at
-//! [`MAX_LEDGER_ENTRIES`] (oldest-recorded evicted first — safe, because
-//! absence refuses). This is deliberately NOT the #2126 probe's `LAST_READ`
-//! map — that one is observe-only, keyed to the probe's own env flag and
-//! 500/24KiB canary, and its per-path counters are `cfg(test)`.
+//! which is why it was not reused). Entries are keyed by
+//! `(parent_session_key, canonical path)`: one session's COMPLETE never
+//! authorizes another's, and canonicalization keeps `read_file` and
+//! `write_file` agreeing over path aliases (`/var` vs `/private/var`). The map
+//! is bounded at [`MAX_LEDGER_ENTRIES`] (oldest-recorded evicted first — safe,
+//! because absence refuses).
+//!
+//! R4 (codex round 3): a missing/empty session key is reachable in production
+//! (agents default to `None`; FFI and fleet workers; plain CLI chat without
+//! `--goals`), so an empty key must NOT share a bucket with another keyless
+//! task. Empty-session reads and writes therefore record NOTHING — a keyless
+//! task can never establish COMPLETE, so the write guard fails closed for its
+//! over-window overwrites (`record_view`/`note_full_write` are the single
+//! enforcement point; the guard adds only a clearer keyless message). This is
+//! deliberately NOT the #2126 probe's `LAST_READ` map — that one is
+//! observe-only, keyed to the probe's own env flag and 500/24KiB canary, and
+//! its per-path counters are `cfg(test)`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -140,6 +149,13 @@ pub(crate) enum WindowClamp {
 /// harness) can match it structurally — same convention as
 /// `[FILE_UNCHANGED]`.
 pub(crate) const PARTIAL_VIEW_OVERWRITE_PREFIX: &str = "[PARTIAL_VIEW_OVERWRITE]";
+
+/// Typed prefix for the DISTINCT tainted-overwrite refusal. A tainted view is
+/// not a "read more" case — the loop sanitizer redacts every raw byte page
+/// too, so paging can never deliver the bytes whole — so it gets its own
+/// prefix and a message that says the flag is incompatible with rewriting
+/// THIS file, rather than the partial-view "page through it" advice.
+pub(crate) const REDACTED_VIEW_OVERWRITE_PREFIX: &str = "[REDACTED_VIEW_OVERWRITE]";
 
 /// Whether window enforcement is armed by the environment.
 ///
@@ -259,6 +275,13 @@ pub(crate) fn record_view(
     total_bytes: usize,
     tainted: bool,
 ) {
+    // R4: a missing/empty session key must never share a bucket with another
+    // keyless task, so keyless tasks record NOTHING — they can then never
+    // reach COMPLETE, and the write guard fails closed for their big-file
+    // overwrites. This is the single enforcement point for that rule.
+    if session.is_empty() {
+        return;
+    }
     let key = ledger_key(session, path);
     let mut guard = LEDGER
         .lock()
@@ -323,6 +346,10 @@ pub(crate) fn view_status(session: &str, path: &Path) -> ViewStatus {
 /// authored.) When the post-write stat fails, the entry is forgotten —
 /// absence refuses, which is the safe direction.
 pub(crate) fn note_full_write(session: &str, path: &Path, written_bytes: usize) {
+    // R4: keyless tasks never establish coverage (see record_view).
+    if session.is_empty() {
+        return;
+    }
     let epoch = std::fs::metadata(path).ok().and_then(|meta| {
         meta.modified().ok().map(|mtime| ViewEpoch {
             mtime,
@@ -330,7 +357,11 @@ pub(crate) fn note_full_write(session: &str, path: &Path, written_bytes: usize) 
         })
     });
     match epoch {
-        Some(epoch) => {
+        // R1 second half: only mark COMPLETE when the bytes on disk are the
+        // bytes we wrote. A size disagreement means a replacement landed in
+        // the write->stat window; recording COMPLETE then would authorize a
+        // later overwrite of content the model never produced. Forget instead.
+        Some(epoch) if epoch.size == written_bytes as u64 => {
             let key = ledger_key(session, path);
             let mut guard = LEDGER
                 .lock()
@@ -347,9 +378,9 @@ pub(crate) fn note_full_write(session: &str, path: &Path, written_bytes: usize) 
             );
             ledger.touch_and_evict(key);
         }
-        // Post-write stat failed: nothing validatable to record — forget,
-        // because absence refuses (the safe direction).
-        None => forget(session, path),
+        // Stat failed, or on-disk size disagrees with what we wrote: nothing
+        // validatable to record — forget, because absence refuses.
+        _ => forget(session, path),
     }
 }
 
@@ -535,6 +566,32 @@ mod tests {
     }
 
     #[test]
+    fn should_record_nothing_for_an_empty_session() {
+        // R4 single enforcement point for isolation: a keyless task (empty
+        // session key) must record NOTHING, so two keyless tasks can never
+        // cross-authorize via a shared "" bucket. Mutating the empty-session
+        // guard in record_view/note_full_write makes this fail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyless.txt");
+        std::fs::write(&path, "0123456789").unwrap();
+
+        record_view("", &path, epoch_at(0, 10), 0, 10, 10, false);
+        assert_eq!(
+            view_status("", &path),
+            ViewStatus::Unknown,
+            "an empty-session read must leave no trace — else two keyless \
+             tasks share a bucket"
+        );
+
+        note_full_write("", &path, 10);
+        assert_eq!(
+            view_status("", &path),
+            ViewStatus::Unknown,
+            "an empty-session write must leave no COMPLETE mark either"
+        );
+    }
+
+    #[test]
     fn should_scope_views_to_the_session() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scoped.txt");
@@ -583,6 +640,36 @@ mod tests {
                  Complete, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn should_not_mark_complete_when_written_bytes_disagree_with_disk() {
+        // R1 second half: post-write re-record must verify the bytes on disk
+        // equal what we claim to have written before marking COMPLETE. If the
+        // caller says it wrote N bytes but the file is a different size (a
+        // replacement landed in the write→stat window), the record must NOT
+        // be COMPLETE — otherwise a stale COMPLETE authorizes a later
+        // overwrite of content the model never produced.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mismatch.txt");
+        std::fs::write(&path, "0123456789").unwrap(); // 10 bytes on disk
+
+        // Claim we wrote 25 bytes — disagrees with the 10 on disk.
+        note_full_write("s", &path, 25);
+        assert_ne!(
+            view_status("s", &path),
+            ViewStatus::Complete {
+                epoch: ViewEpoch {
+                    mtime: std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    size: 10,
+                },
+            },
+            "a size disagreement must not be recorded as COMPLETE"
+        );
+        assert!(
+            !matches!(view_status("s", &path), ViewStatus::Complete { .. }),
+            "any COMPLETE here is a lie — the on-disk bytes are not what was written"
+        );
     }
 
     #[test]

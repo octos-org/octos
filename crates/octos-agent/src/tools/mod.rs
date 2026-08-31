@@ -1381,6 +1381,78 @@ pub async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()>
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
+/// Outcome of an epoch-bound overwrite ([`write_no_follow_checked`]).
+#[derive(Debug)]
+pub(crate) enum CheckedWrite {
+    /// The opened descriptor matched the authorizing epoch and was truncated
+    /// and rewritten.
+    Written,
+    /// The opened descriptor's `(mtime, size)` no longer matched what
+    /// authorized the write — nothing was written.
+    EpochChanged {
+        /// The descriptor's actual epoch at open time.
+        found: crate::tools::read_window::ViewEpoch,
+    },
+}
+
+/// Overwrite an EXISTING file, but only if the descriptor we open still
+/// matches `expected` (#1638 R1 — TOCTOU).
+///
+/// The armed write guard authorizes an overwrite against a *stat of the path*.
+/// A plain `write_no_follow` then opens the path AGAIN and truncates whatever
+/// it resolves to — so an external replacement in that narrow authorize→open
+/// window is silently clobbered. This binds the authorization to the exact
+/// opened inode: it opens WITHOUT `O_TRUNC`, `fstat`s the descriptor, and only
+/// truncates + writes when that descriptor's `(mtime, size)` still equals the
+/// epoch that authorized the write. `O_NOFOLLOW` still rejects a symlink swap;
+/// operating on the validated descriptor (not a re-resolved path) closes the
+/// race even against a same-name inode swap after validation.
+pub(crate) async fn write_no_follow_checked(
+    path: &Path,
+    content: &[u8],
+    expected: crate::tools::read_window::ViewEpoch,
+) -> std::io::Result<CheckedWrite> {
+    let path = path.to_owned();
+    let content = content.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        // No create, no truncate — we must inspect the descriptor before
+        // destroying its contents.
+        opts.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        // fstat the DESCRIPTOR itself (not a re-resolution of the path).
+        let meta = file.metadata()?;
+        let found = crate::tools::read_window::ViewEpoch {
+            mtime: meta.modified()?,
+            size: meta.len(),
+        };
+        if found != expected {
+            return Ok(CheckedWrite::EpochChanged { found });
+        }
+        // The validated descriptor is the one we truncate and rewrite.
+        file.set_len(0)?;
+        file.write_all(&content)?;
+        Ok(CheckedWrite::Written)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 // #1976 note: `create_only` (`O_CREAT|O_EXCL`) enforcement moved into the
 // component-wise confined `openat` walk in `tools::write_grant::open_confined`
 // (which also closes the ancestor-symlink TOCTOU a whole-path lexical open
@@ -1422,6 +1494,65 @@ mod nofollow_tests {
 
         let content = read_no_follow(&file).await.unwrap();
         assert_eq!(content, "hello");
+    }
+
+    // R1 (#1638): the epoch-bound writer closes the TOCTOU between the write
+    // guard's authorizing stat and the truncating open. It fstat's the
+    // descriptor it is about to truncate and refuses if that inode's
+    // (mtime, size) no longer matches what authorized the write — so an
+    // external replacement in the narrow authorize→truncate window is caught
+    // on the exact opened object, not a re-resolved path.
+    #[tokio::test]
+    async fn write_no_follow_checked_writes_when_epoch_matches() {
+        use crate::tools::read_window::ViewEpoch;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "original").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let epoch = ViewEpoch {
+            mtime: meta.modified().unwrap(),
+            size: meta.len(),
+        };
+
+        let outcome = write_no_follow_checked(&file, b"rebuilt", epoch)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CheckedWrite::Written),
+            "a matching epoch must write"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "rebuilt");
+    }
+
+    #[tokio::test]
+    async fn write_no_follow_checked_refuses_a_replaced_inode() {
+        use crate::tools::read_window::ViewEpoch;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "original small").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let authorized = ViewEpoch {
+            mtime: meta.modified().unwrap(),
+            size: meta.len(),
+        };
+
+        // The file is replaced (new size ⇒ new epoch) in the window between
+        // the guard authorizing against `authorized` and this write opening
+        // the descriptor.
+        std::fs::write(&file, "REPLACED with different, important, longer content").unwrap();
+
+        let outcome = write_no_follow_checked(&file, b"model rebuild", authorized)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CheckedWrite::EpochChanged { .. }),
+            "a replaced inode must be refused, not truncated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "REPLACED with different, important, longer content",
+            "the descriptor the guard did not authorize must be left intact"
+        );
     }
 
     /// Pins the PDF auto-extract path (mini5 invoice regression

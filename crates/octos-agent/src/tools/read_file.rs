@@ -116,17 +116,23 @@ impl Tool for ReadFileTool {
         "read_file"
     }
 
-    // #1638 (d): the description is static while window arming is dynamic, so
-    // it states the truncation contract that holds in EVERY mode — unarmed
-    // reads are already truncated with continuation advice by the execution
-    // loop (#2124) or refused with a range hint (#2131), and armed reads
-    // carry the window footer. The mode-specific numbers live in the footer,
-    // where they are always current.
+    // #1638 R6: the tool spec (description + schema) is serialized into the
+    // LLM prompt-cache prefix for EVERY session, so it must be byte-identical
+    // to origin/main when the flag is OFF, or arming one process would bust
+    // the prefix for all of them. Both are therefore conditional on the arm:
+    // unarmed returns exactly the origin strings; armed adds the windowing
+    // contract and the byte-mode parameters. (`window_armed()` reads the
+    // per-instance override or `OCTOS_READ_WINDOW`, both stable for a process,
+    // so `specs()` sees a consistent answer.)
     fn description(&self) -> &str {
-        "Read the contents of a file. Returns the file content with line numbers. Large results \
-         are truncated to a bounded window and the message names the exact call to continue \
-         (offset/limit, or byte_offset for raw byte paging of very long lines) — page forward \
-         until no continuation notice remains."
+        if self.window_armed() {
+            "Read the contents of a file. Returns the file content with line numbers. Large \
+             results are truncated to a bounded window and the message names the exact call to \
+             continue (offset/limit, or byte_offset for raw byte paging of very long lines) — \
+             page forward until no continuation notice remains."
+        } else {
+            "Read the contents of a file. Returns the file content with line numbers."
+        }
     }
 
     fn tags(&self) -> &[&str] {
@@ -134,34 +140,45 @@ impl Tool for ReadFileTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to read (relative to working directory; alias: filePath)"
-                },
-                "start_line": {
-                    "type": "integer",
-                    "description": "Optional starting line number (1-indexed; alias: offset)"
-                },
-                "end_line": {
-                    "type": "integer",
-                    "description": "Optional ending line number (1-indexed, inclusive)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Optional maximum number of lines to read, starting at start_line (alternative to end_line — do not provide both)"
-                },
-                "byte_offset": {
+        // Origin/main properties — MUST stay byte-identical when unarmed.
+        let mut properties = serde_json::json!({
+            "path": {
+                "type": "string",
+                "description": "Path to the file to read (relative to working directory; alias: filePath)"
+            },
+            "start_line": {
+                "type": "integer",
+                "description": "Optional starting line number (1-indexed; alias: offset)"
+            },
+            "end_line": {
+                "type": "integer",
+                "description": "Optional ending line number (1-indexed, inclusive)"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Optional maximum number of lines to read, starting at start_line (alternative to end_line — do not provide both)"
+            }
+        });
+        if self.window_armed() {
+            let props = properties.as_object_mut().expect("object literal");
+            props.insert(
+                "byte_offset".to_string(),
+                serde_json::json!({
                     "type": "integer",
                     "description": "Raw byte mode: 0-indexed byte position to start reading from. Returns file bytes without line numbers — for single lines too long to page by line offset. Do not combine with start_line/end_line/limit."
-                },
-                "byte_limit": {
+                }),
+            );
+            props.insert(
+                "byte_limit".to_string(),
+                serde_json::json!({
                     "type": "integer",
                     "description": "Raw byte mode: maximum bytes to return (default and cap: the read window). Requires byte_offset."
-                }
-            },
+                }),
+            );
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": properties,
             "required": ["path"]
         })
     }
@@ -242,10 +259,26 @@ impl Tool for ReadFileTool {
                 }
             };
 
+        // #1638 R6: byte mode is part of the ARMED feature. It is resolved
+        // once here so the schema/description gating and the execution gating
+        // agree.
+        let window_armed = self.window_armed();
+
         // #1638: raw byte mode is a distinct coordinate system — mixing it
         // with line parameters is ambiguous and rejected, like end_line+limit.
         if input.byte_offset.is_some() || input.byte_limit.is_some() {
-            let message = if input.start_line.is_some()
+            // R6: unarmed, byte mode is not advertised in the schema and must
+            // not execute. Reject rather than silently fall through to a line
+            // read (which would drop the caller's intent). The LLM never hits
+            // this — the schema omits the parameters when unarmed — so this
+            // only guards manual/legacy callers.
+            let message = if !window_armed {
+                Some(
+                    "byte_offset/byte_limit are only available when windowed reads are enabled \
+                     (OCTOS_READ_WINDOW=1)."
+                        .to_string(),
+                )
+            } else if input.start_line.is_some()
                 || input.end_line.is_some()
                 || input.limit.is_some()
             {
@@ -350,20 +383,14 @@ impl Tool for ReadFileTool {
             }
         }
 
-        // #1638: windowed-read enforcement, armed per instance (tests) or by
-        // `OCTOS_READ_WINDOW=1` (production). Resolved once — every armed
-        // branch below keys off this.
-        let window_armed = self.window_armed();
-
-        // #1638: raw byte mode. Bypasses the M8.4 cache in BOTH directions —
-        // the cache's view ranges are line ranges, so a byte request must
-        // never be answered with a line-range [FILE_UNCHANGED] stub, and a
-        // byte view must never be stored as one — and bypasses the #2131
-        // refusal (a byte read is bounded by construction). Works unarmed
-        // too: the schema is static, so an advertised parameter always
-        // works; only the ledger recording is armed-gated.
+        // #1638 R6 (armed-only): raw byte mode. Reached only when armed —
+        // unarmed byte params were rejected above. Bypasses the M8.4 cache in
+        // BOTH directions (the cache's view ranges are line ranges, so a byte
+        // request must never be answered with a line-range [FILE_UNCHANGED]
+        // stub, and a byte view must never be stored as one) and bypasses the
+        // #2131 refusal (a byte read is bounded by construction).
         if let Some(requested_offset) = input.byte_offset {
-            use super::read_window::{FOOTER_RESERVE, WINDOW_MAX_BYTES};
+            use super::read_window::WINDOW_MAX_BYTES;
             let content = match super::read_no_follow(&path).await {
                 Ok(c) => c,
                 Err(e) => return Ok(super::file_io_error(e, &input.path)),
@@ -407,23 +434,19 @@ impl Tool for ReadFileTool {
                     end_b - 1
                 ));
             }
-            debug_assert!(
-                output.len() <= WINDOW_MAX_BYTES + FOOTER_RESERVE,
-                "byte-mode output + footer must stay within the reserve so the loop \
-                 backstop can never fire (got {} bytes)",
-                output.len()
-            );
-            if window_armed {
-                let session = ctx.parent_session_key.clone().unwrap_or_default();
-                let epoch = current_mtime.map(|mtime| super::read_window::ViewEpoch {
-                    mtime,
-                    size: file_size as u64,
-                });
-                let tainted = crate::sanitize::sanitize_tool_output(&output) != output;
-                super::read_window::record_view(
-                    &session, &path, epoch, start_b, end_b, total, tainted,
-                );
-            }
+            // R5: enforce the loop-cap at RUNTIME (not debug_assert, which
+            // release builds drop). Sized to fit under the cap by
+            // construction, so this never actually cuts; it is the real
+            // backstop that keeps the loop's blind head/tail cut from ever
+            // mangling the footer in a release build.
+            output = clamp_armed_return(output);
+            let session = ctx.parent_session_key.clone().unwrap_or_default();
+            let epoch = current_mtime.map(|mtime| super::read_window::ViewEpoch {
+                mtime,
+                size: file_size as u64,
+            });
+            let tainted = crate::sanitize::sanitize_tool_output(&output) != output;
+            super::read_window::record_view(&session, &path, epoch, start_b, end_b, total, tainted);
             return Ok(ToolResult {
                 output,
                 success: true,
@@ -566,13 +589,12 @@ impl Tool for ReadFileTool {
                         ));
                     }
                     advice.push(']');
-                    debug_assert!(
-                        advice.len() <= octos_core::tool_output_limit("read_file"),
-                        "the giant-line advice must stay under the loop cap (got {} bytes)",
-                        advice.len()
-                    );
+                    // R5: real runtime clamp (release builds drop
+                    // debug_assert). The advice interpolates no unbounded
+                    // caller input, so it is already short; the clamp is the
+                    // enforced guarantee.
                     return Ok(ToolResult {
-                        output: advice,
+                        output: clamp_armed_return(advice),
                         success: true,
                         ..Default::default()
                     });
@@ -601,12 +623,11 @@ impl Tool for ReadFileTool {
                     "\n[read_file window: showing lines {shown_from}-{included_end} of \
                      {total_lines} — {limit_clause}. Continue with offset: {next_offset}.]"
                 ));
-                debug_assert!(
-                    output.len() <= WINDOW_MAX_BYTES + super::read_window::FOOTER_RESERVE,
-                    "armed window + footer must stay within its reserve so the loop \
-                     backstop can never fire (got {} bytes)",
-                    output.len()
-                );
+                // R5: real runtime clamp (release builds drop debug_assert).
+                // The window body is bounded to WINDOW_MAX_BYTES and the
+                // footer to well under FOOTER_RESERVE, so this never cuts in
+                // practice; it is the enforced backstop.
+                output = clamp_armed_return(output);
             }
             None => {
                 // Add file info
@@ -699,6 +720,20 @@ impl Tool for ReadFileTool {
             ..Default::default()
         })
     }
+}
+
+/// R5: clamp an ARMED `read_file` return as a real runtime operation. Every
+/// armed window/byte/advice return is sized to fit within
+/// `WINDOW_MAX_BYTES + FOOTER_RESERVE` by construction, so this never cuts in
+/// practice — it is the release-build enforcement that a `debug_assert` (which
+/// release builds drop) cannot provide. The tripwire test pins
+/// `WINDOW_MAX_BYTES + FOOTER_RESERVE <= tool_output_limit("read_file")`, so
+/// clamping to that tighter bound also keeps every armed return under the
+/// loop's blind head/tail backstop (#2124), which must never mangle a footer.
+fn clamp_armed_return(mut output: String) -> String {
+    let bound = super::read_window::WINDOW_MAX_BYTES + super::read_window::FOOTER_RESERVE;
+    octos_core::truncate_utf8(&mut output, bound, "");
+    output
 }
 
 /// Byte offset (into the raw content) where 1-indexed `line` starts.
@@ -1599,6 +1634,108 @@ mod tests {
     // process-global counts (#2077/#2126 lesson).
     // -----------------------------------------------------------------------
 
+    /// R6: the UNARMED tool must be byte-for-byte the origin/main tool at the
+    /// WIRE — same name, description, and input schema — because every enabled
+    /// tool's ToolSpec is serialized into the LLM prompt-cache prefix
+    /// (registry.rs `specs()`). A changed unarmed spec would invalidate that
+    /// prefix for every session on the planet, armed or not, defeating the
+    /// "flag-gated, zero blast radius" premise. This golden is the exact
+    /// origin/main ToolSpec JSON; only the ARMED tool may differ from it.
+    fn read_file_origin_toolspec() -> serde_json::Value {
+        serde_json::json!({
+            "name": "read_file",
+            "description": "Read the contents of a file. Returns the file content with line numbers.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative to working directory; alias: filePath)"
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Optional starting line number (1-indexed; alias: offset)"
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional ending line number (1-indexed, inclusive)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional maximum number of lines to read, starting at start_line (alternative to end_line — do not provide both)"
+                    }
+                },
+                "required": ["path"]
+            }
+        })
+    }
+
+    fn read_file_toolspec(tool: &ReadFileTool) -> serde_json::Value {
+        serde_json::json!({
+            "name": tool.name(),
+            "description": tool.description(),
+            "input_schema": tool.input_schema(),
+        })
+    }
+
+    #[test]
+    fn unarmed_read_file_toolspec_is_byte_identical_to_origin_main() {
+        let tool = ReadFileTool::new("/tmp").with_window_enforcement(false);
+        let spec = read_file_toolspec(&tool);
+        assert_eq!(
+            spec,
+            read_file_origin_toolspec(),
+            "the UNARMED read_file ToolSpec must equal origin/main exactly — no \
+             byte_offset/byte_limit in the schema, no windowing sentence in the \
+             description — or the prompt-cache prefix changes for every session"
+        );
+        // The wire is the serialized string; pin it too (serde_json sorts
+        // keys, so this is deterministic).
+        assert_eq!(
+            serde_json::to_string(&spec).unwrap(),
+            serde_json::to_string(&read_file_origin_toolspec()).unwrap(),
+            "serialized unarmed spec must match origin byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn armed_read_file_toolspec_advertises_byte_mode() {
+        // The armed spec is ALLOWED to differ — byte mode is part of the
+        // armed feature — and it must actually carry the byte parameters.
+        let tool = ReadFileTool::new("/tmp").with_window_enforcement(true);
+        let spec = read_file_toolspec(&tool);
+        assert_ne!(
+            spec,
+            read_file_origin_toolspec(),
+            "the armed spec differs from origin by design"
+        );
+        let props = spec["input_schema"]["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("byte_offset") && props.contains_key("byte_limit"),
+            "armed schema advertises byte mode: {props:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unarmed_byte_params_are_rejected_not_silently_ignored() {
+        // byte mode is an armed-only capability. Unarmed, the schema does not
+        // advertise it, so the model never sends it; a manual caller that
+        // does must get a clear error, never a silent fall-through to a line
+        // read (which would drop its intent).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "abcdef").unwrap();
+        let tool = ReadFileTool::new(dir.path()); // unarmed
+        let r = tool
+            .execute(&serde_json::json!({"path": "f.txt", "byte_offset": 0}))
+            .await
+            .unwrap();
+        assert!(
+            !r.success && r.output.contains("byte_offset"),
+            "unarmed byte_offset must be a clean rejection: {}",
+            r.output
+        );
+    }
+
     /// 1500 lines, 100 bytes of content each (distinct `row NNNNNN` prefixes),
     /// 151,500 content bytes total. With a 4-digit gutter each formatted line
     /// is 109 bytes, so the 49,152-byte window holds exactly 450 of them:
@@ -1955,11 +2092,12 @@ mod tests {
     async fn should_page_raw_bytes_with_byte_offset() {
         // The raw byte mode itself: exact slices, an exact continuation,
         // no footer at EOF, UTF-8 boundary snapping, and clean errors for
-        // out-of-range or ambiguous parameters. Available unarmed too — the
-        // schema is static, so an advertised parameter must always work.
+        // out-of-range or ambiguous parameters. R6: byte mode is part of the
+        // ARMED feature (unarmed the schema does not advertise it), so the
+        // tool is armed here.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bytes.txt"), "abcdefghij").unwrap();
-        let tool = ReadFileTool::new(dir.path());
+        let tool = ReadFileTool::new(dir.path()).with_window_enforcement(true);
 
         let first = tool
             .execute(&serde_json::json!({"path": "bytes.txt", "byte_offset": 0, "byte_limit": 4}))
