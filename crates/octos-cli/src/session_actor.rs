@@ -4628,6 +4628,7 @@ impl SessionActor {
             model.as_deref().and_then(model_pricing).map(|pricing| {
                 pricing.cost_with_cache_for_provider(
                     provider.as_deref().unwrap_or(""),
+                    model.as_deref().unwrap_or(""),
                     response.token_usage.input_tokens,
                     response.token_usage.output_tokens,
                     response.token_usage.cache_read_tokens,
@@ -8870,6 +8871,7 @@ impl SessionActor {
                         .map(|pricing| {
                             pricing.cost_with_cache_for_provider(
                                 overflow_provider,
+                                overflow_model.as_deref().unwrap_or(""),
                                 conv_response.token_usage.input_tokens,
                                 conv_response.token_usage.output_tokens,
                                 conv_response.token_usage.cache_read_tokens,

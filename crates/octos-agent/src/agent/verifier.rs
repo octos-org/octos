@@ -556,6 +556,7 @@ impl Agent {
             octos_llm::pricing::model_pricing(&verifier_metadata.model).map(|p| {
                 p.cost_with_cache_for_provider(
                     &verifier_metadata.provider,
+                    &verifier_metadata.model,
                     response.usage.input_tokens,
                     response.usage.output_tokens,
                     response.usage.cache_read_tokens,

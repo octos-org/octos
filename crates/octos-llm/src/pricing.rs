@@ -129,60 +129,92 @@ const CACHE_WRITE_INPUT_MULTIPLIER: f64 = 1.25;
 
 /// Provider-specific prompt-cache billing multipliers on the base input rate.
 ///
-/// #2194 review: cache economics are a PROVIDER property, not a universal
-/// constant — pricing OpenAI or Gemini cache traffic at Anthropic's
-/// 0.1x/1.25x misprices both. See [`cache_rates_for_provider`] for the rate
-/// cards and their sources.
+/// #2194 review: cache economics are a PROTOCOL/provider property, not a
+/// universal constant — pricing OpenAI or Gemini cache traffic at Anthropic's
+/// 0.1x/1.25x misprices both. See [`cache_rates`] for the rate cards, their
+/// sources, and the protocol keying.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CacheRates {
     /// Cache-read (cache-hit) tokens bill at this multiple of the input rate.
     pub read_multiplier: f64,
-    /// Cache-write tokens bill at this multiple of the input rate on TOP of
-    /// nothing (they are disjoint from `input_tokens`); 0.0 means the
-    /// provider does not bill cache writes per token.
+    /// Cache-write tokens bill at this multiple of the input rate. They are
+    /// DISJOINT from `input_tokens`, so a 0.0 here makes a reported write
+    /// VANISH from cost — only correct for a protocol that never reports
+    /// writes (Google), never for one that does.
     pub write_multiplier: f64,
 }
 
-/// The prompt-cache rate card for a provider label ([`ProviderMetadata::provider`]
-/// / `LlmProvider::provider_name()`, matched case-insensitively).
+/// Whether the answering slot speaks the ANTHROPIC Messages API, keyed on the
+/// resolved provider label + model. This is the protocol that reports
+/// `cache_creation_input_tokens` (writes, 1.25x) and `cache_read_input_tokens`
+/// (reads, 0.1x).
+///
+/// Native `anthropic` plus the relabeled proxies that construct an
+/// `AnthropicProvider` under a custom label: `zai` / `zai-coding` (GLM over
+/// the Anthropic API) and `r9s` when it is serving a `claude-*` model (r9s
+/// auto-selects the Anthropic protocol for claude models and OpenAI for the
+/// rest — see `registry/r9s.rs`). A label CONTAINING "anthropic" also counts,
+/// covering custom Anthropic-compatible endpoints. zhipu / dashscope /
+/// minimax / moonshot-coding are OpenAI-protocol re-hosts and are
+/// deliberately excluded.
+fn speaks_anthropic_protocol(provider: &str, model: &str) -> bool {
+    let p = provider.to_ascii_lowercase();
+    let m = model.to_ascii_lowercase();
+    p.contains("anthropic")
+        || p == "zai"
+        || p == "zai-coding"
+        || (p == "r9s" && m.starts_with("claude"))
+}
+
+/// The prompt-cache rate card for the answering slot, keyed on its
+/// [`ProviderMetadata`] provider label + model (matched case-insensitively).
 ///
 /// Sources, and why each bucket is what it is:
-/// - `anthropic`: cache reads 0.1x the input rate, 5-minute ephemeral cache
-///   writes 1.25x — uniform across Claude models per Anthropic's prompt
-///   caching pricing docs, and consistent with every catalog row that
-///   carries a cached rate (`catalog.rs`: sonnet-4 0.3/3.0, haiku-4.5
-///   0.08/0.80 — both exactly 0.1x).
+/// - ANTHROPIC protocol (native `anthropic`, plus relabeled Anthropic-API
+///   proxies — see [`speaks_anthropic_protocol`]): cache reads 0.1x the input
+///   rate, 5-minute ephemeral cache writes 1.25x — uniform across Claude
+///   models per Anthropic's prompt-caching pricing docs, and consistent with
+///   every catalog row that carries a cached rate (`catalog.rs`: sonnet-4
+///   0.3/3.0, haiku-4.5 0.08/0.80 — both exactly 0.1x). This branch is keyed
+///   on PROTOCOL, not on the family label, because a relabeled proxy (zai
+///   serving GLM, r9s serving claude) still emits Anthropic cache accounting.
 /// - `gemini` / `vertex` / `google`: implicit caching bills cached tokens at
 ///   25% of the input rate (catalog row gemini-2.5-flash: 0.0375/0.15 =
 ///   0.25x). No per-token write charge — explicit-cache STORAGE is
-///   time-billed, and octos never creates explicit caches.
-/// - everything else (openai, openrouter, deepseek, local, relabeled
-///   proxies, unknown/empty): no cached rate is knowable here — the
-///   catalog's only OpenAI row carries `cache_read_per_mtok: None`, and the
-///   public discount varies per model FAMILY (0.5x for gpt-4o-era, deeper
-///   for newer families), so any provider-wide discount would be invented
-///   for some models. Reads therefore bill at the FULL input rate (the
-///   never-understate bound; deliberately overstates where a real discount
-///   exists) and writes carry no premium (automatic caching has no write
-///   charge). Tightening this to real per-model rates needs cached-rate
-///   fields in the runtime model catalog first.
-pub fn cache_rates_for_provider(provider: &str) -> CacheRates {
-    let p = provider.to_ascii_lowercase();
-    if p.contains("anthropic") {
-        CacheRates {
+///   time-billed, octos never creates explicit caches, and the Gemini parser
+///   never reports write tokens, so 0.0 writes can never make a real token
+///   vanish.
+/// - everything else (openai, openrouter, deepseek, local, unknown/empty):
+///   no cached READ rate is knowable — the catalog's only OpenAI row carries
+///   `cache_read_per_mtok: None`, and the public discount varies per model
+///   FAMILY (0.5x for gpt-4o-era, deeper for newer), so a provider-wide
+///   discount would be invented for some models. Reads bill at the FULL input
+///   rate (1.0x — the never-understate bound; overstates where a real
+///   discount exists). WRITES bill at 1.25x, NOT 0: `cache_write_tokens` is
+///   populated ONLY by the Anthropic parser (`anthropic.rs`;
+///   `TokenUsage`'s contract — no OpenAI/Gemini path sets it), so any write
+///   token that reaches this residual bucket is an Anthropic-protocol write
+///   from a proxy whose label we failed to recognize. Pricing it at 0 would
+///   make a billed token vanish (an understatement); 1.25x is the honest
+///   value. Tightening the read side needs cached-rate fields in the runtime
+///   model catalog first.
+pub fn cache_rates(provider: &str, model: &str) -> CacheRates {
+    if speaks_anthropic_protocol(provider, model) {
+        return CacheRates {
             read_multiplier: CACHE_READ_INPUT_MULTIPLIER,
             write_multiplier: CACHE_WRITE_INPUT_MULTIPLIER,
-        }
-    } else if p.contains("gemini") || p.contains("vertex") || p.contains("google") {
-        CacheRates {
+        };
+    }
+    let p = provider.to_ascii_lowercase();
+    if p.contains("gemini") || p.contains("vertex") || p.contains("google") {
+        return CacheRates {
             read_multiplier: 0.25,
             write_multiplier: 0.0,
-        }
-    } else {
-        CacheRates {
-            read_multiplier: 1.0,
-            write_multiplier: 0.0,
-        }
+        };
+    }
+    CacheRates {
+        read_multiplier: 1.0,
+        write_multiplier: CACHE_WRITE_INPUT_MULTIPLIER,
     }
 }
 
@@ -221,14 +253,17 @@ impl ModelPricing {
         )
     }
 
-    /// Cache-aware cost at the rate card of the provider that actually
-    /// served the response ([`cache_rates_for_provider`]). This is the entry
-    /// point runtime pricing should use: `TokenUsage` counts are already
-    /// disjoint-normalized for every provider, so the only provider-specific
-    /// part left is the multipliers.
+    /// Cache-aware cost at the rate card of the slot that actually served the
+    /// response ([`cache_rates`], keyed on its provider label + model). This
+    /// is the entry point runtime pricing should use: `TokenUsage` counts are
+    /// already disjoint-normalized for every provider, so the only
+    /// provider-specific part left is the multipliers, and the model is
+    /// needed to tell a relabeled Anthropic proxy (r9s serving claude) from
+    /// the same label serving an OpenAI-protocol model.
     pub fn cost_with_cache_for_provider(
         &self,
         provider: &str,
+        model: &str,
         input_tokens: u32,
         output_tokens: u32,
         cache_read_tokens: u32,
@@ -239,7 +274,7 @@ impl ModelPricing {
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
-            cache_rates_for_provider(provider),
+            cache_rates(provider, model),
         )
     }
 
@@ -507,7 +542,14 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
         };
-        let cost = p.cost_with_cache_for_provider("anthropic", 100_000, 10_000, 10_000, 2_000);
+        let cost = p.cost_with_cache_for_provider(
+            "anthropic",
+            "claude-opus-4",
+            100_000,
+            10_000,
+            10_000,
+            2_000,
+        );
         let naive = p.cost(100_000, 10_000);
         // 10k reads at 0.1x ($0.003) + 2k writes at 1.25x ($0.0075).
         assert!(
@@ -525,11 +567,25 @@ mod tests {
             input_per_million: 0.15,
             output_per_million: 0.60,
         };
-        let cost = p.cost_with_cache_for_provider("gemini", 100_000, 10_000, 100_000, 5_000);
+        let cost = p.cost_with_cache_for_provider(
+            "gemini",
+            "gemini-2.5-flash",
+            100_000,
+            10_000,
+            100_000,
+            5_000,
+        );
         let naive = p.cost(100_000, 10_000);
         // 100k cached reads at 0.25x of $0.15/M = $0.00375; writes free.
         assert!((cost - (naive + 0.00375)).abs() < 1e-12, "got {cost}");
-        let vertex = p.cost_with_cache_for_provider("vertex", 100_000, 10_000, 100_000, 5_000);
+        let vertex = p.cost_with_cache_for_provider(
+            "vertex",
+            "gemini-2.5-pro",
+            100_000,
+            10_000,
+            100_000,
+            5_000,
+        );
         assert!(
             (vertex - cost).abs() < 1e-12,
             "vertex bills at Google rates"
@@ -537,21 +593,41 @@ mod tests {
     }
 
     #[test]
-    fn should_price_unknown_provider_cache_reads_at_full_input_rate_with_no_write_premium() {
-        // No cached rate is knowable for these providers (the catalog's only
-        // OpenAI row carries cache_read_per_mtok: None, and the public
+    fn should_price_unknown_provider_cache_reads_at_full_input_rate_and_writes_never_free() {
+        // No cached READ rate is knowable for these providers (the catalog's
+        // only OpenAI row carries cache_read_per_mtok: None, and the public
         // discount varies per model family), so reads bill at the FULL input
-        // rate — never an invented discount — and writes carry no premium.
+        // rate — never an invented discount. WRITES, however, are never 0:
+        // cache_write_tokens is only ever populated by the Anthropic parser,
+        // so any write reaching this bucket is an Anthropic-protocol write
+        // from an unrecognized proxy label and bills at 1.25x rather than
+        // vanishing.
         let p = ModelPricing {
             input_per_million: 2.5,
             output_per_million: 10.0,
         };
-        for provider in ["openai", "openrouter", "deepseek", "local", ""] {
-            let cost = p.cost_with_cache_for_provider(provider, 100_000, 10_000, 40_000, 8_000);
-            let expected = p.cost(100_000 + 40_000, 10_000);
+        for (provider, model) in [
+            ("openai", "gpt-4o"),
+            ("openrouter", "anthropic/claude-3.5-sonnet"),
+            ("deepseek", "deepseek-chat"),
+            ("local", "qwen2.5"),
+            ("", ""),
+        ] {
+            let cost =
+                p.cost_with_cache_for_provider(provider, model, 100_000, 10_000, 40_000, 8_000);
+            // reads at full input rate (folded into input) + writes at 1.25x.
+            let expected = p.cost(100_000 + 40_000, 10_000)
+                + (8_000.0 / 1_000_000.0) * p.input_per_million * 1.25;
             assert!(
                 (cost - expected).abs() < 1e-12,
-                "{provider}: cached reads bill at the full input rate, writes free (got {cost})"
+                "{provider}/{model}: reads at full input rate, writes at 1.25x, not free (got {cost})"
+            );
+            // A reported write must never vanish.
+            let read_only =
+                p.cost_with_cache_for_provider(provider, model, 100_000, 10_000, 40_000, 0);
+            assert!(
+                cost - read_only > 1e-9,
+                "{provider}/{model}: cache-write tokens must add cost"
             );
         }
     }
@@ -564,12 +640,70 @@ mod tests {
             input_per_million: 3.0,
             output_per_million: 15.0,
         };
-        let anthropic = p.cost_with_cache_for_provider("anthropic", 100_000, 10_000, 50_000, 5_000);
-        let gemini = p.cost_with_cache_for_provider("gemini", 100_000, 10_000, 50_000, 5_000);
-        let unknown = p.cost_with_cache_for_provider("openai", 100_000, 10_000, 50_000, 5_000);
+        let anthropic = p.cost_with_cache_for_provider(
+            "anthropic",
+            "claude-opus-4",
+            100_000,
+            10_000,
+            50_000,
+            5_000,
+        );
+        let gemini = p.cost_with_cache_for_provider(
+            "gemini",
+            "gemini-2.5-flash",
+            100_000,
+            10_000,
+            50_000,
+            5_000,
+        );
+        let unknown =
+            p.cost_with_cache_for_provider("openai", "gpt-4o", 100_000, 10_000, 50_000, 5_000);
         assert!((anthropic - gemini).abs() > 1e-9);
         assert!((anthropic - unknown).abs() > 1e-9);
         assert!((gemini - unknown).abs() > 1e-9);
+    }
+
+    #[test]
+    fn should_price_relabeled_anthropic_protocol_cache_writes_and_reads_at_anthropic_rates() {
+        // #2194 review round 2: relabeled Anthropic-protocol providers
+        // (zai / zai-coding serving GLM, r9s serving claude, custom
+        // anthropic) emit cache_creation_input_tokens as WRITES. Their label
+        // is not "anthropic", but they speak the Anthropic Messages API, so
+        // writes bill at 1.25x and reads at 0.1x — NOT free, and not the
+        // full-rate residual bucket.
+        let p = ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+        };
+        let anthropic_ref = p.cost_with_cache_for_provider(
+            "anthropic",
+            "claude-opus-4",
+            100_000,
+            10_000,
+            40_000,
+            8_000,
+        );
+        for (provider, model) in [
+            ("zai", "glm-4.6"),
+            ("zai-coding", "glm-4.6"),
+            ("r9s", "claude-3-5-sonnet"),
+            ("custom-anthropic", "claude-3-7-sonnet"),
+        ] {
+            let cost =
+                p.cost_with_cache_for_provider(provider, model, 100_000, 10_000, 40_000, 8_000);
+            assert!(
+                (cost - anthropic_ref).abs() < 1e-12,
+                "{provider}/{model}: Anthropic-protocol cache must price at 0.1x read / 1.25x write \
+                 (got {cost}, anthropic {anthropic_ref})"
+            );
+            // And explicitly: the write is NOT free.
+            let read_only =
+                p.cost_with_cache_for_provider(provider, model, 100_000, 10_000, 40_000, 0);
+            assert!(
+                cost - read_only > 1e-9,
+                "{provider}/{model}: 8k cache-write tokens must add cost, not vanish"
+            );
+        }
     }
 
     #[test]

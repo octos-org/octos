@@ -544,10 +544,11 @@ impl Agent {
     /// `provider_index: None` to price at the active slot — used for
     /// tool-reported usage that has no per-response attribution.
     ///
-    /// Cache-aware (#1640 follow-up, provider-aware per #2194 review): the
-    /// resolved slot's PROVIDER picks the cache rate card
-    /// (`cache_rates_for_provider` — Anthropic 0.1x/1.25x, Gemini 0.25x/0,
-    /// unknown 1.0x/0), and `TokenUsage`'s crate-wide contract is DISJOINT
+    /// Cache-aware (#1640 follow-up, protocol-aware per #2194 review): the
+    /// resolved slot's PROVIDER + MODEL pick the cache rate card
+    /// (`pricing::cache_rates` — Anthropic protocol 0.1x/1.25x incl. relabeled
+    /// proxies, Gemini 0.25x/0, unknown 1.0x/1.25x so a reported write never
+    /// vanishes), and `TokenUsage`'s crate-wide contract is DISJOINT
     /// accounting (inclusive wire formats are normalized at each provider's
     /// parse boundary), so the three counts price independently without
     /// double-billing.
@@ -563,6 +564,7 @@ impl Agent {
         octos_llm::pricing::model_pricing(&metadata.model).map(|p| {
             p.cost_with_cache_for_provider(
                 &metadata.provider,
+                &metadata.model,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -599,6 +601,7 @@ impl Agent {
             pricing.map(|p| {
                 p.cost_with_cache_for_provider(
                     &metadata.provider,
+                    &metadata.model,
                     response_usage.input_tokens,
                     response_usage.output_tokens,
                     response_usage.cache_read_tokens,
@@ -853,29 +856,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_price_cache_at_provider_rate_card_when_slot_is_not_anthropic() {
-        // #2194 review: the multipliers are a PROVIDER property. The same
-        // usage on an openai-labeled slot must bill reads at the full input
-        // rate with no write premium — NOT at Anthropic's 0.1x/1.25x.
+    async fn should_price_unknown_slot_cache_reads_full_and_writes_never_free() {
+        // #2194 review round 2: an unknown-labeled slot bills cache READS at
+        // the full input rate (no invented discount), but cache WRITES are
+        // NEVER free — cache_write_tokens is only ever emitted by the
+        // Anthropic parser, so a write reaching the residual bucket is an
+        // Anthropic-protocol write from an unrecognized proxy and bills at
+        // 1.25x rather than vanishing.
         let (agent, _dir) = priced_agent("openai").await;
         let priced = agent
             .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
             .expect("claude-opus-4 has catalog pricing");
 
         let pricing = octos_llm::pricing::model_pricing("claude-opus-4").unwrap();
-        let expected = pricing.cost(100_000 + 10_000, 10_000);
+        // reads folded in at full input rate + 2k writes at 1.25x.
+        let expected = pricing.cost(100_000 + 10_000, 10_000)
+            + (2_000.0 / 1_000_000.0) * pricing.input_per_million * 1.25;
         assert!(
             (priced - expected).abs() < 1e-12,
-            "unknown-rate providers bill reads at the full input rate, writes free (got {priced})"
+            "unknown slot: reads at full input rate, writes at 1.25x (got {priced})"
+        );
+        // The write must not vanish: dropping it lowers the price.
+        let read_only = agent
+            .response_usage_cost(100_000, 10_000, 10_000, 0, None)
+            .unwrap();
+        assert!(
+            priced - read_only > 1e-9,
+            "a reported cache write must add cost on an unknown slot"
         );
 
+        // And the Anthropic card is still cheaper (0.1x reads), so the
+        // protocol branch genuinely changes the price.
         let (anthropic_agent, _dir2) = priced_agent("anthropic").await;
         let anthropic_priced = anthropic_agent
             .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
             .unwrap();
         assert!(
-            (priced - anthropic_priced).abs() > 1e-9,
-            "the provider label must change the cache pricing"
+            priced - anthropic_priced > 1e-9,
+            "unknown full-rate reads must cost more than Anthropic 0.1x reads"
         );
     }
 

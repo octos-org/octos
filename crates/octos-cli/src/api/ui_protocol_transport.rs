@@ -24514,6 +24514,7 @@ async fn handle_session_btw(
                         model.as_deref().and_then(model_pricing).map(|pricing| {
                             pricing.cost_with_cache_for_provider(
                                 &metadata.provider,
+                                &metadata.model,
                                 response.usage.input_tokens,
                                 response.usage.output_tokens,
                                 response.usage.cache_read_tokens,
@@ -33580,6 +33581,7 @@ async fn run_standalone_turn(
                         model.as_deref().and_then(model_pricing).map(|pricing| {
                             pricing.cost_with_cache_for_provider(
                                 provider.as_deref().unwrap_or(""),
+                                model.as_deref().unwrap_or(""),
                                 response.token_usage.input_tokens,
                                 response.token_usage.output_tokens,
                                 response.token_usage.cache_read_tokens,
