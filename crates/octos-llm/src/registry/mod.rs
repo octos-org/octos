@@ -80,7 +80,7 @@ mod nvidia;
 mod ollama;
 mod openai;
 mod openrouter;
-mod r9s;
+pub(crate) mod r9s;
 mod vertex;
 mod vllm;
 mod zai;

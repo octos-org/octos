@@ -159,11 +159,13 @@ pub struct CacheRates {
 /// deliberately excluded.
 fn speaks_anthropic_protocol(provider: &str, model: &str) -> bool {
     let p = provider.to_ascii_lowercase();
-    let m = model.to_ascii_lowercase();
     p.contains("anthropic")
         || p == "zai"
         || p == "zai-coding"
-        || (p == "r9s" && m.starts_with("claude"))
+        // Mirror r9s construction EXACTLY (case-sensitive `starts_with("claude-")`
+        // on the RAW model): r9s speaks the Anthropic protocol only for the models
+        // it actually builds an `AnthropicProvider` for — see `registry::r9s`.
+        || (p == "r9s" && crate::registry::r9s::prefers_anthropic(model))
 }
 
 /// The prompt-cache rate card for the answering slot, keyed on its
@@ -501,6 +503,33 @@ pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_mirror_r9s_construction_predicate_when_pricing_cache() {
+        // #2194 R3: r9s auto-selects the Anthropic protocol ONLY for
+        // `model.starts_with("claude-")` (case-sensitive; see registry/r9s.rs).
+        // Cache pricing must classify by the SAME predicate, or a model r9s
+        // actually serves over the OpenAI protocol (mixed-case "Claude-...", or
+        // a "claude"-prefixed-but-not-"claude-" name) is handed Anthropic cache
+        // rates it never earns. Before this fix pricing used a LOWERCASED
+        // `starts_with("claude")` and diverged from construction.
+        assert_eq!(
+            cache_rates("r9s", "claude-3-5-sonnet").read_multiplier,
+            CACHE_READ_INPUT_MULTIPLIER,
+            "r9s + claude-* is Anthropic protocol -> 0.1x cache reads",
+        );
+        assert_eq!(
+            cache_rates("r9s", "Claude-3-5-sonnet").read_multiplier,
+            1.0,
+            "r9s builds an OpenAIProvider for a non-'claude-' (mixed-case) model, \
+             so pricing must NOT hand it Anthropic cache rates",
+        );
+        assert_eq!(
+            cache_rates("r9s", "claude2-experimental").read_multiplier,
+            1.0,
+            "a 'claude'-prefixed-but-not-'claude-' model is OpenAI protocol at r9s",
+        );
+    }
 
     #[test]
     fn test_known_model_pricing() {

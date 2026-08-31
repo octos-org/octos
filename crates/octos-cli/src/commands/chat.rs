@@ -3735,7 +3735,12 @@ fn create_custom_provider(
         "anthropic" => {
             let mut provider = octos_llm::anthropic::AnthropicProvider::new(key, model)
                 .with_base_url(&base_url)
-                .with_provider_label("custom");
+                // #2194: encode the protocol in the label so the cache-pricing
+                // classifier (which keys off the metadata label) recognizes this
+                // as Anthropic-protocol (0.1x read / 1.25x write), not the 1.0x
+                // residual bucket. `contains("anthropic")` is the classifier's
+                // documented catch for custom Anthropic-compatible endpoints.
+                .with_provider_label("custom-anthropic");
             if let Some(t) = llm_timeout_secs {
                 let c =
                     llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
@@ -4076,6 +4081,14 @@ mod custom_provider_tests {
 
         assert_eq!(provider.provider_name(), "custom");
         assert_eq!(provider.model_id(), "llama-3.1-70b-instruct");
+        // #2194 R3: a custom OpenAI-protocol endpoint stays in the residual
+        // cache bucket (full-rate reads), NOT the Anthropic 0.1x bucket.
+        assert_eq!(
+            octos_llm::pricing::cache_rates(provider.provider_name(), provider.model_id())
+                .read_multiplier,
+            1.0,
+            "custom + api_type=openai must not be priced as Anthropic-protocol cache",
+        );
     }
 
     #[test]
@@ -4089,8 +4102,18 @@ mod custom_provider_tests {
         )
         .unwrap();
 
-        assert_eq!(provider.provider_name(), "custom");
+        // #2194 R3: the label must ENCODE the Anthropic protocol so the
+        // cache-pricing classifier (which keys off the metadata label) hands
+        // it the 0.1x read / 1.25x write bucket instead of the 1.0x residual
+        // — a 10x cache-read overcharge before this fix.
+        assert_eq!(provider.provider_name(), "custom-anthropic");
         assert_eq!(provider.model_id(), "claude-compatible");
+        assert_eq!(
+            octos_llm::pricing::cache_rates(provider.provider_name(), provider.model_id())
+                .read_multiplier,
+            0.1,
+            "custom + api_type=anthropic must be priced as Anthropic-protocol cache",
+        );
     }
 
     #[test]

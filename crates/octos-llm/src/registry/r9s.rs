@@ -8,6 +8,19 @@ use crate::provider::LlmProvider;
 
 use super::{CreateParams, ProviderEntry};
 
+/// Whether r9s serves `model` over the Anthropic Messages API.
+///
+/// r9s auto-selects the Anthropic protocol for `claude-*` models and the
+/// OpenAI Chat Completions protocol for everything else. This is the SINGLE
+/// source of truth for that split so provider construction (below) and the
+/// cache-pricing classifier (`crate::pricing`) can never diverge — a
+/// divergence would price an OpenAI-protocol model at Anthropic cache rates
+/// (or vice versa). Case-sensitive by construction: a mixed-case
+/// "Claude-..." is NOT `claude-*` and is served over OpenAI.
+pub(crate) fn prefers_anthropic(model: &str) -> bool {
+    model.starts_with("claude-")
+}
+
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "r9s",
     aliases: &["r9s.ai"],
@@ -41,7 +54,7 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
 
     // Auto-detect protocol: Anthropic Messages API for claude-* models,
     // OpenAI Chat Completions for everything else.
-    if model.starts_with("claude-") {
+    if prefers_anthropic(&model) {
         let anthropic_url = url
             .strip_suffix("/v1")
             .map(|base| format!("{base}/anthropic"))
