@@ -82,17 +82,21 @@ const GREP_MAX_LINE_LENGTH: usize = 500;
 
 /// Cap one emitted line at [`GREP_MAX_LINE_LENGTH`] characters.
 ///
-/// Cuts by char index (never inside a multi-byte UTF-8 char) and appends a
-/// suffix naming the original length, so the model knows what it lost —
-/// re-running the search cannot reveal more; `read_file` can.
-fn cap_match_line(line: &str) -> std::borrow::Cow<'_, str> {
-    match line.char_indices().nth(GREP_MAX_LINE_LENGTH) {
-        None => std::borrow::Cow::Borrowed(line),
+/// `display` is the text as it would be emitted (the plain match site trims
+/// it first); `raw_line` is the physical line it came from. The cap fires on
+/// `display` and cuts by char index (never inside a multi-byte UTF-8 char);
+/// the suffix names the RAW line's char count, so the same physical line
+/// reports the same `N chars total` at every emission site regardless of
+/// site-local trimming. Re-running the search cannot reveal more of the
+/// line; `read_file` can.
+fn cap_match_line<'a>(display: &'a str, raw_line: &str) -> std::borrow::Cow<'a, str> {
+    match display.char_indices().nth(GREP_MAX_LINE_LENGTH) {
+        None => std::borrow::Cow::Borrowed(display),
         Some((cut, _)) => {
-            let total_chars = GREP_MAX_LINE_LENGTH + line[cut..].chars().count();
+            let total_chars = raw_line.chars().count();
             std::borrow::Cow::Owned(format!(
                 "{}\u{2026} [line truncated, {total_chars} chars total]",
-                &line[..cut]
+                &display[..cut]
             ))
         }
     }
@@ -442,7 +446,7 @@ fn run_grep(
                             "{} {:4}│ {}\n",
                             marker,
                             actual_line + 1,
-                            cap_match_line(ctx_line)
+                            cap_match_line(ctx_line, ctx_line)
                         ));
                     }
                     matches.push(ctx_output);
@@ -451,7 +455,7 @@ fn run_grep(
                         "{}:{}: {}",
                         rel_path,
                         line_num + 1,
-                        cap_match_line(line.trim())
+                        cap_match_line(line.trim(), line)
                     ));
                 }
             }
@@ -1081,6 +1085,49 @@ mod tests {
             "{}",
             result.output
         );
+    }
+
+    /// The `N chars total` suffix must name the RAW physical line's char
+    /// count at BOTH emission sites. The plain match site trims before
+    /// capping; counting the trimmed text there while the context site
+    /// counts the raw line makes the same physical line report two different
+    /// totals depending on the `context` argument.
+    #[tokio::test]
+    async fn should_report_same_chars_total_with_and_without_context_when_line_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Raw 606 chars: 100 leading spaces + "needle" + 500 'a's (trimmed: 506).
+        let raw_line = format!("{}needle{}", " ".repeat(100), "a".repeat(500));
+        std::fs::write(dir.path().join("indent.txt"), format!("{raw_line}\n")).unwrap();
+
+        let tool = GrepTool::new(dir.path());
+        let plain = tool
+            .execute(&serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        let with_context = tool
+            .execute(&serde_json::json!({ "pattern": "needle", "context": 1 }))
+            .await
+            .unwrap();
+        assert!(plain.success && with_context.success);
+
+        let total_of = |output: &str| -> String {
+            let start = output
+                .find("[line truncated, ")
+                .expect("cap suffix must be present")
+                + "[line truncated, ".len();
+            output[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect()
+        };
+        let plain_total = total_of(&plain.output);
+        let ctx_total = total_of(&with_context.output);
+        assert_eq!(
+            plain_total, ctx_total,
+            "same physical line must report the same total at both emission sites\nplain: {}\nctx: {}",
+            plain.output, with_context.output
+        );
+        assert_eq!(plain_total, "606", "the total is the RAW line's char count");
     }
 
     /// With the per-line cap in place, a long line can no longer be recovered

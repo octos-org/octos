@@ -77,13 +77,6 @@ pub struct TruncationReport {
     /// Exact number of input bytes dropped between head and tail — the same
     /// `N` printed in the elision marker. `0` when not truncated.
     pub omitted_bytes: usize,
-    /// pi's `firstLineExceedsLimit` flags the head-truncation case where not
-    /// even the FIRST LINE fits the byte budget. A head/tail byte split has
-    /// no lines, so the honest analogue reported here: `true` when
-    /// truncation kept ZERO head bytes — `max_len` (minus the marker
-    /// overhead reservation) was too small for even one leading char to
-    /// survive, and `content` is effectively just the marker.
-    pub first_segment_exceeds_limit: bool,
     /// The applied byte limit, as passed.
     pub max_len: usize,
     /// The applied head fraction, after clamping to `[0.1, 0.9]`.
@@ -120,7 +113,6 @@ pub fn truncate_head_tail_report(s: &str, max_len: usize, head_ratio: f32) -> Tr
         total_bytes,
         output_bytes: total_bytes,
         omitted_bytes: 0,
-        first_segment_exceeds_limit: false,
         max_len,
         head_ratio,
     };
@@ -164,7 +156,6 @@ pub fn truncate_head_tail_report(s: &str, max_len: usize, head_ratio: f32) -> Tr
         truncated_by: Some(TruncatedBy::Bytes),
         total_bytes,
         omitted_bytes: omitted,
-        first_segment_exceeds_limit: head_end == 0,
         max_len,
         head_ratio,
     }
@@ -477,7 +468,6 @@ mod tests {
         assert_eq!(r.total_bytes, 100);
         assert_eq!(r.output_bytes, 100);
         assert_eq!(r.omitted_bytes, 0);
-        assert!(!r.first_segment_exceeds_limit);
         assert_eq!(r.max_len, 100);
     }
 
@@ -497,7 +487,6 @@ mod tests {
             "report and inline marker must agree on the omitted count: {}",
             r.content
         );
-        assert!(!r.first_segment_exceeds_limit);
     }
 
     #[test]
@@ -570,18 +559,20 @@ mod tests {
         }
     }
 
+    /// Degenerate regime: `max_len` below the marker overhead reservation
+    /// keeps zero payload bytes — the emitted content is only the elision
+    /// marker (and, pre-existing behaviour, longer than `max_len` itself).
+    /// The report must still be internally consistent: everything omitted,
+    /// marker N accurate. Unreachable through `tool_output_limit` (>= 20K).
     #[test]
-    fn should_flag_first_segment_exceeds_limit_when_budget_below_marker_overhead() {
-        // max_len below the separator overhead: no payload byte survives and
-        // the emitted content is only the elision marker — the head/tail
-        // analogue of pi's firstLineExceedsLimit (see the field doc).
+    fn should_emit_only_marker_when_budget_below_marker_overhead() {
         let s = "z".repeat(100);
         let r = truncate_head_tail_report(&s, 10, 0.7);
         assert!(r.truncated);
-        assert!(r.first_segment_exceeds_limit);
         assert_eq!(r.omitted_bytes, 100);
         assert_eq!(r.content, "\n\n... [100 bytes omitted] ...\n\n");
         assert_eq!(r.truncated_by, Some(TruncatedBy::Bytes));
+        assert_eq!(r.output_bytes, r.content.len());
     }
 
     #[test]
