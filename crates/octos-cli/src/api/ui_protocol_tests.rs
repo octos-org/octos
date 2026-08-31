@@ -1061,9 +1061,17 @@ async fn llm_select_rejects_keyless_models_before_persisting() {
     assert_eq!(result["applied"], true);
     assert_eq!(result["selected"]["model"], "glm-5.3");
     assert_eq!(
-        result.get("restart_required"),
-        None,
+        result["restart_required"],
+        json!(false),
         "dynamic profiles apply without a restart: {result}"
+    );
+    // #2164 uniform post-commit truth: applied stays persistence-only and the
+    // runtime disposition is stamped beside it.
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["effective_from"], "next_turn", "{result}");
+    assert!(
+        result.get("config_revision").is_some_and(|r| r.is_string()),
+        "committed revision must be comparable against the runtime stamp: {result}"
     );
 }
 
@@ -1473,8 +1481,13 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         &delete("openai", "gpt-4o", "official", "d-miss"),
         None,
     )
+    .await
     .expect("delete miss");
     assert_eq!(result["applied"], json!(false));
+    assert_eq!(
+        result["runtime_disposition"], "unchanged",
+        "a miss persists nothing and must not touch the runtime: {result}"
+    );
 
     // (b) Delete the PRIMARY -> the fallback is promoted.
     let result = raw_profile_llm_delete(
@@ -1482,6 +1495,7 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         &delete("zai", "glm-5.3", "official", "d-primary"),
         None,
     )
+    .await
     .expect("delete primary");
     assert_eq!(result["applied"], json!(true));
     let profile = state
@@ -1505,6 +1519,7 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         &delete("deepseek", "deepseek-v4-pro", "official", "d-last"),
         None,
     )
+    .await
     .expect("delete last");
     assert_eq!(result["applied"], json!(true));
     let profile = state
@@ -1525,6 +1540,435 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         "last model removed (an emptied llm block may serialize away): {:?}",
         profile.config.llm
     );
+}
+
+/// #2164 test helpers: read the dynamic ProfileRuntime cache for a profile
+/// through the same key derivation the transport uses.
+fn dynamic_cached_profile_runtime(
+    state: &AppState,
+    profile_id: &str,
+) -> Option<Arc<crate::runtime::ProfileRuntime>> {
+    let key = dynamic_profile_runtime_key(state, profile_id)?;
+    dynamic_profile_runtimes()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+}
+
+fn llm_upsert_rpc(
+    id: &str,
+    profile_id: &str,
+    family: &str,
+    model: &str,
+    base_url: Option<&str>,
+    set_primary: bool,
+) -> RpcRequest<Value> {
+    let mut body = json!({
+        "profile_id": profile_id,
+        "selection": {
+            "family_id": family,
+            "model_id": model,
+            "route": {
+                "route_id": "official",
+                // A test-scoped variable name so resolution can't fall
+                // through to a real key in the process env.
+                "api_key_env": "OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY",
+            },
+        },
+        "api_key": "test-invalidation-key",
+        "set_primary": set_primary,
+    });
+    if let Some(base_url) = base_url {
+        body["selection"]["route"]["base_url"] = json!(base_url);
+    }
+    RpcRequest::new(
+        id.to_string(),
+        APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+        body,
+    )
+}
+
+fn llm_delete_rpc(id: &str, profile_id: &str, family: &str, model: &str) -> RpcRequest<Value> {
+    RpcRequest::new(
+        id.to_string(),
+        APPUI_METHOD_PROFILE_LLM_DELETE.to_string(),
+        json!({
+            "profile_id": profile_id,
+            "family_id": family,
+            "model_id": model,
+            "route_id": "official",
+        }),
+    )
+}
+
+/// #2164 acceptance — dynamic profile, endpoint edit: changing the primary's
+/// base URL (same family/model/route address) must evict the cached
+/// ProfileRuntime and rebuild from the committed file, so the next turn
+/// serves the new endpoint instead of the stale provider chain.
+#[tokio::test]
+async fn should_upsert_endpoint_edit_reload_dynamic_profile_runtime_for_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-v1", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed primary");
+    let before = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime cached after first upsert");
+    assert!(Arc::ptr_eq(
+        &before,
+        &dynamic_cached_profile_runtime(&state, "dev").expect("cache entry"),
+    ));
+    // A turn in flight keeps its start-of-turn runtime; the test drops its
+    // handle the same way a finished turn would, so the rebuild below can
+    // take over the profile's data directory (single-writer redb).
+    let before_ptr = Arc::as_ptr(&before) as usize;
+    drop(before);
+
+    // Same model id, different endpoint: the cache MUST still be invalidated.
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-v2",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            Some("http://127.0.0.1:9/v1"),
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("endpoint edit");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+    assert_eq!(result["effective_from"], "next_turn", "{result}");
+    assert!(
+        result["config_revision"].is_string(),
+        "the committed revision must be comparable against the runtime stamp: {result}"
+    );
+
+    let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
+    assert_ne!(
+        Arc::as_ptr(&after) as usize,
+        before_ptr,
+        "endpoint edit must rebuild the cached ProfileRuntime"
+    );
+    assert_eq!(after.primary_model_id, "gpt-4o-mini");
+    assert_eq!(
+        after.config.base_url.as_deref(),
+        Some("http://127.0.0.1:9/v1"),
+        "the rebuilt chain must serve the COMMITTED endpoint"
+    );
+}
+
+/// #2164 acceptance — deleting the active primary promotes the first
+/// fallback and the NEXT turn uses it: the cached runtime is rebuilt from
+/// the promoted chain, not left on the deleted model.
+#[tokio::test]
+async fn should_delete_primary_promote_fallback_and_reload_dynamic_profile_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-primary", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed primary");
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-fallback",
+            "dev",
+            "deepseek",
+            "deepseek-chat",
+            None,
+            false,
+        ),
+        None,
+    )
+    .await
+    .expect("seed fallback");
+    let before = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime cached");
+    let before_ptr = Arc::as_ptr(&before) as usize;
+    drop(before);
+
+    let result = raw_profile_llm_delete(
+        &state,
+        &llm_delete_rpc("d-1", "dev", "openai", "gpt-4o-mini"),
+        None,
+    )
+    .await
+    .expect("delete primary");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+
+    let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
+    assert_ne!(
+        Arc::as_ptr(&after) as usize,
+        before_ptr,
+        "primary deletion must rebuild the cached ProfileRuntime"
+    );
+    assert_eq!(
+        after.primary_model_id, "deepseek-chat",
+        "the promoted fallback must serve the next turn"
+    );
+}
+
+/// #2164 acceptance — deleting the LAST model evicts the cached runtime and
+/// reports a deterministic deferred disposition; the next turn observes the
+/// empty selection as typed runtime-unavailable truth (no stale chain).
+#[tokio::test]
+async fn should_delete_last_model_evict_dynamic_runtime_and_report_deferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-only", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed sole primary");
+    ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime cached");
+    assert!(dynamic_cached_profile_runtime(&state, "dev").is_some());
+
+    let result = raw_profile_llm_delete(
+        &state,
+        &llm_delete_rpc("d-last", "dev", "openai", "gpt-4o-mini"),
+        None,
+    )
+    .await
+    .expect("delete last model");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "deferred", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the stale runtime must not survive the last-model deletion"
+    );
+    let next_turn = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("ensure");
+    assert!(
+        next_turn.is_none(),
+        "with no selection left the next turn must report typed runtime-unavailable truth"
+    );
+}
+
+/// #2164 acceptance — startup-pinned profile: upsert and delete persist but
+/// return `restart_required: true` with disposition `restart_required`, and
+/// the boot-snapshot runtime is left untouched (no fake reload).
+#[tokio::test]
+async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-primary", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed primary");
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-fallback",
+            "dev",
+            "deepseek",
+            "deepseek-chat",
+            None,
+            false,
+        ),
+        None,
+    )
+    .await
+    .expect("seed fallback");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+
+    // Simulate the serve-startup shape: the runtime lives in the immutable
+    // startup map and nothing sits in the dynamic cache.
+    let mut state = Arc::try_unwrap(state).ok().expect("sole state owner");
+    state.profiles.insert("dev".to_string(), pinned.clone());
+    if let Some(key) = dynamic_profile_runtime_key(&state, "dev") {
+        dynamic_profile_runtimes()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+    let state = Arc::new(state);
+
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-edit",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            Some("http://127.0.0.1:9/v1"),
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("pinned upsert");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(
+        result["runtime_disposition"], "restart_required",
+        "{result}"
+    );
+    assert_eq!(result["restart_required"], json!(true), "{result}");
+    assert_eq!(result["effective_from"], "next_turn", "{result}");
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "a pinned profile must not fake a reload into the dynamic cache"
+    );
+    assert!(
+        Arc::ptr_eq(&pinned, state.profiles.get("dev").unwrap()),
+        "the boot-snapshot runtime stays as-is until restart"
+    );
+
+    let result = raw_profile_llm_delete(
+        &state,
+        &llm_delete_rpc("d-fallback", "dev", "deepseek", "deepseek-chat"),
+        None,
+    )
+    .await
+    .expect("pinned delete");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(
+        result["runtime_disposition"], "restart_required",
+        "{result}"
+    );
+    assert_eq!(result["restart_required"], json!(true), "{result}");
+}
+
+/// #2164 acceptance — a concurrent old bootstrap cannot repopulate the cache
+/// after a mutation: an insert carrying the PRE-bump generation is refused
+/// (the cache stays empty), while a bootstrap that read the committed file
+/// inserts under the new generation.
+#[tokio::test]
+async fn should_refuse_stale_profile_runtime_insert_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-only", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let runtime = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+
+    // Post-mutation state: generation bumped, cache emptied (the transition).
+    let post_commit_generation = bump_profile_runtime_generation(&key);
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+
+    // A bootstrap that captured the PRE-commit generation must be refused…
+    assert!(
+        !insert_profile_runtime_if_current(&key, post_commit_generation - 1, Arc::clone(&runtime),),
+        "a stale in-flight bootstrap must not repopulate the cache"
+    );
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the refused insert must leave the cache empty"
+    );
+    // …while a bootstrap reading the committed file inserts normally.
+    assert!(
+        insert_profile_runtime_if_current(&key, post_commit_generation, Arc::clone(&runtime)),
+        "a current-generation bootstrap inserts"
+    );
+    assert!(dynamic_cached_profile_runtime(&state, "dev").is_some());
+}
+
+/// #2164 acceptance — persisted-but-rebuild-failed is EXPLICIT in the
+/// response (`persisted_but_not_live` + `runtime_error`), not collapsed into
+/// a warn-only server log, and recoverable once the bootstrap blocker is
+/// removed.
+#[tokio::test]
+async fn should_report_persisted_but_not_live_when_runtime_rebuild_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    // Block the runtime bootstrap deterministically: the profile's data dir
+    // is a plain FILE, so the episode store cannot open underneath it.
+    let blocker = dir.path().join("dev-data-blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let mut profile = profile_for_runtime_message("dev");
+    profile.data_dir = Some(blocker.to_string_lossy().to_string());
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string(),
+        "k".to_string(),
+    );
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-edit", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("persistence must succeed");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(
+        result["runtime_disposition"], "persisted_but_not_live",
+        "the failed rebuild must be explicit on the wire: {result}"
+    );
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+    assert!(
+        result["runtime_error"].is_string(),
+        "the rebuild failure detail must be reported: {result}"
+    );
+    assert!(result["config_revision"].is_string(), "{result}");
+
+    // Recoverable: unblock the data dir and the next bootstrap succeeds.
+    std::fs::remove_file(&blocker).unwrap();
+    std::fs::create_dir_all(&blocker).unwrap();
+    let recovered = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap after unblock")
+        .expect("runtime recovers on the next turn");
+    assert_eq!(recovered.primary_model_id, "gpt-4o-mini");
 }
 
 /// A same-address upsert (same family/model/route_id — including a
@@ -28903,7 +29347,9 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
         .opened
         .workspace_root
         .expect("Tier-3 workspace root is still exposed for tools and UI");
-    assert_ne!(workspace_root, profile_runtime.data_dir);
+    // `SessionOpenResult.workspace_root` is wire-typed String; convert so the
+    // comparison against the runtime's PathBuf still type-checks.
+    assert_ne!(PathBuf::from(workspace_root), profile_runtime.data_dir);
 
     let sessions = resolve_sessions_for_lookup(&state, None, Some(profile_id), &session_id)
         .await
