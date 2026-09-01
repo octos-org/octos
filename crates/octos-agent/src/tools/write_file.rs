@@ -501,7 +501,12 @@ impl WriteFileTool {
             // Create parent directories if needed (generic, unfenced path).
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.wrap_err_with(|| {
-                    format!("failed to create directories: {}", parent.display())
+                    // Bound the caller-derived path so an armed Err stays under
+                    // the tool-output cap (#2193 R4).
+                    format!(
+                        "failed to create directories: {}",
+                        octos_core::truncated_utf8(&parent.display().to_string(), 200, "…")
+                    )
                 })?;
             }
             // #1638 R1: when the armed guard authorized this overwrite against
@@ -630,6 +635,34 @@ impl WriteFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn armed_write_caps_an_oversized_malformed_argument_error() {
+        // #2193 R4 (codex round 4): mirror of the read_file cap on write_file's
+        // armed Err path — the caller-controlled unknown key must not blow past
+        // the tool-output cap. Error stays a ToolInputError.
+        let tool = WriteFileTool::new("/tmp").with_window_enforcement(true);
+        let big_key = "k".repeat(60_000);
+        let mut map = serde_json::Map::new();
+        map.insert(big_key, serde_json::json!(1));
+        map.insert("path".to_string(), serde_json::json!("f.txt"));
+        map.insert("content".to_string(), serde_json::json!("x"));
+        let err = match tool.execute(&serde_json::Value::Object(map)).await {
+            Ok(_) => panic!("an unknown parameter must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.chain()
+                .any(|src| src.is::<crate::tools::ToolInputError>()),
+            "the error identity must stay ToolInputError: {err:#}",
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.len() <= crate::tools::TOOL_INPUT_ERROR_MAX_BYTES + 64,
+            "armed malformed-arg error must be capped (got {} bytes)",
+            rendered.len(),
+        );
+    }
 
     #[test]
     fn write_file_tool_is_exclusive() {

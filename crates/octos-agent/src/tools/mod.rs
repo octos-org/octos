@@ -50,10 +50,23 @@ use octos_core::{PathClassification, SessionScope};
 #[derive(Debug, Clone)]
 pub struct ToolInputError(String);
 
+/// Upper bound on a [`ToolInputError`]'s model-facing message. The message can
+/// embed caller-controlled content (unknown parameter names), so it is bounded
+/// at construction — well under every tool's output limit (`tool_output_limit`
+/// min is 20_000) — so an armed tool's `Err` can never exceed the cap and be
+/// mangled by the execution loop's blind head/tail cut (#2193 R4). Real
+/// validation messages are a few hundred bytes.
+pub(crate) const TOOL_INPUT_ERROR_MAX_BYTES: usize = 4096;
+
 impl ToolInputError {
-    /// Build an input-validation error from a model-facing message.
+    /// Build an input-validation error from a model-facing message, bounded to
+    /// [`TOOL_INPUT_ERROR_MAX_BYTES`] so caller-supplied content (e.g. a
+    /// pathological unknown-parameter name) cannot make the error exceed the
+    /// tool-output cap.
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        let mut message = message.into();
+        octos_core::truncate_utf8(&mut message, TOOL_INPUT_ERROR_MAX_BYTES, "…[truncated]");
+        Self(message)
     }
 }
 

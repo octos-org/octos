@@ -75,13 +75,15 @@
 //! Coverage is tracked in BYTES — one coordinate system for line-mode reads
 //! (converted to their byte spans) and raw byte-mode reads, so paging past a
 //! giant line stitches naturally. The mark is a contiguous-from-byte-0
-//! high-water line keyed by an epoch of `(mtime, size)`: any epoch change
-//! resets coverage to the new read alone, and `write_file` re-validates the
-//! recorded epoch against the CURRENT file at write time, so a file replaced
-//! after reading refuses as stale instead of trusting dead coverage.
-//! Same-mtime-same-size replacement is not detectable by this scheme (no
-//! content hash in the epoch); it is also not detectable by the M8.4
-//! file-state cache today.
+//! high-water line keyed by an epoch of `(mtime, size, ctime, inode)` on Unix
+//! (`(mtime, size)` off-Unix): any epoch change resets coverage to the new
+//! read alone, and `write_file` re-validates the recorded epoch against the
+//! CURRENT file at write time, so a file replaced after reading refuses as
+//! stale instead of trusting dead coverage. A same-mtime-same-size IN-PLACE
+//! rewrite IS detected on Unix — ctime advances on any write and userspace
+//! cannot roll it back — and a rename-over swap is detected by the inode.
+//! (Off-Unix the scheme falls back to `(mtime, size)`, a documented weaker
+//! guarantee for this Unix-primary flag.)
 //!
 //! A view only counts if the model actually received the bytes: the recorded
 //! output is checked against `sanitize_tool_output` (the exact function the
@@ -207,7 +209,10 @@ impl ViewEpoch {
     /// inode, not a re-resolved path.
     pub(crate) fn from_metadata(meta: &std::fs::Metadata) -> Option<ViewEpoch> {
         let mtime = meta.modified().ok()?;
-        let (ctime, inode) = ctime_and_inode(meta);
+        // `None` fails closed: no epoch => the view never completes and the
+        // checked writers refuse. On Unix that happens only when ctime is not
+        // representable (below); off-Unix ctime/inode are legitimately absent.
+        let (ctime, inode) = ctime_and_inode(meta)?;
         Some(ViewEpoch {
             mtime,
             size: meta.len(),
@@ -218,20 +223,25 @@ impl ViewEpoch {
 }
 
 #[cfg(unix)]
-fn ctime_and_inode(meta: &std::fs::Metadata) -> (Option<SystemTime>, Option<u64>) {
+fn ctime_and_inode(meta: &std::fs::Metadata) -> Option<(Option<SystemTime>, Option<u64>)> {
     use std::os::unix::fs::MetadataExt;
-    let secs = meta.ctime();
-    let nsecs = meta.ctime_nsec();
-    // ctime is seconds since the epoch; real files are post-1970 (secs >= 0).
-    let ctime = u64::try_from(secs).ok().map(|s| {
-        SystemTime::UNIX_EPOCH + std::time::Duration::new(s, nsecs.clamp(0, 999_999_999) as u32)
-    });
-    (ctime, Some(meta.ino()))
+    // #2193 R4 (codex round 4): a NEGATIVE / unrepresentable ctime must FAIL
+    // CLOSED, not degrade to `None`. If it degraded, two in-place generations
+    // with unrepresentable ctimes would both carry `ctime: None` and compare
+    // equal on (mtime, size, inode) after mtime forgery — the very hole ctime
+    // was added to close. Returning `None` here makes `from_metadata` yield no
+    // epoch, so such a file can never authorize a windowed overwrite.
+    let secs = u64::try_from(meta.ctime()).ok()?;
+    let nsecs = meta.ctime_nsec().clamp(0, 999_999_999) as u32;
+    let ctime = SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nsecs);
+    Some((Some(ctime), Some(meta.ino())))
 }
 
 #[cfg(not(unix))]
-fn ctime_and_inode(_meta: &std::fs::Metadata) -> (Option<SystemTime>, Option<u64>) {
-    (None, None)
+fn ctime_and_inode(_meta: &std::fs::Metadata) -> Option<(Option<SystemTime>, Option<u64>)> {
+    // Off-Unix: ctime/inode are not available; the documented weaker
+    // (mtime, size) fallback applies (the flag is Unix-primary).
+    Some((None, None))
 }
 
 /// What the ledger knows about one `(session, path)`.
@@ -509,6 +519,23 @@ mod tests {
             ViewStatus::Transformed,
             "full coverage of a transformed view must NOT be Complete",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_metadata_binds_ctime_and_inode_on_unix() {
+        // #2193 R4: the epoch carries ctime + inode on Unix (the fields that
+        // defeat a same-size/same-mtime swap and a rename-over). The
+        // fail-closed negative-ctime path (u64::try_from -> None) is covered by
+        // construction.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let epoch = ViewEpoch::from_metadata(&std::fs::metadata(&path).unwrap())
+            .expect("a normal file has a representable ctime");
+        assert!(epoch.ctime.is_some(), "ctime must be bound on Unix");
+        assert!(epoch.inode.is_some(), "inode must be bound on Unix");
+        assert_eq!(epoch.size, 5);
     }
 
     fn epoch_at(secs_ago: u64, size: u64) -> Option<ViewEpoch> {

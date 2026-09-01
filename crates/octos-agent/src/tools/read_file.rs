@@ -809,6 +809,34 @@ mod tests {
     use super::*;
     use crate::tools::ConcurrencyClass;
 
+    #[tokio::test]
+    async fn armed_read_caps_an_oversized_malformed_argument_error() {
+        // #2193 R4 (codex round 4): an armed tool's Err path must be bounded
+        // too — a pathological caller-controlled unknown-parameter name must
+        // not exceed the tool-output cap and get mangled by the loop's blind
+        // head/tail cut. The error stays a ToolInputError (downcastable).
+        let tool = ReadFileTool::new("/tmp").with_window_enforcement(true);
+        let big_key = "k".repeat(60_000);
+        let mut map = serde_json::Map::new();
+        map.insert(big_key, serde_json::json!(1));
+        map.insert("path".to_string(), serde_json::json!("f.txt"));
+        let err = match tool.execute(&serde_json::Value::Object(map)).await {
+            Ok(_) => panic!("an unknown parameter must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.chain()
+                .any(|src| src.is::<crate::tools::ToolInputError>()),
+            "the error identity must stay ToolInputError: {err:#}",
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.len() <= crate::tools::TOOL_INPUT_ERROR_MAX_BYTES + 64,
+            "armed malformed-arg error must be capped (got {} bytes)",
+            rendered.len(),
+        );
+    }
+
     #[test]
     fn read_file_tool_is_safe() {
         // read_file is read-only and side-effect-free — the M8.8 default
