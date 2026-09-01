@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::Result;
+use futures::StreamExt;
 use octos_core::Message;
 use tracing::warn;
 
@@ -12,7 +13,7 @@ use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
 use crate::retry::RetryProvider;
 use crate::router::ProviderRouter;
-use crate::types::{ChatResponse, ChatStream, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 /// A provider that falls back to compatible alternatives on failure.
 /// When a provider fails, it's put in cooldown via the router so future
@@ -71,6 +72,15 @@ impl FallbackProvider {
             router.record_failure(model_id);
         }
     }
+
+    /// Prepend the winning slot index to a stream so a downstream consumer can
+    /// attribute the response to the exact answering provider (mirrors
+    /// `ProviderChain::stream_with_provider_index`).
+    fn stream_with_provider_index(&self, idx: usize, stream: ChatStream) -> ChatStream {
+        Box::pin(
+            futures::stream::once(async move { StreamEvent::ProviderIndex(idx) }).chain(stream),
+        )
+    }
 }
 
 #[async_trait]
@@ -82,7 +92,13 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         match self.primary.chat(messages, tools, config).await {
-            Ok(resp) => Ok(resp),
+            Ok(mut resp) => {
+                // #2194 R5: attribute the winner so pricing resolves the exact
+                // answering provider's cache lane (slots are [primary=0,
+                // fallbacks[i]=i+1]).
+                resp.provider_index = Some(0);
+                Ok(resp)
+            }
             Err(primary_err) => {
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
                     return Err(primary_err);
@@ -110,13 +126,14 @@ impl LlmProvider for FallbackProvider {
                         continue;
                     }
                     match fb.chat(messages, tools, config).await {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
                             warn!(
                                 primary = self.primary.model_id(),
                                 fallback = fb.model_id(),
                                 fallback_idx = i,
                                 "fallback provider succeeded"
                             );
+                            resp.provider_index = Some(i + 1);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -141,7 +158,7 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         match self.primary.chat_stream(messages, tools, config).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => Ok(self.stream_with_provider_index(0, stream)),
             Err(primary_err) => {
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
                     return Err(primary_err);
@@ -155,7 +172,7 @@ impl LlmProvider for FallbackProvider {
                     error = %primary_err,
                     "primary stream failed, trying fallbacks"
                 );
-                for fb in &self.fallbacks {
+                for (i, fb) in self.fallbacks.iter().enumerate() {
                     // #2135 round-7 P1: same fit guard as the chat path.
                     if !crate::context::route_fits_request(fb, messages, tools).await {
                         warn!(
@@ -166,7 +183,7 @@ impl LlmProvider for FallbackProvider {
                         continue;
                     }
                     match fb.chat_stream(messages, tools, config).await {
-                        Ok(stream) => return Ok(stream),
+                        Ok(stream) => return Ok(self.stream_with_provider_index(i + 1, stream)),
                         Err(e) => {
                             self.record_failure(fb.model_id());
                             warn!(fallback = fb.model_id(), error = %e, "fallback stream also failed");
@@ -184,6 +201,25 @@ impl LlmProvider for FallbackProvider {
 
     fn provider_name(&self) -> &str {
         self.primary.provider_name()
+    }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        // #2194 R5: slot 0 (primary) is the identity/default.
+        self.primary.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
+        // Slots are [primary=0, fallbacks[i]=i+1]; delegate to the EXACT
+        // answering provider so its cache lane (and identity) reaches pricing,
+        // not the default Residual — matching the ProviderChain winner stamp.
+        match provider_index {
+            Some(0) | None => self.primary.provider_metadata(),
+            Some(i) => self
+                .fallbacks
+                .get(i - 1)
+                .map(|fb| fb.provider_metadata())
+                .unwrap_or_else(|| self.primary.provider_metadata()),
+        }
     }
 
     // #2135 round-6 P1: the MINIMUM across primary and every fallback —
@@ -383,6 +419,80 @@ mod tests {
             fb_calls.load(Ordering::SeqCst),
             1,
             "fallback must be called once"
+        );
+    }
+
+    #[test]
+    fn fallback_propagates_lane_and_identity_by_index() {
+        // #2194 R5: FallbackProvider wraps [primary, fallbacks...]; pricing must
+        // see the ANSWERING provider's cache lane, not the default Residual, and
+        // the primary's identity must survive for adaptive-lane matching.
+        let primary: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-5-sonnet")
+                .with_provider_label("custom"),
+        );
+        let fallback: Arc<dyn LlmProvider> = Arc::new(
+            crate::openai::OpenAIProvider::new("k", "gpt-4o").with_provider_label("openai"),
+        );
+        let fp = FallbackProvider::new(primary, vec![fallback]);
+
+        let meta = fp.provider_metadata();
+        assert_eq!(meta.provider, "custom", "identity is the primary's label");
+        assert_eq!(
+            meta.cache_lane,
+            crate::CacheLane::Anthropic,
+            "primary's Anthropic lane, not the default Residual",
+        );
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(0)).cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(1)).cache_lane,
+            crate::CacheLane::Residual,
+            "slot 1 is the OpenAI fallback (residual lane)",
+        );
+        // Out-of-range and None both resolve to the primary, never a panic.
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(99)).cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+        assert_eq!(
+            fp.provider_metadata_for_index(None).cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_winner_is_attributed_slot_zero() {
+        let primary = CountingProvider::ok();
+        let fallback = CountingProvider::always_err_500();
+        let fp = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
+        let result = fp.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(
+            result.provider_index,
+            Some(0),
+            "the primary (slot 0) answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_winner_is_attributed_with_its_slot_index() {
+        use crate::{LlmCallPolicy, with_llm_call_policy};
+        // #2194 R5: primary fails, fallback answers -> the response must carry
+        // the fallback's slot index (1) so pricing resolves the fallback's lane.
+        let primary = CountingProvider::always_err_500();
+        let fallback = CountingProvider::ok();
+        let fp = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
+        let result = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            fp.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .expect("fallback answers under Normal policy");
+        assert_eq!(
+            result.provider_index,
+            Some(1),
+            "the fallback (slot 1) answered, so it is the attributed winner",
         );
     }
 
