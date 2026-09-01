@@ -622,6 +622,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    // Unix-only: relies on ctime advancing to detect a same-size/same-mtime
+    // swap; off-Unix the weaker (mtime,size) fallback cannot.
+    #[cfg(unix)]
     #[tokio::test]
     async fn confined_write_checked_refuses_a_changed_leaf() {
         // #2193 R4 (codex H2c): the fenced write path used to O_TRUNC the leaf

@@ -1604,6 +1604,9 @@ mod nofollow_tests {
     // (mtime, size) no longer matches what authorized the write — so an
     // external replacement in the narrow authorize→truncate window is caught
     // on the exact opened object, not a re-resolved path.
+    // Unix-only: off-Unix the epoch has no ctime, so the documented weaker
+    // (mtime,size) fallback cannot detect a same-size/same-mtime swap.
+    #[cfg(unix)]
     #[tokio::test]
     async fn checked_write_refuses_a_same_size_same_mtime_content_swap() {
         // #2193 R4 (codex H2): the (mtime,size)-only epoch authorized an
