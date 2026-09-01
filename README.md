@@ -115,6 +115,25 @@ guide covers the managed-signup, background-service, and public-VPS options.
 
 For development against an unreleased checkout:
 
+### Local development shortcuts
+
+The repository's `Makefile` wraps the common local workflow while retaining
+the existing build scripts. Run `make help` to see every target.
+
+```bash
+make init                         # creates ./.octos/config.json interactively
+# set the API key variable for the provider selected during init, for example:
+export OPENAI_API_KEY=your-key-here
+make serve                        # API + local password-free sign-in
+make dev                          # build /admin/ and /app/, then start the server
+```
+
+`make serve` builds only the `api` feature and serves on `127.0.0.1:50080` by
+default. Override values when needed, for example
+`make serve PORT=50081 FEATURES=api,telegram`. `make dev` requires Node.js;
+it initializes the `octos-web` submodule and invokes the existing frontend
+build scripts.
+
 ```bash
 # Build and install. The features below are the canonical default
 # (matches scripts/milestone-ci.sh) — `octos serve` requires `api`,

@@ -50,6 +50,22 @@ export ANTHROPIC_API_KEY=your-key-here
 octos chat
 ```
 
+## 本地源码开发
+
+仓库顶层的 `Makefile` 封装了常见的本地开发流程；可用 `make help` 查看全部目标：
+
+```bash
+make init                         # 交互式创建 ./.octos/config.json
+# 设置 init 中所选提供者对应的 API Key 环境变量，例如：
+export OPENAI_API_KEY=你的密钥
+make serve                        # 启动 API，并启用免密码本地登录
+make dev                          # 构建 /admin/、/app/ 后启动服务
+```
+
+`make serve` 默认仅构建 `api` feature，并监听 `127.0.0.1:50080`。需要时可覆盖，例如
+`make serve PORT=50081 FEATURES=api,telegram`。`make dev` 需要 Node.js；它会初始化
+`octos-web` 子模块并调用现有的前端构建脚本。
+
 ## 在 Zed 中使用 octos（ACP）
 
 `octos acp` 让 octos 成为一个 **ACP（[Agent Client Protocol](https://agentclientprotocol.com)）服务器**，可被 [Zed](https://zed.dev) 等 ACP 编辑器作为一等的编码 Agent 驱动——具备与 `octos chat` 相同的能力：你的工具 + 沙箱、长期记忆 + `MEMORY.md` 注入、技能/插件、MCP、hooks、上下文压缩、提供者故障转移。
