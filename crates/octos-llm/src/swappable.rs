@@ -112,6 +112,22 @@ impl LlmProvider for SwappableProvider {
         *self.cached_provider_name.read().unwrap()
     }
 
+    fn provider_metadata(&self) -> crate::ProviderMetadata {
+        // #2194 R4: delegate to the currently-swapped provider so its cache
+        // lane reaches pricing (not the default Residual).
+        self.inner.read().unwrap().provider_metadata()
+    }
+
+    fn provider_metadata_for_index(
+        &self,
+        provider_index: Option<usize>,
+    ) -> crate::ProviderMetadata {
+        self.inner
+            .read()
+            .unwrap()
+            .provider_metadata_for_index(provider_index)
+    }
+
     fn export_metrics(&self) -> Option<serde_json::Value> {
         self.inner.read().unwrap().export_metrics()
     }

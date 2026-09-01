@@ -434,6 +434,19 @@ impl LlmProvider for RetryProvider {
         self.inner.provider_name()
     }
 
+    fn provider_metadata(&self) -> crate::ProviderMetadata {
+        // #2194 R4: transparent wrapper — carry the inner slot's cache lane
+        // (and identity) through, or pricing sees the default Residual lane.
+        self.inner.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(
+        &self,
+        provider_index: Option<usize>,
+    ) -> crate::ProviderMetadata {
+        self.inner.provider_metadata_for_index(provider_index)
+    }
+
     fn report_late_failure(&self) {
         self.inner.report_late_failure();
     }
@@ -442,6 +455,35 @@ impl LlmProvider for RetryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_provider_propagates_the_inner_cache_lane() {
+        use std::sync::Arc;
+        // #2194 R4: providers are wrapped RetryProvider -> Chain -> Router; a
+        // wrapper that drops the inner cache lane prices a custom-anthropic slot
+        // at the Residual default. RetryProvider must carry it through.
+        let inner: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-5-sonnet")
+                .with_provider_label("custom"),
+        );
+        assert_eq!(
+            inner.provider_metadata().cache_lane,
+            crate::CacheLane::Anthropic,
+            "sanity: the raw AnthropicProvider reports the Anthropic lane",
+        );
+        let retry = RetryProvider::new(inner);
+        assert_eq!(
+            retry.provider_metadata().cache_lane,
+            crate::CacheLane::Anthropic,
+            "RetryProvider must propagate the inner Anthropic cache lane",
+        );
+        assert_eq!(
+            retry.provider_metadata_for_index(None).cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+        // Identity (label) is preserved — adaptive-lane matching keys on it.
+        assert_eq!(retry.provider_metadata().provider, "custom");
+    }
 
     #[test]
     fn test_is_retryable_429() {

@@ -378,6 +378,25 @@ impl LlmProvider for ProviderRouter {
         "router"
     }
 
+    fn provider_metadata(&self) -> crate::ProviderMetadata {
+        // #2194 R4: delegate to the active sub-provider so its cache lane (and
+        // real model/provider) reaches pricing, not the "router"/Residual stub.
+        self.active_provider()
+            .map(|p| p.provider_metadata())
+            .unwrap_or_else(|_| {
+                crate::ProviderMetadata::new(self.provider_name(), self.model_id(), None)
+            })
+    }
+
+    fn provider_metadata_for_index(
+        &self,
+        provider_index: Option<usize>,
+    ) -> crate::ProviderMetadata {
+        self.active_provider()
+            .map(|p| p.provider_metadata_for_index(provider_index))
+            .unwrap_or_else(|_| self.provider_metadata())
+    }
+
     fn report_late_failure(&self) {
         if let Ok(p) = self.active_provider() {
             p.report_late_failure();

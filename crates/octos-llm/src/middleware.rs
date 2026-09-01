@@ -126,6 +126,19 @@ impl LlmProvider for MiddlewareStack {
         self.inner.provider_name()
     }
 
+    fn provider_metadata(&self) -> crate::ProviderMetadata {
+        // #2194 R4: transparent wrapper — carry the inner slot's cache lane
+        // (and identity) through, or pricing sees the default Residual lane.
+        self.inner.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(
+        &self,
+        provider_index: Option<usize>,
+    ) -> crate::ProviderMetadata {
+        self.inner.provider_metadata_for_index(provider_index)
+    }
+
     fn context_window(&self) -> u32 {
         self.inner.context_window()
     }
