@@ -87,6 +87,13 @@ impl FallbackProvider {
 /// disjoint from any realistic primary slot index, so metadata resolution can
 /// tell a fallback win from the primary's OWN (possibly nested-container)
 /// winner index WITHOUT clobbering the latter. No provider has a million slots.
+///
+/// KNOWN LIMITATION (#2199): this flat tag does NOT compose when the PRIMARY is
+/// itself a `FallbackProvider` — the inner's `FALLBACK_INDEX_BASE + j` tag is
+/// indistinguishable from the outer's own, so a preserved inner-fallback index
+/// resolves to the OUTER's fallback. Same root cause as #2199 (a flat
+/// `provider_index` cannot carry `(which-child, child-index)` through nesting);
+/// the durable fix carries the answering leaf's metadata on the response.
 pub(crate) const FALLBACK_INDEX_BASE: usize = 1_000_000;
 
 #[async_trait]
@@ -488,6 +495,40 @@ mod tests {
             fp.provider_metadata_for_index(Some(super::FALLBACK_INDEX_BASE + 99))
                 .cache_lane,
             crate::CacheLane::Anthropic,
+        );
+    }
+
+    // KNOWN LIMITATION (#2199): a flat provider_index does not compose when a
+    // FallbackProvider is the PRIMARY of another FallbackProvider. The inner's
+    // fallback tag (FALLBACK_INDEX_BASE + j) is misread by the outer as its own
+    // fallback index, so resolution routes to outer.fallbacks[j] instead of the
+    // inner's answering fallback. Ignored until the durable answering-metadata
+    // fix (carry the resolved leaf metadata on the response) lands.
+    #[ignore = "flat-index nesting non-compositionality; tracked in #2199"]
+    #[test]
+    fn nested_fallback_as_primary_resolves_inner_fallback_lane() {
+        let inner_primary: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-5-sonnet")
+                .with_provider_label("custom"),
+        );
+        let inner_fallback: Arc<dyn LlmProvider> = Arc::new(
+            crate::openai::OpenAIProvider::new("k", "gpt-4o").with_provider_label("openai"),
+        );
+        let inner: Arc<dyn LlmProvider> =
+            Arc::new(FallbackProvider::new(inner_primary, vec![inner_fallback]));
+        let outer_fallback: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-opus")
+                .with_provider_label("other-anthropic"),
+        );
+        let outer = FallbackProvider::new(inner, vec![outer_fallback]);
+        // The inner's fallback answered -> its tag is Some(FALLBACK_INDEX_BASE).
+        // DESIRED: resolve to the inner's OpenAI fallback (residual lane).
+        // ACTUAL (bug): resolves to outer.fallbacks[0] (Anthropic).
+        assert_eq!(
+            outer
+                .provider_metadata_for_index(Some(super::FALLBACK_INDEX_BASE))
+                .cache_lane,
+            crate::CacheLane::Residual,
         );
     }
 
