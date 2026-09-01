@@ -83,6 +83,12 @@ impl FallbackProvider {
     }
 }
 
+/// Fallback wins are attributed with `FALLBACK_INDEX_BASE + j`, a range
+/// disjoint from any realistic primary slot index, so metadata resolution can
+/// tell a fallback win from the primary's OWN (possibly nested-container)
+/// winner index WITHOUT clobbering the latter. No provider has a million slots.
+pub(crate) const FALLBACK_INDEX_BASE: usize = 1_000_000;
+
 #[async_trait]
 impl LlmProvider for FallbackProvider {
     async fn chat(
@@ -92,13 +98,11 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         match self.primary.chat(messages, tools, config).await {
-            Ok(mut resp) => {
-                // #2194 R5: attribute the winner so pricing resolves the exact
-                // answering provider's cache lane (slots are [primary=0,
-                // fallbacks[i]=i+1]).
-                resp.provider_index = Some(0);
-                Ok(resp)
-            }
+            // #2194 R6: PRESERVE the primary's own attribution. A nested
+            // container primary already stamped its real winner; clobbering it
+            // with a flat slot index would mis-resolve a mixed-lane primary.
+            // Resolution treats any primary-range index as the primary's own.
+            Ok(resp) => Ok(resp),
             Err(primary_err) => {
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
                     return Err(primary_err);
@@ -133,7 +137,10 @@ impl LlmProvider for FallbackProvider {
                                 fallback_idx = i,
                                 "fallback provider succeeded"
                             );
-                            resp.provider_index = Some(i + 1);
+                            // Tag in a range disjoint from any primary index
+                            // so resolution can tell a fallback win from the
+                            // primary's own index.
+                            resp.provider_index = Some(FALLBACK_INDEX_BASE + i);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -158,7 +165,9 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         match self.primary.chat_stream(messages, tools, config).await {
-            Ok(stream) => Ok(self.stream_with_provider_index(0, stream)),
+            // Pass the primary's stream through unchanged so its own
+            // ProviderIndex (a nested container's real winner) survives.
+            Ok(stream) => Ok(stream),
             Err(primary_err) => {
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
                     return Err(primary_err);
@@ -183,7 +192,11 @@ impl LlmProvider for FallbackProvider {
                         continue;
                     }
                     match fb.chat_stream(messages, tools, config).await {
-                        Ok(stream) => return Ok(self.stream_with_provider_index(i + 1, stream)),
+                        Ok(stream) => {
+                            return Ok(
+                                self.stream_with_provider_index(FALLBACK_INDEX_BASE + i, stream)
+                            );
+                        }
                         Err(e) => {
                             self.record_failure(fb.model_id());
                             warn!(fallback = fb.model_id(), error = %e, "fallback stream also failed");
@@ -209,16 +222,21 @@ impl LlmProvider for FallbackProvider {
     }
 
     fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
-        // Slots are [primary=0, fallbacks[i]=i+1]; delegate to the EXACT
-        // answering provider so its cache lane (and identity) reaches pricing,
-        // not the default Residual — matching the ProviderChain winner stamp.
         match provider_index {
-            Some(0) | None => self.primary.provider_metadata(),
-            Some(i) => self
+            // A fallback answered (tagged FALLBACK_INDEX_BASE + j): resolve to
+            // that fallback. KNOWN LIMITATION (tracked): if the fallback is
+            // itself a mixed-lane container, its exact answering slot is not
+            // resolved here — its default metadata is used.
+            Some(i) if i >= FALLBACK_INDEX_BASE => self
                 .fallbacks
-                .get(i - 1)
+                .get(i - FALLBACK_INDEX_BASE)
                 .map(|fb| fb.provider_metadata())
                 .unwrap_or_else(|| self.primary.provider_metadata()),
+            // The primary answered: the index is the primary's OWN (preserved),
+            // so DELEGATE — a mixed-lane container primary then resolves the
+            // exact answering slot's cache lane rather than its default.
+            Some(i) => self.primary.provider_metadata_for_index(Some(i)),
+            None => self.primary.provider_metadata(),
         }
     }
 
@@ -443,36 +461,48 @@ mod tests {
             crate::CacheLane::Anthropic,
             "primary's Anthropic lane, not the default Residual",
         );
+        // Primary-range indices (incl. a nested container primary's own
+        // winner) and None resolve THROUGH the primary.
         assert_eq!(
             fp.provider_metadata_for_index(Some(0)).cache_lane,
             crate::CacheLane::Anthropic,
         );
         assert_eq!(
             fp.provider_metadata_for_index(Some(1)).cache_lane,
-            crate::CacheLane::Residual,
-            "slot 1 is the OpenAI fallback (residual lane)",
-        );
-        // Out-of-range and None both resolve to the primary, never a panic.
-        assert_eq!(
-            fp.provider_metadata_for_index(Some(99)).cache_lane,
             crate::CacheLane::Anthropic,
+            "index 1 is a primary-range index, delegated to the primary",
         );
         assert_eq!(
             fp.provider_metadata_for_index(None).cache_lane,
             crate::CacheLane::Anthropic,
         );
+        // A fallback win is tagged FALLBACK_INDEX_BASE + j.
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(super::FALLBACK_INDEX_BASE))
+                .cache_lane,
+            crate::CacheLane::Residual,
+            "fallback slot 0 (OpenAI) -> residual lane",
+        );
+        // Out-of-range fallback tag falls back to the primary, never a panic.
+        assert_eq!(
+            fp.provider_metadata_for_index(Some(super::FALLBACK_INDEX_BASE + 99))
+                .cache_lane,
+            crate::CacheLane::Anthropic,
+        );
     }
 
     #[tokio::test]
-    async fn primary_winner_is_attributed_slot_zero() {
+    async fn primary_winner_preserves_child_attribution() {
+        // #2194 R6: a leaf primary reports no index; FallbackProvider must NOT
+        // clobber it, so a nested container primary's real winner survives and
+        // pricing resolves through the primary.
         let primary = CountingProvider::ok();
         let fallback = CountingProvider::always_err_500();
         let fp = FallbackProvider::new(Arc::new(primary), vec![Arc::new(fallback)]);
         let result = fp.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(
-            result.provider_index,
-            Some(0),
-            "the primary (slot 0) answered"
+            result.provider_index, None,
+            "leaf primary's own attribution (None) is preserved, not clobbered",
         );
     }
 
@@ -491,8 +521,8 @@ mod tests {
         .expect("fallback answers under Normal policy");
         assert_eq!(
             result.provider_index,
-            Some(1),
-            "the fallback (slot 1) answered, so it is the attributed winner",
+            Some(super::FALLBACK_INDEX_BASE),
+            "fallback slot 0 answered -> tagged FALLBACK_INDEX_BASE + 0",
         );
     }
 
