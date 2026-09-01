@@ -3735,12 +3735,11 @@ fn create_custom_provider(
         "anthropic" => {
             let mut provider = octos_llm::anthropic::AnthropicProvider::new(key, model)
                 .with_base_url(&base_url)
-                // #2194: encode the protocol in the label so the cache-pricing
-                // classifier (which keys off the metadata label) recognizes this
-                // as Anthropic-protocol (0.1x read / 1.25x write), not the 1.0x
-                // residual bucket. `contains("anthropic")` is the classifier's
-                // documented catch for custom Anthropic-compatible endpoints.
-                .with_provider_label("custom-anthropic");
+                // #2194: label stays "custom" (its logical identity for
+                // adaptive-lane / QoS matching); the Anthropic cache rate is
+                // carried by ProviderMetadata::cache_lane, set from the provider
+                // TYPE in AnthropicProvider::provider_metadata().
+                .with_provider_label("custom");
             if let Some(t) = llm_timeout_secs {
                 let c =
                     llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
@@ -4081,13 +4080,14 @@ mod custom_provider_tests {
 
         assert_eq!(provider.provider_name(), "custom");
         assert_eq!(provider.model_id(), "llama-3.1-70b-instruct");
-        // #2194 R3: a custom OpenAI-protocol endpoint stays in the residual
-        // cache bucket (full-rate reads), NOT the Anthropic 0.1x bucket.
+        // #2194 R4: a custom OpenAI endpoint keeps the "custom" identity AND the
+        // residual cache lane (full-rate reads) — NOT the Anthropic 0.1x bucket.
+        let meta = provider.provider_metadata();
+        assert_eq!(meta.cache_lane, octos_llm::CacheLane::Residual);
         assert_eq!(
-            octos_llm::pricing::cache_rates(provider.provider_name(), provider.model_id())
-                .read_multiplier,
+            octos_llm::pricing::cache_rates_for_lane(meta.cache_lane).read_multiplier,
             1.0,
-            "custom + api_type=openai must not be priced as Anthropic-protocol cache",
+            "custom + api_type=openai must price cache reads at the residual rate",
         );
     }
 
@@ -4102,17 +4102,23 @@ mod custom_provider_tests {
         )
         .unwrap();
 
-        // #2194 R3: the label must ENCODE the Anthropic protocol so the
-        // cache-pricing classifier (which keys off the metadata label) hands
-        // it the 0.1x read / 1.25x write bucket instead of the 1.0x residual
-        // — a 10x cache-read overcharge before this fix.
-        assert_eq!(provider.provider_name(), "custom-anthropic");
+        // #2194 R4: the label STAYS "custom" (its logical identity for
+        // adaptive-lane / QoS matching — relabeling it silently disabled a
+        // configured lane restriction). The Anthropic cache rate is instead
+        // carried by the metadata cache_lane, sourced from the provider TYPE,
+        // so pricing is correct WITHOUT overloading the identity label.
+        assert_eq!(provider.provider_name(), "custom");
         assert_eq!(provider.model_id(), "claude-compatible");
+        let meta = provider.provider_metadata();
         assert_eq!(
-            octos_llm::pricing::cache_rates(provider.provider_name(), provider.model_id())
-                .read_multiplier,
+            meta.cache_lane,
+            octos_llm::CacheLane::Anthropic,
+            "custom + api_type=anthropic must carry the Anthropic cache lane",
+        );
+        assert_eq!(
+            octos_llm::pricing::cache_rates_for_lane(meta.cache_lane).read_multiplier,
             0.1,
-            "custom + api_type=anthropic must be priced as Anthropic-protocol cache",
+            "and therefore price cache reads at 0.1x, not the 1.0x residual",
         );
     }
 

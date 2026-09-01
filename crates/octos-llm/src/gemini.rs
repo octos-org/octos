@@ -373,6 +373,7 @@ impl LlmProvider for GeminiProvider {
         // Derive the metadata name from the auth mode (same as `provider_name`)
         // so Vertex calls aren't mislabelled as AI Studio gemini in provenance.
         ProviderMetadata::new(self.provider_name(), self.model.clone(), endpoint)
+            .with_cache_lane(crate::types::CacheLane::Gemini)
     }
 }
 

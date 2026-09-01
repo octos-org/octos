@@ -554,9 +554,8 @@ impl Agent {
             response.usage.cache_write_tokens,
             tracker,
             octos_llm::pricing::model_pricing(&verifier_metadata.model).map(|p| {
-                p.cost_with_cache_for_provider(
-                    &verifier_metadata.provider,
-                    &verifier_metadata.model,
+                p.cost_with_cache_for_metadata(
+                    &verifier_metadata,
                     response.usage.input_tokens,
                     response.usage.output_tokens,
                     response.usage.cache_read_tokens,

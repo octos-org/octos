@@ -8860,23 +8860,29 @@ impl SessionActor {
                     .as_ref()
                     .map(|meta| meta.model.clone());
                 let overflow_cost = conv_response.estimated_spend_usd.or_else(|| {
-                    let overflow_provider = conv_response
-                        .provider_metadata
-                        .as_ref()
-                        .map(|meta| meta.provider.as_str())
-                        .unwrap_or("");
                     overflow_model
                         .as_deref()
                         .and_then(model_pricing)
                         .map(|pricing| {
-                            pricing.cost_with_cache_for_provider(
-                                overflow_provider,
-                                overflow_model.as_deref().unwrap_or(""),
-                                conv_response.token_usage.input_tokens,
-                                conv_response.token_usage.output_tokens,
-                                conv_response.token_usage.cache_read_tokens,
-                                conv_response.token_usage.cache_write_tokens,
-                            )
+                            // Prefer the authoritative per-slot cache lane; fall back
+                            // to the label guess only if no metadata was carried.
+                            match conv_response.provider_metadata.as_ref() {
+                                Some(meta) => pricing.cost_with_cache_for_metadata(
+                                    meta,
+                                    conv_response.token_usage.input_tokens,
+                                    conv_response.token_usage.output_tokens,
+                                    conv_response.token_usage.cache_read_tokens,
+                                    conv_response.token_usage.cache_write_tokens,
+                                ),
+                                None => pricing.cost_with_cache_for_provider(
+                                    "",
+                                    overflow_model.as_deref().unwrap_or(""),
+                                    conv_response.token_usage.input_tokens,
+                                    conv_response.token_usage.output_tokens,
+                                    conv_response.token_usage.cache_read_tokens,
+                                    conv_response.token_usage.cache_write_tokens,
+                                ),
+                            }
                         })
                 });
                 overflow_session_usage.fold_run(

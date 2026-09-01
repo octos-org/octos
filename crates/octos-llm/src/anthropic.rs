@@ -343,6 +343,7 @@ impl LlmProvider for AnthropicProvider {
             None
         };
         ProviderMetadata::new(self.provider_label.clone(), self.model.clone(), endpoint)
+            .with_cache_lane(crate::types::CacheLane::Anthropic)
     }
 }
 

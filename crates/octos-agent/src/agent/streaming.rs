@@ -562,9 +562,8 @@ impl Agent {
     ) -> Option<f64> {
         let metadata = self.llm.provider_metadata_for_index(provider_index);
         octos_llm::pricing::model_pricing(&metadata.model).map(|p| {
-            p.cost_with_cache_for_provider(
-                &metadata.provider,
-                &metadata.model,
+            p.cost_with_cache_for_metadata(
+                &metadata,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -599,9 +598,8 @@ impl Agent {
         let pricing = octos_llm::pricing::model_pricing(&metadata.model);
         let response_cost = attributed_cost.or_else(|| {
             pricing.map(|p| {
-                p.cost_with_cache_for_provider(
-                    &metadata.provider,
-                    &metadata.model,
+                p.cost_with_cache_for_metadata(
+                    &metadata,
                     response_usage.input_tokens,
                     response_usage.output_tokens,
                     response_usage.cache_read_tokens,
@@ -803,6 +801,20 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             self.provider
+        }
+
+        fn provider_metadata(&self) -> octos_llm::ProviderMetadata {
+            // #2194 R4: real providers source their cache lane from their TYPE.
+            // Mirror that so these pricing tests exercise the metadata lane the
+            // production path now uses: an Anthropic-protocol slot reports the
+            // Anthropic lane, everything else the residual lane.
+            let lane = if self.provider == "anthropic" {
+                octos_llm::CacheLane::Anthropic
+            } else {
+                octos_llm::CacheLane::Residual
+            };
+            octos_llm::ProviderMetadata::new(self.provider, self.model_id(), None)
+                .with_cache_lane(lane)
         }
     }
 

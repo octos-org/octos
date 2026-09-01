@@ -24512,9 +24512,8 @@ async fn handle_session_btw(
                     let model = (!metadata.model.is_empty()).then(|| metadata.model.clone());
                     let estimated_cost_usd =
                         model.as_deref().and_then(model_pricing).map(|pricing| {
-                            pricing.cost_with_cache_for_provider(
-                                &metadata.provider,
-                                &metadata.model,
+                            pricing.cost_with_cache_for_metadata(
+                                &metadata,
                                 response.usage.input_tokens,
                                 response.usage.output_tokens,
                                 response.usage.cache_read_tokens,

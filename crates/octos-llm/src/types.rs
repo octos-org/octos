@@ -3,6 +3,26 @@
 use octos_core::ToolCall;
 use serde::{Deserialize, Serialize};
 
+/// Which prompt-cache rate card the answering slot bills at.
+///
+/// Sourced from the provider TYPE (which API it speaks), NOT from a guessed
+/// label — so a relabeled Anthropic-API proxy (`zai` / `r9s` serving claude /
+/// `custom` + `api_type=anthropic`) is priced correctly while its label stays
+/// its logical identity for adaptive-lane and persisted-QoS matching. Anthropic
+/// = 0.1x read / 1.25x write; Gemini = 0.25x read / 0 write; Residual = full
+/// read rate, writes never free (the fail-safe default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheLane {
+    /// Anthropic Messages API prompt-cache accounting.
+    Anthropic,
+    /// Gemini implicit caching.
+    Gemini,
+    /// OpenAI-protocol / unknown: no known read discount; writes at 1.25x.
+    #[default]
+    Residual,
+}
+
 /// Structured provenance for the provider instance that produced a response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMetadata {
@@ -10,6 +30,10 @@ pub struct ProviderMetadata {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// The cache rate card this slot bills at (see [`CacheLane`]). `#[serde(default)]`
+    /// so older persisted metadata deserializes to `Residual`.
+    #[serde(default)]
+    pub cache_lane: CacheLane,
 }
 
 impl ProviderMetadata {
@@ -22,7 +46,16 @@ impl ProviderMetadata {
             provider: provider.into(),
             model: model.into(),
             endpoint,
+            cache_lane: CacheLane::Residual,
         }
+    }
+
+    /// Set the cache rate card (providers that speak Anthropic/Gemini call this
+    /// from their `provider_metadata()`).
+    #[must_use]
+    pub fn with_cache_lane(mut self, lane: CacheLane) -> Self {
+        self.cache_lane = lane;
+        self
     }
 
     pub fn display_label(&self) -> String {

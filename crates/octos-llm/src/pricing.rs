@@ -220,6 +220,30 @@ pub fn cache_rates(provider: &str, model: &str) -> CacheRates {
     }
 }
 
+/// Rate card for a [`CacheLane`] taken from the answering slot's
+/// [`ProviderMetadata`]. This is the AUTHORITATIVE path — the lane is set from
+/// the provider TYPE at construction, so it needs no label guessing and prices
+/// a relabeled Anthropic proxy (zai/r9s/custom+anthropic) correctly. The
+/// label-guessing [`cache_rates`] remains only for the legacy string-only
+/// reprice fallbacks that carry no metadata.
+pub fn cache_rates_for_lane(lane: crate::types::CacheLane) -> CacheRates {
+    use crate::types::CacheLane;
+    match lane {
+        CacheLane::Anthropic => CacheRates {
+            read_multiplier: CACHE_READ_INPUT_MULTIPLIER,
+            write_multiplier: CACHE_WRITE_INPUT_MULTIPLIER,
+        },
+        CacheLane::Gemini => CacheRates {
+            read_multiplier: 0.25,
+            write_multiplier: 0.0,
+        },
+        CacheLane::Residual => CacheRates {
+            read_multiplier: 1.0,
+            write_multiplier: CACHE_WRITE_INPUT_MULTIPLIER,
+        },
+    }
+}
+
 impl ModelPricing {
     /// Calculate cost for given token counts.
     pub fn cost(&self, input_tokens: u32, output_tokens: u32) -> f64 {
@@ -277,6 +301,29 @@ impl ModelPricing {
             cache_read_tokens,
             cache_write_tokens,
             cache_rates(provider, model),
+        )
+    }
+
+    /// Cache-aware cost keyed on the answering slot's [`ProviderMetadata`]
+    /// cache lane (the AUTHORITATIVE, provider-type-sourced rate). Use this
+    /// wherever the metadata is in hand; it prices relabeled Anthropic proxies
+    /// (and `custom` + `api_type=anthropic`) correctly without guessing from
+    /// the label, whose value must stay the slot's logical identity for
+    /// adaptive-lane / QoS matching.
+    pub fn cost_with_cache_for_metadata(
+        &self,
+        metadata: &crate::types::ProviderMetadata,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+    ) -> f64 {
+        self.cost_with_cache_rates(
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            cache_rates_for_lane(metadata.cache_lane),
         )
     }
 
@@ -716,7 +763,6 @@ mod tests {
             ("zai", "glm-4.6"),
             ("zai-coding", "glm-4.6"),
             ("r9s", "claude-3-5-sonnet"),
-            ("custom-anthropic", "claude-3-7-sonnet"),
         ] {
             let cost =
                 p.cost_with_cache_for_provider(provider, model, 100_000, 10_000, 40_000, 8_000);
