@@ -2173,8 +2173,28 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Hooks
   "hooks": [],
 
-  // MCP servers
-  "mcp_servers": [],
+  // MCP servers — external tool providers octos connects to as a client.
+  // stdio: command + args (+ optional env). HTTP: url (+ headers, or oauth).
+  "mcp_servers": [
+    // {
+    //   "command": "/path/to/server",   // stdio transport
+    //   "args": ["serve", "--root", "/path/to/repo"],
+    //   // stdio children get a SANITIZED environment: only names listed in
+    //   // this map are forwarded, and injection vectors (LD_PRELOAD,
+    //   // DYLD_INSERT_LIBRARIES, NODE_OPTIONS, …) are stripped even from it.
+    //   // A server expecting inherited credentials fails silently — pass
+    //   // keys explicitly here or let the server read its own secrets file.
+    //   "env": {},
+    //   // "safe" (default) runs this server's tools concurrently;
+    //   // "exclusive" serializes them — right for a single-device driver or
+    //   // any one-at-a-time resource. Unknown values fail safe to exclusive.
+    //   "concurrency_class": "exclusive"
+    // },
+    // { "url": "https://mcp.example.com/mcp", "oauth": true, "scopes": [] }
+    // Timeouts: 30s handshake, 60s per tools/call — long-running work should
+    // be started detached by the server (return a handle) and polled via
+    // read-only tools.
+  ],
 
   // Sandbox — see docs/SANDBOX.md for full reference.
   // Backends: bwrap (Linux), sandbox-exec (macOS), AppContainer (Windows,

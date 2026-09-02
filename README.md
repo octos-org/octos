@@ -275,6 +275,8 @@ Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC
     { "url": "https://mcp.example.com/mcp", "oauth": true }
   ]
   ```
+
+  Stdio children receive a **sanitized environment** — only the names explicitly listed under the server's `env` map are forwarded (injection vectors like `LD_PRELOAD` are stripped even from that map), so a server expecting inherited credentials must get them explicitly or read its own secrets file. Set `"concurrency_class": "exclusive"` to serialize a server's tools (default `"safe"` allows concurrent calls) — the right knob for a single-resource server such as a one-device driver. Handshake timeout is 30s and each `tools/call` times out after 60s, so long-running work should be started detached by the server and polled through read-only tools.
 - **`octos acp`** — the editor-facing direction: octos as an **[Agent Client Protocol](https://agentclientprotocol.com) (ACP)** agent over stdio, so ACP-speaking editors (Zed and others) run octos as their coding agent — with the **same capabilities as `octos chat`** (your tools + sandbox, long-term memory + `MEMORY.md`, skills/plugins, MCP, hooks, context compaction, provider failover). It appears in the editor's agent picker alongside Claude Code and Gemini CLI. See [Use octos in Zed](#use-octos-in-zed-acp).
 
 ### Use octos in Zed (ACP)

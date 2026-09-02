@@ -2080,8 +2080,25 @@ chmod +x .octos/skills/translator/main
   // 钩子
   "hooks": [],
 
-  // MCP 服务器
-  "mcp_servers": [],
+  // MCP 服务器 — octos 作为客户端接入的外部工具源。
+  // stdio: command + args(可选 env);HTTP: url(可选 headers 或 oauth)。
+  "mcp_servers": [
+    // {
+    //   "command": "/path/to/server",   // stdio 传输
+    //   "args": ["serve", "--root", "/path/to/repo"],
+    //   // stdio 子进程拿到的是消毒后的环境: 只转发此 map 里显式列出的变量,
+    //   // 注入向量(LD_PRELOAD、DYLD_INSERT_LIBRARIES、NODE_OPTIONS …)
+    //   // 即使写在这里也会被剥掉。指望继承环境拿密钥的服务会静默失败——
+    //   // 在这里显式传,或让服务自读它自己的 secrets 文件。
+    //   "env": {},
+    //   // "safe"(默认)并发调用本服务工具;"exclusive" 串行化——适合
+    //   // 单设备驱动等独占资源。未知值按 exclusive 兜底(fail-safe)。
+    //   "concurrency_class": "exclusive"
+    // },
+    // { "url": "https://mcp.example.com/mcp", "oauth": true, "scopes": [] }
+    // 超时: 握手 30s,单次 tools/call 60s——长任务应由服务端 detach 起跑
+    // (返回句柄),再用只读工具轮询结果。
+  ],
 
   // 沙箱 — 完整说明见 docs/SANDBOX.md。
   // 后端：bwrap（Linux）、sandbox-exec（macOS）、AppContainer（Windows，
