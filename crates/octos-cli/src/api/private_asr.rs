@@ -3,11 +3,13 @@
 //! The long-lived service credential stays in the Octos server environment. The
 //! browser receives only the short-lived grant returned by the ASR control plane.
 
+use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
@@ -18,10 +20,20 @@ const CONTROL_URL_ENV: &str = "PRIVATE_ASR_CONTROL_URL";
 const SERVICE_TOKEN_ENV: &str = "PRIVATE_ASR_SERVICE_TOKEN";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct PrivateAsrConfig {
     grant_url: String,
     service_token: String,
+}
+
+impl fmt::Debug for PrivateAsrConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateAsrConfig")
+            .field("grant_url", &self.grant_url)
+            .field("service_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl PrivateAsrConfig {
@@ -44,7 +56,7 @@ impl PrivateAsrConfig {
             return Err(PrivateAsrError::Unconfigured);
         };
         let parsed = reqwest::Url::parse(control_url).map_err(|_| PrivateAsrError::Unconfigured)?;
-        if !matches!(parsed.scheme(), "http" | "https")
+        if !control_url_is_secure(&parsed)
             || parsed.host_str().is_none()
             || parsed.query().is_some()
             || parsed.fragment().is_some()
@@ -60,6 +72,28 @@ impl PrivateAsrConfig {
             service_token: service_token.to_owned(),
         })
     }
+}
+
+fn control_url_is_secure(url: &reqwest::Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    if url.scheme() != "http" {
+        return false;
+    }
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -97,6 +131,7 @@ struct PrivateAsrErrorEnvelope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrivateAsrError {
     Unconfigured,
+    Forbidden,
     Unavailable,
     InvalidResponse,
 }
@@ -108,6 +143,11 @@ impl PrivateAsrError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "private_asr_unconfigured",
                 "Private speech recognition is not configured",
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "private_asr_forbidden",
+                "Private speech recognition is not available for this profile",
             ),
             Self::Unavailable => (
                 StatusCode::BAD_GATEWAY,
@@ -129,20 +169,14 @@ impl PrivateAsrError {
     }
 }
 
-fn identity_scope(identity: &AuthIdentity) -> (&str, &str) {
-    match identity {
-        AuthIdentity::Admin => ("admin", "admin"),
-        AuthIdentity::User { id, .. } => (id, id),
-    }
-}
-
 fn validate_upstream_grant(
     response: UpstreamGrantResponse,
+    now_ms: u64,
 ) -> Result<BrowserGrantResponse, PrivateAsrError> {
     if response.grant.is_empty()
         || response.grant.len() > 512
         || response.grant.chars().any(char::is_whitespace)
-        || response.expires_at_ms == 0
+        || response.expires_at_ms <= now_ms
     {
         return Err(PrivateAsrError::InvalidResponse);
     }
@@ -187,16 +221,29 @@ async fn exchange_browser_grant(
             tracing::warn!(error = %error, "private ASR grant response could not be decoded");
             PrivateAsrError::InvalidResponse
         })?;
-    validate_upstream_grant(upstream)
+    validate_upstream_grant(upstream, unix_ms())
 }
 
 pub(crate) async fn browser_grant(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Extension(identity): Extension<AuthIdentity>,
 ) -> Result<Json<BrowserGrantResponse>, (StatusCode, Json<PrivateAsrErrorBody>)> {
     let config = PrivateAsrConfig::from_env().map_err(PrivateAsrError::response)?;
-    let (subject, profile_id) = identity_scope(&identity);
-    exchange_browser_grant(&state.http_client, &config, subject, profile_id)
+    let profile_store = state
+        .profile_store
+        .as_ref()
+        .ok_or_else(|| PrivateAsrError::Unconfigured.response())?;
+    let profile_id =
+        super::auth_handlers::resolve_my_profile_id(&identity, profile_store, &state, &headers)
+            .map_err(|status| {
+                if status == StatusCode::FORBIDDEN {
+                    PrivateAsrError::Forbidden.response()
+                } else {
+                    PrivateAsrError::Unconfigured.response()
+                }
+            })?;
+    exchange_browser_grant(&state.http_client, &config, &profile_id, &profile_id)
         .await
         .map(Json)
         .map_err(PrivateAsrError::response)
@@ -205,7 +252,6 @@ pub(crate) async fn browser_grant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::user_store::UserRole;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -236,31 +282,52 @@ mod tests {
             PrivateAsrConfig::from_values(Some("https://user@asr.example.com"), Some(TOKEN)),
             Err(PrivateAsrError::Unconfigured)
         );
+        assert_eq!(
+            PrivateAsrConfig::from_values(Some("http://asr.example.com"), Some(TOKEN)),
+            Err(PrivateAsrError::Unconfigured)
+        );
+        assert!(PrivateAsrConfig::from_values(Some("http://127.0.0.1:8080"), Some(TOKEN)).is_ok());
     }
 
     #[test]
-    fn authenticated_user_is_bound_to_their_own_profile() {
-        let identity = AuthIdentity::User {
-            id: "profile-1".into(),
-            role: UserRole::User,
-        };
-        assert_eq!(identity_scope(&identity), ("profile-1", "profile-1"));
+    fn config_debug_output_redacts_the_service_token() {
+        let config = PrivateAsrConfig::from_values(Some("https://asr.example.com"), Some(TOKEN))
+            .expect("valid config");
+        let output = format!("{config:?}");
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains(TOKEN));
     }
 
     #[test]
     fn upstream_grant_is_strictly_validated() {
-        let valid = validate_upstream_grant(UpstreamGrantResponse {
-            grant: "temporary-grant".into(),
-            expires_at_ms: 42,
-        })
+        let valid = validate_upstream_grant(
+            UpstreamGrantResponse {
+                grant: "temporary-grant".into(),
+                expires_at_ms: 42,
+            },
+            41,
+        )
         .expect("valid grant");
         assert_eq!(valid.grant, "temporary-grant");
 
         assert_eq!(
-            validate_upstream_grant(UpstreamGrantResponse {
-                grant: "contains whitespace".into(),
-                expires_at_ms: 42,
-            }),
+            validate_upstream_grant(
+                UpstreamGrantResponse {
+                    grant: "contains whitespace".into(),
+                    expires_at_ms: 42,
+                },
+                41,
+            ),
+            Err(PrivateAsrError::InvalidResponse)
+        );
+        assert_eq!(
+            validate_upstream_grant(
+                UpstreamGrantResponse {
+                    grant: "expired-grant".into(),
+                    expires_at_ms: 42,
+                },
+                42,
+            ),
             Err(PrivateAsrError::InvalidResponse)
         );
     }
@@ -277,7 +344,7 @@ mod tests {
             })))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "grant": "one-time-grant",
-                "expiresAtMs": 1234,
+                "expiresAtMs": u64::MAX,
             })))
             .expect(1)
             .mount(&server)
@@ -289,6 +356,6 @@ mod tests {
             .await
             .expect("exchange succeeds");
         assert_eq!(grant.grant, "one-time-grant");
-        assert_eq!(grant.expires_at_ms, 1234);
+        assert_eq!(grant.expires_at_ms, u64::MAX);
     }
 }
