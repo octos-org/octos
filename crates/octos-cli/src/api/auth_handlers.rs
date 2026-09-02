@@ -488,30 +488,9 @@ pub async fn send_code(
         None
     };
 
-    if scoped_profile_id.is_some() {
-        if scoped_login_target.is_none() {
-            tracing::warn!(
-                email = %requested_email,
-                scoped_profile = ?scoped_profile_id,
-                "OTP skipped — email does not match scoped profile"
-            );
-            return Ok(Json(SendCodeResponse {
-                ok: true,
-                message: Some("Verification code sent to your email".into()),
-            }));
-        }
-    } else if root_login_target.is_none() {
-        if !auth_mgr.allow_self_registration() {
-            tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
-            return Ok(Json(SendCodeResponse {
-                ok: true,
-                message: Some("Verification code sent to your email".into()),
-            }));
-        }
-        tracing::info!(email = %requested_email, "sending OTP for self-registration (no existing profile)");
-    }
-
-    // Rate-limit OTP sends: max 3 per email per 5-minute window.
+    // Rate-limit every request, including unknown/uninvited addresses. Keeping
+    // this before the eligibility exits prevents a fast, unlimited probe path.
+    // Max 3 requests per email per 5-minute window.
     {
         let mut limits = OTP_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
         let rate_limit_key = scoped_login_target
@@ -541,6 +520,31 @@ pub async fn send_code(
             }));
         }
         entry.0 += 1;
+    }
+
+    if scoped_profile_id.is_some() && scoped_login_target.is_none() {
+        tracing::warn!(
+            email = %requested_email,
+            scoped_profile = ?scoped_profile_id,
+            "OTP skipped — email does not match scoped profile"
+        );
+        delay_ineligible_otp_response().await;
+        return Ok(Json(SendCodeResponse {
+            ok: true,
+            message: Some("Verification code sent to your email".into()),
+        }));
+    }
+    if scoped_profile_id.is_none() && root_login_target.is_none() {
+        tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
+        // The body is identical to an eligible request. A short jittered delay
+        // also reduces the otherwise-obvious microseconds-vs-SMTP timing gap.
+        // It cannot perfectly reproduce arbitrary SMTP latency, so the edge
+        // rate limit remains part of the public deployment's defence in depth.
+        delay_ineligible_otp_response().await;
+        return Ok(Json(SendCodeResponse {
+            ok: true,
+            message: Some("Verification code sent to your email".into()),
+        }));
     }
 
     tracing::info!(email = %requested_email, "login OTP requested");
@@ -579,6 +583,15 @@ pub async fn send_code(
             }))
         }
     }
+}
+
+async fn delay_ineligible_otp_response() {
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis() as u64
+        % 201;
+    tokio::time::sleep(std::time::Duration::from_millis(350 + jitter_ms)).await;
 }
 
 /// GET /api/auth/status
@@ -6102,6 +6115,7 @@ mod tests {
     #[tokio::test]
     async fn scoped_send_code_hides_whether_email_is_registered() {
         let (_dir, state, user_store, profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
         child.public_subdomain = Some("assistant".into());
@@ -6132,11 +6146,19 @@ mod tests {
             resp.message.as_deref(),
             Some("Verification code sent to your email")
         );
+        assert!(
+            auth_mgr
+                .test_pending_code("wrong@example.com", Some("tenant--assistant"))
+                .await
+                .is_none()
+        );
+        assert!(auth_mgr.test_sent_emails().await.is_empty());
     }
 
     #[tokio::test]
     async fn root_send_code_hides_whether_email_is_invited() {
         let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
 
         let Json(resp) = send_code(
             State(Arc::new(state)),
@@ -6153,6 +6175,13 @@ mod tests {
             resp.message.as_deref(),
             Some("Verification code sent to your email")
         );
+        assert!(
+            auth_mgr
+                .test_pending_code("not-invited@example.com", None)
+                .await
+                .is_none()
+        );
+        assert!(auth_mgr.test_sent_emails().await.is_empty());
     }
 
     #[tokio::test]
