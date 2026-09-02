@@ -2087,6 +2087,73 @@ fn should_sanitize_loaded_messages_in_place() {
     assert_eq!(handle.session.messages[0].content, "hi");
 }
 
+/// #2204 regression (real disk round-trip): a session whose persisted
+/// transcript ends in an interrupted thinking-only assistant turn must, on a
+/// COLD reload from disk, have that turn FAILED (dropped) — not resurrected
+/// and resumed. Exercises the exact production path the session actor uses at
+/// bootstrap: persist → `SessionHandle::open` (loads from disk) →
+/// `sanitize_loaded_messages(None, ..)`.
+#[tokio::test]
+async fn cold_reload_fails_interrupted_thinking_only_tail() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "coding");
+
+    // Persist a completed user turn, then an interrupted thinking-only
+    // assistant turn (empty content, non-empty reasoning, no tool calls) — the
+    // killed reasoning spiral that used to be resurrected on the next launch.
+    {
+        let mut writer = SessionHandle::open(tmp.path(), &key);
+        writer
+            .add_message(make_message(MessageRole::User, "hi"))
+            .await
+            .unwrap();
+        let spiral = Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some(
+                "... geometry topology manifold spacetime quantum mechanics ...".into(),
+            ),
+            client_message_id: None,
+            thread_id: Some("01a05fda-turn".into()),
+            timestamp: chrono::Utc::now(),
+        };
+        writer.add_message(spiral).await.unwrap();
+    }
+
+    // Cold reload: a fresh handle loads the transcript from disk, exactly as
+    // the session actor does at bootstrap (retry_state = None).
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(
+        handle.session.messages.len(),
+        2,
+        "both persisted turns must load from disk"
+    );
+
+    let (report, _refs) = handle
+        .sanitize_loaded_messages(None, None)
+        .expect("clean outcome — no workspace root");
+
+    assert_eq!(
+        report.orphan_thinking_dropped, 1,
+        "the interrupted thinking-only tail must be failed on cold reload"
+    );
+    assert_eq!(handle.session.messages.len(), 1);
+    assert_eq!(handle.session.messages[0].content, "hi");
+    assert!(
+        handle
+            .session
+            .messages
+            .last()
+            .unwrap()
+            .reasoning_content
+            .is_none(),
+        "no thinking-only turn survives to be resumed"
+    );
+}
+
 /// M8.6: a missing worktree surfaces as `Err` and DOES NOT mutate the
 /// session's in-memory transcript — callers can still log what was
 /// loaded before deciding to refuse resume.
