@@ -683,7 +683,6 @@ pub struct ToolResult {
 | **configure_tool** | tool, settings | Per-tool runtime config overrides (source: `tools/tool_config.rs`) |
 | **delegate_task** | … | Scoped child agent (M8.7 sub-agent output router) |
 | **check_background_tasks** | — | Inspect outstanding background / `spawn_only` tasks held by `task_supervisor` |
-| **activate_tools** | groups | Pull deferred LRU-evicted tools back into the active registry |
 | **check_workspace_contract** | — | Verify the worktree against `workspace_contract.rs` invariants |
 | **workspace_log** | project, limit? | Git `log --oneline --all -n <limit>` for a workspace project (e.g. `slides/my-deck`, `sites/blog`). Default `limit=20`, capped at 100. Source: `tools/workspace_history.rs:101`. |
 | **workspace_show** | project, commit, file | Read a file at a specific commit (`git show <commit>:<file>`). All three fields required. Source: `tools/workspace_history.rs:199`. |
@@ -983,7 +982,7 @@ Plugin tools marked `spawn_only: true` in `manifest.json` are auto-intercepted d
 
 **Mechanism** (`execution.rs`): When a tool call targets a `spawn_only` tool, the execution loop wraps it in a background tokio task. The tool runs directly (not via a subagent LLM), and any `files_to_send` in the result are auto-dispatched via the session's outbound channel.
 
-**Visibility**: spawn_only tools remain visible in tool specs (the LLM can see and call them). They are protected from LRU eviction via `base_tools`.
+**Visibility**: spawn_only tools remain visible in tool specs (the LLM can see and call them) for the life of the session — there is no recency-based eviction that could hide them.
 
 ### Progress Reporting
 
@@ -1325,7 +1324,7 @@ Two first-class runtime types make profile scope and session scope explicit:
      6. Open per-session `SessionManager` at `<profile.data_dir>/users/<key>/`.
    - Cache hit → return existing `Arc<SessionRuntime>`.
 
-**Bootstrap path is shared between serve and gateway.** Both `commands/serve.rs::run_async` and the `ProcessManager`-spawned `octos gateway` subprocess call `ProfileRuntime::bootstrap` for per-profile state (memory, memory_store, tool_config, credentials, plugin env). Gateway-specific composition (`SwappableProvider`, `provider_router`, `SwitchModelTool`, admin tools, auto-defer, `pipeline_factory`, gateway tool-registry layering) stays as composition ON TOP of the profile runtime — nothing duplicates the LLM/credentials/skills/plugin assembly the runtime owns.
+**Bootstrap path is shared between serve and gateway.** Both `commands/serve.rs::run_async` and the `ProcessManager`-spawned `octos gateway` subprocess call `ProfileRuntime::bootstrap` for per-profile state (memory, memory_store, tool_config, credentials, plugin env). Gateway-specific composition (`SwappableProvider`, `provider_router`, `SwitchModelTool`, admin tools, `pipeline_factory`, gateway tool-registry layering) stays as composition ON TOP of the profile runtime — nothing duplicates the LLM/credentials/skills/plugin assembly the runtime owns.
 
 **Why this exists.** Before M11, `octos serve` ran a server-wide embedded `Agent` constructed by a no-longer-present `try_create_agent`. The agent had no notion of profile or session scope. A series of PRs (#866 / #867 / #868 / #869, all 2026-05-10) retrofitted profile awareness one transient `Config` field at a time. M11 replaced the embedded agent with the two-scope model and M11-F deleted the last of the overlay machinery. See the ADR for the full incident trail.
 
@@ -1529,7 +1528,7 @@ crates/
 │                        grep_tool, web_search, web_fetch, message,
 │                        spawn, delegate, browser, ssrf,
 │                        check_background_tasks, tool_config,
-│                        activate_tools, check_workspace_contract,
+│                        check_workspace_contract,
 │                        deep_search, site_crawl  (registers as deep_crawl),
 │                        recall_memory, save_memory, send_file,
 │                        code_structure, git, synthesize_research,

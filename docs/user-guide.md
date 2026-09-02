@@ -55,7 +55,7 @@ octos serve (control plane + dashboard, ~140 REST endpoints)
        │
        ├── LLM Provider (15 providers via AdaptiveRouter → ProviderChain → RetryProvider)
        ├── Tool Registry (~50 built-ins + plugins + 9 user-facing app-skills)
-       │     LRU deferral keeps ~15 active; spawn_only auto-routes to background
+       │     Full enabled tool set sent each turn; spawn_only auto-routes to background
        ├── Sandbox (bwrap / sandbox-exec / Docker / Windows AppContainer)
        ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
        ├── Swarm Dispatcher (/api/swarm/dispatch — fan-out to N sub-agents)
