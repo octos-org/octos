@@ -32424,6 +32424,20 @@ async fn run_standalone_turn(
     // RFC-0 (#1289): LRU tool deferral + the `activate_tools` recovery
     // meta-tool were removed. Voice turns now carry the full enabled tool set
     // like every other turn.
+    // Re-apply the profile tool_policy AFTER this turn's per-session
+    // channel/dispatcher tools were registered (send_file, peer_*, spawn,
+    // run_pipeline, …). The snapshot at the top of the turn (31061) inherited
+    // the profile-BOOTSTRAP policy, but these tools are added here at
+    // turn-build time and would otherwise bypass an allow/deny list — so a
+    // profile `tool_policy` only constrained the bootstrap roster, not the
+    // per-turn roster the model actually sees. Symptom: octoscode ran a turn
+    // with `tools=31` despite an 8-tool allow-list, drowning small local
+    // models. Mirrors `session_actor.rs:3748` (the gateway path already does
+    // this). No-op when no policy is set, so cloud/default behavior is
+    // unchanged.
+    if let Some(ref policy) = session_runtime.profile.tool_policy {
+        tool_registry.apply_policy(policy);
+    }
     // Wrap the per-turn `ToolRegistry` in an `Arc` here so we retain a
     // handle after `Agent::new_shared` consumes its own clone. The
     // post-terminal drain task (issue #961) inspects

@@ -10432,6 +10432,63 @@ fn ws_turn_handler_registers_supervisor_with_task_query_store() {
     assert_eq!(tasks[0]["status"], "running");
 }
 
+/// Regression: `run_standalone_turn` registers per-session channel/dispatcher
+/// tools (send_file, peer_*, spawn) onto the per-turn snapshot, then MUST
+/// re-apply the profile `tool_policy` so an allow/deny list actually
+/// constrains the roster the model sees. Before the fix the re-apply was
+/// missing on the UI-Protocol path, so octoscode ran turns at `tools=31`
+/// despite an 8-tool allow-list, drowning small local models. Mirrors the
+/// gateway re-apply at `session_actor.rs:3748`.
+#[test]
+fn ws_turn_snapshot_is_constrained_by_reapplied_tool_policy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let parent = octos_agent::ToolRegistry::with_builtins(temp.path());
+    // The per-turn snapshot, exactly as run_standalone_turn builds it.
+    let mut tool_registry = parent.snapshot_excluding(&[]);
+
+    let full_before = tool_registry.tool_names();
+    assert!(
+        full_before.len() > 1,
+        "snapshot should carry the full builtin roster, got {}",
+        full_before.len()
+    );
+    let keep = full_before
+        .iter()
+        .find(|n| n.as_str() == "read_file")
+        .cloned()
+        .unwrap_or_else(|| full_before[0].clone());
+
+    // Register a real per-session tool AFTER the snapshot — the exact class of
+    // tool `run_standalone_turn` adds (send_file / peer_* / spawn) and that used
+    // to bypass the profile policy.
+    let (out_tx, _out_rx) = mpsc::channel::<octos_core::OutboundMessage>(1);
+    tool_registry.register(octos_agent::SendFileTool::new(out_tx));
+    assert!(
+        tool_registry.tool_names().iter().any(|n| n == "send_file"),
+        "send_file must be present after being registered onto the per-turn snapshot",
+    );
+
+    // Re-apply an allow-list that OMITS send_file — what the fix now does with
+    // `session_runtime.profile.tool_policy` after registering session tools.
+    let policy = octos_agent::ToolPolicy {
+        allow: vec![keep.clone()],
+        ..Default::default()
+    };
+    tool_registry.apply_policy(&policy);
+
+    let after = tool_registry.tool_names();
+    assert_eq!(
+        after,
+        vec![keep.clone()],
+        "after re-applying the allow-list, only the allowed tool must remain \
+         — got {after:?}"
+    );
+    assert!(
+        !after.iter().any(|n| n == "send_file"),
+        "the re-applied allow-list must strip the post-snapshot session tool that used to leak",
+    );
+}
+
 /// PR #1324 follow-up — pin that wiring `set_on_failure_signal` on a
 /// per-turn `TaskSupervisor` (the way `run_standalone_turn` does
 /// after this fix) routes a `SpawnOnlyFailureSignal` through to the
