@@ -16,6 +16,12 @@ name: Publish Packages
 # (No tap PAT needed anymore — the formula update uses the built-in GITHUB_TOKEN.)
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to publish'
+        required: true
+        type: string
   release:
     types: [published]
   workflow_dispatch:
@@ -122,8 +128,18 @@ jobs:
               --title "octos ${TAG}: update Homebrew formula" \
               --body "Automated Homebrew formula bump for ${TAG}."
           fi
-          gh pr merge "$branch" --squash --auto 2>/dev/null \
-            || echo "::notice::auto-merge unavailable; merge the formula PR manually."
+          gh pr merge "$branch" --squash --auto
+          for attempt in $(seq 1 60); do
+            state=$(gh pr view "$branch" --json state --jq .state)
+            if [ "$state" = "MERGED" ]; then
+              echo "Formula PR merged."
+              exit 0
+            fi
+            echo "attempt $attempt/60: waiting for formula PR checks and merge"
+            sleep 10
+          done
+          echo "::error::formula PR did not merge within 10 minutes"
+          exit 1
 
   npm:
     if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
@@ -163,3 +179,20 @@ jobs:
           esac
           echo "npm publish @octos-org/octos@${version} --tag ${dist_tag}"
           npm publish --access public --tag "$dist_tag"
+
+      - name: Verify npm publication
+        working-directory: packaging/npm
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          for attempt in $(seq 1 18); do
+            published=$(npm view "@octos-org/octos@${version}" version 2>/dev/null || true)
+            if [ "$published" = "$version" ]; then
+              echo "Verified @octos-org/octos@${version} on npm."
+              exit 0
+            fi
+            echo "attempt $attempt/18: waiting for npm registry visibility"
+            sleep 10
+          done
+          echo "::error::@octos-org/octos@${version} is not visible on npm"
+          exit 1

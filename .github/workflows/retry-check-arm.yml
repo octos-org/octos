@@ -1,22 +1,16 @@
-name: retry-check-arm
+name: retry-nightly-arm
 
-# check-arm dies on roughly half of `main` pushes: GitHub kills the hosted
-# ARM runner mid-run ("lost communication with the server") — an infra
-# failure, not our code. The full investigation lives in ci.yml's check-arm
-# comment (same steps pass in 29s on a matched aarch64 box; memory never
-# dips; RUST_TEST_THREADS and step timeouts disproven). A killed runner
-# cannot retry itself, so this workflow retries it from outside: when a CI
-# run completes with check-arm failed, re-run JUST that job.
+# The hosted ARM runner occasionally disappears without completing a failing
+# step. A dead runner cannot retry itself, so this companion workflow retries
+# that narrow infrastructure case from outside the nightly workflow.
 #
-# The cap is the job's own run_attempt (job-level reruns do NOT bump the
-# workflow run's attempt, so the event-level attempt cannot be used):
-# check-arm gets at most 3 executions per run, then stays red. A persistent
-# real failure therefore costs two extra ARM runs — the price of not
-# re-litigating an infra flake that no workflow config can fix.
+# Test, compiler, linker, timeout, and disk failures all leave a failed step and
+# are deliberately NOT retried. This prevents the old behavior that reran an
+# actionable ENOSPC failure three times and delayed the nightly by hours.
 
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [Nightly Regression]
     types: [completed]
 
 permissions:
@@ -39,18 +33,25 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
-          INFO=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100&filter=latest" \
-            --jq '.jobs[] | select(.name == "check-arm" and .conclusion == "failure") | [.id, (.run_attempt // 1)] | @tsv' \
+          JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100&filter=latest")
+          INFO=$(echo "$JOBS" \
+            | jq -r '.jobs[] | select(.name == "ARM64 workspace tests" and .conclusion == "failure") | [.id, (.run_attempt // 1)] | @tsv' \
             | head -1)
           if [ -z "${INFO}" ]; then
-            echo "check-arm is not a failed job in run ${RUN_ID} — nothing to retry."
+            echo "ARM64 workspace tests is not failed in run ${RUN_ID} — nothing to retry."
             exit 0
           fi
           JOB_ID=$(echo "${INFO}" | cut -f1)
           ATTEMPT=$(echo "${INFO}" | cut -f2)
-          if [ "${ATTEMPT}" -ge 3 ]; then
-            echo "check-arm is at attempt ${ATTEMPT} (>= 3) — not retrying; treat as a persistent failure."
+          FAILED_STEPS=$(echo "$JOBS" | jq \
+            '[.jobs[] | select(.id == '"${JOB_ID}"') | .steps[]? | select(.conclusion == "failure")] | length')
+          if [ "$FAILED_STEPS" -gt 0 ]; then
+            echo "ARM job contains ${FAILED_STEPS} failed step(s); this is an actionable failure, not runner loss."
             exit 0
           fi
-          echo "Rerunning check-arm job ${JOB_ID} (was attempt ${ATTEMPT}, cap is 3)."
+          if [ "${ATTEMPT}" -ge 2 ]; then
+            echo "ARM job is at attempt ${ATTEMPT} (>= 2) — not retrying again."
+            exit 0
+          fi
+          echo "Rerunning vanished ARM job ${JOB_ID} once (attempt ${ATTEMPT})."
           gh run rerun --repo "${{ github.repository }}" --job "${JOB_ID}"
