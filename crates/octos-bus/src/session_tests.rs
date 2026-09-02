@@ -1651,6 +1651,108 @@ fn test_active_session_store_persistence() {
     assert_eq!(store.get_active_topic("telegram:12345"), "research");
 }
 
+/// #2013 — a corrupt `active_sessions.json` must NEVER be silently swallowed
+/// into an empty store that the next `switch_to` then overwrites.
+///
+/// Old behaviour: `serde_json::from_str(..).unwrap_or_default()` turned a
+/// truncated file into an empty store with no error and no log line; the next
+/// topic switch persisted over `active_sessions.json` and every chat's active
+/// topic and `/back` target was gone for good. The load-side property that
+/// prevents that is: the original bytes must still exist on disk afterwards.
+#[test]
+fn corrupt_active_session_store_is_quarantined_not_silently_discarded() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("active_sessions.json");
+    // Truncated mid-token, as an unfsynced write + power loss leaves it. The
+    // cut-off word is deliberately NOT a prefix of a real English word: the
+    // `typos` CI gate reads a truncated word as a misspelling and fails the
+    // build, which is ironic for a fixture whose whole job is to BE
+    // truncated — but not a battle worth having with a spell-checker.
+    let corrupt = r#"{"active":{"telegram:12345":"topic-zzq"#;
+    std::fs::write(&path, corrupt).unwrap();
+
+    let mut store = ActiveSessionStore::open(tmp.path()).unwrap();
+    assert_eq!(
+        store.get_active_topic("telegram:12345"),
+        "",
+        "the store still opens (topics reset is recoverable; losing the mappings is not)",
+    );
+
+    // THE load-bearing assertion: the operator can still get the mappings back.
+    let preserved: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("corrupt-"))
+        })
+        .collect();
+    assert_eq!(
+        preserved.len(),
+        1,
+        "the corrupt store must be quarantined aside, not discarded (got {preserved:?})",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&preserved[0]).unwrap(),
+        corrupt,
+        "the quarantined copy must be byte-identical so mappings can be recovered",
+    );
+    assert!(
+        !path.exists(),
+        "the corrupt file is moved aside, so a later save cannot overwrite it in place",
+    );
+
+    // The next topic switch persists the near-empty store — and must leave
+    // the quarantined evidence untouched.
+    store.switch_to("telegram:12345", "fresh").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&preserved[0]).unwrap(),
+        corrupt,
+        "a post-quarantine save must not clobber the preserved store",
+    );
+}
+
+/// A MISSING store is the normal first run — it must stay silent and must
+/// NOT create a quarantine file.
+#[test]
+fn missing_active_session_store_is_not_treated_as_corruption() {
+    let tmp = TempDir::new().unwrap();
+    let store = ActiveSessionStore::open(tmp.path()).unwrap();
+    assert_eq!(store.get_active_topic("telegram:12345"), "");
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "first run must not leave a quarantine artifact behind",
+    );
+}
+
+/// #2013 — the save path's temp files must be unique and must never linger:
+/// two stores on one data dir saving alternately (the two-processes shape)
+/// leave exactly the store file behind, no `*.tmp` orphans.
+#[test]
+fn active_session_store_saves_leave_no_tmp_orphans() {
+    let tmp = TempDir::new().unwrap();
+    let mut a = ActiveSessionStore::open(tmp.path()).unwrap();
+    let mut b = ActiveSessionStore::open(tmp.path()).unwrap();
+
+    a.switch_to("telegram:1", "from-a").unwrap();
+    b.switch_to("telegram:2", "from-b").unwrap();
+    a.switch_to("telegram:1", "from-a-again").unwrap();
+
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "active_sessions.json")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "saves must clean up their unique temp files, got {leftovers:?}",
+    );
+}
+
 #[test]
 fn test_validate_topic_name() {
     assert!(validate_topic_name("research").is_ok());
