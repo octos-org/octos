@@ -13,7 +13,9 @@ name: Publish Packages
 # maintainer opts in (avoids failing on missing tokens). To go live, set:
 #   - repo variable PUBLISH_PACKAGES = true
 #   - secret NPM_TOKEN           (npm automation token for @octos-org)
-# (No tap PAT needed anymore — the formula update uses the built-in GITHUB_TOKEN.)
+#   - secret HOMEBREW_TAP_TOKEN  (bot/PAT token that can open formula PRs)
+# The Homebrew token is optional at the workflow boundary so manual diagnostics
+# still start, but it is required while the org forbids GITHUB_TOKEN-created PRs.
 
 on:
   workflow_call:
@@ -22,6 +24,13 @@ on:
         description: 'Release tag to publish'
         required: true
         type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        description: 'Bot/PAT token that can push branches and open formula PRs'
+        required: false
+      NPM_TOKEN:
+        description: 'npm automation token for @octos-org'
+        required: false
   release:
     types: [published]
   workflow_dispatch:
@@ -43,13 +52,16 @@ jobs:
       pull-requests: write   # open the PR that bumps Formula/octos.rb
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
-      GH_TOKEN: ${{ github.token }}
+      # A bot/PAT token makes the formula PR trigger CI. Fall back for repos
+      # whose organization explicitly permits GITHUB_TOKEN-created PRs.
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || github.token }}
     steps:
       # Base the formula-bump branch on main (a release event otherwise checks
       # out the tag commit, which would make the PR diff/auto-merge messy).
       - uses: actions/checkout@v6
         with:
           ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN || github.token }}
 
       - name: Download unix bundles for the tag
         run: |
