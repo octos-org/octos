@@ -25,6 +25,36 @@ use super::router::AuthIdentity;
 /// Allows at most 3 requests per 5-minute window per email address.
 static OTP_RATE_LIMIT: LazyLock<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+const OTP_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+const OTP_RATE_LIMIT_MAX_KEYS: usize = 4096;
+
+fn otp_rate_limit_exceeded(
+    limits: &mut HashMap<String, (u32, std::time::Instant)>,
+    rate_limit_key: String,
+    now: std::time::Instant,
+) -> bool {
+    // Unknown addresses are deliberately rate-limited too, but they are
+    // attacker-controlled. Prune expired buckets before enforcing a hard cap
+    // so unique probes cannot grow this process-global map without bound.
+    if limits.len() >= OTP_RATE_LIMIT_MAX_KEYS {
+        limits.retain(|_, (_, started_at)| {
+            now.saturating_duration_since(*started_at) < OTP_RATE_LIMIT_WINDOW
+        });
+    }
+    if !limits.contains_key(&rate_limit_key) && limits.len() >= OTP_RATE_LIMIT_MAX_KEYS {
+        return true;
+    }
+
+    let entry = limits.entry(rate_limit_key).or_insert((0, now));
+    if now.saturating_duration_since(entry.1) >= OTP_RATE_LIMIT_WINDOW {
+        *entry = (0, now);
+    }
+    if entry.0 >= 3 {
+        return true;
+    }
+    entry.0 += 1;
+    false
+}
 
 pub(crate) fn is_top_level_profile_id(state: &AppState, profile_id: &str) -> bool {
     state
@@ -505,13 +535,7 @@ pub async fn send_code(
                 })
             })
             .unwrap_or_else(|| requested_email.clone());
-        let entry = limits
-            .entry(rate_limit_key)
-            .or_insert((0, std::time::Instant::now()));
-        if entry.1.elapsed() > std::time::Duration::from_secs(300) {
-            *entry = (0, std::time::Instant::now()); // reset after 5 min
-        }
-        if entry.0 >= 3 {
+        if otp_rate_limit_exceeded(&mut limits, rate_limit_key, std::time::Instant::now()) {
             tracing::warn!(email = %req.email, "OTP rate limit exceeded");
             // Return generic success to avoid leaking rate-limit state
             return Ok(Json(SendCodeResponse {
@@ -519,7 +543,6 @@ pub async fn send_code(
                 message: Some("Verification code sent to your email".into()),
             }));
         }
-        entry.0 += 1;
     }
 
     if scoped_profile_id.is_some() && scoped_login_target.is_none() {
@@ -4340,6 +4363,38 @@ pub async fn my_wechat_qr_poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn otp_rate_limit_prunes_expired_keys_and_stays_bounded() {
+        let now = std::time::Instant::now();
+        let mut limits = (0..OTP_RATE_LIMIT_MAX_KEYS)
+            .map(|index| (format!("probe-{index}@example.com"), (1, now)))
+            .collect::<HashMap<_, _>>();
+
+        assert!(otp_rate_limit_exceeded(
+            &mut limits,
+            "overflow@example.com".into(),
+            now
+        ));
+        assert_eq!(limits.len(), OTP_RATE_LIMIT_MAX_KEYS);
+        assert!(!limits.contains_key("overflow@example.com"));
+
+        limits.insert(
+            "probe-0@example.com".into(),
+            (
+                1,
+                now - OTP_RATE_LIMIT_WINDOW - std::time::Duration::from_secs(1),
+            ),
+        );
+        assert!(!otp_rate_limit_exceeded(
+            &mut limits,
+            "replacement@example.com".into(),
+            now
+        ));
+        assert_eq!(limits.len(), OTP_RATE_LIMIT_MAX_KEYS);
+        assert!(limits.contains_key("replacement@example.com"));
+        assert!(!limits.contains_key("probe-0@example.com"));
+    }
 
     #[test]
     fn should_require_ominix_only_for_local_voice_legs() {
