@@ -19,9 +19,13 @@
 //!    tool-call messages whose ids have no matching tool result (unless the
 //!    call is referenced by pending retry state).
 //! 2. [`filter_orphaned_thinking_only_messages`] — drops assistant messages
-//!    that have `reasoning_content` but empty `content` and no tool calls,
-//!    unless the message is the tail of the transcript (allow in-flight
-//!    reasoning).
+//!    that have `reasoning_content` but empty `content` and no tool calls.
+//!    A thinking-only message at the tail of the transcript is preserved
+//!    ONLY when `preserve_in_flight_tail` is set — i.e. a live in-process
+//!    retry is under way ([`ResumePolicy::sanitize`] derives this from a
+//!    non-`None` `retry_state`). On a cold reload from disk there is no
+//!    in-flight turn by construction, so the interrupted thinking-only tail
+//!    is failed (dropped) rather than resurrected and resumed.
 //! 3. [`filter_whitespace_only_assistant_messages`] — drops assistant
 //!    messages whose `content.trim().is_empty()` and no tool calls and no
 //!    reasoning content.
@@ -205,7 +209,15 @@ impl ResumePolicy {
         report.unresolved_tool_uses_dropped = dropped_tool_use;
 
         // Pass 2: drop orphan thinking-only assistant messages.
-        let (messages, dropped_thinking) = filter_orphaned_thinking_only_messages(messages);
+        //
+        // A thinking-only tail is preserved only during a live in-process
+        // retry. `retry_state` is `Some` only in that case; on every cold
+        // reload from disk it is `None`, and the process that produced the
+        // tail is gone — so the interrupted turn is failed (dropped) here
+        // rather than resurrected and resumed by the session actor.
+        let preserve_in_flight_tail = retry_state.is_some();
+        let (messages, dropped_thinking) =
+            filter_orphaned_thinking_only_messages(messages, preserve_in_flight_tail);
         report.orphan_thinking_dropped = dropped_thinking;
 
         // Pass 3: drop whitespace-only assistant messages.
@@ -384,17 +396,28 @@ fn result_has_matching_call(kept: &[Message], id: &str) -> bool {
 ///   - `content.trim().is_empty()`.
 ///   - `tool_calls` is None or empty.
 ///
-/// Such messages are dropped EXCEPT when they are the last message in the
-/// transcript — that case represents an in-flight reasoning turn the harness
-/// will continue on resume.
-pub fn filter_orphaned_thinking_only_messages(messages: Vec<Message>) -> (Vec<Message>, usize) {
+/// Such messages are dropped. The one exception is the tail of the transcript
+/// when `preserve_in_flight_tail` is `true`: that represents a live in-process
+/// reasoning turn the harness is about to continue, so it is kept. When
+/// `preserve_in_flight_tail` is `false` (a cold reload from disk, where no turn
+/// is in flight by construction) the tail is treated like any other orphan and
+/// dropped — failing the interrupted turn instead of resurrecting it on resume.
+pub fn filter_orphaned_thinking_only_messages(
+    messages: Vec<Message>,
+    preserve_in_flight_tail: bool,
+) -> (Vec<Message>, usize) {
     let total = messages.len();
     let mut dropped = 0_usize;
     let mut kept = Vec::with_capacity(total);
 
     for (idx, msg) in messages.into_iter().enumerate() {
+        // The tail thinking-only message is kept only when a live in-process
+        // retry is under way (`preserve_in_flight_tail`). On a cold reload it
+        // is an interrupted turn with no live task behind it, so it is dropped
+        // like any other orphan rather than resumed.
         let is_tail = idx + 1 == total;
-        if !is_tail && is_thinking_only(&msg) {
+        let is_live_tail = is_tail && preserve_in_flight_tail;
+        if !is_live_tail && is_thinking_only(&msg) {
             dropped += 1;
         } else {
             kept.push(msg);
@@ -975,7 +998,8 @@ mod tests {
             assistant_text("here is the answer"),
         ];
 
-        let (filtered, dropped) = filter_orphaned_thinking_only_messages(messages);
+        // A mid-transcript orphan is dropped even with tail-preservation on.
+        let (filtered, dropped) = filter_orphaned_thinking_only_messages(messages, true);
 
         assert_eq!(dropped, 1);
         assert_eq!(filtered.len(), 2);
@@ -983,20 +1007,37 @@ mod tests {
     }
 
     #[test]
-    fn should_keep_trailing_thinking_only_message() {
-        // In-flight reasoning: session crashed mid-think. The tail
-        // thinking-only message represents state the harness will
-        // continue — keep it.
+    fn should_keep_trailing_thinking_only_message_during_in_flight_retry() {
+        // Live in-process retry (`preserve_in_flight_tail = true`): the tail
+        // thinking-only message represents state the harness will continue —
+        // keep it.
         let messages = vec![
             user("long one"),
             assistant_thinking_only("still working on it ..."),
         ];
 
-        let (filtered, dropped) = filter_orphaned_thinking_only_messages(messages);
+        let (filtered, dropped) = filter_orphaned_thinking_only_messages(messages, true);
 
         assert_eq!(dropped, 0);
         assert_eq!(filtered.len(), 2);
         assert!(filtered[1].reasoning_content.is_some());
+    }
+
+    #[test]
+    fn should_drop_trailing_thinking_only_message_on_cold_reload() {
+        // Cold reload (`preserve_in_flight_tail = false`): the process that
+        // produced the tail is gone, so the interrupted thinking-only turn is
+        // failed (dropped) rather than resurrected and resumed.
+        let messages = vec![
+            user("hi"),
+            assistant_thinking_only("... spiralling reasoning, never answered ..."),
+        ];
+
+        let (filtered, dropped) = filter_orphaned_thinking_only_messages(messages, false);
+
+        assert_eq!(dropped, 1);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].content, "hi");
     }
 
     #[test]
@@ -1101,6 +1142,34 @@ mod tests {
         assert_eq!(outcome.report.output_len, 4);
         assert!(!outcome.report.worktree_missing);
         assert!(outcome.report.warnings.is_empty());
+    }
+
+    #[test]
+    fn sanitize_fails_interrupted_thinking_tail_on_cold_reload() {
+        // Cold reload: `retry_state = None`. A transcript ending in a
+        // thinking-only assistant turn (interrupted mid-reasoning) must have
+        // that turn dropped so the session opens clean instead of resuming it.
+        let messages = vec![user("hi"), assistant_thinking_only("... never finished")];
+
+        let outcome = ResumePolicy::sanitize(messages, None, None).unwrap();
+
+        assert_eq!(outcome.report.orphan_thinking_dropped, 1);
+        assert_eq!(outcome.messages.len(), 1);
+        assert_eq!(outcome.messages[0].content, "hi");
+    }
+
+    #[test]
+    fn sanitize_preserves_thinking_tail_during_in_flight_retry() {
+        // Live in-process retry: a non-empty `retry_state` marks the turn as
+        // in-flight, so the trailing thinking-only message is preserved.
+        let messages = vec![user("hi"), assistant_thinking_only("... still going")];
+        let retry_state: HashSet<String> = ["pending-call".to_string()].into_iter().collect();
+
+        let outcome = ResumePolicy::sanitize(messages, Some(&retry_state), None).unwrap();
+
+        assert_eq!(outcome.report.orphan_thinking_dropped, 0);
+        assert_eq!(outcome.messages.len(), 2);
+        assert!(outcome.messages[1].reasoning_content.is_some());
     }
 
     #[test]
