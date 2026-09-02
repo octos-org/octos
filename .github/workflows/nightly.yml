@@ -40,6 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
       # The former main-branch ARM job repeatedly exhausted the hosted disk.
       # Remove large preinstalled SDKs before compiling the workspace.
       - name: Free runner disk
@@ -70,6 +71,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: nightly-windows
