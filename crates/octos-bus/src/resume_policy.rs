@@ -162,6 +162,13 @@ impl std::error::Error for SanitizeError {}
 /// retry-state types in `octos-agent` (e.g. a future `LoopRetryState` with
 /// pending id tracking) implement this to bridge into the policy without
 /// introducing a reverse crate dependency.
+///
+/// WARNING (#2204): a value handed to [`ResumePolicy::sanitize`] must reflect
+/// state that is LIVE in the current process. `sanitize` treats a non-`None`
+/// `retry_state` as "a turn is in flight" and, on that basis, preserves a
+/// trailing thinking-only turn. A persisted retry-state sidecar reloaded from
+/// disk is NOT live — passing it in on a cold reload would resurrect an
+/// interrupted turn. Pass `None` on every cold reload.
 pub trait RetryStateView {
     /// Returns `true` when the given tool_call_id is pinned by an in-flight
     /// retry (e.g. the harness is about to replay the call after a provider
@@ -215,6 +222,14 @@ impl ResumePolicy {
         // reload from disk it is `None`, and the process that produced the
         // tail is gone — so the interrupted turn is failed (dropped) here
         // rather than resurrected and resumed by the session actor.
+        //
+        // INVARIANT (#2204): `retry_state` here means "a turn is live in this
+        // process", NOT merely "retry state exists on disk". `LoopRetryState`
+        // is persisted to a sidecar and survives a cold reload — it must NEVER
+        // be loaded from disk and threaded into `sanitize`, because `is_some()`
+        // would then be `true` on a cold reload and resurrect exactly the dead
+        // thinking-only tail this pass exists to fail. Cold-reload callers pass
+        // `None`; a live-retry caller passes the in-memory pending-id set.
         let preserve_in_flight_tail = retry_state.is_some();
         let (messages, dropped_thinking) =
             filter_orphaned_thinking_only_messages(messages, preserve_in_flight_tail);
