@@ -496,16 +496,16 @@ pub async fn send_code(
                 "OTP skipped — email does not match scoped profile"
             );
             return Ok(Json(SendCodeResponse {
-                ok: false,
-                message: Some("This email is not registered for this account".into()),
+                ok: true,
+                message: Some("Verification code sent to your email".into()),
             }));
         }
     } else if root_login_target.is_none() {
         if !auth_mgr.allow_self_registration() {
             tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
             return Ok(Json(SendCodeResponse {
-                ok: false,
-                message: Some("This email is not registered for login".into()),
+                ok: true,
+                message: Some("Verification code sent to your email".into()),
             }));
         }
         tracing::info!(email = %requested_email, "sending OTP for self-registration (no existing profile)");
@@ -6100,7 +6100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_send_code_rejects_wrong_email() {
+    async fn scoped_send_code_hides_whether_email_is_registered() {
         let (_dir, state, user_store, profile_store) = temp_app_state();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
@@ -6127,10 +6127,31 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!resp.ok);
+        assert!(resp.ok);
         assert_eq!(
             resp.message.as_deref(),
-            Some("This email is not registered for this account")
+            Some("Verification code sent to your email")
+        );
+    }
+
+    #[tokio::test]
+    async fn root_send_code_hides_whether_email_is_invited() {
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+
+        let Json(resp) = send_code(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "not-invited@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.ok);
+        assert_eq!(
+            resp.message.as_deref(),
+            Some("Verification code sent to your email")
         );
     }
 
