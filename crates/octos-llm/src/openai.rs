@@ -654,7 +654,7 @@ impl OpenAIProvider {
                         provider = %self.provider_label,
                         model = %self.model,
                         dropped = ?dropped,
-                        "sampling_params keys collide with dedicated request fields and are dropped; use the dedicated config knobs instead"
+                        "sampling_params keys collide with reserved request fields and are dropped; set them via the dedicated ChatConfig field where one exists (e.g. temperature, max_tokens) — keys without one must not be sent"
                     );
                 }
                 extra
