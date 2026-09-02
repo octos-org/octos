@@ -1323,7 +1323,8 @@ pub async fn update_my_profile(
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
     }
-    super::admin::merge_profile_config_from_body(&mut profile.config, &body, true);
+    super::admin::merge_profile_config_from_body(&mut profile.config, &body, true)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA JSON,
     // including a private key pasted under a custom env name) into the OS
     // keychain before persisting. Uses the shared content-detecting helper so
@@ -3683,7 +3684,8 @@ pub async fn update_my_sub_account(
     if let Some(enabled) = req.enabled {
         sub.enabled = enabled;
     }
-    super::admin::merge_profile_config_from_body(&mut sub.config, &body, true);
+    super::admin::merge_profile_config_from_body(&mut sub.config, &body, true)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
     // persisting so a sub-account never writes a private key to disk.
     let sub_id = sub.id.clone();
@@ -5736,6 +5738,109 @@ mod tests {
         assert_eq!(home["events"][0]["title"], "Dinner");
     }
 
+    // #1470: the strict `config: Option<ProfileConfig>` parse ran before the
+    // raw body merge, so a partial nested-section patch for a section with
+    // required fields (e.g. `email.provider`) 400'd before the merge could
+    // preserve the stored values.
+    #[tokio::test]
+    async fn my_profile_config_patch_accepts_partial_nested_email() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.email = Some(crate::profiles::EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp1.example.org".into()),
+            smtp_port: Some(587),
+            username: None,
+            password_env: None,
+            password: None,
+            from_address: Some("bot@example.org".into()),
+            feishu_app_id: None,
+            feishu_app_secret_env: None,
+            feishu_app_secret: None,
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+        profile_store.save(&profile).unwrap();
+
+        let Json(resp) = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "email": {
+                        "smtp_host": "smtp2.example.org"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let email = resp.profile.config.email.expect("email config");
+        assert_eq!(email.provider, "smtp");
+        assert_eq!(email.smtp_host.as_deref(), Some("smtp2.example.org"));
+        assert_eq!(email.smtp_port, Some(587));
+        assert_eq!(email.from_address.as_deref(), Some("bot@example.org"));
+    }
+
+    // The flip side of accepting partial nested patches: a patch that merges
+    // to an INVALID config (here a wrong-typed `smtp_port`) must 400 and
+    // leave the stored config untouched — the post-merge validation error
+    // must not be silently swallowed.
+    #[tokio::test]
+    async fn my_profile_config_patch_rejects_invalid_merged_config() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.email = Some(crate::profiles::EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp1.example.org".into()),
+            smtp_port: Some(587),
+            username: None,
+            password_env: None,
+            password: None,
+            from_address: None,
+            feishu_app_id: None,
+            feishu_app_secret_env: None,
+            feishu_app_secret: None,
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+        profile_store.save(&profile).unwrap();
+
+        let err = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "email": {
+                        "smtp_port": "not-a-port"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        let err = match err {
+            Ok(_) => panic!("invalid merged config unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        let email = stored.config.email.expect("email config");
+        assert_eq!(email.smtp_host.as_deref(), Some("smtp1.example.org"));
+        assert_eq!(email.smtp_port, Some(587));
+    }
+
     // The config merge preserves sections the client omits (above), but a
     // provided `env_vars` map must still be able to DROP keys and clear the set
     // — otherwise secrets could never be removed via self-service. `env_vars` is
@@ -6023,6 +6128,64 @@ mod tests {
         assert_eq!(home["settings"]["city"], "Kyoto");
         assert_eq!(home["settings"]["clock_format"], "24h");
         assert_eq!(home["events"][0]["title"], "School pickup");
+    }
+
+    // #1470: same partial nested-section patch as above, but through the
+    // parent-managed sub-account endpoint.
+    #[tokio::test]
+    async fn managed_sub_account_config_patch_accepts_partial_nested_email() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        child.config.email = Some(crate::profiles::EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp1.example.org".into()),
+            smtp_port: None,
+            username: None,
+            password_env: None,
+            password: None,
+            from_address: None,
+            feishu_app_id: None,
+            feishu_app_secret_env: None,
+            feishu_app_secret: None,
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+        profile_store.save(&child).unwrap();
+
+        let Json(resp) = update_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            Path("tenant--assistant".into()),
+            serde_json::json!({
+                "config": {
+                    "email": {
+                        "smtp_host": "smtp2.example.org"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let email = resp.profile.config.email.expect("email config");
+        assert_eq!(email.provider, "smtp");
+        assert_eq!(email.smtp_host.as_deref(), Some("smtp2.example.org"));
     }
 
     #[tokio::test]
