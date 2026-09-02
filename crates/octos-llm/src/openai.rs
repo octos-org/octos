@@ -640,8 +640,22 @@ impl OpenAIProvider {
                 // dedicated fields, so a misconfigured sampler param can't emit
                 // duplicate/divergent keys across the streaming (to_value,
                 // last-wins) and non-streaming (to_vec, duplicate) send paths.
+                // The strip must not be silent (#2177): an operator who puts
+                // e.g. `temperature` in sampling_params would otherwise see a
+                // configured-but-unchanged request with no signal at any level.
+                let mut dropped = Vec::new();
                 for reserved in RESERVED_SAMPLING_KEYS {
-                    extra.remove(*reserved);
+                    if extra.remove(*reserved).is_some() {
+                        dropped.push(*reserved);
+                    }
+                }
+                if !dropped.is_empty() {
+                    tracing::warn!(
+                        provider = %self.provider_label,
+                        model = %self.model,
+                        dropped = ?dropped,
+                        "sampling_params keys collide with dedicated request fields and are dropped; use the dedicated config knobs instead"
+                    );
                 }
                 extra
             },
@@ -1647,6 +1661,79 @@ mod tests {
         let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
         assert_eq!(v["temperature"], serde_json::json!(0.5));
         assert_eq!(v["repeat_penalty"], serde_json::json!(1.1));
+    }
+
+    /// In-memory log capture so a test can assert a `tracing::warn!` fired
+    /// (same shape as octos-cli's turn_trace tests).
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(run: impl FnOnce()) -> String {
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn should_warn_when_sampling_params_contain_reserved_keys() {
+        // #2177: stripping reserved keys from sampling_params must not be
+        // silent — an operator who puts `temperature` there otherwise gets a
+        // configured-but-unchanged request with zero signal.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("temperature".to_string(), serde_json::json!(1.9));
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        let cfg = ChatConfig {
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let logs = capture_logs(|| {
+            p.build_request(&msgs, &[], &cfg, false);
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("temperature"), "{logs}");
+        assert!(
+            !logs.contains("repeat_penalty"),
+            "non-reserved keys pass through and are not named in the warning: {logs}"
+        );
+    }
+
+    #[test]
+    fn should_not_warn_when_sampling_params_have_no_reserved_keys() {
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        let cfg = ChatConfig {
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let logs = capture_logs(|| {
+            p.build_request(&msgs, &[], &cfg, false);
+        });
+        assert!(
+            !logs.contains("WARN"),
+            "no reserved keys → no warning, got: {logs}"
+        );
     }
 
     #[test]
