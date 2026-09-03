@@ -1325,6 +1325,10 @@ pub async fn update_my_profile(
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     body: String,
 ) -> Result<Json<ProfileResponse>, (StatusCode, String)> {
+    let runtime_config_changed = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("config").cloned())
+        .is_some();
     let req: super::admin::UpdateProfileRequest = serde_json::from_str(&body).map_err(|e| {
         tracing::warn!(error = %e, body = %body, "failed to parse my profile update request");
         (
@@ -1374,6 +1378,15 @@ pub async fn update_my_profile(
         tracing::error!(profile = %profile.id, error = %e, "failed to save user profile");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
+
+    if runtime_config_changed {
+        crate::api::ui_protocol_transport::refresh_profile_runtime_after_profile_update(
+            &state,
+            &profile.id,
+            Some(profile.updated_at.to_rfc3339()),
+        )
+        .await;
+    }
 
     tracing::info!(profile = %profile.id, "user profile updated");
     let status = if let Some(ref pm) = state.process_manager {
@@ -1816,10 +1829,12 @@ pub(crate) async fn synthesize_speech(
         .map_err(|status| SpeechSynthesisError::new(status, "profile unavailable"))?;
     let _synthesis_permit = acquire_speech_synthesis_permit(&profile_id)?;
     consume_speech_synthesis_quota(&profile_id, text.chars().count())?;
-    let runtime = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+    let runtime = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
         &state,
         Some(&profile_id),
     )
+    .await
+    .map_err(|error| SpeechSynthesisError::new(StatusCode::SERVICE_UNAVAILABLE, error.message))?
     .ok_or_else(|| {
         SpeechSynthesisError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1898,10 +1913,13 @@ pub async fn voice_readiness(
     // runtimes (onboarding, `profile/llm/upsert`) that live outside
     // `state.profiles` — so readiness can't report "not started" while voice
     // turns actually work.
-    let rt = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+    let rt = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
         &state,
         Some(&profile_id),
-    );
+    )
+    .await
+    .ok()
+    .flatten();
     let llm = VoiceLeg {
         ready: rt
             .as_ref()
@@ -5838,6 +5856,51 @@ mod tests {
         assert_eq!(home["settings"]["city"], "Osaka");
         assert_eq!(home["settings"]["clock_format"], "24h");
         assert_eq!(home["events"][0]["title"], "Dinner");
+    }
+
+    #[tokio::test]
+    async fn my_profile_llm_patch_bootstraps_on_demand_appui_runtime() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.enabled = false;
+        profile_store.save(&profile).unwrap();
+        let state = Arc::new(state);
+
+        let _ = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "llm": {
+                        "primary": {
+                            "family_id": "openai",
+                            "model_id": "gpt-4o-mini",
+                            "route": {
+                                "api_key_env": "OCTOS_TEST_MY_PROFILE_LLM_KEY"
+                            }
+                        },
+                        "fallbacks": []
+                    },
+                    "env_vars": {
+                        "OCTOS_TEST_MY_PROFILE_LLM_KEY": "test-key"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("profile update");
+
+        let runtime = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+            &state,
+            Some("tenant"),
+        )
+        .expect("profile update should make the runtime live");
+        assert_eq!(runtime.primary_model_id, "gpt-4o-mini");
     }
 
     // #1470: the strict `config: Option<ProfileConfig>` parse ran before the

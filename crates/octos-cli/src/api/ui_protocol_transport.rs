@@ -12555,7 +12555,14 @@ async fn raw_profile_llm_test(
         thread_id: None,
         timestamp: Utc::now(),
     }];
-    let max_tokens = if family_id == "gemini" { 128 } else { 16 };
+    let canonical_family = octos_llm::registry::lookup(&family_id)
+        .map(|entry| entry.name)
+        .unwrap_or(family_id.as_str());
+    let max_tokens = if canonical_family == "gemini" || canonical_family == "vertex" {
+        128
+    } else {
+        16
+    };
     let config = octos_llm::ChatConfig {
         max_tokens: Some(max_tokens),
         temperature: Some(0.0),
@@ -19740,7 +19747,7 @@ fn insert_profile_runtime_if_current(
     true
 }
 
-async fn ensure_session_profile_runtime(
+pub(crate) async fn ensure_session_profile_runtime(
     state: &AppState,
     active_profile_id: Option<&str>,
 ) -> Result<Option<Arc<crate::runtime::ProfileRuntime>>, RpcError> {
@@ -19784,7 +19791,12 @@ async fn ensure_session_profile_runtime(
         // helper also runs for live cache replacement (for example
         // `profile/llm/select`), where marking active jobs abandoned would lie
         // about work still executing in this process.
-        if !profile.enabled || profile.parent_id.is_some() || !profile.config.has_llm_selection() {
+        // `enabled` controls whether a profile's standalone gateway process is
+        // auto-started; it must not disable authenticated AppUI/skill sessions.
+        // Public BYOK profiles are intentionally created with `enabled: false`
+        // so a VPS does not eagerly start one gateway per account. They still
+        // need an on-demand ProfileRuntime after selecting an LLM.
+        if profile.parent_id.is_some() || !profile.config.has_llm_selection() {
             return Ok(None);
         }
 
@@ -19858,10 +19870,8 @@ async fn rebuild_profile_runtime_after_skill_mutation(
 /// Explain why `ensure_session_profile_runtime`/`resolve_session_profile_runtime`
 /// returned `None` for `profile_id`, re-deriving the same checks in the same
 /// order. The 4 call sites used to collapse every cause (no profile store, no
-/// such profile, disabled, sub-account, no LLM selected) into one "Set up the
-/// profile with an API key" message — accurate only for the last cause and
-/// actively misleading for the other four, e.g. telling a disabled profile's
-/// owner to add an API key it may already have.
+/// such profile, sub-account, or no LLM selection) into one "Set up the profile
+/// with an API key" message.
 fn profile_runtime_unavailable_message(state: &AppState, profile_id: &str) -> String {
     let Some(store) = state.profile_store.as_ref() else {
         return format!(
@@ -19873,9 +19883,6 @@ fn profile_runtime_unavailable_message(state: &AppState, profile_id: &str) -> St
         Ok(None) => return format!("Profile '{profile_id}' does not exist."),
         Err(error) => return format!("Failed to read profile '{profile_id}': {error}"),
     };
-    if !profile.enabled {
-        return format!("Profile '{profile_id}' is disabled.");
-    }
     if profile.parent_id.is_some() {
         return format!(
             "Profile '{profile_id}' is a sub-account and does not have its own runtime."
@@ -19888,6 +19895,19 @@ fn profile_runtime_unavailable_message(state: &AppState, profile_id: &str) -> St
         );
     }
     format!("Profile '{profile_id}' runtime is unavailable.")
+}
+
+/// Invalidate and rebuild an on-demand AppUI runtime after the self-service
+/// profile endpoint changes runtime configuration. The REST settings surface
+/// predates `profile/llm/upsert`; without this bridge it persisted a new
+/// model/key while every following skill action kept using a stale runtime (or
+/// had no runtime at all) until the server restarted.
+pub(crate) async fn refresh_profile_runtime_after_profile_update(
+    state: &AppState,
+    profile_id: &str,
+    config_revision: Option<String>,
+) {
+    let _ = commit_profile_llm_runtime_transition(state, profile_id, config_revision).await;
 }
 
 /// Resolve the canonical `SessionManager` handle for read operations
