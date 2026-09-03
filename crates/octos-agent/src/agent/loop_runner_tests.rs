@@ -6781,6 +6781,29 @@ fn should_preserve_both_turns_increments_when_turns_overlap() {
 }
 
 #[test]
+fn should_preserve_both_turns_increments_when_dropped_in_reverse_order() {
+    // Reverse-order twin of
+    // `should_preserve_both_turns_increments_when_turns_overlap` (#2221):
+    // dropping turn B first exercises the same delta merge from the other
+    // side — `rate_limited`, the bucket BOTH turns incremented, must still
+    // accumulate 2 + 1 regardless of which drop runs the merge first.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let mut turn_a = PersistentRetryStateGuard::new(Some(handle.clone()));
+    let mut turn_b = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    turn_a.counters.rate_limited += 2;
+    turn_b.counters.rate_limited += 1;
+    turn_b.counters.network += 3;
+
+    drop(turn_b);
+    drop(turn_a);
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.counters.rate_limited, 3);
+    assert_eq!(shared.counters.network, 3);
+}
+
+#[test]
 fn should_write_back_exact_state_when_no_concurrent_writer() {
     // Single-agent regression: with no concurrent writer the drop must
     // reproduce today's byte-for-byte write-back, including the grace-call
