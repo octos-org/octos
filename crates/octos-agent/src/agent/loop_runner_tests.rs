@@ -6380,6 +6380,110 @@ async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
     );
 }
 
+/// #2197 mock: two identical unbounded `read_file` calls, then EndTurn.
+struct ReadsSameFileTwiceThenEnds {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for ReadsSameFileTwiceThenEnds {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call < 2 {
+            ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("call_read_{call}"),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({ "path": "many_tiny.txt" }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        } else {
+            ChatResponse {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+}
+
+/// #2197 end-to-end through the real loop: an unbounded read whose formatted
+/// output crosses the tool's internal output cut must not poison the
+/// file-state cache as a "complete" view. The unit tests prove the tool
+/// records the emitted range; this drives the real loop (registry builtins,
+/// real `FileStateCache`, the loop's head/tail backstop) and inspects what
+/// the model actually receives for the SECOND identical read — real content
+/// with the advising footer, never `[FILE_UNCHANGED] (full file cached)`.
+#[tokio::test]
+async fn repeated_read_of_a_cut_file_reaches_the_model_as_content_not_a_stub() {
+    let dir = tempfile::tempdir().unwrap();
+    // 32,000 raw bytes — under the #2131 unbounded-read refusal budget —
+    // whose formatted form (11 bytes/line) exceeds the unarmed cut budget.
+    std::fs::write(dir.path().join("many_tiny.txt"), "x\n".repeat(16_000)).unwrap();
+
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let provider: Arc<dyn LlmProvider> = Arc::new(ReadsSameFileTwiceThenEnds {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("read-cut-cache"), provider, tools, memory)
+        .with_file_state_cache(Arc::new(crate::file_state_cache::FileStateCache::new()));
+
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+
+    let tool_messages: Vec<&Message> = result
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .collect();
+    assert_eq!(
+        tool_messages.len(),
+        2,
+        "two read_file calls, two tool messages: {:?}",
+        result.messages.iter().map(|m| m.role).collect::<Vec<_>>()
+    );
+    let second = &tool_messages[1].content;
+    assert!(
+        !second.contains("[FILE_UNCHANGED]"),
+        "a truncated first view must never be served back as unchanged-complete: {second}"
+    );
+    assert!(
+        second.contains("Continue with offset:"),
+        "the honest answer is the advised first page again: {second}"
+    );
+    assert!(
+        !second.contains("bytes omitted"),
+        "the in-tool advising cut is sized under the loop cap, so the blind \
+         head/tail backstop must never middle-elide a read_file page: {second}"
+    );
+    assert_eq!(
+        tool_messages[0].content, *second,
+        "an uncacheable partial view is re-served byte-identically, not stubbed"
+    );
+}
+
 /// Every `<digits> bytes omitted` count in `content`, in order of appearance.
 fn omitted_byte_counts(content: &str) -> Vec<u64> {
     let mut counts = Vec::new();
