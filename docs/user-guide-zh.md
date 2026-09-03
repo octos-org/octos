@@ -55,7 +55,7 @@ octos serve（控制面板 + 仪表盘，约 140 个 REST 端点）
        │
        ├── LLM 提供商（15 家，AdaptiveRouter → ProviderChain → RetryProvider）
        ├── 工具注册表（约 50 个内置 + 插件 + 9 个用户级 app-skill）
-       │      LRU 延迟加载保留约 15 个活跃；spawn_only 自动转后台
+       │      每轮发送全部已启用工具；spawn_only 自动转后台
        ├── 沙箱（bwrap / sandbox-exec / Docker / Windows AppContainer）
        ├── Pipeline 引擎（DOT 图，逐节点模型，限流扇出）
        ├── Swarm 调度器（/api/swarm/dispatch — 扇出到 N 个子 Agent）

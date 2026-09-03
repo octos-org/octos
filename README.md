@@ -88,7 +88,7 @@ Most agentic systems are single-tenant chat assistants — one user, one model, 
 - **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime, with bounded concurrency for fleet stability.
 - **Multi-agent topologies**: sub-agents (in-process children you own), peer agents (sovereign sibling sessions via `peer_handoff`/`peer_gather`), and a **swarm dispatcher** (fan contracts to N workers — native or external `claude -p`/`codex exec` — validator-gated, cost rolled up, at `/api/swarm/dispatch`). See [Agent topologies](#agent-topologies-sub-agents-peers--swarm).
 - **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, lane scoring, circuit breakers.
-- **LRU tool deferral**: ~15 active tools for fast LLM reasoning, ~50 on demand. Idle tools auto-evict. `spawn_only` tools auto-redirect to background execution.
+- **Static, profile-scoped tool surface**: every enabled tool's full schema is sent to the LLM each turn (no dynamic eviction — the prompt prefix stays cache-stable). Runtime profiles such as `coding` narrow the enabled set; `coding-full` restores the broad surface. `spawn_only` tools auto-redirect to background execution.
 - **5 queue modes per session**: Followup, Collect, Steer, Interrupt, Speculative — users control agent concurrency via `/queue`.
 - **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, DingTalk, Matrix, Feishu.
 - **Sticky thread_id + committed_seq**: Every SSE event is bound to a thread; replay is deterministic by committed sequence number (M8.10).
@@ -644,7 +644,7 @@ Runtime view:
          ├── LLM Provider (Anthropic, OpenAI, Gemini, DeepSeek, Moonshot, …)
          │   └── AdaptiveRouter → ProviderChain → RetryProvider
          ├── Tool Registry (~50 built-in + plugins + 8 app-skills)
-         │   └── LRU Deferral (~15 active, activate on demand)
+         │   └── Full enabled set emitted per turn (profiles narrow it)
          ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
          ├── Swarm Dispatcher (fan-out → aggregate → validator gate → cost rollup)
          ├── Sandbox (bwrap / Landlock+seccomp / sandbox-exec / Docker / AppContainer)

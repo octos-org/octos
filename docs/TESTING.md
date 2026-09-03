@@ -83,7 +83,6 @@ cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
 cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
 cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
 cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
-cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
 # 3. Focused M9 Rust tests.
 cargo test -p octos-core ui_protocol -- --nocapture

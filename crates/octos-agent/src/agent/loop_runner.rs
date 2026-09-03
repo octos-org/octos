@@ -254,9 +254,10 @@ pub(crate) enum LoopErrorAction {
 }
 
 /// Review A F-015 RAII guard. Loads a `LoopRetryState` from an optional
-/// shared `Arc<Mutex<...>>` at construction and writes back on drop so
-/// bucket counters persist across `process_message` / `run_task` calls
-/// for sessions that attach a persistent retry-state handle.
+/// shared `Arc<Mutex<...>>` at construction and merges the turn's delta
+/// back on drop so bucket counters persist across `process_message` /
+/// `run_task` calls for sessions that attach a persistent retry-state
+/// handle.
 ///
 /// The loop body accesses the owned `state` field via `Deref`/`DerefMut`
 /// so existing code keeps its `&mut retry_state` call pattern.
@@ -266,16 +267,38 @@ pub(crate) enum LoopErrorAction {
 /// nowhere on drop.
 struct PersistentRetryStateGuard {
     state: super::loop_state::LoopRetryState,
+    /// Snapshot taken at construction. `Drop` merges only the delta the
+    /// loop applied on top of it, and skips the write entirely when the
+    /// loop left the state untouched, so a clean turn can never clobber a
+    /// concurrent turn's increments (#1655).
+    loaded: super::loop_state::LoopRetryState,
     handle: Option<Arc<std::sync::Mutex<super::loop_state::LoopRetryState>>>,
+}
+
+/// Lock the shared retry state. A panicked prior holder poisons the mutex;
+/// recover the inner state with a warning instead of silently swallowing
+/// the corruption signal (#1655).
+fn lock_persistent_retry_state(
+    handle: &Arc<std::sync::Mutex<super::loop_state::LoopRetryState>>,
+) -> std::sync::MutexGuard<'_, super::loop_state::LoopRetryState> {
+    handle.lock().unwrap_or_else(|poisoned| {
+        warn!("persistent retry state mutex poisoned; recovering inner state");
+        poisoned.into_inner()
+    })
 }
 
 impl PersistentRetryStateGuard {
     fn new(handle: Option<Arc<std::sync::Mutex<super::loop_state::LoopRetryState>>>) -> Self {
         let state = handle
             .as_ref()
-            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .map(|h| lock_persistent_retry_state(h).clone())
             .unwrap_or_default();
-        Self { state, handle }
+        let loaded = state.clone();
+        Self {
+            state,
+            loaded,
+            handle,
+        }
     }
 }
 
@@ -295,8 +318,9 @@ impl std::ops::DerefMut for PersistentRetryStateGuard {
 impl Drop for PersistentRetryStateGuard {
     fn drop(&mut self) {
         if let Some(handle) = &self.handle {
-            let mut locked = handle.lock().unwrap_or_else(|e| e.into_inner());
-            *locked = self.state.clone();
+            if self.state != self.loaded {
+                lock_persistent_retry_state(handle).merge_turn_delta(&self.loaded, &self.state);
+            }
         }
     }
 }
