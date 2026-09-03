@@ -74,6 +74,7 @@ mod gemini;
 mod groq;
 mod local;
 mod minimax;
+mod minimax_cn;
 mod moonshot;
 mod moonshot_coding;
 mod nvidia;
@@ -204,6 +205,9 @@ static ALL: &[ProviderEntry] = &[
     moonshot_coding::ENTRY,
     moonshot::ENTRY,
     dashscope::ENTRY,
+    // Region-variant families FIRST so an explicit `minimax-cn` resolves to
+    // the China endpoint before the base family's name/aliases.
+    minimax_cn::ENTRY,
     minimax::ENTRY,
     zai_coding::ENTRY,
     zhipu::ENTRY,
@@ -285,6 +289,7 @@ mod tests {
             ("gemini", "gemini-2.5-flash"),
             ("local", "local-default"),
             ("minimax", "MiniMax-M3"),
+            ("minimax-cn", "MiniMax-M3"),
             ("moonshot-coding", "k3"),
             ("openai", "gpt-4o"),
             ("openrouter", "anthropic/claude-sonnet-4-6"),
@@ -440,7 +445,7 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 19);
+        assert_eq!(all_entries().len(), 20);
     }
 
     /// Keyless = provider construction succeeds with no API key. The
@@ -478,6 +483,26 @@ mod tests {
         // The base families are unshadowed by the coding families.
         assert_eq!(lookup("kimi").map(|e| e.name), Some("moonshot"));
         assert_eq!(lookup("z.ai").map(|e| e.name), Some("zai"));
+    }
+
+    /// The China region family resolves to the api.minimaxi.com endpoint with
+    /// the Token-plan default model, its alias + key-env alias work, and it
+    /// neither shadows the international family nor steals its model
+    /// auto-detection (region selection is explicit, octos#2125).
+    #[test]
+    fn minimax_cn_resolves_to_the_china_endpoint() {
+        let cn = lookup("minimax-cn").expect("minimax-cn registered");
+        assert_eq!(cn.default_base_url, Some("https://api.minimaxi.com/v1"));
+        assert_eq!(cn.default_model(), Some("MiniMax-M3"));
+        assert_eq!(cn.api_key_env, Some("MINIMAX_CN_API_KEY"));
+        assert!(cn.is_known_key_env("MINIMAX_API_KEY"));
+        assert_eq!(lookup("minimaxi").map(|e| e.name), Some("minimax-cn"));
+
+        // The international family keeps its endpoint and its MiniMax-*
+        // model auto-detection — `minimax-cn` has no detect patterns.
+        let intl = lookup("minimax").expect("minimax registered");
+        assert_eq!(intl.default_base_url, Some("https://api.minimax.io/v1"));
+        assert_eq!(detect_provider("MiniMax-M3"), Some("minimax"));
     }
 
     #[test]
