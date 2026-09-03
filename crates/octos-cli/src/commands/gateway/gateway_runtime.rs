@@ -362,6 +362,15 @@ impl GatewayRuntime {
             config.hooks = resolved.config.hooks.clone();
             config.memory = resolved.config.memory.clone();
             config.approval_policy = resolved.config.approval_policy.clone();
+            // #2217: thread the inherited tool_policy too — the ConfigWatcher
+            // seed (below) is this flattened `config`, while `parse_first`
+            // re-layers defaults on every edit; a mismatch here would make a
+            // tool_policy-only defaults inheritance look like a policy edit
+            // and emit a spurious restart-required signal. ProfileRuntime
+            // already enforces the resolved policy, so this only aligns the
+            // seed with what runs. Pinned by
+            // config_watcher::tests::inherited_tool_policy_does_not_spuriously_restart_on_unrelated_edit.
+            config.tool_policy = resolved.config.tool_policy.clone();
             // OR-merge signing so neither the env-forced host policy (already
             // merged into `config.plugins` above) nor a defaults signing floor
             // is dropped.
