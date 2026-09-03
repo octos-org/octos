@@ -1552,7 +1552,7 @@ pub struct VoiceLeg {
 #[derive(Serialize)]
 pub struct VoiceAsrLeg {
     pub ready: bool,
-    /// Effective route: `"external"` (`ASR_API_URL`) or `"ominix"`.
+    /// Effective route: `"private"`, `"external"` (`ASR_API_URL`), or `"ominix"`.
     pub mode: String,
     pub detail: String,
 }
@@ -1622,10 +1622,11 @@ async fn external_asr_readiness(client: &reqwest::Client, base_url: &str) -> Voi
 }
 
 fn voice_readiness_needs_ominix(
+    private_asr_configured: bool,
     asr_route: &crate::skills_scope::AsrRoute,
     tts_route: crate::api::voice_turn::TtsRoute,
 ) -> bool {
-    matches!(asr_route, crate::skills_scope::AsrRoute::Ominix(_))
+    (!private_asr_configured && matches!(asr_route, crate::skills_scope::AsrRoute::Ominix(_)))
         || tts_route == crate::api::voice_turn::TtsRoute::Local
 }
 
@@ -1868,8 +1869,8 @@ pub(crate) async fn synthesize_speech(
 /// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
 ///
 /// Confirms the whole pipeline can run under THIS profile's current config:
-/// - **ASR**: `ASR_API_URL` health when explicitly configured; otherwise the
-///   OMiniX ASR model.
+/// - **ASR**: the private browser ASR service when configured; otherwise
+///   `ASR_API_URL` health when explicitly configured; otherwise OMiniX.
 /// - **LLM**: the profile's provider chain is constructed (running runtime with
 ///   a named provider).
 /// - **TTS**: the *chosen* route is actually usable — cloud credentials resolve
@@ -1920,35 +1921,45 @@ pub async fn voice_readiness(
         .unwrap_or_else(|| ("auto".to_string(), None));
     let cloud_configured = crate::api::voice_turn::cloud_tts_configured(cloud.as_ref());
     let tts_route = crate::api::voice_turn::classify_tts_route(&provider, cloud_configured);
+    let private_asr = super::private_asr::readiness(&state.http_client).await;
     let asr_route = crate::skills_scope::discover_asr_route();
-    let ominix_runtime = if voice_readiness_needs_ominix(&asr_route, tts_route) {
-        Some(crate::api::ominix_runtime::runtime_status(&state.http_client).await)
-    } else {
-        None
-    };
+    let ominix_runtime =
+        if voice_readiness_needs_ominix(private_asr.is_some(), &asr_route, tts_route) {
+            Some(crate::api::ominix_runtime::runtime_status(&state.http_client).await)
+        } else {
+            None
+        };
 
     // ── ASR leg (route-aware) ──
-    let asr = match &asr_route {
-        crate::skills_scope::AsrRoute::External(url) => {
-            external_asr_readiness(&state.http_client, url).await
+    let asr = if let Some(private) = private_asr {
+        VoiceAsrLeg {
+            ready: private.ready,
+            mode: "private".into(),
+            detail: private.detail,
         }
-        crate::skills_scope::AsrRoute::Ominix(_) => {
-            let runtime = ominix_runtime
-                .as_ref()
-                .expect("OMiniX ASR route requires an OMiniX runtime probe");
-            let health_healthy = runtime.health.healthy;
-            let ready =
-                crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
-            VoiceAsrLeg {
-                ready,
-                mode: "ominix".into(),
-                detail: if ready {
-                    "OMiniX ASR ready".into()
-                } else if !health_healthy {
-                    "OMiniX voice engine unavailable".into()
-                } else {
-                    "OMiniX ASR model not ready".into()
-                },
+    } else {
+        match &asr_route {
+            crate::skills_scope::AsrRoute::External(url) => {
+                external_asr_readiness(&state.http_client, url).await
+            }
+            crate::skills_scope::AsrRoute::Ominix(_) => {
+                let runtime = ominix_runtime
+                    .as_ref()
+                    .expect("OMiniX ASR route requires an OMiniX runtime probe");
+                let health_healthy = runtime.health.healthy;
+                let ready =
+                    crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
+                VoiceAsrLeg {
+                    ready,
+                    mode: "ominix".into(),
+                    detail: if ready {
+                        "OMiniX ASR ready".into()
+                    } else if !health_healthy {
+                        "OMiniX voice engine unavailable".into()
+                    } else {
+                        "OMiniX ASR model not ready".into()
+                    },
+                }
             }
         }
     };
@@ -4407,10 +4418,32 @@ mod tests {
         let external = AsrRoute::External("http://127.0.0.1:8093".to_string());
         let ominix = AsrRoute::Ominix(Some("http://127.0.0.1:8081".to_string()));
 
-        assert!(!voice_readiness_needs_ominix(&external, TtsRoute::Cloud));
-        assert!(voice_readiness_needs_ominix(&external, TtsRoute::Local));
-        assert!(voice_readiness_needs_ominix(&ominix, TtsRoute::Cloud));
-        assert!(voice_readiness_needs_ominix(&ominix, TtsRoute::Local));
+        assert!(!voice_readiness_needs_ominix(
+            false,
+            &external,
+            TtsRoute::Cloud
+        ));
+        assert!(voice_readiness_needs_ominix(
+            false,
+            &external,
+            TtsRoute::Local
+        ));
+        assert!(voice_readiness_needs_ominix(
+            false,
+            &ominix,
+            TtsRoute::Cloud
+        ));
+        assert!(voice_readiness_needs_ominix(
+            false,
+            &ominix,
+            TtsRoute::Local
+        ));
+        assert!(!voice_readiness_needs_ominix(
+            true,
+            &ominix,
+            TtsRoute::Cloud
+        ));
+        assert!(voice_readiness_needs_ominix(true, &ominix, TtsRoute::Local));
     }
 
     async fn external_asr_health_server(status: &str) -> String {
