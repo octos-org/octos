@@ -178,7 +178,7 @@ export SMTP_PASSWORD="your-app-password"
 
 ## 3. 配置 LLM 提供商
 
-Octos 开箱即用支持 16 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
+Octos 开箱即用支持 17 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
 
 ### 3.1 支持的提供商
 

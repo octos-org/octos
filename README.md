@@ -65,7 +65,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.s
 
 A Rust-native, API-first Agentic OS.
 
-31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 16 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
+31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 17 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
 
 ## What is Octos?
 

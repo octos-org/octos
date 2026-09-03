@@ -193,6 +193,14 @@
       { "id": "MiniMax-M2", "input": 0.2, "output": 1.1, "max_output": 16384 }
     ]
   },
+  "minimax-cn": {
+    "env": "MINIMAX_CN_API_KEY",
+    "models": [
+      { "id": "MiniMax-M3", "input": 0.15, "output": 1.5, "max_output": 131072, "endpoints": [
+        { "id": "minimax-cn", "label": "MiniMax China (Token Plan)", "base_url": "https://api.minimaxi.com/v1", "api_key_env": "MINIMAX_CN_API_KEY" }
+      ] }
+    ]
+  },
   "zai-coding": {
     "env": "ZAI_CODING_API_KEY",
     "models": [
