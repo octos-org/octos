@@ -16,7 +16,7 @@ A published observation: the same model at the same reasoning effort, run on Cla
 | Per-turn injected extras | none | episodic recall ≤6 episodes (embedder-gated) |
 | **Fixed total** | **≈1.3 K tok** | **≈10.4–13.5 K tok** |
 
-The dominant octos cost is tool-schema emission. **RFC-0 (#1578) removed LRU tool deferral**, so `specs()` (`tools/registry.rs:661-665`) emits every enabled schema every round; the old 15-active/34-deferred behavior described in CLAUDE.md no longer exists. A `tools>25` warning exists but only logs (`loop_runner.rs:1022`).
+The dominant octos cost is tool-schema emission. **RFC-0 (#1289) removed LRU tool deferral**, so `specs()` (`tools/registry.rs`) emits every enabled schema every round; the old 15-active/34-deferred behavior no longer exists. A `tools>25` warning exists but only logs (`agent/loop_runner.rs`).
 
 For scale: `octos gateway` swaps in an 18 KB system prompt (≈4.5 K tok) on top of the same tool wall.
 

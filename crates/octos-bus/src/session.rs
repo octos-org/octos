@@ -3306,7 +3306,28 @@ impl ActiveSessionStore {
         let path = data_dir.join("active_sessions.json");
         let (active, previous) = if path.exists() {
             let data = std::fs::read_to_string(&path)?;
-            let stored: StoredActiveSessions = serde_json::from_str(&data).unwrap_or_default();
+            // #2013: a corrupt store must never silently become an empty one
+            // — the store is not read-only, so the next `save` would persist
+            // the empty-plus-one store OVER the file and destroy every chat's
+            // active topic and `/back` target permanently. Quarantine the
+            // bytes aside (loudly) and start empty instead; the operator can
+            // recover the mappings from the preserved file. Twin of #2005
+            // (cron store).
+            let stored: StoredActiveSessions = match serde_json::from_str(&data) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        %error,
+                        bytes = data.len(),
+                        "active session store is corrupt; quarantining it and starting \
+                         with no active topics. Existing topic mappings will not apply \
+                         until this is resolved.",
+                    );
+                    quarantine_active_session_store(&path);
+                    StoredActiveSessions::default()
+                }
+            };
             (stored.active, stored.previous)
         } else {
             (Default::default(), Default::default())
@@ -3372,10 +3393,32 @@ impl ActiveSessionStore {
         };
         let json = serde_json::to_string_pretty(&stored)?;
 
-        // Atomic write-then-rename
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &self.path)?;
+        // Atomic write-then-rename. #2013: the temp name must be UNIQUE —
+        // two processes sharing a data dir racing one fixed `.tmp` path would
+        // both write it and race the rename, one clobbering the other's
+        // store (the same hazard `rewrite_tmp_path` documents for session
+        // JSONL). fsync the temp file BEFORE the rename and the directory
+        // AFTER: the rename was already atomic, but not DURABLE — a hard
+        // power loss could leave a zero-length/truncated
+        // `active_sessions.json`, exactly the input the corrupt-store branch
+        // in `open` then has to quarantine. Mirrors `write_cron_json_atomic`
+        // (#2005).
+        let tmp = self.path.with_extension(format!(
+            "json.{}-{}.tmp",
+            std::process::id(),
+            ACTIVE_SESSIONS_TMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        if let Err(error) = write_and_sync(&tmp, &json) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.wrap_err("failed to write active session store temp"));
+        }
+        if let Err(error) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(eyre::Report::new(error).wrap_err("failed to rename active session store"));
+        }
+        if let Some(dir) = self.path.parent() {
+            fsync_dir(dir);
+        }
         Ok(())
     }
 }
@@ -3386,6 +3429,61 @@ struct StoredActiveSessions {
     active: std::collections::HashMap<String, String>,
     #[serde(default)]
     previous: std::collections::HashMap<String, String>,
+}
+
+/// Per-process counter for unique active-session-store temp-file names
+/// (same collision argument as `REWRITE_TMP_COUNTER` above, for the
+/// `active_sessions.json` rewrite in `ActiveSessionStore::save`).
+static ACTIVE_SESSIONS_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Move a corrupt active-session store aside so the next save cannot
+/// overwrite it. Best-effort: if the rename fails we have still logged the
+/// corruption, and leaving the file in place is no worse than the pre-#2013
+/// behaviour.
+fn quarantine_active_session_store(path: &Path) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let quarantined = path.with_extension(format!("corrupt-{stamp}"));
+    match std::fs::rename(path, &quarantined) {
+        Ok(()) => tracing::error!(
+            quarantined = %quarantined.display(),
+            "corrupt active session store preserved here — recover topic mappings from it",
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            %error,
+            "could not quarantine the corrupt active session store",
+        ),
+    }
+}
+
+/// Write `json` to `path` and fsync the FILE before it is renamed into place.
+fn write_and_sync(path: &Path, json: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(json.as_bytes())?;
+    // `flush()` on a std File is a no-op (no userspace buffer) — `sync_all` is
+    // what actually gets the bytes to stable storage.
+    file.sync_all()?;
+    Ok(())
+}
+
+/// fsync a directory so a rename into it is durable. Best-effort: on non-Unix
+/// std cannot open a directory for syncing, so the rename there is only as
+/// durable as the filesystem makes it (it stays atomic either way).
+fn fsync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
 }
 
 /// Validate a topic name. Returns Err with a message if invalid.

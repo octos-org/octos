@@ -180,10 +180,97 @@ async fn should_reset_to_default_when_no_handle_attached() {
     );
 }
 
-// Silence "unused" warning for the LlmError import without suppressing
-// the unused_imports lint for the whole file — we need the type in scope
-// for the session-summary fixtures if they get added here later.
-#[allow(dead_code)]
-fn _force_llm_error_import() -> LlmError {
-    LlmError::new(LlmErrorKind::Authentication, "x")
+/// Provider whose first two `chat` calls rendezvous at a barrier and then
+/// fail with a timeout error, so two concurrent turns are guaranteed to be
+/// mid-flight (guards constructed, nothing written back yet) before either
+/// turn's first error is observed. The error is deliberately a Timeout with
+/// a message that matches none of the stream layer's retryable substrings,
+/// so it bubbles to the agent loop's retry-bucket machine on the FIRST
+/// failure instead of being retried transparently inside `call_llm`.
+struct BarrierTimeoutProvider {
+    barrier: Arc<tokio::sync::Barrier>,
+    chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmProvider for BarrierTimeoutProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        _config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        let call = self
+            .chat_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < 2 {
+            self.barrier.wait().await;
+            return Err(LlmError::new(LlmErrorKind::Timeout, "provider deadline hit").into());
+        }
+        Ok(ChatResponse {
+            content: Some("ok".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn context_window(&self) -> u32 {
+        128_000
+    }
+
+    fn model_id(&self) -> &str {
+        "barrier-timeout"
+    }
+
+    fn provider_name(&self) -> &str {
+        "barrier-timeout"
+    }
+}
+
+#[tokio::test]
+async fn should_merge_concurrent_agents_increments_through_real_turns() {
+    // #1655 end-to-end: two agents wired to the SAME persistent handle run
+    // real `process_message` turns concurrently; each turn observes exactly
+    // one timeout error. Pre-fix, the later guard drop overwrote the shared
+    // state with its own snapshot and one increment was lost (final counter
+    // 1); post-fix both deltas merge (final counter 2).
+    let state = Arc::new(Mutex::new(LoopRetryState::new()));
+    let provider: Arc<dyn LlmProvider> = Arc::new(BarrierTimeoutProvider {
+        barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+
+    let build = || async {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let memory = Arc::new(
+            EpisodeStore::open(tmp.path())
+                .await
+                .expect("open episode store"),
+        );
+        let tools = octos_agent::ToolRegistry::new();
+        Agent::new(
+            AgentId::new("test-retry-concurrent"),
+            provider.clone(),
+            tools,
+            memory,
+        )
+        .with_persistent_retry_state(state.clone())
+    };
+    let agent_a = build().await;
+    let agent_b = build().await;
+
+    let (result_a, result_b) = tokio::join!(
+        agent_a.process_message("a", &[], vec![]),
+        agent_b.process_message("b", &[], vec![]),
+    );
+    assert_eq!(result_a.expect("turn a").content, "ok");
+    assert_eq!(result_b.expect("turn b").content, "ok");
+    assert_eq!(
+        state.lock().unwrap().counters().timeout,
+        2,
+        "both concurrent turns' timeout increments must survive"
+    );
 }

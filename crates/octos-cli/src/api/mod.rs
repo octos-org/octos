@@ -23,6 +23,7 @@ pub mod metrics;
 pub(crate) mod ominix_runtime;
 pub mod preview;
 pub mod preview_tokens;
+mod private_asr;
 pub mod purge;
 mod router;
 pub(crate) mod session_ingress;

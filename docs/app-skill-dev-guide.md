@@ -1024,7 +1024,7 @@ The host resolves these keys from the active profile's auth store and passes the
 3. The skill binary runs to completion in the background, emitting protocol v2 events.
 4. On completion (or failure), the supervisor commits a `session_result` event with `committed_seq` and re-engages the LLM if needed (M8.9 runtime failure recovery).
 
-`spawn_only` tools cannot be evicted from the LRU tool registry, and their `SKILL.md` is auto-injected into the system prompt so the LLM knows how to use them.
+`spawn_only` tools stay visible in the tool specs for the life of the session, and their `SKILL.md` is auto-injected into the system prompt so the LLM knows how to use them.
 
 ### Multiple Tools in One Skill
 

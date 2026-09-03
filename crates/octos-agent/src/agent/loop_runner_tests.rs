@@ -6758,3 +6758,118 @@ async fn non_empty_max_tokens_returns_content_unchanged() {
     .await;
     assert_eq!(content, "partial but real");
 }
+
+// --- PersistentRetryStateGuard shared-handle write-back (#1655) ---
+
+#[test]
+fn should_not_write_back_when_turn_left_retry_state_unmodified() {
+    // A turn that observed no errors must not touch the shared handle at
+    // all: a concurrent turn's increments landed after this guard loaded,
+    // and an unconditional write-back would silently discard them.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    // Concurrent turn observes two rate-limits while `guard` is alive.
+    {
+        let mut shared = handle.lock().unwrap();
+        shared.counters.rate_limited = 2;
+    }
+
+    drop(guard);
+    assert_eq!(
+        handle.lock().unwrap().counters.rate_limited,
+        2,
+        "clean turn must not clobber concurrent increments"
+    );
+}
+
+#[test]
+fn should_preserve_both_turns_increments_when_turns_overlap() {
+    // Two turns sharing one handle, each observing different errors from
+    // the same base: the merged state must reflect BOTH turns' increments,
+    // so a bucket that crossed its limit cannot be rolled back to a
+    // pre-exhaustion count by the later drop.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let mut turn_a = PersistentRetryStateGuard::new(Some(handle.clone()));
+    let mut turn_b = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    turn_a.counters.rate_limited += 2;
+    turn_b.counters.rate_limited += 1;
+    turn_b.counters.network += 3;
+
+    drop(turn_a);
+    drop(turn_b);
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.counters.rate_limited, 3);
+    assert_eq!(shared.counters.network, 3);
+}
+
+#[test]
+fn should_write_back_exact_state_when_no_concurrent_writer() {
+    // Single-agent regression: with no concurrent writer the drop must
+    // reproduce today's byte-for-byte write-back, including the grace-call
+    // reset of `productive_tool_calls_since_last_grace` (a non-monotonic
+    // field, so a naive max-merge would corrupt it).
+    let handle = Arc::new(StdMutex::new(LoopRetryState {
+        productive_tool_calls_since_last_grace: 3,
+        ..Default::default()
+    }));
+    {
+        let mut guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+        guard.observe_budget_exhaustion(); // fires the grace call, resets the counter
+        guard.counters.timeout += 1;
+    }
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.productive_tool_calls_since_last_grace, 0);
+    assert_eq!(shared.grace_calls_fired, 1);
+    assert_eq!(shared.counters.timeout, 1);
+}
+
+#[test]
+fn should_recover_state_from_poisoned_retry_state_mutex() {
+    // A panic while holding the lock poisons the mutex; the guard must
+    // still recover the inner state (with a warning) rather than panic or
+    // discard it.
+    let handle = Arc::new(StdMutex::new(LoopRetryState {
+        grace_calls_fired: 7,
+        ..Default::default()
+    }));
+    let poisoned = handle.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = poisoned.lock().unwrap();
+        panic!("simulated panic while holding the retry-state lock");
+    }));
+    assert!(handle.is_poisoned());
+
+    let guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+    assert_eq!(guard.grace_calls_fired, 7);
+    drop(guard);
+    assert_eq!(
+        handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .grace_calls_fired,
+        7
+    );
+
+    // A DIRTY guard must also recover on drop: the write-back path takes
+    // the same poisoned lock and must merge, not panic.
+    {
+        let mut dirty = PersistentRetryStateGuard::new(Some(handle.clone()));
+        dirty.counters.timeout += 1;
+    }
+    let shared = handle.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(shared.grace_calls_fired, 7);
+    assert_eq!(shared.counters.timeout, 1);
+}
+
+#[test]
+fn should_write_nowhere_when_no_handle_attached() {
+    // Legacy reset-per-turn behaviour: without a handle the guard owns a
+    // fresh state and its drop touches nothing.
+    let mut guard = PersistentRetryStateGuard::new(None);
+    guard.counters.internal += 1;
+    drop(guard); // must not panic
+}

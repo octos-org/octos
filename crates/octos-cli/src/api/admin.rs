@@ -88,8 +88,13 @@ pub struct UpdateProfileRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub data_dir: Option<Option<String>>,
+    /// Parsed as opaque JSON on purpose: the typed round-trip happens in
+    /// `merge_profile_config_from_body` *after* the raw patch is merged over
+    /// the stored config (an invalid merged result is a 400), so a partial
+    /// nested-section patch (e.g. `{"email":{"smtp_host":…}}` without the
+    /// required `provider`) must still parse here (#1470).
     #[serde(default)]
-    pub config: Option<ProfileConfig>,
+    pub config: Option<serde_json::Value>,
     /// Set or update the email address for OTP login.
     #[serde(default)]
     pub email: Option<String>,
@@ -420,7 +425,8 @@ pub async fn update_profile(
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
     }
-    merge_profile_config_from_body(&mut profile.config, &body, false);
+    merge_profile_config_from_body(&mut profile.config, &body, false)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA
     // JSON) into the OS keychain before persisting, so an admin edit can't
     // write a private key into plaintext profile config.
@@ -1286,23 +1292,35 @@ pub(crate) fn merge_profile_config_from_body(
     config: &mut ProfileConfig,
     body: &str,
     env_vars_authoritative: bool,
-) {
+) -> Result<(), String> {
     let raw: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
-    if let Some(config_patch) = raw.get("config") {
-        if config_patch.is_object() {
-            let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
-            json_merge(&mut existing, config_patch);
-            if env_vars_authoritative {
-                if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
-                    if let Some(existing_obj) = existing.as_object_mut() {
-                        existing_obj.insert("env_vars".to_string(), env_vars.clone());
-                    }
-                }
-            }
-            if let Ok(merged) = serde_json::from_value(existing) {
-                *config = merged;
+    let Some(config_patch) = raw.get("config") else {
+        return Ok(());
+    };
+    if config_patch.is_null() {
+        return Ok(());
+    }
+    if !config_patch.is_object() {
+        return Err("config must be an object".into());
+    }
+    let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
+    json_merge(&mut existing, config_patch);
+    if env_vars_authoritative {
+        if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
+            if let Some(existing_obj) = existing.as_object_mut() {
+                existing_obj.insert("env_vars".to_string(), env_vars.clone());
             }
         }
+    }
+    // The request body parses `config` as opaque JSON (see UpdateProfileRequest),
+    // so this typed round-trip is the only validation gate: an invalid merged
+    // result must surface as an error instead of silently dropping the patch.
+    match serde_json::from_value(existing) {
+        Ok(merged) => {
+            *config = merged;
+            Ok(())
+        }
+        Err(e) => Err(format!("invalid config: {e}")),
     }
 }
 
@@ -5580,7 +5598,8 @@ mod tests {
             &mut config,
             r#"{"config":{"env_vars":{"SMTP_PASSWORD":"new"}}}"#,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             config.env_vars.get("SMTP_PASSWORD").map(String::as_str),
@@ -5601,17 +5620,47 @@ mod tests {
         config.env_vars.insert("A".into(), "a".into());
         config.env_vars.insert("B".into(), "b".into());
 
-        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true);
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true)
+            .unwrap();
         assert_eq!(config.env_vars.get("A").map(String::as_str), Some("a2"));
         assert!(
             !config.env_vars.contains_key("B"),
             "authoritative replace drops omitted keys"
         );
 
-        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true);
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true).unwrap();
         assert!(
             config.env_vars.is_empty(),
             "an explicit empty map clears all entries"
+        );
+    }
+
+    // The request struct parses `config` as opaque JSON, so the merged
+    // typed round-trip is the only validation gate: patches that produce an
+    // invalid config must error (the handlers map this to 400) instead of
+    // silently dropping the patch. A literal `null` config stays a no-op.
+    #[test]
+    fn merge_config_rejects_invalid_patches() {
+        let mut config = ProfileConfig::default();
+        assert!(merge_profile_config_from_body(&mut config, r#"{"config":null}"#, false).is_ok());
+
+        let err =
+            merge_profile_config_from_body(&mut config, r#"{"config":42}"#, false).unwrap_err();
+        assert_eq!(err, "config must be an object");
+
+        // Merges fine as JSON but the result fails ProfileConfig's typed
+        // deserialization (`smtp_port` must be a number).
+        let err = merge_profile_config_from_body(
+            &mut config,
+            r#"{"config":{"email":{"provider":"smtp","smtp_port":"abc"}}}"#,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("invalid config:"), "got: {err}");
+        assert_eq!(
+            config,
+            ProfileConfig::default(),
+            "failed merge must not mutate"
         );
     }
 
