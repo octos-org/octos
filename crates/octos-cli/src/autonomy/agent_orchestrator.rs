@@ -11675,6 +11675,14 @@ impl InProcessAgentOrchestrator {
         self.state().force_wake_persist_failure = value;
     }
 
+    /// Test hook (#1707 round 2, codex Blocker 1 fix 3): the next coalesced-
+    /// carrier persist is treated as FAILED, so the fold must abort (extras
+    /// requeued, batch delivered in original shape, nothing tombstoned).
+    #[cfg(test)]
+    pub(crate) fn set_force_coalesce_persist_failure_for_test(&self, value: bool) {
+        self.state().force_coalesce_persist_failure = value;
+    }
+
     /// Test hook (codex round 3 lost-update-race test): reset the firing
     /// monitor's rate window in the phase-1→phase-2 gap, as a concurrent
     /// `monitor/resume` would, so the test can assert the deferred accounting
@@ -11910,6 +11918,12 @@ struct AutonomyRuntimeState {
     /// per test), so it never leaks across parallel tests.
     #[cfg(test)]
     force_wake_persist_failure: bool,
+    /// #1707 round 2 (codex Blocker 1, fix 3) — test-only switch that makes
+    /// `persist_continuation_coalesced_checked` fail BEFORE touching the store,
+    /// exercising the fold-ABORT path (no tombstones, extras requeued, batch
+    /// delivered as-is). Per-instance, like `force_wake_persist_failure`.
+    #[cfg(test)]
+    force_coalesce_persist_failure: bool,
     /// #1977 codex round 3 — test-only switch that resets the firing monitor's
     /// rate window right before phase-2 accounting, simulating a concurrent
     /// `monitor/resume` landing in the unlocked gap (defect 2). Per-instance.
@@ -13442,6 +13456,15 @@ fn coalesce_terminal_continuations(
         carrier_group.as_str(),
         carrier_workspace.as_deref(),
     );
+    // Restore path for the fold-ABORT below: `extras` were REMOVED from the
+    // scheduler by the take, so an abort must requeue them (crash-safe
+    // restore — no redelivery-attempt increment) or their notifications would
+    // vanish for the rest of this process.
+    let requeue_taken = |state: &mut AutonomyRuntimeState, items: Vec<QueuedMasterContinuation>| {
+        for item in items {
+            state.continuations.requeue_taken(item);
+        }
+    };
     let mut batch: Vec<QueuedMasterContinuation> = Vec::new();
     let mut others: Vec<QueuedMasterContinuation> = Vec::new();
     let mut primary_slot: Option<usize> = None;
@@ -13458,9 +13481,13 @@ fn coalesce_terminal_continuations(
     batch.extend(extras);
     let slot = primary_slot.unwrap_or(0);
     if batch.len() < 2 {
-        if let Some(only) = batch.pop() {
+        // Nothing to fold after all (the kept side held the whole scope): put
+        // the taken extras back and deliver everything as-is.
+        let mut rest = batch;
+        if let Some(only) = rest.pop() {
             others.insert(slot, only);
         }
+        requeue_taken(state, rest);
         *kept = others;
         return;
     }
@@ -13470,10 +13497,54 @@ fn coalesce_terminal_continuations(
         .unwrap_or(0);
     let mut primary = batch.remove(primary_idx);
     let now = now_ms_u64();
-    let mut lines: Vec<String> = Vec::new();
-    let mut rendered = 0usize;
-    let mut folded = 0usize;
-    for item in batch {
+    // #1707 round 2 (codex Blocker 1 fix 1) — per-carrier coalesce GENERATION.
+    // The durable carrier persist embeds `attempt` in the event id
+    // (`continuation_queued:{group}:{id}:{attempt}`) and replay DEDUPS by that
+    // id, so a SECOND fold of the same carrier at a fixed attempt would emit
+    // the same event id and be silently dropped on replay — the restored
+    // carrier would keep stale metadata while the second fold's extras are
+    // tombstoned (notification loss). Bump `coalesce_generation` on every fold
+    // and derive `attempt = 1 + generation` below, making each fold's event id
+    // distinct; replay applies them in ledger order and the rank-equal upsert
+    // keeps the LAST one. The key lives in `metadata` so the restore path
+    // (`payload:*` round-trip in `master_continuation_request_from_persisted`)
+    // carries it across restarts.
+    let generation: u64 = primary
+        .metadata
+        .get("coalesce_generation")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    // #1707 round 2 (codex Blocker 1 fix 2) — RE-FOLD must APPEND, not
+    // overwrite: a previously folded carrier (already carrying
+    // `coalesced_children`) that re-enters a batch would otherwise have its
+    // prompt rebuilt from the CURRENT batch only, silently dropping the
+    // earlier (already tombstoned) children. Start from the existing folded
+    // text and fold-count, and count the existing text toward the char budget
+    // (new lines past the budget drop, same as before).
+    let existing_children = primary.metadata.get("coalesced_children").cloned();
+    let existing_lines: Vec<String> = existing_children
+        .as_deref()
+        .map(|text| {
+            text.split(" | ")
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let existing_count: usize = primary
+        .metadata
+        .get("coalesced_count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut rendered = existing_children
+        .as_deref()
+        .map(str::len)
+        .unwrap_or_default();
+    let mut lines: Vec<String> = existing_lines;
+    let mut folded = existing_count;
+    let mut folded_keys: Vec<String> = Vec::new();
+    for item in &batch {
         folded += 1;
         let child = item
             .child_agent_id
@@ -13499,20 +13570,15 @@ fn coalesce_terminal_continuations(
             "{child} [{reason} {status}] {summary} [group {group}] [workspace {workspace}]",
             reason = master_continuation_reason_wire_name(&item.reason),
             group = item.group_id.as_str(),
-            workspace = item_workspace(&item).unwrap_or("none"),
+            workspace = item_workspace(item).unwrap_or("none"),
         );
         if rendered + line.len() <= COALESCED_CHILDREN_MAX_CHARS {
             rendered += line.len();
-            lines.push(line);
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
         }
-        if let Some(store) = state.supervisor_store.as_ref() {
-            let _ = store.record_continuation_completed(
-                item.group_id.as_str(),
-                item.dedupe_key.as_str(),
-                now,
-                Some(format!("coalesced into {}", primary.dedupe_key.as_str())),
-            );
-        }
+        folded_keys.push(item.dedupe_key.as_str().to_owned());
     }
     primary
         .metadata
@@ -13520,6 +13586,90 @@ fn coalesce_terminal_continuations(
     primary
         .metadata
         .insert("coalesced_children".to_owned(), lines.join(" | "));
+    primary
+        .metadata
+        .insert("coalesce_generation".to_owned(), generation.to_string());
+    // #1707 (codex Blocker 1) — DURABILITY FIRST. The extras' Completed
+    // tombstones below are the point of no return: once written, a restart
+    // re-enqueues ONLY records still `Queued`. Persist the carrier's UPDATED
+    // record (with `coalesced_count` / `coalesced_children` in its metadata)
+    // BEFORE any tombstone, via a distinct `ContinuationQueued` event at
+    // `attempt = 1 + coalesce_generation` (the event id embeds the attempt, so
+    // each fold of the same carrier is a DISTINCT replay event, and the
+    // Queued==Queued rank-equal upsert keeps the LAST one — ledger order —
+    // wholesale, metadata included) (`persist_continuation_coalesced_checked`).
+    // On failure, ABORT the fold: nothing was tombstoned yet, so requeue the
+    // taken extras and deliver the whole batch in its original per-item shape
+    // (a warn + N turns, never a lost notification).
+    if state.supervisor_store.is_some()
+        && let Err(err) = persist_continuation_coalesced_checked(state, &primary)
+    {
+        tracing::warn!(
+            ?err,
+            session_key = %session_id.0,
+            profile_id = %profile_id,
+            carrier = %primary.dedupe_key.as_str(),
+            folded,
+            "coalesced-carrier persist failed; aborting the fold and delivering \
+             the batch as-is (no extras were tombstoned)"
+        );
+        // Roll back ONLY this fold's mutations: a RE-folded carrier already
+        // carried prior generations' `coalesced_*` metadata (whose extras were
+        // tombstoned durably), which must survive this abort intact.
+        match existing_children {
+            Some(text) => {
+                primary
+                    .metadata
+                    .insert("coalesced_children".to_owned(), text);
+            }
+            None => {
+                primary.metadata.remove("coalesced_children");
+            }
+        }
+        if existing_count > 0 {
+            primary
+                .metadata
+                .insert("coalesced_count".to_owned(), existing_count.to_string());
+        } else {
+            primary.metadata.remove("coalesced_count");
+        }
+        if generation > 1 {
+            primary.metadata.insert(
+                "coalesce_generation".to_owned(),
+                (generation - 1).to_string(),
+            );
+        } else {
+            primary.metadata.remove("coalesce_generation");
+        }
+        others.insert(slot, primary);
+        requeue_taken(state, batch);
+        *kept = others;
+        return;
+    }
+    // Carrier is durable — NOW tombstone each folded extra. A tombstone-write
+    // failure is NOT undone: the extra stays `Queued` and is re-enqueued on
+    // restart, which is the safe direction (a duplicate notification, never a
+    // lost one).
+    if let Some(store) = state.supervisor_store.as_ref() {
+        for key in &folded_keys {
+            if let Err(err) = store.record_continuation_completed(
+                carrier_group.as_str(),
+                key,
+                now,
+                Some(format!("coalesced into {}", primary.dedupe_key.as_str())),
+            ) {
+                tracing::warn!(
+                    ?err,
+                    session_key = %session_id.0,
+                    profile_id = %profile_id,
+                    folded_key = %key,
+                    carrier = %primary.dedupe_key.as_str(),
+                    "folded-extra tombstone write failed; the extra may re-appear \
+                     after a restart (safe direction — duplicate, not loss)"
+                );
+            }
+        }
+    }
     tracing::info!(
         session_key = %session_id.0,
         profile_id = %profile_id,
@@ -13937,6 +14087,55 @@ fn persist_continuation_queued_checked(
     state: &AutonomyRuntimeState,
     continuation: &QueuedMasterContinuation,
 ) -> std::io::Result<()> {
+    persist_continuation_queued_with_attempt(state, continuation, 1)
+}
+
+/// #1707 (codex Blocker 1) — durably persist the CARRIER of a terminal fold
+/// with its `coalesced_count` / `coalesced_children` metadata attached, BEFORE
+/// the folded extras are tombstoned. The extras' tombstones are the point of
+/// no return: if the process exits after them but before the carrier's turn
+/// completes, a restart re-enqueues ONLY records still `Queued`. Persisting
+/// the updated carrier record FIRST (a distinct `ContinuationQueued` event)
+/// closes that window: the restored carrier carries `payload:coalesced_*` and
+/// the folded notifications survive the restart.
+///
+/// #1707 round 2 — the event id embeds `attempt`
+/// (`continuation_queued:{group}:{id}:{attempt}`) and replay dedups by that
+/// id, so the attempt must DIFFER per fold of the same carrier or a second
+/// fold's persist is silently dropped on replay. The carrier's
+/// `coalesce_generation` metadata (bumped by `coalesce_terminal_continuations`
+/// on every fold, durable via the `payload:*` restore round-trip) drives it:
+/// `attempt = 1 + generation` = 2 for the first fold, 3 for a re-fold, ... —
+/// replay applies each fold's record in ledger order and the rank-equal
+/// upsert keeps the last one.
+fn persist_continuation_coalesced_checked(
+    state: &AutonomyRuntimeState,
+    carrier: &QueuedMasterContinuation,
+) -> std::io::Result<()> {
+    // #1707 round 2 (codex Blocker 1 fix 3) — test hook: fail BEFORE touching
+    // the store so the fold-abort path is exercised end-to-end (no tombstones
+    // written, extras requeued). Analogous to `force_wake_persist_failure`.
+    #[cfg(test)]
+    if state.force_coalesce_persist_failure {
+        return Err(std::io::Error::other(
+            "forced coalesced-carrier persist failure (test hook)",
+        ));
+    }
+    let attempt: u32 = carrier
+        .metadata
+        .get("coalesce_generation")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(u64::from(u32::MAX)) as u32;
+    persist_continuation_queued_with_attempt(state, carrier, attempt)
+}
+
+fn persist_continuation_queued_with_attempt(
+    state: &AutonomyRuntimeState,
+    continuation: &QueuedMasterContinuation,
+    attempt: u32,
+) -> std::io::Result<()> {
     // codex round 3 — the monitor crash-window test drives THIS real error
     // path (not a parallel forced branch): when the hook is armed, the durable
     // persist itself returns an error, so `handle_monitor_batch` exercises its
@@ -13985,7 +14184,7 @@ fn persist_continuation_queued_checked(
         started_at_ms: None,
         completed_at_ms: None,
         result: None,
-        attempt: 1,
+        attempt,
         metadata,
     };
     store.record_continuation_queued(record).map(|_| ())
@@ -20178,6 +20377,211 @@ mod tests {
         let prompt = master_continuation_prompt(carrier);
         assert!(prompt.contains("coalesced_children"), "{prompt}");
         assert!(prompt.contains("ONE update"), "{prompt}");
+    }
+
+    /// #1707 (codex Blocker 1) — the carrier's `coalesced_count` /
+    /// `coalesced_children` metadata must be DURABLE, not in-memory-only.
+    /// Drain the fold out of a store-backed orchestrator but do NOT dispatch
+    /// the carrier's turn (no `record_continuation_completed` for it), then
+    /// start a fresh orchestrator over the same store: the restored carrier
+    /// must still carry the folded-children metadata (durable-first persist),
+    /// and the folded extras must NOT re-appear (they were tombstoned only
+    /// after the carrier persisted).
+    #[test]
+    fn coalesced_carrier_metadata_survives_restart_before_dispatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-rs", "api", "coalesce-restart");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        for idx in 0..3 {
+            let agent_id = format!("task-restart-{idx}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: format!("rs-{idx}"),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(format!("done {idx}")),
+                cwd: None,
+                profile_id: "tenant-rs".to_owned(),
+            });
+        }
+        let pending_before =
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-rs");
+        assert!(
+            pending_before >= 4,
+            "expected a burst of child + scatter items, got {pending_before}"
+        );
+
+        // Drain the carrier (the fold happens here, durably) but do NOT
+        // dispatch its turn — the process "exits" right after the drain.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rs",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "exactly one carrier");
+        assert_eq!(
+            drained[0]
+                .metadata
+                .get("coalesced_count")
+                .map(String::as_str),
+            Some((pending_before - 1).to_string().as_str()),
+            "the live carrier carries the folded count"
+        );
+        drop(drained);
+        drop(orchestrator);
+
+        // Fresh process over the SAME store: restore re-enqueues every
+        // non-Completed record — the (undispatched, attempt-2-persisted)
+        // carrier with its coalesced metadata, and NOT the tombstoned extras.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let restored = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rs",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(restored.len(), 1, "the carrier restores as one item");
+        let carrier = &restored[0];
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some((pending_before - 1).to_string().as_str()),
+            "the RESTORED carrier must carry the durable folded count"
+        );
+        let children = carrier
+            .metadata
+            .get("coalesced_children")
+            .expect("the restored carrier must carry the folded children");
+        for idx in 0..3 {
+            assert!(
+                children.contains(&format!("task-restart-{idx}")),
+                "folded child task-restart-{idx} missing from restored metadata: {children}"
+            );
+        }
+        let prompt = master_continuation_prompt(carrier);
+        assert!(prompt.contains("coalesced_children"), "{prompt}");
+        for idx in 0..3 {
+            assert!(
+                prompt.contains(&format!("task-restart-{idx}")),
+                "restored carrier prompt must mention folded child task-restart-{idx}: {prompt}"
+            );
+        }
+        assert_eq!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-rs"),
+            0,
+            "nothing else may drain after the carrier — the extras were tombstoned"
+        );
+    }
+
+    /// #1707 round 2 (codex Blocker 1 fix 3) — when the coalesced-carrier
+    /// durable persist FAILS, the fold must ABORT: no extras are tombstoned,
+    /// the taken extras are requeued, and the batch delivers in its ORIGINAL
+    /// per-item shape (no `coalesced_children` carrier). Armed via the
+    /// per-instance `force_coalesce_persist_failure` test hook, the abort
+    /// repeats on every drain — so the queue NEVER wedges — and every one of
+    /// the 3 agents' terminal notifications (3 ChildCompleted + the join
+    /// ScatterJoinComplete(s)) still drains, ending with pending == 0.
+    /// (Counts are measured at runtime: the enqueue path stamps
+    /// `last_joined_key` AFTER the enqueue, so each of the 3 terminal marks
+    /// enqueues a join item and the initial pending count is 6.)
+    #[test]
+    fn coalesce_abort_on_carrier_persist_failure_delivers_as_is() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-ab", "api", "coalesce-abort");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        for idx in 0..3 {
+            let agent_id = format!("task-abort-{idx}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: format!("ab-{idx}"),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(format!("done {idx}")),
+                cwd: None,
+                profile_id: "tenant-ab".to_owned(),
+            });
+        }
+        let pending_before =
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ab");
+        assert!(
+            pending_before >= 4,
+            "expected a burst of child + scatter items, got {pending_before}"
+        );
+
+        orchestrator.set_force_coalesce_persist_failure_for_test(true);
+        let mut total: Vec<QueuedMasterContinuation> = Vec::new();
+        for _ in 0..10 {
+            let drained = orchestrator.drain_ready_continuations_for_session(
+                &session_id,
+                "tenant-ab",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            assert!(
+                drained.len() <= 1,
+                "a fold-abort must never over-deliver, got {} items",
+                drained.len()
+            );
+            let empty = drained.is_empty();
+            total.extend(drained);
+            if empty {
+                break;
+            }
+        }
+        assert_eq!(
+            total.len(),
+            pending_before,
+            "every terminal notification must deliver as-is across drains, got {}",
+            total.len()
+        );
+        for item in &total {
+            assert!(
+                !item.metadata.contains_key("coalesced_children")
+                    && !item.metadata.contains_key("coalesced_count"),
+                "a failed fold must deliver items in ORIGINAL shape, got coalesced metadata on {:?}",
+                item.reason
+            );
+        }
+        assert_eq!(
+            total
+                .iter()
+                .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+                .count(),
+            3,
+            "3 ChildCompleted notifications"
+        );
+        assert_eq!(
+            total
+                .iter()
+                .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+                .count(),
+            pending_before - 3,
+            "the remaining notifications are ScatterJoinComplete"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ab"),
+            0,
+            "the abort path must requeue extras, not wedge the queue"
+        );
+        // Explicit disarm (defensive; the flag is per-orchestrator instance).
+        orchestrator.set_force_coalesce_persist_failure_for_test(false);
     }
 
     /// #1707: terminal coalescing batches by continuation GROUP. Two

@@ -663,6 +663,31 @@ impl MasterContinuationScheduler {
         ReinsertOutcome::Requeued
     }
 
+    /// #1707 (codex Blocker 1) — put back an item REMOVED by
+    /// [`Self::take_pending_terminal_for_scope`] when its fold aborts (the
+    /// carrier's durable persist failed, so nothing was tombstoned and the
+    /// batch must deliver as-is). Unlike [`Self::reinsert`], this is a
+    /// crash-safe RESTORE, not a delivery attempt: it clears the claim guard
+    /// and restores the item to pending + heap with a FRESH sequence (back of
+    /// the FIFO) WITHOUT counting a redelivery attempt — the fold abort is a
+    /// durability failure, not a failed delivery. Idempotent: a key already
+    /// pending is left untouched.
+    pub(crate) fn requeue_taken(&mut self, mut item: QueuedMasterContinuation) {
+        self.recently_claimed_external.remove(&item.dedupe_key);
+        if self.pending_by_key.contains_key(&item.dedupe_key) {
+            return;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        item.sequence = sequence;
+        self.heap.push(HeapEntry {
+            priority: item.priority,
+            sequence,
+            dedupe_key: item.dedupe_key.clone(),
+        });
+        self.pending_by_key.insert(item.dedupe_key.clone(), item);
+    }
+
     pub(crate) fn peek_ready(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,
