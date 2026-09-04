@@ -529,7 +529,22 @@ impl SupervisorState {
         let key = continuation_key(&continuation.group_id, &continuation.continuation_id);
         match self.continuations.get_mut(&key) {
             Some(existing) => {
-                if continuation_rank(&continuation.status) >= continuation_rank(&existing.status) {
+                // #1707 round 3 (codex Blocker 3): `attempt` is the REVISION
+                // of a queued payload for this continuation id. A status
+                // correction (`failed` → `completed` on the same identity
+                // dedupe key) persists a fresh `Queued` record with a
+                // strictly higher attempt — and the status-rank gate alone
+                // (`Queued 0 < Completed 2`) would silently DROP it behind a
+                // delivered item's tombstone, resurrecting the OLD payload on
+                // restart replay. So a strictly-higher attempt is
+                // rank-eligible regardless of status; a same-or-lower attempt
+                // can never downgrade a higher-rank record (an attempt-1
+                // re-persist behind the tombstone stays dropped).
+                let attempt_eligible = continuation.attempt > existing.attempt;
+                if attempt_eligible
+                    || continuation_rank(&continuation.status)
+                        >= continuation_rank(&existing.status)
+                {
                     *existing = merge_continuation(existing.clone(), continuation);
                 }
             }
@@ -1847,16 +1862,27 @@ fn merge_continuation(
     existing: PendingContinuationRecord,
     mut next: PendingContinuationRecord,
 ) -> PendingContinuationRecord {
-    next.started_at_ms = match (existing.started_at_ms, next.started_at_ms) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
-    next.completed_at_ms = match (existing.completed_at_ms, next.completed_at_ms) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
+    // #1707 round 3 follow-up: when a strictly-higher-attempt CORRECTION
+    // resurrects the payload at a LOWER status rank (e.g. Queued replacing a
+    // Completed tombstone), the tombstone's lifecycle timestamps
+    // (started_at_ms / completed_at_ms) must NOT survive into the corrected
+    // record — a Queued record with completion timestamps is a lie.
+    let is_correction = continuation_rank(&next.status) < continuation_rank(&existing.status);
+    if is_correction {
+        next.started_at_ms = None;
+        next.completed_at_ms = None;
+    } else {
+        next.started_at_ms = match (existing.started_at_ms, next.started_at_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        next.completed_at_ms = match (existing.completed_at_ms, next.completed_at_ms) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+    }
     if next.result.is_none() {
         next.result = existing.result;
     }
@@ -2530,6 +2556,101 @@ mod tests {
             "new.md"
         );
         assert_eq!(state.applied_event_ids.len(), 4);
+    }
+
+    /// #1707 round 3 (codex Blocker 3): `attempt` is the REVISION of a queued
+    /// payload for one continuation id. A status correction persists a fresh
+    /// `Queued` record with a strictly higher attempt, which must be
+    /// rank-ELIGIBLE — it replaces an existing `Completed` record of the same
+    /// (group, continuation_id) even though `Queued` ranks below `Completed`.
+    /// A same-or-lower attempt must NOT downgrade the higher-rank record.
+    #[test]
+    fn continuation_upsert_higher_attempt_replaces_completed_tombstone() {
+        let dir = TestDir::new("attempt-rank");
+        let store = SupervisorStore::new(&dir.path);
+        let record = |attempt: u32, status_label: &str| PendingContinuationRecord {
+            group_id: "group-1".to_string(),
+            continuation_id: "child/group-1/sess/agent-1".to_string(),
+            child_id: Some("agent-1".to_string()),
+            prompt: None,
+            status: ContinuationStatus::Queued,
+            queued_at_ms: 100 + u64::from(attempt),
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: None,
+            attempt,
+            metadata: {
+                let mut metadata = SupervisorMetadata::new();
+                metadata.insert(
+                    "payload:status".into(),
+                    serde_json::Value::String(status_label.to_string()),
+                );
+                metadata
+            },
+        };
+
+        // Original delivery: Queued attempt=1, then the drain tombstones it
+        // Completed. The completed_at_ms stamp dedups the completed event id.
+        store
+            .record_continuation_queued(record(1, "failed"))
+            .unwrap();
+        store
+            .record_continuation_completed("group-1", "child/group-1/sess/agent-1", 200, None)
+            .unwrap();
+        let key = continuation_key("group-1", "child/group-1/sess/agent-1");
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Completed
+        );
+
+        // Status correction: a Queued record at a strictly HIGHER attempt
+        // must replace the Completed tombstone (rank gate alone would drop
+        // it: Queued 0 < Completed 2).
+        store
+            .record_continuation_queued(record(2, "completed"))
+            .unwrap();
+        let state = store.load_state().unwrap();
+        let restored = &state.continuations[&key];
+        assert_eq!(
+            restored.status,
+            ContinuationStatus::Queued,
+            "a higher-attempt Queued record must replace the Completed tombstone"
+        );
+        assert_eq!(
+            restored
+                .metadata
+                .get("payload:status")
+                .and_then(|v| v.as_str()),
+            Some("completed"),
+            "the replacement carries the corrected payload"
+        );
+        assert_eq!(
+            restored.completed_at_ms, None,
+            "the corrected Queued record must NOT inherit the tombstone's completion timestamp"
+        );
+        assert_eq!(
+            restored.started_at_ms, None,
+            "the corrected Queued record must NOT inherit the tombstone's start timestamp"
+        );
+
+        // A same-or-lower attempt must NOT downgrade the higher-rank record:
+        // re-persisting attempt=1 behind the tombstone stays dropped.
+        let _ = store.record_continuation_queued(record(1, "failed"));
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Queued,
+            "attempt=1 behind attempt=2 must not downgrade the record"
+        );
+        assert_eq!(
+            state.continuations[&key]
+                .metadata
+                .get("payload:status")
+                .and_then(|v| v.as_str()),
+            Some("completed"),
+            "the older payload must not overwrite the corrected one"
+        );
     }
 
     // Not run on Windows for the same reason as

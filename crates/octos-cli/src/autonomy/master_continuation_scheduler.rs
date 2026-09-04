@@ -688,6 +688,31 @@ impl MasterContinuationScheduler {
         self.pending_by_key.insert(item.dedupe_key.clone(), item);
     }
 
+    /// #1707 round 3 (codex Blocker 3) — STATUS-CORRECTION enqueue: a
+    /// terminal re-forward whose STATUS differs from the pending/drained one
+    /// (a `failed` → `completed` correction on the same identity dedupe key)
+    /// must REPLACE any still-pending older payload instead of collapsing as
+    /// a `Duplicate`, and must bypass the reclaim window when the older item
+    /// was claimed moments ago (`CHILD_SCATTER_RECLAIM_WINDOW` —
+    /// the correction is a DIFFERENT occurrence of the same key, not the
+    /// double-enqueue the guard exists to collapse).
+    ///
+    /// Mechanics mirror [`Self::requeue_taken`] but from a request: remove
+    /// any pending item with the same dedupe key (its heap entry goes stale
+    /// and is skipped by `entry_matches_pending`), clear the key's
+    /// recently-claimed guard entry, then enqueue the fresh request with a
+    /// fresh sequence and NO redelivery counting. Returns the outcome like
+    /// [`Self::enqueue_at`].
+    pub(crate) fn replace_pending_payload(
+        &mut self,
+        request: MasterContinuationRequest,
+    ) -> MasterContinuationEnqueueOutcome {
+        let dedupe_key = request.stable_dedupe_key();
+        self.pending_by_key.remove(&dedupe_key);
+        self.recently_claimed_external.remove(&dedupe_key);
+        self.enqueue_at(request, SystemTime::now())
+    }
+
     pub(crate) fn peek_ready(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,

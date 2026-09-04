@@ -11792,9 +11792,9 @@ struct AutonomyRuntimeState {
     /// additive — legacy persisted state deserializes with epoch 0 / None.
     scatter_join_state: HashMap<String, ScatterJoinState>,
     /// Durable "already told the master" marks for child terminal events:
-    /// `child/<group>/<session>/<agent>` dedupe key → the terminal status that
-    /// was last enqueued as a `ChildCompleted`. Seeded from the supervisor
-    /// store's persisted ChildCompleted continuations in
+    /// `child/<group>/<session>/<agent>` dedupe key → the terminal status
+    /// (+ revision) that was last enqueued as a `ChildCompleted`. Seeded from
+    /// the supervisor store's persisted ChildCompleted continuations in
     /// `configure_supervisor_store` and updated on every enqueue.
     ///
     /// Why: `pending_by_key` only collapses duplicates while an item is
@@ -11805,7 +11805,21 @@ struct AutonomyRuntimeState {
     /// master re-entries (one turn each) after a goal was cleared on a
     /// 40-peer session. Keyed on status so a genuine failed→completed
     /// correction (#2054) still re-enters.
-    delivered_terminal_marks: HashMap<String, String>,
+    ///
+    /// #1707 round 3 (codex Blockers 3+4): the child and scatter marks are
+    /// now SEPARATE maps — a delivered ChildCompleted must not suppress the
+    /// ScatterJoinComplete computation (a crash between the two enqueues is
+    /// real), and a status CORRECTION bumps `revision` so the correction's
+    /// durable persist carries a distinct `attempt` (the event id embeds it)
+    /// and replaces any still-pending older-status payload.
+    delivered_child_marks: HashMap<String, DeliveredChildMark>,
+    /// Durable "already told the master" marks for scatter joins:
+    /// the full join key (`scatter_join/{group}/{session}/{profile}/
+    /// {cwd_hash}/{epoch}`) → "joined". Seeded from persisted
+    /// `scatter_join_complete` continuation records at boot (and used to
+    /// restore `scatter_join_state[group].last_joined_key` / `join_epoch`),
+    /// updated on every scatter enqueue. See `delivered_child_marks`.
+    delivered_scatter_marks: HashMap<String, String>,
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
     /// #1977 — durable monitor records (specs + wake accounting). The live
@@ -11936,6 +11950,20 @@ struct AutonomyRuntimeState {
 struct ScatterJoinState {
     join_epoch: u64,
     last_joined_key: Option<String>,
+}
+
+/// #1707 round 3 (codex Blockers 3+4) — durable mark for one delivered
+/// `ChildCompleted`: the terminal status the master was last told about and
+/// the monotonically increasing REVISION of that delivery. The revision maps
+/// onto the persisted record's `attempt` field so a status CORRECTION
+/// (`failed` → `completed`, same identity key) persists with `attempt =
+/// revision + 1` — a distinct `continuation_queued` event id AND an
+/// attempt-eligible upsert that can replace an older `Completed` tombstone —
+/// while an equal-or-lower attempt can never downgrade the record.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DeliveredChildMark {
+    status: String,
+    revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -13363,24 +13391,92 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     (verdict, usage)
 }
 
-/// Seed `delivered_terminal_marks` from every persisted `ChildCompleted`
-/// continuation (any status: queued ones are re-enqueued by the caller and
-/// collapse through `pending_by_key`; started/completed ones were already
-/// delivered). The persisted `continuation_id` IS the dedupe key.
+/// Seed the delivered terminal marks from every persisted terminal
+/// continuation:
+/// - `ChildCompleted` records (reason `child_completed`, any status: queued
+///   ones are re-enqueued by the caller and collapse through
+///   `pending_by_key`; started/completed ones were already delivered) seed
+///   `delivered_child_marks` — status from `payload:status`, revision from
+///   the record's `attempt` (#1707 round 3: a later status correction must
+///   persist with a strictly higher attempt).
+/// - `ScatterJoinComplete` records (reason `scatter_join_complete`) seed
+///   `delivered_scatter_marks` AND restore `scatter_join_state[group]`'s
+///   `join_epoch` (the codex Blocker-4 crash window: a child mark persisting
+///   without its scatter record must NOT permanently suppress the missing
+///   join — the restored join epoch keeps a re-computed join key equal to
+///   the one already delivered, and a MISSING scatter simply re-enqueues)
+///   plus `last_joined_key` (the dedupe key of the MAX-epoch record). The
+///   `last_joined_key` restore is what keeps post-restart spawn admission
+///   correct: `upsert_agent` gates its epoch bump on
+///   `last_joined_key.is_some()`, and restoring it (a) lets a NEW agent
+///   joining an already-joined group bump the epoch so its join is not
+///   swallowed by the seeded `delivered_scatter_marks`, while (b) restored
+///   roster members (handled by `restore_agents_from_supervisor_state`)
+///   never pass through `upsert_agent`'s new-admission path, so no
+///   spurious bump fires for them.
+///
+/// The persisted `continuation_id` IS the dedupe key in both cases.
 fn seed_delivered_terminal_marks(
     state: &mut AutonomyRuntimeState,
     supervisor_state: &SupervisorState,
 ) {
+    // Per group, track the MAX-epoch scatter record so the group's
+    // `last_joined_key` is the key that actually joined last (a superseded
+    // epoch's record may linger in the store).
+    let mut max_epoch_per_group: HashMap<String, (u64, String)> = HashMap::new();
     for record in supervisor_state.continuations.values() {
-        if supervisor_metadata_str(&record.metadata, "reason") != Some("child_completed") {
-            continue;
+        match supervisor_metadata_str(&record.metadata, "reason") {
+            Some("child_completed") => {
+                let status = supervisor_metadata_str(&record.metadata, "payload:status")
+                    .unwrap_or("completed")
+                    .to_owned();
+                state.delivered_child_marks.insert(
+                    record.continuation_id.clone(),
+                    DeliveredChildMark {
+                        status,
+                        revision: u64::from(record.attempt),
+                    },
+                );
+            }
+            Some("scatter_join_complete") => {
+                state
+                    .delivered_scatter_marks
+                    .insert(record.continuation_id.clone(), "joined".to_owned());
+                // Restore the join epoch (parsed from the join key's LAST
+                // segment; MAX across records — a superseded epoch's record
+                // may linger).
+                let epoch = record
+                    .continuation_id
+                    .rsplit('/')
+                    .next()
+                    .and_then(|segment| segment.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let join_state = state
+                    .scatter_join_state
+                    .entry(record.group_id.clone())
+                    .or_default();
+                join_state.join_epoch = join_state.join_epoch.max(epoch);
+                let entry = max_epoch_per_group
+                    .entry(record.group_id.clone())
+                    .or_insert((epoch, record.continuation_id.clone()));
+                if epoch > entry.0 {
+                    *entry = (epoch, record.continuation_id.clone());
+                }
+            }
+            _ => {}
         }
-        let status = supervisor_metadata_str(&record.metadata, "payload:status")
-            .unwrap_or("completed")
-            .to_owned();
-        state
-            .delivered_terminal_marks
-            .insert(record.continuation_id.clone(), status);
+    }
+    // Restore `last_joined_key` from the max-epoch scatter record per group.
+    // This is the key piece that lets post-restart spawn admission work: the
+    // `upsert_agent` epoch bump is gated on `last_joined_key.is_some()`, and
+    // restoring it means a genuinely NEW agent joining the group bumps the
+    // epoch (so its join is NOT swallowed by the seeded delivered marks),
+    // while restored roster members (which go through
+    // `restore_agents_from_supervisor_state`, NOT `upsert_agent`) never
+    // trigger the bump.
+    for (group, (_epoch, key)) in max_epoch_per_group {
+        let join_state = state.scatter_join_state.entry(group).or_default();
+        join_state.last_joined_key = Some(key);
     }
 }
 
@@ -13687,55 +13783,117 @@ fn enqueue_agent_terminal_continuations(
 ) {
     let group_id = agent_continuation_group_id(agent);
     let child_key = child_completed_dedupe_key(&group_id, &agent.session_id.0, &agent.agent_id);
-    if state
-        .delivered_terminal_marks
-        .get(&child_key)
-        .is_some_and(|status| status == &agent.status)
-    {
-        tracing::debug!(
-            agent_id = %agent.agent_id,
-            status = %agent.status,
-            "terminal mark already delivered to the master; skipping ChildCompleted / \
-             ScatterJoinComplete re-enqueue (durable dedupe)"
-        );
-        return;
+    let prior_mark = state.delivered_child_marks.get(&child_key).cloned();
+    match &prior_mark {
+        Some(mark) if mark.status == agent.status => {
+            // #1707 round 3 (codex Blocker 4): the CHILD was already
+            // delivered at this status — skip ONLY the child enqueue. A
+            // persisted ChildCompleted record does NOT prove the paired
+            // ScatterJoinComplete was persisted too (the process can exit
+            // between the two enqueues), so FALL THROUGH to the scatter
+            // computation below: the join is then re-observed and enqueued,
+            // or skipped only when the scatter's OWN durable mark
+            // (`delivered_scatter_marks` / `last_joined_key`) proves the
+            // join was already delivered.
+            tracing::debug!(
+                agent_id = %agent.agent_id,
+                status = %agent.status,
+                "child terminal mark already delivered; skipping only the \
+                 ChildCompleted re-enqueue (scatter join still evaluated)"
+            );
+        }
+        Some(mark) => {
+            // #1707 round 3 (codex Blocker 3): a STATUS CORRECTION (same
+            // identity key, different terminal status). The correction must
+            // (a) REPLACE any still-pending older-status payload atomically
+            // and bypass the reclaim window when the older item was just
+            // claimed, and (b) persist with `attempt = revision + 1` so the
+            // durable record carries a distinct event id and an
+            // attempt-eligible upsert that can overwrite an older Completed
+            // tombstone. The mark advances ONLY after the enqueue succeeded
+            // AND the persist write returned Ok — on any failure it stays
+            // at the old status so a later terminal re-forward retries.
+            let revision = mark.revision.saturating_add(1);
+            let child = build_child_terminal_request(agent, &group_id, &child_key);
+            let outcome = state.continuations.replace_pending_payload(child);
+            let mut delivered = false;
+            match &outcome {
+                MasterContinuationEnqueueOutcome::Queued(continuation) => {
+                    match persist_continuation_queued_with_attempt(
+                        state,
+                        continuation,
+                        revision.min(u64::from(u32::MAX)) as u32,
+                    ) {
+                        Ok(()) => delivered = true,
+                        Err(err) => tracing::warn!(
+                            ?err,
+                            agent_id = %agent.agent_id,
+                            status = %agent.status,
+                            revision,
+                            "terminal-status correction persisted failed; the mark \
+                             stays at the old status so a later re-forward retries"
+                        ),
+                    }
+                }
+                MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+                    tracing::warn!(
+                        agent_id = %agent.agent_id,
+                        status = %agent.status,
+                        revision,
+                        "terminal-status correction collapsed as Duplicate after \
+                         payload replacement; the mark stays at the old status"
+                    );
+                }
+            }
+            if delivered {
+                state.delivered_child_marks.insert(
+                    child_key.clone(),
+                    DeliveredChildMark {
+                        status: agent.status.clone(),
+                        revision,
+                    },
+                );
+            }
+            persist_agent_terminal(state, agent);
+        }
+        None => {
+            // First delivery of this child's terminal mark. Mirror the
+            // correction arm: the mark advances ONLY after the enqueue
+            // succeeded AND the persist write returned Ok — a swallowed
+            // persist error would leave an in-memory "delivered" mark with
+            // no durable record, and a restart would replay the item.
+            let child = build_child_terminal_request(agent, &group_id, &child_key);
+            let outcome = state.continuations.enqueue(child);
+            let mut delivered = false;
+            match &outcome {
+                MasterContinuationEnqueueOutcome::Queued(continuation) => {
+                    match persist_continuation_queued_with_attempt(state, continuation, 1) {
+                        Ok(()) => delivered = true,
+                        Err(err) => tracing::warn!(
+                            ?err,
+                            agent_id = %agent.agent_id,
+                            status = %agent.status,
+                            "first-delivery terminal persist failed; the mark \
+                             stays unset so a later re-forward retries"
+                        ),
+                    }
+                }
+                MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+                    // Already pending — nothing to do.
+                }
+            }
+            if delivered {
+                state.delivered_child_marks.insert(
+                    child_key.clone(),
+                    DeliveredChildMark {
+                        status: agent.status.clone(),
+                        revision: 1,
+                    },
+                );
+            }
+            persist_agent_terminal(state, agent);
+        }
     }
-    let mut child = MasterContinuationRequest::new(
-        group_id.clone(),
-        agent.session_id.to_string(),
-        agent.profile_id.clone(),
-        MasterContinuationReason::ChildCompleted,
-        SystemTime::now(),
-    )
-    .with_child_agent_id(agent.agent_id.clone())
-    // Gap-1 step 3: explicit success dedupe key, symmetric to the failure
-    // key `external/<kind>/<session>/<task_id>`. Keyed ONLY on stable
-    // identity (group + session + agent_id) so repeated terminal marks of
-    // the same agent (live + cascade + orphan-sweep, AND the strangler's
-    // legacy on_change + unified on_terminal double-delivery) collapse to
-    // one ChildCompleted continuation via `pending_by_key` — independent of
-    // metadata drift (status/summary/nickname/role), which the auto-derived
-    // `stable_dedupe_key` would otherwise fold into the key and split into
-    // distinct entries.
-    .with_dedupe_key(child_key.clone())
-    .with_metadata("status", agent.status.clone())
-    .with_metadata("nickname", agent.nickname.clone())
-    .with_metadata("role", agent.role.clone());
-    // #1707: stamp the child's workspace so a future drain-site guard can drop
-    // a continuation replayed under a wire session key that has since been
-    // rebound to a DIFFERENT project (sessions_in_cwd reuse). Self-describing;
-    // no behavior change on its own.
-    if let Some(cwd) = agent.cwd.as_deref().filter(|value| !value.is_empty()) {
-        child = child.with_metadata("workspace", cwd.to_owned());
-    }
-    if let Some(last_task) = agent.last_task.as_deref().filter(|value| !value.is_empty()) {
-        child = child.with_metadata("summary", last_task.chars().take(1200).collect::<String>());
-    }
-    enqueue_and_persist_continuation(state, child);
-    state
-        .delivered_terminal_marks
-        .insert(child_key, agent.status.clone());
-    persist_agent_terminal(state, agent);
 
     // #1707: siblings for the scatter/gather join MUST share a workspace. Two
     // agents that merely reuse the same wire `session_id` across different
@@ -13772,7 +13930,11 @@ fn enqueue_agent_terminal_continuations(
     // check skips re-observation, restart-safe); a genuinely re-expanded
     // group gets a new epoch at spawn admission and joins again.
     let join_group_key = agent_continuation_group_id(agent);
-    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
+    let join_epoch = state
+        .scatter_join_state
+        .get(&join_group_key)
+        .map(|join_state| join_state.join_epoch)
+        .unwrap_or(0);
     let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
     let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
@@ -13782,11 +13944,19 @@ fn enqueue_agent_terminal_continuations(
         session = agent.session_id.0,
         profile = agent.profile_id,
         cwd_hash = cwd_hash,
-        epoch = join_state.join_epoch,
+        epoch = join_epoch,
     );
-    if join_state.last_joined_key.as_deref() == Some(join_key.as_str()) {
-        // This epoch already joined — skip enqueue entirely (also covers the
-        // re-marked-terminal-with-no-new-child case and restart replay).
+    // This epoch already joined — skip enqueue entirely (also covers the
+    // re-marked-terminal-with-no-new-child case and restart replay). The
+    // durable scatter mark (`delivered_scatter_marks`, seeded from persisted
+    // ScatterJoinComplete records) is the restart-proof half of this check:
+    // `last_joined_key` alone is in-memory only.
+    let already_joined = state
+        .scatter_join_state
+        .get(&join_group_key)
+        .is_some_and(|join_state| join_state.last_joined_key.as_deref() == Some(join_key.as_str()))
+        || state.delivered_scatter_marks.contains_key(&join_key);
+    if already_joined {
         return;
     }
     let scatter = MasterContinuationRequest::new(
@@ -13810,10 +13980,18 @@ fn enqueue_agent_terminal_continuations(
         Some(cwd) => scatter.with_metadata("workspace", cwd.to_owned()),
         None => scatter,
     };
-    enqueue_and_persist_continuation(state, scatter);
-    let join_group_key = agent_continuation_group_id(agent);
+    let scatter_outcome = enqueue_and_persist_continuation(state, scatter);
     let join_state = state.scatter_join_state.entry(join_group_key).or_default();
-    join_state.last_joined_key = Some(join_key);
+    join_state.last_joined_key = Some(join_key.clone());
+    if !scatter_outcome.is_duplicate() {
+        // #1707 round 3 (codex Blocker 4): the scatter has its OWN durable
+        // mark now — a future crash window where the child record persisted
+        // but this scatter record did NOT is recovered by the seeding path,
+        // not by assuming the child record implies the join.
+        state
+            .delivered_scatter_marks
+            .insert(join_key, "joined".to_owned());
+    }
 }
 
 /// Gap-1 step 3: explicit `ChildCompleted` dedupe key, symmetric to the
@@ -13823,6 +14001,49 @@ fn enqueue_agent_terminal_continuations(
 /// strangler double-delivery or repeated terminal marks.
 fn child_completed_dedupe_key(group_id: &str, session_id: &str, agent_id: &str) -> String {
     format!("child/{group_id}/{session_id}/{agent_id}")
+}
+
+/// Build the `ChildCompleted` request for one terminal agent. Shared by the
+/// first-delivery and status-correction arms of
+/// `enqueue_agent_terminal_continuations` so both enqueue byte-identical
+/// request shapes (#1707 round 3).
+fn build_child_terminal_request(
+    agent: &AutonomyAgentRecord,
+    group_id: &str,
+    child_key: &str,
+) -> MasterContinuationRequest {
+    let mut child = MasterContinuationRequest::new(
+        group_id.to_owned(),
+        agent.session_id.to_string(),
+        agent.profile_id.clone(),
+        MasterContinuationReason::ChildCompleted,
+        SystemTime::now(),
+    )
+    .with_child_agent_id(agent.agent_id.clone())
+    // Gap-1 step 3: explicit success dedupe key, symmetric to the failure
+    // key `external/<kind>/<session>/<task_id>`. Keyed ONLY on stable
+    // identity (group + session + agent_id) so repeated terminal marks of
+    // the same agent (live + cascade + orphan-sweep, AND the strangler's
+    // legacy on_change + unified on_terminal double-delivery) collapse to
+    // one ChildCompleted continuation via `pending_by_key` — independent of
+    // metadata drift (status/summary/nickname/role), which the auto-derived
+    // `stable_dedupe_key` would otherwise fold into the key and split into
+    // distinct entries.
+    .with_dedupe_key(child_key.to_owned())
+    .with_metadata("status", agent.status.clone())
+    .with_metadata("nickname", agent.nickname.clone())
+    .with_metadata("role", agent.role.clone());
+    // #1707: stamp the child's workspace so a future drain-site guard can drop
+    // a continuation replayed under a wire session key that has since been
+    // rebound to a DIFFERENT project (sessions_in_cwd reuse). Self-describing;
+    // no behavior change on its own.
+    if let Some(cwd) = agent.cwd.as_deref().filter(|value| !value.is_empty()) {
+        child = child.with_metadata("workspace", cwd.to_owned());
+    }
+    if let Some(last_task) = agent.last_task.as_deref().filter(|value| !value.is_empty()) {
+        child = child.with_metadata("summary", last_task.chars().take(1200).collect::<String>());
+    }
+    child
 }
 
 /// Explicit `LoopFire` dedupe key shared by BOTH enqueue paths — the
@@ -14590,24 +14811,12 @@ fn restore_agents_from_supervisor_state(
             context_contract: None,
             restored: true,
         };
-        // Refs #2102 (Gap 3): spawn admission into an ALREADY-JOINED group
-        // bumps the join epoch BEFORE insertion, under the same state lock —
-        // a crash can never land between admission and the increment. The
-        // child's group comes from the supervisor record (`child.group_id`).
-        {
-            let group = child.group_id.clone();
-            let already_joined = state
-                .scatter_join_state
-                .get(&group)
-                .is_some_and(|s| s.last_joined_key.is_some());
-            if already_joined {
-                state
-                    .scatter_join_state
-                    .entry(group)
-                    .or_default()
-                    .join_epoch += 1;
-            }
-        }
+        // Refs #2102 (Gap 3) — restore must NOT bump the join epoch.
+        // Restored roster members are not NEW admissions: they were already
+        // counted in the epoch that produced the persisted ScatterJoinComplete
+        // (whose dedupe key is seeded into `last_joined_key` above). The
+        // epoch bump belongs exclusively to `upsert_agent`'s new-admission
+        // path (which fires only for agents NOT already in the roster).
         state.agents.insert(agent.agent_id.clone(), agent);
     }
 }
@@ -20234,6 +20443,312 @@ mod tests {
         );
     }
 
+    /// #1707 round 3 (codex Blocker 4, test 1): the exact crash window — a
+    /// ChildCompleted persisted for agent-1 while a sibling was still running
+    /// (so NO ScatterJoinComplete existed yet), then the process exits. On
+    /// restart, agent-1's child mark must NOT suppress the join: when the
+    /// restored roster's sibling scan sees both children terminal, the
+    /// missing ScatterJoinComplete still enqueues and drains.
+    #[test]
+    fn scatter_join_survives_restart_after_child_only_crash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-sj", "api", "scatter-crash");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: "tenant-sj".to_owned(),
+        };
+
+        // Orchestrator A: two live children in one group; agent-1 turns
+        // terminal while agent-2 still runs → ONLY its ChildCompleted is
+        // enqueued + persisted (the sibling scan is not all-terminal, so no
+        // scatter). NO drain, NO tombstones — then the process "exits".
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("agent-1", "running"));
+        first.upsert_agent(upsert("agent-2", "running"));
+        first.upsert_agent(upsert("agent-1", "completed"));
+        let pending = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-sj",
+            MasterContinuationRuntimeState::busy(),
+            usize::MAX,
+        );
+        assert!(
+            pending.is_empty(),
+            "busy runtime state drains nothing — the crash keeps everything pending"
+        );
+        drop(first);
+
+        // Fresh orchestrator on the same store: the roster restore keeps both
+        // children visible and the child-completed record replays as pending.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        // Agent-2 turns terminal now: the sibling scan (restored agent-1 is
+        // already terminal) reaches all-terminal and the ScatterJoinComplete
+        // must enqueue DESPITE agent-1's child mark — the child mark only
+        // suppresses agent-1's OWN ChildCompleted re-enqueue.
+        fresh.upsert_agent(upsert("agent-2", "completed"));
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-sj",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let scatter = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .count();
+        assert_eq!(
+            scatter,
+            1,
+            "the child-only crash window must not lose the scatter join; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        let terminal_children = drained
+            .iter()
+            .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .and_then(|item| item.metadata.get("terminal_children"))
+            .map(String::as_str);
+        assert_eq!(
+            terminal_children,
+            Some("2"),
+            "the restored sibling scan must see BOTH terminal children"
+        );
+    }
+
+    /// #1707 round 3 (codex Blocker 3, test 2): a terminal-status correction
+    /// (failed → completed) while the failed ChildCompleted is still PENDING
+    /// must REPLACE the pending payload — the drained continuation carries
+    /// the corrected status, not the swallowed old one.
+    #[test]
+    fn status_correction_replaces_pending_payload() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-sc", "api", "correction-pending");
+        let agent_id = "task-correction-pending".to_owned();
+        let upsert = |status: &str| AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: "sc".to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{status}")),
+            cwd: None,
+            profile_id: "tenant-sc".to_owned(),
+        };
+
+        orchestrator.upsert_agent(upsert("failed"));
+        // No drain: the failed ChildCompleted is still pending when the
+        // correction lands.
+        orchestrator.upsert_agent(upsert("completed"));
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-sc",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let children = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children.len(),
+            1,
+            "the correction replaces the pending payload in place; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            children[0].metadata.get("status").map(String::as_str),
+            Some("completed"),
+            "the drained ChildCompleted must carry the CORRECTED status"
+        );
+    }
+
+    /// #1707 round 3 (codex Blocker 3, test 3): a correction landing INSIDE
+    /// the 2s reclaim window right after a drain must not be swallowed by the
+    /// recently-claimed guard — `replace_pending_payload` clears the guard
+    /// entry for a status correction.
+    ///
+    /// LIMITATION: this test only proves the t=0 guard-clear case. Threading
+    /// an explicit timestamp (e.g. claim+1.9s) through the correction path is
+    /// not possible: `build_child_terminal_request` always stamps
+    /// `SystemTime::now()`, and `replace_pending_payload` internally calls
+    /// `enqueue_at(request, SystemTime::now())`. A future refactor that
+    /// exposes an `enqueue_at` variant for corrections could extend this test
+    /// to construct the correction inside the window at a controlled offset.
+    #[test]
+    fn status_correction_within_reclaim_window_delivers() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-rw", "api", "correction-window");
+        let agent_id = "task-correction-window".to_owned();
+        let upsert = |status: &str| AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: "rw".to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{status}")),
+            cwd: None,
+            profile_id: "tenant-rw".to_owned(),
+        };
+
+        orchestrator.upsert_agent(upsert("completed"));
+        // Drain claims the identity key (records the recently-claimed guard).
+        let first = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rw",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            first
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "the initial terminal mark drains"
+        );
+        // IMMEDIATELY correct the status — well inside the 2s reclaim window.
+        orchestrator.upsert_agent(upsert("failed"));
+        let second = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rw",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let corrected = second
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            corrected.len(),
+            1,
+            "the in-window correction must bypass the reclaim guard; drained {:?}",
+            second.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            corrected[0].metadata.get("status").map(String::as_str),
+            Some("failed"),
+            "the in-window correction delivers the corrected status"
+        );
+    }
+
+    /// #1707 round 3 (codex Blocker 3, test 4): a persisted status correction
+    /// (attempt ≥ 2) must survive a restart — the seeded mark reads the
+    /// CORRECTED status, so a same-status re-forward collapses and a new
+    /// correction still enqueues.
+    #[test]
+    fn status_correction_survives_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-sr", "api", "correction-restart");
+        let agent_id = "task-correction-restart".to_owned();
+        let upsert = |status: &str| AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: "sr".to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{status}")),
+            cwd: None,
+            profile_id: "tenant-sr".to_owned(),
+        };
+
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("failed"));
+        // Correct before any drain: the pending payload is replaced AND the
+        // durable record is persisted with attempt=2.
+        first.upsert_agent(upsert("completed"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-sr",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.iter().any(|item| {
+                item.reason == MasterContinuationReason::ChildCompleted
+                    && item.metadata.get("status").map(String::as_str) == Some("completed")
+            }),
+            "the correction drains with the corrected status; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        // Mark the delivered continuations Completed so nothing replays.
+        let store = SupervisorStore::new(dir.path());
+        for item in &drained {
+            store
+                .record_continuation_completed(
+                    item.group_id.as_str(),
+                    item.dedupe_key.as_str(),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("mark delivered");
+        }
+        drop(first);
+
+        // Fresh orchestrator on the same store: the seeded child mark must
+        // read the CORRECTED status ("completed"), not the swallowed "failed"
+        // — the attempt=2 record replaced the attempt=1 tombstone ordering.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let baseline =
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-sr");
+        assert_eq!(baseline, 0, "nothing undelivered to recover at boot");
+        fresh.forget_agent_for_test(&agent_id);
+        fresh.upsert_agent(upsert("completed"));
+        // The agent record was forgotten → treated as a NEW admission into
+        // the already-joined group, which correctly bumps the epoch and
+        // enqueues a new-epoch ScatterJoinComplete (exactly 1 item). The
+        // ChildCompleted re-enqueue is still suppressed by the durable mark.
+        assert_eq!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-sr"),
+            baseline + 1,
+            "same-status re-forward suppresses ChildCompleted but the epoch bump \
+             from the new admission produces exactly one new scatter"
+        );
+        // A NEW correction (back to failed) still re-enters and delivers.
+        fresh.forget_agent_for_test(&agent_id);
+        fresh.upsert_agent(upsert("failed"));
+        let corrected = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-sr",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            corrected.iter().any(|item| {
+                item.reason == MasterContinuationReason::ChildCompleted
+                    && item.metadata.get("status").map(String::as_str) == Some("failed")
+            }),
+            "a new correction after restart still delivers; drained {:?}",
+            corrected
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
     /// A terminal mirror for a child whose `ChildCompleted` was already
     /// delivered must NOT re-enter the master — even from a fresh process on
     /// the same supervisor store, and even when the in-memory roster no
@@ -20300,10 +20815,15 @@ mod tests {
         assert_eq!(baseline, 0, "nothing undelivered to recover at boot");
         fresh.forget_agent_for_test(&agent_id);
         fresh.upsert_agent(upsert("completed"));
+        // The agent record was forgotten → treated as a NEW admission into
+        // the already-joined group, which correctly bumps the epoch and
+        // enqueues a new-epoch ScatterJoinComplete (exactly 1 item). The
+        // ChildCompleted re-enqueue is still suppressed by the durable mark.
         assert_eq!(
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd"),
-            baseline,
-            "an already-delivered terminal mark must not re-enqueue on replay"
+            baseline + 1,
+            "same-status re-forward suppresses ChildCompleted but the epoch bump \
+             from the new admission produces exactly one new scatter"
         );
 
         // A genuine correction (different terminal status) still re-enters.
@@ -20313,6 +20833,148 @@ mod tests {
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd")
                 > baseline,
             "a terminal-status correction must still reach the master"
+        );
+    }
+
+    /// #1707 round 3 (codex Blocker 4, regression): after a restart, a NEW
+    /// agent joining an already-joined group must trigger the epoch bump via
+    /// the restored `last_joined_key`, so its ScatterJoinComplete enqueues
+    /// with the NEW epoch (not swallowed by the seeded delivered marks).
+    /// A second restart (no new agents) must NOT re-emit.
+    #[test]
+    fn restart_then_new_sibling_gets_new_epoch_join() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-rs", "api", "restart-epoch");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: "tenant-rs".to_owned(),
+        };
+
+        // Orchestrator A: two agents, both completed. Scatter enqueues and
+        // drains; mark everything delivered so nothing replays.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("agent-1", "running"));
+        first.upsert_agent(upsert("agent-2", "running"));
+        first.upsert_agent(upsert("agent-1", "completed"));
+        first.upsert_agent(upsert("agent-2", "completed"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rs",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let scatter_items: Vec<_> = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .collect();
+        assert_eq!(
+            scatter_items.len(),
+            1,
+            "epoch-0 scatter must drain; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        // Mark all drained items completed so nothing replays.
+        let store = SupervisorStore::new(dir.path());
+        for item in &drained {
+            store
+                .record_continuation_completed(
+                    item.group_id.as_str(),
+                    item.dedupe_key.as_str(),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("mark delivered");
+        }
+        drop(first);
+
+        // Fresh orchestrator B on same store: roster restored, delivered
+        // marks seeded (including last_joined_key). Upsert a THIRD agent —
+        // a NEW admission into the already-joined group. The epoch bump must
+        // fire (last_joined_key is restored), producing epoch 1.
+        let fresh_b = InProcessAgentOrchestrator::default();
+        fresh_b
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        fresh_b.upsert_agent(upsert("agent-3", "completed"));
+        let drained_b = fresh_b.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rs",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let scatter_b: Vec<_> = drained_b
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .collect();
+        assert_eq!(
+            scatter_b.len(),
+            1,
+            "a new admission into the joined group must produce exactly one scatter; drained {:?}",
+            drained_b
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+        let epoch_segment = scatter_b[0]
+            .dedupe_key
+            .as_str()
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        assert_eq!(
+            epoch_segment,
+            1,
+            "the new admission's scatter must use epoch 1 (post-bump); key={}",
+            scatter_b[0].dedupe_key.as_str(),
+        );
+        // Mark epoch-1 scatter delivered too.
+        let store_b = SupervisorStore::new(dir.path());
+        store_b
+            .record_continuation_completed(
+                scatter_b[0].group_id.as_str(),
+                scatter_b[0].dedupe_key.as_str(),
+                now_ms_u64(),
+                None,
+            )
+            .expect("mark delivered");
+        drop(fresh_b);
+
+        // Fresh orchestrator C on same store, NO new upserts: the delivered
+        // marks must hold — nothing re-emits.
+        let fresh_c = InProcessAgentOrchestrator::default();
+        fresh_c
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        let drained_c = fresh_c.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rs",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let scatter_c = drained_c
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .count();
+        assert_eq!(
+            scatter_c,
+            0,
+            "a second restart with no new agents must NOT re-emit the scatter; drained {:?}",
+            drained_c
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>(),
         );
     }
 
