@@ -21,9 +21,10 @@ use super::monitor_runtime::{
     MonitorWatchConfig, append_monitor_note, monitor_batch_hash,
 };
 use super::supervisor_store::{
-    ArtifactRecord as SupervisorArtifactRecord, ChildAgentRecord, ChildStatus, ContinuationStatus,
-    GroupStatus, HeartbeatPing, PendingContinuationRecord, SupervisedGroupRecord, SupervisorEvent,
-    SupervisorMetadata, SupervisorState, SupervisorStore, TerminalKind, TerminalState,
+    ArtifactRecord as SupervisorArtifactRecord, ChildAgentRecord, ChildStatus,
+    CoalescedTombstoneEntry, ContinuationStatus, GroupStatus, HeartbeatPing,
+    PendingContinuationRecord, SupervisedGroupRecord, SupervisorEvent, SupervisorMetadata,
+    SupervisorState, SupervisorStore, TerminalKind, TerminalState,
 };
 use chrono::Utc;
 use octos_agent::tools::mcp_agent::DispatchContextContract;
@@ -11683,6 +11684,15 @@ impl InProcessAgentOrchestrator {
         self.state().force_coalesce_persist_failure = value;
     }
 
+    /// Test hook (#1707 round 4, codex Should-fix 3): the FIRST folded-extra
+    /// tombstone batch of the next fold is treated as FAILED (warn + retry),
+    /// so the test can assert the retry succeeds and the extras stay
+    /// tombstoned across a restart. Self-disarms after one use.
+    #[cfg(test)]
+    pub(crate) fn set_force_tombstone_failure_once_for_test(&self, value: bool) {
+        self.state().force_tombstone_failure_once = value;
+    }
+
     /// Test hook (codex round 3 lost-update-race test): reset the firing
     /// monitor's rate window in the phase-1→phase-2 gap, as a concurrent
     /// `monitor/resume` would, so the test can assert the deferred accounting
@@ -11938,6 +11948,12 @@ struct AutonomyRuntimeState {
     /// delivered as-is). Per-instance, like `force_wake_persist_failure`.
     #[cfg(test)]
     force_coalesce_persist_failure: bool,
+    /// #1707 round 4 (codex Should-fix 3) — test-only switch: the FIRST folded
+    /// -extra tombstone batch attempt fails (the hook, not the store, returns
+    /// the failure), so the checked warn + exactly-once retry path is
+    /// exercised end-to-end. Self-disarming (reset on use), per-instance.
+    #[cfg(test)]
+    force_tombstone_failure_once: bool,
     /// #1977 codex round 3 — test-only switch that resets the firing monitor's
     /// rate window right before phase-2 accounting, simulating a concurrent
     /// `monitor/resume` landing in the unlocked gap (defect 2). Per-instance.
@@ -13506,6 +13522,23 @@ fn is_terminal_kind_continuation(item: &QueuedMasterContinuation) -> bool {
 /// describes its own group). The folded batch is summarized into
 /// `coalesced_children` / `coalesced_count` metadata and tombstoned in the
 /// supervisor store so a restart does not replay them.
+///
+/// #1707 round 4 (codex Should-fix 1/2/3):
+/// - Should-fix 1 — the carrier inside the batch is the `ScatterJoinComplete`
+///   with the HIGHEST `sequence` (i.e. the LATEST join epoch): batch items
+///   arrive oldest-first (`take_pending_terminal_for_scope` sorts by
+///   sequence; the kept-order partition preserves it), and the first-scatter
+///   pick used to hand the master epoch 0's stale `terminal_children` while
+///   the newer epochs were tombstoned.
+/// - Should-fix 2 — `coalesced_count` counts UNIQUE child agent ids among
+///   folded `ChildCompleted` rows; folded `ScatterJoinComplete` items are
+///   CONTROL rows (rendered compactly, never counted). Every folded child's
+///   id + status + group + workspace ALWAYS appears in `coalesced_children`;
+///   the char budget applies to summaries only, each omitted summary bumps
+///   `omitted_summary_count`.
+/// - Should-fix 3 — the extras' tombstones go down in ONE batched append
+///   (`SupervisorStore::record_continuations_coalesced`, a single append
+///   lock), with checked errors, a warn, and exactly one retry.
 fn coalesce_terminal_continuations(
     state: &mut AutonomyRuntimeState,
     session_id: &SessionKey,
@@ -13587,9 +13620,21 @@ fn coalesce_terminal_continuations(
         *kept = others;
         return;
     }
+    // Should-fix 1 — carrier = the LATEST-sequence `ScatterJoinComplete` in
+    // the batch. The batch is ordered oldest-first (the take sorts by
+    // sequence and the kept partition preserves queue order), so the FIRST
+    // scatter is also the OLDEST join epoch: picking it tombstones the newer
+    // epochs while the master receives epoch-0's stale `terminal_children`.
+    // Max-sequence selection makes the carrier's OWN join metadata (epoch in
+    // the dedupe key, `terminal_children`) the latest by construction, so no
+    // cross-carrier metadata merge is needed. Fallback (no scatter): the
+    // first terminal item, as before.
     let primary_idx = batch
         .iter()
-        .position(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+        .enumerate()
+        .filter(|(_, item)| item.reason == MasterContinuationReason::ScatterJoinComplete)
+        .max_by_key(|(_, item)| item.sequence)
+        .map(|(idx, _)| idx)
         .unwrap_or(0);
     let mut primary = batch.remove(primary_idx);
     let now = now_ms_u64();
@@ -13633,46 +13678,91 @@ fn coalesce_terminal_continuations(
         .get("coalesced_count")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    let existing_omitted: usize = primary
+        .metadata
+        .get("omitted_summary_count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     let mut rendered = existing_children
         .as_deref()
         .map(str::len)
         .unwrap_or_default();
     let mut lines: Vec<String> = existing_lines;
+    // Should-fix 2 — `coalesced_count` counts UNIQUE child agent ids among
+    // folded `ChildCompleted` rows (deduped per fold; a previously folded
+    // carrier's base count carries over as before). Folded
+    // `ScatterJoinComplete` items are CONTROL rows — rendered compactly,
+    // never counted as child terminations.
     let mut folded = existing_count;
+    let mut omitted = existing_omitted;
+    let mut counted_children: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut folded_keys: Vec<String> = Vec::new();
     for item in &batch {
-        folded += 1;
-        let child = item
-            .child_agent_id
-            .as_ref()
-            .map(|id| id.as_str().to_owned())
-            .unwrap_or_else(|| item.group_id.as_str().to_owned());
-        let status = item.metadata.get("status").cloned().unwrap_or_default();
-        let summary = item
-            .metadata
-            .get("summary")
-            .map(|text| {
-                text.chars()
-                    .take(COALESCED_CHILD_SUMMARY_CHARS)
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
         // Every folded line carries its group AND workspace so the carrier
         // prompt preserves full scope identity for each folded child (#1707:
         // the blocker's "完整保留每项的 group/workspace"). Workspace is
         // rendered as `none` when absent — the whole batch shares the
         // carrier's workspace, so this stays informative, not noisy.
-        let line = format!(
-            "{child} [{reason} {status}] {summary} [group {group}] [workspace {workspace}]",
-            reason = master_continuation_reason_wire_name(&item.reason),
-            group = item.group_id.as_str(),
-            workspace = item_workspace(item).unwrap_or("none"),
-        );
-        if rendered + line.len() <= COALESCED_CHILDREN_MAX_CHARS {
-            rendered += line.len();
-            if !lines.contains(&line) {
+        match item.reason {
+            MasterContinuationReason::ScatterJoinComplete => {
+                // Control metadata, not a child row. Compact and ALWAYS
+                // included: the carrier only needs to know which join epochs
+                // folded into it. Not counted in `coalesced_count`, never
+                // toward `omitted_summary_count`.
+                let join_key = item.dedupe_key.as_str();
+                let join_key_short = join_key.strip_prefix("scatter_join/").unwrap_or(join_key);
+                lines.push(format!(
+                    "{join_key_short} [scatter_join joined] [group {group}] [workspace {workspace}]",
+                    group = item.group_id.as_str(),
+                    workspace = item_workspace(item).unwrap_or("none"),
+                ));
+            }
+            MasterContinuationReason::ChildCompleted => {
+                let child = item
+                    .child_agent_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned())
+                    .unwrap_or_else(|| item.group_id.as_str().to_owned());
+                if counted_children.insert(child.clone()) {
+                    folded += 1;
+                }
+                let status = item.metadata.get("status").cloned().unwrap_or_default();
+                // The id/status/group/workspace skeleton is NEVER budget-
+                // dropped: every folded child's identity must reach the
+                // master (Should-fix 2 — no silent truncation of subjects).
+                let skeleton = format!(
+                    "{child} [{reason} {status}] [group {group}] [workspace {workspace}]",
+                    reason = master_continuation_reason_wire_name(&item.reason),
+                    group = item.group_id.as_str(),
+                    workspace = item_workspace(item).unwrap_or("none"),
+                );
+                // The budget applies to SUMMARIES only: once the running
+                // total exceeds the cap, later lines render as the bare
+                // skeleton and each omitted summary is counted so the
+                // prompt note can disclose the truncation explicitly.
+                let summary = item
+                    .metadata
+                    .get("summary")
+                    .map(|text| {
+                        text.chars()
+                            .take(COALESCED_CHILD_SUMMARY_CHARS)
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let line = if summary.is_empty() {
+                    skeleton
+                } else if rendered + skeleton.len() + 1 + summary.len()
+                    <= COALESCED_CHILDREN_MAX_CHARS
+                {
+                    rendered += skeleton.len() + 1 + summary.len();
+                    format!("{skeleton} {summary}")
+                } else {
+                    omitted += 1;
+                    skeleton
+                };
                 lines.push(line);
             }
+            _ => {}
         }
         folded_keys.push(item.dedupe_key.as_str().to_owned());
     }
@@ -13685,6 +13775,13 @@ fn coalesce_terminal_continuations(
     primary
         .metadata
         .insert("coalesce_generation".to_owned(), generation.to_string());
+    if omitted > 0 {
+        primary
+            .metadata
+            .insert("omitted_summary_count".to_owned(), omitted.to_string());
+    } else {
+        primary.metadata.remove("omitted_summary_count");
+    }
     // #1707 (codex Blocker 1) — DURABILITY FIRST. The extras' Completed
     // tombstones below are the point of no return: once written, a restart
     // re-enqueues ONLY records still `Queued`. Persist the carrier's UPDATED
@@ -13729,6 +13826,14 @@ fn coalesce_terminal_continuations(
         } else {
             primary.metadata.remove("coalesced_count");
         }
+        if existing_omitted > 0 {
+            primary.metadata.insert(
+                "omitted_summary_count".to_owned(),
+                existing_omitted.to_string(),
+            );
+        } else {
+            primary.metadata.remove("omitted_summary_count");
+        }
         if generation > 1 {
             primary.metadata.insert(
                 "coalesce_generation".to_owned(),
@@ -13742,26 +13847,95 @@ fn coalesce_terminal_continuations(
         *kept = others;
         return;
     }
-    // Carrier is durable — NOW tombstone each folded extra. A tombstone-write
+    // Carrier is durable — NOW tombstone the folded extras. A tombstone-write
     // failure is NOT undone: the extra stays `Queued` and is re-enqueued on
     // restart, which is the safe direction (a duplicate notification, never a
     // lost one).
+    //
+    // Should-fix 3 — ONE batched append instead of N per-item appends: the
+    // fold runs under the global `AutonomyRuntimeState` lock, so N
+    // independent `record_continuation_completed` calls serialised N
+    // file-lock waits (and up to N snapshot compactions) while every
+    // orchestrator operation blocked. `record_continuations_coalesced`
+    // acquires the store append lock ONCE for the whole batch. Failures are
+    // checked, warned, and retried exactly once (the codex text's floor:
+    // "至少对失败记录 error/warn 并安排重试"). The retry rewrites the FULL
+    // batch; every entry's event id is stable (`continuation_completed:
+    // {group}:{id}:{completed_at_ms}`), so replay's `applied_event_ids`
+    // dedup makes rewriting an already-persisted entry a no-op — no
+    // double-application from a partial first batch.
+    //
+    // Test hook: "fail" the FIRST batch attempt without touching the store
+    // (self-disarming flag read + cleared BEFORE borrowing the store), so
+    // the checked warn + exactly-once retry path below is exercised
+    // end-to-end.
+    #[cfg(test)]
+    let force_first_attempt_failure = {
+        let armed = state.force_tombstone_failure_once;
+        if armed {
+            state.force_tombstone_failure_once = false;
+        }
+        armed
+    };
     if let Some(store) = state.supervisor_store.as_ref() {
-        for key in &folded_keys {
-            if let Err(err) = store.record_continuation_completed(
-                carrier_group.as_str(),
-                key,
-                now,
-                Some(format!("coalesced into {}", primary.dedupe_key.as_str())),
-            ) {
+        let result = format!("coalesced into {}", primary.dedupe_key.as_str());
+        let entries: Vec<CoalescedTombstoneEntry> = folded_keys
+            .iter()
+            .map(|key| CoalescedTombstoneEntry {
+                group_id: carrier_group.clone(),
+                continuation_id: key.clone(),
+                completed_at_ms: now,
+                result: result.clone(),
+            })
+            .collect();
+        #[cfg(test)]
+        let needs_first_attempt = {
+            if force_first_attempt_failure {
+                tracing::warn!(
+                    session_key = %session_id.0,
+                    profile_id = %profile_id,
+                    carrier = %primary.dedupe_key.as_str(),
+                    count = entries.len(),
+                    "folded-extra tombstone batch failed (forced, test hook); \
+                     retrying the batch once"
+                );
+                if let Err(err) = store.record_continuations_coalesced(&entries) {
+                    tracing::warn!(
+                        ?err,
+                        session_key = %session_id.0,
+                        profile_id = %profile_id,
+                        carrier = %primary.dedupe_key.as_str(),
+                        count = entries.len(),
+                        "folded-extra tombstone batch retry also failed; the extras may \
+                         re-appear after a restart (safe direction — duplicate, not loss)"
+                    );
+                }
+                false
+            } else {
+                true
+            }
+        };
+        #[cfg(not(test))]
+        let needs_first_attempt = true;
+        if needs_first_attempt && let Err(err) = store.record_continuations_coalesced(&entries) {
+            tracing::warn!(
+                ?err,
+                session_key = %session_id.0,
+                profile_id = %profile_id,
+                carrier = %primary.dedupe_key.as_str(),
+                count = entries.len(),
+                "folded-extra tombstone batch failed; retrying the batch once \
+                 (already-persisted entries dedup on replay)"
+            );
+            if let Err(err) = store.record_continuations_coalesced(&entries) {
                 tracing::warn!(
                     ?err,
                     session_key = %session_id.0,
                     profile_id = %profile_id,
-                    folded_key = %key,
                     carrier = %primary.dedupe_key.as_str(),
-                    "folded-extra tombstone write failed; the extra may re-appear \
-                     after a restart (safe direction — duplicate, not loss)"
+                    count = entries.len(),
+                    "folded-extra tombstone batch retry also failed; the extras may \
+                     re-appear after a restart (safe direction — duplicate, not loss)"
                 );
             }
         }
@@ -15408,12 +15582,31 @@ pub(crate) fn master_continuation_reason_name(reason: &MasterContinuationReason)
 }
 
 /// Rendered when the drain site folded further terminal marks into this
-/// continuation (see `coalesce_terminal_continuations`).
+/// continuation (see `coalesced_terminal_continuations`). `coalesced_count`
+/// counts UNIQUE child terminations (folded `ScatterJoinComplete` items are
+/// control rows, not counted — #1707 round 4, codex Should-fix 2). When the
+/// summary budget forced summaries off later lines, `omitted_summary_count`
+/// discloses the truncation explicitly: every child's id and status is still
+/// listed.
 fn coalesced_children_note(continuation: &QueuedMasterContinuation) -> String {
     match continuation.metadata.get("coalesced_count") {
-        Some(count) => format!(
-            "\n\nNOTE: {count} further child termination(s) were folded into this single notice (see `coalesced_children` in Metadata). Cover ALL of them in ONE update; no separate turn will arrive for them."
-        ),
+        Some(count) => {
+            let omitted = continuation
+                .metadata
+                .get("omitted_summary_count")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let omission = if omitted > 0 {
+                format!(
+                    " {omitted} summary(ies) were omitted for length; all child ids and statuses are listed."
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "\n\nNOTE: {count} unique child termination(s) were folded into this single notice (see `coalesced_children` in Metadata). Cover ALL of them in ONE update; no separate turn will arrive for them.{omission}"
+            )
+        }
         None => String::new(),
     }
 }
@@ -21022,9 +21215,16 @@ mod tests {
             carrier.reason,
             MasterContinuationReason::ScatterJoinComplete
         );
+        // #1707 round 4 (codex Should-fix 2): `coalesced_count` now counts
+        // UNIQUE folded child agent ids (this burst has 3), NOT every folded
+        // item — folded ScatterJoinComplete items are control rows, so the
+        // old `pending_before - 1` assertion (which counted the folded
+        // scatters as child terminations) is no longer correct.
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
-            Some((pending_before - 1).to_string().as_str())
+            Some("3"),
+            "coalesced_count counts unique folded child ids (was pending_before - 1 = {} before Should-fix 2)",
+            pending_before - 1
         );
         let folded = carrier
             .metadata
@@ -21090,13 +21290,19 @@ mod tests {
             1,
         );
         assert_eq!(drained.len(), 1, "exactly one carrier");
+        // #1707 round 4 (codex Should-fix 2): `coalesced_count` now counts
+        // UNIQUE folded child agent ids (this burst has 3), NOT every folded
+        // item — folded ScatterJoinComplete items are control rows, so the
+        // old `pending_before - 1` assertion is no longer correct.
         assert_eq!(
             drained[0]
                 .metadata
                 .get("coalesced_count")
                 .map(String::as_str),
-            Some((pending_before - 1).to_string().as_str()),
-            "the live carrier carries the folded count"
+            Some("3"),
+            "the live carrier carries the folded unique-child count \
+             (was pending_before - 1 = {} before Should-fix 2)",
+            pending_before - 1
         );
         drop(drained);
         drop(orchestrator);
@@ -21114,10 +21320,12 @@ mod tests {
         );
         assert_eq!(restored.len(), 1, "the carrier restores as one item");
         let carrier = &restored[0];
+        // Should-fix 2 semantics: unique folded child ids (3), not every
+        // folded item (`pending_before - 1` counted the folded scatters).
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
-            Some((pending_before - 1).to_string().as_str()),
-            "the RESTORED carrier must carry the durable folded count"
+            Some("3"),
+            "the RESTORED carrier must carry the durable folded unique-child count"
         );
         let children = carrier
             .metadata
@@ -21244,6 +21452,328 @@ mod tests {
         );
         // Explicit disarm (defensive; the flag is per-orchestrator instance).
         orchestrator.set_force_coalesce_persist_failure_for_test(false);
+    }
+
+    /// #1707 round 4 (codex Should-fix 1) — the codex scenario: agents
+    /// complete ONE BY ONE, each terminal mark enqueuing a fresh
+    /// ScatterJoinComplete (later epochs supersede earlier ones). The fold's
+    /// carrier must be the LATEST-sequence scatter — its dedupe key carries
+    /// the HIGHEST join epoch and its `terminal_children` equals the FINAL
+    /// count (3), NOT epoch 0's stale count of 1.
+    #[test]
+    fn carrier_uses_latest_scatter_epoch_metadata() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-ls", "api", "latest-scatter");
+        for idx in 0..3 {
+            let agent_id = format!("task-latest-{idx}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: format!("ls-{idx}"),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(format!("done {idx}")),
+                cwd: None,
+                profile_id: "tenant-ls".to_owned(),
+            });
+        }
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-ls",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "exactly one carrier");
+        let carrier = &drained[0];
+        assert_eq!(
+            carrier.reason,
+            MasterContinuationReason::ScatterJoinComplete,
+            "a scatter carrier must win over ChildCompleted items"
+        );
+        let epoch: u64 = carrier
+            .dedupe_key
+            .as_str()
+            .rsplit('/')
+            .next()
+            .and_then(|segment| segment.parse::<u64>().ok())
+            .expect("the scatter dedupe key's last segment is the join epoch");
+        assert_eq!(
+            epoch,
+            2,
+            "the carrier must be the LATEST-epoch scatter (0,1,2), not the oldest; key={}",
+            carrier.dedupe_key.as_str()
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("terminal_children")
+                .map(String::as_str),
+            Some("3"),
+            "the latest epoch saw all 3 children terminal — not epoch 0's stale count of 1"
+        );
+        // The folded superseded scatters ride along as CONTROL rows.
+        let folded = carrier
+            .metadata
+            .get("coalesced_children")
+            .expect("folded list");
+        assert!(
+            folded.contains("[scatter_join joined]"),
+            "superseded scatters fold as control rows: {folded}"
+        );
+    }
+
+    /// #1707 round 4 (codex Should-fix 2) — `coalesced_count` counts UNIQUE
+    /// child agent ids among folded ChildCompleted items. A 3-child burst
+    /// folds 5 extras (3 children + 2 superseded scatters) yet must report 3
+    /// — the old all-items count reported 5 "child terminations". And with
+    /// two distinct-cwd groups in one session, each workspace's carrier
+    /// counts only its own scope's children.
+    #[test]
+    fn coalesced_count_counts_unique_children_not_scatters() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-uc", "api", "unique-count");
+        for idx in 0..3 {
+            let agent_id = format!("task-unique-{idx}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: format!("uc-{idx}"),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(format!("done {idx}")),
+                cwd: None,
+                profile_id: "tenant-uc".to_owned(),
+            });
+        }
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-uc",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "exactly one carrier");
+        let carrier = &drained[0];
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("3"),
+            "3 unique children folded — the 2 superseded scatter control rows must NOT count"
+        );
+        let folded = carrier
+            .metadata
+            .get("coalesced_children")
+            .expect("folded list");
+        assert!(
+            folded.matches("[scatter_join joined]").count() >= 2,
+            "both superseded scatters render as control rows: {folded}"
+        );
+
+        // Two distinct-cwd groups in ONE session: per-scope counts stay
+        // per-group (2 unique children each, not 4 shared).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-ug", "api", "unique-grouped");
+        for cwd in ["/tmp/ug-a", "/tmp/ug-b"] {
+            for idx in 0..2 {
+                let agent_id = format!("task-{cwd}-{idx}").replace('/', "-");
+                orchestrator.upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: agent_id.clone(),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {agent_id}")),
+                    cwd: Some(cwd.to_owned()),
+                    profile_id: "tenant-ug".to_owned(),
+                });
+            }
+        }
+        let first = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-ug",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        let second = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-ug",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        for carrier in [&first[0], &second[0]] {
+            assert_eq!(
+                carrier.reason,
+                MasterContinuationReason::ScatterJoinComplete
+            );
+            assert_eq!(
+                carrier.metadata.get("coalesced_count").map(String::as_str),
+                Some("2"),
+                "each workspace's carrier counts ONLY its own scope's unique children"
+            );
+        }
+    }
+
+    /// #1707 round 4 (codex Should-fix 2) — the 6000-char budget must never
+    /// silently drop a folded child's identity. 60 children with ~160-char
+    /// summaries blow past COALESCED_CHILDREN_MAX_CHARS: EVERY child id +
+    /// status must still appear in `coalesced_children`, later summaries are
+    /// omitted with `omitted_summary_count` recorded, and the prompt note
+    /// discloses the omission.
+    #[test]
+    fn folded_children_never_silently_truncated() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-nt", "api", "no-truncate");
+        let summary: String = "s".repeat(COALESCED_CHILD_SUMMARY_CHARS + 20);
+        for idx in 0..60 {
+            let agent_id = format!("task-nt-{idx}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: format!("nt-{idx}"),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(summary.clone()),
+                cwd: None,
+                profile_id: "tenant-nt".to_owned(),
+            });
+        }
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-nt",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(
+            drained.len(),
+            1,
+            "exactly one carrier, got {}",
+            drained.len()
+        );
+        let carrier = &drained[0];
+        let folded = carrier
+            .metadata
+            .get("coalesced_children")
+            .expect("folded list");
+        for idx in 0..60 {
+            let child = format!("task-nt-{idx}");
+            assert!(
+                folded.contains(&format!("{child} [child_completed completed]")),
+                "every folded child's id + status must appear regardless of the budget; missing {child} in:\n{folded}"
+            );
+        }
+        let omitted: usize = carrier
+            .metadata
+            .get("omitted_summary_count")
+            .expect("omitted_summary_count must be recorded when the budget forced omissions")
+            .parse()
+            .expect("omitted_summary_count is an integer string");
+        assert!(
+            omitted > 0,
+            "60 children x ~160-char summaries exceed the budget; some summaries must be omitted"
+        );
+        let prompt = master_continuation_prompt(carrier);
+        assert!(
+            prompt.contains("omitted"),
+            "the prompt note must disclose the omission: {prompt}"
+        );
+        assert!(
+            prompt.contains("all child ids and statuses are listed"),
+            "the note must reassure that identities were not dropped: {prompt}"
+        );
+    }
+
+    /// #1707 round 4 (codex Should-fix 3) — the folded-extra tombstone batch
+    /// is CHECKED and retried exactly once on failure. With the
+    /// `force_tombstone_failure_once` hook armed, the first batch attempt
+    /// "fails" (warn), the retry succeeds, and the extras stay tombstoned:
+    /// a fresh orchestrator over the same store does NOT re-enqueue them.
+    #[test]
+    fn tombstone_failure_warns_and_retries_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-tf", "api", "tombstone-retry");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        for idx in 0..3 {
+            let agent_id = format!("task-tf-{idx}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: format!("tf-{idx}"),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(format!("done {idx}")),
+                cwd: None,
+                profile_id: "tenant-tf".to_owned(),
+            });
+        }
+        orchestrator.set_force_tombstone_failure_once_for_test(true);
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-tf",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(
+            drained.len(),
+            1,
+            "the fold still completes (retry succeeded)"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-tf"),
+            0,
+            "nothing pending after the fold"
+        );
+        drop(orchestrator);
+
+        // Fresh orchestrator on the SAME store: the retry must have
+        // persisted the tombstones — only the un-dispatched carrier
+        // re-enqueues, the folded extras do NOT re-appear.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let drained_fresh = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-tf",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            drained_fresh.len(),
+            1,
+            "only the carrier re-enqueues; the retry tombstoned every extra; drained {:?}",
+            drained_fresh
+                .iter()
+                .map(|item| item.dedupe_key.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            drained_fresh[0].reason,
+            MasterContinuationReason::ScatterJoinComplete
+        );
+        assert!(
+            drained_fresh[0].metadata.contains_key("coalesced_children"),
+            "the restored carrier still carries the folded metadata"
+        );
     }
 
     /// #1707: terminal coalescing batches by continuation GROUP. Two
@@ -21410,11 +21940,16 @@ mod tests {
                 .metadata
                 .get("coalesced_children")
                 .expect("folded list");
+            // #1707 round 4 (codex Should-fix 2): `coalesced_count` counts
+            // UNIQUE folded child agent ids — each workspace's carrier folds
+            // its 2 children (the superseded same-workspace scatter folds as
+            // a CONTROL row and is not counted), so the old count of 3
+            // (which included the folded scatter) is no longer correct.
             assert_eq!(
                 carrier.metadata.get("coalesced_count").map(String::as_str),
-                Some("3"),
-                "each carrier folds its workspace's other ChildCompleted + \
-                 the remaining child + its ScatterJoinComplete, all same-scope"
+                Some("2"),
+                "each carrier folds its workspace's 2 unique children \
+                 (scatter control rows are not counted since Should-fix 2)"
             );
             for idx in 0..2 {
                 let own_child = format!("task-{own_ws}-{idx}").replace('/', "-");

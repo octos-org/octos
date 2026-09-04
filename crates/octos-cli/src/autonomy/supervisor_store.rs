@@ -345,6 +345,16 @@ pub enum SupervisorEvent {
     },
 }
 
+/// One folded-extra tombstone in a coalesced terminal-continuation fold
+/// (#1707 round 4). `result` names the carrier the extra folded into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoalescedTombstoneEntry {
+    pub group_id: String,
+    pub continuation_id: String,
+    pub completed_at_ms: u64,
+    pub result: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SupervisorEventLedgerRow {
     pub event_id: String,
@@ -1190,6 +1200,68 @@ impl SupervisorStore {
                 result,
             },
         )
+    }
+
+    /// One coalesced-fold tombstone (a folded extra, marked `Completed` with
+    /// `result` naming the carrier it folded into).
+    ///
+    /// #1707 round 4 (codex Should-fix 3): the terminal-coalesce fold used to
+    /// issue one `record_continuation_completed` per extra — N independent
+    /// append-lock acquisitions serialised inside the orchestrator state
+    /// lock. [`SupervisorStore::record_continuations_coalesced`] now appends
+    /// the whole batch under ONE append lock (one lock wait, at most one
+    /// snapshot compaction).
+    pub fn record_continuations_coalesced(
+        &self,
+        entries: &[CoalescedTombstoneEntry],
+    ) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Single-append-lock batch: mirror `append_event`'s lock + seq-cache
+        // pattern, then assign consecutive sequences and write each row.
+        // Every entry keeps its own STABLE event id (keyed on the
+        // continuation id + completed_at_ms) so replay's `applied_event_ids`
+        // dedup makes a partial batch + caller retry idempotent per entry.
+        let _lock = self.acquire_append_lock()?;
+        let mut cache = self.lock_seq_cache();
+        self.refresh_seq_cache_locked(&mut cache)?;
+        let mut sequence = cache.last_sequence;
+        let result = (|| -> io::Result<()> {
+            for entry in entries {
+                sequence = sequence.saturating_add(1);
+                let row = SupervisorEventLedgerRow {
+                    event_id: format!(
+                        "continuation_completed:{}:{}:{}",
+                        entry.group_id, entry.continuation_id, entry.completed_at_ms
+                    ),
+                    sequence,
+                    recorded_at_ms: unix_time_millis(),
+                    event: SupervisorEvent::ContinuationCompleted {
+                        group_id: entry.group_id.clone(),
+                        continuation_id: entry.continuation_id.clone(),
+                        completed_at_ms: entry.completed_at_ms,
+                        result: Some(entry.result.clone()),
+                    },
+                };
+                self.append_row_locked(&row, &mut cache)?;
+            }
+            Ok(())
+        })();
+        if self.snapshot_every_appends > 0 && cache.ledger_rows >= self.snapshot_every_appends {
+            if let Err(err) = self.snapshot_and_compact_locked(&mut cache) {
+                // Mirror `append_event`: a failed compaction never fails the
+                // already-durable appends; the threshold stays exceeded so a
+                // later append retries.
+                tracing::warn!(
+                    error = %err,
+                    events_path = %self.events_path.display(),
+                    "supervisor ledger auto-compaction failed; will retry on a later append"
+                );
+            }
+        }
+        result?;
+        Ok(())
     }
 
     /// Whole-line append (append lock must be held — EVERY events-file write
