@@ -1209,12 +1209,17 @@ pub async fn provider_models(
     }
     // Protocol-aware discovery shared with the AppUI `profile/llm/
     // fetch_models` surface — the strategy resolves from the route (api_type
-    // override, then the family's declared protocol), never from the literal
-    // family id, so the two clients cannot drift.
-    let discovery =
-        octos_llm::discovery::resolve_model_discovery(Some(&req.provider), req.api_type.as_deref());
+    // override, then the family's declared protocol — per-model for families
+    // like r9s that pick the wire protocol by model name), never from the
+    // literal family id, so the two clients cannot drift.
+    let route = octos_llm::discovery::resolve_model_discovery(
+        Some(&req.provider),
+        req.api_type.as_deref(),
+        (!req.model.trim().is_empty()).then_some(req.model.trim()),
+        req.base_url.as_deref(),
+    );
     let outcome = octos_llm::discovery::discover_models(
-        discovery,
+        &route,
         &api_key,
         req.base_url.as_deref(),
         Some(&req.provider),
