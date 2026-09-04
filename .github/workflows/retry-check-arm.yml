@@ -4,9 +4,10 @@ name: retry-nightly-arm
 # step. A dead runner cannot retry itself, so this companion workflow retries
 # that narrow infrastructure case from outside the nightly workflow.
 #
-# Test, compiler, linker, timeout, and disk failures all leave a failed step and
-# are deliberately NOT retried. This prevents the old behavior that reran an
-# actionable ENOSPC failure three times and delayed the nightly by hours.
+# Discriminator: a killed runner uploads NO logs, while actionable failures
+# (compiler, linker, timeout, disk/ENOSPC) always write them. Retry ONLY the
+# log-absence signature; everything that wrote logs is an actionable failure
+# and is NOT retried — so a real ENOSPC no longer burns ARM runs.
 
 on:
   workflow_run:
@@ -43,15 +44,21 @@ jobs:
           fi
           JOB_ID=$(echo "${INFO}" | cut -f1)
           ATTEMPT=$(echo "${INFO}" | cut -f2)
-          FAILED_STEPS=$(echo "$JOBS" | jq \
-            '[.jobs[] | select(.id == '"${JOB_ID}"') | .steps[]? | select(.conclusion == "failure")] | length')
-          if [ "$FAILED_STEPS" -gt 0 ]; then
-            echo "ARM job contains ${FAILED_STEPS} failed step(s); this is an actionable failure, not runner loss."
+          # Death signature: a killed runner uploads no logs (the deleted ci.yml
+          # memo's own marker — empirically 5/5 historical runner deaths left a
+          # failed step behind, so step-count-based discrimination never fires
+          # on the case this retry exists for). Retry only the log-absence
+          # signature; everything that wrote logs is actionable.
+          LOG_BYTES=$(gh api \
+            "repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" \
+            2>/dev/null | wc -c || echo 0)
+          if [ "${LOG_BYTES}" -gt 200 ]; then
+            echo "ARM job wrote ${LOG_BYTES} bytes of logs; actionable failure, not runner loss."
             exit 0
           fi
           if [ "${ATTEMPT}" -ge 2 ]; then
             echo "ARM job is at attempt ${ATTEMPT} (>= 2) — not retrying again."
             exit 0
           fi
-          echo "Rerunning vanished ARM job ${JOB_ID} once (attempt ${ATTEMPT})."
+          echo "Rerunning log-less ARM job ${JOB_ID} once (attempt ${ATTEMPT})."
           gh run rerun --repo "${{ github.repository }}" --job "${JOB_ID}"
