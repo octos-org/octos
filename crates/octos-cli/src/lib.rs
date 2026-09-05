@@ -74,10 +74,10 @@ pub mod memory_consolidate;
 pub mod memory_refresh;
 #[cfg(feature = "api")]
 pub mod monitor;
-#[cfg(feature = "api")]
-pub mod otp;
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod obs_events;
+#[cfg(feature = "api")]
+pub mod otp;
 // Peer recovery is also used by gateway actors without `api`. The remaining
 // staging and OUP transport helpers are intentionally dormant in that build.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
