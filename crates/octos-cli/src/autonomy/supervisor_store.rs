@@ -924,10 +924,12 @@ pub struct SupervisorStore {
     /// Live-ledger row count that triggers snapshot + compaction on append;
     /// `0` disables auto-compaction.
     snapshot_every_appends: u64,
-    /// `Some(n)`: fsync the events file every n-th `append_event`;
+    /// `Some(n)`: fsync after n sequenced rows (at a batch's end);
     /// `None` (default): appends are never fsynced (see `append_ledger_row`).
     append_fsync_every: Option<u64>,
     seq_cache: Arc<Mutex<SeqCache>>,
+    #[cfg(test)]
+    append_io: Arc<Mutex<tests::AppendIoProbe>>,
 }
 
 #[derive(Debug)]
@@ -951,6 +953,8 @@ impl SupervisorStore {
             snapshot_every_appends: SNAPSHOT_EVERY_APPENDS,
             append_fsync_every: None,
             seq_cache: Arc::new(Mutex::new(SeqCache::default())),
+            #[cfg(test)]
+            append_io: Arc::new(Mutex::new(tests::AppendIoProbe::default())),
             root_dir,
         }
     }
@@ -962,10 +966,11 @@ impl SupervisorStore {
         self
     }
 
-    /// Opt into batched append durability: fsync the events file every
-    /// `every`-th `append_event`. `0` keeps the default (no append fsync —
-    /// the documented trade-off on `append_ledger_row`). Snapshots are always
-    /// fsynced regardless of this setting.
+    /// Opt into batched append durability: fsync after `every` sequenced
+    /// rows. A multi-row append that crosses the threshold syncs its whole
+    /// batch once, leaving no unsynced remainder. `0` keeps the default (no
+    /// append fsync — the documented trade-off on `append_ledger_row`).
+    /// Snapshots are always fsynced regardless of this setting.
     pub fn with_append_fsync_every(mut self, every: u64) -> Self {
         self.append_fsync_every = (every > 0).then_some(every);
         self
@@ -1471,8 +1476,9 @@ impl SupervisorStore {
     /// issue one `record_continuation_completed` per extra — N independent
     /// append-lock acquisitions serialised inside the orchestrator state
     /// lock. [`SupervisorStore::record_continuations_coalesced`] now appends
-    /// the whole batch under ONE append lock (one lock wait, at most one
-    /// snapshot compaction).
+    /// the whole batch under ONE append lock with one ledger open,
+    /// `write_all`, and flush (one lock wait, at most one snapshot compaction).
+    /// `/stop` tombstones use this same batch path.
     pub fn record_continuations_coalesced(
         &self,
         entries: &[CoalescedTombstoneEntry],
@@ -1481,7 +1487,7 @@ impl SupervisorStore {
             return Ok(());
         }
         // Single-append-lock batch: mirror `append_event`'s lock + seq-cache
-        // pattern, then assign consecutive sequences and write each row.
+        // pattern, then assign consecutive sequences and write one payload.
         // Every entry keeps its own STABLE event id (keyed on the
         // continuation id + completed_at_ms) so replay's `applied_event_ids`
         // dedup makes a partial batch + caller retry idempotent per entry.
@@ -1489,10 +1495,11 @@ impl SupervisorStore {
         let mut cache = self.lock_seq_cache();
         self.refresh_seq_cache_locked(&mut cache)?;
         let mut sequence = cache.last_sequence;
-        let result = (|| -> io::Result<()> {
-            for entry in entries {
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|entry| {
                 sequence = sequence.saturating_add(1);
-                let row = SupervisorEventLedgerRow {
+                SupervisorEventLedgerRow {
                     event_id: format!(
                         "continuation_completed:{}:{}:{}",
                         entry.group_id, entry.continuation_id, entry.completed_at_ms
@@ -1506,11 +1513,10 @@ impl SupervisorStore {
                         result: Some(entry.result.clone()),
                         attempt: entry.attempt,
                     },
-                };
-                self.append_row_locked(&row, &mut cache)?;
-            }
-            Ok(())
-        })();
+                }
+            })
+            .collect();
+        let result = self.append_rows_locked(&rows, &mut cache);
         if self.snapshot_every_appends > 0 && cache.ledger_rows >= self.snapshot_every_appends {
             if let Err(err) = self.snapshot_and_compact_locked(&mut cache) {
                 // Mirror `append_event`: a failed compaction never fails the
@@ -1527,7 +1533,11 @@ impl SupervisorStore {
         Ok(())
     }
 
-    /// Whole-line append (append lock must be held — EVERY events-file write
+    fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
+        self.write_rows_sealed_locked(std::slice::from_ref(row))
+    }
+
+    /// Whole-line batch append (append lock must be held — EVERY events-file write
     /// goes through here under the lock; an unlocked write could land between
     /// a concurrent compaction's "snapshot rows" and "rotate ledger" steps
     /// and be rotated away unreplayed). Returns the handle so callers can
@@ -1536,7 +1546,7 @@ impl SupervisorStore {
     /// Two repairs happen inline:
     /// - Torn tail: if the file is non-empty and does not end in a newline
     ///   (a crash split an earlier append), a `\n` is written first so this
-    ///   row can never concatenate onto the torn content. The torn bytes are
+    ///   batch can never concatenate onto the torn content. The torn bytes are
     ///   preserved, never truncated — they may be a complete row that merely
     ///   lost its terminator.
     /// - Fresh file: when this write CREATES the ledger (fresh store, or the
@@ -1545,16 +1555,17 @@ impl SupervisorStore {
     ///   batched append-fsync bound would be void (power loss could keep the
     ///   snapshot but lose the new ledger's directory entry).
     ///
-    /// The row and its terminator go down in a single `write_all`, keeping
-    /// the torn-write exposure to one syscall.
-    fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
+    /// All rows and their terminators share one `write_all`. A failed write
+    /// can still persist a prefix; replay tolerates a torn final row and
+    /// stable event IDs suppress already-written entries on caller retry.
+    fn write_rows_sealed_locked(&self, rows: &[SupervisorEventLedgerRow]) -> io::Result<File> {
         self.ensure_root_dir()?;
         let created = !self.events_path.exists();
         // #39 — the ledger append OPEN also sits on the compaction-adjacent
         // path (the file was just rotated; Windows reopens can hit the same
         // transient spectrum). Retry-wrapped on Windows, single-shot on unix.
         #[cfg(windows)]
-        let mut file = fs_retry(
+        let file = fs_retry(
             &RetryClock::default(),
             std::time::Duration::from_millis(fs_retry_total_ms()),
             || {
@@ -1571,7 +1582,7 @@ impl SupervisorStore {
             is_transient_windows_lock,
         )?;
         #[cfg(not(windows))]
-        let mut file = fs_ctx(
+        let file = fs_ctx(
             "events-append-open",
             &self.events_path,
             OpenOptions::new()
@@ -1580,6 +1591,10 @@ impl SupervisorStore {
                 .append(true)
                 .open(&self.events_path),
         )?;
+        #[cfg(test)]
+        let mut file = tests::ObservedAppendFile::new(file, Arc::clone(&self.append_io));
+        #[cfg(not(test))]
+        let mut file = file;
         #[cfg(windows)]
         let len = fs_retry(
             &RetryClock::default(),
@@ -1599,8 +1614,10 @@ impl SupervisorStore {
                 payload.push(b'\n');
             }
         }
-        serde_json::to_writer(&mut payload, row).map_err(invalid_data)?;
-        payload.push(b'\n');
+        for row in rows {
+            serde_json::to_writer(&mut payload, row).map_err(invalid_data)?;
+            payload.push(b'\n');
+        }
         // O_APPEND: the write lands at EOF regardless of the read seek above.
         fs_ctx(
             "events-row-write",
@@ -1615,34 +1632,52 @@ impl SupervisorStore {
                 fsync_dir(&self.root_dir),
             )?;
         }
+        #[cfg(test)]
+        let file = file.inner;
         Ok(file)
     }
 
-    /// Append a sequenced row while holding the append lock: write, apply
-    /// the batched fsync policy, and advance the in-memory cursor to the new
-    /// tail.
     fn append_row_locked(
         &self,
         row: &SupervisorEventLedgerRow,
         cache: &mut SeqCache,
     ) -> io::Result<()> {
-        let file = self.write_row_sealed_locked(row)?;
+        self.append_rows_locked(std::slice::from_ref(row), cache)
+    }
+
+    /// Write one sequenced batch, apply the fsync policy, and advance the
+    /// cursor only after the whole write succeeds. On any I/O error the next
+    /// append reseeds from disk, including a possibly persisted prefix.
+    fn append_rows_locked(
+        &self,
+        rows: &[SupervisorEventLedgerRow],
+        cache: &mut SeqCache,
+    ) -> io::Result<()> {
+        let Some(last) = rows.last() else {
+            return Ok(());
+        };
+        let row_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        cache.seeded = false;
+        // Count conservatively before I/O: even a failed write/flush may
+        // leave rows on disk. Keep their fsync debt until a successful sync
+        // so partial batches cannot silently extend the durability window.
+        if self.append_fsync_every.is_some() {
+            cache.appends_since_fsync = cache.appends_since_fsync.saturating_add(row_count);
+        }
+        let file = self.write_rows_sealed_locked(rows)?;
         if let Some(every) = self.append_fsync_every {
-            cache.appends_since_fsync = cache.appends_since_fsync.saturating_add(1);
             if cache.appends_since_fsync >= every {
+                #[cfg(test)]
+                {
+                    self.append_io.lock().unwrap().syncs += 1;
+                }
                 file.sync_data()?;
                 cache.appends_since_fsync = 0;
             }
         }
-        // #34f — release the events-file handle BEFORE the caller may
-        // compact: on Windows, renaming a file that still has an open handle
-        // fails, and `append_event`'s auto-compaction below renames exactly
-        // this file. POSIX tolerates the open handle, which is why the five
-        // snapshot tests were green on Linux and Os error 3 on Windows.
-        cache.last_sequence = cache.last_sequence.max(row.sequence);
         // Exact length of the file we just extended; nothing else can write
         // while we hold the lock.
-        cache.events_len = file.metadata()?.len();
+        let events_len = file.metadata()?.len();
         // #34f — release the events-file handle BEFORE the caller may
         // compact (metadata read above must come first): on Windows,
         // renaming a file that still has an open handle fails, and
@@ -1650,7 +1685,9 @@ impl SupervisorStore {
         // POSIX tolerates the open handle — the five snapshot tests were
         // green on Linux and Os error 3 on Windows for exactly this reason.
         drop(file);
-        cache.ledger_rows = cache.ledger_rows.saturating_add(1);
+        cache.last_sequence = cache.last_sequence.max(last.sequence);
+        cache.events_len = events_len;
+        cache.ledger_rows = cache.ledger_rows.saturating_add(row_count);
         cache.seeded = true;
         Ok(())
     }
@@ -2311,6 +2348,74 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Debug, Default)]
+    pub(super) struct AppendIoProbe {
+        opens: usize,
+        writes: usize,
+        flushes: usize,
+        pub(super) syncs: usize,
+        fail_after_first_row: bool,
+        fail_flush: bool,
+    }
+
+    /// Wrap the actual append handle, so counts follow real file operations
+    /// and the failure test leaves real bytes for a fresh store to replay.
+    pub(super) struct ObservedAppendFile {
+        pub(super) inner: File,
+        probe: Arc<Mutex<AppendIoProbe>>,
+    }
+
+    impl ObservedAppendFile {
+        pub(super) fn new(inner: File, probe: Arc<Mutex<AppendIoProbe>>) -> Self {
+            probe.lock().unwrap().opens += 1;
+            Self { inner, probe }
+        }
+    }
+
+    impl std::ops::Deref for ObservedAppendFile {
+        type Target = File;
+
+        fn deref(&self) -> &File {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for ObservedAppendFile {
+        fn deref_mut(&mut self) -> &mut File {
+            &mut self.inner
+        }
+    }
+
+    impl Write for ObservedAppendFile {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            let mut probe = self.probe.lock().unwrap();
+            probe.writes += 1;
+            if std::mem::take(&mut probe.fail_after_first_row) {
+                let first_row_end = buf.iter().position(|&byte| byte == b'\n').unwrap() + 1;
+                self.inner
+                    .write_all(&buf[..(first_row_end + 17).min(buf.len())])?;
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "injected partial ledger write",
+                ));
+            }
+            self.inner.write_all(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut probe = self.probe.lock().unwrap();
+            probe.flushes += 1;
+            if std::mem::take(&mut probe.fail_flush) {
+                return Err(io::Error::other("injected ledger flush failure"));
+            }
+            self.inner.flush()
+        }
+    }
+
     /// ###27-B2 — rename_replace error-classification pins (unix arm).
     mod replace_ops_27b2 {
         #[cfg(windows)]
@@ -3450,6 +3555,251 @@ mod tests {
             .record_heartbeat(test_ping("g", "c-4", "p-4", 4))
             .unwrap();
         assert_eq!(row.sequence, 4);
+    }
+
+    #[test]
+    fn coalesced_and_stop_batches_write_once_and_reload() {
+        for result in ["coalesced_into:carrier", "purged_by_stop"] {
+            let dir = TestDir::new("coalesced-stop-batch-io");
+            let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+            let entries = queued_tombstone_batch(&store, result);
+            *store.append_io.lock().unwrap() = AppendIoProbe::default();
+
+            store.record_continuations_coalesced(&entries).unwrap();
+
+            assert_append_io(&store, 1, 1, 1);
+            let rows = live_ledger_rows(&store);
+            assert_eq!(
+                rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5, 6]
+            );
+            let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+            assert_eq!(restored.last_sequence, 6);
+            for entry in &entries {
+                let continuation =
+                    &restored.continuations[&continuation_key("g", &entry.continuation_id)];
+                assert_eq!(continuation.status, ContinuationStatus::Completed);
+                assert_eq!(continuation.result.as_deref(), Some(result));
+            }
+            assert_eq!(store.lock_seq_cache().ledger_rows, 6);
+            assert_eq!(
+                store.lock_seq_cache().events_len,
+                fs::metadata(store.events_path()).unwrap().len()
+            );
+        }
+    }
+
+    fn queued_tombstone_batch(
+        store: &SupervisorStore,
+        result: &str,
+    ) -> Vec<CoalescedTombstoneEntry> {
+        (0..3)
+            .map(|index| {
+                let continuation_id = format!("continuation-{index}");
+                store
+                    .record_continuation_queued(PendingContinuationRecord {
+                        group_id: "g".to_string(),
+                        continuation_id: continuation_id.clone(),
+                        child_id: Some(format!("child-{index}")),
+                        prompt: None,
+                        status: ContinuationStatus::Queued,
+                        queued_at_ms: 1,
+                        started_at_ms: None,
+                        completed_at_ms: None,
+                        result: None,
+                        attempt: 1,
+                        metadata: SupervisorMetadata::new(),
+                    })
+                    .unwrap();
+                CoalescedTombstoneEntry {
+                    group_id: "g".to_string(),
+                    continuation_id,
+                    completed_at_ms: 42,
+                    result: result.to_string(),
+                    attempt: 1,
+                }
+            })
+            .collect()
+    }
+
+    fn assert_append_io(store: &SupervisorStore, opens: usize, writes: usize, flushes: usize) {
+        let probe = store.append_io.lock().unwrap();
+        assert_eq!(
+            (probe.opens, probe.writes, probe.flushes),
+            (opens, writes, flushes),
+            "append handle opens, write_all calls, flush calls"
+        );
+    }
+
+    #[test]
+    fn coalesced_batch_partial_write_retry_deduplicates_after_reload_and_compaction() {
+        let dir = TestDir::new("coalesced-batch-partial-write");
+        let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+        let mut entries = queued_tombstone_batch(&store, "coalesced_into:carrier");
+        *store.append_io.lock().unwrap() = AppendIoProbe {
+            fail_after_first_row: true,
+            ..AppendIoProbe::default()
+        };
+
+        let err = store.record_continuations_coalesced(&entries).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_append_io(&store, 1, 1, 0);
+        let partial = fs::read(store.events_path()).unwrap();
+        assert_ne!(partial.last(), Some(&b'\n'), "second row must be torn");
+        let recovered = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(recovered.last_sequence, 4);
+        assert_eq!(
+            recovered
+                .continuations
+                .values()
+                .filter(|record| record.status == ContinuationStatus::Completed)
+                .count(),
+            1
+        );
+
+        // Deliberately change the replayed payload: the stable event ID must
+        // preserve the prefix that reached disk even though the batch failed.
+        entries[0].result = "duplicate must not overwrite".to_string();
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_append_io(&store, 2, 2, 1);
+        assert_eq!(
+            live_ledger_rows(&store)
+                .iter()
+                .map(|row| row.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.last_sequence, 7);
+        assert_eq!(restored.applied_event_ids.len(), 6);
+        assert!(
+            restored
+                .continuations
+                .values()
+                .all(|record| record.status == ContinuationStatus::Completed)
+        );
+        assert_eq!(
+            restored.continuations[&continuation_key("g", "continuation-0")]
+                .result
+                .as_deref(),
+            Some("coalesced_into:carrier")
+        );
+        let event_ids: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "continuation_completed:{}:{}:{}",
+                    entry.group_id, entry.continuation_id, entry.completed_at_ms
+                )
+            })
+            .collect();
+        assert!(
+            event_ids
+                .iter()
+                .all(|event_id| restored.applied_event_ids.contains(event_id))
+        );
+
+        store.snapshot_now().unwrap();
+        let restarted = SupervisorStore::new(&dir.path);
+        restarted.record_continuations_coalesced(&entries).unwrap();
+        let after_snapshot_retry = restarted.load_state().unwrap();
+        assert_eq!(after_snapshot_retry.last_sequence, 10);
+        assert_eq!(after_snapshot_retry.continuations, restored.continuations);
+        assert_eq!(
+            after_snapshot_retry.applied_event_ids,
+            restored.applied_event_ids
+        );
+    }
+
+    #[test]
+    fn coalesced_batch_flush_failure_retries_above_written_sequences() {
+        let dir = TestDir::new("coalesced-batch-flush-failure");
+        let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+        let entries = queued_tombstone_batch(&store, "purged_by_stop");
+        *store.append_io.lock().unwrap() = AppendIoProbe {
+            fail_flush: true,
+            ..AppendIoProbe::default()
+        };
+
+        assert!(store.record_continuations_coalesced(&entries).is_err());
+        assert_eq!(
+            SupervisorStore::new(&dir.path)
+                .load_state()
+                .unwrap()
+                .last_sequence,
+            6
+        );
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_append_io(&store, 2, 2, 2);
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.last_sequence, 9);
+        assert_eq!(restored.applied_event_ids.len(), 6);
+        assert_eq!(store.lock_seq_cache().ledger_rows, 9);
+    }
+
+    #[test]
+    fn coalesced_batch_fsync_threshold_covers_the_whole_batch() {
+        let dir = TestDir::new("coalesced-batch-fsync");
+        let store = SupervisorStore::new(&dir.path)
+            .with_snapshot_every_appends(0)
+            .with_append_fsync_every(4);
+        let entries = queued_tombstone_batch(&store, "coalesced_into:carrier");
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 3);
+        *store.append_io.lock().unwrap() = AppendIoProbe::default();
+
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_eq!(store.append_io.lock().unwrap().syncs, 1);
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 0);
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_eq!(store.append_io.lock().unwrap().syncs, 1);
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 3);
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_eq!(store.append_io.lock().unwrap().syncs, 2);
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 0);
+        assert_append_io(&store, 3, 3, 3);
+        assert_eq!(
+            SupervisorStore::new(&dir.path)
+                .load_state()
+                .unwrap()
+                .last_sequence,
+            12
+        );
+    }
+
+    #[test]
+    fn coalesced_batch_seals_missing_newline_with_one_write() {
+        let dir = TestDir::new("coalesced-batch-missing-newline");
+        let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+        let entries = queued_tombstone_batch(&store, "coalesced_into:carrier");
+        let mut content = fs::read(store.events_path()).unwrap();
+        assert_eq!(content.pop(), Some(b'\n'));
+        fs::write(store.events_path(), &content).unwrap();
+        *store.append_io.lock().unwrap() = AppendIoProbe::default();
+
+        store.record_continuations_coalesced(&entries).unwrap();
+
+        assert_append_io(&store, 1, 1, 1);
+        assert_eq!(live_ledger_rows(&store).len(), 6);
+        assert_eq!(
+            SupervisorStore::new(&dir.path)
+                .load_state()
+                .unwrap()
+                .last_sequence,
+            6
+        );
+    }
+
+    #[test]
+    fn cohort_admission_uses_one_event_write() {
+        let dir = TestDir::new("cohort-admission-single-write");
+        let store = SupervisorStore::new(&dir.path);
+
+        let row = store
+            .record_cohort_admission("g", 7, "child", 2, 42)
+            .unwrap();
+
+        assert_append_io(&store, 1, 1, 1);
+        assert_eq!(live_ledger_rows(&store), vec![row]);
     }
 
     #[test]

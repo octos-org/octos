@@ -2813,6 +2813,10 @@ impl InProcessAgentOrchestrator {
                             "error": "cohort admission persist failed (forced test hook)",
                         });
                     }
+                    // #23: keep this checked single-event append under the
+                    // state lock so competing admissions cannot select the
+                    // same next epoch. Moving it outside needs a reservation
+                    // and revision protocol; the store emits one event write.
                     let admission = state.supervisor_store.as_ref().map(|store| {
                         store.record_cohort_admission(
                             group.as_str(),
@@ -14720,26 +14724,159 @@ fn seed_delivered_terminal_marks(
 /// single master re-entry prompt.
 const COALESCED_CHILDREN_MAX_CHARS: usize = 6_000;
 const COALESCED_CHILD_SUMMARY_CHARS: usize = 160;
-/// #15b — hard caps on the coalesced payload's LINEAR growth (outer loop
-/// 15:25 closeout point 2). `coalesced_child_ids` and the id/status/group/
-/// workspace skeleton rows grow without bound as children fold in; cap the
-/// persisted id SET at 512 entries and the rendered skeleton ROWS at 1024
-/// lines, each disclosed via a `*_truncated` metadata flag.
-///
-/// Why truncate instead of externalizing the payload into the store: an
-/// external record would need a new read path at every prompt-render and a
-/// consistency window between carrier and payload; a 600+-child burst has
-/// never been observed in the field, and these caps already bound the
-/// worst-case metadata size.
-///
-/// `coalesced_count` is NEVER truncated (the true unique total) and the
-/// re-fold dedup seeds from the truncated set: a child id cut from the set
-/// that reappears in a later fold is counted a second time, so under
-/// truncation the count may slightly OVER-count — deliberately biased toward
-/// over-reporting, never under-reporting (a lost child notification is the
-/// failure this machinery exists to prevent).
+/// Bounded display and identity cache. `coalesced_count` records observed
+/// child report rows, NOT unique children: repeated reports can be counted
+/// again, and omitted history cannot be deduplicated after truncation.
+/// `listed_child_count + omitted_child_count == coalesced_count`; scatter
+/// and correction control rows contribute to none of these counts.
 const COALESCED_CHILD_IDS_MAX: usize = 512;
 const COALESCED_CHILDREN_MAX_LINES: usize = 1024;
+const COALESCED_CHILDREN_MAX_BYTES: usize = 256 * 1024;
+const COALESCED_CHILD_IDS_MAX_BYTES: usize = 64 * 1024;
+
+const COALESCED_METADATA_KEYS: &[&str] = &[
+    "coalesced_child_ids",
+    "coalesced_children",
+    "coalesced_count",
+    "coalesced_count_kind",
+    "listed_child_count",
+    "omitted_child_count",
+    "coalesced_row_kinds",
+    "omitted_summary_count",
+    "coalesce_generation",
+    "coalesced_child_ids_truncated",
+    "coalesced_children_truncated",
+    "coalesced_correction_note",
+];
+
+#[derive(Clone)]
+struct CoalescedRow {
+    text: String,
+    child: bool,
+}
+
+fn coalesced_rows(metadata: &std::collections::BTreeMap<String, String>) -> Vec<CoalescedRow> {
+    let kinds = metadata.get("coalesced_row_kinds").map(String::as_bytes);
+    metadata
+        .get("coalesced_children")
+        .into_iter()
+        .flat_map(|text| text.split(" | ").filter(|line| !line.is_empty()))
+        .enumerate()
+        .map(|(index, text)| CoalescedRow {
+            text: text.to_owned(),
+            // New records carry a bounded type mask so summaries and control
+            // text cannot masquerade as child rows. Pre-#23 records use the
+            // generated reason marker as a backwards-compatible fallback.
+            child: kinds.and_then(|kinds| kinds.get(index)).map_or_else(
+                || {
+                    text.split_once(" [")
+                        .is_some_and(|(_, reason)| reason.starts_with("child_completed "))
+                },
+                |kind| *kind == b'c',
+            ),
+        })
+        .collect()
+}
+
+fn coalesced_omitted_children(metadata: &std::collections::BTreeMap<String, String>) -> usize {
+    metadata
+        .get("omitted_child_count")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            // Old carriers did not store omission counts; count CHILD rows
+            // only when upgrading them, never scatter/correction controls.
+            let total = metadata
+                .get("coalesced_count")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            total.saturating_sub(
+                coalesced_rows(metadata)
+                    .iter()
+                    .filter(|row| row.child)
+                    .count(),
+            )
+        })
+}
+
+fn json_string_body_bytes(text: &str) -> usize {
+    serde_json::to_string(text)
+        .expect("string serialization")
+        .len()
+        - 2
+}
+
+fn store_coalesced_rows(
+    metadata: &mut std::collections::BTreeMap<String, String>,
+    rows: Vec<CoalescedRow>,
+    previously_omitted: usize,
+) {
+    let observed = previously_omitted.saturating_add(rows.iter().filter(|row| row.child).count());
+    let mut text = String::new();
+    let mut kinds = String::new();
+    let mut serialized_bytes = 2; // JSON string quotes count toward the cap.
+    let mut listed = 0usize;
+    let mut truncated = false;
+    for row in rows {
+        // Keep the row separator unambiguous across persistence/re-fold.
+        // Escape the separator's prefix so overlapping ` | | ` patterns
+        // cannot leave a separator behind; already escaped rows stay stable.
+        let line = row.text.replace(" |", " \\|");
+        let separator_bytes = if kinds.is_empty() { 0 } else { 3 };
+        let next_bytes = serialized_bytes + separator_bytes + json_string_body_bytes(&line);
+        if truncated
+            || kinds.len() >= COALESCED_CHILDREN_MAX_LINES
+            || next_bytes > COALESCED_CHILDREN_MAX_BYTES
+        {
+            truncated = true;
+            continue;
+        }
+        if !kinds.is_empty() {
+            text.push_str(" | ");
+        }
+        text.push_str(&line);
+        kinds.push(if row.child { 'c' } else { 's' });
+        listed += usize::from(row.child);
+        serialized_bytes = next_bytes;
+    }
+    metadata.insert("coalesced_children".into(), text);
+    metadata.insert("coalesced_row_kinds".into(), kinds);
+    metadata.insert("coalesced_count".into(), observed.to_string());
+    metadata.insert("coalesced_count_kind".into(), "observed".into());
+    metadata.insert("listed_child_count".into(), listed.to_string());
+    metadata.insert(
+        "omitted_child_count".into(),
+        observed.saturating_sub(listed).to_string(),
+    );
+    if truncated {
+        metadata.insert("coalesced_children_truncated".into(), "true".into());
+    }
+    // Truncation flags are sticky; neither a re-fold nor a correction can
+    // reconstruct discarded history and clear an earlier flag.
+}
+
+fn store_coalesced_ids(
+    metadata: &mut std::collections::BTreeMap<String, String>,
+    ids: std::collections::HashSet<String>,
+) {
+    let mut ids: Vec<_> = ids.into_iter().collect();
+    ids.sort();
+    let mut text = String::new();
+    let mut serialized_bytes = 2;
+    for (index, id) in ids.iter().enumerate() {
+        let separator_bytes = usize::from(index > 0);
+        let next_bytes = serialized_bytes + separator_bytes + json_string_body_bytes(id);
+        if index >= COALESCED_CHILD_IDS_MAX || next_bytes > COALESCED_CHILD_IDS_MAX_BYTES {
+            metadata.insert("coalesced_child_ids_truncated".into(), "true".into());
+            break; // Never keep a partial identity or split UTF-8.
+        }
+        if index > 0 {
+            text.push(',');
+        }
+        text.push_str(id);
+        serialized_bytes = next_bytes;
+    }
+    metadata.insert("coalesced_child_ids".into(), text);
+}
 
 fn is_terminal_kind_continuation(item: &QueuedMasterContinuation) -> bool {
     matches!(
@@ -14770,12 +14907,9 @@ fn is_terminal_kind_continuation(item: &QueuedMasterContinuation) -> bool {
 ///   sequence; the kept-order partition preserves it), and the first-scatter
 ///   pick used to hand the master epoch 0's stale `terminal_children` while
 ///   the newer epochs were tombstoned.
-/// - Should-fix 2 — `coalesced_count` counts UNIQUE child agent ids among
-///   folded `ChildCompleted` rows; folded `ScatterJoinComplete` items are
-///   CONTROL rows (rendered compactly, never counted). Every folded child's
-///   id + status + group + workspace ALWAYS appears in `coalesced_children`;
-///   the char budget applies to summaries only, each omitted summary bumps
-///   `omitted_summary_count`.
+/// - #23 — `coalesced_count` counts observed child report rows. Persist exact
+///   listed/omitted child-row counts and a row-type mask; controls never count.
+///   The bounded text and identity cache retain sticky truncation flags.
 /// - Should-fix 3 — the extras' tombstones go down in ONE batched append
 ///   (`SupervisorStore::record_continuations_coalesced`, a single append
 ///   lock), with checked errors, a warn, and exactly one retry.
@@ -14901,198 +15035,111 @@ fn coalesce_terminal_continuations(
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0)
         .saturating_add(1);
-    // #1707 round 2 (codex Blocker 1 fix 2) — RE-FOLD must APPEND, not
-    // overwrite: a previously folded carrier (already carrying
-    // `coalesced_children`) that re-enters a batch would otherwise have its
-    // prompt rebuilt from the CURRENT batch only, silently dropping the
-    // earlier (already tombstoned) children. Start from the existing folded
-    // text and fold-count, and count the existing text toward the char budget
-    // (new lines past the budget drop, same as before).
-    let existing_children = primary.metadata.get("coalesced_children").cloned();
-    let existing_lines: Vec<String> = existing_children
-        .as_deref()
-        .map(|text| {
-            text.split(" | ")
-                .filter(|line| !line.is_empty())
-                .map(str::to_owned)
-                .collect()
+    // Capture the complete prior metadata for failure rollback, including
+    // all #23 counts/type information and sticky truncation flags.
+    let original_metadata = primary.metadata.clone();
+    // A full display may omit both the correction control row and its fresh
+    // child status row. Keep the latest carrier's standalone verdict note
+    // before any absorbed carrier is tombstoned.
+    let correction_note = std::iter::once(&primary)
+        .chain(batch.iter())
+        .filter_map(|item| {
+            item.metadata
+                .get("coalesced_correction_note")
+                .map(|note| (item.sequence, note))
         })
-        .unwrap_or_default();
-    let existing_count: usize = primary
-        .metadata
-        .get("coalesced_count")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    let existing_omitted: usize = primary
-        .metadata
-        .get("omitted_summary_count")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    // #15 SF2 — captured for the fold-ABORT rollback below: the abort must
-    // restore the prior structured child-id set alongside the text/count so
-    // a later retry of the same fold dedups against the same baseline.
-    let existing_child_ids = primary.metadata.get("coalesced_child_ids").cloned();
-    // #15b — captured alongside for the fold-abort rollback.
-    let existing_ids_truncated = primary
-        .metadata
-        .get("coalesced_child_ids_truncated")
-        .cloned();
-    let existing_children_truncated = primary
-        .metadata
-        .get("coalesced_children_truncated")
-        .cloned();
-    let mut rendered = existing_children
-        .as_deref()
-        .map(str::len)
-        .unwrap_or_default();
-    let mut lines: Vec<String> = existing_lines;
-    // Should-fix 2 — `coalesced_count` counts UNIQUE child agent ids among
-    // folded `ChildCompleted` rows (deduped per fold). Since #25 the value
-    // is re-derived as the UNION size after the primary seed + absorbed-
-    // carrier union below (the absorbed `coalesced_count` is never summed
-    // in — dedupe, not sum). Folded `ScatterJoinComplete` items are CONTROL
-    // rows — rendered compactly, never counted as child terminations.
-    let mut folded;
-    let mut omitted = existing_omitted;
-    // #15 SF2 — the RE-FOLD must not RE-COUNT a child already folded in an
-    // earlier generation. The folded child-id set is persisted alongside the
-    // text as structured metadata (`coalesced_child_ids`, comma-joined) so a
-    // re-folded carrier re-seeds the dedup set from its OWN durable record —
-    // today the set starts empty on every fold and a child id that reappears
-    // (a duplicate ChildCompleted folded in a later batch) is counted a
-    // second time even though `existing_count` already included it. Text
-    // append semantics are unchanged (a genuinely re-present child appends
-    // another LINE; only the COUNT is deduped across generations).
-    let mut counted_children: std::collections::HashSet<String> = primary
-        .metadata
-        .get("coalesced_child_ids")
-        .map(|ids| {
-            ids.split(',')
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    // #25 (round-4 Blocker #18-B3) — UNION the metadata of ABSORBED
-    // carriers: a batch item that is ITSELF a former carrier (it carries
-    // `coalesced_child_ids` / `coalesced_children` from an earlier fold)
-    // previously rendered only as a control row / single child line, so
-    // tombstoning it DROPPED its folded children (the "换 carrier" crash:
-    // carrier1 folds A/B, dies undelivered, restore re-enqueues it, and the
-    // next fold picks the NEW max-sequence scatter as carrier — carrier1's
-    // A/B payload vanished with its tombstone). Union each absorbed
-    // carrier's structured child-id set and text lines into the new
-    // carrier's seed BEFORE the batch's fresh children insert, and carry
-    // over its omitted-summary / truncation flags. The absorbed
-    // `coalesced_count` is deliberately NOT summed in — the count is
-    // re-derived as the UNION size below (dedupe, not sum). Seed order:
-    // (1) the primary's own existing metadata (re-fold case), (2) each
-    // absorbed carrier's metadata (here), (3) the current batch's fresh
-    // children (the loop below). Unioning runs unconditionally — an aborted
-    // fold never reaches the tombstones, so no absorbed carrier's payload
-    // is lost by seeding data that the abort would leave redundant.
-    let mut absorbed_ids_truncated = false;
-    let mut absorbed_children_truncated = false;
-    for item in &batch {
-        let Some(absorbed_ids) = item.metadata.get("coalesced_child_ids") else {
-            continue;
-        };
-        // An absorbed carrier's own CHILD row (below) still contributes its
-        // identity to the union — it is itself a child report of the scope —
-        // while its folded children re-associate here.
-        for id in absorbed_ids.split(',').filter(|id| !id.is_empty()) {
-            counted_children.insert(id.to_owned());
-        }
-        if item.metadata.contains_key("coalesced_child_ids_truncated") {
-            absorbed_ids_truncated = true;
-        }
-        if item.metadata.contains_key("coalesced_children_truncated") {
-            absorbed_children_truncated = true;
-        }
-        if let Some(absorbed_text) = item.metadata.get("coalesced_children") {
-            for line in absorbed_text.split(" | ").filter(|line| !line.is_empty()) {
-                // Dedupe identical lines (the union may overlap the
-                // primary's own seed on a re-fold of related carriers).
-                if !lines.iter().any(|existing| existing == line) {
-                    rendered += line.len();
-                    lines.push(line.to_owned());
-                }
-            }
-        }
-        if let Some(absorbed_omitted) = item
-            .metadata
-            .get("omitted_summary_count")
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            omitted += absorbed_omitted;
-        }
-    }
-    // The union is authoritative for the count: an absorbed carrier's
-    // children re-associated above are part of the folded set even where
-    // the #15b id-cap had cut them from the ABSORBED record's id list
-    // (its `coalesced_count` kept the true total). Re-deriving from the
-    // set keeps `count == ids.len()` exactly — never LESS than what the
-    // persisted id list shows.
-    folded = counted_children.len();
-    if absorbed_children_truncated {
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, note)| note.clone());
+    if let Some(note) = correction_note {
         primary
             .metadata
-            .insert("coalesced_children_truncated".to_owned(), "true".to_owned());
+            .insert("coalesced_correction_note".into(), note);
     }
-    let mut folded_keys: Vec<String> = Vec::new();
+    let mut lines = Vec::<CoalescedRow>::new();
+    let mut inherited_lines = std::collections::HashMap::new();
+    let mut counted_children = std::collections::HashSet::new();
+    let mut omitted_children = 0usize;
+    let mut omitted = 0usize;
+    // Keep #25 carrier inheritance: merge every absorbed carrier BEFORE
+    // tombstoning it. Merge overlapping carriers' retained rows with their
+    // maximum multiplicity: repeated observations within a carrier survive
+    // re-fold. Omitted observations remain counted because their identities
+    // are no longer recoverable.
+    let mut ids_truncated = false;
+    let mut children_truncated = false;
+    for item in std::iter::once(&primary).chain(batch.iter()) {
+        let mut carrier_lines = std::collections::HashMap::new();
+        for row in coalesced_rows(&item.metadata) {
+            let key = (row.text.clone(), row.child);
+            let count = carrier_lines.entry(key.clone()).or_insert(0usize);
+            *count += 1;
+            let inherited = inherited_lines.entry(key).or_insert(0usize);
+            if *count > *inherited {
+                *inherited = *count;
+                lines.push(row);
+            }
+        }
+        if let Some(ids) = item.metadata.get("coalesced_child_ids") {
+            counted_children.extend(
+                ids.split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        omitted_children =
+            omitted_children.saturating_add(coalesced_omitted_children(&item.metadata));
+        omitted = omitted.saturating_add(
+            item.metadata
+                .get("omitted_summary_count")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+        );
+        ids_truncated |= item
+            .metadata
+            .get("coalesced_child_ids_truncated")
+            .is_some_and(|v| v == "true");
+        children_truncated |= item
+            .metadata
+            .get("coalesced_children_truncated")
+            .is_some_and(|v| v == "true");
+    }
+    let mut rendered: usize = lines.iter().map(|row| row.text.len()).sum();
+    let mut folded_keys = Vec::new();
     for item in &batch {
-        // Every folded line carries its group AND workspace so the carrier
-        // prompt preserves full scope identity for each folded child (#1707:
-        // the blocker's "完整保留每项的 group/workspace"). Workspace is
-        // rendered as `none` when absent — the whole batch shares the
-        // carrier's workspace, so this stays informative, not noisy.
         match item.reason {
             MasterContinuationReason::ScatterJoinComplete => {
-                // Control metadata, not a child row. Compact and ALWAYS
-                // included: the carrier only needs to know which join epochs
-                // folded into it. Not counted in `coalesced_count`, never
-                // toward `omitted_summary_count`.
                 let join_key = item.dedupe_key.as_str();
                 let join_key_short = join_key.strip_prefix("scatter_join/").unwrap_or(join_key);
-                lines.push(format!(
-                    "{join_key_short} [scatter_join joined] [group {group}] [workspace {workspace}]",
-                    group = item.group_id.as_str(),
-                    workspace = item_workspace(item).unwrap_or("none"),
-                ));
+                lines.push(CoalescedRow {
+                    text: format!("{join_key_short} [scatter_join joined] [group {group}] [workspace {workspace}]",
+                        group = item.group_id.as_str(), workspace = item_workspace(item).unwrap_or("none")),
+                    child: false,
+                });
             }
             MasterContinuationReason::ChildCompleted => {
                 let child = item
                     .child_agent_id
                     .as_ref()
-                    .map(|id| id.as_str().to_owned())
-                    .unwrap_or_else(|| item.group_id.as_str().to_owned());
-                if counted_children.insert(child.clone()) {
-                    folded += 1;
-                }
-                let status = item.metadata.get("status").cloned().unwrap_or_default();
-                // The id/status/group/workspace skeleton is NEVER budget-
-                // dropped: every folded child's identity must reach the
-                // master (Should-fix 2 — no silent truncation of subjects).
+                    .map(|id| id.as_str())
+                    .unwrap_or_else(|| item.group_id.as_str());
+                counted_children.insert(child.to_owned());
+                let status = item
+                    .metadata
+                    .get("status")
+                    .map(String::as_str)
+                    .unwrap_or_default();
                 let skeleton = format!(
                     "{child} [{reason} {status}] [group {group}] [workspace {workspace}]",
                     reason = master_continuation_reason_wire_name(&item.reason),
                     group = item.group_id.as_str(),
-                    workspace = item_workspace(item).unwrap_or("none"),
+                    workspace = item_workspace(item).unwrap_or("none")
                 );
-                // The budget applies to SUMMARIES only: once the running
-                // total exceeds the cap, later lines render as the bare
-                // skeleton and each omitted summary is counted so the
-                // prompt note can disclose the truncation explicitly.
-                let summary = item
+                let summary: String = item
                     .metadata
                     .get("summary")
-                    .map(|text| {
-                        text.chars()
-                            .take(COALESCED_CHILD_SUMMARY_CHARS)
-                            .collect::<String>()
-                    })
+                    .map(|text| text.chars().take(COALESCED_CHILD_SUMMARY_CHARS).collect())
                     .unwrap_or_default();
-                let line = if summary.is_empty() {
+                let text = if summary.is_empty() {
                     skeleton
                 } else if rendered + skeleton.len() + 1 + summary.len()
                     <= COALESCED_CHILDREN_MAX_CHARS
@@ -15103,72 +15150,32 @@ fn coalesce_terminal_continuations(
                     omitted += 1;
                     skeleton
                 };
-                lines.push(line);
+                lines.push(CoalescedRow { text, child: true });
             }
             _ => {}
         }
         folded_keys.push(item.dedupe_key.as_str().to_owned());
     }
-    // Written AFTER the batch loop: the union pre-pass already re-derived
-    // the count from the absorbed set, and fresh children bump it there.
-    primary
-        .metadata
-        .insert("coalesced_count".to_owned(), folded.to_string());
-    // #15b — bound the skeleton-row count: the identity rows grow linearly
-    // with the folded-child count, so past 1024 lines the list is truncated
-    // and the omission is disclosed via `coalesced_children_truncated`; the
-    // prompt note (built from `coalesced_count`) tells the master the true
-    // total and that further children were omitted from the list.
-    let children_truncated = lines.len() > COALESCED_CHILDREN_MAX_LINES;
-    if children_truncated {
-        lines.truncate(COALESCED_CHILDREN_MAX_LINES);
+    if ids_truncated {
+        primary
+            .metadata
+            .insert("coalesced_child_ids_truncated".into(), "true".into());
     }
-    primary
-        .metadata
-        .insert("coalesced_children".to_owned(), lines.join(" | "));
     if children_truncated {
         primary
             .metadata
-            .insert("coalesced_children_truncated".to_owned(), "true".to_owned());
-    } else {
-        primary.metadata.remove("coalesced_children_truncated");
+            .insert("coalesced_children_truncated".into(), "true".into());
     }
-    // #15 SF2 — persist the structured child-id set alongside the text so a
-    // RE-fold (this process or a restored carrier) seeds its dedup set from
-    // it and never re-counts a previously folded child. Sorted for a stable
-    // persisted record.
-    let mut child_ids: Vec<String> = counted_children.iter().cloned().collect();
-    child_ids.sort();
-    // #15b — bound the persisted id set the same way (linear growth without
-    // a cap): keep the FIRST 512 sorted ids and disclose the truncation.
-    // `coalesced_count` above still holds the TRUE unique total. Re-fold
-    // dedup seeds from this truncated set, so a cut id that reappears later
-    // is re-counted — a deliberate over-report bias (see the cap constants).
-    // An absorbed carrier whose OWN id list was truncated (#15b) may have
-    // folded children its persisted set no longer shows; the flag unions
-    // in so the disclosure is never lost on a carrier swap (#25).
-    let child_ids_truncated = absorbed_ids_truncated || child_ids.len() > COALESCED_CHILD_IDS_MAX;
-    if child_ids.len() > COALESCED_CHILD_IDS_MAX {
-        child_ids.truncate(COALESCED_CHILD_IDS_MAX);
-    }
+    store_coalesced_rows(&mut primary.metadata, lines, omitted_children);
+    store_coalesced_ids(&mut primary.metadata, counted_children);
+    let folded = primary.metadata["coalesced_count"].clone();
     primary
         .metadata
-        .insert("coalesced_child_ids".to_owned(), child_ids.join(","));
-    if child_ids_truncated {
-        primary.metadata.insert(
-            "coalesced_child_ids_truncated".to_owned(),
-            "true".to_owned(),
-        );
-    } else {
-        primary.metadata.remove("coalesced_child_ids_truncated");
-    }
-    primary
-        .metadata
-        .insert("coalesce_generation".to_owned(), generation.to_string());
+        .insert("coalesce_generation".into(), generation.to_string());
     if omitted > 0 {
         primary
             .metadata
-            .insert("omitted_summary_count".to_owned(), omitted.to_string());
+            .insert("omitted_summary_count".into(), omitted.to_string());
     } else {
         primary.metadata.remove("omitted_summary_count");
     }
@@ -15198,75 +15205,7 @@ fn coalesce_terminal_continuations(
             "coalesced-carrier persist failed; aborting the fold and delivering \
              the batch as-is (no extras were tombstoned)"
         );
-        // Roll back ONLY this fold's mutations: a RE-folded carrier already
-        // carried prior generations' `coalesced_*` metadata (whose extras were
-        // tombstoned durably), which must survive this abort intact.
-        match existing_children {
-            Some(text) => {
-                primary
-                    .metadata
-                    .insert("coalesced_children".to_owned(), text);
-            }
-            None => {
-                primary.metadata.remove("coalesced_children");
-            }
-        }
-        if existing_count > 0 {
-            primary
-                .metadata
-                .insert("coalesced_count".to_owned(), existing_count.to_string());
-        } else {
-            primary.metadata.remove("coalesced_count");
-        }
-        if existing_omitted > 0 {
-            primary.metadata.insert(
-                "omitted_summary_count".to_owned(),
-                existing_omitted.to_string(),
-            );
-        } else {
-            primary.metadata.remove("omitted_summary_count");
-        }
-        // #15 SF2 — roll back the structured child-id set with the rest of
-        // this fold's metadata mutations.
-        match existing_child_ids {
-            Some(ids) => {
-                primary
-                    .metadata
-                    .insert("coalesced_child_ids".to_owned(), ids);
-            }
-            None => {
-                primary.metadata.remove("coalesced_child_ids");
-            }
-        }
-        // #15b — and the truncation flags with it.
-        match existing_ids_truncated {
-            Some(flag) => {
-                primary
-                    .metadata
-                    .insert("coalesced_child_ids_truncated".to_owned(), flag);
-            }
-            None => {
-                primary.metadata.remove("coalesced_child_ids_truncated");
-            }
-        }
-        match existing_children_truncated {
-            Some(flag) => {
-                primary
-                    .metadata
-                    .insert("coalesced_children_truncated".to_owned(), flag);
-            }
-            None => {
-                primary.metadata.remove("coalesced_children_truncated");
-            }
-        }
-        if generation > 1 {
-            primary.metadata.insert(
-                "coalesce_generation".to_owned(),
-                (generation - 1).to_string(),
-            );
-        } else {
-            primary.metadata.remove("coalesce_generation");
-        }
+        primary.metadata = original_metadata;
         others.insert(slot, primary);
         requeue_taken(state, batch);
         *kept = others;
@@ -15501,75 +15440,40 @@ fn enqueue_agent_terminal_continuations(
                         .get("coalesced_child_ids")
                         .is_some_and(|ids| ids.contains(&agent.agent_id))
                 })
-                .map(|pending| {
-                    (
-                        pending.metadata.get("coalesced_child_ids").cloned(),
-                        pending.metadata.get("coalesced_children").cloned(),
-                        pending.metadata.get("coalesced_count").cloned(),
-                        pending.metadata.get("omitted_summary_count").cloned(),
-                        pending.metadata.get("coalesce_generation").cloned(),
-                        pending
-                            .metadata
-                            .get("coalesced_child_ids_truncated")
-                            .cloned(),
-                        pending
-                            .metadata
-                            .get("coalesced_children_truncated")
-                            .cloned(),
-                    )
-                });
-            if let Some((
-                child_ids,
-                children,
-                count,
-                omitted,
-                generation,
-                ids_truncated,
-                children_truncated,
-            )) = carried_coalesced
-            {
-                if let Some(child_ids) = child_ids {
-                    child = child.with_metadata("coalesced_child_ids", child_ids);
+                .map(|pending| pending.metadata.clone());
+            if let Some(carried) = carried_coalesced {
+                for key in COALESCED_METADATA_KEYS {
+                    if let Some(value) = carried.get(*key) {
+                        child = child.with_metadata(*key, value.clone());
+                    }
                 }
-                // The correction note rides INSIDE the children text as an
-                // appended line (no surgery on the rendered rows), so a later
-                // fold's absorbed-carrier line merge carries it forward
-                // instead of dropping it with the replaced item. The line is
-                // appended even when the old carrier had no text yet (a
-                // control row folded to ids-only), so the note is never lost.
-                let children = match children {
-                    Some(children) => format!(
-                        "{children} | carrier child {child_key} verdict corrected: {}",
-                        agent.status
-                    ),
-                    None => format!(
-                        "carrier child {child_key} verdict corrected: {}",
-                        agent.status
-                    ),
-                };
-                child = child.with_metadata("coalesced_children", children);
-                if let Some(count) = count {
-                    child = child.with_metadata("coalesced_count", count);
-                }
-                if let Some(omitted) = omitted {
-                    child = child.with_metadata("omitted_summary_count", omitted);
-                }
-                if let Some(generation) = generation {
-                    child = child.with_metadata("coalesce_generation", generation);
-                }
-                if let Some(flag) = ids_truncated {
-                    child = child.with_metadata("coalesced_child_ids_truncated", flag);
-                }
-                if let Some(flag) = children_truncated {
-                    child = child.with_metadata("coalesced_children_truncated", flag);
-                }
-                child = child.with_metadata(
-                    "coalesced_correction_note",
-                    format!(
-                        "carrier child {child_key} verdict corrected: {}",
-                        agent.status
-                    ),
+                let note = format!(
+                    "carrier child {child_key} verdict corrected: {}",
+                    agent.status
                 );
+                let mut rows = coalesced_rows(&carried);
+                rows.push(CoalescedRow {
+                    text: note.clone(),
+                    child: false,
+                });
+                store_coalesced_rows(
+                    &mut child.metadata,
+                    rows,
+                    coalesced_omitted_children(&carried),
+                );
+                let ids = carried
+                    .get("coalesced_child_ids")
+                    .into_iter()
+                    .flat_map(|ids| {
+                        ids.split(',')
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                    })
+                    .collect();
+                store_coalesced_ids(&mut child.metadata, ids);
+                // This separate field retains the latest correction even if
+                // the bounded display has no room for another control row.
+                child = child.with_metadata("coalesced_correction_note", note);
             }
             let outcome = state.continuations.replace_pending_payload(child);
             let mut delivered = false;
@@ -17653,58 +17557,47 @@ pub(crate) fn master_continuation_reason_name(reason: &MasterContinuationReason)
     }
 }
 
-/// Rendered when the drain site folded further terminal marks into this
-/// continuation (see `coalesced_terminal_continuations`). `coalesced_count`
-/// counts UNIQUE child terminations (folded `ScatterJoinComplete` items are
-/// control rows, not counted — #1707 round 4, codex Should-fix 2). When the
-/// summary budget forced summaries off later lines, `omitted_summary_count`
-/// discloses the truncation explicitly: every child's id and status is still
-/// listed.
+/// Display the persisted observed/listed/omitted child counts. Never infer
+/// omissions by counting scatter/correction lines in presentation text.
 fn coalesced_children_note(continuation: &QueuedMasterContinuation) -> String {
-    match continuation.metadata.get("coalesced_count") {
-        Some(count) => {
-            let omitted = continuation
-                .metadata
-                .get("omitted_summary_count")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            let omission = if omitted > 0 {
-                format!(
-                    " {omitted} summary(ies) were omitted for length; all child ids and statuses are listed."
-                )
-            } else {
-                String::new()
-            };
-            // #15b — when the payload caps cut the list itself, say so: the
-            // count stays the TRUE unique total even though the rendered list
-            // (and the persisted id set) stopped at the cap.
-            let lines_truncated = continuation
-                .metadata
-                .get("coalesced_children_truncated")
-                .is_some_and(|value| value == "true");
-            let truncation = if lines_truncated {
-                let listed = continuation
-                    .metadata
-                    .get("coalesced_children")
-                    .map(|text| text.split(" | ").filter(|line| !line.is_empty()).count())
-                    .unwrap_or(0);
-                let omitted_children = count
-                    .parse::<usize>()
-                    .ok()
-                    .map(|total| total.saturating_sub(listed))
-                    .unwrap_or(0);
-                format!(
-                    " {omitted_children} further children omitted from the list; coalesced_count holds the true total."
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                "\n\nNOTE: {count} unique child termination(s) were folded into this single notice (see `coalesced_children` in Metadata). Cover ALL of them in ONE update; no separate turn will arrive for them.{omission}{truncation}"
-            )
-        }
-        None => String::new(),
-    }
+    let Some(count) = continuation.metadata.get("coalesced_count") else {
+        return String::new();
+    };
+    let listed = continuation
+        .metadata
+        .get("listed_child_count")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            coalesced_rows(&continuation.metadata)
+                .iter()
+                .filter(|row| row.child)
+                .count()
+        });
+    let omitted_children = coalesced_omitted_children(&continuation.metadata);
+    let omitted_summaries = continuation
+        .metadata
+        .get("omitted_summary_count")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let summaries = if omitted_summaries > 0 {
+        format!(" {omitted_summaries} summary(ies) were omitted for length.")
+    } else {
+        String::new()
+    };
+    let truncation = if [
+        "coalesced_children_truncated",
+        "coalesced_child_ids_truncated",
+    ]
+    .iter()
+    .any(|key| continuation.metadata.get(*key).is_some_and(|v| v == "true"))
+    {
+        " The retained report list or identity cache was truncated; repeated child ids may occur."
+    } else {
+        ""
+    };
+    format!(
+        "\n\nNOTE: {count} observed child report(s) were folded into this single notice (see `coalesced_children` in Metadata): {listed} child report row(s) listed, {omitted_children} further child report row(s) omitted from the list. Combine the available reports in ONE update; no separate turn will arrive for them.{summaries}{truncation}"
+    )
 }
 
 pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
@@ -23861,7 +23754,7 @@ mod tests {
             Some("completed"),
             "the carrier carries the CORRECTED status"
         );
-        // `coalesced_count` counts UNIQUE FOLDED children (the extras only —
+        // `coalesced_count` counts observed folded child reports (the extras only —
         // the carrier itself is not counted), so A(carrier) + B(extra) = 1.
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
@@ -24323,14 +24216,14 @@ mod tests {
             MasterContinuationReason::ScatterJoinComplete
         );
         // #1707 round 4 (codex Should-fix 2): `coalesced_count` now counts
-        // UNIQUE folded child agent ids (this burst has 3), NOT every folded
+        // observed folded child reports (this burst has 3), NOT every folded
         // item — folded ScatterJoinComplete items are control rows, so the
         // old `pending_before - 1` assertion (which counted the folded
         // scatters as child terminations) is no longer correct.
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
             Some("3"),
-            "coalesced_count counts unique folded child ids (was pending_before - 1 = {} before Should-fix 2)",
+            "coalesced_count counts observed folded child reports (was pending_before - 1 = {} before Should-fix 2)",
             pending_before - 1
         );
         let folded = carrier
@@ -24398,7 +24291,7 @@ mod tests {
         );
         assert_eq!(drained.len(), 1, "exactly one carrier");
         // #1707 round 4 (codex Should-fix 2): `coalesced_count` now counts
-        // UNIQUE folded child agent ids (this burst has 3), NOT every folded
+        // observed folded child reports (this burst has 3), NOT every folded
         // item — folded ScatterJoinComplete items are control rows, so the
         // old `pending_before - 1` assertion is no longer correct.
         assert_eq!(
@@ -24407,7 +24300,7 @@ mod tests {
                 .get("coalesced_count")
                 .map(String::as_str),
             Some("3"),
-            "the live carrier carries the folded unique-child count \
+            "the live carrier carries the folded observed report count \
              (was pending_before - 1 = {} before Should-fix 2)",
             pending_before - 1
         );
@@ -24427,12 +24320,12 @@ mod tests {
         );
         assert_eq!(restored.len(), 1, "the carrier restores as one item");
         let carrier = &restored[0];
-        // Should-fix 2 semantics: unique folded child ids (3), not every
+        // #23 semantics: observed folded child reports (3), not every
         // folded item (`pending_before - 1` counted the folded scatters).
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
             Some("3"),
-            "the RESTORED carrier must carry the durable folded unique-child count"
+            "the RESTORED carrier must carry the durable folded observed report count"
         );
         let children = carrier
             .metadata
@@ -24634,14 +24527,14 @@ mod tests {
         );
     }
 
-    /// #1707 round 4 (codex Should-fix 2) — `coalesced_count` counts UNIQUE
-    /// child agent ids among folded ChildCompleted items. A 3-child burst
+    /// #1707 round 4 (codex Should-fix 2) — `coalesced_count` counts observed
+    /// child report rows among folded ChildCompleted items. A 3-child burst
     /// folds 5 extras (3 children + 2 superseded scatters) yet must report 3
     /// — the old all-items count reported 5 "child terminations". And with
     /// two distinct-cwd groups in one session, each workspace's carrier
     /// counts only its own scope's children.
     #[test]
-    fn coalesced_count_counts_unique_children_not_scatters() {
+    fn coalesced_count_counts_observed_children_not_scatters() {
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey::with_profile("tenant-uc", "api", "unique-count");
         for idx in 0..3 {
@@ -24672,7 +24565,7 @@ mod tests {
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
             Some("3"),
-            "3 unique children folded — the 2 superseded scatter control rows must NOT count"
+            "3 child reports folded — the 2 superseded scatter control rows must NOT count"
         );
         let folded = carrier
             .metadata
@@ -24726,7 +24619,7 @@ mod tests {
             assert_eq!(
                 carrier.metadata.get("coalesced_count").map(String::as_str),
                 Some("2"),
-                "each workspace's carrier counts ONLY its own scope's unique children"
+                "each workspace's carrier counts ONLY its own scope's child reports"
             );
         }
     }
@@ -24799,8 +24692,8 @@ mod tests {
             "the prompt note must disclose the omission: {prompt}"
         );
         assert!(
-            prompt.contains("all child ids and statuses are listed"),
-            "the note must reassure that identities were not dropped: {prompt}"
+            prompt.contains("60 child report row(s) listed, 0 further child report row(s) omitted"),
+            "the note must report that all 60 child rows survived: {prompt}"
         );
     }
 
@@ -25048,14 +24941,14 @@ mod tests {
                 .get("coalesced_children")
                 .expect("folded list");
             // #1707 round 4 (codex Should-fix 2): `coalesced_count` counts
-            // UNIQUE folded child agent ids — each workspace's carrier folds
+            // observed folded child reports — each workspace's carrier folds
             // its 2 children (the superseded same-workspace scatter folds as
             // a CONTROL row and is not counted), so the old count of 3
             // (which included the folded scatter) is no longer correct.
             assert_eq!(
                 carrier.metadata.get("coalesced_count").map(String::as_str),
                 Some("2"),
-                "each carrier folds its workspace's 2 unique children \
+                "each carrier folds its workspace's 2 child reports \
                  (scatter control rows are not counted since Should-fix 2)"
             );
             for idx in 0..2 {
@@ -40079,13 +39972,9 @@ mod tests {
         );
     }
 
-    /// #15 SF2 — a RE-fold must NOT re-count a child already folded in an
-    /// earlier generation. Fold once (children X and Y fold into the
-    /// carrier), requeue the carrier as if its claimed turn failed, let a
-    /// duplicate ChildCompleted for X re-enter via the in-process
-    /// (non-gating) mark path, then fold again: `coalesced_count` must still
-    /// count X exactly ONCE and `coalesced_child_ids` must contain X exactly
-    /// once.
+    /// Re-forwarding an unchanged terminal does not enqueue a fresh child
+    /// report. After retrying the carrier, its observed count and retained
+    /// identity cache must therefore be unchanged.
     #[test]
     fn refold_does_not_recount_previously_folded_child() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -40445,7 +40334,32 @@ mod tests {
         assert_eq!(
             carrier_meta.get("coalesced_count").map(String::as_str),
             Some("2"),
-            "the structured count is identity — unchanged by the verdict fix"
+            "the verdict fix does not add another folded child report"
+        );
+        for metadata in [&carrier_meta, &corrected_meta] {
+            assert_eq!(metadata["coalesced_count_kind"], "observed");
+            assert_eq!(metadata["listed_child_count"], "2");
+            assert_eq!(metadata["omitted_child_count"], "0");
+            assert!(
+                serde_json::to_string(&metadata["coalesced_children"])
+                    .unwrap()
+                    .len()
+                    <= 256 * 1024
+            );
+            assert!(
+                serde_json::to_string(&metadata["coalesced_child_ids"])
+                    .unwrap()
+                    .len()
+                    <= 64 * 1024
+            );
+        }
+        assert_eq!(
+            coalesced_rows(&corrected_meta)
+                .iter()
+                .filter(|row| row.child)
+                .count(),
+            2,
+            "the correction control row does not count as a listed child"
         );
         // The correction note lands on the CORRECTED child row (task-b),
         // not the carrier — the carrier keeps the folded payload unchanged.
@@ -40583,119 +40497,156 @@ mod tests {
         );
     }
 
-    /// #15 Nit2 — the goal-clear incident shape, end to end: two REAL
-    /// `TaskSupervisor` peer tasks registered with the #13r2 workspace stamp
-    /// both complete; a terminal re-forward into a FRESH store-backed
-    /// orchestrator (restart replay) routes through the shared dual-sink
-    /// entry (`upsert_background_task_agent`), and the drain delivers
-    /// exactly ONE carrier whose coalesced metadata covers both children.
+    /// #23: drive BOTH installed supervisor callbacks, replay the same
+    /// terminal rows through both, then consume exactly one carrier. Neither
+    /// a second drain nor another restore may revive the delivered burst.
     #[test]
     fn background_task_terminal_dual_sink_reforward_to_drain() {
-        let dir = tempfile::TempDir::new().unwrap();
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
         let profile = "tenant-nit2";
         let session_id = SessionKey::with_profile(profile, "api", "dual-sink");
-        let workspace = "/tmp/ws-nit2";
-
-        // Runtime A: both tasks register and complete; nothing drains, so
-        // the terminal records stay Queued in the store (the restart
-        // replays them). The re-forward below uses the SAME task ids — the
-        // terminal event carries the task row — so the restored roster (agent
-        // id `task-<task_id>`) matches and the gate sees the seeded marks.
         let first = InProcessAgentOrchestrator::default();
-        first.configure_supervisor_store(dir.path()).expect("store");
-        // The registration-time supervisor stamps `workspace_root` (#13r2),
-        // so the terminal event the mirror consumes derives its cwd from the
-        // stamp. Capture the FULL terminal task rows (with ids, stamps, and
-        // timestamps) — the restart re-forward below replays THOSE rows, not
-        // hand-built approximations.
-        let mut terminal_tasks: Vec<octos_agent::BackgroundTask> = Vec::new();
-        {
-            let supervisor = octos_agent::TaskSupervisor::new();
-            for slug in ["ds-a", "ds-b"] {
-                let task_id = bind_peer_task_with_wired_terminal_sink(
-                    &supervisor,
-                    &first,
-                    crate::peers::peer_wire_key(profile, slug),
-                    &session_id,
-                    profile,
-                    Some(workspace),
-                );
-                supervisor.mark_completed(&task_id, Vec::new());
-                let task = supervisor
-                    .get_task(&task_id)
-                    .expect("registered task row readable");
-                terminal_tasks.push(task);
-            }
+        first.configure_supervisor_store(dir.path()).unwrap();
+        let target = Arc::new(Mutex::new(first.clone()));
+        let terminal_calls = Arc::new(AtomicUsize::new(0));
+        let change_calls = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::<octos_agent::TerminalEvent>::new()));
+        let terminal_sink = {
+            let target = target.clone();
+            let calls = terminal_calls.clone();
+            let events = events.clone();
+            Arc::new(move |event: &octos_agent::TerminalEvent| {
+                if matches!(event.outcome, octos_agent::TerminalOutcome::Completed) {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    events.lock().unwrap().push(event.clone());
+                    let runtime = target.lock().unwrap().clone();
+                    let _ = runtime.upsert_background_task_agent(&event.task, Some(profile));
+                }
+            })
+        };
+        let change_sink = {
+            let target = target.clone();
+            let calls = change_calls.clone();
+            Arc::new(move |task: &octos_agent::BackgroundTask| {
+                if task.status == octos_agent::TaskStatus::Completed {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let runtime = target.lock().unwrap().clone();
+                    let _ = runtime.upsert_background_task_agent(task, Some(profile));
+                }
+            })
+        };
+        let supervisor = octos_agent::TaskSupervisor::new();
+        supervisor.set_on_terminal({
+            let sink = terminal_sink.clone();
+            move |event| sink(event)
+        });
+        supervisor.set_on_change({
+            let sink = change_sink.clone();
+            move |task| sink(task)
+        });
+        for slug in ["ds-a", "ds-b"] {
+            let key = crate::peers::peer_wire_key(profile, slug);
+            let task_id = crate::peers::bind_peer_supervised_task_with_workspace_strict(
+                &supervisor,
+                key.clone(),
+                &session_id.0,
+                Some("/tmp/ws-nit2"),
+            )
+            .unwrap()
+            .unwrap();
+            supervisor.mark_completed(&task_id, Vec::new());
+            assert_eq!(
+                crate::peers::peer_task_registry().take(&key).as_deref(),
+                Some(task_id.as_str())
+            );
         }
         assert_eq!(
-            first.pending_continuation_count_for_session_for_test(&session_id, profile),
-            4,
-            "2 ChildCompleted + 2 epoch-bumped ScatterJoinComplete persisted pre-restart"
+            terminal_calls.load(Ordering::SeqCst),
+            2,
+            "both real terminal transitions reached set_on_terminal"
         );
-        drop(first);
+        assert_eq!(
+            change_calls.load(Ordering::SeqCst),
+            2,
+            "the same transitions also reached set_on_change"
+        );
+        assert_eq!(
+            first.pending_continuation_count_for_session_for_test(&session_id, profile),
+            4
+        );
+        let terminal_events = events.lock().unwrap().clone();
 
-        // Runtime B (the "restart"): the re-forwarded terminal events route
-        // through the SAME shared entry both production sinks use. The
-        // records were still Queued (never drained), so the marks seed
-        // non-gating and the re-forward refreshes without duplicating.
         let fresh = InProcessAgentOrchestrator::default();
-        fresh.configure_supervisor_store(dir.path()).expect("store");
-        for task in &terminal_tasks {
-            // The production re-forward delivers the SAME task row (same id,
-            // same workspace stamp), so the mirror derives the same agent id
-            // and cwd and collapses onto the restored roster — the gate sees
-            // the seeded delivered mark.
-            let _ = fresh.upsert_background_task_agent(task, Some(profile));
+        fresh.configure_supervisor_store(dir.path()).unwrap();
+        *target.lock().unwrap() = fresh.clone();
+        drop(first);
+        // Reuse the exact installed callback bodies with the original event
+        // snapshots: each entry re-forwards each terminal task twice.
+        for _ in 0..2 {
+            for event in &terminal_events {
+                terminal_sink(event);
+                change_sink(&event.task);
+            }
         }
-        // max_items=1 — the goal-clear incident's one-carrier-per-turn
-        // shape: the pending ChildCompleted pair + scatter fold into exactly
-        // ONE carrier with coalesced metadata.
+        assert_eq!(terminal_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(change_calls.load(Ordering::SeqCst), 6);
         let drained = fresh.drain_ready_continuations_for_session(
             &session_id,
             profile,
             MasterContinuationRuntimeState::idle(),
             1,
         );
-        assert_eq!(
-            drained.len(),
-            1,
-            "exactly one carrier delivered for the re-forwarded pair; drained {:?}",
-            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
-        );
+        assert_eq!(drained.len(), 1, "max_items=1 yields exactly one carrier");
         let carrier = &drained[0];
         assert_eq!(
             carrier.reason,
-            MasterContinuationReason::ScatterJoinComplete,
-            "the latest-epoch scatter is the carrier"
+            MasterContinuationReason::ScatterJoinComplete
         );
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
-            Some("2"),
-            "the carrier's coalesced metadata covers both children (the re-forward collapses onto the restored roster); metadata {:?}",
-            carrier.metadata,
+            Some("2")
         );
-        let rest = fresh.drain_ready_continuations_for_session(
-            &session_id,
-            profile,
-            MasterContinuationRuntimeState::idle(),
-            usize::MAX,
+        assert_eq!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0
         );
-        // A second turn MAY deliver the superseded epoch-0 scatter (it was
-        // folded into the carrier as a CONTROL row, but its tombstone is
-        // only consulted on the NEXT restart — the in-process queue still
-        // held it). It must carry NO additional folded children: the burst
-        // cost exactly one carrier + at most one control-row turn.
+        fresh.mark_continuation_completed(carrier, Some("dual-sink reports consumed".into()));
         assert!(
-            rest.len() <= 1,
-            "at most one superseded-epoch control row may remain; got {:?}",
-            rest.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+            fresh
+                .drain_ready_continuations_for_session(
+                    &session_id,
+                    profile,
+                    MasterContinuationRuntimeState::idle(),
+                    usize::MAX,
+                )
+                .is_empty(),
+            "no extra control-row turn is permitted"
+        );
+
+        let restored = InProcessAgentOrchestrator::default();
+        restored.configure_supervisor_store(dir.path()).unwrap();
+        *target.lock().unwrap() = restored.clone();
+        drop(fresh);
+        for event in &terminal_events {
+            terminal_sink(event);
+            change_sink(&event.task);
+        }
+        assert_eq!(
+            restored.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0
         );
         assert!(
-            rest.iter()
-                .all(|item| !item.metadata.contains_key("coalesced_children")
-                    || item.metadata.get("coalesced_count").map(String::as_str) == Some("0")),
-            "no further folded children after the carrier; rest {:?}",
-            rest.iter().map(|i| i.metadata.clone()).collect::<Vec<_>>(),
+            restored
+                .drain_ready_continuations_for_session(
+                    &session_id,
+                    profile,
+                    MasterContinuationRuntimeState::idle(),
+                    1,
+                )
+                .is_empty(),
+            "delivered carrier and both sink re-forwards stay retired after restart"
         );
     }
 
@@ -40990,9 +40941,342 @@ mod tests {
         );
     }
 
+    fn coalesce_item_for_test(id: &str, scatter: bool, sequence: u64) -> QueuedMasterContinuation {
+        let reason = if scatter {
+            MasterContinuationReason::ScatterJoinComplete
+        } else {
+            MasterContinuationReason::ChildCompleted
+        };
+        let request = MasterContinuationRequest::new(
+            "coalesce-test-group",
+            "coalesce-test-session",
+            "coalesce-test-profile",
+            reason,
+            SystemTime::now(),
+        )
+        .with_child_agent_id(id)
+        .with_dedupe_key(format!("test-{sequence}"))
+        .with_metadata("status", "completed");
+        let mut item = MasterContinuationScheduler::default()
+            .enqueue(request)
+            .queued()
+            .unwrap()
+            .clone();
+        item.sequence = sequence;
+        item
+    }
+
+    #[test]
+    fn coalesce_refold_truncated_counts_and_flags_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        let session = SessionKey("coalesce-test-session".to_owned());
+        let mut batch = Vec::new();
+        for index in 0..514 {
+            batch.push(coalesce_item_for_test(
+                &format!("child-{index:04}"),
+                false,
+                index * 2,
+            ));
+            batch.push(coalesce_item_for_test(
+                &format!("join-{index}"),
+                true,
+                index * 2 + 1,
+            ));
+        }
+        coalesce_terminal_continuations(
+            &mut runtime.state(),
+            &session,
+            "coalesce-test-profile",
+            &mut batch,
+        );
+        assert_eq!(batch.len(), 1);
+        let mut carrier = batch.remove(0);
+        assert_eq!(
+            carrier
+                .metadata
+                .get("listed_child_count")
+                .map(String::as_str),
+            Some("512")
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("omitted_child_count")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("514")
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("coalesced_count_kind")
+                .map(String::as_str),
+            Some("observed")
+        );
+        // Replay observations of retained ids: both truncation flags must stay
+        // set even though the retained id union does not exceed 512 this time.
+        batch = vec![
+            carrier,
+            coalesce_item_for_test("child-0000", false, 2000),
+            coalesce_item_for_test("child-0001", false, 2001),
+        ];
+        coalesce_terminal_continuations(
+            &mut runtime.state(),
+            &session,
+            "coalesce-test-profile",
+            &mut batch,
+        );
+        carrier = batch.remove(0);
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("516")
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("listed_child_count")
+                .map(String::as_str),
+            Some("512")
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("omitted_child_count")
+                .map(String::as_str),
+            Some("4")
+        );
+        for flag in [
+            "coalesced_child_ids_truncated",
+            "coalesced_children_truncated",
+        ] {
+            assert_eq!(carrier.metadata.get(flag).map(String::as_str), Some("true"));
+        }
+        // A correction whose control row could not fit survives separately.
+        // A new carrier must inherit that verdict as well as the counts.
+        let correction_note = "carrier child child-0001 verdict corrected: failed";
+        carrier
+            .metadata
+            .insert("coalesced_correction_note".into(), correction_note.into());
+        batch = vec![
+            carrier,
+            coalesce_item_for_test("new-join", true, 3000),
+            coalesce_item_for_test("new-a", false, 3001),
+            coalesce_item_for_test("new-b", false, 3002),
+        ];
+        coalesce_terminal_continuations(
+            &mut runtime.state(),
+            &session,
+            "coalesce-test-profile",
+            &mut batch,
+        );
+        carrier = batch.remove(0);
+        assert_eq!(
+            carrier
+                .metadata
+                .get("coalesced_correction_note")
+                .map(String::as_str),
+            Some(correction_note)
+        );
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("518")
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("omitted_child_count")
+                .map(String::as_str),
+            Some("6")
+        );
+        let loaded = SupervisorStore::new(dir.path()).load_state().unwrap();
+        let record = loaded
+            .continuations
+            .values()
+            .find(|record| record.continuation_id == carrier.dedupe_key.as_str())
+            .unwrap();
+        for key in [
+            "coalesced_count",
+            "coalesced_children",
+            "coalesced_child_ids",
+            "listed_child_count",
+            "omitted_child_count",
+            "coalesced_count_kind",
+            "coalesced_row_kinds",
+            "coalesced_child_ids_truncated",
+            "coalesced_children_truncated",
+            "coalesced_correction_note",
+        ] {
+            assert_eq!(
+                record
+                    .metadata
+                    .get(&format!("payload:{key}"))
+                    .and_then(serde_json::Value::as_str),
+                carrier.metadata.get(key).map(String::as_str)
+            );
+        }
+        let restored = master_continuation_request_from_persisted(record).unwrap();
+        assert_eq!(restored.metadata, carrier.metadata);
+        assert!(
+            serde_json::to_string(&restored.metadata["coalesced_children"])
+                .unwrap()
+                .len()
+                <= 256 * 1024
+        );
+        assert!(
+            serde_json::to_string(&restored.metadata["coalesced_child_ids"])
+                .unwrap()
+                .len()
+                <= 64 * 1024
+        );
+        let prompt = coalesced_children_note(&carrier);
+        assert!(prompt.contains("observed"), "{prompt}");
+        assert!(
+            !prompt.contains("unique") && !prompt.contains("true total"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn coalesce_legacy_truncated_refold_keeps_omissions_and_sticky_flags() {
+        let runtime = InProcessAgentOrchestrator::default();
+        let session = SessionKey("coalesce-test-session".to_owned());
+        let mut legacy = coalesce_item_for_test("join", true, 3);
+        for (key, value) in [
+            (
+                "coalesced_children",
+                "a [child_completed completed] | join [scatter_join joined] | b [child_completed completed]",
+            ),
+            ("coalesced_child_ids", "a,b"),
+            ("coalesced_count", "7"),
+            ("coalesced_child_ids_truncated", "true"),
+            ("coalesced_children_truncated", "true"),
+        ] {
+            legacy.metadata.insert(key.to_owned(), value.to_owned());
+        }
+        // Neither display hits a cap in this fold: only inheritance can
+        // preserve the flags. Legacy omissions exclude the scatter row.
+        let mut batch = vec![
+            legacy,
+            coalesce_item_for_test("a", false, 4),
+            coalesce_item_for_test("b", false, 5),
+        ];
+        coalesce_terminal_continuations(
+            &mut runtime.state(),
+            &session,
+            "coalesce-test-profile",
+            &mut batch,
+        );
+        let carrier = &batch[0];
+        assert_eq!(carrier.metadata["coalesced_count"], "9");
+        assert_eq!(carrier.metadata["listed_child_count"], "4");
+        assert_eq!(carrier.metadata["omitted_child_count"], "5");
+        assert_eq!(carrier.metadata["coalesced_count_kind"], "observed");
+        assert_eq!(carrier.metadata["coalesced_child_ids_truncated"], "true");
+        assert_eq!(carrier.metadata["coalesced_children_truncated"], "true");
+        assert_eq!(carrier.metadata["coalesced_row_kinds"], "csccc");
+    }
+
+    #[test]
+    fn coalesce_refold_preserves_repeated_observations_and_row_kinds() {
+        let runtime = InProcessAgentOrchestrator::default();
+        let session = SessionKey("coalesce-test-session".to_owned());
+        // Delimiters/reason-like text in identifiers cannot create extra
+        // rows on re-fold. Two fresh reports of the same child are observed
+        // twice, and carrying that history must never reduce its count.
+        let repeated_id = "same | | injected [child_completed fake]";
+        let mut batch = vec![
+            coalesce_item_for_test("join", true, 3),
+            coalesce_item_for_test(repeated_id, false, 1),
+            coalesce_item_for_test(repeated_id, false, 2),
+        ];
+        for expected in [2, 4, 6] {
+            coalesce_terminal_continuations(
+                &mut runtime.state(),
+                &session,
+                "coalesce-test-profile",
+                &mut batch,
+            );
+            assert_eq!(batch.len(), 1);
+            let carrier = &batch[0];
+            assert_eq!(carrier.metadata["coalesced_count"], expected.to_string());
+            assert_eq!(carrier.metadata["listed_child_count"], expected.to_string());
+            assert_eq!(carrier.metadata["omitted_child_count"], "0");
+            assert_eq!(coalesced_rows(&carrier.metadata).len(), expected);
+            batch.push(coalesce_item_for_test(
+                repeated_id,
+                false,
+                10 + expected as u64,
+            ));
+            batch.push(coalesce_item_for_test(
+                repeated_id,
+                false,
+                20 + expected as u64,
+            ));
+        }
+    }
+
+    #[test]
+    fn coalesce_serialized_byte_caps_drop_whole_utf8_rows_and_ids() {
+        let runtime = InProcessAgentOrchestrator::default();
+        let session = SessionKey("coalesce-test-session".to_owned());
+        // NUL is one raw byte but six JSON bytes: enforce the serialized
+        // cap as well as the UTF-8 cap, dropping entire rows/identities.
+        for long_id in ["界".repeat(100_000), "\0".repeat(50_000)] {
+            let mut batch = vec![
+                coalesce_item_for_test("join", true, 3),
+                coalesce_item_for_test(&format!("a{long_id}"), false, 1),
+                coalesce_item_for_test(&format!("b{long_id}"), false, 2),
+            ];
+            coalesce_terminal_continuations(
+                &mut runtime.state(),
+                &session,
+                "coalesce-test-profile",
+                &mut batch,
+            );
+            let carrier = &batch[0];
+            assert!(
+                serde_json::to_string(&carrier.metadata["coalesced_children"])
+                    .unwrap()
+                    .len()
+                    <= 256 * 1024
+            );
+            assert!(
+                serde_json::to_string(&carrier.metadata["coalesced_child_ids"])
+                    .unwrap()
+                    .len()
+                    <= 64 * 1024
+            );
+            assert_eq!(
+                carrier
+                    .metadata
+                    .get("listed_child_count")
+                    .map(String::as_str),
+                Some("0")
+            );
+            assert_eq!(
+                carrier
+                    .metadata
+                    .get("omitted_child_count")
+                    .map(String::as_str),
+                Some("2")
+            );
+            for flag in [
+                "coalesced_child_ids_truncated",
+                "coalesced_children_truncated",
+            ] {
+                assert_eq!(carrier.metadata.get(flag).map(String::as_str), Some("true"));
+            }
+        }
+    }
+
     /// #15b closeout point 2 — the coalesced payload is BOUNDED. Folding
     /// 1100 children (enough to exceed BOTH caps with one batch) must leave
-    /// `coalesced_count` at the true unique total while the persisted id set
+    /// `coalesced_count` at the observed report total while the persisted id set
     /// stops at `COALESCED_CHILD_IDS_MAX` (512, flagged
     /// `coalesced_child_ids_truncated`) and the rendered skeleton list stops
     /// at `COALESCED_CHILDREN_MAX_LINES` (1024, flagged
@@ -41036,11 +41320,11 @@ mod tests {
         );
         assert_eq!(drained.len(), 1, "the whole burst folds into one carrier");
         let carrier = &drained[0];
-        // The count is NEVER truncated: the true unique total.
+        // The observed report count is retained even when display/cache truncate.
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
             Some(total_children.to_string().as_str()),
-            "coalesced_count holds the true unique total"
+            "coalesced_count preserves the observed report total"
         );
         // The persisted id set stops at the cap and says so.
         let ids = carrier
@@ -41082,11 +41366,11 @@ mod tests {
             "the list truncation must be disclosed"
         );
         // The prompt note tells the master the list was cut and where the
-        // true total lives.
+        // observed total lives.
         let prompt = master_continuation_prompt(carrier);
         assert!(
-            prompt.contains("further children omitted from the list")
-                && prompt.contains("coalesced_count holds the true total"),
+            prompt.contains("child report row(s) omitted from the list")
+                && prompt.contains("observed child report(s)"),
             "the note must disclose the omitted children; prompt tail: {}",
             &prompt[prompt.len().saturating_sub(400)..],
         );
