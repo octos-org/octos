@@ -21,10 +21,10 @@ use super::monitor_runtime::{
     MonitorWatchConfig, append_monitor_note, monitor_batch_hash,
 };
 use super::supervisor_store::{
-    ArtifactRecord as SupervisorArtifactRecord, ChildAgentRecord, ChildStatus,
-    CoalescedTombstoneEntry, CohortEpochAdmission, ContinuationStatus, GroupStatus, HeartbeatPing,
-    PendingContinuationRecord, SupervisedGroupRecord, SupervisorEvent, SupervisorMetadata,
-    SupervisorState, SupervisorStore, TerminalKind, TerminalState,
+    ArtifactRecord as SupervisorArtifactRecord, COALESCED_METADATA_KEYS, ChildAgentRecord,
+    ChildStatus, CoalescedTombstoneEntry, CohortEpochAdmission, ContinuationStatus, GroupStatus,
+    HeartbeatPing, PendingContinuationRecord, SupervisedGroupRecord, SupervisorEvent,
+    SupervisorMetadata, SupervisorState, SupervisorStore, TerminalKind, TerminalState,
 };
 use super::workspace_scope::WorkspaceScope;
 use chrono::Utc;
@@ -2861,7 +2861,19 @@ impl InProcessAgentOrchestrator {
                 .is_none_or(|status| !is_agent_terminal_status(status) || status != agent.status);
         let payload = autonomy_agent_json(&agent);
         state.agents.insert(agent.agent_id.clone(), agent.clone());
-        if transitioned_terminal {
+        // A failed carrier read defers notification after the live status
+        // already changed. Same-status re-forwards must retry that undelivered
+        // verdict, while a matching delivered mark keeps normal dedupe intact.
+        let terminal_delivery_pending = is_agent_terminal_status(&agent.status)
+            && state
+                .delivered_child_marks
+                .get(&child_completed_dedupe_key(
+                    &agent_continuation_group_id(&agent),
+                    &agent.session_id.0,
+                    &agent.agent_id,
+                ))
+                .is_none_or(|mark| mark.status != agent.status);
+        if transitioned_terminal || terminal_delivery_pending {
             enqueue_agent_terminal_continuations(&mut state, &agent);
         }
         Ok(payload)
@@ -12536,6 +12548,9 @@ struct AutonomyRuntimeState {
     /// Self-disarms after one use; per-instance, like the other force hooks.
     #[cfg(test)]
     force_admission_persist_failure: bool,
+    /// One-shot durable carrier read failure during a terminal correction.
+    #[cfg(test)]
+    force_correction_carrier_read_failure: bool,
     /// #27 (round-4, #18 SF3) — test-only switch: after the armed scatter
     /// persist fails and the key is recorded in `pending_unpersisted_scatters`,
     /// the FIRST checked retry ALSO fails, so the retry loop itself (not just
@@ -12589,6 +12604,8 @@ impl Default for AutonomyRuntimeState {
             force_scatter_persist_failure: false,
             #[cfg(test)]
             force_admission_persist_failure: false,
+            #[cfg(test)]
+            force_correction_carrier_read_failure: false,
             #[cfg(test)]
             force_scatter_retry_failure_once: false,
         }
@@ -15757,25 +15774,56 @@ const COALESCED_CHILDREN_MAX_LINES: usize = 1024;
 const COALESCED_CHILDREN_MAX_BYTES: usize = 256 * 1024;
 const COALESCED_CHILD_IDS_MAX_BYTES: usize = 64 * 1024;
 
-const COALESCED_METADATA_KEYS: &[&str] = &[
-    "coalesced_child_ids",
-    "coalesced_children",
-    "coalesced_count",
-    "coalesced_count_kind",
-    "listed_child_count",
-    "omitted_child_count",
-    "coalesced_row_kinds",
-    "omitted_summary_count",
-    "coalesce_generation",
-    "coalesced_child_ids_truncated",
-    "coalesced_children_truncated",
-    "coalesced_correction_note",
-];
-
 #[derive(Clone)]
 struct CoalescedRow {
     text: String,
     child: bool,
+}
+
+/// Reuse restart's legacy workspace evidence instead of comparing peer stamps
+/// to canonical keys. Completed rows no longer own undelivered folded reports.
+fn durable_correction_carrier_metadata(
+    snapshot: &SupervisorState,
+    agent: &AutonomyAgentRecord,
+    group_id: &str,
+    child_key: &str,
+) -> std::io::Result<Option<std::collections::BTreeMap<String, String>>> {
+    let compat = WorkspaceCompat::build(snapshot)?;
+    let mut candidates = Vec::new();
+    for record in snapshot.continuations.values() {
+        if record.status == ContinuationStatus::Completed {
+            continue;
+        }
+        let Some(request) = master_continuation_request_from_persisted(record) else {
+            continue;
+        };
+        if request.session_id.as_str() != agent.session_id.0
+            || request.profile_id.as_str() != agent.profile_id
+            || request.group_id.as_str() != group_id
+            || !matches!(
+                request.reason,
+                MasterContinuationReason::ChildCompleted
+                    | MasterContinuationReason::ScatterJoinComplete
+            )
+            || !request.metadata.contains_key("coalesced_child_ids")
+            || compat.request_scope(record)? != agent.workspace_scope
+        {
+            continue;
+        }
+        let rank = (
+            record.continuation_id == child_key,
+            request.metadata["coalesced_child_ids"]
+                .split(',')
+                .any(|id| id == agent.agent_id),
+            record.queued_at_ms,
+            record.continuation_id.as_str(),
+        );
+        candidates.push((rank, request.metadata));
+    }
+    Ok(candidates
+        .into_iter()
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, metadata)| metadata))
 }
 
 fn coalesced_rows(metadata: &std::collections::BTreeMap<String, String>) -> Vec<CoalescedRow> {
@@ -16405,35 +16453,10 @@ fn enqueue_agent_terminal_continuations(
             // one write behind the other.
             let revision = next_continuation_attempt(state, &child_key);
             let mut child = build_child_terminal_request(agent, &group_id, &child_key);
-            // #25 (round-4 Blocker #18-B3) — a correction landing on a
-            // pending CARRIER (the still-undelivered fold target) must NOT
-            // drop the folded payload: `replace_pending_payload` removes
-            // the old item wholesale, so its `coalesced_*` metadata is
-            // captured here FIRST and re-attached to the rebuilt request.
-            // The correction changes ONLY the carrier-child's own verdict —
-            // the structured child-id set and count are unchanged (they are
-            // identity, not status) — with a human-readable note line
-            // appended instead of text surgery on the rendered rows.
-            //
-            // The pending carrier may sit under a DIFFERENT dedupe key than
-            // the corrected child: the fold at drain time takes every
-            // same-scope terminal item into its batch, so the in-memory
-            // carrier is already claimed (its record stays Queued in the
-            // store, but pending_by_key no longer holds it). We find the
-            // carrier by CONTENT (any pending terminal item for this session
-            // whose metadata already carries `coalesced_child_ids`) rather
-            // than by key — the fold's `take_pending_terminal_for_scope`
-            // removes ALL same-scope rows, so the carrier is the only
-            // pending item that can have folded children.
-            //
-            // #25 round 2 (outer-loop 22:46 bounce): `pending_items()` is a
-            // GLOBAL queue — the old unscoped `.find()` would graft another
-            // session's (or another group/workspace's) folded payload onto
-            // THIS correction. The carrier must sit in the SAME
-            // (session, profile, group, workspace) scope as the corrected
-            // child — exactly the scope `take_pending_terminal_for_scope`
-            // folds by — and among the scope's carriers we prefer the one
-            // whose folded id set actually CONTAINS this child.
+            // A correction replaces the carrier payload, including any folded
+            // siblings. Claimed carriers have left pending_items(), so recover
+            // their still-undelivered durable payload when pending has none.
+            // Both sources must match session/profile/group/workspace.
             let carrier_scope = |pending: &QueuedMasterContinuation| {
                 pending.session_id.as_str() == agent.session_id.0.as_str()
                     && pending.profile_id.as_str() == agent.profile_id.as_str()
@@ -16446,24 +16469,47 @@ fn enqueue_agent_terminal_continuations(
                     && item_workspace(pending)
                         == agent.workspace_scope.as_ref().map(WorkspaceScope::key)
             };
-            let carried_coalesced = state
+            let mut carried_coalesced = state
                 .continuations
                 .pending_items()
                 .filter(|pending| {
                     carrier_scope(pending) && pending.metadata.contains_key("coalesced_child_ids")
                 })
-                // Preference pass: a carrier whose folded ids name THIS
-                // child is THE carrier its verdict row lives in; a scope
-                // can hold at most one carrier with folded children, but
-                // prefer-by-content keeps the pick unambiguous if a
-                // correction ever races a second fold.
                 .max_by_key(|pending| {
-                    pending
-                        .metadata
-                        .get("coalesced_child_ids")
-                        .is_some_and(|ids| ids.contains(&agent.agent_id))
+                    (
+                        pending.dedupe_key.as_str() == child_key,
+                        pending
+                            .metadata
+                            .get("coalesced_child_ids")
+                            .is_some_and(|ids| ids.split(',').any(|id| id == agent.agent_id)),
+                        pending.sequence,
+                    )
                 })
                 .map(|pending| pending.metadata.clone());
+            if carried_coalesced.is_none()
+                && let Some(store) = state.supervisor_store.as_ref()
+            {
+                #[cfg(test)]
+                let snapshot = if std::mem::take(&mut state.force_correction_carrier_read_failure) {
+                    Err(std::io::Error::other(
+                        "forced correction carrier read failure",
+                    ))
+                } else {
+                    store.load_state()
+                };
+                #[cfg(not(test))]
+                let snapshot = store.load_state();
+                match snapshot.and_then(|snapshot| {
+                    durable_correction_carrier_metadata(&snapshot, agent, &group_id, &child_key)
+                }) {
+                    Ok(metadata) => carried_coalesced = metadata,
+                    Err(err) => {
+                        tracing::warn!(?err, agent_id = %agent.agent_id,
+                                "deferring correction until its executing carrier metadata can be recovered");
+                        return;
+                    }
+                }
+            }
             if let Some(carried) = carried_coalesced {
                 for key in COALESCED_METADATA_KEYS {
                     if let Some(value) = carried.get(*key) {
@@ -41609,6 +41655,234 @@ mod tests {
             reemitted.is_empty(),
             "nothing re-emitted for A/B/C/D after delivery + restart; got {reemitted:?}"
         );
+    }
+
+    #[test]
+    fn correction_executing_child_carrier_preserves_folded_reports_after_restart() {
+        for scenario in [
+            "executing",
+            "late_completion",
+            "changed_workspace",
+            "read_failure",
+            "already_completed",
+        ] {
+            let late_completion = scenario == "late_completion";
+            let changed_workspace = scenario == "changed_workspace";
+            let read_failure = scenario == "read_failure";
+            let completed_delivery = scenario == "already_completed";
+            let dir = tempfile::tempdir().unwrap();
+            let session = SessionKey::with_profile("correction-r5", "api", "executing");
+            let upsert = |id: &str, status: &str, workspace: &str| AgentUpsert {
+                agent_id: id.into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session.clone(),
+                task_id: None,
+                path: format!("master/{id}"),
+                role: "background_task".into(),
+                nickname: id.into(),
+                backend_kind: "native".into(),
+                status: status.into(),
+                last_task: Some(format!("summary-{id}")),
+                cwd: Some(workspace.into()),
+                profile_id: "correction-r5".into(),
+            };
+            let orch = Box::leak(Box::new(InProcessAgentOrchestrator::default()));
+            orch.configure_supervisor_store(dir.path()).unwrap();
+            for id in ["task-a", "task-b", "task-c"] {
+                orch.upsert_agent(upsert(id, "running", "/tmp/carrier-a"))
+                    .unwrap();
+            }
+            orch.upsert_agent(upsert("task-a", "failed", "/tmp/carrier-a"))
+                .unwrap();
+            orch.upsert_agent(upsert("task-b", "completed", "/tmp/carrier-a"))
+                .unwrap();
+            let (held, guard) = orch.drain_and_claim_ready_continuation_for_session(
+                &session,
+                "correction-r5",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            assert!(guard.is_some());
+            assert_eq!(held.len(), 1);
+            let old = &held[0];
+            assert_eq!(old.reason, MasterContinuationReason::ChildCompleted);
+            assert_eq!(old.child_agent_id.as_ref().unwrap().as_str(), "task-a");
+            assert_eq!(old.metadata["coalesced_child_ids"], "task-b");
+            orch.mark_continuation_started(old);
+            assert_eq!(orch.state().continuations.pending_items().count(), 0);
+            let store = SupervisorStore::new(dir.path());
+            let durable_key = format!("{}/{}", old.group_id.as_str(), old.dedupe_key.as_str());
+            let b_key = format!(
+                "{}/{}",
+                old.group_id.as_str(),
+                child_completed_dedupe_key(old.group_id.as_str(), &session.0, "task-b",)
+            );
+            let before = store.load_state().unwrap();
+            assert_eq!(
+                before.continuations[&durable_key].status,
+                ContinuationStatus::Started
+            );
+            assert_eq!(
+                before.continuations[&b_key].status,
+                ContinuationStatus::Completed
+            );
+
+            // Durable fallback applies the same four-part scope as pending.
+            let agent = orch.state().agents["task-a"].clone();
+            for key in [
+                "session_id",
+                "profile_id",
+                "payload:workspace_scope",
+                "group",
+            ] {
+                let mut foreign = before.clone();
+                let record = foreign.continuations.get_mut(&durable_key).unwrap();
+                if key == "group" {
+                    record.group_id = "foreign".into();
+                } else {
+                    record.metadata.insert(key.into(), json!("foreign"));
+                }
+                assert!(
+                    durable_correction_carrier_metadata(
+                        &foreign,
+                        &agent,
+                        old.group_id.as_str(),
+                        old.dedupe_key.as_str()
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "scope {key}"
+                );
+            }
+            // A legacy peer carrier is matched using its decoded path evidence.
+            let mut legacy = before.clone();
+            let legacy_child = legacy
+                .children
+                .values_mut()
+                .find(|child| child.child_id == "task-a")
+                .unwrap();
+            legacy_child
+                .metadata
+                .insert("backend_kind".into(), json!("task_supervisor:peer_handoff"));
+            let legacy_record = legacy.continuations.get_mut(&durable_key).unwrap();
+            legacy_record.metadata.remove("payload:workspace_scope");
+            legacy_record.metadata.insert(
+                "payload:workspace".into(),
+                json!(
+                    WorkspaceScope::from_raw(Some("/tmp/carrier-a"))
+                        .unwrap()
+                        .legacy_hex()
+                ),
+            );
+            assert_eq!(
+                durable_correction_carrier_metadata(
+                    &legacy,
+                    &agent,
+                    old.group_id.as_str(),
+                    old.dedupe_key.as_str()
+                )
+                .unwrap()
+                .unwrap()["coalesced_child_ids"],
+                "task-b"
+            );
+
+            // Keep the first attempt held: no scheduler reinsert at any point.
+            let workspace = if changed_workspace {
+                "/tmp/carrier-b"
+            } else {
+                "/tmp/carrier-a"
+            };
+            if completed_delivery {
+                orch.mark_continuation_completed(old, Some("A and B already delivered".into()));
+            }
+            if read_failure {
+                orch.state().force_correction_carrier_read_failure = true;
+                let revisions = orch.state().continuation_revisions.clone();
+                orch.upsert_agent(upsert("task-a", "completed", workspace))
+                    .unwrap();
+                assert_eq!(orch.state().agents["task-a"].status, "completed");
+                assert_eq!(
+                    orch.state().continuations.pending_items().count(),
+                    0,
+                    "a failed carrier read must defer the correction without replacing its payload"
+                );
+                assert_eq!(orch.state().continuation_revisions, revisions);
+                assert_eq!(
+                    orch.state().delivered_child_marks[old.dedupe_key.as_str()].status,
+                    "failed"
+                );
+                assert_eq!(
+                    store.load_state().unwrap().continuations[&durable_key],
+                    before.continuations[&durable_key]
+                );
+            }
+            // Same-status re-forward retries a deferred correction after read recovery.
+            orch.upsert_agent(upsert("task-a", "completed", workspace))
+                .unwrap();
+            let corrected = orch
+                .state()
+                .continuations
+                .pending_items()
+                .find(|item| item.dedupe_key == old.dedupe_key)
+                .unwrap()
+                .clone();
+            assert_eq!(corrected.metadata["status"], "completed");
+            assert_eq!(item_workspace(&corrected), Some(workspace));
+            assert!(corrected.persisted_attempt > old.persisted_attempt);
+            if changed_workspace || completed_delivery {
+                assert!(!corrected.metadata.contains_key("coalesced_child_ids"));
+            } else {
+                assert_eq!(
+                    corrected
+                        .metadata
+                        .get("coalesced_child_ids")
+                        .map(String::as_str),
+                    Some("task-b")
+                );
+                assert_eq!(corrected.metadata["coalesced_count"], "1");
+                assert!(corrected.metadata["coalesced_correction_note"].contains("completed"));
+            }
+            if late_completion {
+                orch.mark_continuation_completed(old, Some("old attempt finished".into()));
+            }
+            let durable = store.load_state().unwrap();
+            let current = &durable.continuations[&durable_key];
+            assert_eq!(current.status, ContinuationStatus::Queued);
+            assert_eq!(current.attempt, corrected.persisted_attempt);
+            assert_eq!(current.started_at_ms, None);
+            assert_eq!(current.completed_at_ms, None);
+            assert_eq!(
+                current
+                    .metadata
+                    .get("payload:coalesced_child_ids")
+                    .and_then(Value::as_str),
+                (!changed_workspace && !completed_delivery).then_some("task-b")
+            );
+            assert_eq!(
+                durable.continuations[&b_key].status,
+                ContinuationStatus::Completed
+            );
+            drop(guard);
+
+            let fresh = InProcessAgentOrchestrator::default();
+            fresh.configure_supervisor_store(dir.path()).unwrap();
+            let recovered = fresh.drain_ready_continuations_for_session(
+                &session,
+                "correction-r5",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].dedupe_key, old.dedupe_key);
+            assert_eq!(
+                recovered[0]
+                    .metadata
+                    .get("coalesced_child_ids")
+                    .map(String::as_str),
+                (!changed_workspace && !completed_delivery).then_some("task-b")
+            );
+            assert_eq!(recovered[0].metadata["status"], "completed");
+        }
     }
 
     /// #25 (round-4 Blocker #18-B3, fold-then-correction) — task-a/task-b

@@ -2395,10 +2395,50 @@ pub(crate) fn replace_with(ops: &ReplaceOps, src: &Path, dst: &Path) -> io::Resu
     }
 }
 
+pub(super) const COALESCED_METADATA_KEYS: &[&str] = &[
+    "coalesced_child_ids",
+    "coalesced_children",
+    "coalesced_count",
+    "coalesced_count_kind",
+    "listed_child_count",
+    "omitted_child_count",
+    "coalesced_row_kinds",
+    "omitted_summary_count",
+    "coalesce_generation",
+    "coalesced_child_ids_truncated",
+    "coalesced_children_truncated",
+    "coalesced_correction_note",
+];
+
+/// Canonical scope is authoritative even when two workspaces share a display
+/// path. Without a canonical key, only exact legacy path evidence is safe here;
+/// peer-stamp decoding requires the roster evidence owned by WorkspaceCompat.
+fn continuation_workspace(record: &PendingContinuationRecord) -> Option<&serde_json::Value> {
+    record
+        .metadata
+        .get("payload:workspace_scope")
+        .or_else(|| record.metadata.get("payload:workspace"))
+}
+
 fn merge_continuation(
     existing: PendingContinuationRecord,
     mut next: PendingContinuationRecord,
 ) -> PendingContinuationRecord {
+    // Completed carriers have delivered or retired their reports. Carrying
+    // those fields into a correction would replay already-resolved siblings.
+    if existing.status != ContinuationStatus::Completed
+        && existing.group_id == next.group_id
+        && existing.metadata.get("session_id") == next.metadata.get("session_id")
+        && existing.metadata.get("profile_id") == next.metadata.get("profile_id")
+        && continuation_workspace(&existing) == continuation_workspace(&next)
+    {
+        for key in COALESCED_METADATA_KEYS {
+            let key = format!("payload:{key}");
+            if let Some(value) = existing.metadata.get(&key) {
+                next.metadata.entry(key).or_insert_with(|| value.clone());
+            }
+        }
+    }
     // #1707 round 3 follow-up: when a strictly-higher-attempt CORRECTION
     // resurrects the payload at a LOWER status rank (e.g. Queued replacing a
     // Completed tombstone), the tombstone's lifecycle timestamps
@@ -3170,6 +3210,115 @@ mod tests {
             "new.md"
         );
         assert_eq!(state.applied_event_ids.len(), 4);
+    }
+
+    #[test]
+    fn correction_merge_preserves_folded_metadata_only_within_scope() {
+        let keys = [
+            "coalesced_child_ids",
+            "coalesced_children",
+            "coalesced_count",
+            "coalesced_count_kind",
+            "listed_child_count",
+            "omitted_child_count",
+            "coalesced_row_kinds",
+            "omitted_summary_count",
+            "coalesce_generation",
+            "coalesced_child_ids_truncated",
+            "coalesced_children_truncated",
+            "coalesced_correction_note",
+        ];
+        for changed in [
+            None,
+            Some("session_id"),
+            Some("profile_id"),
+            Some("group"),
+            Some("payload:workspace_scope"),
+            Some("legacy_workspace"),
+            Some("completed"),
+        ] {
+            let mut old = PendingContinuationRecord {
+                group_id: "group".into(),
+                continuation_id: "same-child-id".into(),
+                child_id: Some("a".into()),
+                prompt: None,
+                status: ContinuationStatus::Started,
+                queued_at_ms: 1,
+                started_at_ms: Some(2),
+                completed_at_ms: None,
+                result: None,
+                attempt: 1,
+                metadata: SupervisorMetadata::from_iter([
+                    ("session_id".into(), serde_json::json!("session")),
+                    ("profile_id".into(), serde_json::json!("profile")),
+                    (
+                        "payload:workspace_scope".into(),
+                        serde_json::json!("/tmp/a"),
+                    ),
+                    (
+                        "payload:workspace".into(),
+                        serde_json::json!("same display"),
+                    ),
+                ]),
+            };
+            if changed == Some("legacy_workspace") {
+                old.metadata.remove("payload:workspace_scope");
+            }
+            if changed == Some("completed") {
+                old.status = ContinuationStatus::Completed;
+                old.completed_at_ms = Some(3);
+            }
+            let mut next = old.clone();
+            for key in keys {
+                old.metadata.insert(
+                    format!("payload:{key}"),
+                    serde_json::json!(format!("old-{key}")),
+                );
+            }
+            old.metadata
+                .insert("payload:unrelated".into(), serde_json::json!("not carried"));
+            next.status = ContinuationStatus::Queued;
+            next.attempt = 2;
+            next.metadata.insert(
+                "payload:coalesced_correction_note".into(),
+                serde_json::json!("explicit new note"),
+            );
+            if let Some(key) = changed.filter(|key| *key != "completed") {
+                if key == "group" {
+                    next.group_id = "other".into();
+                } else {
+                    next.metadata.insert(
+                        if key == "legacy_workspace" {
+                            "payload:workspace"
+                        } else {
+                            key
+                        }
+                        .into(),
+                        serde_json::json!("other"),
+                    );
+                }
+            }
+            let merged = merge_continuation(old, next);
+            assert_eq!(merged.started_at_ms, None);
+            assert_eq!(
+                merged.metadata["payload:coalesced_correction_note"],
+                "explicit new note"
+            );
+            assert!(!merged.metadata.contains_key("payload:unrelated"));
+            for key in keys
+                .into_iter()
+                .filter(|key| *key != "coalesced_correction_note")
+            {
+                assert_eq!(
+                    merged.metadata.get(&format!("payload:{key}")),
+                    changed
+                        .is_none()
+                        .then(|| serde_json::json!(format!("old-{key}")))
+                        .as_ref(),
+                    "field {key}, changed scope {changed:?}"
+                );
+            }
+        }
     }
 
     /// #1707 round 3 (codex Blocker 3): `attempt` is the REVISION of a queued
