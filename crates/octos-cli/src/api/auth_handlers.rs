@@ -6034,8 +6034,9 @@ mod tests {
         // legitimately relocated: the call succeeds and the slot becomes a
         // keychain marker, never the raw value. Hosts with NO backend keep
         // the rejection.
+        let secrets = tempfile::tempdir().unwrap();
         let _secrets_root =
-            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         let (_dir, state, _user_store, profile_store) = temp_app_state();
         profile_store
             .save(&make_user_profile("tenant", "Tenant Owner"))

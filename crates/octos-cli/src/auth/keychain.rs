@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 
 use eyre::Result;
+#[cfg(target_os = "macos")]
+use eyre::WrapErr;
 
 /// Sentinel prefix stored in profile `env_vars` to indicate that the real
 /// secret lives in the macOS Keychain.
@@ -102,6 +104,10 @@ pub fn backend_name() -> &'static str {
 
 /// Whether a secret-store backend exists on this platform.
 pub fn is_available() -> bool {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return true;
+    }
     #[cfg(target_os = "macos")]
     {
         true
@@ -130,6 +136,10 @@ fn unsupported_store_error(op: &str) -> eyre::Report {
 ///
 /// No-op on Linux (the file store has no lock); unsupported elsewhere.
 pub fn unlock(password: &str) -> Result<()> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         macos_unlock(password)
@@ -150,6 +160,10 @@ pub fn unlock(password: &str) -> Result<()> {
 
 /// Store a secret in the platform secret store.
 pub fn set_secret(name: &str, secret: &str) -> Result<()> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::set_secret(name, secret);
+    }
     #[cfg(target_os = "macos")]
     {
         macos_set_secret(name, secret)
@@ -170,6 +184,10 @@ pub fn set_secret(name: &str, secret: &str) -> Result<()> {
 /// Returns `Ok(Some(secret))` on success, `Ok(None)` if not found,
 /// or `Err` on unexpected failures (keychain locked, etc.).
 pub fn get_secret(name: &str) -> Result<Option<String>> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::get_secret(name);
+    }
     #[cfg(target_os = "macos")]
     {
         macos_get_secret(name)
@@ -189,6 +207,10 @@ pub fn get_secret(name: &str) -> Result<Option<String>> {
 ///
 /// Returns `Ok(true)` if deleted, `Ok(false)` if not found.
 pub fn delete_secret(name: &str) -> Result<bool> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::delete_secret(name);
+    }
     #[cfg(target_os = "macos")]
     {
         macos_delete_secret(name)
@@ -206,6 +228,10 @@ pub fn delete_secret(name: &str) -> Result<bool> {
 
 /// Check if the secret store is accessible (unlocked / usable).
 pub fn is_accessible() -> bool {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::is_accessible();
+    }
     #[cfg(target_os = "macos")]
     {
         macos_is_accessible()
@@ -225,56 +251,26 @@ pub fn is_accessible() -> bool {
 // `<octos home>/secrets/<account>` — one file per secret, 0600, directory
 // 0700. The root mirrors the `ProfileStore::octos_home_dir()` the CLI auth
 // commands use (`~/.octos`): same resolver, `secrets/` sibling of `profiles/`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) mod linux_file {
-    use std::io::Write as _;
-    use std::path::{Path, PathBuf};
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::OwnedFd;
+    use std::path::PathBuf;
 
     use eyre::{Result, WrapErr};
+    use rustix::fs::{
+        AtFlags, Mode, OFlags, fchmod, fsync, mkdirat, open, openat, renameat, unlinkat,
+    };
 
-    const DIR_MODE: u32 = 0o700;
-    const FILE_MODE: u32 = 0o600;
-
-    #[cfg(test)]
-    thread_local! {
-        // #2234: thread-local override — a global single-slot TEST_ROOT let
-        // PARALLEL tests stomp each other's temp root (one drops, the next
-        // op in a sibling test hits ENOENT). Per-thread slots make every
-        // test's injection independent; cargo's thread-per-test model
-        // guarantees isolation.
-        static TEST_ROOT: std::cell::RefCell<Option<PathBuf>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// Test-only pin of the secrets root. The guard serializes concurrent
-    /// tests (they contend on the same mutex) and restores the default
-    /// resolution when dropped.
-    #[cfg(test)]
-    /// #2234: RootGuard holds NOTHING (lock-free) — the override is set on
-    /// entry and cleared on drop via short lock acquisitions only, so
-    /// secrets_root's read never contends with a held lock (same-thread
-    /// re-entrant deadlock was the roundtrip hang).
-    pub(crate) fn override_root_for_tests(dir: PathBuf) -> RootGuard {
-        TEST_ROOT.with(|slot| *slot.borrow_mut() = Some(dir));
-        RootGuard
-    }
-
-    #[cfg(test)]
-    pub(crate) struct RootGuard;
-
-    #[cfg(test)]
-    impl Drop for RootGuard {
-        fn drop(&mut self) {
-            TEST_ROOT.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
+    const DIR_MODE: Mode = Mode::RWXU;
+    const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 
     /// The secrets root: `<octos home>/secrets`, with the octos home resolved
     /// exactly as `ProfileStore::octos_home_dir()` does for the CLI auth
     /// commands (`~/.octos`).
     fn secrets_root() -> Result<PathBuf> {
         #[cfg(test)]
-        if let Some(dir) = TEST_ROOT.with(|slot| slot.borrow().clone()) {
+        if let Some(dir) = super::test_store::root() {
             return Ok(dir);
         }
         let home = dirs::home_dir()
@@ -291,84 +287,219 @@ pub(crate) mod linux_file {
         Ok(())
     }
 
-    fn ensure_root(root: &Path) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(root)
-            .wrap_err_with(|| format!("failed to create secrets dir: {}", root.display()))?;
-        // Re-assert 0700 even when the dir already existed (umask could have
-        // loosened it at creation).
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(DIR_MODE))
-            .wrap_err_with(|| format!("failed to restrict secrets dir: {}", root.display()))?;
-        Ok(())
+    fn open_root(create: bool) -> Result<Option<OwnedFd>> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let root = secrets_root()?;
+        let parent = root
+            .parent()
+            .ok_or_else(|| eyre::eyre!("secret root has no parent"))?;
+        let leaf = root
+            .file_name()
+            .ok_or_else(|| eyre::eyre!("secret root has no name"))?;
+        if create {
+            // The production parent is ~/.octos. Refuse a symlink at that
+            // boundary below, rather than following it while chmod'ing secrets.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .wrap_err_with(|| {
+                    format!("failed to create secret-store parent: {}", parent.display())
+                })?;
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let parent = match open(parent, flags, Mode::empty()) {
+            Ok(parent) => parent,
+            Err(error) if !create && error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to open secret-store parent for {}", root.display())
+                });
+            }
+        };
+        if create {
+            match mkdirat(&parent, leaf, DIR_MODE) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to create secrets dir: {}", root.display())
+                    });
+                }
+            }
+        }
+        let dir = match openat(&parent, leaf, flags, Mode::empty()) {
+            Ok(dir) => dir,
+            Err(error) if !create && error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to open secrets dir: {}", root.display()));
+            }
+        };
+        if create {
+            // Restrict the opened inode, never a path that could be swapped.
+            fchmod(&dir, DIR_MODE).wrap_err("failed to restrict secrets directory")?;
+        }
+        Ok(Some(dir))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn is_available() -> bool {
         secrets_root().is_ok()
     }
 
     pub fn is_accessible() -> bool {
-        secrets_root().and_then(|root| ensure_root(&root)).is_ok()
+        open_root(true).is_ok()
     }
 
     pub fn set_secret(name: &str, secret: &str) -> Result<()> {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         validate_name(name)?;
-        let root = secrets_root()?;
-        ensure_root(&root)?;
-        let path = root.join(name);
-        // mode() applies 0600 atomically at creation; the later
-        // set_permissions re-asserts it in case a umask quirk loosened it.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(FILE_MODE)
-            .open(&path)
-            .wrap_err_with(|| format!("failed to create secret file: {}", path.display()))?;
-        file.write_all(secret.as_bytes())
-            .wrap_err_with(|| format!("failed to write secret file: {}", path.display()))?;
-        file.sync_all()
-            .wrap_err_with(|| format!("failed to sync secret file: {}", path.display()))?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(FILE_MODE))
-            .wrap_err_with(|| format!("failed to restrict secret file: {}", path.display()))?;
+        let dir = open_root(true)?.expect("create opens a directory or returns an error");
+        let temporary = format!(".secret-{}.tmp", uuid::Uuid::new_v4());
+        let fd = openat(
+            &dir,
+            temporary.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            FILE_MODE,
+        )
+        .wrap_err("failed to create private temporary secret file")?;
+        let mut file = std::fs::File::from(fd);
+        let written = (|| -> Result<()> {
+            // Creation can only be MORE restrictive under umask. Restore the
+            // owner's read/write bits on this opened inode before writing.
+            fchmod(&file, FILE_MODE).wrap_err("failed to restrict secret file")?;
+            file.write_all(secret.as_bytes())
+                .wrap_err("failed to write secret file")?;
+            file.sync_all().wrap_err("failed to sync secret file")?;
+            // All operations use the SAME directory fd, even if its path is
+            // concurrently renamed. Rename replaces a symlink/hardlink itself;
+            // it never truncates another inode or exposes a partially written key.
+            renameat(&dir, temporary.as_str(), &dir, name)
+                .wrap_err("failed to replace secret file")?;
+            fsync(&dir).wrap_err("failed to sync secret directory")?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = unlinkat(&dir, temporary.as_str(), AtFlags::empty());
+        }
+        written?;
         Ok(())
     }
 
     pub fn get_secret(name: &str) -> Result<Option<String>> {
         validate_name(name)?;
-        let path = secrets_root()?.join(name);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(eyre::eyre!(
-                    "failed to read secret file {}: {e}",
-                    path.display()
-                ));
-            }
+        let Some(dir) = open_root(false)? else {
+            return Ok(None);
         };
-        String::from_utf8(bytes)
-            .map(Some)
-            .wrap_err_with(|| format!("secret file {} is not valid UTF-8", path.display()))
+        let fd = match openat(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => return Err(error).wrap_err("failed to open secret file"),
+        };
+        let mut file = std::fs::File::from(fd);
+        if !file.metadata()?.is_file() {
+            eyre::bail!("secret account is not a regular file");
+        }
+        let mut value = String::new();
+        file.read_to_string(&mut value)
+            .wrap_err("failed to read UTF-8 secret file")?;
+        Ok(Some(value))
     }
 
     pub fn delete_secret(name: &str) -> Result<bool> {
         validate_name(name)?;
-        let path = secrets_root()?.join(name);
-        match std::fs::remove_file(&path) {
+        let Some(dir) = open_root(false)? else {
+            return Ok(false);
+        };
+        match unlinkat(&dir, name, AtFlags::empty()) {
             Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(eyre::eyre!(
-                "failed to delete secret file {}: {e}",
-                path.display()
-            )),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
+            Err(error) => Err(error).wrap_err("failed to delete secret file"),
         }
     }
 }
 
-/// Test hook: pin the Linux secrets root to a temp dir (no-op elsewhere).
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) use linux_file::override_root_for_tests as test_override_secrets_root;
+/// Explicit, thread-local test backend on EVERY host; never a no-op that falls
+/// through to the login Keychain. Keep the tempdir alive until the guard drops.
+#[cfg(test)]
+pub(crate) use test_store::override_root as test_override_secrets_root;
+
+#[cfg(test)]
+mod test_store {
+    use std::path::PathBuf;
+
+    thread_local! {
+        static ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn root() -> Option<PathBuf> {
+        ROOT.with(|slot| slot.borrow().clone())
+    }
+
+    pub(crate) fn override_root(dir: PathBuf) -> RootGuard {
+        RootGuard {
+            previous: ROOT.with(|slot| slot.replace(Some(dir))),
+            // Restoring a thread-local override on another thread is invalid.
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) struct RootGuard {
+        previous: Option<PathBuf>,
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            ROOT.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) use super::linux_file::{delete_secret, get_secret, is_accessible, set_secret};
+
+    // Unsupported production hosts still need an explicitly isolated fixture
+    // backend. Encode account names (scoped names contain ':' on Windows).
+    #[cfg(not(unix))]
+    fn path(name: &str) -> eyre::Result<PathBuf> {
+        let root = root().expect("test backend requires an explicit override");
+        std::fs::create_dir_all(&root)?;
+        let leaf: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+        Ok(root.join(format!("fixture-{leaf}")))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn set_secret(name: &str, value: &str) -> eyre::Result<()> {
+        Ok(std::fs::write(path(name)?, value)?)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn get_secret(name: &str) -> eyre::Result<Option<String>> {
+        match std::fs::read_to_string(path(name)?) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn delete_secret(name: &str) -> eyre::Result<bool> {
+        match std::fs::remove_file(path(name)?) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn is_accessible() -> bool {
+        root().is_some_and(|root| std::fs::create_dir_all(root).is_ok())
+    }
+}
 
 /// Unlock the login keychain so subsequent operations succeed from SSH.
 ///
@@ -641,7 +772,190 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    fn should_isolate_and_restore_nested_test_stores_on_every_host() {
+        let outer = tempfile::tempdir().unwrap();
+        let _outer = test_override_secrets_root(outer.path().to_path_buf());
+        assert!(is_available());
+        assert!(is_accessible());
+        set_secret("FIXTURE::profile", "outer-fixture").unwrap();
+        {
+            let inner = tempfile::tempdir().unwrap();
+            let _inner = test_override_secrets_root(inner.path().to_path_buf());
+            assert_eq!(get_secret("FIXTURE::profile").unwrap(), None);
+            set_secret("FIXTURE::profile", "inner-fixture").unwrap();
+            assert_eq!(
+                get_secret("FIXTURE::profile").unwrap().as_deref(),
+                Some("inner-fixture")
+            );
+        }
+        assert_eq!(
+            get_secret("FIXTURE::profile").unwrap().as_deref(),
+            Some("outer-fixture")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_reject_read_through_account_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "outside-fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("KEY")).unwrap();
+        let _root = test_override_secrets_root(root);
+        assert!(get_secret("KEY").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_replace_account_symlink_without_touching_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "outside-fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("KEY")).unwrap();
+        let _root = test_override_secrets_root(root.clone());
+        set_secret("KEY", "new-fixture").unwrap();
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside-fixture");
+        assert!(
+            std::fs::symlink_metadata(root.join("KEY"))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(get_secret("KEY").unwrap().as_deref(), Some("new-fixture"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_refuse_symlinked_secret_directory_without_chmod_or_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = tmp.path().join("secrets");
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let _root = test_override_secrets_root(root);
+        assert!(set_secret("KEY", "fixture").is_err());
+        assert!(get_secret("KEY").is_err());
+        assert!(delete_secret("KEY").is_err());
+        assert!(!is_accessible());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_replace_hardlinked_account_without_changing_other_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "outside-fixture").unwrap();
+        std::fs::hard_link(&outside, root.join("KEY")).unwrap();
+        let _root = test_override_secrets_root(root);
+        set_secret("KEY", "new-fixture").unwrap();
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside-fixture");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_leave_no_temporary_secret_when_atomic_replace_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("KEY")).unwrap();
+        let _root = test_override_secrets_root(tmp.path().to_path_buf());
+        assert!(set_secret("KEY", "fixture").is_err());
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("KEY")]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_reject_fifo_account_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(tmp.path().join("KEY"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _root = test_override_secrets_root(tmp.path().to_path_buf());
+        assert!(get_secret("KEY").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_not_create_missing_store_during_read_or_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("missing");
+        let _root = test_override_secrets_root(root.clone());
+        assert_eq!(get_secret("KEY").unwrap(), None);
+        assert!(!delete_secret("KEY").unwrap());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_keep_owner_read_write_permissions_under_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ROOT: &str = "OCTOS_TEST_SECRET_UMASK_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let _root = test_override_secrets_root(root.clone());
+            set_secret("KEY", "fixture").unwrap();
+            assert_eq!(
+                std::fs::metadata(root.join("KEY"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(get_secret("KEY").unwrap().as_deref(), Some("fixture"));
+            return;
+        }
+        // umask is process-global: change it ONLY in a dedicated child, never
+        // in the parallel test runner. The existing root is owned by this test.
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", "umask 777; exec \"$@\"", "secret-fixture"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "should_keep_owner_read_write_permissions_under_restrictive_umask",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_refuse_symlinked_store_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let parent = tmp.path().join("octos-home");
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        let _root = test_override_secrets_root(parent.join("secrets"));
+        assert!(set_secret("KEY", "fixture").is_err());
+        assert!(get_secret("KEY").is_err());
+        assert!(delete_secret("KEY").is_err());
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn linux_file_backend_roundtrip_with_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -685,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn linux_file_backend_rejects_path_escaping_names() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = test_override_secrets_root(tmp.path().to_path_buf());
