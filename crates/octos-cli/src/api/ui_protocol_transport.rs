@@ -615,6 +615,14 @@ impl WsConnection {
         }
     }
 
+    /// True for the `octos serve --stdio` transport (see [`Self::new_stdio`]).
+    /// Stdio carries no auth identity, and `write_stdio_message` answers a
+    /// `Close` frame by ENDING the writer loop — so WebSocket-only signals
+    /// (e.g. the 1008 auth-expiry close) must not be enqueued on it (#2040).
+    fn is_stdio(&self) -> bool {
+        self.stdio_writer.is_some()
+    }
+
     /// Codex #1336 round-2 BLOCKER 1: snapshot the per-connection
     /// feature set so the send helpers can apply the same capability
     /// filter the broadcast forwarder uses. Cheap because
@@ -40293,14 +40301,22 @@ fn close_ws_with_code(ws: &WsConnection, code: u16, reason: &str) -> Result<(), 
 /// from `validate_authenticated_session_scope` (i.e. the connection IS
 /// authenticated and the requested scope doesn't match), accompany it with a
 /// close-code 1008 frame so the SPA `crew:auth_expired` listener fires.
-/// Non-auth scope errors (malformed input, etc.) leave the socket open.
+/// Non-auth scope errors (malformed input, etc.) leave the socket open, and
+/// stdio connections never get the close: they carry no auth identity, and a
+/// Close frame would end the stdio writer loop (#2040).
 fn send_scope_error(ws: &WsConnection, id: String, error: RpcError) {
     let auth_violation = is_auth_scope_violation(&error);
     // Codex BLOCK (2026-05-13): when the writer channel has just one free
     // slot, the close-code is the load-bearing signal — the SPA uses it to
     // detect auth-expiry and clear its token. Enqueue the close FIRST so it
     // survives backpressure even if the courtesy error envelope is dropped.
-    if auth_violation {
+    //
+    // #2040: the close is a WebSocket-only signal. A stdio connection has no
+    // auth identity (its scope comes from the session/open candidate, not a
+    // token), and a Close frame ends the stdio writer loop — dropping the
+    // error envelope queued behind it and tearing down the transport with
+    // the request unanswered. Stdio gets the error reply only.
+    if auth_violation && !ws.is_stdio() {
         let _ = close_ws_with_code(ws, 1008, "auth_expired");
     }
     let _ = send_rpc_error(ws, Some(id), error);
