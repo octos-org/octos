@@ -476,11 +476,16 @@ pub struct SupervisorState {
 
 impl SupervisorState {
     pub fn apply_ledger_row(&mut self, row: &SupervisorEventLedgerRow) {
-        self.last_sequence = self.last_sequence.max(row.sequence);
-        if !row.event_id.is_empty() && !self.applied_event_ids.insert(row.event_id.clone()) {
-            return;
+        if self.accept_ledger_row(row) {
+            self.apply_event(&row.event, row.recorded_at_ms);
         }
-        self.apply_event(&row.event, row.recorded_at_ms);
+    }
+
+    // Both full replay and the continuation projection deduplicate ALL event
+    // kinds globally, after advancing the sequence even for a duplicate.
+    fn accept_ledger_row(&mut self, row: &SupervisorEventLedgerRow) -> bool {
+        self.last_sequence = self.last_sequence.max(row.sequence);
+        row.event_id.is_empty() || self.applied_event_ids.insert(row.event_id.clone())
     }
 
     pub fn apply_event(&mut self, event: &SupervisorEvent, recorded_at_ms: u64) {
@@ -1040,6 +1045,56 @@ impl SupervisorState {
     }
 }
 
+// This fingerprint follows normal atomic snapshot replacement. It is not a
+// content hash: arbitrary external edits preserving identity/length/timestamps
+// are outside the filesystem cache contract. Missing modification timestamps
+// disable reuse conservatively.
+#[derive(Debug, PartialEq, Eq)]
+struct SnapshotFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+#[derive(Debug)]
+struct ContinuationIndex {
+    // Only continuations, global event IDs and last_sequence are retained.
+    state: SupervisorState,
+    snapshot_cutoff: u64,
+    snapshot: Option<SnapshotFingerprint>,
+    offset: u64,
+    boundary_sequence: Option<u64>,
+    extendable: bool,
+}
+
+impl ContinuationIndex {
+    fn project(state: SupervisorState) -> SupervisorState {
+        SupervisorState {
+            continuations: state.continuations,
+            applied_event_ids: state.applied_event_ids,
+            last_sequence: state.last_sequence,
+            ..SupervisorState::default()
+        }
+    }
+
+    fn apply(&mut self, row: &SupervisorEventLedgerRow) {
+        // Keep the snapshot cutoff fixed, even for out-of-order raw rows.
+        if row.sequence <= self.snapshot_cutoff || !self.state.accept_ledger_row(row) {
+            return;
+        }
+        if matches!(
+            row.event,
+            SupervisorEvent::ContinuationQueued { .. }
+                | SupervisorEvent::ContinuationStarted { .. }
+                | SupervisorEvent::ContinuationCompleted { .. }
+        ) {
+            self.state.apply_event(&row.event, row.recorded_at_ms);
+            self.state.groups.clear();
+        }
+    }
+}
+
 /// In-memory cursor over the on-disk ledger, shared by every clone of a store
 /// (the orchestrator clones its store into drain loops and tasks). It is only
 /// read or written while the cross-process append file-lock is held; the
@@ -1058,6 +1113,9 @@ struct SeqCache {
     ledger_rows: u64,
     /// Appends since the events file was last fsynced (batched-fsync mode).
     appends_since_fsync: u64,
+    /// Independent validity: refreshing this projection never changes the
+    /// sequence cursor or fsync debt, including AlreadyCompleted returns.
+    continuations: Option<ContinuationIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -1150,6 +1208,14 @@ impl SupervisorStore {
     /// ledger-first, either the rows are still in the ledger we read, or the
     /// snapshot we read afterwards already contains them.
     pub fn load_state(&self) -> io::Result<SupervisorState> {
+        self.load_state_with_cutoff().map(|(state, _)| state)
+    }
+
+    fn load_state_with_cutoff(&self) -> io::Result<(SupervisorState, u64)> {
+        #[cfg(test)]
+        {
+            self.append_io.lock().unwrap().full_replays += 1;
+        }
         let rows = self.read_ledger_rows()?;
         let snapshot = self.load_snapshot()?;
         let snapshot_last_sequence = snapshot.as_ref().map_or(0, |s| s.last_sequence);
@@ -1161,7 +1227,7 @@ impl SupervisorStore {
                 state.apply_ledger_row(&row);
             }
         }
-        Ok(state)
+        Ok((state, snapshot_last_sequence))
     }
 
     /// #26a — goal-scoped view of the stream, folded BY (session, goal) KEY.
@@ -1251,6 +1317,10 @@ impl SupervisorStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        #[cfg(test)]
+        {
+            self.append_io.lock().unwrap().snapshot_reads += 1;
+        }
         let snapshot: SupervisorSnapshot = serde_json::from_str(&body).map_err(invalid_data)?;
         if snapshot.schema_version > SNAPSHOT_SCHEMA_VERSION {
             return Err(io::Error::new(
@@ -1377,6 +1447,7 @@ impl SupervisorStore {
     pub fn append_ledger_row(&self, row: &SupervisorEventLedgerRow) -> io::Result<()> {
         let _lock = self.acquire_append_lock()?;
         let mut cache = self.lock_seq_cache();
+        cache.continuations = None;
         self.write_row_sealed_locked(row)?;
         // Raw rows bypass sequence assignment; rather than guess at the
         // ledger's shape (this path must keep working even on a ledger whose
@@ -1617,14 +1688,17 @@ impl SupervisorStore {
             ));
         }
         let _lock = self.acquire_append_lock()?;
-        let mut durable = self.load_state()?;
+        let mut cache = self.lock_seq_cache();
+        self.refresh_continuations_locked(&mut cache)?;
         let key = continuation_key(&continuation.group_id, &continuation.continuation_id);
-        if let Some(current) = durable.continuations.remove(&key)
+        if let Some(current) = cache
+            .continuations
+            .as_ref()
+            .and_then(|index| index.state.continuations.get(&key))
             && current.status == ContinuationStatus::Completed
         {
-            return Ok(ContinuationQueueOutcome::AlreadyCompleted(current));
+            return Ok(ContinuationQueueOutcome::AlreadyCompleted(current.clone()));
         }
-        drop(durable);
         #[cfg(test)]
         {
             let barrier = self
@@ -1642,7 +1716,6 @@ impl SupervisorStore {
             "continuation_queued:{}:{}:{}",
             continuation.group_id, continuation.continuation_id, continuation.attempt
         );
-        let mut cache = self.lock_seq_cache();
         self.append_event_locked(
             event_id,
             SupervisorEvent::ContinuationQueued { continuation },
@@ -1886,6 +1959,10 @@ impl SupervisorStore {
             return Ok(());
         };
         let row_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        // Move, never clone the growing index. Keep its old checkpoint after
+        // success so the next guard consumes local AND foreign suffix rows in
+        // order. Any uncertain write/sync/metadata failure leaves it invalid.
+        let continuations = cache.continuations.take();
         cache.seeded = false;
         // Count conservatively before I/O: even a failed write/flush may
         // leave rows on disk. Keep their fsync debt until a successful sync
@@ -1898,7 +1975,11 @@ impl SupervisorStore {
             if cache.appends_since_fsync >= every {
                 #[cfg(test)]
                 {
-                    self.append_io.lock().unwrap().syncs += 1;
+                    let mut probe = self.append_io.lock().unwrap();
+                    probe.syncs += 1;
+                    if std::mem::take(&mut probe.fail_sync) {
+                        return Err(io::Error::other("injected ledger fsync failure"));
+                    }
                 }
                 file.sync_data()?;
                 cache.appends_since_fsync = 0;
@@ -1918,6 +1999,7 @@ impl SupervisorStore {
         cache.events_len = events_len;
         cache.ledger_rows = cache.ledger_rows.saturating_add(row_count);
         cache.seeded = true;
+        cache.continuations = continuations;
         Ok(())
     }
 
@@ -2010,6 +2092,7 @@ impl SupervisorStore {
     /// failure the cursor is left stale, which the next append detects and
     /// repairs by reseeding from disk.
     fn snapshot_and_compact_locked(&self, cache: &mut SeqCache) -> io::Result<SupervisorSnapshot> {
+        cache.continuations = None;
         let snapshot = self.write_snapshot_locked()?;
         if self.events_path.exists() {
             // #34g — rename_replace handles the previous generation
@@ -2032,6 +2115,19 @@ impl SupervisorStore {
         cache.ledger_rows = 0;
         // The snapshot fsync covered everything the ledger held.
         cache.appends_since_fsync = 0;
+        cache.continuations = Some(ContinuationIndex {
+            state: SupervisorState {
+                continuations: snapshot.state.continuations.clone(),
+                applied_event_ids: snapshot.state.applied_event_ids.clone(),
+                last_sequence: snapshot.state.last_sequence,
+                ..SupervisorState::default()
+            },
+            snapshot_cutoff: snapshot.last_sequence,
+            snapshot: self.snapshot_fingerprint()?,
+            offset: 0,
+            boundary_sequence: None,
+            extendable: true,
+        });
         Ok(snapshot)
     }
 
@@ -2043,9 +2139,86 @@ impl SupervisorStore {
                 // half-updated cursor; force a reseed from disk on next use.
                 let mut guard = poisoned.into_inner();
                 guard.seeded = false;
+                guard.continuations = None;
                 guard
             }
         }
+    }
+
+    fn snapshot_fingerprint(&self) -> io::Result<Option<SnapshotFingerprint>> {
+        let metadata = match fs::metadata(&self.snapshot_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(SnapshotFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        }))
+    }
+
+    // The append lock is held throughout validation, catch-up, check and write.
+    // Take the index before fallible reads; never publish partial replay after
+    // an error and never clone the whole index on the ordinary warm path.
+    fn refresh_continuations_locked(&self, cache: &mut SeqCache) -> io::Result<()> {
+        let previous = cache.continuations.take();
+        let snapshot = self.snapshot_fingerprint()?;
+        let disk_len = match fs::metadata(&self.events_path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err),
+        };
+        let mut index = match previous {
+            Some(mut index)
+                if index.snapshot == snapshot
+                    && snapshot
+                        .as_ref()
+                        .is_none_or(|stamp| stamp.modified.is_some())
+                    && index.extendable
+                    && disk_len >= index.offset
+                    && (index.offset == 0
+                        || (index.boundary_sequence.is_some()
+                            && self.read_last_row_sequence(index.offset)?
+                                == index.boundary_sequence)) =>
+            {
+                if disk_len == index.offset {
+                    cache.continuations = Some(index);
+                    return Ok(());
+                }
+                for row in self.read_ledger_rows_from(index.offset)? {
+                    index.apply(&row);
+                }
+                index
+            }
+            _ => {
+                let (state, snapshot_cutoff) = self.load_state_with_cutoff()?;
+                ContinuationIndex {
+                    state: ContinuationIndex::project(state),
+                    snapshot_cutoff,
+                    snapshot,
+                    offset: 0,
+                    boundary_sequence: None,
+                    extendable: false,
+                }
+            }
+        };
+        index.offset = disk_len;
+        index.boundary_sequence = self.read_last_row_sequence(disk_len)?;
+        index.extendable = if disk_len == 0 {
+            true
+        } else {
+            let mut file = File::open(&self.events_path)?;
+            file.seek(SeekFrom::Start(disk_len - 1))?;
+            let mut byte = [0];
+            file.read_exact(&mut byte)?;
+            byte[0] == b'\n'
+        };
+        cache.continuations = Some(index);
+        Ok(())
     }
 
     /// Bring the in-memory cursor in line with the on-disk ledger. Must be
@@ -2157,6 +2330,10 @@ impl SupervisorStore {
     }
 
     fn read_ledger_rows(&self) -> io::Result<Vec<SupervisorEventLedgerRow>> {
+        self.read_ledger_rows_from(0)
+    }
+
+    fn read_ledger_rows_from(&self, offset: u64) -> io::Result<Vec<SupervisorEventLedgerRow>> {
         // Open-and-match instead of exists()-then-open: a concurrent
         // compaction may rotate the ledger away between the two, which must
         // read as "no rows", not an error.
@@ -2166,11 +2343,12 @@ impl SupervisorStore {
         // window. `load_snapshot` uses `fs::read_to_string`, whose handle
         // is opened-and-closed inside the call. Kept explicit so a future
         // refactor that hoists these handles shows up against this comment.
-        let file = match File::open(&self.events_path) {
+        let mut file = match File::open(&self.events_path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        file.seek(SeekFrom::Start(offset))?;
         let reader = BufReader::new(file);
         let mut rows = Vec::new();
         // #26a — tolerant replay: a SINGLE malformed line (a torn write from a
@@ -2188,12 +2366,19 @@ impl SupervisorStore {
                 continue;
             }
             match serde_json::from_str(&line) {
-                Ok(row) => rows.push(row),
+                Ok(row) => {
+                    #[cfg(test)]
+                    {
+                        self.append_io.lock().unwrap().decoded_rows += 1;
+                    }
+                    rows.push(row);
+                }
                 Err(err) => {
                     skipped += 1;
                     tracing::warn!(
                         target: "octos::supervisor",
                         path = %self.events_path.display(),
+                        replay_offset = offset,
                         line = idx + 1,
                         error = %err,
                         "skipping malformed supervisor event row (#26a tolerant replay)"
@@ -2623,8 +2808,12 @@ mod tests {
         writes: usize,
         flushes: usize,
         pub(super) syncs: usize,
+        pub(super) full_replays: usize,
+        pub(super) snapshot_reads: usize,
+        pub(super) decoded_rows: usize,
         fail_after_first_row: bool,
         fail_flush: bool,
+        pub(super) fail_sync: bool,
         fail_before_write: bool,
         fail_write_after_bytes: Option<usize>,
         pub(super) conditional_queue_barrier: Option<Arc<std::sync::Barrier>>,
@@ -4968,6 +5157,538 @@ mod tests {
             attempt,
             metadata: SupervisorMetadata::new(),
         }
+    }
+
+    fn assert_continuation_index_matches_replay(store: &SupervisorStore) {
+        let expected = store.load_state().unwrap();
+        let _lock = store.acquire_append_lock().unwrap();
+        let mut cache = store.lock_seq_cache();
+        store.refresh_continuations_locked(&mut cache).unwrap();
+        let actual = &cache.continuations.as_ref().unwrap().state;
+        assert_eq!(actual.continuations, expected.continuations);
+        assert_eq!(actual.applied_event_ids, expected.applied_event_ids);
+        assert_eq!(actual.last_sequence, expected.last_sequence);
+        assert!(actual.groups.is_empty());
+        assert!(actual.children.is_empty());
+        assert!(actual.artifacts.is_empty());
+    }
+
+    #[test]
+    fn continuation_index_warm_completion_clone_foreign_compaction_and_regrowth() {
+        for mode in 0..6 {
+            let dir = tempfile::tempdir().unwrap();
+            let a = SupervisorStore::new(dir.path())
+                .with_snapshot_every_appends(0)
+                .with_append_fsync_every(100);
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .unwrap();
+            // Refresh through the queued boundary, so compaction/regrowth must
+            // validate the historical boundary of a nonempty warm index.
+            assert_continuation_index_matches_replay(&a);
+            let old_len = fs::metadata(a.events_path()).unwrap().len();
+            let b = if mode == 0 {
+                a.clone()
+            } else {
+                SupervisorStore::new(dir.path()).with_snapshot_every_appends(0)
+            };
+            b.record_continuation_started("conditional-group", "scatter-key", 15, 1)
+                .unwrap();
+            b.record_continuation_completed(
+                "conditional-group",
+                "scatter-key",
+                20,
+                Some("exact result".into()),
+                1,
+            )
+            .unwrap();
+            if (2..=4).contains(&mode) {
+                b.snapshot_now().unwrap();
+            }
+            if mode == 5 {
+                b.write_snapshot().unwrap();
+            }
+            if mode == 3 {
+                let mut filler = conditional_queue_record(1);
+                filler.continuation_id = "regrowth".into();
+                filler.prompt = Some("x".repeat(old_len as usize + 100));
+                b.record_continuation_queued(filler).unwrap();
+                assert!(fs::metadata(a.events_path()).unwrap().len() > old_len);
+            }
+            if mode == 4 {
+                // Observe the first empty generation, then compact another
+                // generation to empty before A gets another guard call.
+                assert_continuation_index_matches_replay(&a);
+                b.record_continuation_completed(
+                    "conditional-group",
+                    "scatter-key",
+                    30,
+                    Some("second empty generation".into()),
+                    1,
+                )
+                .unwrap();
+                b.snapshot_now().unwrap();
+            }
+            let expected = a.load_state().unwrap().continuations
+                [&continuation_key("conditional-group", "scatter-key")]
+                .clone();
+            let before_bytes = fs::read(a.events_path()).ok();
+            let (sequence, debt) = {
+                let cache = a.lock_seq_cache();
+                (cache.last_sequence, cache.appends_since_fsync)
+            };
+            *a.append_io.lock().unwrap() = AppendIoProbe::default();
+            for _ in 0..4 {
+                let ContinuationQueueOutcome::AlreadyCompleted(actual) = a
+                    .record_continuation_queued_if_not_completed(conditional_queue_record(99))
+                    .unwrap()
+                else {
+                    panic!("warm completion lost in mode {mode}");
+                };
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(fs::read(a.events_path()).ok(), before_bytes);
+            let cache = a.lock_seq_cache();
+            assert_eq!(
+                (cache.last_sequence, cache.appends_since_fsync),
+                (sequence, debt)
+            );
+            let probe = a.append_io.lock().unwrap();
+            assert_eq!(
+                (probe.opens, probe.writes, probe.flushes, probe.syncs),
+                (0, 0, 0, 0)
+            );
+            assert!(probe.full_replays <= usize::from(mode >= 2));
+        }
+    }
+
+    #[test]
+    fn continuation_index_reuses_local_compaction_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(2);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        a.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        assert!(!a.events_path().exists());
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        for _ in 0..8 {
+            assert!(matches!(
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                    .unwrap(),
+                ContinuationQueueOutcome::AlreadyCompleted(_)
+            ));
+        }
+        let probe = a.append_io.lock().unwrap();
+        assert_eq!(
+            (
+                probe.full_replays,
+                probe.snapshot_reads,
+                probe.decoded_rows,
+                probe.opens
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn continuation_index_matches_lifecycle_global_dedup_and_raw_sequence_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        let b = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        let completed = |attempt| SupervisorEvent::ContinuationCompleted {
+            group_id: "conditional-group".into(),
+            continuation_id: "scatter-key".into(),
+            completed_at_ms: 20,
+            result: Some(format!("attempt {attempt}")),
+            attempt,
+        };
+        let queued = |attempt| SupervisorEvent::ContinuationQueued {
+            continuation: conditional_queue_record(attempt),
+        };
+        let events = vec![
+            ("complete-one", completed(1)),
+            ("old-queued", queued(1)),
+            ("reopen", queued(2)),
+            ("stale-complete", completed(1)),
+            (
+                "stale-start",
+                SupervisorEvent::ContinuationStarted {
+                    group_id: "conditional-group".into(),
+                    continuation_id: "scatter-key".into(),
+                    started_at_ms: 21,
+                    attempt: 1,
+                },
+            ),
+            (
+                "cross-kind",
+                SupervisorEvent::Heartbeat {
+                    ping: test_ping("unrelated", "child", "ping", 30),
+                },
+            ),
+            ("cross-kind", completed(2)),
+            ("legacy-complete", completed(0)),
+            ("reopen-again", queued(3)),
+            (
+                "missing-queued",
+                SupervisorEvent::ContinuationCompleted {
+                    group_id: "other-group".into(),
+                    continuation_id: "scatter-key".into(),
+                    completed_at_ms: 31,
+                    result: None,
+                    attempt: 1,
+                },
+            ),
+        ];
+        for (event_id, event) in events {
+            b.append_event(event_id, event).unwrap();
+            assert_continuation_index_matches_replay(&a);
+        }
+        b.snapshot_now().unwrap();
+        assert_continuation_index_matches_replay(&a);
+        b.append_event("legacy-complete", completed(0)).unwrap(); // snapshot's dedup survives
+        assert_continuation_index_matches_replay(&a);
+        let base = b.load_state().unwrap().last_sequence;
+        for (sequence, event_id, event) in [
+            (base + 10, "high-sequence", queued(4)),
+            (base + 2, "lower-sequence-new-id", completed(0)),
+            (base + 20, "cross-kind", queued(5)),
+        ] {
+            b.append_ledger_row(&SupervisorEventLedgerRow {
+                event_id: event_id.into(),
+                sequence,
+                recorded_at_ms: 40,
+                event,
+            })
+            .unwrap();
+            assert_continuation_index_matches_replay(&a);
+        }
+        let ContinuationQueueOutcome::AlreadyCompleted(record) = a
+            .record_continuation_queued_if_not_completed(conditional_queue_record(99))
+            .unwrap()
+        else {
+            panic!("lower sequence above the fixed snapshot cutoff must apply");
+        };
+        assert_eq!(record.attempt, 4);
+    }
+
+    #[test]
+    fn continuation_index_tolerates_malformed_suffix_and_unterminated_rows() {
+        for valid_eof in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .unwrap();
+            assert_continuation_index_matches_replay(&a);
+            let row = SupervisorEventLedgerRow {
+                event_id: "raw-completed".into(),
+                sequence: 2,
+                recorded_at_ms: 20,
+                event: SupervisorEvent::ContinuationCompleted {
+                    group_id: "conditional-group".into(),
+                    continuation_id: "scatter-key".into(),
+                    completed_at_ms: 20,
+                    result: None,
+                    attempt: 1,
+                },
+            };
+            {
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(a.events_path())
+                    .unwrap();
+                file.write_all(b"malformed middle\n\n").unwrap();
+                if valid_eof {
+                    file.write_all(&serde_json::to_vec(&row).unwrap()).unwrap();
+                } else {
+                    file.write_all(b"{torn").unwrap();
+                }
+            }
+            assert_continuation_index_matches_replay(&a);
+            // Both the valid EOF record and an incomplete final row force
+            // conservative reseeding after the append API seals the tail.
+            a.record_continuation_completed("other", "sealed", 30, None, 0)
+                .unwrap();
+            assert_continuation_index_matches_replay(&a);
+            if !valid_eof {
+                let b = SupervisorStore::new(dir.path());
+                let mut row = row;
+                row.sequence = 4;
+                b.append_ledger_row(&row).unwrap();
+            }
+            assert!(matches!(
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                    .unwrap(),
+                ContinuationQueueOutcome::AlreadyCompleted(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn continuation_index_reseeds_same_length_changed_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        a.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        let before = fs::read_to_string(a.events_path()).unwrap();
+        let after = before.replace("\"sequence\":2", "\"sequence\":9");
+        assert_ne!(before, after);
+        assert_eq!(before.len(), after.len());
+        fs::write(a.events_path(), after).unwrap();
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(99))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        assert_eq!(a.append_io.lock().unwrap().full_replays, 1);
+        assert_continuation_index_matches_replay(&a);
+    }
+
+    #[test]
+    fn continuation_index_snapshot_replacement_errors_fail_closed_when_warm() {
+        for nonempty in [false, true] {
+            for corrupt in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                    .unwrap();
+                let mut snapshot = a.snapshot_now().unwrap();
+                if nonempty {
+                    a.record_continuation_completed("other", "tail", 20, None, 0)
+                        .unwrap();
+                }
+                assert_continuation_index_matches_replay(&a);
+                let old_bytes = fs::read(a.events_path()).ok();
+                let tmp = dir.path().join("replacement");
+                snapshot.schema_version += 1;
+                fs::write(
+                    &tmp,
+                    if corrupt {
+                        b"invalid snapshot".to_vec()
+                    } else {
+                        serde_json::to_vec(&snapshot).unwrap()
+                    },
+                )
+                .unwrap();
+                rename_replace(&tmp, a.snapshot_path()).unwrap();
+                *a.append_io.lock().unwrap() = AppendIoProbe::default();
+                assert!(
+                    a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                        .is_err()
+                );
+                assert_eq!(fs::read(a.events_path()).ok(), old_bytes);
+                assert_eq!(a.append_io.lock().unwrap().opens, 0);
+                assert!(a.lock_seq_cache().continuations.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_index_reconciles_failed_completion_writes_and_fsync_debt() {
+        // Ordinary and raw paths may report an error after bytes reached disk.
+        // Only persisted, complete rows may suppress the retry.
+        for raw in [false, true] {
+            for failure in 0..4 {
+                if raw && failure == 3 {
+                    continue;
+                } // raw API has no fsync policy
+                let dir = tempfile::tempdir().unwrap();
+                let a = SupervisorStore::new(dir.path())
+                    .with_snapshot_every_appends(0)
+                    .with_append_fsync_every(1);
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                    .unwrap();
+                assert_continuation_index_matches_replay(&a);
+                {
+                    let mut probe = a.append_io.lock().unwrap();
+                    match failure {
+                        0 => probe.fail_before_write = true,
+                        1 => probe.fail_write_after_bytes = Some(17),
+                        2 => probe.fail_flush = true,
+                        3 => probe.fail_sync = true,
+                        _ => unreachable!(),
+                    }
+                }
+                let result = if raw {
+                    a.append_ledger_row(&SupervisorEventLedgerRow {
+                        event_id: "raw-failure".into(),
+                        sequence: 2,
+                        recorded_at_ms: 20,
+                        event: SupervisorEvent::ContinuationCompleted {
+                            group_id: "conditional-group".into(),
+                            continuation_id: "scatter-key".into(),
+                            completed_at_ms: 20,
+                            result: Some("persisted".into()),
+                            attempt: 1,
+                        },
+                    })
+                } else {
+                    a.clone()
+                        .record_continuation_completed(
+                            "conditional-group",
+                            "scatter-key",
+                            20,
+                            Some("persisted".into()),
+                            1,
+                        )
+                        .map(|_| ())
+                };
+                assert!(result.is_err());
+                assert!(a.lock_seq_cache().continuations.is_none());
+                assert_continuation_index_matches_replay(&a);
+                let debt = a.lock_seq_cache().appends_since_fsync;
+                *a.append_io.lock().unwrap() = AppendIoProbe::default();
+                let outcome = a
+                    .record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                    .unwrap();
+                if failure >= 2 {
+                    let ContinuationQueueOutcome::AlreadyCompleted(record) = outcome else {
+                        panic!("persisted completion lost");
+                    };
+                    assert_eq!(record.result.as_deref(), Some("persisted"));
+                    assert_eq!(a.append_io.lock().unwrap().opens, 0);
+                    assert_eq!(a.lock_seq_cache().appends_since_fsync, debt);
+                    if !raw {
+                        assert_eq!(debt, 1);
+                    }
+                } else {
+                    assert!(matches!(outcome, ContinuationQueueOutcome::Written(_)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_index_reconciles_partial_completed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        a.append_io.lock().unwrap().fail_after_first_row = true;
+        let entries: Vec<_> = ["scatter-key", "second-key"]
+            .into_iter()
+            .map(|id| CoalescedTombstoneEntry {
+                group_id: "conditional-group".into(),
+                continuation_id: id.into(),
+                completed_at_ms: 20,
+                result: "folded".into(),
+                attempt: 1,
+            })
+            .collect();
+        assert!(a.record_continuations_coalesced(&entries).is_err());
+        assert!(a.lock_seq_cache().continuations.is_none());
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        let mut second = conditional_queue_record(1);
+        second.continuation_id = "second-key".into();
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(second)
+                .unwrap(),
+            ContinuationQueueOutcome::Written(_)
+        ));
+        assert_continuation_index_matches_replay(&a);
+    }
+
+    #[test]
+    fn continuation_index_utf8_read_error_invalidates_partial_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        let b = SupervisorStore::new(dir.path());
+        b.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(a.events_path())
+            .unwrap()
+            .write_all(&[0xff, b'\n'])
+            .unwrap();
+        let bytes = fs::read(a.events_path()).unwrap();
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .is_err()
+        );
+        assert!(a.lock_seq_cache().continuations.is_none());
+        assert_eq!(a.append_io.lock().unwrap().opens, 0);
+        assert_eq!(fs::read(a.events_path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn continuation_index_recovers_after_compaction_rotation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        a.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        fs::create_dir(a.rotated_events_path()).unwrap();
+        fs::write(a.rotated_events_path().join("obstacle"), "keep").unwrap();
+        assert!(a.snapshot_now().is_err());
+        assert!(a.lock_seq_cache().continuations.is_none());
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        assert_continuation_index_matches_replay(&a);
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_batch_replays_history_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        for idx in 0..64 {
+            let mut record = conditional_queue_record(1);
+            record.continuation_id = format!("snapshot-{idx}");
+            record.prompt = Some("substantial historical payload".repeat(128));
+            store.record_continuation_queued(record).unwrap();
+        }
+        store.snapshot_now().unwrap();
+        let store = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        for idx in 0..16 {
+            store
+                .record_continuation_completed("history", format!("tail-{idx}"), 20, None, 0)
+                .unwrap();
+        }
+        *store.append_io.lock().unwrap() = AppendIoProbe::default();
+        for idx in 0..12 {
+            let mut record = conditional_queue_record(1);
+            record.continuation_id = format!("join-{idx}");
+            assert!(matches!(
+                store
+                    .clone()
+                    .record_continuation_queued_if_not_completed(record)
+                    .unwrap(),
+                ContinuationQueueOutcome::Written(_)
+            ));
+            store
+                .record_continuation_completed("history", format!("intervening-{idx}"), 30, None, 0)
+                .unwrap();
+        }
+        let probe = store.append_io.lock().unwrap();
+        assert_eq!(probe.full_replays, 1, "batch must seed exactly once");
+        assert_eq!(
+            probe.snapshot_reads, 1,
+            "large snapshot must be read exactly once"
+        );
+        assert!(
+            probe.decoded_rows <= 16 + 24,
+            "historical tail must be decoded once, got {} decoded rows",
+            probe.decoded_rows
+        );
     }
 
     #[test]
