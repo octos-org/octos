@@ -22533,6 +22533,7 @@ fn make_background_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -22814,6 +22815,7 @@ async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentr
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     };
 
     // The production `set_on_change` callback, threading the resolved
@@ -22927,6 +22929,7 @@ fn unified_terminal_test_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 

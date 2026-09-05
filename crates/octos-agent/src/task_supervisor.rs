@@ -357,6 +357,25 @@ pub struct BackgroundTask {
     /// domain-specific views from the canonical task lifecycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_metadata: Option<Value>,
+    /// #1707 round 5 codex round 2 (board item #13 round 2) — the MASTER
+    /// session's workspace root, captured at registration time.
+    ///
+    /// The background-task agent mirror derives its `cwd` stamp from this
+    /// value (falling back to the legacy `output_files[0]` parent-dir
+    /// derivation when absent), so the continuation queue's workspace stamps
+    /// — which the `/stop` terminal purge matches against the interrupted
+    /// turn's `session_runtime.workspace_root` — share ONE source with the
+    /// purge argument instead of depending on how the task completed
+    /// (`retire_peer_supervised_task` completes with EMPTY output files →
+    /// `cwd=None`; orphan adoption completes with `<profile-data>/peers/
+    /// <slug>/result.md` → `cwd=<…>/peers/<slug>` — NEITHER equalled the
+    /// master's workspace root, so the `/stop` purge matched ZERO
+    /// `peer_handoff` items in production).
+    ///
+    /// `#[serde(default)]` so pre-existing persisted snapshots deserialize
+    /// unchanged; `None` preserves the legacy derivation bit-for-bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 impl BackgroundTask {
@@ -2543,6 +2562,7 @@ impl TaskSupervisor {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         // Codex P2 atomicity: when this is a child-task registration
@@ -2650,6 +2670,35 @@ impl TaskSupervisor {
             // Stamp updated_at so reconnect hydration / dashboards see
             // the projection update even when no lifecycle transition
             // fires.
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
+        self.emit_progress_for_state(&snapshot);
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13 round 2) — stamp the
+    /// MASTER session's workspace root onto an already-registered task.
+    /// Same post-registration shape as [`Self::set_m13b_projection`]:
+    /// keeps every `register_*` signature unchanged (octos-agent stays
+    /// additive) while letting the registration site record the purge-side
+    /// workspace value the background-task mirror derives `cwd` from. A
+    /// `None` / empty value is ignored — the task keeps any existing stamp
+    /// (and the legacy `output_files` derivation stays the fallback).
+    pub fn set_workspace_root(&self, task_id: &str, workspace_root: Option<&str>) {
+        let Some(workspace_root) = workspace_root.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            if task.workspace_root.as_deref() == Some(workspace_root) {
+                return;
+            }
+            task.workspace_root = Some(workspace_root.to_string());
             task.updated_at = Utc::now();
             task.clone()
         };

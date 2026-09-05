@@ -12445,17 +12445,32 @@ impl InProcessAgentOrchestrator {
     /// notification) is the safe failure, silently dropping them is not.
     /// The in-memory purge + marks happen regardless so THIS process stops
     /// re-entering immediately.
+    ///
+    /// Selection is scoped to the FULL `(session, profile, workspace)`
+    /// triple (#1707 round 5 codex round 2, board item #13): AppUI permits
+    /// BARE wire session keys, so a same-named session under a DIFFERENT
+    /// profile — or (with `appui.sessions_in_cwd`) the same profile+session
+    /// rebound to a different project folder — leaves its own pending
+    /// terminal items behind, and a bare-session-id purge would wipe those
+    /// OTHER scope's undelivered child verdicts. `workspace` is normalized
+    /// exactly like [`item_workspace`] (empty → `None`) so an unstamped
+    /// item only matches a `None` purge and vice versa.
     pub(crate) fn clear_pending_terminal_continuations_for_session(
         &self,
         session_id: &SessionKey,
+        profile_id: &str,
+        workspace: Option<&str>,
         reason: &str,
     ) -> usize {
         let mut state = self.state();
+        let workspace = workspace.filter(|value| !value.is_empty());
         let targets: Vec<QueuedMasterContinuation> = state
             .continuations
             .pending_items()
             .filter(|item| {
                 item.session_id.as_str() == session_id.0
+                    && item.profile_id.as_str() == profile_id
+                    && item_workspace(item) == workspace
                     && matches!(
                         item.reason,
                         MasterContinuationReason::ChildCompleted
@@ -12562,6 +12577,8 @@ impl InProcessAgentOrchestrator {
         if purged > 0 {
             tracing::info!(
                 session_key = %session_id.0,
+                profile_id,
+                workspace = workspace.unwrap_or("none"),
                 count = purged,
                 reason,
                 "/stop purged pending terminal continuations (tombstoned + marks stamped)"
@@ -15216,11 +15233,32 @@ fn background_task_last_task(task: &octos_agent::BackgroundTask) -> Option<Strin
 }
 
 fn background_task_cwd(task: &octos_agent::BackgroundTask) -> Option<String> {
-    task.output_files
-        .first()
-        .and_then(|path| Path::new(path).parent())
-        .map(|path| path.to_string_lossy().into_owned())
+    // #1707 round 5 codex round 2 (board item #13 round 2) — the workspace
+    // stamp and the `/stop` purge argument must be the SAME VALUE: the purge
+    // matches against the interrupted turn's `session_runtime.workspace_root`
+    // (ui_protocol_transport.rs), so the stamp is taken from the task's
+    // registration-time `workspace_root` — stamped by the peer_handoff
+    // `emit_staged` callback from the same SessionRuntime instance — and only
+    // falls back to the legacy `output_files[0]` parent-dir derivation when
+    // the task carries no stamp. The legacy derivation is FALSIFIED for
+    // `peer_handoff` in production: the close path completes the task with
+    // EMPTY output files (`cwd=None`) and orphan adoption completes it with
+    // `<profile-data>/peers/<slug>/result.md` (`cwd=<…>/peers/<slug>`) —
+    // neither equalled the master's workspace root, so the scoped purge
+    // matched ZERO production peer items. Scatter cohort grouping and
+    // `persist_agent_started`'s `workspace_path` both read `agent.cwd`, so
+    // they inherit the same source automatically.
+    task.workspace_root
+        .as_deref()
         .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            task.output_files
+                .first()
+                .and_then(|path| Path::new(path).parent())
+                .map(|path| path.to_string_lossy().into_owned())
+                .filter(|path| !path.is_empty())
+        })
 }
 
 fn background_task_artifacts(task: &octos_agent::BackgroundTask) -> Vec<AgentArtifactRecord> {
@@ -21406,6 +21444,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
 
         let (_, agent) = upsert_background_task_agent(&task, None).expect("task should mirror");
@@ -21475,6 +21514,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
 
         let (mirrored_session, agent) =
@@ -21797,6 +21837,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
 
         // Orchestrator A: the task mirrors (ChildCompleted + scatter persist)
@@ -22304,6 +22345,8 @@ mod tests {
 
         let purged = orchestrator.clear_pending_terminal_continuations_for_session(
             &session_id,
+            "tenant-u2",
+            None,
             "session_interrupt_stop",
         );
         assert_eq!(purged, 1, "only child X's ChildCompleted was pending");
@@ -23461,6 +23504,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         }
     }
 
@@ -23510,6 +23554,8 @@ mod tests {
 
         let purged = orchestrator.clear_pending_terminal_continuations_for_session(
             &session_id,
+            "tenant-stop",
+            None,
             "session_interrupt_stop",
         );
         assert_eq!(
@@ -23570,6 +23616,457 @@ mod tests {
             reenqueue_reasons,
             vec![MasterContinuationReason::ScatterJoinComplete],
             "the single re-enqueued item must be the new-epoch scatter, not a child re-entry"
+        );
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13) — /stop purge is scoped
+    /// by PROFILE: AppUI permits a BARE wire session key, so two profiles
+    /// running the same-named session each leave their own pending terminal
+    /// items behind. Purging under profile A must drop ONLY A's items; B's
+    /// stay pending until a purge under B's own profile clears them.
+    #[test]
+    fn stop_purge_scopes_by_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Bare key: no profile prefix — the profile scope comes ONLY from
+        // the purge call (and from each agent's own `profile_id`).
+        let session_id = SessionKey("stopscope".to_owned());
+        let upsert = |agent_id: &str, profile_id: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some(format!("master-{profile_id}")),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master-{profile_id}/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: "completed".to_owned(),
+            last_task: Some(format!("done {agent_id}")),
+            cwd: None,
+            profile_id: profile_id.to_owned(),
+        };
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        // Two profiles, same bare session key: 2 children each → 2
+        // ChildCompleted + 2 ScatterJoinComplete per profile (the second
+        // completion of a group bumps the join epoch, #2102).
+        for profile_id in ["tenant-scope-a", "tenant-scope-b"] {
+            for idx in 0..2 {
+                orchestrator.upsert_agent(upsert(&format!("agent-{profile_id}-{idx}"), profile_id));
+            }
+        }
+        assert_eq!(
+            orchestrator
+                .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-a"),
+            4,
+            "profile A staged 2 child completes + 2 epoch-bumped scatter joins"
+        );
+        assert_eq!(
+            orchestrator
+                .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-b"),
+            4,
+            "profile B staged 2 child completes + 2 epoch-bumped scatter joins"
+        );
+
+        // Purge with profile A only: A's items drop, B's are untouched even
+        // though the bare session key matches BOTH profiles' items.
+        let purged_a = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "tenant-scope-a",
+            None,
+            "session_interrupt_stop",
+        );
+        assert_eq!(purged_a, 4, "the purge reports exactly A's pending items");
+        assert_eq!(
+            orchestrator
+                .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-a"),
+            0,
+            "profile A's session has nothing terminal left pending"
+        );
+        assert_eq!(
+            orchestrator
+                .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-b"),
+            4,
+            "profile B's pending items survive a purge scoped to profile A"
+        );
+
+        // A second purge under B's profile clears the rest.
+        let purged_b = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "tenant-scope-b",
+            None,
+            "session_interrupt_stop",
+        );
+        assert_eq!(purged_b, 4, "the second purge reports exactly B's items");
+        for profile_id in ["tenant-scope-a", "tenant-scope-b"] {
+            assert_eq!(
+                orchestrator
+                    .pending_continuation_count_for_session_for_test(&session_id, profile_id),
+                0,
+                "both profiles fully drained after their own scoped purges"
+            );
+        }
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13) — /stop purge is scoped
+    /// by WORKSPACE: `appui.sessions_in_cwd` lets the same profile+session be
+    /// rebound to a different project folder, and the children stamped their
+    /// cwd onto their continuations (`payload:workspace`). Purging under one
+    /// workspace must not wipe the other workspace's undelivered verdicts —
+    /// and a `None` purge must never match stamped items (nor vice versa).
+    #[test]
+    fn stop_purge_scopes_by_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey("stopws".to_owned());
+        let upsert = |agent_id: &str, cwd: Option<&str>| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: "completed".to_owned(),
+            last_task: Some(format!("done {agent_id}")),
+            cwd: cwd.map(str::to_owned),
+            profile_id: "tenant-ws".to_owned(),
+        };
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        // Same session + profile, three workspace scopes: /tmp/ws-a (2
+        // children), /tmp/ws-b (2 children), and UNSTAMPED (1 child, no cwd).
+        for cwd in ["/tmp/ws-a", "/tmp/ws-b"] {
+            for idx in 0..2 {
+                let agent_id = format!("agent-{}-{idx}", cwd.replace('/', "-"));
+                orchestrator.upsert_agent(upsert(&agent_id, Some(cwd)));
+            }
+        }
+        orchestrator.upsert_agent(upsert("agent-unstamped", None));
+        // ws-a: 2 child + 2 epoch-bumped joins; ws-b: same; unstamped: 1
+        // child + 1 join (the unstamped child joins its own group).
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ws"),
+            10,
+            "4 per stamped workspace + 2 unstamped must be pending pre-purge"
+        );
+
+        // Purge with workspace /tmp/ws-a: only ws-a's items drop.
+        let purged_a = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "tenant-ws",
+            Some("/tmp/ws-a"),
+            "session_interrupt_stop",
+        );
+        assert_eq!(purged_a, 4, "only ws-a's 2 child + 2 join items purge");
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ws"),
+            6,
+            "ws-b's and the unstamped items survive the ws-a purge"
+        );
+
+        // An identical second purge finds nothing (idempotent at the scope).
+        let purged_again = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "tenant-ws",
+            Some("/tmp/ws-a"),
+            "session_interrupt_stop",
+        );
+        assert_eq!(purged_again, 0, "replayed ws-a purge is a no-op");
+
+        // A `None` purge must NOT match stamped items — only the unstamped
+        // child's items drop here.
+        let purged_none = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "tenant-ws",
+            None,
+            "session_interrupt_stop",
+        );
+        assert_eq!(
+            purged_none, 2,
+            "the None purge matches exactly the unstamped child's pair"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ws"),
+            4,
+            "ws-b's stamped items survive the None purge"
+        );
+
+        // Drain the survivors: ws-b's burst was never touched by any purge.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-ws",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !drained.is_empty(),
+            "ws-b's surviving burst drains intact after the scoped purges"
+        );
+        assert!(
+            drained
+                .iter()
+                .all(|item| item_workspace(item) == Some("/tmp/ws-b")),
+            "every surviving item belongs to ws-b: {:?}",
+            drained
+                .iter()
+                .map(|item| item_workspace(item).map(str::to_owned))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ws"),
+            0,
+            "nothing remains once the surviving burst is drained"
+        );
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13 ROUND 2) — wire the REAL
+    /// production chain for a test-local orchestrator: the supervisor's
+    /// terminal event (fired by `mark_completed`) must mirror through
+    /// `InProcessAgentOrchestrator::upsert_background_task_agent` — the same
+    /// sink `route_terminal_event_to_continuation_queue`'s Completed arm
+    /// drives in production — so the continuation lands on the TEST's
+    /// orchestrator instance, not the process-global default.
+    ///
+    /// Returns the bound task id. The chain under test:
+    /// `bind_peer_supervised_task_with_workspace` (registration stamp from
+    /// the master workspace root) → `mark_completed(output_files)` →
+    /// supervisor `on_terminal` → mirror upsert → `background_task_cwd` →
+    /// `workspace` metadata on the ChildCompleted.
+    #[cfg(test)]
+    fn bind_peer_task_with_wired_terminal_sink(
+        supervisor: &octos_agent::TaskSupervisor,
+        orchestrator: &InProcessAgentOrchestrator,
+        registry_key: String,
+        session_id: &SessionKey,
+        profile: &'static str,
+        workspace: Option<&str>,
+    ) -> String {
+        let task_id = crate::peers::bind_peer_supervised_task_with_workspace(
+            supervisor,
+            registry_key,
+            &session_id.to_string(),
+            workspace,
+        )
+        .expect("bind peer task");
+        // The per-turn production wiring routes the terminal event through
+        // `route_terminal_event_to_continuation_queue`; its Completed arm is
+        // exactly this upsert against the turn's orchestrator. Wiring the
+        // SAME method keeps the mirror real (cwd derivation, scatter cohort
+        // grouping, delivered-mark stamping all exercised) while staying on
+        // the test-local instance.
+        let sink = orchestrator.clone();
+        supervisor.set_on_terminal(move |event| {
+            if matches!(event.outcome, octos_agent::TerminalOutcome::Completed) {
+                let _ = sink.upsert_background_task_agent(&event.task, Some(profile));
+            }
+        });
+        task_id
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13 ROUND 2) — the /stop purge
+    /// must clear a `peer_handoff` child whose task was completed with EMPTY
+    /// output files (the `retire_peer_supervised_task` close path). This test
+    /// drives the REAL source chain: `TaskSupervisor::register` +
+    /// `set_workspace_root` (what `bind_peer_supervised_task_with_workspace`
+    /// does at the WS `emit_staged` registration point) →
+    /// `mark_completed(task_id, Vec::new())` → supervisor terminal event →
+    /// the mirror derives `cwd` from the REGISTRATION stamp (never from
+    /// `output_files`) → the purge with the SAME workspace root clears the
+    /// pending ChildCompleted. The pre-#13r2 code derived `cwd=None` for this
+    /// shape, so a `Some(ws)` purge matched NOTHING — `/stop` was a silent
+    /// no-op for live peer completions.
+    #[test]
+    fn stop_purge_clears_unstamped_peer_child_via_registered_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-peer-unstamped";
+        let session_id = SessionKey::with_profile(profile, "api", "peer-unstamped");
+        let workspace = "/tmp/ws-peer-unstamped";
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        let task_id = bind_peer_task_with_wired_terminal_sink(
+            &supervisor,
+            &orchestrator,
+            crate::peers::peer_wire_key(profile, "unstamped-peer"),
+            &session_id,
+            profile,
+            Some(workspace),
+        );
+
+        // Live close path: completion with NO output files.
+        supervisor.mark_completed(&task_id, Vec::new());
+
+        let pending =
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile);
+        assert_eq!(
+            pending, 2,
+            "one ChildCompleted + the epoch-0 ScatterJoinComplete (single-child \
+             group is all-terminal at once) must be pending pre-purge"
+        );
+        // The stamp came from the REGISTRATION workspace, not the (empty)
+        // output files — the board-#13r2 falsified derivation.
+        let items: Vec<_> = {
+            let state = orchestrator.state();
+            state.continuations.pending_items().cloned().collect()
+        };
+        assert!(
+            items
+                .iter()
+                .all(|item| item_workspace(item) == Some(workspace)),
+            "every pending item must carry the registered workspace stamp: {:?}",
+            items
+                .iter()
+                .map(|item| item_workspace(item).map(str::to_owned))
+                .collect::<Vec<_>>()
+        );
+
+        // Positive: purge with the SAME root clears it.
+        let purged = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            profile,
+            Some(workspace),
+            "session_interrupt_stop",
+        );
+        assert_eq!(
+            purged, 2,
+            "purge with the registered root must clear the peer child + join"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
+        );
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13 ROUND 2, negative half) —
+    /// a purge under a DIFFERENT workspace must NOT clear the stamped peer
+    /// child (cross-workspace isolation on the real source chain).
+    #[test]
+    fn stop_purge_rejects_other_workspace_for_registered_peer_child() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-peer-neg";
+        let session_id = SessionKey::with_profile(profile, "api", "peer-neg");
+        let workspace = "/tmp/ws-peer-neg";
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        let task_id = bind_peer_task_with_wired_terminal_sink(
+            &supervisor,
+            &orchestrator,
+            crate::peers::peer_wire_key(profile, "neg-peer"),
+            &session_id,
+            profile,
+            Some(workspace),
+        );
+
+        supervisor.mark_completed(&task_id, Vec::new());
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            2,
+            "one ChildCompleted + the epoch-0 ScatterJoinComplete pre-purge"
+        );
+
+        let purged = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            profile,
+            Some("/tmp/ws-somewhere-else"),
+            "session_interrupt_stop",
+        );
+        assert_eq!(
+            purged, 0,
+            "a purge under another workspace must not touch the stamped item"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            2,
+            "the peer child + join survive a foreign-workspace purge"
+        );
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13 ROUND 2) — the orphan
+    /// ADOPTION path completes the parked task with
+    /// `output_files=[<profile-data>/peers/<slug>/result.md]`. The legacy
+    /// derivation would stamp `cwd=<…>/peers/<slug>` — never equal to the
+    /// master's workspace root — so the pre-#13r2 purge matched ZERO adopted
+    /// peer items. With the registration-time stamp the adopted child is
+    /// cleared by a purge with the SAME root, exactly like the close path.
+    #[test]
+    fn stop_purge_clears_adopted_peer_child() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-peer-adopted";
+        let session_id = SessionKey::with_profile(profile, "api", "peer-adopted");
+        let workspace = "/tmp/ws-peer-adopted";
+        let peers_root = dir.path().join("peers");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        let task_id = bind_peer_task_with_wired_terminal_sink(
+            &supervisor,
+            &orchestrator,
+            crate::peers::peer_wire_key(profile, "adopted-peer"),
+            &session_id,
+            profile,
+            Some(workspace),
+        );
+
+        // Orphan-adoption shape: result.md lives under the PROFILE's peers
+        // root — unrelated to the project workspace root.
+        let staged = peers_root.join("adopted-peer");
+        std::fs::create_dir_all(&staged).unwrap();
+        let result_md = staged.join("result.md");
+        std::fs::write(&result_md, "findings").unwrap();
+        supervisor.mark_completed(&task_id, vec![result_md.display().to_string()]);
+
+        let items: Vec<_> = {
+            let state = orchestrator.state();
+            state.continuations.pending_items().cloned().collect()
+        };
+        assert_eq!(
+            items.len(),
+            2,
+            "one ChildCompleted + the epoch-0 ScatterJoinComplete pending pre-purge"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| item_workspace(item) == Some(workspace)),
+            "every adopted-peer item must carry the REGISTERED workspace root, \
+             not the result.md parent dir ({}); the pre-#13r2 derivation \
+             stamped the peers dir and the purge missed it: {:?}",
+            result_md.parent().unwrap().display(),
+            items
+                .iter()
+                .map(|item| item_workspace(item).map(str::to_owned))
+                .collect::<Vec<_>>()
+        );
+
+        let purged = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            profile,
+            Some(workspace),
+            "session_interrupt_stop",
+        );
+        assert_eq!(
+            purged, 2,
+            "the adopted peer child + join purge under the registered root"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
+            0,
         );
     }
 
@@ -23833,6 +24330,7 @@ mod tests {
                 artifact_count: None,
                 runtime_policy_stamp: None,
                 projection_metadata: None,
+                workspace_root: None,
             };
             octos_agent::TerminalEvent {
                 task: task.clone(),
@@ -26391,6 +26889,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -26489,6 +26988,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -26603,6 +27103,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
 
         // Reconcile under the profile the turn actually runs under ("coding"),

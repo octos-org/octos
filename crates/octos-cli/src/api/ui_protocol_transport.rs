@@ -32055,6 +32055,15 @@ async fn run_standalone_turn(
             // runs many turns and would otherwise retire after its first.
             let peer_supervisor = tool_registry.supervisor();
             let peer_task_profile = session_runtime.profile.profile_id.clone();
+            // #1707 round 5 codex round 2 (board item #13 round 2) — stamp
+            // the registered peer task with THIS turn's workspace root, from
+            // the SAME `SessionRuntime.workspace_root` instance the
+            // interrupt-time `/stop` purge reads (`purge_workspace` below).
+            // Both sides then compare ONE value; the pre-#13r2 derivation
+            // from `output_files[0]` never matched it in production (close
+            // path: empty output files → `cwd=None`; orphan adoption:
+            // `cwd=<profile-data>/peers/<slug>`).
+            let peer_task_workspace = session_runtime.workspace_root.to_str().map(str::to_owned);
             let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
                 Arc::new(move |event: PeerStagedEvent| {
                     let registry_key = peer_wire_key(&peer_task_profile, &event.slug);
@@ -32062,10 +32071,11 @@ async fn run_standalone_turn(
                     // supervisor refuses. Binding that would make the close path
                     // try to retire a task that never existed. See
                     // `bind_peer_supervised_task` for the binding contract.
-                    if bind_peer_supervised_task(
+                    if bind_peer_supervised_task_with_workspace(
                         &peer_supervisor,
                         registry_key,
                         &event.session_id.0,
+                        peer_task_workspace.as_deref(),
                     )
                     .is_none()
                     {
@@ -34726,8 +34736,25 @@ async fn run_standalone_turn(
         // External own their lifecycle (goal pause, loop delete, fleet
         // outbox). Idempotent: a replayed interrupt finds nothing pending
         // and returns 0.
+        //
+        // #1707 round 5 codex round 2 (board item #13) — the purge is scoped
+        // to the full `(session, profile, workspace)` triple, not the bare
+        // session id: a same-named session under another profile, or the same
+        // profile+session rebound to a different project folder
+        // (`sessions_in_cwd`), keeps its own pending terminal items. The
+        // profile is THIS turn's resolved runtime profile
+        // (`session_runtime.profile.profile_id`) — the same id every agent
+        // the turn spawned was registered with. The workspace is THIS turn's
+        // effective tool workspace (`session_runtime.workspace_root`), the
+        // same root the tool registry was bound to and the canonical cwd the
+        // children inherited (the continuations' `payload:workspace` stamps
+        // come from `agent.cwd`). An empty root string normalizes to `None`,
+        // matching unstamped items only.
+        let purge_workspace = session_runtime.workspace_root.to_str();
         let purged = default_agent_orchestrator().clear_pending_terminal_continuations_for_session(
             &session_id,
+            &session_runtime.profile.profile_id,
+            purge_workspace,
             "session_interrupt_stop",
         );
         if purged > 0 {
