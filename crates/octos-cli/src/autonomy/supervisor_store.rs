@@ -335,6 +335,13 @@ pub enum SupervisorEvent {
         group_id: String,
         continuation_id: String,
         started_at_ms: u64,
+        /// #26 (round-4, #18 B4) — the revision (persisted `attempt`) of the
+        /// queued payload THIS start belongs to. `#[serde(default)]` keeps
+        /// pre-#26 events readable: they deserialize at 0 and the apply-side
+        /// revision check treats a 0 as "no revision carried" (legacy
+        /// behavior — always applied).
+        #[serde(default)]
+        attempt: u32,
     },
     ContinuationCompleted {
         group_id: String,
@@ -342,6 +349,13 @@ pub enum SupervisorEvent {
         completed_at_ms: u64,
         #[serde(default)]
         result: Option<String>,
+        /// #26 (round-4, #18 B4) — same as `ContinuationStarted::attempt`:
+        /// the queued revision this completion resolves. A Completed for an
+        /// OLD attempt must never tombstone a NEWER revision that has not
+        /// executed yet (crash window: attempt-1 turn finishes after the
+        /// attempt-2 correction was already durably queued).
+        #[serde(default)]
+        attempt: u32,
     },
     /// #15b — durable join-epoch bump marker. `upsert_agent` bumps a group's
     /// join epoch IN MEMORY when a new agent is admitted into an
@@ -398,6 +412,11 @@ pub struct CoalescedTombstoneEntry {
     pub continuation_id: String,
     pub completed_at_ms: u64,
     pub result: String,
+    /// #26 (round-4, #18 B4) — the revision the tombstone resolves. 0 keeps
+    /// the legacy event id / unconditional-apply shape (folded extras whose
+    /// durable attempt is unknown or 0); a positive value carries the same
+    /// revision-match rule as single-record completions.
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -467,17 +486,22 @@ impl SupervisorState {
                 group_id,
                 continuation_id,
                 started_at_ms,
-            } => self.apply_continuation_started(group_id, continuation_id, *started_at_ms),
+                attempt,
+            } => {
+                self.apply_continuation_started(group_id, continuation_id, *started_at_ms, *attempt)
+            }
             SupervisorEvent::ContinuationCompleted {
                 group_id,
                 continuation_id,
                 completed_at_ms,
                 result,
+                attempt,
             } => self.apply_continuation_completed(
                 group_id,
                 continuation_id,
                 *completed_at_ms,
                 result.clone(),
+                *attempt,
             ),
             SupervisorEvent::GroupEpochBumped {
                 group_id,
@@ -676,14 +700,66 @@ impl SupervisorState {
         }
     }
 
+    /// #26 (round-4, #18 B4) — revision-matched terminal transitions. A
+    /// Started/Completed for an OLD attempt must not touch a record that
+    /// now holds a NEWER queued revision: the attempt-1 turn may finish
+    /// (and write its Completed) AFTER a status correction durably queued
+    /// attempt 2; applying that Completed would tombstone the not-yet-run
+    /// correction, and after a crash neither replay nor the seeded gate
+    /// would surface it again. Rule: an incoming lifecycle event carries
+    /// the attempt of the payload it resolved; it applies only when the
+    /// record's current attempt is EQUAL or LOWER (equal = the normal
+    /// same-revision path; lower = the record is an older legacy row the
+    /// event still describes). A STRICTLY HIGHER record attempt means a
+    /// newer revision superseded this event's payload — the event is
+    /// ignored (warn) so the newer revision stays Queued for redelivery.
+    /// `incoming == 0` is the legacy shape (pre-#26 events deserialize
+    /// without an attempt): applied unconditionally, preserving the
+    /// historical behavior of old ledgers.
+    fn continuation_lifecycle_attempt_matches(
+        &self,
+        key: &str,
+        incoming_attempt: u32,
+        event_kind: &str,
+        continuation_id: &str,
+    ) -> bool {
+        let Some(record) = self.continuations.get(key) else {
+            return true;
+        };
+        if incoming_attempt == 0 {
+            return true;
+        }
+        if record.attempt > incoming_attempt {
+            tracing::warn!(
+                event = event_kind,
+                continuation_id,
+                record_attempt = record.attempt,
+                event_attempt = incoming_attempt,
+                "ignoring lifecycle event for a superseded attempt; the newer \
+                 queued revision stays pending"
+            );
+            return false;
+        }
+        true
+    }
+
     fn apply_continuation_started(
         &mut self,
         group_id: &str,
         continuation_id: &str,
         started_at_ms: u64,
+        attempt: u32,
     ) {
         self.ensure_group(group_id, started_at_ms);
         let key = continuation_key(group_id, continuation_id);
+        if !self.continuation_lifecycle_attempt_matches(
+            &key,
+            attempt,
+            "continuation_started",
+            continuation_id,
+        ) {
+            return;
+        }
         let continuation =
             self.continuations
                 .entry(key)
@@ -716,9 +792,18 @@ impl SupervisorState {
         continuation_id: &str,
         completed_at_ms: u64,
         result: Option<String>,
+        attempt: u32,
     ) {
         self.ensure_group(group_id, completed_at_ms);
         let key = continuation_key(group_id, continuation_id);
+        if !self.continuation_lifecycle_attempt_matches(
+            &key,
+            attempt,
+            "continuation_completed",
+            continuation_id,
+        ) {
+            return;
+        }
         let continuation =
             self.continuations
                 .entry(key)
@@ -1337,16 +1422,19 @@ impl SupervisorStore {
         group_id: impl Into<String>,
         continuation_id: impl Into<String>,
         started_at_ms: u64,
+        attempt: u32,
     ) -> io::Result<SupervisorEventLedgerRow> {
         let group_id = group_id.into();
         let continuation_id = continuation_id.into();
-        let event_id = format!("continuation_started:{group_id}:{continuation_id}:{started_at_ms}");
+        let event_id =
+            format!("continuation_started:{group_id}:{continuation_id}:{started_at_ms}:{attempt}");
         self.append_event(
             event_id,
             SupervisorEvent::ContinuationStarted {
                 group_id,
                 continuation_id,
                 started_at_ms,
+                attempt,
             },
         )
     }
@@ -1357,11 +1445,13 @@ impl SupervisorStore {
         continuation_id: impl Into<String>,
         completed_at_ms: u64,
         result: Option<String>,
+        attempt: u32,
     ) -> io::Result<SupervisorEventLedgerRow> {
         let group_id = group_id.into();
         let continuation_id = continuation_id.into();
-        let event_id =
-            format!("continuation_completed:{group_id}:{continuation_id}:{completed_at_ms}");
+        let event_id = format!(
+            "continuation_completed:{group_id}:{continuation_id}:{completed_at_ms}:{attempt}"
+        );
         self.append_event(
             event_id,
             SupervisorEvent::ContinuationCompleted {
@@ -1369,6 +1459,7 @@ impl SupervisorStore {
                 continuation_id,
                 completed_at_ms,
                 result,
+                attempt,
             },
         )
     }
@@ -1413,6 +1504,7 @@ impl SupervisorStore {
                         continuation_id: entry.continuation_id.clone(),
                         completed_at_ms: entry.completed_at_ms,
                         result: Some(entry.result.clone()),
+                        attempt: entry.attempt,
                     },
                 };
                 self.append_row_locked(&row, &mut cache)?;
@@ -2684,10 +2776,10 @@ mod tests {
             })
             .unwrap();
         store
-            .record_continuation_started("group-1", "cont-1", 150)
+            .record_continuation_started("group-1", "cont-1", 150, 1)
             .unwrap();
         store
-            .record_continuation_completed("group-1", "cont-1", 160, Some("resumed".to_string()))
+            .record_continuation_completed("group-1", "cont-1", 160, Some("resumed".to_string()), 1)
             .unwrap();
         store
             .record_child_completed("group-1", "child-a", 170, Some("done".to_string()))
@@ -2838,7 +2930,7 @@ mod tests {
             .record_continuation_queued(record(1, "failed"))
             .unwrap();
         store
-            .record_continuation_completed("group-1", "child/group-1/sess/agent-1", 200, None)
+            .record_continuation_completed("group-1", "child/group-1/sess/agent-1", 200, None, 1)
             .unwrap();
         let key = continuation_key("group-1", "child/group-1/sess/agent-1");
         let state = store.load_state().unwrap();
@@ -3637,5 +3729,96 @@ mod tests {
         assert!(err.to_string().contains("schema_version"), "{err}");
         let err = store.load_state().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn lifecycle_event_for_superseded_attempt_is_ignored() {
+        // #26 (round-4, #18 B4): a Started/Completed carrying an attempt
+        // LOWER than the record's current revision is dropped (warn), the
+        // record stays Queued at the higher attempt; the LEGACY shape
+        // (attempt 0, pre-#26 events) still applies unconditionally.
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SupervisorStore::new(dir.path());
+        store
+            .record_continuation_queued(PendingContinuationRecord {
+                group_id: "group-1".to_owned(),
+                continuation_id: "child/group-1/sess/agent-1".to_owned(),
+                child_id: None,
+                prompt: None,
+                status: ContinuationStatus::Queued,
+                queued_at_ms: 100,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: None,
+                attempt: 2,
+                metadata: SupervisorMetadata::new(),
+            })
+            .unwrap();
+        // Old-attempt lifecycle events are ignored.
+        store
+            .record_continuation_started("group-1", "child/group-1/sess/agent-1", 120, 1)
+            .unwrap();
+        store
+            .record_continuation_completed("group-1", "child/group-1/sess/agent-1", 130, None, 1)
+            .unwrap();
+        let key = continuation_key("group-1", "child/group-1/sess/agent-1");
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Queued,
+            "an attempt-1 lifecycle event cannot touch the attempt-2 record"
+        );
+        assert!(
+            state.continuations[&key].started_at_ms.is_none(),
+            "the ignored Started left no timestamp"
+        );
+
+        // Same-attempt events apply normally.
+        store
+            .record_continuation_started("group-1", "child/group-1/sess/agent-1", 140, 2)
+            .unwrap();
+        store
+            .record_continuation_completed(
+                "group-1",
+                "child/group-1/sess/agent-1",
+                150,
+                Some("done".to_owned()),
+                2,
+            )
+            .unwrap();
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Completed
+        );
+        assert_eq!(state.continuations[&key].started_at_ms, Some(140));
+        assert_eq!(state.continuations[&key].result.as_deref(), Some("done"));
+
+        // Legacy (attempt 0) events still apply — pre-#26 ledger replay.
+        store
+            .record_continuation_queued(PendingContinuationRecord {
+                group_id: "group-1".to_owned(),
+                continuation_id: "child/group-1/sess/agent-2".to_owned(),
+                child_id: None,
+                prompt: None,
+                status: ContinuationStatus::Queued,
+                queued_at_ms: 160,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: None,
+                attempt: 3,
+                metadata: SupervisorMetadata::new(),
+            })
+            .unwrap();
+        store
+            .record_continuation_completed("group-1", "child/group-1/sess/agent-2", 170, None, 0)
+            .unwrap();
+        let state = store.load_state().unwrap();
+        let legacy_key = continuation_key("group-1", "child/group-1/sess/agent-2");
+        assert_eq!(
+            state.continuations[&legacy_key].status,
+            ContinuationStatus::Completed,
+            "legacy attempt-0 lifecycle events keep applying unconditionally"
+        );
     }
 }

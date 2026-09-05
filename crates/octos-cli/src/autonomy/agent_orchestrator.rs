@@ -2148,7 +2148,17 @@ impl InProcessAgentOrchestrator {
         });
         for continuation in reenqueue {
             if let Some(request) = master_continuation_request_from_persisted(continuation) {
+                let dedupe_key = request.stable_dedupe_key();
                 state.continuations.enqueue(request);
+                // #26 (round-4, #18 B4) — the restored item carries the
+                // DURABLE revision its record was persisted at, so its
+                // eventual delivery resolves exactly that attempt (and an
+                // old turn's lifecycle events cannot tombstone it).
+                if continuation.attempt > 0 {
+                    state
+                        .continuations
+                        .stamp_persisted_attempt(&dedupe_key, continuation.attempt);
+                }
             }
         }
         // #1707 round 7 (board item #12, codex round-2 B4 residue): after the
@@ -2435,6 +2445,9 @@ impl InProcessAgentOrchestrator {
                     dedupe_key.as_str(),
                     now_ms_u64(),
                     Some("discarded:solo_boot_parked_loop".into()),
+                    // #26: discard-path tombstone — legacy shape (no revision
+                    // match), byte-identical to pre-#26 apply behavior.
+                    0,
                 );
             }
             tracing::info!(
@@ -2522,6 +2535,7 @@ impl InProcessAgentOrchestrator {
                         dedupe_key.as_str(),
                         now_ms_u64(),
                         Some("discarded:solo_boot_parked_goal".into()),
+                        0,
                     );
                 }
                 tracing::info!(
@@ -2711,6 +2725,7 @@ impl InProcessAgentOrchestrator {
                             dedupe_key.as_str(),
                             now_ms_u64(),
                             Some("discarded:goal_archived_by_operator".into()),
+                            0,
                         );
                     }
                 }
@@ -3670,6 +3685,7 @@ impl InProcessAgentOrchestrator {
                                     Some(
                                         "discarded:unbound_goal_continuation_stale (#2066)".into(),
                                     ),
+                                    0,
                                 );
                             }
                             tracing::debug!(
@@ -3701,6 +3717,7 @@ impl InProcessAgentOrchestrator {
                             item.dedupe_key.as_str(),
                             now_ms_u64(),
                             Some("discarded:stale_at_drain (#1150)".into()),
+                            0,
                         );
                     }
                     tracing::debug!(
@@ -3883,10 +3900,16 @@ impl InProcessAgentOrchestrator {
     pub(crate) fn mark_continuation_started(&self, continuation: &QueuedMasterContinuation) {
         let state = self.state();
         if let Some(store) = state.supervisor_store.as_ref() {
+            // #26 (round-4, #18 B4) — the start carries the revision of the
+            // payload this delivery actually resolved
+            // (`QueuedMasterContinuation::persisted_attempt`); the store's
+            // apply-side revision check keeps a late OLD-attempt start from
+            // touching a NEWER queued revision.
             let _ = store.record_continuation_started(
                 continuation.group_id.as_str(),
                 continuation.dedupe_key.as_str(),
                 now_ms_u64(),
+                continuation.persisted_attempt,
             );
         }
     }
@@ -3898,11 +3921,15 @@ impl InProcessAgentOrchestrator {
     ) {
         let state = self.state();
         if let Some(store) = state.supervisor_store.as_ref() {
+            // #26 (round-4, #18 B4) — same revision-match rule as the start:
+            // an old turn's Completed for attempt 1 must not tombstone a
+            // correction's attempt-2 Queued record that has not run yet.
             let _ = store.record_continuation_completed(
                 continuation.group_id.as_str(),
                 continuation.dedupe_key.as_str(),
                 now_ms_u64(),
                 result,
+                continuation.persisted_attempt,
             );
         }
     }
@@ -12809,6 +12836,9 @@ impl InProcessAgentOrchestrator {
                 continuation_id: item.dedupe_key.as_str().to_owned(),
                 completed_at_ms: now,
                 result: format!("discarded: {reason}"),
+                // #26: legacy shape — the purge tombstones whatever revision
+                // sits on the key, unconditionally (unchanged behavior).
+                attempt: 0,
             });
             // Stamp the delivered mark so a same-process re-forward of the
             // terminal task (the idempotency gate aside, the enqueue path
@@ -15281,6 +15311,9 @@ fn coalesce_terminal_continuations(
                 continuation_id: key.clone(),
                 completed_at_ms: now,
                 result: result.clone(),
+                // #26: legacy shape — folded extras tombstone their key
+                // unconditionally (the carrier holds the superseding payload).
+                attempt: 0,
             })
             .collect();
         #[cfg(test)]
@@ -15341,6 +15374,20 @@ fn coalesce_terminal_continuations(
         carrier = %primary.dedupe_key.as_str(),
         folded,
         "coalesced terminal child continuations into one master re-entry"
+    );
+    // #26 (round-4, #18 B4) — the fold's carrier persist succeeded above;
+    // copy the durable revision onto the POPPED item being delivered so its
+    // eventual Started/Completed resolve the revision the store holds (a
+    // stale-attempt lifecycle event is ignored on the apply side).
+    primary.persisted_attempt = primary.persisted_attempt.max(
+        u32::try_from(
+            state
+                .continuation_revisions
+                .get(primary.dedupe_key.as_str())
+                .copied()
+                .unwrap_or(0),
+        )
+        .unwrap_or(u32::MAX),
     );
     others.insert(slot, primary);
     *kept = others;
@@ -16508,6 +16555,12 @@ fn persist_continuation_coalesced_checked(
     let attempt = next_continuation_attempt(state, carrier.dedupe_key.as_str());
     let result = persist_continuation_queued_with_attempt(state, carrier, attempt);
     if result.is_ok() {
+        // #26 (round-4, #18 B4) — the carrier is a POPPED local here (the
+        // fold operates on already-drained items), so the
+        // `stamp_persisted_attempt` inside the persist helper cannot reach
+        // it. The delivered `kept` item must still carry the durable
+        // revision: seed the unified counter here AND leave the stamped
+        // value where the fold's success path can copy it onto `primary`.
         state
             .continuation_revisions
             .insert(carrier.dedupe_key.as_str().to_owned(), u64::from(attempt));
@@ -16516,7 +16569,7 @@ fn persist_continuation_coalesced_checked(
 }
 
 fn persist_continuation_queued_with_attempt(
-    state: &AutonomyRuntimeState,
+    state: &mut AutonomyRuntimeState,
     continuation: &QueuedMasterContinuation,
     attempt: u32,
 ) -> std::io::Result<()> {
@@ -16537,6 +16590,18 @@ fn persist_continuation_queued_with_attempt(
     let Some(store) = state.supervisor_store.as_ref() else {
         return Ok(());
     };
+    // #26 (round-4, #18 B4) — stamp the durable revision onto the QUEUED
+    // item in the scheduler so a later drain delivers a
+    // `QueuedMasterContinuation` whose `persisted_attempt` matches the
+    // persisted record: the delivery path's Started/Completed carry that
+    // revision and the store ignores lifecycle events for superseded
+    // attempts. When no store exists the write below is skipped, so this
+    // stamp lives INSIDE the store-backed branch only.
+    if attempt > 0 {
+        state
+            .continuations
+            .stamp_persisted_attempt(&continuation.dedupe_key, attempt);
+    }
     let mut metadata = SupervisorMetadata::new();
     metadata.insert("session_id".into(), json!(continuation.session_id.as_str()));
     metadata.insert("profile_id".into(), json!(continuation.profile_id.as_str()));
@@ -16606,6 +16671,7 @@ fn retire_old_peer_injection(
             old_key.as_str(),
             now_ms_u64(),
             Some(reason.to_owned()),
+            0,
         ) {
             tracing::error!(
                 ?err,
@@ -22842,6 +22908,7 @@ mod tests {
                     item.dedupe_key.as_str(),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("mark delivered");
         }
@@ -22997,6 +23064,7 @@ mod tests {
                     item.dedupe_key.as_str(),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("mark delivered");
         }
@@ -23118,6 +23186,7 @@ mod tests {
                         item.dedupe_key.as_str(),
                         now_ms_u64(),
                         None,
+                        0,
                     )
                     .expect("mark delivered");
             }
@@ -23670,6 +23739,7 @@ mod tests {
                     item.dedupe_key.as_str(),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("mark delivered");
         }
@@ -24029,6 +24099,7 @@ mod tests {
                     item.dedupe_key.as_str(),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("mark delivered");
         }
@@ -24120,6 +24191,7 @@ mod tests {
                     item.dedupe_key.as_str(),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("mark delivered");
         }
@@ -24174,6 +24246,7 @@ mod tests {
                 scatter_b[0].dedupe_key.as_str(),
                 now_ms_u64(),
                 None,
+                0,
             )
             .expect("mark delivered");
         drop(fresh_b);
@@ -25723,6 +25796,7 @@ mod tests {
                     item.dedupe_key.as_str(),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("mark delivered");
         }
@@ -25737,6 +25811,7 @@ mod tests {
                     format!("child/{group_id}/{session_id}/{agent_id}"),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("tombstone child record");
         }
@@ -25823,6 +25898,7 @@ mod tests {
                     item.dedupe_key.as_str(),
                     now_ms_u64(),
                     None,
+                    0,
                 )
                 .expect("mark delivered");
         }
@@ -41590,6 +41666,119 @@ mod tests {
         assert_eq!(
             epoch1_joins, 1,
             "the retried epoch-1 join re-emits exactly once after restart"
+        );
+    }
+
+    /// #26 (round-4, #18 B4) — an OLD turn's Completed must not tombstone a
+    /// NEWER queued revision. Sequence: attempt-1 (`failed`) is drained and
+    /// its turn starts; while the turn runs, a status correction durably
+    /// queues attempt 2 (`completed`) as a pending replacement; the old turn
+    /// then finishes and writes its Completed carrying the attempt-1 revision.
+    /// The store must IGNORE that completion (record attempt 2 > event
+    /// attempt 1) so a crash-and-restart still re-enqueues the correction.
+    #[test]
+    fn stale_turn_completion_cannot_tombstone_newer_revision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-b4", "api", "stale-turn-completion");
+        let agent_id = "task-stale-completion".to_owned();
+        let upsert = |status: &str| AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: "stale".to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{status}")),
+            cwd: None,
+            profile_id: "tenant-b4".to_owned(),
+        };
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).expect("store");
+        // Attempt 1: first terminal delivery (`failed`) — queued, persisted,
+        // drained, and its turn STARTS (the durable record holds attempt 1
+        // while the turn is in flight).
+        orch.upsert_agent(upsert("failed"));
+        let drained = orch.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-b4",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let stale_item = drained
+            .into_iter()
+            .find(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .expect("attempt-1 ChildCompleted drained");
+        assert_eq!(
+            stale_item.persisted_attempt, 1,
+            "the drained item carries the revision it was persisted at"
+        );
+        orch.mark_continuation_started(&stale_item);
+
+        // While that turn runs, the verdict is CORRECTED to `completed`: the
+        // correction arm replaces the pending payload and durably persists
+        // attempt 2 (the store record now sits at attempt 2, Queued).
+        orch.upsert_agent(upsert("completed"));
+        {
+            let state = orch.state();
+            let group = format!("agent-group:tenant-b4:{}:master", session_id.0);
+            let child_key = child_completed_dedupe_key(&group, &session_id.0, &agent_id);
+            let mark = state
+                .delivered_child_marks
+                .get(&child_key)
+                .expect("the correction advanced the delivered mark");
+            assert_eq!(mark.status, "completed");
+            assert_eq!(
+                mark.revision, 2,
+                "the correction was persisted at attempt 2"
+            );
+        }
+
+        // The OLD turn finishes LAST: its Completed carries the attempt-1
+        // revision and must be IGNORED by the store (record attempt 2 >
+        // event attempt 1) — the attempt-2 correction stays Queued.
+        orch.mark_continuation_completed(&stale_item, Some("old turn finished late".into()));
+        {
+            let store = SupervisorStore::new(dir.path());
+            let state = store.load_state().unwrap();
+            let group = format!("agent-group:tenant-b4:{}:master", session_id.0);
+            let child_key = child_completed_dedupe_key(&group, &session_id.0, &agent_id);
+            let record = state
+                .continuations
+                .get(&format!("{group}/{child_key}"))
+                .expect("the child record exists");
+            assert_eq!(
+                record.status,
+                ContinuationStatus::Queued,
+                "the late attempt-1 Completed did NOT tombstone the attempt-2 correction"
+            );
+            assert_eq!(record.attempt, 2);
+        }
+        drop(orch);
+
+        // Crash + restart: the attempt-2 correction re-enqueues (it was
+        // never tombstoned) and drains with the CORRECTED status.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let recovered = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-b4",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let corrected = recovered
+            .iter()
+            .find(|item| {
+                item.reason == MasterContinuationReason::ChildCompleted
+                    && item.metadata.get("status").map(String::as_str) == Some("completed")
+            })
+            .expect("the attempt-2 correction re-enqueues after restart");
+        assert_eq!(
+            corrected.persisted_attempt, 2,
+            "the restored item carries the durable attempt-2 revision"
         );
     }
 }

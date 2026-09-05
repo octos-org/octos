@@ -353,6 +353,14 @@ pub(crate) struct QueuedMasterContinuation {
     /// the item (pop→reinsert→pop preserves it) and dies when the item is
     /// consumed or re-homed to a fresh continuation.
     pub(crate) redelivery_attempts: u32,
+    /// #26 (round-4, #18 B4) — the DURABLE revision (`attempt`) this queued
+    /// item's payload was persisted at, so the delivery path can stamp
+    /// Started/Completed with the revision it actually resolved. 0 = not
+    /// (yet) durable / legacy shape (the lifecycle event then applies
+    /// unconditionally, matching pre-#26 behavior). Set by the persist
+    /// helpers and by restart restore (the record's own `attempt`); NOT
+    /// part of dedupe identity.
+    pub(crate) persisted_attempt: u32,
 }
 
 /// #1707: the item's workspace scope, from its `workspace` metadata with an
@@ -602,6 +610,7 @@ impl MasterContinuationScheduler {
             created_at: request.created_at,
             enqueued_at,
             redelivery_attempts: 0,
+            persisted_attempt: 0,
         };
 
         self.heap.push(HeapEntry {
@@ -618,6 +627,23 @@ impl MasterContinuationScheduler {
         dedupe_key: &MasterContinuationDedupeKey,
     ) -> Option<QueuedMasterContinuation> {
         self.pending_by_key.remove(dedupe_key)
+    }
+
+    /// #26 (round-4, #18 B4) — stamp the durable revision onto the still-
+    /// pending item so any later drain of it carries the attempt its
+    /// payload was persisted at (the delivery path's Started/Completed
+    /// resolve that revision). A no-op when the key is no longer pending
+    /// (already drained/cancelled — nothing left to stamp). Never lowers an
+    /// existing stamp: a retry's re-persist of the same payload at a higher
+    /// allocator attempt only lifts it.
+    pub(crate) fn stamp_persisted_attempt(
+        &mut self,
+        dedupe_key: &MasterContinuationDedupeKey,
+        attempt: u32,
+    ) {
+        if let Some(item) = self.pending_by_key.get_mut(dedupe_key) {
+            item.persisted_attempt = item.persisted_attempt.max(attempt);
+        }
     }
 
     /// #436 P1 #2/#4 — RE-INSERT a continuation that was popped (claimed) but
