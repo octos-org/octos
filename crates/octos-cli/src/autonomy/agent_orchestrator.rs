@@ -2752,13 +2752,22 @@ impl InProcessAgentOrchestrator {
                     upsert.session_id,
                     upsert.parent_agent_id.as_deref().unwrap_or("master")
                 );
+                // #19 (round-4 B1) — the admission check and the epoch bump
+                // are scoped to the agent's OWN (group, cwd) cohort: a new
+                // admission under workspace B must NOT bump workspace A's
+                // join epoch, and B's own bump fires only when B's cohort
+                // already joined.
+                let cohort_key = scatter_cohort_key(&group, scatter_cwd_hash(&upsert.cwd));
                 let already_joined = state
                     .scatter_join_state
-                    .get(&group)
+                    .get(&cohort_key)
                     .is_some_and(|s| s.last_joined_key.is_some());
                 if already_joined {
                     let new_epoch = {
-                        let join_state = state.scatter_join_state.entry(group.clone()).or_default();
+                        let join_state = state
+                            .scatter_join_state
+                            .entry(cohort_key.clone())
+                            .or_default();
                         join_state.join_epoch += 1;
                         join_state.join_epoch
                     };
@@ -2774,12 +2783,17 @@ impl InProcessAgentOrchestrator {
                     // bumped epoch's key (not delivered → re-emit). A lost
                     // marker falls back to the pre-#15b behavior (old epoch).
                     if let Some(store) = state.supervisor_store.as_ref()
-                        && let Err(err) =
-                            store.record_group_epoch_bump(group.as_str(), new_epoch, now_ms_u64())
+                        && let Err(err) = store.record_group_epoch_bump(
+                            group.as_str(),
+                            scatter_cwd_hash(&upsert.cwd),
+                            new_epoch,
+                            now_ms_u64(),
+                        )
                     {
                         tracing::warn!(
                             ?err,
                             group = %group,
+                            cwd_hash = scatter_cwd_hash(&upsert.cwd),
                             new_epoch,
                             "join-epoch bump marker persist failed; a crash before the \
                              new epoch's scatter persists could lose that epoch's join"
@@ -12226,13 +12240,20 @@ pub(crate) fn clear_default_agent_orchestrator_for_test() {
 #[allow(clippy::derivable_impls)] // see the manual-Default comment below (#7 round 3)
 struct AutonomyRuntimeState {
     agents: HashMap<String, AutonomyAgentRecord>,
-    /// Refs #2102 (Gap 3) — per-group scatter-join bookkeeping. `join_epoch`
-    /// increments when a child is admitted into an already-joined group
+    /// Refs #2102 (Gap 3) — per-COHORT scatter-join bookkeeping. `join_epoch`
+    /// increments when a child is admitted into an already-joined cohort
     /// (spawn-admission path, under the state lock, BEFORE insertion);
     /// `last_joined_key` records the explicit dedupe key of the last
     /// ScatterJoinComplete actually enqueued, so the all-terminal edge can
     /// skip an already-joined epoch even across a restart. Defaults are
     /// additive — legacy persisted state deserializes with epoch 0 / None.
+    ///
+    /// #19 (round-4 B1) — the map key is the COHORT key
+    /// (`{group}#{cwd_hash}`, see [`scatter_cohort_key`]), not the bare group
+    /// string: sibling cohorts and join keys are workspace-isolated, and the
+    /// join state must follow the same isolation or two workspaces sharing
+    /// one group collide on restart (only one cohort's max-epoch key seeded,
+    /// the other re-emitting).
     scatter_join_state: HashMap<String, ScatterJoinState>,
     /// Durable "already told the master" marks for child terminal events:
     /// `child/<group>/<session>/<agent>` dedupe key → the terminal status
@@ -12570,15 +12591,14 @@ impl InProcessAgentOrchestrator {
         let Some(agent) = siblings.first().cloned() else {
             return;
         };
-        let join_group_key = group_id.clone();
+        let cwd_hash = scatter_cwd_hash(&agent.cwd);
+        // #19 (round-4 B1) — cohort-scoped join state.
+        let join_group_key = scatter_cohort_key(group_id.as_str(), cwd_hash);
         let join_epoch = state
             .scatter_join_state
             .get(&join_group_key)
             .map(|join_state| join_state.join_epoch)
             .unwrap_or(0);
-        let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
-        let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
         let join_key = format!(
             "scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}",
             group = group_id.as_str(),
@@ -12731,9 +12751,16 @@ impl InProcessAgentOrchestrator {
                     state
                         .delivered_scatter_marks
                         .insert(item.dedupe_key.as_str().to_owned(), "joined".to_owned());
+                    // #19 (round-4 B1) — stamp the mark under the COHORT the
+                    // join key itself names (its cwd_hash segment), not the
+                    // bare group.
+                    let cohort_key = scatter_cohort_key(
+                        item.group_id.as_str(),
+                        cwd_hash_from_join_key(item.dedupe_key.as_str()),
+                    );
                     state
                         .scatter_join_state
-                        .entry(item.group_id.as_str().to_owned())
+                        .entry(cohort_key)
                         .or_default()
                         .last_joined_key = Some(item.dedupe_key.as_str().to_owned());
                 }
@@ -12837,6 +12864,42 @@ impl InProcessAgentOrchestrator {
 struct ScatterJoinState {
     join_epoch: u64,
     last_joined_key: Option<String>,
+}
+
+/// #19 (round-4 B1) — hash an agent cwd into the SAME `cwd_hash` the join
+/// key embeds (`scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}`),
+/// so the scatter-join STATE keys and the persisted join keys derive from one
+/// normalization. `None` and `Some(_)` hash through the identical hasher; the
+/// value is a stable process-internal u64 (never parsed back into a path).
+fn scatter_cwd_hash(cwd: &Option<String>) -> u64 {
+    let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(cwd, &mut cwd_hasher);
+    std::hash::Hasher::finish(&cwd_hasher)
+}
+
+/// #19 (round-4 B1) — the COHORT key for scatter-join state. Before this fix
+/// `scatter_join_state`, the seeded max-epoch map, the `GroupEpochBumped`
+/// marker, and `last_joined_key` were keyed by the GROUP STRING ONLY, so two
+/// workspaces sharing one (session, profile, parent) group collided: a
+/// restart restored the single max-epoch cohort and the other workspace's
+/// joins could re-emit forever (HashMap seeds only one). Keying by
+/// `{group}#{cwd_hash}` — the same hashed-cwd normalization the join key
+/// uses — isolates the cohorts while keeping the join-key FORMAT untouched.
+fn scatter_cohort_key(group_id: &str, cwd_hash: u64) -> String {
+    format!("{group_id}#{cwd_hash}")
+}
+
+/// #19 (round-4 B1) — parse the `cwd_hash` segment (5th `/`-separated
+/// segment) out of a persisted scatter join key, the inverse of the
+/// formatting in the enqueue paths. Unparseable/short keys fall back to the
+/// NONE-workspace cohort hash so legacy records still seed SOME cohort
+/// (single-workspace stores behave exactly as before).
+fn cwd_hash_from_join_key(join_key: &str) -> u64 {
+    join_key
+        .split('/')
+        .nth(4)
+        .and_then(|segment| segment.parse::<u64>().ok())
+        .unwrap_or_else(|| scatter_cwd_hash(&None))
 }
 
 /// #1707 round 3 (codex Blockers 3+4) — durable mark for one delivered
@@ -14325,10 +14388,14 @@ fn seed_delivered_terminal_marks(
     state: &mut AutonomyRuntimeState,
     supervisor_state: &SupervisorState,
 ) {
-    // Per group, track the MAX-epoch scatter record so the group's
-    // `last_joined_key` is the key that actually joined last (a superseded
-    // epoch's record may linger in the store).
-    let mut max_epoch_per_group: HashMap<String, (u64, String)> = HashMap::new();
+    // Per COHORT (#19, round-4 B1), track the MAX-epoch scatter record so the
+    // cohort's `last_joined_key` is the key that actually joined last (a
+    // superseded epoch's record may linger in the store). The cohort identity
+    // is parsed from the join key's OWN `cwd_hash` segment — persisted
+    // records carry their workspace identity, so two workspaces at the same
+    // epoch each seed their own entry (previously the group-keyed HashMap let
+    // only one cohort win).
+    let mut max_epoch_per_cohort: HashMap<String, (u64, String)> = HashMap::new();
     for record in supervisor_state.continuations.values() {
         // #1707 round 6 (board item #11): seed the UNIFIED revision counter
         // for EVERY persisted continuation record (any reason, any status) —
@@ -14383,13 +14450,20 @@ fn seed_delivered_terminal_marks(
                     .next()
                     .and_then(|segment| segment.parse::<u64>().ok())
                     .unwrap_or(0);
+                // #19 (round-4 B1) — seed per COHORT: the `cwd_hash` is parsed
+                // from the record's own join key, so two workspaces sharing a
+                // group never collapse into one entry.
+                let cohort_key = scatter_cohort_key(
+                    record.group_id.as_str(),
+                    cwd_hash_from_join_key(&record.continuation_id),
+                );
                 let join_state = state
                     .scatter_join_state
-                    .entry(record.group_id.clone())
+                    .entry(cohort_key.clone())
                     .or_default();
                 join_state.join_epoch = join_state.join_epoch.max(epoch);
-                let entry = max_epoch_per_group
-                    .entry(record.group_id.clone())
+                let entry = max_epoch_per_cohort
+                    .entry(cohort_key)
                     .or_insert((epoch, record.continuation_id.clone()));
                 if epoch > entry.0 {
                     *entry = (epoch, record.continuation_id.clone());
@@ -14406,8 +14480,8 @@ fn seed_delivered_terminal_marks(
     // while restored roster members (which go through
     // `restore_agents_from_supervisor_state`, NOT `upsert_agent`) never
     // trigger the bump.
-    for (group, (_epoch, key)) in max_epoch_per_group {
-        let join_state = state.scatter_join_state.entry(group).or_default();
+    for (cohort, (_epoch, key)) in max_epoch_per_cohort {
+        let join_state = state.scatter_join_state.entry(cohort).or_default();
         join_state.last_joined_key = Some(key.clone());
         // #15 Nit1 — seed the delivered mark for the MAX-epoch record only
         // (the epoch the group can still re-derive); superseded epochs' keys
@@ -14425,15 +14499,28 @@ fn seed_delivered_terminal_marks(
     // bumped one — so `reconcile_missing_scatters_on_restore` derives the
     // bumped epoch's key, finds it undelivered, and re-emits the lost join.
     for group in supervisor_state.groups.values() {
-        if let Some(marker_epoch) = group
-            .metadata
-            .get("join_epoch")
-            .and_then(|value| value.as_u64())
-        {
-            let join_state = state
-                .scatter_join_state
-                .entry(group.group_id.clone())
-                .or_default();
+        for (metadata_key, value) in &group.metadata {
+            // #19 (round-4 B1) — cohort-scoped marker keys
+            // (`join_epoch#{cwd_hash}`); the legacy bare `join_epoch` key is
+            // folded into the NONE-workspace cohort (pre-#19 stores only ever
+            // recorded that cohort — every fixture upserts `cwd: None` — and
+            // a cwd-Some marker pre-#19 simply never existed).
+            let Some(cwd_hash) = metadata_key
+                .strip_prefix("join_epoch#")
+                .map(|segment| {
+                    segment
+                        .parse::<u64>()
+                        .unwrap_or_else(|_| scatter_cwd_hash(&None))
+                })
+                .or_else(|| (metadata_key == "join_epoch").then(|| scatter_cwd_hash(&None)))
+            else {
+                continue;
+            };
+            let Some(marker_epoch) = value.as_u64() else {
+                continue;
+            };
+            let cohort_key = scatter_cohort_key(group.group_id.as_str(), cwd_hash);
+            let join_state = state.scatter_join_state.entry(cohort_key).or_default();
             join_state.join_epoch = join_state.join_epoch.max(marker_epoch);
         }
     }
@@ -15201,15 +15288,16 @@ fn enqueue_agent_terminal_continuations(
     // same epoch joins exactly once (persisted `last_joined_key` equality
     // check skips re-observation, restart-safe); a genuinely re-expanded
     // group gets a new epoch at spawn admission and joins again.
-    let join_group_key = agent_continuation_group_id(agent);
+    let group_id = agent_continuation_group_id(agent);
+    let cwd_hash = scatter_cwd_hash(&agent.cwd);
+    // #19 (round-4 B1) — cohort-scoped join state: two workspaces sharing one
+    // group string track their epochs/marks independently.
+    let join_group_key = scatter_cohort_key(group_id.as_str(), cwd_hash);
     let join_epoch = state
         .scatter_join_state
         .get(&join_group_key)
         .map(|join_state| join_state.join_epoch)
         .unwrap_or(0);
-    let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
-    let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
     let join_key = format!(
         "scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}",
         group = group_id.as_str(),
@@ -15410,15 +15498,16 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
         let Some(agent) = siblings.first().cloned() else {
             continue;
         };
-        let join_group_key = group_id.clone();
+        let cwd_hash = scatter_cwd_hash(&agent.cwd);
+        // #19 (round-4 B1) — the cohort key IS the (group, cwd) identity this
+        // loop iterates over, so each workspace cohort re-derives its OWN
+        // epoch's join key.
+        let join_group_key = scatter_cohort_key(group_id.as_str(), cwd_hash);
         let join_epoch = state
             .scatter_join_state
             .get(&join_group_key)
             .map(|join_state| join_state.join_epoch)
             .unwrap_or(0);
-        let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
-        let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
         let join_key = format!(
             "scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}",
             group = group_id.as_str(),
@@ -22133,6 +22222,500 @@ mod tests {
         );
     }
 
+    /// #19 (round-4 B1, test a) — same (session, profile, group) under TWO
+    /// workspaces: both cohorts join at epoch 0 and drain; after a restart
+    /// the seed pass must restore ONE entry per cohort (previously the
+    /// group-keyed HashMap let only one cohort win) and the restore rebuild
+    /// must NOT re-emit either join.
+    #[test]
+    fn dual_workspace_same_group_epochs_isolated_on_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-dw", "api", "dual-ws");
+        let group = format!("agent-group:tenant-dw:{}:master", session_id);
+        let upsert = |agent_id: &str, status: &str, cwd: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: Some(cwd.to_owned()),
+            profile_id: "tenant-dw".to_owned(),
+        };
+
+        // Orchestrator A: two children per workspace, all terminal → each
+        // workspace cohort joins at ITS OWN epoch 0 (the admission check is
+        // cohort-scoped, so workspace B's admission does NOT bump A).
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        for agent in ["ws-a-1", "ws-a-2", "ws-b-1", "ws-b-2"] {
+            let cwd = if agent.starts_with("ws-a") {
+                "/tmp/ws-a"
+            } else {
+                "/tmp/ws-b"
+            };
+            first.upsert_agent(upsert(agent, "running", cwd));
+        }
+        first.upsert_agent(upsert("ws-a-1", "completed", "/tmp/ws-a"));
+        first.upsert_agent(upsert("ws-a-2", "completed", "/tmp/ws-a"));
+        first.upsert_agent(upsert("ws-b-1", "completed", "/tmp/ws-b"));
+        first.upsert_agent(upsert("ws-b-2", "completed", "/tmp/ws-b"));
+        {
+            let state = first.state();
+            for cwd in ["/tmp/ws-a", "/tmp/ws-b"] {
+                let cohort = scatter_cohort_key(&group, scatter_cwd_hash(&Some(cwd.to_owned())));
+                let join_state = state
+                    .scatter_join_state
+                    .get(&cohort)
+                    .unwrap_or_else(|| panic!("cohort {cohort} must exist"));
+                assert_eq!(
+                    join_state.join_epoch, 0,
+                    "cohort {cohort} joins at its own epoch 0"
+                );
+                assert!(
+                    join_state
+                        .last_joined_key
+                        .as_deref()
+                        .is_some_and(|key| key.ends_with("/0")),
+                    "cohort {cohort}'s last_joined_key names its epoch-0 join"
+                );
+            }
+        }
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-dw",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let scatters = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .count();
+        assert_eq!(
+            scatters,
+            2,
+            "both cohorts drain exactly one epoch-0 join each; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        // Delivery completion tombstones the drained records so the restart
+        // models the normal post-delivery lifecycle (the drain pops from the
+        // in-memory queue but leaves the persisted record Queued).
+        let store = SupervisorStore::new(dir.path());
+        for item in &drained {
+            store
+                .record_continuation_completed(
+                    item.group_id.as_str(),
+                    item.dedupe_key.as_str(),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("mark delivered");
+        }
+        drop(first);
+
+        // Fresh orchestrator: BOTH cohort keys must seed (each cohort one
+        // entry) and NOTHING may re-emit.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        {
+            let state = fresh.state();
+            for cwd in ["/tmp/ws-a", "/tmp/ws-b"] {
+                let cohort = scatter_cohort_key(&group, scatter_cwd_hash(&Some(cwd.to_owned())));
+                let join_state = state
+                    .scatter_join_state
+                    .get(&cohort)
+                    .unwrap_or_else(|| panic!("cohort {cohort} must be seeded on restart"));
+                assert_eq!(join_state.join_epoch, 0, "cohort {cohort} restores epoch 0");
+                assert!(
+                    join_state
+                        .last_joined_key
+                        .as_deref()
+                        .is_some_and(|key| key.ends_with("/0")),
+                    "cohort {cohort} restores its own max-epoch last_joined_key"
+                );
+            }
+        }
+        let redrained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-dw",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            redrained.is_empty(),
+            "no re-emission for either cohort after restart; got {:?}",
+            redrained
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// #19 (round-4 B1, test b) — a NEW admission under workspace B must NOT
+    /// bump workspace A's join epoch: A's cohort stays at epoch 0, B's cohort
+    /// starts untouched, and when B's roster goes all-terminal it joins at
+    /// its OWN epoch 0 (not a phantom epoch 1). Restart: no re-emit either.
+    #[test]
+    fn workspace_b_admission_does_not_bump_workspace_a() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-wb", "api", "ws-b-admission");
+        let group = format!("agent-group:tenant-wb:{}:master", session_id);
+        let upsert = |agent_id: &str, status: &str, cwd: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: Some(cwd.to_owned()),
+            profile_id: "tenant-wb".to_owned(),
+        };
+
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        // Workspace A: two children join at epoch 0 and drain.
+        first.upsert_agent(upsert("a-1", "running", "/tmp/ws-a"));
+        first.upsert_agent(upsert("a-2", "running", "/tmp/ws-a"));
+        first.upsert_agent(upsert("a-1", "completed", "/tmp/ws-a"));
+        first.upsert_agent(upsert("a-2", "completed", "/tmp/ws-a"));
+        let drained_first = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-wb",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained_first
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "workspace A epoch-0 join drained"
+        );
+        // Now a NEW child is admitted under workspace B. Pre-#19 the
+        // group-keyed `last_joined_key.is_some()` saw A's join and bumped the
+        // SHARED epoch to 1; the fix keeps A at epoch 0 and B untouched.
+        first.upsert_agent(upsert("b-1", "running", "/tmp/ws-b"));
+        {
+            let state = first.state();
+            let cohort_a =
+                scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-a".to_owned())));
+            let cohort_b =
+                scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-b".to_owned())));
+            assert_eq!(
+                state
+                    .scatter_join_state
+                    .get(&cohort_a)
+                    .map(|s| s.join_epoch),
+                Some(0),
+                "workspace B's admission must NOT bump workspace A's epoch"
+            );
+            assert!(
+                !state.scatter_join_state.contains_key(&cohort_b),
+                "workspace B's cohort has no join state yet (no fake bump entry)"
+            );
+        }
+        // B completes its roster → B joins at its OWN epoch 0.
+        first.upsert_agent(upsert("b-1", "completed", "/tmp/ws-b"));
+        {
+            let state = first.state();
+            let cohort_b =
+                scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-b".to_owned())));
+            let join_state = state
+                .scatter_join_state
+                .get(&cohort_b)
+                .expect("B's cohort joins after its roster goes all-terminal");
+            assert_eq!(
+                join_state.join_epoch, 0,
+                "B joins at epoch 0, not a bumped 1"
+            );
+            assert!(
+                join_state
+                    .last_joined_key
+                    .as_deref()
+                    .is_some_and(|key| key.ends_with("/0")),
+                "B's join key names epoch 0"
+            );
+        }
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-wb",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let b_joins = drained
+            .iter()
+            .filter(|item| {
+                item.reason == MasterContinuationReason::ScatterJoinComplete
+                    && item.dedupe_key.as_str().ends_with("/0")
+            })
+            .count();
+        assert_eq!(b_joins, 1, "exactly one epoch-0 join drains for B");
+        // Tombstone BOTH drained batches (A's earlier drain + B's) so the
+        // restart models the normal post-delivery lifecycle.
+        let store = SupervisorStore::new(dir.path());
+        for item in drained_first.iter().chain(drained.iter()) {
+            store
+                .record_continuation_completed(
+                    item.group_id.as_str(),
+                    item.dedupe_key.as_str(),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("mark delivered");
+        }
+        drop(first);
+
+        // Restart: neither cohort re-emits.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let redrained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-wb",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            redrained.is_empty(),
+            "no re-emission for either workspace cohort after restart; got {:?}",
+            redrained
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// #19 (round-4 B1, test c) — cross-epoch cohorts: workspace A is bumped
+    /// to epoch 1 (a third child admitted after A's epoch-0 join; its join
+    /// persists), workspace B sits at epoch 0. After a restart each cohort
+    /// re-derives ONLY its own epoch's key — no phantom A/epoch-0 re-join
+    /// (previously the group-keyed seed could mis-derive one) and no B
+    /// re-emit.
+    #[test]
+    fn dual_workspace_cross_epoch_no_phantom_join() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-ce", "api", "cross-epoch");
+        let group = format!("agent-group:tenant-ce:{}:master", session_id);
+        let upsert = |agent_id: &str, status: &str, cwd: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: Some(cwd.to_owned()),
+            profile_id: "tenant-ce".to_owned(),
+        };
+
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        // Workspace A: epoch-0 join (a-1, a-2), then a-3's re-admission bumps
+        // A's cohort to epoch 1 and its completion persists the epoch-1 join.
+        first.upsert_agent(upsert("a-1", "running", "/tmp/ws-a"));
+        first.upsert_agent(upsert("a-2", "running", "/tmp/ws-a"));
+        first.upsert_agent(upsert("a-1", "completed", "/tmp/ws-a"));
+        first.upsert_agent(upsert("a-2", "completed", "/tmp/ws-a"));
+        // Workspace B: epoch-0 join (b-1, b-2).
+        first.upsert_agent(upsert("b-1", "running", "/tmp/ws-b"));
+        first.upsert_agent(upsert("b-2", "running", "/tmp/ws-b"));
+        first.upsert_agent(upsert("b-1", "completed", "/tmp/ws-b"));
+        first.upsert_agent(upsert("b-2", "completed", "/tmp/ws-b"));
+        // A re-admission → bump to epoch 1 → A's epoch-1 join.
+        first.upsert_agent(upsert("a-3", "running", "/tmp/ws-a"));
+        first.upsert_agent(upsert("a-3", "completed", "/tmp/ws-a"));
+        // Drain in a LOOP (SF1 epoch-ordered turns): A's epoch-0 children are
+        // folded into A's LATEST (epoch-1) join carrier while B's epoch-0
+        // join delivers as its own item keyed under B's cwd_hash — one turn
+        // per persisted epoch.
+        let join_epochs_of = |items: &[QueuedMasterContinuation]| {
+            let mut epochs = items
+                .iter()
+                .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+                .map(|item| {
+                    item.dedupe_key
+                        .as_str()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("?")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            epochs.sort_unstable();
+            epochs
+        };
+        let mut all_epochs: Vec<String> = Vec::new();
+        let mut epoch0_joins: Vec<QueuedMasterContinuation> = Vec::new();
+        let mut epoch1_joins: Vec<QueuedMasterContinuation> = Vec::new();
+        let store = SupervisorStore::new(dir.path());
+        for _ in 0..8 {
+            let drained = first.drain_ready_continuations_for_session(
+                &session_id,
+                "tenant-ce",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            if drained.is_empty() {
+                break;
+            }
+            all_epochs.extend(join_epochs_of(&drained));
+            for item in &drained {
+                if item.reason != MasterContinuationReason::ScatterJoinComplete {
+                    continue;
+                }
+                if item.dedupe_key.as_str().ends_with("/1") {
+                    epoch1_joins.push(item.clone());
+                } else {
+                    epoch0_joins.push(item.clone());
+                }
+            }
+            // Tombstone each drained batch so the restart models the normal
+            // post-delivery lifecycle (the drain pops from the in-memory
+            // queue but leaves the persisted record Queued).
+            for item in &drained {
+                store
+                    .record_continuation_completed(
+                        item.group_id.as_str(),
+                        item.dedupe_key.as_str(),
+                        now_ms_u64(),
+                        None,
+                    )
+                    .expect("mark delivered");
+            }
+        }
+        all_epochs.sort_unstable();
+        assert_eq!(
+            all_epochs,
+            vec!["0".to_owned(), "1".to_owned()],
+            "exactly one epoch-0 join (B's cohort key) + one epoch-1 join \
+             (A's cohort key) deliver; epochs {all_epochs:?}"
+        );
+        // Each delivered join is keyed under its OWN cohort's cwd_hash — the
+        // #19 isolation this test exists to pin.
+        let cohort_a = scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-a".to_owned())));
+        let cohort_b = scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-b".to_owned())));
+        let hash_of = |cohort: &str| cohort.rsplit('#').next().unwrap_or("?").to_owned();
+        assert!(
+            epoch0_joins.first().is_some_and(|item| item
+                .dedupe_key
+                .as_str()
+                .contains(&format!("/{}/", hash_of(&cohort_b)))),
+            "the epoch-0 join carries B's cwd_hash ({cohort_b}); key {:?}",
+            epoch0_joins.first().map(|i| i.dedupe_key.clone()),
+        );
+        assert!(
+            epoch1_joins.first().is_some_and(|item| item
+                .dedupe_key
+                .as_str()
+                .contains(&format!("/{}/", hash_of(&cohort_a)))),
+            "the epoch-1 join carries A's cwd_hash ({cohort_a}); key {:?}",
+            epoch1_joins.first().map(|i| i.dedupe_key.clone()),
+        );
+        // A's epoch-1 carrier folds ALL THREE of A's children (the two
+        // epoch-0 completions folded into the latest-epoch carrier per the
+        // round-4 batching semantics) and NEVER touches B's children.
+        let carrier = epoch1_joins.first().expect("A's epoch-1 join");
+        let folded_ids = carrier
+            .metadata
+            .get("coalesced_child_ids")
+            .map(String::as_str)
+            .unwrap_or("");
+        for child in ["a-1", "a-2", "a-3"] {
+            assert!(
+                folded_ids.split(',').any(|id| id == child),
+                "A's epoch-1 carrier folds {child}; coalesced_child_ids={folded_ids:?}"
+            );
+        }
+        assert!(
+            !folded_ids.split(',').any(|id| id.starts_with("b-")),
+            "A's carrier never folds B's children; coalesced_child_ids={folded_ids:?}"
+        );
+        {
+            let state = first.state();
+            let cohort_a =
+                scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-a".to_owned())));
+            let cohort_b =
+                scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-b".to_owned())));
+            assert_eq!(
+                state
+                    .scatter_join_state
+                    .get(&cohort_a)
+                    .map(|s| s.join_epoch),
+                Some(1),
+                "A's cohort bumped to epoch 1"
+            );
+            assert_eq!(
+                state
+                    .scatter_join_state
+                    .get(&cohort_b)
+                    .map(|s| s.join_epoch),
+                Some(0),
+                "B's cohort stays at epoch 0"
+            );
+        }
+        drop(first);
+
+        // Restart: A re-derives ONLY its epoch-1 key, B ONLY its epoch-0 key;
+        // both are delivered, so nothing re-emits — and crucially no phantom
+        // A/epoch-0 join appears.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        {
+            let state = fresh.state();
+            let cohort_a =
+                scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-a".to_owned())));
+            let cohort_b =
+                scatter_cohort_key(&group, scatter_cwd_hash(&Some("/tmp/ws-b".to_owned())));
+            let state_a = state
+                .scatter_join_state
+                .get(&cohort_a)
+                .expect("A's cohort seeded");
+            let state_b = state
+                .scatter_join_state
+                .get(&cohort_b)
+                .expect("B's cohort seeded");
+            assert_eq!(state_a.join_epoch, 1, "A restores its epoch-1 state");
+            assert!(
+                state_a
+                    .last_joined_key
+                    .as_deref()
+                    .is_some_and(|key| key.ends_with("/1")),
+                "A's last_joined_key names the epoch-1 join only"
+            );
+            assert_eq!(state_b.join_epoch, 0, "B restores its epoch-0 state");
+            assert!(
+                state_b
+                    .last_joined_key
+                    .as_deref()
+                    .is_some_and(|key| key.ends_with("/0")),
+                "B's last_joined_key names the epoch-0 join only"
+            );
+        }
+        let redrained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-ce",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            redrained.is_empty(),
+            "no phantom join of ANY epoch re-emits after restart; got {:?}",
+            redrained
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
     /// #1707 round 7 (board item #12, codex round-2 B4 residue): the EXACT
     /// crash window — child-B's `ChildCompleted` record persisted but the
     /// paired scatter's durable persist FAILED (forced by the test hook), so
@@ -22187,7 +22770,7 @@ mod tests {
             assert!(
                 state
                     .scatter_join_state
-                    .get(&join_group)
+                    .get(&scatter_cohort_key(&join_group, scatter_cwd_hash(&None)))
                     .is_none_or(|join_state| join_state.last_joined_key.is_none()),
                 "the failed scatter persist must NOT advance last_joined_key"
             );
@@ -39242,7 +39825,10 @@ mod tests {
             first
                 .state()
                 .scatter_join_state
-                .get(&format!("agent-group:tenant-me:{}:master", session_id))
+                .get(&scatter_cohort_key(
+                    &format!("agent-group:tenant-me:{}:master", session_id),
+                    scatter_cwd_hash(&None),
+                ))
                 .map(|s| s.join_epoch),
             Some(1),
             "re-admission into an already-joined group bumps the epoch to 1"

@@ -348,11 +348,23 @@ pub enum SupervisorEvent {
     /// already-joined group; without this record a crash before the bumped
     /// epoch's scatter persists would restart at the last persisted epoch and
     /// the reconcile pass could never derive the lost epoch's join key.
-    /// `apply_event` upserts the group's `metadata["join_epoch"]` (max wins).
+    /// `apply_event` upserts the group's cohort-scoped `join_epoch` metadata
+    /// (max wins).
+    ///
+    /// #19 (round-4 B1) — `cwd_hash` carries the admitted agent's workspace
+    /// cohort (the same `DefaultHasher`-over-`Option<String>` value the join
+    /// key embeds): a bump under one workspace must not lift another
+    /// workspace's join epoch. `#[serde(default)]` keeps pre-#19 events
+    /// readable — they deserialize with 0 and map onto the NONE-workspace
+    /// cohort; pre-#19 stores only ever persisted the None-cwd cohort in
+    /// practice (every existing test fixture upserts with `cwd: None`), so
+    /// this fallback is exact there and best-effort elsewhere.
     GroupEpochBumped {
         group_id: String,
         new_epoch: u64,
         observed_at_ms: u64,
+        #[serde(default)]
+        cwd_hash: u64,
     },
 }
 
@@ -449,20 +461,27 @@ impl SupervisorState {
                 group_id,
                 new_epoch,
                 observed_at_ms,
+                cwd_hash,
             } => {
                 // #15b — durable epoch bump: max-upsert the group's
                 // `join_epoch` metadata so a restart restores the HIGHEST
                 // admitted epoch, not just the highest PERSISTED scatter.
+                // #19 (round-4 B1) — the metadata key is cohort-scoped
+                // (`join_epoch#{cwd_hash}`): each workspace cohort restores
+                // its OWN highest admitted epoch. Pre-#19 events carry
+                // `cwd_hash: 0` via `#[serde(default)]` and keep landing on
+                // the NONE-workspace cohort key.
                 let group = self.ensure_group(group_id, *observed_at_ms);
+                let metadata_key = format!("join_epoch#{cwd_hash}");
                 let existing = group
                     .metadata
-                    .get("join_epoch")
+                    .get(&metadata_key)
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
                 if *new_epoch > existing {
                     group
                         .metadata
-                        .insert("join_epoch".to_owned(), serde_json::Value::from(*new_epoch));
+                        .insert(metadata_key, serde_json::Value::from(*new_epoch));
                 }
                 group.updated_at_ms = group.updated_at_ms.max(*observed_at_ms);
             }
@@ -1073,22 +1092,26 @@ impl SupervisorStore {
     /// #15b — persist a join-epoch bump marker so a restart restores the
     /// HIGHEST admitted epoch even when the bumped epoch's scatter record was
     /// never persisted (crash between admission and the scatter write).
-    /// The event id is keyed on (group, epoch): replay dedup makes a retried
-    /// or double-written bump for the same epoch idempotent.
+    /// The event id is keyed on (group, cwd_hash, epoch): replay dedup makes a
+    /// retried or double-written bump for the same cohort+epoch idempotent.
+    /// #19 (round-4 B1) — `cwd_hash` scopes the marker to the admitted
+    /// agent's workspace cohort (same hashing the join key uses).
     pub fn record_group_epoch_bump(
         &self,
         group_id: impl Into<String>,
+        cwd_hash: u64,
         new_epoch: u64,
         observed_at_ms: u64,
     ) -> io::Result<SupervisorEventLedgerRow> {
         let group_id = group_id.into();
-        let event_id = format!("group_epoch_bumped:{group_id}:{new_epoch}");
+        let event_id = format!("group_epoch_bumped:{group_id}:{cwd_hash}:{new_epoch}");
         self.append_event(
             event_id,
             SupervisorEvent::GroupEpochBumped {
                 group_id,
                 new_epoch,
                 observed_at_ms,
+                cwd_hash,
             },
         )
     }
