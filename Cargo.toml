@@ -50,6 +50,8 @@ repository = "https://github.com/octos-org/octos"
 [workspace.lints.rust]
 unsafe_code = "deny"
 [workspace.dependencies]
+# #2234/45c — echo-free interactive secret input (safe termios wrapper; the workspace denies unsafe_code, blocking a hand-rolled termios arm)
+rpassword = "7"
 # Internal crates
 octos-core = { path = "crates/octos-core" }
 octos-diagnostics = { path = "crates/octos-diagnostics" }

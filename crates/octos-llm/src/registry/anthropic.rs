@@ -18,6 +18,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     requires_model: false,
     detect_patterns: &["claude"],
     model_discovery: crate::discovery::ANTHROPIC_MODELS,
+    model_discovery_for_model: None,
     create,
 };
 
