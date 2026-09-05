@@ -1466,6 +1466,35 @@ pub(crate) fn install_goal_task_row_observers(
     install_goal_task_row_settle_listener(supervisor);
 }
 
+/// #8 — [`install_goal_task_row_observers`] with the restore callback body
+/// SUPPLIED rather than derived from a binding resolver, so several
+/// restore-time consumers can compose inside the SINGLE `on_restore` slot
+/// (reconciliation + peer adoption). Registration observer and settle
+/// listener are identical to the resolver variant.
+pub(crate) fn install_goal_task_row_observers_composed(
+    supervisor: &octos_agent::TaskSupervisor,
+    profile_data_dir: &Path,
+    resolve_register_binding: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
+    on_restore: impl Fn(&[octos_agent::BackgroundTask]) + Send + Sync + 'static,
+) {
+    let data_dir = profile_data_dir.to_path_buf();
+    supervisor.set_on_register(move |task| {
+        // (goal_id, profile_id); `None` ⇒ no goal bound ⇒ no row — correct
+        // behavior, not an error.
+        let Some((goal_id, profile_id)) = resolve_register_binding() else {
+            return;
+        };
+        default_agent_orchestrator().record_goal_task_registration(
+            &data_dir,
+            &profile_id,
+            &goal_id,
+            task,
+        );
+    });
+    supervisor.set_on_restore(on_restore);
+    install_goal_task_row_settle_listener(supervisor);
+}
+
 /// #2055 review round 3 — [`install_goal_task_row_observers`] with the
 /// callback-time resolver: the session's ACTIVE goal is looked up on every
 /// registration via [`InProcessAgentOrchestrator::active_goal_id`]. For
@@ -1476,29 +1505,136 @@ pub(crate) fn install_goal_task_row_observers(
 /// #2056 round 2 — reconciliation resolves through
 /// [`InProcessAgentOrchestrator::bound_goal_id`] instead, which drops the
 /// active-only filter.
+///
+/// `extra_restore_consumer` — when non-`None`, runs inside the SINGLE
+/// `on_restore` callback AFTER the goal reconciliation, receiving the same
+/// restored-table snapshot. `on_restore` is a single-callback slot, so
+/// restore-time consumers that live beside the goal bookkeeping (e.g. peer
+/// adoption, #8) must COMPOSE inside this one callback rather than race a
+/// second `set_on_restore`. The registration resolver is untouched.
+/// #8 — the boxed extra consumer composed into the shared `on_restore`
+/// callback (see `install_goal_task_row_observers_resolving_at_callback_
+/// composed`). A type alias keeps clippy's `type_complexity` happy.
+type ExtraRestoreConsumer = Box<dyn Fn(&[octos_agent::BackgroundTask]) + Send + Sync + 'static>;
+
+fn install_goal_task_row_observers_resolving_at_callback_composed(
+    supervisor: &octos_agent::TaskSupervisor,
+    session_id: &SessionKey,
+    profile_id: &str,
+    profile_data_dir: &Path,
+    extra_restore_consumer: Option<ExtraRestoreConsumer>,
+) {
+    let register_session = session_id.clone();
+    let register_profile = profile_id.to_owned();
+    let register_resolver = move || {
+        default_agent_orchestrator()
+            .active_goal_id(&register_session, &register_profile)
+            .map(|goal_id| (goal_id, register_profile.clone()))
+    };
+    match extra_restore_consumer {
+        None => {
+            let restore_session = session_id.clone();
+            let restore_profile = profile_id.to_owned();
+            install_goal_task_row_observers(
+                supervisor,
+                profile_data_dir,
+                register_resolver,
+                move || {
+                    default_agent_orchestrator()
+                        .bound_goal_id(&restore_session, &restore_profile)
+                        .map(|goal_id| (goal_id, restore_profile.clone()))
+                },
+            );
+        }
+        Some(extra) => {
+            // ONE `on_restore` slot ⇒ install the COMPOSITE directly, with
+            // no intermediate goal-only install: an earlier goal-only
+            // `set_on_restore` would consume a pending MISSED restore through
+            // the goal-only callback before the composite replaced it, and
+            // the extra consumer would never see that restore.
+            let reconcile_session = session_id.clone();
+            let reconcile_profile = profile_id.to_owned();
+            let reconcile_data_dir = profile_data_dir.to_path_buf();
+            install_goal_task_row_observers_composed(
+                supervisor,
+                profile_data_dir,
+                register_resolver,
+                move |restored| {
+                    if let Some(goal_id) = default_agent_orchestrator()
+                        .bound_goal_id(&reconcile_session, &reconcile_profile)
+                    {
+                        default_agent_orchestrator().reconcile_goal_task_rows_after_restore(
+                            &reconcile_data_dir,
+                            &reconcile_profile,
+                            &goal_id,
+                            restored,
+                        );
+                    }
+                    extra(restored);
+                },
+            );
+        }
+    }
+}
+
+/// #2055 review round 3 — [`install_goal_task_row_observers`] with the
+/// callback-time resolver. See
+/// [`install_goal_task_row_observers_resolving_at_callback_composed`] for the
+/// full resolver contract; this is the goal-only variant (no restore-time
+/// composition).
 pub(crate) fn install_goal_task_row_observers_resolving_at_callback(
     supervisor: &octos_agent::TaskSupervisor,
     session_id: &SessionKey,
     profile_id: &str,
     profile_data_dir: &Path,
 ) {
-    let register_session = session_id.clone();
-    let register_profile = profile_id.to_owned();
-    let restore_session = session_id.clone();
-    let restore_profile = profile_id.to_owned();
-    install_goal_task_row_observers(
+    install_goal_task_row_observers_resolving_at_callback_composed(
         supervisor,
+        session_id,
+        profile_id,
         profile_data_dir,
-        move || {
-            default_agent_orchestrator()
-                .active_goal_id(&register_session, &register_profile)
-                .map(|goal_id| (goal_id, register_profile.clone()))
-        },
-        move || {
-            default_agent_orchestrator()
-                .bound_goal_id(&restore_session, &restore_profile)
-                .map(|goal_id| (goal_id, restore_profile.clone()))
-        },
+        None,
+    );
+}
+
+/// #8 (continuation-replay review) — the adoption sibling of the goal-task-row
+/// restore observer, deliberately NOT folded into
+/// [`install_goal_task_row_observers`]: `on_restore` is a SINGLE-callback slot,
+/// so two installers must COMPOSE inside one callback rather than both call
+/// `set_on_restore`, and peer adoption has nothing to do with goal bookkeeping.
+/// This installer runs the goal reconciliation resolver first, then
+/// [`crate::peers::adopt_parked_peer_tasks_with_results`] on the same restored
+/// table — one `set_on_restore`, both consumers. Replaces
+/// [`install_goal_task_row_observers_resolving_at_callback`] at every call
+/// site whose supervisor can carry `peer_handoff` rows — same signature, same
+/// resolvers, so a site cannot drift onto the goal-only variant.
+///
+/// The adoption half fires AFTER the restart orphan sweep has parked the
+/// unattributable peer rows (the observer delivers the FINAL rebuilt table),
+/// and is naturally idempotent: it filters on `TaskStatus::Parked`, so an
+/// already-adopted (Completed) row is skipped rather than re-marked terminal.
+/// Ungated: the gateway session actor (which owns the supervisor peer tasks
+/// register against) wires it WITHOUT the `api` feature.
+pub(crate) fn install_peer_restore_observers_resolving_at_callback(
+    supervisor: &octos_agent::TaskSupervisor,
+    session_id: &SessionKey,
+    profile_id: &str,
+    profile_data_dir: &Path,
+) {
+    let adoption_supervisor = supervisor.clone();
+    let adoption_data_dir = profile_data_dir.to_path_buf();
+    install_goal_task_row_observers_resolving_at_callback_composed(
+        supervisor,
+        session_id,
+        profile_id,
+        profile_data_dir,
+        Some(Box::new(move |restored| {
+            crate::peers::adopt_parked_peer_tasks_with_results(
+                &adoption_supervisor,
+                &adoption_data_dir,
+                restored,
+            );
+        })),
     );
 }
 

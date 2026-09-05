@@ -3432,7 +3432,12 @@ impl ActorFactory {
         // sink below): `cancel` emits only `notify_change`, and the sink's
         // once-per-task dedupe would swallow the owner's failed→complete
         // correction. Inherited by nested child supervisors.
-        crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+        // #8 — the COMPOSED restore observer: the gateway supervisor is the
+        // one peer tasks register against (`bind_peer_supervised_task`), so
+        // its restore must also adopt parked `peer_handoff` orphans whose
+        // `result.md` already sits on the blackboard. Same goal resolvers,
+        // one shared `on_restore` callback.
+        crate::autonomy::agent_orchestrator::install_peer_restore_observers_resolving_at_callback(
             &supervisor,
             &session_key,
             session_key.profile_id().unwrap_or(MAIN_PROFILE_ID),

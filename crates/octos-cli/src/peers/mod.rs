@@ -44,6 +44,7 @@ use octos_core::ui_protocol::{
 };
 #[cfg(any(feature = "api", test))]
 use tracing::warn;
+use tracing::{debug, info};
 
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
 use crate::contracts::UiProtocolContractStores;
@@ -275,6 +276,94 @@ pub(crate) fn retire_peer_supervised_task(
 /// gateway inbox registry's key construction in `session_actor`).
 pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
     format!("{profile_id}:peer:{slug}")
+}
+
+/// #8 (continuation-replay review) — adopt orphaned `peer_handoff` tasks whose
+/// result already sits on the blackboard.
+///
+/// The restart orphan sweep parks every `peer_handoff` row it cannot attribute
+/// to a live process (`task_supervisor.rs`: "orphaned across restart"). The
+/// task row itself carries NO staging path (registration `tool_input` is
+/// `None`), so the sweep cannot decide between "peer still working, result
+/// coming" and "peer finished before the restart and already wrote its
+/// `result.md`". Only octos-cli knows the `peers/<slug>/` layout, so the
+/// disambiguation lives HERE: a parked peer task whose staged dir already
+/// carries a REGULAR `result.md` has nothing left to wait for and is adopted
+/// — `mark_completed` with the blackboard file as its output — instead of
+/// idling in `Parked` until a client happens to gather it.
+///
+/// Slug extraction: the row's `tool_call_id` IS the wire key
+/// [`peer_wire_key`] (`"{profile}:peer:{slug}"`). Profile ids may contain
+/// colons, so the split is on the LAST `:peer:` occurrence (`rsplit_once`).
+/// The slug is then re-validated with [`peer_slug_is_safe`] and resolved
+/// through [`staged_peer_dir`], so a malformed or hostile key can never steer
+/// the lookup out of `peers/`.
+///
+/// `TaskStatus::Parked` is NOT terminal, so `mark_completed` is the legal,
+/// documented adoption path. Filtering on `status == Parked` makes the sweep
+/// naturally idempotent: an already-adopted (Completed) row is skipped on any
+/// later restore instead of re-marking a terminal task. Returns the number of
+/// tasks adopted. A parked peer WITHOUT a result stays `Parked` (debug log
+/// only) — the client may still adopt it. Ungated (unlike
+/// [`bind_peer_supervised_task`]): the gateway session actor wires it without
+/// the `api` feature.
+pub(crate) fn adopt_parked_peer_tasks_with_results(
+    supervisor: &octos_agent::TaskSupervisor,
+    profile_data_dir: &Path,
+    restored: &[octos_agent::BackgroundTask],
+) -> usize {
+    let peers_root = profile_data_dir.join("peers");
+    let mut adopted = 0usize;
+    for task in restored {
+        if task.tool_name != "peer_handoff" || task.status != octos_agent::TaskStatus::Parked {
+            continue;
+        }
+        let Some(slug) = task
+            .tool_call_id
+            .rsplit_once(":peer:")
+            .map(|(_, slug)| slug)
+        else {
+            debug!(
+                task_id = %task.id,
+                tool_call_id = %task.tool_call_id,
+                "parked peer task without a ':peer:' wire key; cannot locate its blackboard"
+            );
+            continue;
+        };
+        if !peer_slug_is_safe(slug) {
+            debug!(
+                task_id = %task.id,
+                tool_call_id = %task.tool_call_id,
+                "parked peer task wire key carries an unsafe slug; refusing path lookup"
+            );
+            continue;
+        }
+        let Some(dir) = staged_peer_dir(&peers_root, slug) else {
+            debug!(
+                task_id = %task.id,
+                slug,
+                "parked peer task has no staged dir (or it failed the safety gate); leaving Parked"
+            );
+            continue;
+        };
+        if !peer_io::peer_regular_file_exists(&dir, "result.md") {
+            debug!(
+                task_id = %task.id,
+                slug,
+                "parked peer task has no result.md yet; leaving Parked (client may still adopt)"
+            );
+            continue;
+        }
+        let result_path = dir.join("result.md").display().to_string();
+        supervisor.mark_completed(&task.id, vec![result_path]);
+        info!(
+            task_id = %task.id,
+            slug,
+            "orphaned peer adopted: result.md already on the blackboard"
+        );
+        adopted += 1;
+    }
+    adopted
 }
 
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
@@ -2936,6 +3025,119 @@ pub(crate) fn build_peer_list_callback(
 #[cfg(test)]
 mod peer_task_registry_tests {
     use super::*;
+
+    /// #8 (continuation-replay review) — a parked `peer_handoff` orphan whose
+    /// `result.md` already sits on the blackboard must be ADOPTED
+    /// (mark_completed) by `adopt_parked_peer_tasks_with_results`, not left
+    /// idling in `Parked`.
+    ///
+    /// Reproduces the restart shape over a SHARED ledger: the staging turn
+    /// registers + parks the row; a fresh supervisor restores it (the real
+    /// orphan sweep parks unattributable peer rows at boot), writes the
+    /// result, and runs the adoption sweep. The parked row with a result
+    /// completes with the blackboard file as its output; the parked row
+    /// WITHOUT one stays Parked for a client to adopt.
+    #[test]
+    fn parked_peer_orphan_with_result_md_is_adopted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger = dir.path().join("tasks.jsonl");
+        let data_dir = dir.path().join("profile");
+        let peers_root = data_dir.join("peers");
+
+        // Staging turn: register two peer rows over the shared ledger.
+        let staging = octos_agent::TaskSupervisor::new();
+        staging.enable_persistence(&ledger).unwrap();
+        let done_id =
+            bind_peer_supervised_task(&staging, peer_wire_key("adopt-a", "done"), "adopt-a:local")
+                .expect("bind done peer");
+        let pending_id = bind_peer_supervised_task(
+            &staging,
+            peer_wire_key("adopt-a", "pending"),
+            "adopt-a:local",
+        )
+        .expect("bind pending peer");
+
+        // The finished peer wrote its result BEFORE the restart; the pending
+        // one staged a brief but never finished.
+        for slug in ["done", "pending"] {
+            std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+            std::fs::write(peers_root.join(slug).join("brief.md"), "brief").unwrap();
+        }
+        std::fs::write(peers_root.join("done").join("result.md"), "findings").unwrap();
+
+        // Next boot: restore over the shared ledger, then the orphan sweep's
+        // verdict — both rows parked as cross-restart orphans (their workers
+        // are not in the fresh live-set).
+        let restored_boot = octos_agent::TaskSupervisor::new();
+        restored_boot.enable_persistence(&ledger).unwrap();
+        restored_boot.mark_parked(&done_id, "orphaned across restart".to_string());
+        restored_boot.mark_parked(&pending_id, "orphaned across restart".to_string());
+
+        // The restore observer fires with the rebuilt table; the production
+        // sweep runs over exactly that snapshot.
+        let table = restored_boot.get_all_tasks();
+        let adopted = adopt_parked_peer_tasks_with_results(&restored_boot, &data_dir, &table);
+
+        assert_eq!(adopted, 1, "only the peer WITH a result may be adopted");
+        let done = restored_boot.get_task(&done_id).expect("done row");
+        assert_eq!(done.status, octos_agent::TaskStatus::Completed);
+        assert_eq!(
+            done.output_files,
+            vec![
+                peers_root
+                    .join("done")
+                    .join("result.md")
+                    .display()
+                    .to_string()
+            ],
+            "the adoption must surface the blackboard result as the output"
+        );
+        let pending = restored_boot.get_task(&pending_id).expect("pending row");
+        assert_eq!(
+            pending.status,
+            octos_agent::TaskStatus::Parked,
+            "no result.md ⇒ stays Parked; the client may still adopt it"
+        );
+
+        // Idempotence: a second sweep (e.g. a later restore of the same
+        // supervisor) skips the now-Completed row instead of re-marking.
+        let table = restored_boot.get_all_tasks();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(&restored_boot, &data_dir, &table),
+            0,
+            "re-running the sweep must not re-adopt a Completed row"
+        );
+    }
+
+    /// #8 negative space — a parked row whose wire key does not parse to a
+    /// SAFE staged slug is refused, not followed out of `peers/`.
+    #[test]
+    fn parked_peer_orphan_with_an_unsafe_slug_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile");
+
+        let supervisor = octos_agent::TaskSupervisor::new();
+        // A profile id MAY contain colons (gateway keys are
+        // `profile:channel:chat`), so the split is on the LAST `:peer:`;
+        // here the tail is a traversal attempt that must fail the slug gate.
+        let task_id = supervisor.register(
+            "peer_handoff",
+            "tenant:a:peer:../escape",
+            Some("tenant:a:local:tui"),
+        );
+        supervisor.mark_parked(&task_id, "orphaned across restart".to_string());
+
+        let table = supervisor.get_all_tasks();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(&supervisor, &data_dir, &table),
+            0,
+            "an unsafe slug must never be turned into a path lookup"
+        );
+        assert_eq!(
+            supervisor.get_task(&task_id).unwrap().status,
+            octos_agent::TaskStatus::Parked,
+        );
+    }
 
     /// #1868 Phase 1 — staging a peer must REGISTER it with the supervisor,
     /// keyed to the MASTER's session.

@@ -11140,7 +11140,11 @@ fn wire_goal_task_row_observers_for_cached_supervisor(
 ) {
     // Round 3 — thin adapter over the SHARED installer so this site cannot
     // drift from the per-turn / gateway wiring or from the effect tests.
-    crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+    // #8 — the COMPOSED variant: a cached WS supervisor can restore
+    // `peer_handoff` rows, so its restore must also adopt parked orphans whose
+    // `result.md` already sits on the blackboard (one shared `on_restore`
+    // callback; goal resolvers unchanged).
+    crate::autonomy::agent_orchestrator::install_peer_restore_observers_resolving_at_callback(
         supervisor,
         session_id,
         profile_id,
