@@ -399,6 +399,14 @@ pub(crate) fn persist_peer_task_id_binding(peers_root: &Path, slug: &str, task_i
 /// only) — the client may still adopt it. Ungated (unlike
 /// [`bind_peer_supervised_task`]): the gateway session actor wires it without
 /// the `api` feature.
+///
+/// #15 RA-4 — ORIGINATOR-LESS FALLBACK contract: when the staged dir carries
+/// no `originator` leaf (legacy staging predating #14's binding files), the
+/// adoption falls back to comparing the ROW's `parent_session_key` against
+/// `expected_master_session` — so the caller MUST pass the master session
+/// the row is expected to belong to (the installer's own session key), and
+/// rows whose `parent_session_key` names another master are refused. When the
+/// leaf exists it is authoritative and this fallback never runs.
 pub(crate) fn adopt_parked_peer_tasks_with_results(
     supervisor: &octos_agent::TaskSupervisor,
     expected_profile: &str,

@@ -1193,7 +1193,12 @@ impl InProcessAgentOrchestrator {
                 }
                 if let Some(final_output) = task.final_output.as_deref() {
                     if !final_output.trim().is_empty() {
-                        let _ = self.set_agent_output_if_empty(
+                        // #15 R12-1 — the gated branch FORCE-overwrites: the
+                        // re-forwarded production `final_output` is
+                        // authoritative over the restored (possibly stale)
+                        // summary-derived mirror. The non-gated path keeps
+                        // `set_agent_output_if_empty`.
+                        let _ = self.set_agent_output_forced(
                             &agent_id,
                             &session_id,
                             profile_id,
@@ -1202,12 +1207,7 @@ impl InProcessAgentOrchestrator {
                     }
                 }
                 let cwd = background_task_cwd(task);
-                self.reconcile_scatter_for_existing_group(
-                    &session_id,
-                    profile_id,
-                    Some("master"),
-                    cwd.as_deref(),
-                );
+                self.reconcile_scatter_for_existing_group(&session_id, profile_id, cwd.as_deref());
                 return None;
             }
         }
@@ -1239,6 +1239,27 @@ impl InProcessAgentOrchestrator {
         let cwd = background_task_cwd(task);
         let task_id = task.id.parse::<TaskId>().ok();
         let last_task = background_task_last_task(task);
+
+        // #15 R12-1 — a NON-gated terminal mirror (the "delivered in-memory,
+        // persisted-but-never-drained" shape: the record was restored, the
+        // mark is non-gating) refreshes the output mirror by OVERWRITE: the
+        // restored record's output is derived from the persisted summary and
+        // may be stale relative to the re-forwarded task's richer
+        // `final_output`. Runs BEFORE the upsert so the mirror write is not
+        // disturbed by the upsert itself; a first-seen agent simply has no
+        // record yet and the refresh is a no-op (the upsert's own
+        // `set_agent_output_if_empty` then fills it).
+        if task.status.is_terminal()
+            && let Some(final_output) = task.final_output.as_deref()
+            && !final_output.trim().is_empty()
+        {
+            let _ = self.set_agent_output_forced(
+                &agent_id,
+                &session_id,
+                profile_id.as_str(),
+                final_output,
+            );
+        }
 
         let orchestrator = self;
         let mut agent = orchestrator.upsert_agent(AgentUpsert {
@@ -1643,6 +1664,18 @@ pub(crate) fn install_goal_task_row_observers_resolving_at_callback(
 /// needs [`install_goal_task_row_observers_resolving_at_callback_composed`]
 /// under a callable name. Pure alias; the resolve-at-callback convenience
 /// above and the goal-only variant below both delegate to the same body.
+///
+/// #15 RA-3 — the WS per-turn supervisor wires this COMPOSED variant with an
+/// on_restore that reconciles the goal task rows against the RAW `restored`
+/// slice it is handed, i.e. the PRE-adoption snapshot — inconsistent with the
+/// callback resolver variant below, which reconciles `get_all_tasks()` AFTER
+/// adoption. That is deliberate and safe: the pre-adoption reconcile is a
+/// NO-OP for the parked (non-terminal) peer rows it would have missed —
+/// `reconcile_goal_task_rows_after_restore` settles only terminal rows, and
+/// parked rows are non-terminal in every snapshot, so reconciling pre- vs
+/// post-adoption makes no difference here. Adoption's own `mark_completed`
+/// fires the change-feed settle (wired by the same installer), which is what
+/// lands the adopted row's ledger flip.
 pub(crate) fn install_peer_restore_observers_composed(
     supervisor: &octos_agent::TaskSupervisor,
     profile_data_dir: &Path,
@@ -2091,10 +2124,29 @@ impl InProcessAgentOrchestrator {
         state.supervisor_store = Some(store);
         restore_runtime_from_supervisor_state(&mut state, &supervisor_state);
         seed_delivered_terminal_marks(&mut state, &supervisor_state);
-        for continuation in supervisor_state.continuations.values() {
-            if continuation.status == ContinuationStatus::Completed {
-                continue;
-            }
+        // #15 SF1 — DETERMINISTIC restart re-enqueue order.
+        // `supervisor_state.continuations` is a HashMap, so iterating
+        // `.values()` enqueues in a nondeterministic order and the restored
+        // scheduler sequence numbers (and therefore the post-restart delivery
+        // order) reflect iteration order instead of work age/epoch. Collect
+        // the candidates first and sort by: (1) the scatter join epoch parsed
+        // from the dedupe key's LAST segment (0 for non-scatter records),
+        // (2) the durable enqueue time `queued_at_ms`, (3) the continuation
+        // id as a final tiebreak. The sort is stable, so two fresh
+        // orchestrators over the same store re-enqueue identically.
+        let mut reenqueue: Vec<&PendingContinuationRecord> = supervisor_state
+            .continuations
+            .values()
+            .filter(|continuation| continuation.status != ContinuationStatus::Completed)
+            .collect();
+        reenqueue.sort_by_key(|continuation| {
+            (
+                restart_reenqueue_join_epoch(continuation),
+                continuation.queued_at_ms,
+                continuation.continuation_id.clone(),
+            )
+        });
+        for continuation in reenqueue {
             if let Some(request) = master_continuation_request_from_persisted(continuation) {
                 state.continuations.enqueue(request);
             }
@@ -3285,6 +3337,40 @@ impl InProcessAgentOrchestrator {
         if !agent.output.is_empty() {
             return Ok(false);
         }
+        agent.output.push_str(text);
+        agent.updated_at_ms = now_ms();
+        Ok(true)
+    }
+
+    /// #15 R12-1 — set the agent record's output, OVERWRITING whatever is
+    /// there. The gated stale-terminal re-forward branch of
+    /// `upsert_background_task_agent` uses this: the store-seeded mark proves
+    /// a PREVIOUS runtime delivered the verdict, but the restored record's
+    /// output (derived from the persisted summary) may be stale or empty
+    /// relative to the re-forwarded task's richer `final_output` — the
+    /// production `final_output` is authoritative and must replace the
+    /// mirror, not fill-if-empty behind it. The NON-gated path keeps the
+    /// fill-once contract ([`Self::set_agent_output_if_empty`]) so a live
+    /// streaming agent's output is never clobbered by a mirror upsert.
+    pub(crate) fn set_agent_output_forced(
+        &self,
+        agent_id: &str,
+        session_id: &SessionKey,
+        profile_id: &str,
+        text: &str,
+    ) -> Result<bool, RpcError> {
+        let mut state = self.state();
+        let request = AgentRequest {
+            agent_id: agent_id.to_owned(),
+            session_id: Some(session_id.clone()),
+            profile_id: profile_id.to_owned(),
+        };
+        let agent = state
+            .agents
+            .get_mut(agent_id)
+            .ok_or_else(|| agent_not_found_error(&request))?;
+        ensure_agent_control_scope(agent, Some(session_id), profile_id)?;
+        agent.output.clear();
         agent.output.push_str(text);
         agent.updated_at_ms = now_ms();
         Ok(true)
@@ -12146,6 +12232,17 @@ struct AutonomyRuntimeState {
     /// real), and a status CORRECTION bumps `revision` so the correction's
     /// durable persist carries a distinct `attempt` (the event id embeds it)
     /// and replaces any still-pending older-status payload.
+    ///
+    /// #15 Nit1 — retention is bounded by the number of delivered children
+    /// (one mark per delivered child id) and there is deliberately NO TTL /
+    /// eviction: a delivered-child mark is what suppresses a replayed
+    /// re-forward after a restart (清理后重放不得复活), so evicting a
+    /// `Completed` mark would re-admit the gated re-forward and resurrect
+    /// the swallowed ChildCompleted. The unbounded growth was the BOOT
+    /// SEEDING of every historical record, not live-path growth; scatter
+    /// marks are now seeded max-epoch-only per group (see
+    /// `seed_delivered_terminal_marks`), and child marks are seeded only for
+    /// records whose persisted lifecycle requires the gate.
     delivered_child_marks: HashMap<String, DeliveredChildMark>,
     /// #1707 round 6 (board item #11) — ONE unified monotonic revision per
     /// continuation id (dedupe key → the last attempt durably persisted for
@@ -12169,6 +12266,14 @@ struct AutonomyRuntimeState {
     /// `scatter_join_complete` continuation records at boot (and used to
     /// restore `scatter_join_state[group].last_joined_key` / `join_epoch`),
     /// updated on every scatter enqueue. See `delivered_child_marks`.
+    ///
+    /// #15 Nit1 — the boot seeding inserts ONLY the max-epoch record's key
+    /// per group (see `seed_delivered_terminal_marks`), so a group with N
+    /// superseded epoch records no longer grows this map by N at every
+    /// restart. There is deliberately NO TTL / eviction: a delivered scatter
+    /// mark is what suppresses a replayed re-forward of a join that was
+    /// already emitted, so evicting it would re-admit the gated re-forward
+    /// and resurrect the join (清理后重放不得复活).
     delivered_scatter_marks: HashMap<String, String>,
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
@@ -12406,20 +12511,20 @@ impl InProcessAgentOrchestrator {
     /// SAME checked-persist helper. Without an existing roster record for
     /// this group (or with a non-terminal member) it is a no-op: the live
     /// upsert path owns first-time joins.
+    ///
+    /// #15 R12-2 — the parent is hard-wired to `master`: the ONLY caller is
+    /// the background-task mirror's gated re-forward branch
+    /// (`upsert_background_task_agent`), whose mirrored children all hang off
+    /// the master agent. A future non-master scope must widen this signature
+    /// AND the cohort filter together.
     pub(crate) fn reconcile_scatter_for_existing_group(
         &self,
         session_id: &SessionKey,
         profile_id: &str,
-        parent_agent_id: Option<&str>,
         cwd: Option<&str>,
     ) {
         let mut state = self.state();
-        let group_id = format!(
-            "agent-group:{}:{}:{}",
-            profile_id,
-            session_id,
-            parent_agent_id.unwrap_or("master")
-        );
+        let group_id = format!("agent-group:{}:{}:master", profile_id, session_id);
         let cwd = cwd.map(str::to_owned);
         let siblings = state
             .agents
@@ -12427,8 +12532,7 @@ impl InProcessAgentOrchestrator {
             .filter(|candidate| {
                 candidate.session_id == *session_id
                     && candidate.profile_id == profile_id
-                    && candidate.parent_agent_id.as_deref()
-                        == Some(parent_agent_id.unwrap_or("master"))
+                    && candidate.parent_agent_id.as_deref() == Some("master")
                     && candidate.cwd == cwd
             })
             .cloned()
@@ -12508,6 +12612,14 @@ impl InProcessAgentOrchestrator {
     /// OTHER scope's undelivered child verdicts. `workspace` is normalized
     /// exactly like [`item_workspace`] (empty → `None`) so an unstamped
     /// item only matches a `None` purge and vice versa.
+    ///
+    /// #15 RA-2 — which registration paths intentionally remain UNSTAMPED
+    /// (cwd derived from `output_files[0]`, usually `None`): the GATEWAY
+    /// session-actor registration (`session_actor` keeps
+    /// `bind_peer_supervised_task` — no workspace root is in scope there;
+    /// RA-1) and rows persisted BEFORE #13r2 (the durable task store has no
+    /// retroactive stamp). The WS per-turn `emit_staged` path is the only
+    /// stamped producer.
     pub(crate) fn clear_pending_terminal_continuations_for_session(
         &self,
         session_id: &SessionKey,
@@ -12611,18 +12723,74 @@ impl InProcessAgentOrchestrator {
         if entries.is_empty() {
             return 0;
         }
+        // Test hook: "fail" the FIRST batch attempt without touching the
+        // store (self-disarming flag read + cleared BEFORE borrowing the
+        // store) so the warn + exactly-once retry path is exercised
+        // end-to-end. The hook is shared with the fold path; whichever path
+        // runs first consumes it.
+        #[cfg(test)]
+        let force_first_attempt_failure = {
+            let armed = state.force_tombstone_failure_once;
+            if armed {
+                state.force_tombstone_failure_once = false;
+            }
+            armed
+        };
+        #[cfg(not(test))]
+        let force_first_attempt_failure = false;
         if let Some(store) = state.supervisor_store.as_ref() {
-            if let Err(err) = store.record_continuations_coalesced(&entries) {
-                // Checked, not swallowed: a restart replays the purged items
-                // from their still-Queued durable records (duplicate
-                // notification — the safe direction). The in-memory purge
-                // and delivered marks above still hold for THIS process.
+            // #15 SF3 — mirror the fold path's exactly-once retry
+            // (`coalesce_terminal_continuations`). The tombstone batch's
+            // event ids are STABLE (`continuation_completed:{group}:{id}:
+            // {completed_at_ms}` — the SAME `now` stamped above is reused on
+            // the retry), so replay's `applied_event_ids` dedup makes
+            // rewriting an already-persisted entry a no-op: a retry after a
+            // partial first batch never double-applies. Note on the codex
+            // "store 内逐条 open/write/flush" concern: `record_continuations_
+            // coalesced` appends every entry under ONE append lock
+            // (single fsync cadence); the per-entry `append_row_locked`
+            // calls are intentionally NOT restructured — the lock, not the
+            // call count, is the serialization point. The forced-failure
+            // flag itself was read (and self-disarmed) before this borrow;
+            // see above.
+            let first_attempt_failed = if force_first_attempt_failure {
+                tracing::warn!(
+                    session_key = %session_id.0,
+                    count = entries.len(),
+                    reason,
+                    "/stop purge tombstone batch failed (forced, test hook); \
+                     retrying the batch once"
+                );
+                true
+            } else {
+                match store.record_continuations_coalesced(&entries) {
+                    Ok(()) => false,
+                    Err(err) => {
+                        // Checked, not swallowed: a restart replays the
+                        // purged items from their still-Queued durable
+                        // records (duplicate notification — the safe
+                        // direction). The in-memory purge and delivered
+                        // marks above still hold for THIS process.
+                        tracing::warn!(
+                            ?err,
+                            session_key = %session_id.0,
+                            count = entries.len(),
+                            reason,
+                            "/stop purge tombstone batch failed; retrying the batch once \
+                             (already-persisted entries dedup on replay)"
+                        );
+                        true
+                    }
+                }
+            };
+            if first_attempt_failed && let Err(err) = store.record_continuations_coalesced(&entries)
+            {
                 tracing::warn!(
                     ?err,
                     session_key = %session_id.0,
                     count = entries.len(),
                     reason,
-                    "/stop purge tombstone batch failed; the purged continuations may \
+                    "/stop purge tombstone batch retry also failed; the purged continuations may \
                      re-appear after a restart (safe direction — duplicate, not loss)"
                 );
             }
@@ -14171,9 +14339,12 @@ fn seed_delivered_terminal_marks(
                 );
             }
             Some("scatter_join_complete") => {
-                state
-                    .delivered_scatter_marks
-                    .insert(record.continuation_id.clone(), "joined".to_owned());
+                // #15 Nit1 — `delivered_scatter_marks` no longer inserts
+                // every historical join key here; ONLY the max-epoch record's
+                // key per group is seeded below (the same record that becomes
+                // `last_joined_key`). A superseded epoch can never be
+                // re-derived (join keys are computed at the CURRENT restored
+                // `join_epoch`, which is the max), so its mark is dead weight.
                 // Restore the join epoch (parsed from the join key's LAST
                 // segment; MAX across records — a superseded epoch's record
                 // may linger).
@@ -14208,7 +14379,14 @@ fn seed_delivered_terminal_marks(
     // trigger the bump.
     for (group, (_epoch, key)) in max_epoch_per_group {
         let join_state = state.scatter_join_state.entry(group).or_default();
-        join_state.last_joined_key = Some(key);
+        join_state.last_joined_key = Some(key.clone());
+        // #15 Nit1 — seed the delivered mark for the MAX-epoch record only
+        // (the epoch the group can still re-derive); superseded epochs' keys
+        // are never re-computed, so their marks would be unbounded dead
+        // entries at every restart.
+        state
+            .delivered_scatter_marks
+            .insert(key, "joined".to_owned());
     }
 }
 
@@ -14404,6 +14582,10 @@ fn coalesce_terminal_continuations(
         .get("omitted_summary_count")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    // #15 SF2 — captured for the fold-ABORT rollback below: the abort must
+    // restore the prior structured child-id set alongside the text/count so
+    // a later retry of the same fold dedups against the same baseline.
+    let existing_child_ids = primary.metadata.get("coalesced_child_ids").cloned();
     let mut rendered = existing_children
         .as_deref()
         .map(str::len)
@@ -14416,7 +14598,25 @@ fn coalesce_terminal_continuations(
     // never counted as child terminations.
     let mut folded = existing_count;
     let mut omitted = existing_omitted;
-    let mut counted_children: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // #15 SF2 — the RE-FOLD must not RE-COUNT a child already folded in an
+    // earlier generation. The folded child-id set is persisted alongside the
+    // text as structured metadata (`coalesced_child_ids`, comma-joined) so a
+    // re-folded carrier re-seeds the dedup set from its OWN durable record —
+    // today the set starts empty on every fold and a child id that reappears
+    // (a duplicate ChildCompleted folded in a later batch) is counted a
+    // second time even though `existing_count` already included it. Text
+    // append semantics are unchanged (a genuinely re-present child appends
+    // another LINE; only the COUNT is deduped across generations).
+    let mut counted_children: std::collections::HashSet<String> = primary
+        .metadata
+        .get("coalesced_child_ids")
+        .map(|ids| {
+            ids.split(',')
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut folded_keys: Vec<String> = Vec::new();
     for item in &batch {
         // Every folded line carries its group AND workspace so the carrier
@@ -14493,6 +14693,15 @@ fn coalesce_terminal_continuations(
     primary
         .metadata
         .insert("coalesced_children".to_owned(), lines.join(" | "));
+    // #15 SF2 — persist the structured child-id set alongside the text so a
+    // RE-fold (this process or a restored carrier) seeds its dedup set from
+    // it and never re-counts a previously folded child. Sorted for a stable
+    // persisted record.
+    let mut child_ids: Vec<String> = counted_children.iter().cloned().collect();
+    child_ids.sort();
+    primary
+        .metadata
+        .insert("coalesced_child_ids".to_owned(), child_ids.join(","));
     primary
         .metadata
         .insert("coalesce_generation".to_owned(), generation.to_string());
@@ -14556,6 +14765,18 @@ fn coalesce_terminal_continuations(
             );
         } else {
             primary.metadata.remove("omitted_summary_count");
+        }
+        // #15 SF2 — roll back the structured child-id set with the rest of
+        // this fold's metadata mutations.
+        match existing_child_ids {
+            Some(ids) => {
+                primary
+                    .metadata
+                    .insert("coalesced_child_ids".to_owned(), ids);
+            }
+            None => {
+                primary.metadata.remove("coalesced_child_ids");
+            }
         }
         if generation > 1 {
             primary.metadata.insert(
@@ -15017,15 +15238,19 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
     if state.supervisor_store.is_none() {
         return;
     }
-    // Snapshot per-group representative agents. `HashMap::entry` keeps ONE
+    // Snapshot per-group representative agents. `BTreeMap::entry` keeps ONE
     // agent per (group, session, profile, cwd, parent) cohort — the same
     // shape the live sibling scan in `enqueue_agent_terminal_continuations`
     // uses — and only cohorts whose every restored member is terminal are
     // eligible.
     // (group, session, profile, cwd, parent) — the cohort identity the live
     // sibling scan filters on.
+    // #15 R12-3 — `BTreeMap`, not `HashMap`: the rebuilt scatters enqueue in
+    // cohort-sorted order so a boot over the same store re-enqueues
+    // deterministically (aids SF1's deterministic restart order story).
     type ScatterCohortKey = (String, String, String, Option<String>, Option<String>);
-    let mut cohorts: HashMap<ScatterCohortKey, Vec<AutonomyAgentRecord>> = HashMap::new();
+    let mut cohorts: std::collections::BTreeMap<ScatterCohortKey, Vec<AutonomyAgentRecord>> =
+        std::collections::BTreeMap::new();
     for agent in state.agents.values() {
         let group_id = agent_continuation_group_id(agent);
         if !group_id.starts_with("agent-group:") {
@@ -15638,6 +15863,23 @@ fn retire_old_peer_injection(
             );
         }
     }
+}
+
+/// #15 SF1 — the primary sort key for the deterministic restart re-enqueue:
+/// the scatter join EPOCH parsed from the dedupe key's LAST segment
+/// (`scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}`), 0 for
+/// non-scatter records and for a trailing segment that does not parse (a
+/// malformed epoch sorts as epoch 0, i.e. oldest — the safe direction).
+fn restart_reenqueue_join_epoch(continuation: &PendingContinuationRecord) -> u64 {
+    if supervisor_metadata_str(&continuation.metadata, "reason") != Some("scatter_join_complete") {
+        return 0;
+    }
+    continuation
+        .continuation_id
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn master_continuation_request_from_persisted(
@@ -21926,14 +22168,17 @@ mod tests {
         );
         // The restored record pre-fills its output from the persisted
         // last-task summary (restore behavior, independent of this test).
-        // Empty it so the refresh below is what must fill the mirror.
+        // #15 R12-1 — do NOT pre-clear it: the gated refresh must OVERWRITE
+        // the stale pre-existing output with the richer final_output, not
+        // fill-if-empty behind it. Overwrite it with a marker that must be
+        // GONE after the refresh.
         fresh
             .state()
             .agents
             .get_mut(&agent_id)
             .expect("restored agent")
             .output
-            .clear();
+            .replace_range(.., "STALE-PRE-EXISTING-OUTPUT");
         let refreshed = make_task(Some(
             "Status: SUCCESS\n\nREVIEW BODY: refreshed after restart",
         ));
@@ -21956,6 +22201,11 @@ mod tests {
         assert!(
             text.contains("REVIEW BODY: refreshed after restart"),
             "the re-forward must refresh the output mirror: {text:?}"
+        );
+        assert!(
+            !text.contains("STALE-PRE-EXISTING-OUTPUT"),
+            "R12-1: the gated refresh must OVERWRITE the stale restored output, \
+             not fill-if-empty behind it: {text:?}"
         );
         let drained = fresh.drain_ready_continuations_for_session(
             &session_id,
@@ -38400,6 +38650,381 @@ mod tests {
             )
             .is_none(),
             "no owner → never block, even for a branch switch"
+        );
+    }
+
+    /// #15 SF1 — restart re-enqueues persisted continuations in a
+    /// DETERMINISTIC epoch/age order. Three scatter records at join epochs
+    /// 0/1/2 with staggered `queued_at_ms` must drain epoch-ascending from a
+    /// fresh orchestrator, and a SECOND fresh orchestrator over the same
+    /// store must re-enqueue identically (no HashMap iteration-order leak).
+    #[test]
+    fn restart_reenqueues_in_deterministic_epoch_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-det", "api", "det-restart");
+        let group = format!("agent-group:tenant-det:{}:master", session_id);
+        let make_record = |epoch: u64, queued_at_ms: u64| {
+            let join_key = format!(
+                "scatter_join/{group}/{}/{}/deadbeef/{epoch}",
+                session_id.0, "tenant-det"
+            );
+            let mut metadata = SupervisorMetadata::new();
+            metadata.insert("session_id".into(), json!(session_id.0));
+            metadata.insert("profile_id".into(), json!("tenant-det"));
+            metadata.insert("reason".into(), json!("scatter_join_complete"));
+            metadata.insert("dedupe_key".into(), json!(join_key));
+            metadata.insert("priority".into(), json!(3));
+            metadata.insert("payload:workspace".into(), json!("/tmp/ws-det"));
+            PendingContinuationRecord {
+                group_id: group.clone(),
+                continuation_id: join_key,
+                child_id: None,
+                prompt: None,
+                status: ContinuationStatus::Queued,
+                queued_at_ms,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: None,
+                attempt: 1,
+                metadata,
+            }
+        };
+        // Persist epochs OUT of order (2, 0, 1) with queued_at staggered so
+        // insertion order, epoch order, and age order all disagree — only
+        // the SF1 sort key can produce the asserted drain order.
+        let store = SupervisorStore::new(dir.path());
+        for (epoch, queued_at) in [(2u64, 300u64), (0, 100), (1, 200)] {
+            store
+                .record_continuation_queued(make_record(epoch, queued_at))
+                .expect("persist scatter record");
+        }
+
+        let drain_all = || {
+            let fresh = InProcessAgentOrchestrator::default();
+            fresh.configure_supervisor_store(dir.path()).expect("store");
+            let drained = fresh.drain_ready_continuations_for_session(
+                &session_id,
+                "tenant-det",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            drained
+                .iter()
+                .map(|item| {
+                    item.dedupe_key
+                        .as_str()
+                        .rsplit('/')
+                        .next()
+                        .expect("epoch segment")
+                        .parse::<u64>()
+                        .expect("numeric epoch")
+                })
+                .collect::<Vec<u64>>()
+        };
+        let first = drain_all();
+        assert_eq!(
+            first,
+            vec![0, 1, 2],
+            "restart re-enqueue must be epoch-ascending regardless of the              store's HashMap iteration order; got {first:?}"
+        );
+        let second = drain_all();
+        assert_eq!(
+            first, second,
+            "two fresh orchestrators over the same store must re-enqueue              identically; {first:?} vs {second:?}"
+        );
+    }
+
+    /// #15 SF2 — a RE-fold must NOT re-count a child already folded in an
+    /// earlier generation. Fold once (children X and Y fold into the
+    /// carrier), requeue the carrier as if its claimed turn failed, let a
+    /// duplicate ChildCompleted for X re-enter via the in-process
+    /// (non-gating) mark path, then fold again: `coalesced_count` must still
+    /// count X exactly ONCE and `coalesced_child_ids` must contain X exactly
+    /// once.
+    #[test]
+    fn refold_does_not_recount_previously_folded_child() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-rf", "api", "refold-dedupe");
+        let upsert = |agent_id: &str, last_task: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: "completed".to_owned(),
+            last_task: Some(last_task.to_owned()),
+            cwd: None,
+            profile_id: "tenant-rf".to_owned(),
+        };
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        orchestrator.upsert_agent(upsert("task-x", "x done"));
+        orchestrator.upsert_agent(upsert("task-y", "y done"));
+
+        // First drain: the two-child burst folds into ONE carrier counting
+        // X and Y once each.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rf",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "first fold yields one carrier");
+        let carrier = drained.into_iter().next().expect("carrier");
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("2"),
+            "first fold counts X and Y once each"
+        );
+        let ids = carrier
+            .metadata
+            .get("coalesced_child_ids")
+            .expect("structured child-id set persisted");
+        assert_eq!(
+            ids.matches("task-x").count(),
+            1,
+            "coalesced_child_ids contains X exactly once after the first fold: {ids}"
+        );
+
+        // The carrier's claimed turn fails mid-flight: reinsert it (the
+        // scheduler's real redelivery path). A duplicate ChildCompleted for
+        // X ALSO re-enters (its in-process delivered mark is NOT
+        // store-seeded, so the #7 gate does not suppress it and the
+        // pending_by_key entry is gone after the fold).
+        {
+            let mut state = orchestrator.state();
+            assert!(
+                matches!(
+                    state.continuations.reinsert(carrier),
+                    ReinsertOutcome::Requeued
+                ),
+                "the claimed carrier must requeue for redelivery"
+            );
+        }
+        orchestrator.upsert_agent(upsert("task-x", "x re-forwarded"));
+
+        // Second drain: the carrier re-folds X's re-forwarded report. The
+        // persisted child-id set must seed the dedup so X is NOT counted a
+        // second time.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-rf",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "second fold yields one carrier");
+        let carrier = &drained[0];
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("2"),
+            "SF2: the re-fold must NOT re-count the previously folded child X;              metadata {:?}",
+            carrier.metadata,
+        );
+        let ids = carrier
+            .metadata
+            .get("coalesced_child_ids")
+            .expect("structured child-id set after re-fold");
+        assert_eq!(
+            ids.matches("task-x").count(),
+            1,
+            "coalesced_child_ids contains X exactly once after the re-fold: {ids}"
+        );
+        assert_eq!(
+            ids.matches("task-y").count(),
+            1,
+            "coalesced_child_ids still contains Y from the first fold: {ids}"
+        );
+    }
+
+    /// #15 SF3 — the /stop purge's tombstone batch now mirrors the fold
+    /// path's exactly-once retry. With the (shared, self-disarming)
+    /// `force_tombstone_failure_once` hook armed, the purge's first batch
+    /// attempt "fails" (warn), the retry succeeds, and a fresh orchestrator
+    /// over the same store replays NOTHING for the purged session.
+    #[test]
+    fn stop_purge_tombstone_failure_retries_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-spr", "api", "purge-retry");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        for agent_id in ["agent-p1", "agent-p2"] {
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.to_owned(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: agent_id.to_owned(),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(format!("done {agent_id}")),
+                cwd: None,
+                profile_id: "tenant-spr".to_owned(),
+            });
+        }
+        assert!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-spr")
+                > 0,
+            "pending terminal items exist pre-purge"
+        );
+        orchestrator.set_force_tombstone_failure_once_for_test(true);
+        // 2 ChildCompleted + 2 scatter joins: admitting the second child
+        // bumps the join epoch (#2102), so its completion enqueues a NEW-epoch
+        // join alongside epoch 0's.
+        let pending_pre =
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-spr");
+        assert_eq!(pending_pre, 4, "2 children + 2 epoch-bumped joins pending");
+        let purged = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "tenant-spr",
+            None,
+            "turn/interrupt",
+        );
+        assert_eq!(
+            purged, 4,
+            "every pending terminal item of the session is purged"
+        );
+        drop(orchestrator);
+
+        // The retry must have persisted the tombstones: a fresh orchestrator
+        // on the same store re-enqueues nothing for the purged session.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-spr",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "the purge's retried tombstone batch must be durable; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// #15 Nit2 — the goal-clear incident shape, end to end: two REAL
+    /// `TaskSupervisor` peer tasks registered with the #13r2 workspace stamp
+    /// both complete; a terminal re-forward into a FRESH store-backed
+    /// orchestrator (restart replay) routes through the shared dual-sink
+    /// entry (`upsert_background_task_agent`), and the drain delivers
+    /// exactly ONE carrier whose coalesced metadata covers both children.
+    #[test]
+    fn background_task_terminal_dual_sink_reforward_to_drain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-nit2";
+        let session_id = SessionKey::with_profile(profile, "api", "dual-sink");
+        let workspace = "/tmp/ws-nit2";
+
+        // Runtime A: both tasks register and complete; nothing drains, so
+        // the terminal records stay Queued in the store (the restart
+        // replays them). The re-forward below uses the SAME task ids — the
+        // terminal event carries the task row — so the restored roster (agent
+        // id `task-<task_id>`) matches and the gate sees the seeded marks.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        // The registration-time supervisor stamps `workspace_root` (#13r2),
+        // so the terminal event the mirror consumes derives its cwd from the
+        // stamp. Capture the FULL terminal task rows (with ids, stamps, and
+        // timestamps) — the restart re-forward below replays THOSE rows, not
+        // hand-built approximations.
+        let mut terminal_tasks: Vec<octos_agent::BackgroundTask> = Vec::new();
+        {
+            let supervisor = octos_agent::TaskSupervisor::new();
+            for slug in ["ds-a", "ds-b"] {
+                let task_id = bind_peer_task_with_wired_terminal_sink(
+                    &supervisor,
+                    &first,
+                    crate::peers::peer_wire_key(profile, slug),
+                    &session_id,
+                    profile,
+                    Some(workspace),
+                );
+                supervisor.mark_completed(&task_id, Vec::new());
+                let task = supervisor
+                    .get_task(&task_id)
+                    .expect("registered task row readable");
+                terminal_tasks.push(task);
+            }
+        }
+        assert_eq!(
+            first.pending_continuation_count_for_session_for_test(&session_id, profile),
+            4,
+            "2 ChildCompleted + 2 epoch-bumped ScatterJoinComplete persisted pre-restart"
+        );
+        drop(first);
+
+        // Runtime B (the "restart"): the re-forwarded terminal events route
+        // through the SAME shared entry both production sinks use. The
+        // records were still Queued (never drained), so the marks seed
+        // non-gating and the re-forward refreshes without duplicating.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        for task in &terminal_tasks {
+            // The production re-forward delivers the SAME task row (same id,
+            // same workspace stamp), so the mirror derives the same agent id
+            // and cwd and collapses onto the restored roster — the gate sees
+            // the seeded delivered mark.
+            let _ = fresh.upsert_background_task_agent(task, Some(profile));
+        }
+        // max_items=1 — the goal-clear incident's one-carrier-per-turn
+        // shape: the pending ChildCompleted pair + scatter fold into exactly
+        // ONE carrier with coalesced metadata.
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(
+            drained.len(),
+            1,
+            "exactly one carrier delivered for the re-forwarded pair; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        let carrier = &drained[0];
+        assert_eq!(
+            carrier.reason,
+            MasterContinuationReason::ScatterJoinComplete,
+            "the latest-epoch scatter is the carrier"
+        );
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("2"),
+            "the carrier's coalesced metadata covers both children (the re-forward collapses onto the restored roster); metadata {:?}",
+            carrier.metadata,
+        );
+        let rest = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // A second turn MAY deliver the superseded epoch-0 scatter (it was
+        // folded into the carrier as a CONTROL row, but its tombstone is
+        // only consulted on the NEXT restart — the in-process queue still
+        // held it). It must carry NO additional folded children: the burst
+        // cost exactly one carrier + at most one control-row turn.
+        assert!(
+            rest.len() <= 1,
+            "at most one superseded-epoch control row may remain; got {:?}",
+            rest.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        assert!(
+            rest.iter()
+                .all(|item| !item.metadata.contains_key("coalesced_children")
+                    || item.metadata.get("coalesced_count").map(String::as_str) == Some("0")),
+            "no further folded children after the carrier; rest {:?}",
+            rest.iter().map(|i| i.metadata.clone()).collect::<Vec<_>>(),
         );
     }
 }

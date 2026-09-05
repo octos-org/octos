@@ -3437,6 +3437,16 @@ impl ActorFactory {
         // its restore must also adopt parked `peer_handoff` orphans whose
         // `result.md` already sits on the blackboard. Same goal resolvers,
         // one shared `on_restore` callback.
+        // #15 RA-1 — this path INTENTIONALLY stays on the UNSTAMPED
+        // `bind_peer_supervised_task` (no `_with_workspace`): the actor's
+        // `ActorFactory` carries `self.data_dir` (the profile data dir), NOT
+        // the session's workspace root — that value only exists per-turn on
+        // the WS `emit_staged` registration site (`ui_protocol_transport`),
+        // which DOES stamp it. Gateway-registered peer tasks therefore keep
+        // the pre-#13r2 `output_files`-derived cwd, and the /stop purge
+        // matches them only under a `workspace: None` scope — see the
+        // unstamped-registration comment in
+        // `clear_pending_terminal_continuations_for_session`.
         crate::autonomy::agent_orchestrator::install_peer_restore_observers_resolving_at_callback(
             &supervisor,
             &session_key,
