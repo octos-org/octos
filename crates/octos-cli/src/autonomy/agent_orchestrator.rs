@@ -22,9 +22,10 @@ use super::monitor_runtime::{
 };
 use super::supervisor_store::{
     ArtifactRecord as SupervisorArtifactRecord, COALESCED_METADATA_KEYS, ChildAgentRecord,
-    ChildStatus, CoalescedTombstoneEntry, CohortEpochAdmission, ContinuationStatus, GroupStatus,
-    HeartbeatPing, PendingContinuationRecord, SupervisedGroupRecord, SupervisorEvent,
-    SupervisorMetadata, SupervisorState, SupervisorStore, TerminalKind, TerminalState,
+    ChildStatus, CoalescedTombstoneEntry, CohortEpochAdmission, ContinuationQueueOutcome,
+    ContinuationStatus, GroupStatus, HeartbeatPing, PendingContinuationRecord,
+    SupervisedGroupRecord, SupervisorEvent, SupervisorMetadata, SupervisorState, SupervisorStore,
+    TerminalKind, TerminalState,
 };
 use super::workspace_scope::WorkspaceScope;
 use chrono::Utc;
@@ -2384,7 +2385,7 @@ impl InProcessAgentOrchestrator {
                             ?err,
                             "fleet keeper wake durable persist failed; rolling back enqueue"
                         );
-                        state.continuations.cancel(&continuation.dedupe_key);
+                        cancel_pending_continuation(&mut state, &continuation.dedupe_key);
                         WakeCommit::NotDurable
                     }
                 }
@@ -2466,8 +2467,8 @@ impl InProcessAgentOrchestrator {
             })
             .collect();
         for (group_id, dedupe_key, loop_id) in orphaned_fires {
-            state.continuations.cancel(&dedupe_key);
-            if let Some(store) = supervisor_store {
+            cancel_pending_continuation(state, &dedupe_key);
+            if let Some(store) = state.supervisor_store.as_ref() {
                 let _ = store.record_continuation_completed(
                     group_id.as_str(),
                     dedupe_key.as_str(),
@@ -2556,8 +2557,8 @@ impl InProcessAgentOrchestrator {
                 .map(|item| (item.group_id.clone(), item.dedupe_key.clone()))
                 .collect();
             for (group_id, dedupe_key) in orphaned {
-                state.continuations.cancel(&dedupe_key);
-                if let Some(store) = supervisor_store {
+                cancel_pending_continuation(state, &dedupe_key);
+                if let Some(store) = state.supervisor_store.as_ref() {
                     let _ = store.record_continuation_completed(
                         group_id.as_str(),
                         dedupe_key.as_str(),
@@ -2746,7 +2747,7 @@ impl InProcessAgentOrchestrator {
                     .map(|item| (item.group_id.clone(), item.dedupe_key.clone()))
                     .collect::<Vec<_>>();
                 for (group_id, dedupe_key) in queued {
-                    state.continuations.cancel(&dedupe_key);
+                    cancel_pending_continuation(&mut state, &dedupe_key);
                     if let Some(store) = state.supervisor_store.as_ref() {
                         let _ = store.record_continuation_completed(
                             group_id.as_str(),
@@ -3622,11 +3623,16 @@ impl InProcessAgentOrchestrator {
         let mut kept: Vec<QueuedMasterContinuation> = Vec::with_capacity(max_items.min(32));
         while kept.len() < max_items {
             let remaining = max_items - kept.len();
-            let drained = state.continuations.drain_ready_for_session(
+            let drained = state.continuations.drain_ready_for_session_if(
                 runtime_state,
                 remaining,
                 &session_id.to_string(),
                 profile_id,
+                |item| {
+                    !state
+                        .pending_unpersisted_scatters
+                        .contains_key(item.dedupe_key.as_str())
+                },
             );
             if drained.is_empty() {
                 break;
@@ -3707,6 +3713,9 @@ impl InProcessAgentOrchestrator {
             }
         }
         coalesce_terminal_continuations(state, session_id, profile_id, &mut kept);
+        for item in &kept {
+            retire_scatter_retry(state, item);
+        }
         kept
     }
 
@@ -3872,7 +3881,8 @@ impl InProcessAgentOrchestrator {
     }
 
     pub(crate) fn mark_continuation_started(&self, continuation: &QueuedMasterContinuation) {
-        let state = self.state();
+        let mut state = self.state();
+        retire_scatter_retry(&mut state, continuation);
         if let Some(store) = state.supervisor_store.as_ref() {
             // #26 (round-4, #18 B4) — the start carries the revision of the
             // payload this delivery actually resolved
@@ -3893,7 +3903,8 @@ impl InProcessAgentOrchestrator {
         continuation: &QueuedMasterContinuation,
         result: Option<String>,
     ) {
-        let state = self.state();
+        let mut state = self.state();
+        retire_scatter_retry(&mut state, continuation);
         if let Some(store) = state.supervisor_store.as_ref() {
             // #26 (round-4, #18 B4) — same revision-match rule as the start:
             // an old turn's Completed for attempt 1 must not tombstone a
@@ -4957,7 +4968,7 @@ impl InProcessAgentOrchestrator {
                         slug,
                         "peer_send_input durable persist failed; rolling back enqueue"
                     );
-                    state.continuations.cancel(&continuation.dedupe_key);
+                    cancel_pending_continuation(&mut state, &continuation.dedupe_key);
                     PeerSendInputEnqueueOutcome::PersistFailed
                 } else {
                     PeerSendInputEnqueueOutcome::Queued
@@ -5436,7 +5447,7 @@ impl InProcessAgentOrchestrator {
                     "peer_send_input re-home persist failed; leaving the old record \
                      intact (not re-homed this pass)"
                 );
-                state.continuations.cancel(&new_cont.dedupe_key);
+                cancel_pending_continuation(&mut state, &new_cont.dedupe_key);
                 continue;
             }
             // New is durable — NOW retire the old (cancel in-mem + tombstone).
@@ -11958,7 +11969,7 @@ impl InProcessAgentOrchestrator {
                                 "monitor wake durable persist failed; rolling back enqueue \
                                  (event will re-fire / re-inject, no accounting advanced)"
                             );
-                            state.continuations.cancel(&continuation.dedupe_key);
+                            cancel_pending_continuation(&mut state, &continuation.dedupe_key);
                             false
                         }
                     }
@@ -12393,16 +12404,13 @@ struct AutonomyRuntimeState {
     /// already emitted, so evicting it would re-admit the gated re-forward
     /// and resurrect the join (清理后重放不得复活).
     delivered_scatter_marks: HashMap<String, String>,
-    /// #27 (round-4, #18 SF3) — scatter join items whose enqueue SUCCEEDED
-    /// but whose checked persist FAILED, keyed by join key (= the item's
-    /// dedupe key). Carrying the `QueuedMasterContinuation` lets the retry
-    /// sites re-persist WITHOUT re-scanning the scheduler queue (the item is
-    /// still pending there, so a naive re-enqueue collapses to `Duplicate`
-    /// and the "later re-forward retries" assumption never fires). The three
-    /// retry sites — the same-group terminal upsert, the gated re-forward
-    /// reconcile, and the pre-drain pass — re-attempt the durable write for
-    /// every recorded item. NOT persisted: a crash is recovered by the
-    /// restore rebuild pass (#12), which re-derives the same key exactly once.
+    /// Failed scatter writes, keyed by the scheduler dedupe key. The saved
+    /// item identifies the occurrence and its scope for orphan cleanup; retry
+    /// always reads the current scheduler payload and checks the item ID.
+    /// Pending items own retries: cancel, claim and fold retire both together.
+    /// Failed retries remain visible to wake discovery but cannot be extracted.
+    /// This map is transient; restart reconstructs missing joins while honoring
+    /// durable Completed records, including bare /stop tombstones.
     pending_unpersisted_scatters: std::collections::HashMap<String, QueuedMasterContinuation>,
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
@@ -12793,6 +12801,12 @@ impl InProcessAgentOrchestrator {
         let targets: Vec<QueuedMasterContinuation> = state
             .continuations
             .pending_items()
+            .chain(state.pending_unpersisted_scatters.values().filter(|retry| {
+                state
+                    .continuations
+                    .pending_item(&retry.dedupe_key)
+                    .is_none()
+            }))
             .filter(|item| {
                 item.session_id.as_str() == session_id.0
                     && item.profile_id.as_str() == profile_id
@@ -12803,8 +12817,18 @@ impl InProcessAgentOrchestrator {
                             | MasterContinuationReason::ScatterJoinComplete
                     )
             })
-            .cloned()
+            .map(|item| (item.dedupe_key.clone(), item.clone()))
+            .collect::<std::collections::HashMap<_, _>>()
+            .into_values()
             .collect();
+        // A stale retry may name a replaced item in another scope. Purge its
+        // marker here, but only authoritative pending items (or true orphans)
+        // above can nominate a scheduler item or durable key for cancellation.
+        state.pending_unpersisted_scatters.retain(|_, item| {
+            !(item.session_id.as_str() == session_id.0
+                && item.profile_id.as_str() == profile_id
+                && item_workspace(item) == workspace)
+        });
         if targets.is_empty() {
             return 0;
         }
@@ -12812,9 +12836,7 @@ impl InProcessAgentOrchestrator {
         let mut entries: Vec<CoalescedTombstoneEntry> = Vec::with_capacity(targets.len());
         let mut purged = 0usize;
         for item in &targets {
-            if state.continuations.cancel(&item.dedupe_key).is_none() {
-                continue;
-            }
+            cancel_pending_continuation(&mut state, &item.dedupe_key);
             purged += 1;
             entries.push(CoalescedTombstoneEntry {
                 group_id: item.group_id.as_str().to_owned(),
@@ -13559,6 +13581,88 @@ mod workspace_r5_tests {
         }
         assert!(!old_scatter.is_empty());
         (session, group_id, old_scatter, 7, child_id)
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_legacy_bare_tombstone_uses_observed_scope_alias() {
+        for case in ["legacy", "unknown_hash", "malformed", "foreign_prefix"] {
+            let source = tempfile::tempdir().unwrap();
+            let (session, group, old_id, _, _) =
+                legacy_store(source.path(), false, "2f746d702f7773");
+            let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let store = SupervisorStore::new(dir.path());
+            for group in snapshot.groups.values() {
+                store.record_group_registered(group.clone()).unwrap();
+            }
+            for child in snapshot.children.values() {
+                store.record_child_started(child.clone()).unwrap();
+            }
+            for record in snapshot
+                .continuations
+                .values()
+                .filter(|r| r.continuation_id != old_id)
+            {
+                store.record_continuation_queued(record.clone()).unwrap();
+            }
+            let tombstone_id = match case {
+                "unknown_hash" => scatter_proof_key(&old_id, 123),
+                "malformed" => format!("{}/bad", old_id.rsplit_once('/').unwrap().0),
+                "foreign_prefix" => old_id.replacen("/workspace-r5/", "/foreign-profile/", 1),
+                _ => old_id.clone(),
+            };
+            store
+                .record_continuation_completed(
+                    &group,
+                    &tombstone_id,
+                    999,
+                    Some("stop after failed write".into()),
+                    0,
+                )
+                .unwrap();
+            let before = store.load_state().unwrap();
+            assert!(
+                before
+                    .continuations
+                    .values()
+                    .find(|r| r.continuation_id == tombstone_id)
+                    .unwrap()
+                    .metadata
+                    .is_empty()
+            );
+            let runtime = InProcessAgentOrchestrator::default();
+            runtime.configure_supervisor_store(dir.path()).unwrap();
+            let joins = runtime.drain_ready_continuations_for_session(
+                &session,
+                "workspace-r5",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert_eq!(
+                joins
+                    .iter()
+                    .any(|r| r.reason == MasterContinuationReason::ScatterJoinComplete),
+                case != "legacy",
+                "only a validated, observed alias may suppress the current cohort: {case}"
+            );
+            let after = store.load_state().unwrap();
+            assert_eq!(
+                after
+                    .continuations
+                    .values()
+                    .find(|r| r.continuation_id == tombstone_id)
+                    .unwrap()
+                    .status,
+                ContinuationStatus::Completed
+            );
+            if case == "legacy" {
+                assert_eq!(
+                    after.continuations.len(),
+                    before.continuations.len(),
+                    "restart cannot mint a canonical alias of the tombstone"
+                );
+            }
+        }
     }
 
     #[test]
@@ -15520,6 +15624,44 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     (verdict, usage)
 }
 
+/// A failed first write leaves no payload for /stop's Completed tombstone.
+/// Recognize its reserved key only against an actual child in the same group;
+/// workspace aliasing still comes exclusively from WorkspaceCompat evidence.
+fn is_bare_completed_scatter(
+    record: &PendingContinuationRecord,
+    snapshot: &SupervisorState,
+) -> bool {
+    if record.status != ContinuationStatus::Completed
+        || !record.group_id.starts_with("agent-group:")
+    {
+        return false;
+    }
+    snapshot.children.values().any(|child| {
+        if child.group_id != record.group_id {
+            return false;
+        }
+        let Some(session) = supervisor_metadata_str(&child.metadata, "session_id") else {
+            return false;
+        };
+        let Some(profile) =
+            supervisor_metadata_str(&child.metadata, "profile_id").or(child.profile_id.as_deref())
+        else {
+            return false;
+        };
+        let prefix = format!("scatter_join/{}/{session}/{profile}/", record.group_id);
+        let Some((hash, epoch)) = record
+            .continuation_id
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.split_once('/'))
+        else {
+            return false;
+        };
+        [hash, epoch].iter().all(|part| {
+            part.bytes().all(|byte| byte.is_ascii_digit()) && part.parse::<u64>().is_ok()
+        })
+    })
+}
+
 /// Seed the delivered terminal marks from every persisted terminal
 /// continuation:
 /// - `ChildCompleted` records (reason `child_completed`, any status: queued
@@ -15577,7 +15719,10 @@ fn seed_delivered_terminal_marks(
             .entry(record.continuation_id.clone())
             .or_insert(0);
         *revision = (*revision).max(u64::from(record.attempt));
-        match supervisor_metadata_str(&record.metadata, "reason") {
+        let reason = supervisor_metadata_str(&record.metadata, "reason").or_else(|| {
+            is_bare_completed_scatter(record, supervisor_state).then_some("scatter_join_complete")
+        });
+        match reason {
             Some("child_completed") => {
                 let status = supervisor_metadata_str(&record.metadata, "payload:status")
                     .unwrap_or("completed")
@@ -15789,9 +15934,8 @@ fn durable_correction_carrier_metadata(
     child_key: &str,
 ) -> std::io::Result<Option<std::collections::BTreeMap<String, String>>> {
     let compat = WorkspaceCompat::build(snapshot)?;
-    let mut candidates = Vec::new();
     for record in snapshot.continuations.values() {
-        if record.status == ContinuationStatus::Completed {
+        if record.status == ContinuationStatus::Completed || record.continuation_id != child_key {
             continue;
         }
         let Some(request) = master_continuation_request_from_persisted(record) else {
@@ -15810,20 +15954,9 @@ fn durable_correction_carrier_metadata(
         {
             continue;
         }
-        let rank = (
-            record.continuation_id == child_key,
-            request.metadata["coalesced_child_ids"]
-                .split(',')
-                .any(|id| id == agent.agent_id),
-            record.queued_at_ms,
-            record.continuation_id.as_str(),
-        );
-        candidates.push((rank, request.metadata));
+        return Ok(Some(request.metadata));
     }
-    Ok(candidates
-        .into_iter()
-        .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, metadata)| metadata))
+    Ok(None)
 }
 
 fn coalesced_rows(metadata: &std::collections::BTreeMap<String, String>) -> Vec<CoalescedRow> {
@@ -16029,6 +16162,11 @@ fn coalesce_terminal_continuations(
         profile_id,
         carrier_group.as_str(),
         carrier_workspace.as_deref(),
+        |item| {
+            !state
+                .pending_unpersisted_scatters
+                .contains_key(item.dedupe_key.as_str())
+        },
     );
     // Restore path for the fold-ABORT below: `extras` were REMOVED from the
     // scheduler by the take, so an abort must requeue them (crash-safe
@@ -16282,6 +16420,10 @@ fn coalesce_terminal_continuations(
         *kept = others;
         return;
     }
+    for item in &batch {
+        retire_scatter_retry(state, item);
+    }
+    retire_scatter_retry(state, &primary);
     // Carrier is durable — NOW tombstone the folded extras. A tombstone-write
     // failure is NOT undone: the extra stays `Queued` and is re-enqueued on
     // restart, which is the safe direction (a duplicate notification, never a
@@ -16472,18 +16614,10 @@ fn enqueue_agent_terminal_continuations(
             let mut carried_coalesced = state
                 .continuations
                 .pending_items()
-                .filter(|pending| {
-                    carrier_scope(pending) && pending.metadata.contains_key("coalesced_child_ids")
-                })
-                .max_by_key(|pending| {
-                    (
-                        pending.dedupe_key.as_str() == child_key,
-                        pending
-                            .metadata
-                            .get("coalesced_child_ids")
-                            .is_some_and(|ids| ids.split(',').any(|id| id == agent.agent_id)),
-                        pending.sequence,
-                    )
+                .find(|pending| {
+                    pending.dedupe_key.as_str() == child_key
+                        && carrier_scope(pending)
+                        && pending.metadata.contains_key("coalesced_child_ids")
                 })
                 .map(|pending| pending.metadata.clone());
             if carried_coalesced.is_none()
@@ -16780,86 +16914,20 @@ fn reconcile_missing_scatter(
     let continuation = match &scatter_outcome {
         MasterContinuationEnqueueOutcome::Queued(continuation) => continuation.clone(),
         MasterContinuationEnqueueOutcome::Duplicate { .. } => {
-            // #27 (round-4, #18 SF3) — the enqueue collapsed to `Duplicate`
-            // because the item is ALREADY pending in-memory. If that pending
-            // item's persist previously FAILED (it is recorded in
-            // `pending_unpersisted_scatters`), this is exactly the case the
-            // naive "later re-forward retries" assumption missed: re-attempt
-            // the durable write now. When the key is NOT recorded, the marks
-            // belong to whichever pass persists it — leave them untouched.
-            let Some(pending) = state.pending_unpersisted_scatters.get(&join_key).cloned() else {
-                return;
-            };
-            let attempt = next_continuation_attempt(state, &join_key);
-            match persist_scatter_queued_checked(state, &pending, attempt) {
-                Ok(()) => {
-                    advance_scatter_marks_after_persist(
-                        state,
-                        &join_group_key,
-                        &join_key,
-                        join_epoch,
-                        attempt,
-                    );
-                    state.pending_unpersisted_scatters.remove(&join_key);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        join_key = %join_key,
-                        attempt,
-                        "scatter join persist retry (Duplicate path) failed; the key \
-                         stays pending for the next retry site"
-                    );
-                }
-            }
+            persist_pending_scatter(state, &join_key, true);
             return;
         }
     };
-    // #1707 round 7: the scatter is a FRESH key per epoch, so its first
-    // persist allocates through the SAME unified `continuation_revisions`
-    // allocator the child correction/coalesce-fold paths use (board item
-    // #11) — a fresh key yields 1, matching the first-delivery contract.
-    // Persisting through `persist_continuation_queued` (fixed attempt 1)
-    // would leave the unified counter unseeded for this key; a later
-    // fold of THIS carrier would then re-allocate attempt 1 and replay
-    // dedup would swallow the fold's carrier persist.
-    let attempt = next_continuation_attempt(state, &join_key);
-    match persist_scatter_queued_checked(state, &continuation, attempt) {
-        Ok(()) => {
-            advance_scatter_marks_after_persist(
-                state,
-                &join_group_key,
-                &join_key,
-                join_epoch,
-                attempt,
-            );
-            // #27 (round-4, #18 SF3) — a persist that finally succeeded clears
-            // the key from the pending-unpersisted map (no-op on first persist).
-            state.pending_unpersisted_scatters.remove(&join_key);
-        }
-        Err(err) => {
-            // #1707 round 7 (board item #12): the persist FAILED — do NOT
-            // advance `last_joined_key` / `delivered_scatter_marks`.
-            // #27 (round-4, #18 SF3): RECORD the item in
-            // `pending_unpersisted_scatters`. The in-memory item stays queued,
-            // so a later same-group terminal upsert collapses to `Duplicate`
-            // and the naive "re-forward retries" assumption never fires;
-            // the explicit retry sites (same-group terminal upsert, the
-            // Duplicate arm above, the gated re-forward reconcile, and the
-            // pre-drain pass) re-attempt the durable write for every recorded
-            // item. A crash before any retry is still recovered by the restore
-            // rebuild pass re-deriving the same key.
-            state
-                .pending_unpersisted_scatters
-                .insert(join_key.clone(), continuation.clone());
-            tracing::warn!(
-                ?err,
-                join_key = %join_key,
-                attempt,
-                "scatter join persist failed; recorded for in-process retry \
-                 (marks stay unset; a restart rebuilds it)"
-            );
-        }
+    if state.supervisor_store.is_some() {
+        // Restore can reconstruct a key whose first write failed before /stop
+        // tombstoned it. First persistence must honor Completed just like retry.
+        state
+            .pending_unpersisted_scatters
+            .insert(join_key.clone(), continuation);
+        persist_pending_scatter(state, &join_key, false);
+    } else {
+        let attempt = next_continuation_attempt(state, &join_key);
+        advance_scatter_marks_after_persist(state, &join_group_key, &join_key, join_epoch, attempt);
     }
 }
 
@@ -16892,8 +16960,10 @@ fn advance_scatter_marks_after_persist(
         .or_default();
     // Belt-and-braces: the enqueue path already seeded this epoch, but a
     // hand-built restore fixture may persist first.
-    join_state.join_epoch = join_state.join_epoch.max(join_epoch);
-    join_state.last_joined_key = Some(proof_key.clone());
+    if join_epoch >= join_state.join_epoch {
+        join_state.join_epoch = join_epoch;
+        join_state.last_joined_key = Some(proof_key.clone());
+    }
     // #1707 round 3 (codex Blocker 4): the scatter has its OWN durable mark —
     // a future crash window where the child record persisted but this scatter
     // record did NOT is recovered by the rebuild path, not by assuming the
@@ -17008,117 +17078,98 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
     }
 }
 
-/// #1707 round 7 (board item #12) — CHECKED scatter persist. Thin wrapper
-/// over [`persist_continuation_queued_with_attempt`] carrying the test hook
-/// that simulates a crash exactly at the scatter's durable write: armed, the
-/// hook fails BEFORE touching the store (and self-disarms), so the caller's
-/// genuine `Err` handling (marks stay unset) is exercised end-to-end.
-fn persist_scatter_queued_checked(
-    state: &mut AutonomyRuntimeState,
-    continuation: &QueuedMasterContinuation,
-    attempt: u32,
-) -> std::io::Result<()> {
-    #[cfg(test)]
-    if state.force_scatter_persist_failure {
-        state.force_scatter_persist_failure = false;
-        return Err(std::io::Error::other(
-            "forced scatter persist failure (test hook)",
-        ));
+/// Scheduler ownership is authoritative; the map only records a failed write.
+fn retire_scatter_retry(state: &mut AutonomyRuntimeState, item: &QueuedMasterContinuation) {
+    if state
+        .pending_unpersisted_scatters
+        .get(item.dedupe_key.as_str())
+        .is_some_and(|retry| retry.id == item.id)
+    {
+        state
+            .pending_unpersisted_scatters
+            .remove(item.dedupe_key.as_str());
     }
-    persist_continuation_queued_with_attempt(state, continuation, attempt)
 }
 
-/// #27 (round-4, #18 SF3) — re-attempt the durable persist for every scatter
-/// join key recorded in `pending_unpersisted_scatters` (enqueue succeeded,
-/// persist failed). The in-memory item is STILL queued, so a naive re-enqueue
-/// collapses to `Duplicate` and the "later re-forward retries" assumption
-/// never fires — this pass is what actually retries the write in-process.
-///
-/// Each recorded entry carries the still-pending `QueuedMasterContinuation`
-/// (inserted by `reconcile_missing_scatter`'s `Err` arm), so the pass
-/// re-persists it directly — no scheduler re-scan — via the shared
-/// `persist_scatter_queued_checked` at attempt 1 (a fresh key's first
-/// persist; replay dedup makes a re-persist of an already-durable record a
-/// no-op). On `Ok` the join marks advance EXACTLY as the original persist
-/// would have (`advance_scatter_marks_after_persist`) and the entry leaves
-/// the map; on `Err` it STAYS recorded so a later site retries again.
-/// Sites: the same-group terminal upsert (`enqueue_agent_terminal_continuations`),
-/// the gated re-forward reconcile (`reconcile_scatter_for_existing_group`),
-/// and the pre-drain pass (`drain_ready_continuations_for_session` /
-/// `drain_and_claim_ready_continuation_for_session`).
-///
-/// NOTE (锁内 I/O): this runs under the orchestrator state lock, like every
-/// other checked persist in this subsystem. Per the board the explicit retry
-/// is in-scope this round; the broader "persist outside the state lock"
-/// redesign is #23 SF2's concern and is deliberately NOT folded in here.
+fn cancel_pending_continuation(
+    state: &mut AutonomyRuntimeState,
+    key: &MasterContinuationDedupeKey,
+) -> Option<QueuedMasterContinuation> {
+    state.pending_unpersisted_scatters.remove(key.as_str());
+    state.continuations.cancel(key)
+}
+
 fn retry_pending_unpersisted_scatters(state: &mut AutonomyRuntimeState) {
-    if state.pending_unpersisted_scatters.is_empty() || state.supervisor_store.is_none() {
-        return;
+    let mut keys: Vec<_> = state.pending_unpersisted_scatters.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        persist_pending_scatter(state, &key, true);
     }
-    // Test hook: the FIRST retry also fails, exercising the retry loop.
+}
+
+fn persist_pending_scatter(state: &mut AutonomyRuntimeState, join_key: &str, _is_retry: bool) {
+    let Some(retry) = state.pending_unpersisted_scatters.get(join_key) else {
+        return;
+    };
+    let key = retry.dedupe_key.clone();
+    let Some(item) = state
+        .continuations
+        .pending_item(&key)
+        .filter(|item| {
+            item.id == retry.id && item.reason == MasterContinuationReason::ScatterJoinComplete
+        })
+        .cloned()
+    else {
+        state.pending_unpersisted_scatters.remove(join_key);
+        return;
+    };
+    let Some(store) = state.supervisor_store.as_ref() else {
+        return;
+    };
     #[cfg(test)]
-    let fail_first_retry = {
-        let armed = state.force_scatter_retry_failure_once;
-        if armed {
+    if (_is_retry && state.force_scatter_retry_failure_once) || state.force_scatter_persist_failure
+    {
+        if _is_retry {
             state.force_scatter_retry_failure_once = false;
         }
-        armed
-    };
-    // Snapshot (join_key, item) pairs; BTreeMap for deterministic retry order.
-    let pending: std::collections::BTreeMap<String, QueuedMasterContinuation> = state
-        .pending_unpersisted_scatters
-        .iter()
-        .map(|(key, item)| (key.clone(), item.clone()))
-        .collect();
-    #[cfg(test)]
-    let mut fail_budget = fail_first_retry;
-    for (join_key, continuation) in pending {
-        #[cfg(test)]
-        if fail_budget {
-            fail_budget = false;
-            tracing::warn!(
-                join_key = %join_key,
-                "forced scatter retry failure (test hook); key stays pending"
-            );
-            continue;
+        state.force_scatter_persist_failure = false;
+        return;
+    }
+    let attempt = next_continuation_attempt(state, join_key);
+    let outcome = store
+        .record_continuation_queued_if_not_completed(queued_continuation_record(&item, attempt));
+    let hash = scatter_cwd_hash(&item_workspace(&item).map(str::to_owned));
+    let cohort = scatter_cohort_key(item.group_id.as_str(), hash);
+    let epoch = join_key
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    match outcome {
+        Ok(ContinuationQueueOutcome::Written(_)) => {
+            state.continuations.stamp_persisted_attempt(&key, attempt);
+            advance_scatter_marks_after_persist(state, &cohort, join_key, epoch, attempt);
+            retire_scatter_retry(state, &item);
         }
-        // #25 round 2 (outer-loop 22:02 item 3): the attempt comes from the
-        // UNIFIED `continuation_revisions` allocator — the same source the
-        // Duplicate arm of `enqueue_and_persist_continuation` uses — NOT a
-        // hardcoded 1. A retry whose key was already persisted-and-marked
-        // (then re-enqueued under a fresh epoch) would otherwise re-stamp
-        // attempt 1, colliding with the #11 event-id namespace.
-        let attempt = next_continuation_attempt(state, &join_key);
-        match persist_scatter_queued_checked(state, &continuation, attempt) {
-            Ok(()) => {
-                let cohort_key = scatter_cohort_key(
-                    continuation.group_id.as_str(),
-                    scatter_cwd_hash(&item_workspace(&continuation).map(str::to_owned)),
-                );
-                let join_epoch = continuation
-                    .dedupe_key
-                    .as_str()
-                    .rsplit('/')
-                    .next()
-                    .and_then(|segment| segment.parse::<u64>().ok())
-                    .unwrap_or(0);
-                advance_scatter_marks_after_persist(
-                    state,
-                    &cohort_key,
-                    &join_key,
-                    join_epoch,
-                    attempt,
-                );
-                state.pending_unpersisted_scatters.remove(&join_key);
+        Ok(ContinuationQueueOutcome::AlreadyCompleted(record)) => {
+            cancel_pending_continuation(state, &key);
+            let revision = state
+                .continuation_revisions
+                .entry(join_key.to_owned())
+                .or_default();
+            *revision = (*revision).max(u64::from(record.attempt));
+            let proof = scatter_proof_key(join_key, hash);
+            state
+                .delivered_scatter_marks
+                .insert(proof.clone(), "joined".into());
+            let joined = state.scatter_join_state.entry(cohort).or_default();
+            if epoch >= joined.join_epoch {
+                joined.join_epoch = epoch;
+                joined.last_joined_key = Some(proof);
             }
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    join_key = %join_key,
-                    "scatter join persist retry failed; key stays pending for the \
-                     next retry site (a restart rebuilds it if the process exits)"
-                );
-            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, join_key, "scatter retry failed; retaining pending ownership until storage recovers");
         }
     }
 }
@@ -17617,6 +17668,15 @@ fn persist_continuation_queued_with_attempt(
             .continuations
             .stamp_persisted_attempt(&continuation.dedupe_key, attempt);
     }
+    store
+        .record_continuation_queued(queued_continuation_record(continuation, attempt))
+        .map(|_| ())
+}
+
+fn queued_continuation_record(
+    continuation: &QueuedMasterContinuation,
+    attempt: u32,
+) -> PendingContinuationRecord {
     let mut metadata = SupervisorMetadata::new();
     metadata.insert("session_id".into(), json!(continuation.session_id.as_str()));
     metadata.insert("profile_id".into(), json!(continuation.profile_id.as_str()));
@@ -17635,7 +17695,7 @@ fn persist_continuation_queued_with_attempt(
     for (key, value) in &continuation.metadata {
         metadata.insert(format!("payload:{key}"), json!(value));
     }
-    let record = PendingContinuationRecord {
+    PendingContinuationRecord {
         group_id: continuation.group_id.as_str().to_owned(),
         continuation_id: continuation.dedupe_key.as_str().to_owned(),
         child_id: continuation
@@ -17650,8 +17710,7 @@ fn persist_continuation_queued_with_attempt(
         result: None,
         attempt,
         metadata,
-    };
-    store.record_continuation_queued(record).map(|_| ())
+    }
 }
 
 /// #436 P1 #1 — retire a re-homed peer injection's OLD record: drop the
@@ -17679,7 +17738,7 @@ fn retire_old_peer_injection(
     old_key: &MasterContinuationDedupeKey,
     reason: &str,
 ) {
-    state.continuations.cancel(old_key);
+    cancel_pending_continuation(state, old_key);
     if let Some(store) = state.supervisor_store.as_ref() {
         if let Err(err) = store.record_continuation_completed(
             PEER_SEND_INPUT_GROUP,
@@ -41885,229 +41944,121 @@ mod tests {
         }
     }
 
-    /// #25 (round-4 Blocker #18-B3, fold-then-correction) — task-a/task-b
-    /// fold into a carrier that is still PENDING (claimed but its record
-    /// was never tombstoned, so the correction arm's replace path finds it
-    /// in the pending set) when a status correction for the carrier child
-    /// lands (failed → completed re-forward). The rebuilt request must
-    /// RE-ATTACH the folded payload: `coalesced_child_ids` still lists A
-    /// and B, `coalesced_count` is unchanged, and the correction note names
-    /// the corrected child.
+    /// A pending scatter keeps ownership of its folded reports when a
+    /// different child key receives a corrected verdict.
     #[test]
-    fn correction_on_carrier_keeps_folded_payload() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let session_id = SessionKey::with_profile("tenant-cc", "api", "carrier-correction");
-        let upsert = |agent_id: &str, status: &str| AgentUpsert {
-            agent_id: agent_id.to_owned(),
-            parent_agent_id: Some("master".to_owned()),
-            session_id: session_id.clone(),
+    fn correction_of_folded_child_keeps_pending_carrier_as_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey::with_profile("tenant-cc", "api", "carrier-correction");
+        let upsert = |id: &str, status: &str| AgentUpsert {
+            agent_id: id.into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session.clone(),
             task_id: None,
-            path: format!("master/{agent_id}"),
-            role: "background_task".to_owned(),
-            nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
-            status: status.to_owned(),
-            last_task: Some(format!("summary-{agent_id}")),
+            path: format!("master/{id}"),
+            role: "background_task".into(),
+            nickname: id.into(),
+            backend_kind: "task_supervisor:peer_handoff".into(),
+            status: status.into(),
+            last_task: Some(format!("summary-{id}")),
             cwd: None,
-            profile_id: "tenant-cc".to_owned(),
+            profile_id: "tenant-cc".into(),
         };
-
-        let orchestrator = InProcessAgentOrchestrator::default();
-        orchestrator
-            .configure_supervisor_store(dir.path())
-            .expect("store");
-        orchestrator
-            .upsert_agent(upsert("task-a", "completed"))
-            .unwrap();
-        orchestrator
-            .upsert_agent(upsert("task-b", "failed"))
-            .unwrap();
-
-        // The burst folds into ONE carrier keyed on task-b (fold order:
-        // A first, then B — the oldest-first batch makes the LAST-pending
-        // child the fallback carrier when no scatter exists). The drain
-        // claims it but its record stays Queued and its reinsert below puts
-        // it back pending — the undelivered carrier the correction targets.
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &session_id,
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).unwrap();
+        orch.upsert_agent(upsert("task-a", "completed")).unwrap();
+        orch.upsert_agent(upsert("task-b", "failed")).unwrap();
+        let mut drained = orch.drain_ready_continuations_for_session(
+            &session,
             "tenant-cc",
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        assert_eq!(drained.len(), 1, "A/B burst folds into one carrier");
-        let carrier = drained.into_iter().next().expect("carrier");
-        let carrier_key = carrier.dedupe_key.as_str().to_owned();
+        assert_eq!(drained.len(), 1);
+        let carrier = drained.remove(0);
         assert_eq!(
             carrier.reason,
-            MasterContinuationReason::ScatterJoinComplete,
-            "the max-sequence scatter is the carrier (both children terminal): {carrier_key}"
+            MasterContinuationReason::ScatterJoinComplete
         );
+        assert_eq!(carrier.metadata["coalesced_count"], "2");
         assert_eq!(
-            carrier.metadata.get("coalesced_count").map(String::as_str),
-            Some("2"),
+            orch.state().continuations.reinsert(carrier.clone()),
+            ReinsertOutcome::Requeued
         );
+        orch.upsert_agent(upsert("task-b", "completed")).unwrap();
         {
-            let mut state = orchestrator.state();
-            assert!(
-                matches!(
-                    state.continuations.reinsert(carrier),
-                    ReinsertOutcome::Requeued
-                ),
-                "the undelivered carrier must be pending when the correction lands"
+            let state = orch.state();
+            let pending = state
+                .continuations
+                .pending_item(&carrier.dedupe_key)
+                .unwrap();
+            assert_eq!(
+                pending.metadata, carrier.metadata,
+                "the existing carrier remains the sole owner of A/B reports"
             );
-        }
-
-        // Status correction on the FOLDED child task-b: failed → completed.
-        // The delivered mark differs, so the correction arm rebuilds the
-        // request — and the pending CARRIER (the epoch-1 scatter row that
-        // folded task-b) must have its `coalesced_*` payload RE-ATTACHED to
-        // the corrected child row rather than vanishing with the replace.
-        orchestrator
-            .upsert_agent(upsert("task-b", "completed"))
-            .unwrap();
-
-        // Peek BEFORE the drain: the fold at drain time would absorb the
-        // corrected child row into a carrier and erase the 1:1 correction
-        // shape this test asserts. The corrected task-b row must sit in the
-        // pending set with its own verdict flipped...
-        let (corrected_key, corrected_meta, carrier_meta) = {
-            let state = orchestrator.state();
             let corrected = state
                 .continuations
                 .pending_items()
-                .find(|item| {
-                    item.reason == MasterContinuationReason::ChildCompleted
-                        && item
-                            .child_agent_id
-                            .as_ref()
-                            .is_some_and(|id| id.as_str() == "task-b")
-                })
-                .expect("the corrected task-b row is pending after the replace");
-            let carrier = state
-                .continuations
-                .pending_items()
-                .find(|item| item.dedupe_key.as_str() == carrier_key.as_str())
-                .expect("the epoch-1 scatter carrier is still pending");
-            (
-                corrected.dedupe_key.as_str().to_owned(),
-                corrected.metadata.clone(),
-                carrier.metadata.clone(),
-            )
-        };
-        assert_eq!(
-            corrected_meta.get("status").map(String::as_str),
-            Some("completed"),
-            "the corrected verdict is on the child row itself: {corrected_key}"
-        );
-        // ...and the still-pending carrier must STILL carry the folded
-        // payload (ids for A and B, the count, the verdict note) — the
-        // correction did not strip the carrier's `coalesced_*` metadata.
-        let ids = carrier_meta
-            .get("coalesced_child_ids")
-            .expect("the pending carrier keeps its folded child-id set");
-        assert_eq!(
-            ids.matches("task-a").count(),
-            1,
-            "the carrier preserves folded child A: {ids}"
-        );
-        assert_eq!(
-            ids.matches("task-b").count(),
-            1,
-            "the carrier preserves folded child B: {ids}"
-        );
-        assert_eq!(
-            carrier_meta.get("coalesced_count").map(String::as_str),
-            Some("2"),
-            "the verdict fix does not add another folded child report"
-        );
-        for metadata in [&carrier_meta, &corrected_meta] {
-            assert_eq!(metadata["coalesced_count_kind"], "observed");
-            assert_eq!(metadata["listed_child_count"], "2");
-            assert_eq!(metadata["omitted_child_count"], "0");
-            assert!(
-                serde_json::to_string(&metadata["coalesced_children"])
-                    .unwrap()
-                    .len()
-                    <= 256 * 1024
-            );
-            assert!(
-                serde_json::to_string(&metadata["coalesced_child_ids"])
-                    .unwrap()
-                    .len()
-                    <= 64 * 1024
-            );
+                .find(|item| item.reason == MasterContinuationReason::ChildCompleted)
+                .unwrap();
+            assert_eq!(corrected.metadata["status"], "completed");
+            assert!(!corrected.metadata.contains_key("coalesced_child_ids"));
+            assert!(!corrected.metadata.contains_key("coalesced_children"));
         }
-        assert_eq!(
-            coalesced_rows(&corrected_meta)
-                .iter()
-                .filter(|row| row.child)
-                .count(),
-            2,
-            "the correction control row does not count as a listed child"
-        );
-        // The correction note lands on the CORRECTED child row (task-b),
-        // not the carrier — the carrier keeps the folded payload unchanged.
-        let note = corrected_meta
-            .get("coalesced_correction_note")
-            .unwrap_or_else(|| panic!("the correction note records the verdict change; corrected_meta={corrected_meta:?}"));
-        assert!(
-            note.contains("task-b") && note.contains("completed"),
-            "the note names the corrected child and its new verdict: {note}"
-        );
-
-        // The subsequent drain folds the corrected carrier (with its A/B
-        // payload) + the corrected child row into ONE carrier keyed on the
-        // epoch-1 join: the payload is never dropped, and B's corrected
-        // verdict rides along.
-        let drained = orchestrator.drain_ready_continuations_for_session(
-            &session_id,
+        let drained = orch.drain_ready_continuations_for_session(
+            &session,
             "tenant-cc",
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        // The scatter carrier was CLAIMED during the earlier drain (its
-        // record stays Queued in the store, but pending_by_key no longer
-        // holds it), so the drain yields the carrier AS-IS alongside the
-        // corrected child row — the fold only happens within one drain's
-        // batch. What matters: BOTH items carry the full folded payload.
-        assert_eq!(
-            drained.len(),
-            2,
-            "the corrected carrier + corrected child row deliver as two items; got {drained:?}"
-        );
-        let folded_carrier = drained
+        assert_eq!(drained.len(), 2);
+        let delivered_carrier = drained
             .iter()
-            .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
-            .expect("the epoch-1 scatter carrier is delivered");
-        let folded_ids = folded_carrier
-            .metadata
-            .get("coalesced_child_ids")
-            .expect("the folded carrier keeps the union id set");
-        assert_eq!(
-            folded_ids.matches("task-a").count(),
-            1,
-            "task-a survives correction-then-fold: {folded_ids}"
-        );
-        assert_eq!(
-            folded_ids.matches("task-b").count(),
-            1,
-            "task-b survives correction-then-fold: {folded_ids}"
-        );
-        // The scatter carrier was claimed BEFORE the correction landed, so
-        // the note rides on the corrected CHILD row (not the carrier). The
-        // carrier's own `coalesced_children` still shows the ORIGINAL
-        // verdict for task-b (failed); the corrected row carries the note.
-        let corrected_row = drained
+            .find(|item| item.dedupe_key == carrier.dedupe_key)
+            .unwrap();
+        assert_eq!(delivered_carrier.metadata, carrier.metadata);
+        let corrected = drained
             .iter()
             .find(|item| item.reason == MasterContinuationReason::ChildCompleted)
-            .expect("the corrected task-b row is delivered");
+            .unwrap();
+        assert_eq!(corrected.metadata["status"], "completed");
         assert!(
-            corrected_row
+            !corrected.metadata.contains_key("coalesced_children"),
+            "the correction cannot repeat the carrier's siblings"
+        );
+        let snapshot = SupervisorStore::new(dir.path()).load_state().unwrap();
+        let durable_correction = snapshot
+            .continuations
+            .values()
+            .find(|row| row.continuation_id == corrected.dedupe_key.as_str())
+            .unwrap();
+        assert!(
+            !durable_correction
                 .metadata
-                .get("coalesced_children")
-                .is_some_and(|text| text.contains("corrected: completed")),
-            "the correction note survives on the corrected child row: {:?}",
-            corrected_row.metadata.get("coalesced_children"),
+                .contains_key("payload:coalesced_children")
+        );
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).unwrap();
+        let restored = fresh.drain_ready_continuations_for_session(
+            &session,
+            "tenant-cc",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let restored_carrier = restored
+            .iter()
+            .find(|row| row.dedupe_key == carrier.dedupe_key)
+            .unwrap();
+        assert_eq!(restored_carrier.metadata, carrier.metadata);
+        let restored_correction = restored
+            .iter()
+            .find(|row| row.dedupe_key == corrected.dedupe_key)
+            .unwrap();
+        assert_eq!(restored_correction.metadata["status"], "completed");
+        assert!(
+            !restored_correction
+                .metadata
+                .contains_key("coalesced_children")
         );
     }
 
@@ -43388,8 +43339,8 @@ mod tests {
     /// correction in session A must never graft session B's folded payload
     /// (nor another group's, nor another workspace's) onto A's corrected
     /// child row. Two sessions each hold a pending carrier with folded ids;
-    /// correcting session A's child must leave A's row carrying ONLY A's
-    /// ids and session B's carrier UNTOUCHED.
+    /// correcting session A's child leaves both carriers as owners of their
+    /// reports, and emits only that child's standalone corrected verdict.
     #[test]
     fn correction_does_not_graft_foreign_session_carrier() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -43464,10 +43415,7 @@ mod tests {
             }
         }
 
-        // STATUS CORRECTION in session A only: a2 failed → completed. The
-        // rebuilt a2 row must carry ONLY {a1, a2} — session B's carrier
-        // (also pending, also carrying coalesced_child_ids) must NOT be
-        // grafted onto it.
+        // A different child key cannot take either session's carrier payload.
         orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "completed"))
             .unwrap();
 
@@ -43480,21 +43428,20 @@ mod tests {
                 .find(|item| {
                     item.reason == MasterContinuationReason::ChildCompleted
                         && item.group_id.as_str() == group
-                        && item.metadata.contains_key("coalesced_child_ids")
+                        && item
+                            .child_agent_id
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == "a2")
                 })
-                .expect("the corrected a2 row sits pending with re-attached metadata");
-            let ids = corrected
-                .metadata
-                .get("coalesced_child_ids")
-                .expect("re-attached id set");
-            assert!(
-                ids.contains("a1") && ids.contains("a2"),
-                "the corrected row carries session A's folded ids: {ids}"
-            );
-            assert!(
-                !ids.contains("b1") && !ids.contains("b2"),
-                "session B's ids must NOT be grafted onto session A's correction: {ids}"
-            );
+                .expect("the corrected a2 verdict sits pending");
+            assert_eq!(corrected.metadata["status"], "completed");
+            assert!(!corrected.metadata.contains_key("coalesced_child_ids"));
+            assert!(!corrected.metadata.contains_key("coalesced_children"));
+            let own_carrier = state
+                .continuations
+                .pending_item(&carriers["a"].dedupe_key)
+                .unwrap();
+            assert_eq!(own_carrier.metadata, carriers["a"].metadata);
             corrected.dedupe_key.as_str().to_owned()
         };
 
@@ -43759,6 +43706,490 @@ mod tests {
         assert_eq!(
             corrected.persisted_attempt, 2,
             "the restored item carries the durable attempt-2 revision"
+        );
+    }
+    fn failed_scatter_fixture() -> (
+        tempfile::TempDir,
+        InProcessAgentOrchestrator,
+        SessionKey,
+        QueuedMasterContinuation,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).unwrap();
+        let session = SessionKey::with_profile("retry-life", "api", "session");
+        let agent = |id: &str, status: &str| AgentUpsert {
+            agent_id: id.into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session.clone(),
+            task_id: None,
+            path: format!("master/{id}"),
+            role: "background_task".into(),
+            nickname: id.into(),
+            backend_kind: "task_supervisor:peer_handoff".into(),
+            status: status.into(),
+            last_task: Some(format!("summary-{id}")),
+            cwd: None,
+            profile_id: "retry-life".into(),
+        };
+        orch.upsert_agent(agent("one", "running")).unwrap();
+        orch.upsert_agent(agent("two", "running")).unwrap();
+        orch.upsert_agent(agent("one", "completed")).unwrap();
+        orch.set_force_scatter_persist_failure_for_test(true);
+        orch.upsert_agent(agent("two", "interrupted")).unwrap();
+        let item = orch
+            .state()
+            .pending_unpersisted_scatters
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        (dir, orch, session, item)
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_stop_never_revives() {
+        let (dir, orch, session, item) = failed_scatter_fixture();
+        assert_eq!(
+            orch.clear_pending_terminal_continuations_for_session(
+                &session,
+                "retry-life",
+                None,
+                "user stop"
+            ),
+            3
+        );
+        assert!(
+            orch.state().pending_unpersisted_scatters.is_empty(),
+            "stop must retire retry ownership"
+        );
+        retry_pending_unpersisted_scatters(&mut orch.state());
+        let store = SupervisorStore::new(dir.path());
+        let durable = store.load_state().unwrap();
+        assert_eq!(
+            durable
+                .continuations
+                .values()
+                .find(|r| r.continuation_id == item.dedupe_key.as_str())
+                .unwrap()
+                .status,
+            ContinuationStatus::Completed
+        );
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).unwrap();
+        assert!(
+            fresh
+                .drain_ready_continuations_for_session(
+                    &session,
+                    "retry-life",
+                    MasterContinuationRuntimeState::idle(),
+                    usize::MAX
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_failed_predrain_excludes_coalesce_and_abort() {
+        for abort_fold in [false, true] {
+            let (_dir, orch, session, item) = failed_scatter_fixture();
+            orch.set_force_scatter_retry_failure_once_for_test(true);
+            orch.set_force_coalesce_persist_failure_for_test(abort_fold);
+            let drained = orch.drain_ready_continuations_for_session(
+                &session,
+                "retry-life",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            assert!(!drained.is_empty(), "healthy child work must still drain");
+            assert!(
+                drained.iter().all(|r| r.dedupe_key != item.dedupe_key),
+                "blocked scatter cannot be selected as carrier"
+            );
+            {
+                let state = orch.state();
+                let pending = state
+                    .continuations
+                    .pending_items()
+                    .find(|r| r.dedupe_key == item.dedupe_key)
+                    .expect("failed retry stays pending");
+                assert_eq!(pending.id, item.id);
+                assert_eq!(pending.sequence, item.sequence);
+                assert_eq!(pending.redelivery_attempts, item.redelivery_attempts);
+                assert!(
+                    state
+                        .pending_unpersisted_scatters
+                        .contains_key(item.dedupe_key.as_str())
+                );
+            }
+            orch.set_force_coalesce_persist_failure_for_test(false);
+            let recovered = orch.drain_ready_continuations_for_session(
+                &session,
+                "retry-life",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert!(recovered.iter().any(|r| r.dedupe_key == item.dedupe_key));
+            assert!(orch.state().pending_unpersisted_scatters.is_empty());
+        }
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_completed_snapshot_retires_without_regressing_epoch() {
+        let (dir, orch, _session, item) = failed_scatter_fixture();
+        let store = SupervisorStore::new(dir.path());
+        store
+            .record_continuation_completed(
+                item.group_id.as_str(),
+                item.dedupe_key.as_str(),
+                900,
+                Some("stop".into()),
+                0,
+            )
+            .unwrap();
+        store.snapshot_now().unwrap();
+        let cohort = scatter_cohort_key(item.group_id.as_str(), scatter_cwd_hash(&None));
+        {
+            let mut state = orch.state();
+            let join = state.scatter_join_state.entry(cohort.clone()).or_default();
+            join.join_epoch = 9;
+            join.last_joined_key = Some("newer-join".into());
+            retry_pending_unpersisted_scatters(&mut state);
+            assert!(state.pending_unpersisted_scatters.is_empty());
+            assert!(
+                !state
+                    .continuations
+                    .pending_items()
+                    .any(|r| r.dedupe_key == item.dedupe_key),
+                "Completed scatter cannot remain deliverable"
+            );
+            assert_eq!(
+                state.scatter_join_state[&cohort].last_joined_key.as_deref(),
+                Some("newer-join")
+            );
+        }
+        assert_eq!(
+            store
+                .load_state()
+                .unwrap()
+                .continuations
+                .values()
+                .find(|r| r.continuation_id == item.dedupe_key.as_str())
+                .unwrap()
+                .status,
+            ContinuationStatus::Completed
+        );
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_orphan_stop_is_scoped() {
+        let (_dir, orch, session, item) = failed_scatter_fixture();
+        {
+            let mut state = orch.state();
+            let keys: Vec<_> = state
+                .continuations
+                .pending_items()
+                .map(|r| r.dedupe_key.clone())
+                .collect();
+            for key in keys {
+                state.continuations.cancel(&key);
+            }
+            let mut foreign = item.clone();
+            foreign.profile_id = "foreign".into();
+            state
+                .pending_unpersisted_scatters
+                .insert("foreign-retry".into(), foreign);
+        }
+        orch.clear_pending_terminal_continuations_for_session(&session, "retry-life", None, "stop");
+        let state = orch.state();
+        assert!(
+            !state
+                .pending_unpersisted_scatters
+                .contains_key(item.dedupe_key.as_str()),
+            "orphan retry must be purged before empty-target return"
+        );
+        assert!(
+            state
+                .pending_unpersisted_scatters
+                .contains_key("foreign-retry")
+        );
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_read_failure_defers() {
+        let (dir, orch, session, item) = failed_scatter_fixture();
+        let store = SupervisorStore::new(dir.path());
+        std::fs::write(store.snapshot_path(), "invalid snapshot").unwrap();
+        orch.drain_ready_continuations_for_session(
+            &session,
+            "retry-life",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert!(
+            orch.state()
+                .pending_unpersisted_scatters
+                .contains_key(item.dedupe_key.as_str()),
+            "a read failure must not be treated as absence"
+        );
+        assert!(
+            orch.state()
+                .continuations
+                .pending_items()
+                .any(|r| r.dedupe_key == item.dedupe_key)
+        );
+        std::fs::remove_file(store.snapshot_path()).unwrap();
+        retry_pending_unpersisted_scatters(&mut orch.state());
+        assert!(orch.state().pending_unpersisted_scatters.is_empty());
+    }
+
+    #[test]
+    fn correction_different_child_does_not_copy_executing_carrier_siblings() {
+        for corrected in ["task-x", "task-b"] {
+            let dir = tempfile::tempdir().unwrap();
+            let session = SessionKey::with_profile("owner-r5", "api", "executing");
+            let upsert = |id: &str, status: &str| AgentUpsert {
+                agent_id: id.into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session.clone(),
+                task_id: None,
+                path: format!("master/{id}"),
+                role: "background_task".into(),
+                nickname: id.into(),
+                backend_kind: "native".into(),
+                status: status.into(),
+                last_task: Some(format!("summary-{id}")),
+                cwd: None,
+                profile_id: "owner-r5".into(),
+            };
+            let orch = Box::leak(Box::new(InProcessAgentOrchestrator::default()));
+            orch.configure_supervisor_store(dir.path()).unwrap();
+            for id in ["task-x", "task-a", "task-b", "task-c", "task-d"] {
+                orch.upsert_agent(upsert(id, "running")).unwrap();
+            }
+            orch.upsert_agent(upsert("task-x", "failed")).unwrap();
+            let (x, xguard) = orch.drain_and_claim_ready_continuation_for_session(
+                &session,
+                "owner-r5",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            orch.mark_continuation_completed(&x[0], None);
+            drop(xguard);
+            for (id, status) in [
+                ("task-a", "failed"),
+                ("task-b", "failed"),
+                ("task-d", "completed"),
+            ] {
+                orch.upsert_agent(upsert(id, status)).unwrap();
+            }
+            let (held, guard) = orch.drain_and_claim_ready_continuation_for_session(
+                &session,
+                "owner-r5",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            let carrier = &held[0];
+            assert_eq!(carrier.child_agent_id.as_ref().unwrap().as_str(), "task-a");
+            assert!(carrier.metadata["coalesced_child_ids"].contains("task-d"));
+            orch.mark_continuation_started(carrier);
+            orch.upsert_agent(upsert(corrected, "completed")).unwrap();
+            {
+                let state = orch.state();
+                let pending = state
+                    .continuations
+                    .pending_items()
+                    .find(|r| {
+                        r.child_agent_id
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == corrected)
+                    })
+                    .unwrap();
+                assert!(
+                    !pending.metadata.contains_key("coalesced_children"),
+                    "different child correction must not steal the held carrier's sibling reports"
+                );
+            }
+            let store = SupervisorStore::new(dir.path());
+            let snapshot = store.load_state().unwrap();
+            let correction = snapshot
+                .continuations
+                .values()
+                .find(|r| r.child_id.as_deref() == Some(corrected))
+                .unwrap();
+            assert!(
+                !correction
+                    .metadata
+                    .contains_key("payload:coalesced_children")
+            );
+            let old = snapshot
+                .continuations
+                .values()
+                .find(|r| r.continuation_id == carrier.dedupe_key.as_str())
+                .unwrap();
+            assert_eq!(old.status, ContinuationStatus::Started);
+            assert_eq!(
+                old.metadata["payload:coalesced_children"],
+                json!(carrier.metadata["coalesced_children"])
+            );
+            orch.mark_continuation_completed(carrier, None);
+            drop(guard);
+            let fresh = InProcessAgentOrchestrator::default();
+            fresh.configure_supervisor_store(dir.path()).unwrap();
+            let restored = fresh.drain_ready_continuations_for_session(
+                &session,
+                "owner-r5",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            let correction = restored
+                .iter()
+                .find(|r| {
+                    r.child_agent_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == corrected)
+                })
+                .unwrap();
+            assert!(!correction.metadata.contains_key("coalesced_children"));
+        }
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_current_payload_survives_requeue() {
+        let (dir, orch, _session, item) = failed_scatter_fixture();
+        {
+            let mut state = orch.state();
+            let mut current = state.continuations.cancel(&item.dedupe_key).unwrap();
+            current
+                .metadata
+                .insert("terminal_children".into(), "17".into());
+            state.continuations.requeue_taken(current);
+            retry_pending_unpersisted_scatters(&mut state);
+            assert!(state.pending_unpersisted_scatters.is_empty());
+        }
+        let snapshot = SupervisorStore::new(dir.path()).load_state().unwrap();
+        let record = snapshot
+            .continuations
+            .values()
+            .find(|r| r.continuation_id == item.dedupe_key.as_str())
+            .unwrap();
+        assert_eq!(record.metadata["payload:terminal_children"], json!("17"));
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_replaced_generation_and_late_callbacks() {
+        let (_dir, orch, session, old) = failed_scatter_fixture();
+        {
+            let mut state = orch.state();
+            let mut replacement = state.continuations.cancel(&old.dedupe_key).unwrap();
+            replacement.id =
+                super::super::master_continuation_scheduler::MasterContinuationId::new(999);
+            replacement
+                .metadata
+                .insert("workspace_scope".into(), "/tmp/foreign-generation".into());
+            state.continuations.requeue_taken(replacement.clone());
+            // The stale marker belongs to /stop's scope, the current item does not.
+        }
+        orch.clear_pending_terminal_continuations_for_session(
+            &session,
+            "retry-life",
+            None,
+            "stop old scope",
+        );
+        let replacement = {
+            let mut state = orch.state();
+            assert!(state.pending_unpersisted_scatters.is_empty());
+            let replacement = state
+                .continuations
+                .pending_item(&old.dedupe_key)
+                .unwrap()
+                .clone();
+            assert_ne!(replacement.id, old.id);
+            state
+                .pending_unpersisted_scatters
+                .insert(old.dedupe_key.as_str().into(), old.clone());
+            retry_pending_unpersisted_scatters(&mut state);
+            assert!(
+                state.pending_unpersisted_scatters.is_empty(),
+                "stale generation cannot retry"
+            );
+            state
+                .pending_unpersisted_scatters
+                .insert(old.dedupe_key.as_str().into(), replacement.clone());
+            replacement
+        };
+        orch.mark_continuation_started(&old);
+        orch.mark_continuation_completed(&old, None);
+        assert_eq!(
+            orch.state().pending_unpersisted_scatters[old.dedupe_key.as_str()].id,
+            replacement.id,
+            "old callbacks cannot clear the new retry owner"
+        );
+    }
+
+    #[test]
+    fn scatter_retry_lifecycle_task_supervisor_cancel_then_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).unwrap();
+        let profile = "cancel-r5";
+        let session = SessionKey::with_profile(profile, "api", "real-cancel");
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let runtime = orch.clone();
+        supervisor.set_on_change(move |task| {
+            runtime
+                .upsert_background_task_agent(task, Some(profile))
+                .unwrap();
+        });
+        let wire = crate::peers::peer_wire_key(profile, "cancel-r5-child");
+        let task = crate::peers::bind_peer_supervised_task_with_workspace_strict(
+            &supervisor,
+            wire.clone(),
+            &session.0,
+            Some("/tmp/cancel-r5"),
+        )
+        .unwrap()
+        .unwrap();
+        orch.set_force_scatter_persist_failure_for_test(true);
+        supervisor.cancel(&task).unwrap();
+        {
+            let state = orch.state();
+            assert_eq!(state.pending_unpersisted_scatters.len(), 1);
+            assert!(
+                state
+                    .continuations
+                    .pending_items()
+                    .any(|r| r.reason == MasterContinuationReason::ChildCompleted
+                        && r.metadata.get("status").map(String::as_str) == Some("interrupted")),
+                "standalone task cancel still emits its child verdict"
+            );
+        }
+        assert_eq!(
+            orch.clear_pending_terminal_continuations_for_session(
+                &session,
+                profile,
+                Some("/tmp/cancel-r5"),
+                "user stop"
+            ),
+            2
+        );
+        assert!(orch.state().pending_unpersisted_scatters.is_empty());
+        retry_pending_unpersisted_scatters(&mut orch.state());
+        assert_eq!(
+            crate::peers::peer_task_registry().take(&wire).as_deref(),
+            Some(task.as_str())
+        );
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).unwrap();
+        assert!(
+            fresh
+                .drain_ready_continuations_for_session(
+                    &session,
+                    profile,
+                    MasterContinuationRuntimeState::idle(),
+                    usize::MAX
+                )
+                .is_empty()
         );
     }
 }

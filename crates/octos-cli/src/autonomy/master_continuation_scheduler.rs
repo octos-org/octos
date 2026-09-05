@@ -790,12 +790,24 @@ impl MasterContinuationScheduler {
         drained
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_ready_for_session(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,
         max_items: usize,
         session_id: &str,
         profile_id: &str,
+    ) -> Vec<QueuedMasterContinuation> {
+        self.drain_ready_for_session_if(runtime_state, max_items, session_id, profile_id, |_| true)
+    }
+
+    pub(crate) fn drain_ready_for_session_if(
+        &mut self,
+        runtime_state: MasterContinuationRuntimeState,
+        max_items: usize,
+        session_id: &str,
+        profile_id: &str,
+        mut eligible: impl FnMut(&QueuedMasterContinuation) -> bool,
     ) -> Vec<QueuedMasterContinuation> {
         if max_items == 0 || !runtime_state.is_idle_eligible() {
             return Vec::new();
@@ -814,7 +826,9 @@ impl MasterContinuationScheduler {
                 .pending_by_key
                 .get(&entry.dedupe_key)
                 .is_some_and(|item| {
-                    item.session_id.as_str() == session_id && item.profile_id.as_str() == profile_id
+                    item.session_id.as_str() == session_id
+                        && item.profile_id.as_str() == profile_id
+                        && eligible(item)
                 });
             if matches_session {
                 if let Some(item) = self.pending_by_key.remove(&entry.dedupe_key) {
@@ -868,6 +882,7 @@ impl MasterContinuationScheduler {
         profile_id: &str,
         group_id: &str,
         workspace: Option<&str>,
+        mut eligible: impl FnMut(&QueuedMasterContinuation) -> bool,
     ) -> Vec<QueuedMasterContinuation> {
         let keys = self
             .pending_by_key
@@ -882,6 +897,7 @@ impl MasterContinuationScheduler {
                     )
                     && item.group_id.as_str() == group_id
                     && item_workspace(item) == workspace
+                    && eligible(item)
             })
             .map(|item| item.dedupe_key.clone())
             .collect::<Vec<_>>();
@@ -927,6 +943,13 @@ impl MasterContinuationScheduler {
     /// goal/loop has since been paused, cleared, or deleted.
     pub(crate) fn pending_items(&self) -> impl Iterator<Item = &QueuedMasterContinuation> + '_ {
         self.pending_by_key.values()
+    }
+
+    pub(crate) fn pending_item(
+        &self,
+        key: &MasterContinuationDedupeKey,
+    ) -> Option<&QueuedMasterContinuation> {
+        self.pending_by_key.get(key)
     }
 
     fn discard_stale_heap_entries(&mut self) {

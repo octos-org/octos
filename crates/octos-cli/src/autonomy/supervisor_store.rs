@@ -300,6 +300,14 @@ pub struct PendingContinuationRecord {
     pub metadata: SupervisorMetadata,
 }
 
+/// Outcome of a retry that must never supersede a completed continuation.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ContinuationQueueOutcome {
+    Written(SupervisorEventLedgerRow),
+    AlreadyCompleted(PendingContinuationRecord),
+}
+
 /// Optional cohort epoch committed with a complete child admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CohortEpochAdmission {
@@ -1303,9 +1311,18 @@ impl SupervisorStore {
     ) -> io::Result<SupervisorEventLedgerRow> {
         let _lock = self.acquire_append_lock()?;
         let mut cache = self.lock_seq_cache();
-        self.refresh_seq_cache_locked(&mut cache)?;
+        self.append_event_locked(event_id.into(), event, &mut cache)
+    }
+
+    // Caller holds the append-file lock, then the sequence-cache guard.
+    fn append_event_locked(
+        &self,
+        mut event_id: String,
+        event: SupervisorEvent,
+        cache: &mut SeqCache,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        self.refresh_seq_cache_locked(cache)?;
         let sequence = cache.last_sequence.saturating_add(1);
-        let mut event_id = event_id.into();
         if event_id.is_empty() {
             event_id = format!("event:{sequence}");
         }
@@ -1315,9 +1332,9 @@ impl SupervisorStore {
             recorded_at_ms: unix_time_millis(),
             event,
         };
-        self.append_row_locked(&row, &mut cache)?;
+        self.append_row_locked(&row, cache)?;
         if self.snapshot_every_appends > 0 && cache.ledger_rows >= self.snapshot_every_appends {
-            if let Err(err) = self.snapshot_and_compact_locked(&mut cache) {
+            if let Err(err) = self.snapshot_and_compact_locked(cache) {
                 tracing::warn!(
                     error = %err,
                     events_path = %self.events_path.display(),
@@ -1585,6 +1602,53 @@ impl SupervisorStore {
             event_id,
             SupervisorEvent::ContinuationQueued { continuation },
         )
+    }
+
+    /// Check replayed state and append under the same cross-process lock.
+    /// Completed is final for retry callers, even for a higher offered attempt.
+    pub fn record_continuation_queued_if_not_completed(
+        &self,
+        continuation: PendingContinuationRecord,
+    ) -> io::Result<ContinuationQueueOutcome> {
+        if continuation.status != ContinuationStatus::Queued {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected Queued continuation",
+            ));
+        }
+        let _lock = self.acquire_append_lock()?;
+        let mut durable = self.load_state()?;
+        let key = continuation_key(&continuation.group_id, &continuation.continuation_id);
+        if let Some(current) = durable.continuations.remove(&key)
+            && current.status == ContinuationStatus::Completed
+        {
+            return Ok(ContinuationQueueOutcome::AlreadyCompleted(current));
+        }
+        drop(durable);
+        #[cfg(test)]
+        {
+            let barrier = self
+                .append_io
+                .lock()
+                .unwrap()
+                .conditional_queue_barrier
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+                barrier.wait();
+            }
+        }
+        let event_id = format!(
+            "continuation_queued:{}:{}:{}",
+            continuation.group_id, continuation.continuation_id, continuation.attempt
+        );
+        let mut cache = self.lock_seq_cache();
+        self.append_event_locked(
+            event_id,
+            SupervisorEvent::ContinuationQueued { continuation },
+            &mut cache,
+        )
+        .map(ContinuationQueueOutcome::Written)
     }
 
     pub fn record_continuation_started(
@@ -2563,6 +2627,7 @@ mod tests {
         fail_flush: bool,
         fail_before_write: bool,
         fail_write_after_bytes: Option<usize>,
+        pub(super) conditional_queue_barrier: Option<Arc<std::sync::Barrier>>,
     }
 
     /// Wrap the actual append handle, so counts follow real file operations
@@ -4888,5 +4953,188 @@ mod tests {
             ContinuationStatus::Completed,
             "legacy attempt-0 lifecycle events keep applying unconditionally"
         );
+    }
+    fn conditional_queue_record(attempt: u32) -> PendingContinuationRecord {
+        PendingContinuationRecord {
+            group_id: "conditional-group".into(),
+            continuation_id: "scatter-key".into(),
+            child_id: None,
+            prompt: None,
+            status: ContinuationStatus::Queued,
+            queued_at_ms: 10,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: None,
+            attempt,
+            metadata: SupervisorMetadata::new(),
+        }
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_foreign_writer_snapshot_and_no_io() {
+        for compact in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = SupervisorStore::new(dir.path());
+            a.record_continuation_queued(conditional_queue_record(1))
+                .unwrap();
+            let b = SupervisorStore::new(dir.path());
+            b.record_continuation_completed(
+                "conditional-group",
+                "scatter-key",
+                20,
+                Some("stopped".into()),
+                1,
+            )
+            .unwrap();
+            if compact {
+                b.snapshot_now().unwrap();
+            }
+            let bytes = std::fs::read(a.events_path()).ok();
+            let sequence = a.lock_seq_cache().last_sequence;
+            let debt = a.lock_seq_cache().appends_since_fsync;
+            *a.append_io.lock().unwrap() = AppendIoProbe::default();
+            let outcome = a
+                .record_continuation_queued_if_not_completed(conditional_queue_record(99))
+                .unwrap();
+            let ContinuationQueueOutcome::AlreadyCompleted(record) = outcome else {
+                panic!("foreign completion must be final");
+            };
+            assert_eq!(record.attempt, 1);
+            assert_eq!(record.result.as_deref(), Some("stopped"));
+            assert_eq!(std::fs::read(a.events_path()).ok(), bytes);
+            assert_eq!(a.lock_seq_cache().last_sequence, sequence);
+            assert_eq!(a.lock_seq_cache().appends_since_fsync, debt);
+            let io = a.append_io.lock().unwrap();
+            assert_eq!((io.opens, io.writes, io.flushes, io.syncs), (0, 0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_validates_scope_and_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path());
+        let mut invalid = conditional_queue_record(1);
+        invalid.status = ContinuationStatus::Started;
+        assert_eq!(
+            a.record_continuation_queued_if_not_completed(invalid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!a.events_path().exists());
+        let b = SupervisorStore::new(dir.path());
+        b.record_continuation_completed("other-group", "scatter-key", 1, None, 0)
+            .unwrap();
+        std::fs::write(a.snapshot_path(), "invalid snapshot").unwrap();
+        let bytes = std::fs::read(a.events_path()).unwrap();
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(a.events_path()).unwrap(), bytes);
+        std::fs::remove_file(a.snapshot_path()).unwrap();
+        let ContinuationQueueOutcome::Written(row) = a
+            .record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap()
+        else {
+            panic!("different group is independent");
+        };
+        assert_eq!(row.sequence, 2);
+        assert_eq!(
+            row.event_id,
+            "continuation_queued:conditional-group:scatter-key:1"
+        );
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_holds_lock_across_check_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        a.append_io.lock().unwrap().conditional_queue_barrier = Some(barrier.clone());
+        let b = SupervisorStore::new(dir.path());
+        let writer = std::thread::spawn(move || {
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .unwrap()
+        });
+        barrier.wait(); // A checked absence and still owns the append lock.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let completer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let row = b
+                .record_continuation_completed("conditional-group", "scatter-key", 20, None, 0)
+                .unwrap();
+            done_tx.send(row.sequence).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early_completion = done_rx.recv_timeout(std::time::Duration::from_millis(50));
+        let blocked = matches!(
+            early_completion,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        barrier.wait();
+        let outcome = writer.join().unwrap();
+        let completed_sequence = early_completion.unwrap_or_else(|_| done_rx.recv().unwrap());
+        completer.join().unwrap();
+        assert!(
+            blocked,
+            "another writer cannot complete between the check and queue append"
+        );
+        let ContinuationQueueOutcome::Written(row) = outcome else {
+            panic!("A was first");
+        };
+        assert!(row.sequence < completed_sequence);
+        assert_eq!(
+            SupervisorStore::new(dir.path())
+                .load_state()
+                .unwrap()
+                .continuations[&continuation_key("conditional-group", "scatter-key")]
+                .status,
+            ContinuationStatus::Completed
+        );
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_prewrite_and_postflush_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_append_fsync_every(3);
+        a.append_io.lock().unwrap().fail_before_write = true;
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .is_err()
+        );
+        assert!(a.load_state().unwrap().continuations.is_empty());
+        *a.append_io.lock().unwrap() = AppendIoProbe {
+            fail_flush: true,
+            ..AppendIoProbe::default()
+        };
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .is_err()
+        );
+        assert_eq!(
+            a.load_state().unwrap().continuations
+                [&continuation_key("conditional-group", "scatter-key")]
+                .status,
+            ContinuationStatus::Queued
+        );
+        assert_eq!(a.lock_seq_cache().appends_since_fsync, 2);
+        let b = SupervisorStore::new(dir.path());
+        b.record_continuation_completed("conditional-group", "scatter-key", 20, None, 0)
+            .unwrap();
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        assert_eq!(a.append_io.lock().unwrap().opens, 0);
+        assert_eq!(a.lock_seq_cache().appends_since_fsync, 2);
+        let mut next = conditional_queue_record(1);
+        next.continuation_id = "other-key".into();
+        a.record_continuation_queued_if_not_completed(next).unwrap();
+        assert_eq!(a.append_io.lock().unwrap().syncs, 1);
+        assert_eq!(a.lock_seq_cache().appends_since_fsync, 0);
     }
 }
