@@ -2179,7 +2179,7 @@ impl InProcessAgentOrchestrator {
             // No store → the pending occurrence is in-memory only, NOT durable.
             MasterContinuationEnqueueOutcome::Duplicate { .. } => WakeCommit::NotDurable,
             MasterContinuationEnqueueOutcome::Queued(continuation) => {
-                match persist_continuation_queued_checked(&state, &continuation) {
+                match persist_continuation_queued_checked(&mut state, &continuation) {
                     // Persisted to the durable store → survives a restart.
                     Ok(()) if has_store => WakeCommit::Durable,
                     // No supervisor store: in-memory only, NOT durable — do not
@@ -4668,7 +4668,7 @@ impl InProcessAgentOrchestrator {
                 PeerSendInputEnqueueOutcome::Duplicate
             }
             MasterContinuationEnqueueOutcome::Queued(continuation) => {
-                if let Err(err) = persist_continuation_queued_checked(&state, &continuation) {
+                if let Err(err) = persist_continuation_queued_checked(&mut state, &continuation) {
                     tracing::error!(
                         ?err,
                         slug,
@@ -5146,7 +5146,7 @@ impl InProcessAgentOrchestrator {
             // Persist the NEW record before touching the old. On a durable-write
             // failure, propagate it: roll back the in-mem new and LEAVE the old
             // intact (still deliverable + durable) rather than risk losing both.
-            if let Err(err) = persist_continuation_queued_checked(&state, &new_cont) {
+            if let Err(err) = persist_continuation_queued_checked(&mut state, &new_cont) {
                 tracing::error!(
                     ?err,
                     slug,
@@ -9574,6 +9574,20 @@ impl InProcessAgentOrchestrator {
             .pending_count_for_session(&session_id.to_string(), profile_id)
     }
 
+    /// Test-only: read a delivered child terminal mark as
+    /// `(status, revision, seeded_from_store)` — board item #11's purge test
+    /// asserts the /stop purge never regresses the mark's revision.
+    #[cfg(test)]
+    pub(crate) fn delivered_child_mark_for_test(
+        &self,
+        child_key: &str,
+    ) -> Option<(String, u64, bool)> {
+        self.state()
+            .delivered_child_marks
+            .get(child_key)
+            .map(|mark| (mark.status.clone(), mark.revision, mark.seeded_from_store))
+    }
+
     /// Test-only: snapshot the pending fleet-keeper (`External(fleet_keeper_wake)`)
     /// continuations as `(session_id, dedupe_key, fleet_id metadata)`. Filters
     /// out unrelated continuations (e.g. a goal's `GoalContinue`) so a
@@ -11652,7 +11666,7 @@ impl InProcessAgentOrchestrator {
                     // `persist_continuation_queued_checked` itself honours the
                     // round-2 test hook (returns a real Err), so this exercises
                     // the genuine error path, not a parallel forced branch.
-                    match persist_continuation_queued_checked(&state, continuation) {
+                    match persist_continuation_queued_checked(&mut state, continuation) {
                         Ok(()) => true,
                         Err(err) => {
                             tracing::error!(
@@ -12018,6 +12032,22 @@ struct AutonomyRuntimeState {
     /// durable persist carries a distinct `attempt` (the event id embeds it)
     /// and replaces any still-pending older-status payload.
     delivered_child_marks: HashMap<String, DeliveredChildMark>,
+    /// #1707 round 6 (board item #11) — ONE unified monotonic revision per
+    /// continuation id (dedupe key → the last attempt durably persisted for
+    /// it). This is the SINGLE allocation source for the `attempt` embedded in
+    /// every `continuation_queued:{group}:{id}:{attempt}` event id, shared by
+    /// the first-delivery, status-correction, and coalesced-carrier re-persist
+    /// paths. Before this map the correction arm allocated `mark.revision + 1`
+    /// while the fold allocated `coalesce_generation + 1` — two counters over
+    /// ONE event-id namespace, so a fold of an attempt-2-corrected child
+    /// re-emitted attempt=2 and replay dedup silently swallowed one of the two
+    /// writes behind the other (the extras were already tombstoned → loss).
+    /// Seeded from every persisted continuation record in
+    /// `configure_supervisor_store` (MAX attempt per id) and advanced ONLY
+    /// after the persist write returns Ok, so a failed write never burns a
+    /// revision and a post-restart re-persist always allocates strictly above
+    /// the persisted history.
+    continuation_revisions: HashMap<String, u64>,
     /// Durable "already told the master" marks for scatter joins:
     /// the full join key (`scatter_join/{group}/{session}/{profile}/
     /// {cwd_hash}/{epoch}`) → "joined". Seeded from persisted
@@ -12168,6 +12198,7 @@ impl Default for AutonomyRuntimeState {
             agents: HashMap::new(),
             scatter_join_state: HashMap::new(),
             delivered_child_marks: HashMap::new(),
+            continuation_revisions: HashMap::new(),
             delivered_scatter_marks: HashMap::new(),
             goals: HashMap::new(),
             loops: HashMap::new(),
@@ -12299,17 +12330,36 @@ impl InProcessAgentOrchestrator {
                         .get("status")
                         .filter(|status| !status.is_empty())
                     {
-                        state.delivered_child_marks.insert(
-                            item.dedupe_key.as_str().to_owned(),
-                            DeliveredChildMark {
+                        // #1707 round 6 (board item #11): NEVER regress an
+                        // existing mark's revision — resetting it to 1 let a
+                        // post-purge correction allocate a LOWER attempt than
+                        // the unified `continuation_revisions` history, and a
+                        // low-attempt write landing behind a higher-attempt
+                        // tombstone is dropped by the upsert's rank gate while
+                        // the in-memory mark advanced. `entry().or_insert*`
+                        // preserves an existing revision; a key with no mark
+                        // yet starts from the unified counter (or 1). The
+                        // purge itself writes Completed TOMBSTONES, not queued
+                        // re-persists, so `continuation_revisions` is left
+                        // as-is.
+                        let fallback_revision = state
+                            .continuation_revisions
+                            .get(item.dedupe_key.as_str())
+                            .copied()
+                            .unwrap_or(1);
+                        let mark = state
+                            .delivered_child_marks
+                            .entry(item.dedupe_key.as_str().to_owned())
+                            .or_insert_with(|| DeliveredChildMark {
                                 status: status.clone(),
-                                revision: 1,
+                                revision: fallback_revision,
                                 // A /stop purge is THIS process's verdict —
                                 // it must not gate later upserts like a
                                 // store-seeded (pre-boot) mark would.
                                 seeded_from_store: false,
-                            },
-                        );
+                            });
+                        mark.status = status.clone();
+                        mark.seeded_from_store = false;
                     }
                 }
                 MasterContinuationReason::ScatterJoinComplete => {
@@ -13851,6 +13901,18 @@ fn seed_delivered_terminal_marks(
     // epoch's record may linger in the store).
     let mut max_epoch_per_group: HashMap<String, (u64, String)> = HashMap::new();
     for record in supervisor_state.continuations.values() {
+        // #1707 round 6 (board item #11): seed the UNIFIED revision counter
+        // for EVERY persisted continuation record (any reason, any status) —
+        // MAX attempt per continuation id (the upsert keeps one record per
+        // id, so a single read usually suffices; `.max()` is belt-and-braces
+        // for a hand-built multi-attempt fixture). This is what makes a
+        // post-restart correction or fold allocate strictly above the whole
+        // persisted history, never re-emitting an event id replay dedups.
+        let revision = state
+            .continuation_revisions
+            .entry(record.continuation_id.clone())
+            .or_insert(0);
+        *revision = (*revision).max(u64::from(record.attempt));
         match supervisor_metadata_str(&record.metadata, "reason") {
             Some("child_completed") => {
                 let status = supervisor_metadata_str(&record.metadata, "payload:status")
@@ -14059,11 +14121,16 @@ fn coalesce_terminal_continuations(
     // the same event id and be silently dropped on replay — the restored
     // carrier would keep stale metadata while the second fold's extras are
     // tombstoned (notification loss). Bump `coalesce_generation` on every fold
-    // and derive `attempt = 1 + generation` below, making each fold's event id
-    // distinct; replay applies them in ledger order and the rank-equal upsert
-    // keeps the LAST one. The key lives in `metadata` so the restore path
-    // (`payload:*` round-trip in `master_continuation_request_from_persisted`)
-    // carries it across restarts.
+    // so the fold's generation bookkeeping and the re-fold APPEND path below
+    // stay correct across restarts (the key lives in `metadata` so the
+    // restore path's `payload:*` round-trip in
+    // `master_continuation_request_from_persisted` carries it). Since round 6
+    // (board item #11) the generation NO LONGER derives the event-id attempt —
+    // `persist_continuation_coalesced_checked` allocates it from the unified
+    // `continuation_revisions` counter shared with the status-correction arm,
+    // so a fold can never collide with a correction's event id; replay
+    // applies each record in ledger order and the rank-equal upsert keeps the
+    // LAST one.
     let generation: u64 = primary
         .metadata
         .get("coalesce_generation")
@@ -14200,11 +14267,13 @@ fn coalesce_terminal_continuations(
     // tombstones below are the point of no return: once written, a restart
     // re-enqueues ONLY records still `Queued`. Persist the carrier's UPDATED
     // record (with `coalesced_count` / `coalesced_children` in its metadata)
-    // BEFORE any tombstone, via a distinct `ContinuationQueued` event at
-    // `attempt = 1 + coalesce_generation` (the event id embeds the attempt, so
-    // each fold of the same carrier is a DISTINCT replay event, and the
-    // Queued==Queued rank-equal upsert keeps the LAST one — ledger order —
-    // wholesale, metadata included) (`persist_continuation_coalesced_checked`).
+    // BEFORE any tombstone, via a distinct `ContinuationQueued` event whose
+    // attempt comes from the unified `continuation_revisions` allocator
+    // (round 6, board item #11 — the event id embeds the attempt, so each
+    // fold of the same carrier is a DISTINCT replay event that can never
+    // collide with a status correction's attempt, and the Queued==Queued
+    // rank-equal upsert keeps the LAST one — ledger order — wholesale,
+    // metadata included) (`persist_continuation_coalesced_checked`).
     // On failure, ABORT the fold: nothing was tombstoned yet, so requeue the
     // taken extras and deliver the whole batch in its original per-item shape
     // (a warn + N turns, never a lost notification).
@@ -14390,28 +14459,30 @@ fn enqueue_agent_terminal_continuations(
                  ChildCompleted re-enqueue (scatter join still evaluated)"
             );
         }
-        Some(mark) => {
+        Some(_mark) => {
             // #1707 round 3 (codex Blocker 3): a STATUS CORRECTION (same
             // identity key, different terminal status). The correction must
             // (a) REPLACE any still-pending older-status payload atomically
             // and bypass the reclaim window when the older item was just
-            // claimed, and (b) persist with `attempt = revision + 1` so the
+            // claimed, and (b) persist with a strictly-higher attempt so the
             // durable record carries a distinct event id and an
             // attempt-eligible upsert that can overwrite an older Completed
             // tombstone. The mark advances ONLY after the enqueue succeeded
             // AND the persist write returned Ok — on any failure it stays
             // at the old status so a later terminal re-forward retries.
-            let revision = mark.revision.saturating_add(1);
+            //
+            // Round 6 (board item #11): the attempt comes from the UNIFIED
+            // `continuation_revisions` allocator (shared with the coalesced-
+            // carrier fold), NOT `mark.revision + 1` — the two counters
+            // could collide on one event id, and replay dedup would swallow
+            // one write behind the other.
+            let revision = next_continuation_attempt(state, &child_key);
             let child = build_child_terminal_request(agent, &group_id, &child_key);
             let outcome = state.continuations.replace_pending_payload(child);
             let mut delivered = false;
             match &outcome {
                 MasterContinuationEnqueueOutcome::Queued(continuation) => {
-                    match persist_continuation_queued_with_attempt(
-                        state,
-                        continuation,
-                        revision.min(u64::from(u32::MAX)) as u32,
-                    ) {
+                    match persist_continuation_queued_with_attempt(state, continuation, revision) {
                         Ok(()) => delivered = true,
                         Err(err) => tracing::warn!(
                             ?err,
@@ -14434,6 +14505,10 @@ fn enqueue_agent_terminal_continuations(
                 }
             }
             if delivered {
+                let revision = u64::from(revision);
+                state
+                    .continuation_revisions
+                    .insert(child_key.clone(), revision);
                 state.delivered_child_marks.insert(
                     child_key.clone(),
                     DeliveredChildMark {
@@ -14450,13 +14525,24 @@ fn enqueue_agent_terminal_continuations(
             // correction arm: the mark advances ONLY after the enqueue
             // succeeded AND the persist write returned Ok — a swallowed
             // persist error would leave an in-memory "delivered" mark with
-            // no durable record, and a restart would replay the item.
+            // no durable record, and a restart would replay the item. Round
+            // 6: route the attempt through the same unified allocator (a
+            // fresh key yields 1, matching the pre-round-6 contract; a key
+            // with persisted history ALWAYS has a seeded mark, so the `None`
+            // arm only ever sees fresh keys). Seeding `continuation_revisions`
+            // with the delivered attempt is REQUIRED, not redundant: without
+            // it a later correction would allocate the same attempt in memory
+            // whether or not this record is still durable — and after a
+            // restart whose replay dropped the correction behind a
+            // higher-rank tombstone, the in-memory counter must hold the
+            // TOMBSTONE'S height so the next re-forward allocates above it.
+            let attempt = next_continuation_attempt(state, &child_key);
             let child = build_child_terminal_request(agent, &group_id, &child_key);
             let outcome = state.continuations.enqueue(child);
             let mut delivered = false;
             match &outcome {
                 MasterContinuationEnqueueOutcome::Queued(continuation) => {
-                    match persist_continuation_queued_with_attempt(state, continuation, 1) {
+                    match persist_continuation_queued_with_attempt(state, continuation, attempt) {
                         Ok(()) => delivered = true,
                         Err(err) => tracing::warn!(
                             ?err,
@@ -14472,11 +14558,14 @@ fn enqueue_agent_terminal_continuations(
                 }
             }
             if delivered {
+                state
+                    .continuation_revisions
+                    .insert(child_key.clone(), u64::from(attempt));
                 state.delivered_child_marks.insert(
                     child_key.clone(),
                     DeliveredChildMark {
                         status: agent.status.clone(),
-                        revision: 1,
+                        revision: u64::from(attempt),
                         seeded_from_store: false,
                     },
                 );
@@ -14881,8 +14970,24 @@ fn persist_agent_artifacts(state: &AutonomyRuntimeState, agent: &AutonomyAgentRe
     }
 }
 
+/// #1707 round 6 (board item #11) — the unified attempt allocator: the NEXT
+/// attempt for a re-persist of an EXISTING continuation id, derived from the
+/// single `continuation_revisions` counter (never from `coalesce_generation`
+/// or the delivered mark's revision, which used to be two counters over one
+/// event-id namespace). Returns `1 + last persisted attempt` (1 for a fresh
+/// key), saturating at `u32::MAX`.
+fn next_continuation_attempt(state: &AutonomyRuntimeState, dedupe_key: &str) -> u32 {
+    state
+        .continuation_revisions
+        .get(dedupe_key)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(u64::from(u32::MAX)) as u32
+}
+
 fn persist_continuation_queued(
-    state: &AutonomyRuntimeState,
+    state: &mut AutonomyRuntimeState,
     continuation: &QueuedMasterContinuation,
 ) {
     // Existing callers keep the fire-and-forget shape; the peer_send_input
@@ -14894,11 +14999,36 @@ fn persist_continuation_queued(
 /// Durably persist a queued continuation, RETURNING the store error instead of
 /// discarding it. `Ok(())` when there is no supervisor store (pure in-memory
 /// serve — delivery still works in-process) or the write succeeds.
+///
+/// First-persist attempt is ALWAYS 1 — NOT the unified allocator: a re-persist
+/// of an item that is ALREADY durable at attempt 1 (a restart replay that
+/// re-enqueued it in-memory) must reproduce the SAME event id, which replay
+/// dedups into a no-op. Bumping the attempt here would rewrite the record to a
+/// higher attempt, and the later `Completed` tombstone for the DELIVERED item
+/// would then be rank-dropped behind it (same-attempt, higher-rank keeps the
+/// queued row) — resurrecting the item on every restart. Only paths that must
+/// supersede a durable record (status corrections, coalesced-carrier folds)
+/// allocate via `continuation_revisions` (#1707 round 6, board item #11).
+///
+/// On success the unified counter is seeded to at least 1 for this key, so a
+/// LATER fold/correction of the same id allocates attempt 2+ instead of
+/// re-emitting the attempt-1 event id (which replay dedup would swallow,
+/// losing the fold's carrier metadata behind the tombstoned extras). The
+/// write is a max, never a regression: a replayed item whose restored
+/// history already sits above 1 keeps its seeded height.
 fn persist_continuation_queued_checked(
-    state: &AutonomyRuntimeState,
+    state: &mut AutonomyRuntimeState,
     continuation: &QueuedMasterContinuation,
 ) -> std::io::Result<()> {
-    persist_continuation_queued_with_attempt(state, continuation, 1)
+    let result = persist_continuation_queued_with_attempt(state, continuation, 1);
+    if result.is_ok() {
+        let revision = state
+            .continuation_revisions
+            .entry(continuation.dedupe_key.as_str().to_owned())
+            .or_insert(0);
+        *revision = (*revision).max(1);
+    }
+    result
 }
 
 /// #1707 (codex Blocker 1) — durably persist the CARRIER of a terminal fold
@@ -14913,14 +15043,20 @@ fn persist_continuation_queued_checked(
 /// #1707 round 2 — the event id embeds `attempt`
 /// (`continuation_queued:{group}:{id}:{attempt}`) and replay dedups by that
 /// id, so the attempt must DIFFER per fold of the same carrier or a second
-/// fold's persist is silently dropped on replay. The carrier's
-/// `coalesce_generation` metadata (bumped by `coalesce_terminal_continuations`
-/// on every fold, durable via the `payload:*` restore round-trip) drives it:
-/// `attempt = 1 + generation` = 2 for the first fold, 3 for a re-fold, ... —
-/// replay applies each fold's record in ledger order and the rank-equal
-/// upsert keeps the last one.
+/// fold's persist is silently dropped on replay.
+///
+/// #1707 round 6 (board item #11): the attempt now comes from the UNIFIED
+/// `continuation_revisions` allocator — the same counter the status-
+/// correction arm draws from — so a fold of a corrected child can never
+/// re-emit the correction's event id (previously `1 + coalesce_generation`
+/// could collide with `mark.revision + 1` and replay dedup would swallow one
+/// of the two writes while the fold's extras were already tombstoned). The
+/// `coalesce_generation` metadata is STILL bumped per fold and persisted: it
+/// gates the fold's own generation bookkeeping and the re-fold append path,
+/// it just no longer drives the event-id attempt. The counter advances ONLY
+/// on a successful write.
 fn persist_continuation_coalesced_checked(
-    state: &AutonomyRuntimeState,
+    state: &mut AutonomyRuntimeState,
     carrier: &QueuedMasterContinuation,
 ) -> std::io::Result<()> {
     // #1707 round 2 (codex Blocker 1 fix 3) — test hook: fail BEFORE touching
@@ -14932,14 +15068,14 @@ fn persist_continuation_coalesced_checked(
             "forced coalesced-carrier persist failure (test hook)",
         ));
     }
-    let attempt: u32 = carrier
-        .metadata
-        .get("coalesce_generation")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0)
-        .saturating_add(1)
-        .min(u64::from(u32::MAX)) as u32;
-    persist_continuation_queued_with_attempt(state, carrier, attempt)
+    let attempt = next_continuation_attempt(state, carrier.dedupe_key.as_str());
+    let result = persist_continuation_queued_with_attempt(state, carrier, attempt);
+    if result.is_ok() {
+        state
+            .continuation_revisions
+            .insert(carrier.dedupe_key.as_str().to_owned(), u64::from(attempt));
+    }
+    result
 }
 
 fn persist_continuation_queued_with_attempt(
@@ -21355,6 +21491,263 @@ mod tests {
                 .iter()
                 .map(|i| i.reason.clone())
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    /// #1707 round 6 (board item #11, codex round-2 B1/B3) — a corrected
+    /// child that becomes the fold's CARRIER must persist the fold at an
+    /// attempt STRICTLY ABOVE the correction's, from the unified
+    /// `continuation_revisions` allocator (previously the fold derived
+    /// `attempt = 1 + coalesce_generation` = 2 — the SAME event id the
+    /// correction persisted at `revision + 1` = 2 — and replay dedup
+    /// swallowed one of the two writes while the extras were already
+    /// tombstoned).
+    ///
+    /// Construction (no ScatterJoinComplete in scope — child C never goes
+    /// terminal, so the group never joins): child A fails then corrects to
+    /// completed (durable attempts 1 and 2), child B completes (attempt 1),
+    /// and a `max_items = 1` drain folds A(corrected, carrier) + B. The
+    /// carrier's record must be attempt 3. A crash-restart replay over the
+    /// SAME store must restore the carrier WITH its coalesced metadata AND
+    /// the corrected "completed" status — neither write swallowed.
+    #[test]
+    fn attempt2_correction_then_carrier_fold_survives_replay() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-u1", "api", "unified-revision");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}-{status}")),
+            cwd: None,
+            profile_id: "tenant-u1".to_owned(),
+        };
+        let group_id = format!("agent-group:tenant-u1:{session_id}:master");
+        let _ = &group_id;
+        let child_a_key = child_completed_dedupe_key(&group_id, &session_id.0, "agent-a");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        // Register the whole roster non-terminal FIRST so no all-terminal
+        // edge fires mid-construction (C running blocks the join), then drive
+        // the terminal transitions:
+        // - child A: failed (attempt 1) then corrected to completed (attempt 2);
+        // - child B: completed (attempt 1) — with A, two same-scope pending
+        //   ChildCompleted items and NO scatter (C never goes terminal, so the
+        //   group never joins and no ScatterJoinComplete can be the carrier).
+        orchestrator.upsert_agent(upsert("agent-a", "running"));
+        orchestrator.upsert_agent(upsert("agent-b", "running"));
+        orchestrator.upsert_agent(upsert("agent-c", "running"));
+        orchestrator.upsert_agent(upsert("agent-a", "failed"));
+        orchestrator.upsert_agent(upsert("agent-a", "completed"));
+        orchestrator.upsert_agent(upsert("agent-b", "completed"));
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-u1",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "exactly one folded carrier drains");
+        let carrier = &drained[0];
+        assert_eq!(
+            carrier.dedupe_key.as_str(),
+            child_a_key,
+            "the OLDEST same-scope terminal item (corrected child A) is the carrier"
+        );
+        assert_eq!(
+            carrier.metadata.get("status").map(String::as_str),
+            Some("completed"),
+            "the carrier carries the CORRECTED status"
+        );
+        // `coalesced_count` counts UNIQUE FOLDED children (the extras only —
+        // the carrier itself is not counted), so A(carrier) + B(extra) = 1.
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("1"),
+            "child B folded into the corrected child A carrier"
+        );
+
+        // CRITICAL: the fold persisted at attempt 3 — strictly above the
+        // correction's attempt 2 for the SAME continuation id. With the old
+        // `1 + coalesce_generation` allocation this was 2, the same event id
+        // as the correction.
+        let store = SupervisorStore::new(dir.path());
+        let record = store
+            .load_state()
+            .expect("ledger state")
+            .continuations
+            .values()
+            .find(|record| record.continuation_id == child_a_key)
+            .expect("carrier's ledger record")
+            .clone();
+        assert_eq!(
+            record.attempt, 3,
+            "the unified allocator persists the corrected-child fold at attempt 3 \
+             (1=failed, 2=correction, 3=fold)"
+        );
+        assert_eq!(record.status, ContinuationStatus::Queued);
+        // Simulated crash: the drained carrier is NEVER marked completed.
+        drop(drained);
+        drop(orchestrator);
+
+        // Fresh process over the SAME store: replay applies attempt 1
+        // (failed), attempt 2 (correction), attempt 3 (fold) in ledger
+        // order — dedup by event id keeps all three (distinct ids), the
+        // rank-equal upsert keeps the LAST, so the restored carrier carries
+        // BOTH the corrected status AND the fold's coalesced metadata.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let restored = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-u1",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let restored_a = restored
+            .iter()
+            .find(|item| item.dedupe_key.as_str() == child_a_key)
+            .expect("the carrier restores from the durable record");
+        assert_eq!(
+            restored_a.metadata.get("status").map(String::as_str),
+            Some("completed"),
+            "replay shows the CORRECTED status — the correction was not \
+             swallowed behind the fold's event id"
+        );
+        assert_eq!(
+            restored_a
+                .metadata
+                .get("coalesced_count")
+                .map(String::as_str),
+            Some("1"),
+            "replay shows the fold's coalesced metadata — the fold was not \
+             swallowed behind the correction's event id"
+        );
+        let children = restored_a
+            .metadata
+            .get("coalesced_children")
+            .expect("the restored carrier carries the folded children");
+        assert!(
+            children.contains("agent-b"),
+            "folded child B missing: {children}"
+        );
+        // Child B was tombstoned by the fold — it must NOT re-appear.
+        let restored_b = restored
+            .iter()
+            .filter(|item| item.dedupe_key.as_str().contains("agent-b"))
+            .count();
+        assert_eq!(restored_b, 0, "the folded extra stays tombstoned");
+    }
+
+    /// #1707 round 6 (board item #11, side B) — a /stop purge must NEVER
+    /// regress a delivered mark's revision to 1: a post-purge correction
+    /// would then allocate a LOWER attempt than the unified
+    /// `continuation_revisions` history, and the low-attempt write landing
+    /// behind a higher-attempt tombstone is dropped by the upsert's rank
+    /// gate while the in-memory mark advanced (silent correction loss).
+    #[test]
+    fn stop_purge_preserves_mark_revision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-u2", "api", "purge-revision");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}-{status}")),
+            cwd: None,
+            profile_id: "tenant-u2".to_owned(),
+        };
+        let group_id = format!("agent-group:tenant-u2:{session_id}:master");
+        let child_x_key = child_completed_dedupe_key(&group_id, &session_id.0, "agent-x");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        // Child X completes (mark revision 1) and a correction bumps it to
+        // revision 2 — the mark now sits ABOVE 1 so the purge's old
+        // reset-to-1 is observable. Child Y keeps the group from joining
+        // (no scatter noise in the assertions).
+        orchestrator.upsert_agent(upsert("agent-x", "running"));
+        orchestrator.upsert_agent(upsert("agent-y", "running"));
+        orchestrator.upsert_agent(upsert("agent-x", "completed"));
+        orchestrator.upsert_agent(upsert("agent-x", "failed"));
+        assert_eq!(
+            orchestrator.delivered_child_mark_for_test(&child_x_key),
+            Some(("failed".to_owned(), 2, false)),
+            "the correction advanced the mark to revision 2"
+        );
+
+        let purged = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "session_interrupt_stop",
+        );
+        assert_eq!(purged, 1, "only child X's ChildCompleted was pending");
+        // The purge TOMBSTONES the pending item and stamps the mark, but
+        // the mark's revision must stay at 2 — not regress to 1.
+        assert_eq!(
+            orchestrator.delivered_child_mark_for_test(&child_x_key),
+            Some(("failed".to_owned(), 2, false)),
+            "the /stop purge preserves the mark's revision (and re-stamps the \
+             status as this process's own verdict)"
+        );
+
+        // A post-purge correction re-enters and persists at attempt 3 —
+        // strictly above the purged record's attempt-2 history (monotonic;
+        // the old reset-to-1 would have allocated attempt 2, colliding with
+        // the purged record's event id, and even attempt 2 behind the
+        // tombstone would be rank-dropped on replay).
+        orchestrator.upsert_agent(upsert("agent-x", "completed"));
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-u2",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.iter().any(|item| {
+                item.reason == MasterContinuationReason::ChildCompleted
+                    && item.metadata.get("status").map(String::as_str) == Some("completed")
+            }),
+            "the post-purge correction re-enqueues and delivers; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            orchestrator.delivered_child_mark_for_test(&child_x_key),
+            Some(("completed".to_owned(), 3, false)),
+            "the correction advanced the mark monotonically to revision 3"
+        );
+        let record = SupervisorStore::new(dir.path())
+            .load_state()
+            .expect("ledger state")
+            .continuations
+            .values()
+            .find(|record| record.continuation_id == child_x_key)
+            .expect("child X's ledger record")
+            .clone();
+        assert_eq!(
+            record.attempt, 3,
+            "the post-purge correction persisted at attempt 3 (monotonic over \
+             the attempt-2 purge tombstone)"
+        );
+        assert_eq!(
+            supervisor_metadata_str(&record.metadata, "payload:status"),
+            Some("completed"),
+            "the correction's payload WON the replay over the purge tombstone"
         );
     }
 
