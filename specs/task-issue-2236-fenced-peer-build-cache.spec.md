@@ -22,15 +22,22 @@ issue #2236)。本任务让围栏 peer 在不放松 `.git` 隔离的前提下复
 - 机制:在克隆完成后写 `wt/.cargo/config.toml`,内容恰为
   `[build]` + `target-dir` 两行,不含 CARGO_HOME/registry 等任何其它键
   (原条目续):
-  `[build]\ntarget-dir = "<workspace_root>/target"\n`(绝对路径,经 `Path::display`),
+  `[build]\ntarget-dir = "<workspace_root>/target"\n`(绝对路径,按 TOML basic string
+  编码,反斜线/引号/控制字符必须原样往返;非 UTF-8 路径保守地不共享),
   并把 `.cargo/config.toml` 追加进 `wt/.git/info/exclude`,保证 peer 的 `git status` 干净、
-  `git add` 不会把它带进提交。不用环境变量(peer 的工具进程环境不由 stage 阶段掌控)。
-- 若 `wt/.cargo/config.toml` 已存在(仓库自带 `.cargo/config.toml` 被克隆进来),不覆盖,
-  改为在 `model_note` 记 `build cache: repo has its own .cargo/config.toml, left untouched`。
+  普通 `git add` 不会把它带进提交(不承诺阻止 `git add -f`)。
+  不用环境变量(peer 的工具进程环境不由 stage 阶段掌控)。
+- 若 `wt/.cargo/config` 或 `wt/.cargo/config.toml` 已存在(含悬空符号链接),不覆盖,
+  改为在 `model_note` 记 `build cache: repo has its own .cargo/config or config.toml, left untouched`。
+  Cargo 的旧名称 `config` 优先级更高,不能在旁边新增 config.toml 后误报 shared。
+- Unix 写入必须锚定 peer/wt/.cargo/.git/info 的 no-follow 目录句柄,拒绝符号链接;
+  先成功追加 Git exclusion,再以 no-replace 原子发布配置,绝不截断项目的现有文件。
+  失败返回 None,不发布未排除配置或误报 Shared。非 Unix 沿用 checked-path fallback,
+  拒绝已有符号链接/目录 reparse point,不声称消除 check/open 的并发竞态。
 - `model_note` 追加一行 `build cache: target-dir -> <workspace_root>/target`(与既有
   model-lane 提示同字段、换行拼接,已有内容不丢)。
 - `peer_staged` 事件的 `detail` 由 `"peer staged"` 扩为 `"peer staged (build cache: shared)"`
-  / `"peer staged (build cache: none)"` / `"peer staged (build cache: repo-config)"` 三种之一;
+  / `"peer staged"`(None) / `"peer staged (build cache: repo-config)"` 三种之一;
   未围栏的 peer 保持 `"peer staged"` 不变。
 - 沙箱边界:本任务不改沙箱策略。共享 `target/` 在 `--danger-full-access` 与
   workspace-write 且 workspace 根可写的档位下生效;沙箱不放行时 cargo 自己报错,
@@ -89,6 +96,31 @@ Scenario: 未围栏 peer 不受影响
   When 以 worktree=false 执行 stage_peer
   Then workspace 根下不新增 .cargo/config.toml
   And peer_staged 事件 detail 等于 "peer staged"
+
+Scenario: 配置路径正确转义
+  Test: should_encode_target_path_when_fenced_workspace_contains_toml_metacharacters
+  Given workspace 路径包含反斜线或引号
+  When 以 worktree=true 执行 stage_peer
+  Then 生成的 TOML 可解析且 target-dir 精确等于原始绝对 target 路径
+
+Scenario: 旧 Cargo 配置保留且决定真实
+  Test: should_preserve_legacy_config_when_fenced_repository_owns_cargo_settings
+  Given 仓库已提交 .cargo/config
+  When 以 worktree=true 执行 stage_peer
+  Then config 保持不变且不创建 config.toml
+  And build_cache 等于 RepoConfig
+
+Scenario: 克隆来的符号链接不允许围栏外写入
+  Test: should_not_write_outside_fence_when_cloned_cargo_directory_is_symlinked
+  Given 仓库已提交指向临时围栏外目录的 .cargo 符号链接
+  When 以 worktree=true 执行 stage_peer
+  Then 围栏外不出现 config.toml 且 build_cache 等于 None
+
+Scenario: 排除规则写入失败不能宣称共享成功
+  Test: should_decline_shared_cache_when_git_exclusion_cannot_be_written
+  Given Git exclude 不是可写入的普通文件
+  When 执行共享缓存配置
+  Then 不发布 config.toml 且 build_cache 等于 None
 
 Scenario: peer_staged 事件携带构建缓存决定
   Test: peer_staged_detail_reports_build_cache
