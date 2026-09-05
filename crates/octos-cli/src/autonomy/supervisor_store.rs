@@ -366,6 +366,28 @@ pub enum SupervisorEvent {
         #[serde(default)]
         cwd_hash: u64,
     },
+    /// #20 (round-4 B2) — ATOMIC cohort admission. One durable event binds
+    /// the cohort admission, the admitted child's identity, AND the bumped
+    /// join epoch, replacing the two-step "bump in memory, then best-effort
+    /// `GroupEpochBumped`, then insert + persist the child" sequence whose
+    /// crash windows could (a) lose a join (marker failed, child durable) or
+    /// (b) fabricate a phantom join (marker durable, child lost). The event
+    /// id embeds the child id, so replaying the SAME admission is idempotent.
+    ///
+    /// `apply_event` appends `child_id:new_epoch` to the group's
+    /// `admissions#{cwd_hash}` metadata (comma list, append-if-absent) and
+    /// max-upserts the cohort-scoped `join_epoch#{cwd_hash}` marker — so the
+    /// restore side reads ONE metadata surface. The seed pass only TRUSTS an
+    /// admission whose child exists in `children` (durable child record),
+    /// which closes the phantom-join window.
+    CohortAdmission {
+        group_id: String,
+        #[serde(default)]
+        cwd_hash: u64,
+        child_id: String,
+        new_epoch: u64,
+        observed_at_ms: u64,
+    },
 }
 
 /// One folded-extra tombstone in a coalesced terminal-continuation fold
@@ -482,6 +504,45 @@ impl SupervisorState {
                     group
                         .metadata
                         .insert(metadata_key, serde_json::Value::from(*new_epoch));
+                }
+                group.updated_at_ms = group.updated_at_ms.max(*observed_at_ms);
+            }
+            SupervisorEvent::CohortAdmission {
+                group_id,
+                cwd_hash,
+                child_id,
+                new_epoch,
+                observed_at_ms,
+            } => {
+                // #20 (round-4 B2) — record the admission in the cohort's
+                // `admissions#{cwd_hash}` metadata as a `child_id:new_epoch`
+                // comma list (append-if-absent by CHILD, so a replayed
+                // admission is a no-op). This is deliberately the ONLY
+                // metadata the event writes: the seed pass derives the cohort
+                // epoch from this list under the child-exists gate (an
+                // admission whose child record is not durable does NOT lift
+                // the epoch), whereas the legacy `join_epoch#{cwd_hash}`
+                // marker — written by the pre-#20 `GroupEpochBumped` arm — is
+                // read ungated for backward compatibility. Writing both from
+                // THIS arm would re-open the phantom-join window.
+                let group = self.ensure_group(group_id, *observed_at_ms);
+                let admissions_key = format!("admissions#{cwd_hash}");
+                let entry = format!("{child_id}:{new_epoch}");
+                let mut list: Vec<String> = group
+                    .metadata
+                    .get(&admissions_key)
+                    .and_then(|value| value.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.split(',').map(str::to_owned).collect())
+                    .unwrap_or_default();
+                if !list
+                    .iter()
+                    .any(|e| e.split(':').next() == Some(child_id.as_str()))
+                {
+                    list.push(entry);
+                    group
+                        .metadata
+                        .insert(admissions_key, serde_json::Value::from(list.join(",")));
                 }
                 group.updated_at_ms = group.updated_at_ms.max(*observed_at_ms);
             }
@@ -1112,6 +1173,38 @@ impl SupervisorStore {
                 new_epoch,
                 observed_at_ms,
                 cwd_hash,
+            },
+        )
+    }
+
+    /// #20 (round-4 B2) — persist an ATOMIC cohort admission: one durable
+    /// event binds the admitted child's identity AND the bumped join epoch.
+    /// Unlike `record_group_epoch_bump` (fire-and-forget marker), this is the
+    /// CHECKED admission record: `upsert_agent` writes it BEFORE the in-memory
+    /// bump + child insert and treats an `Err` as an admission failure (no
+    /// bump, no insert). The event id embeds the child id, so replaying the
+    /// SAME admission is idempotent; the restore side only trusts an
+    /// admission whose child record is durable (see `apply_event` + the seed
+    /// pass), which closes the phantom-join crash window.
+    pub fn record_cohort_admission(
+        &self,
+        group_id: impl Into<String>,
+        cwd_hash: u64,
+        child_id: impl Into<String>,
+        new_epoch: u64,
+        observed_at_ms: u64,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        let group_id = group_id.into();
+        let child_id = child_id.into();
+        let event_id = format!("cohort_admission:{group_id}:{cwd_hash}:{child_id}:{new_epoch}");
+        self.append_event(
+            event_id,
+            SupervisorEvent::CohortAdmission {
+                group_id,
+                cwd_hash,
+                child_id,
+                new_epoch,
+                observed_at_ms,
             },
         )
     }

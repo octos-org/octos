@@ -2763,41 +2763,88 @@ impl InProcessAgentOrchestrator {
                     .get(&cohort_key)
                     .is_some_and(|s| s.last_joined_key.is_some());
                 if already_joined {
-                    let new_epoch = {
-                        let join_state = state
-                            .scatter_join_state
-                            .entry(cohort_key.clone())
-                            .or_default();
-                        join_state.join_epoch += 1;
-                        join_state.join_epoch
-                    };
-                    // #15b — persist the bumped epoch IMMEDIATELY (best-effort,
-                    // never blocks admission): the bump above is in-memory only,
-                    // so a crash before the new epoch's scatter record persists
-                    // would restart at the LAST PERSISTED scatter's epoch, whose
-                    // key is already in `delivered_scatter_marks` — the
-                    // reconcile pass would skip it and the bumped epoch's join
-                    // would be lost FOREVER. With this marker, the restore
-                    // seeds `join_epoch` as max(persisted scatter max, marker),
-                    // and `reconcile_missing_scatters_on_restore` derives the
-                    // bumped epoch's key (not delivered → re-emit). A lost
-                    // marker falls back to the pre-#15b behavior (old epoch).
-                    if let Some(store) = state.supervisor_store.as_ref()
-                        && let Err(err) = store.record_group_epoch_bump(
+                    // #20 (round-4 B2) — ATOMIC admission. Compute the bumped
+                    // epoch WITHOUT mutating memory, then write ONE checked
+                    // durable admission record binding the cohort, the child
+                    // identity, and the new epoch. ONLY on `Ok` do we bump the
+                    // in-memory epoch and fall through to the child insert;
+                    // on `Err` we skip the bump and the insert entirely (the
+                    // admission fails observably, no half-state). This
+                    // replaces the #15b two-step (bump → best-effort
+                    // `GroupEpochBumped` → insert) whose crash windows could
+                    // lose a join or fabricate a phantom one.
+                    let current_epoch = state
+                        .scatter_join_state
+                        .get(&cohort_key)
+                        .map(|s| s.join_epoch)
+                        .unwrap_or(0);
+                    let new_epoch = current_epoch + 1;
+                    let cwd_hash = scatter_cwd_hash(&upsert.cwd);
+                    // Test hook: simulate a crash exactly at the durable
+                    // admission write.
+                    #[cfg(test)]
+                    if state.force_admission_persist_failure {
+                        state.force_admission_persist_failure = false;
+                        tracing::warn!(
+                            agent_id = %upsert.agent_id,
+                            group = %group,
+                            new_epoch,
+                            "forced cohort-admission persist failure (test hook); \
+                             admission blocked"
+                        );
+                        return json!({
+                            "agent_id": upsert.agent_id,
+                            "admitted": false,
+                            "error": "cohort admission persist failed (forced test hook)",
+                        });
+                    }
+                    let admission = state.supervisor_store.as_ref().map(|store| {
+                        store.record_cohort_admission(
                             group.as_str(),
-                            scatter_cwd_hash(&upsert.cwd),
+                            cwd_hash,
+                            upsert.agent_id.as_str(),
                             new_epoch,
                             now_ms_u64(),
                         )
-                    {
-                        tracing::warn!(
-                            ?err,
-                            group = %group,
-                            cwd_hash = scatter_cwd_hash(&upsert.cwd),
-                            new_epoch,
-                            "join-epoch bump marker persist failed; a crash before the \
-                             new epoch's scatter persists could lose that epoch's join"
-                        );
+                    });
+                    match admission {
+                        Some(Ok(_row)) => {
+                            // Admission durable — now bump memory + insert.
+                            let join_state = state
+                                .scatter_join_state
+                                .entry(cohort_key.clone())
+                                .or_default();
+                            join_state.join_epoch = join_state.join_epoch.max(new_epoch);
+                        }
+                        Some(Err(err)) => {
+                            // The durable admission FAILED — do NOT bump the
+                            // in-memory epoch and do NOT insert the child: a
+                            // crash now would restart at the OLD epoch with no
+                            // admission record, so no phantom join is possible.
+                            tracing::warn!(
+                                ?err,
+                                agent_id = %upsert.agent_id,
+                                group = %group,
+                                cwd_hash,
+                                new_epoch,
+                                "cohort admission persist failed; admission blocked \
+                                 (no epoch bump, no child insert)"
+                            );
+                            return json!({
+                                "agent_id": upsert.agent_id,
+                                "admitted": false,
+                                "error": format!("cohort admission persist failed: {err}"),
+                            });
+                        }
+                        None => {
+                            // No supervisor store (pure in-memory runtime): keep
+                            // the prior behavior — bump in memory only.
+                            let join_state = state
+                                .scatter_join_state
+                                .entry(cohort_key.clone())
+                                .or_default();
+                            join_state.join_epoch = join_state.join_epoch.max(new_epoch);
+                        }
                     }
                 }
             }
@@ -12148,6 +12195,16 @@ impl InProcessAgentOrchestrator {
         self.state().force_scatter_persist_failure = value;
     }
 
+    /// Test hook (#20, round-4 B2): the next CHECKED cohort-admission write
+    /// (`record_cohort_admission`) is treated as FAILED before the store is
+    /// touched, so `upsert_agent`'s genuine `Err` handling (no in-memory bump,
+    /// no child insert, no half-state) is exercised end-to-end. Self-disarms
+    /// after one use; per-instance.
+    #[cfg(test)]
+    pub(crate) fn set_force_admission_persist_failure_for_test(&self, value: bool) {
+        self.state().force_admission_persist_failure = value;
+    }
+
     /// Test accessor (codex round 2): the monitor's persisted rate-window count.
     #[cfg(test)]
     pub(crate) fn monitor_rate_count_for_test(&self, monitor_id: &str) -> Option<u32> {
@@ -12456,6 +12513,13 @@ struct AutonomyRuntimeState {
     /// after one use; per-instance, like `force_coalesce_persist_failure`.
     #[cfg(test)]
     force_scatter_persist_failure: bool,
+    /// #20 (round-4 B2) — test-only switch that makes the CHECKED cohort-
+    /// admission write (`record_cohort_admission`) fail BEFORE touching the
+    /// store, so the admission path's genuine `Err` handling (no in-memory
+    /// bump, no child insert, no half-state) is exercised end-to-end.
+    /// Self-disarms after one use; per-instance, like the other force hooks.
+    #[cfg(test)]
+    force_admission_persist_failure: bool,
 }
 
 // Manual `Default` (NOT derived): the `#[cfg(test)]`-gated fields below
@@ -12500,6 +12564,8 @@ impl Default for AutonomyRuntimeState {
             reset_window_before_accounting: false,
             #[cfg(test)]
             force_scatter_persist_failure: false,
+            #[cfg(test)]
+            force_admission_persist_failure: false,
         }
     }
 }
@@ -14498,6 +14564,56 @@ fn seed_delivered_terminal_marks(
     // the LAST JOINED (older-epoch) key while `join_epoch` already names the
     // bumped one — so `reconcile_missing_scatters_on_restore` derives the
     // bumped epoch's key, finds it undelivered, and re-emits the lost join.
+    // #20 (round-4 B2) — the atomic `CohortAdmission` event appends
+    // `child_id:new_epoch` to the cohort's `admissions#{cwd_hash}` metadata.
+    // The seed derives the cohort epoch from the ADMISSIONS LIST (max epoch),
+    // but only TRUSTS an admission whose child exists in
+    // `supervisor_state.children` (durable child record). An admission durable
+    // while its child never persisted is exactly the "phantom join" crash
+    // window — gating on child existence closes it: no durable child → that
+    // admission does NOT lift the epoch → no join is re-emitted for a child
+    // the roster never saw.
+    for group in supervisor_state.groups.values() {
+        for (metadata_key, value) in &group.metadata {
+            let Some(cwd_hash) = metadata_key
+                .strip_prefix("admissions#")
+                .and_then(|segment| segment.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(list) = value.as_str() else {
+                continue;
+            };
+            let mut max_admitted_epoch = 0u64;
+            for entry in list.split(',').filter(|e| !e.is_empty()) {
+                let mut parts = entry.rsplitn(2, ':');
+                let (Some(epoch_str), Some(child_id)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                let Ok(epoch) = epoch_str.parse::<u64>() else {
+                    continue;
+                };
+                // Phantom-join guard: only trust the admission when its child
+                // record is durable in the store. The `children` map is keyed
+                // by `{group_id}/{child_id}` (see `SupervisorState::upsert_child`).
+                let child_store_key = format!("{}/{child_id}", group.group_id.as_str());
+                if supervisor_state.children.contains_key(&child_store_key) {
+                    max_admitted_epoch = max_admitted_epoch.max(epoch);
+                }
+            }
+            if max_admitted_epoch > 0 {
+                let cohort_key = scatter_cohort_key(group.group_id.as_str(), cwd_hash);
+                let join_state = state.scatter_join_state.entry(cohort_key).or_default();
+                join_state.join_epoch = join_state.join_epoch.max(max_admitted_epoch);
+            }
+        }
+    }
+    // #15b / legacy compat — the pre-#20 `GroupEpochBumped` marker wrote the
+    // cohort's `join_epoch#{cwd_hash}` metadata directly. Keep reading it so
+    // stores persisted before the atomic-admission event still restore the
+    // highest admitted epoch. (The `CohortAdmission` arm ALSO max-upserts
+    // this same key, but the admissions pass above already covers it with the
+    // child-exists gate; this loop is the legacy fallback.)
     for group in supervisor_state.groups.values() {
         for (metadata_key, value) in &group.metadata {
             // #19 (round-4 B1) — cohort-scoped marker keys
@@ -15387,10 +15503,11 @@ fn reconcile_missing_scatter(
         None => scatter,
     };
     let scatter_outcome = state.continuations.enqueue(scatter);
-    let MasterContinuationEnqueueOutcome::Queued(continuation) = &scatter_outcome else {
-        // Already pending in-memory — the marks belong to whichever pass
-        // persists the durable record; leave them untouched.
-        return;
+    let continuation = match &scatter_outcome {
+        MasterContinuationEnqueueOutcome::Queued(continuation) => continuation.clone(),
+        MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+            return;
+        }
     };
     // #1707 round 7: the scatter is a FRESH key per epoch, so its first
     // persist allocates through the SAME unified `continuation_revisions`
@@ -15401,40 +15518,60 @@ fn reconcile_missing_scatter(
     // fold of THIS carrier would then re-allocate attempt 1 and replay
     // dedup would swallow the fold's carrier persist.
     let attempt = next_continuation_attempt(state, &join_key);
-    match persist_scatter_queued_checked(state, continuation, attempt) {
+    match persist_scatter_queued_checked(state, &continuation, attempt) {
         Ok(()) => {
-            state
-                .continuation_revisions
-                .insert(join_key.clone(), u64::from(attempt));
-            let join_state = state.scatter_join_state.entry(join_group_key).or_default();
-            // Belt-and-braces: the enqueue path already seeded this epoch,
-            // but a hand-built restore fixture may call here first.
-            join_state.join_epoch = join_state.join_epoch.max(join_epoch);
-            join_state.last_joined_key = Some(join_key.clone());
-            // #1707 round 3 (codex Blocker 4): the scatter has its OWN
-            // durable mark now — a future crash window where the child
-            // record persisted but this scatter record did NOT is recovered
-            // by the rebuild path, not by assuming the child record implies
-            // the join.
-            state
-                .delivered_scatter_marks
-                .insert(join_key, "joined".to_owned());
+            advance_scatter_marks_after_persist(
+                state,
+                &join_group_key,
+                &join_key,
+                join_epoch,
+                attempt,
+            );
         }
         Err(err) => {
             // #1707 round 7 (board item #12): the persist FAILED — do NOT
-            // advance `last_joined_key` / `delivered_scatter_marks`. A later
-            // terminal re-forward of a sibling retries the join in this
-            // process; a crash before any retry is recovered by the restore
-            // rebuild pass re-deriving the same key.
+            // advance `last_joined_key` / `delivered_scatter_marks`.
             tracing::warn!(
                 ?err,
                 join_key = %join_key,
                 attempt,
-                "scatter join persist failed; the join marks stay unset so a \
-                 later re-forward retries and a restart rebuilds it"
+                "scatter join persist failed (marks stay unset; a restart rebuilds it)"
             );
         }
     }
+}
+
+/// #27 (round-4, #18 SF3) — advance the scatter join marks after a CHECKED
+/// persist returned `Ok`. Shared by the first-persist path
+/// (`reconcile_missing_scatter`), the `Duplicate`-arm retry, and the
+/// pre-drain retry pass so every successful durable write advances
+/// `continuation_revisions`, the cohort's `last_joined_key` (+ epoch, max),
+/// and the durable `delivered_scatter_marks` IDENTICALLY.
+fn advance_scatter_marks_after_persist(
+    state: &mut AutonomyRuntimeState,
+    join_group_key: &str,
+    join_key: &str,
+    join_epoch: u64,
+    attempt: u32,
+) {
+    state
+        .continuation_revisions
+        .insert(join_key.to_owned(), u64::from(attempt));
+    let join_state = state
+        .scatter_join_state
+        .entry(join_group_key.to_owned())
+        .or_default();
+    // Belt-and-braces: the enqueue path already seeded this epoch, but a
+    // hand-built restore fixture may persist first.
+    join_state.join_epoch = join_state.join_epoch.max(join_epoch);
+    join_state.last_joined_key = Some(join_key.to_owned());
+    // #1707 round 3 (codex Blocker 4): the scatter has its OWN durable mark —
+    // a future crash window where the child record persisted but this scatter
+    // record did NOT is recovered by the rebuild path, not by assuming the
+    // child record implies the join.
+    state
+        .delivered_scatter_marks
+        .insert(join_key.to_owned(), "joined".to_owned());
 }
 
 /// #1707 round 7 (board item #12) — boot-time rebuild pass: for every
@@ -40157,6 +40294,195 @@ mod tests {
                 && prompt.contains("coalesced_count holds the true total"),
             "the note must disclose the omitted children; prompt tail: {}",
             &prompt[prompt.len().saturating_sub(400)..],
+        );
+    }
+
+    /// #20 (round-4 B2) test 1 — a FAILED durable cohort-admission write
+    /// blocks the admission cleanly: no in-memory epoch bump, no child
+    /// insert, no half-state. The armed hook makes `record_cohort_admission`
+    /// return `Err` before touching the store; `upsert_agent` must take the
+    /// admission-failure path (observable via the returned payload) and leave
+    /// the cohort exactly as it was.
+    #[test]
+    fn admission_marker_failure_blocks_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-amf";
+        let session_id = SessionKey::with_profile(profile, "api", "admission-fail");
+        let group = format!("agent-group:{profile}:{session_id}:master");
+        let cohort_key = scatter_cohort_key(&group, scatter_cwd_hash(&None));
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: profile.to_owned(),
+        };
+
+        // Establish an ALREADY-JOINED cohort: two children complete and the
+        // epoch-0 join drains, so the cohort has a `last_joined_key`.
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).expect("store");
+        orch.upsert_agent(upsert("agent-1", "running"));
+        orch.upsert_agent(upsert("agent-2", "running"));
+        orch.upsert_agent(upsert("agent-1", "completed"));
+        orch.upsert_agent(upsert("agent-2", "completed"));
+        let drained = orch.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "epoch-0 join drained, cohort is now joined"
+        );
+        assert_eq!(
+            orch.state()
+                .scatter_join_state
+                .get(&cohort_key)
+                .map(|s| s.join_epoch),
+            Some(0),
+            "cohort epoch is 0 after the epoch-0 join"
+        );
+
+        // Arm the admission-persist failure hook, then admit a NEW child into
+        // the joined cohort. The durable admission must fail and the upsert
+        // must NOT bump the epoch or insert the child.
+        orch.set_force_admission_persist_failure_for_test(true);
+        let result = orch.upsert_agent(upsert("agent-3", "running"));
+        assert_eq!(
+            result.get("admitted").and_then(|v| v.as_bool()),
+            Some(false),
+            "the blocked admission is observable in the returned payload: {result}"
+        );
+        assert!(
+            result.get("error").is_some(),
+            "the failure payload carries an error field: {result}"
+        );
+        assert!(
+            !orch.state().agents.contains_key("agent-3"),
+            "the blocked admission must NOT insert the child"
+        );
+        assert_eq!(
+            orch.state()
+                .scatter_join_state
+                .get(&cohort_key)
+                .map(|s| s.join_epoch),
+            Some(0),
+            "the blocked admission must NOT bump the in-memory epoch"
+        );
+        // And no durable admission/marker was written: a restart restores the
+        // cohort at epoch 0 with no phantom join for agent-3.
+        drop(orch);
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        assert_eq!(
+            fresh
+                .state()
+                .scatter_join_state
+                .get(&cohort_key)
+                .map(|s| s.join_epoch),
+            Some(0),
+            "restart restores the cohort at the OLD epoch (no phantom admission)"
+        );
+        assert!(
+            !fresh.state().agents.contains_key("agent-3"),
+            "agent-3 was never durable"
+        );
+    }
+
+    /// #20 (round-4 B2) test 2 — an admission durable while its child record
+    /// never persisted must NOT lift the restored epoch (the phantom-join
+    /// window). We hand-write a `CohortAdmission` for a child that has no
+    /// durable `ChildAgentRecord`, restart a fresh orchestrator over the
+    /// store, and assert the epoch stays at the scatter-derived max and no
+    /// phantom join is re-emitted.
+    #[test]
+    fn admission_durable_child_not_crash_no_phantom_join() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-adc";
+        let session_id = SessionKey::with_profile(profile, "api", "admission-phantom");
+        let group = format!("agent-group:{profile}:{session_id}:master");
+        let cohort_key = scatter_cohort_key(&group, scatter_cwd_hash(&None));
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: profile.to_owned(),
+        };
+
+        // Epoch-0 join drains (cohort joined, epoch 0 durable + delivered).
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).expect("store");
+        orch.upsert_agent(upsert("agent-1", "running"));
+        orch.upsert_agent(upsert("agent-2", "running"));
+        orch.upsert_agent(upsert("agent-1", "completed"));
+        orch.upsert_agent(upsert("agent-2", "completed"));
+        let drained = orch.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "epoch-0 join drained"
+        );
+        drop(orch);
+
+        // Simulate the crash window directly at the store layer: an admission
+        // for `agent-ghost` at epoch 1 is written DURABLY, but `agent-ghost`'s
+        // child record is NOT (the process died between the two writes).
+        let store = SupervisorStore::new(dir.path());
+        store
+            .record_cohort_admission(group.as_str(), scatter_cwd_hash(&None), "agent-ghost", 1, 1)
+            .expect("admission durable");
+
+        // Restart: the admission marker is present, but its child is not.
+        // The child-exists gate must REFUSE to lift the epoch — the cohort
+        // restores at epoch 0 and NO phantom epoch-1 join is emitted.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        assert_eq!(
+            fresh
+                .state()
+                .scatter_join_state
+                .get(&cohort_key)
+                .map(|s| s.join_epoch),
+            Some(0),
+            "an admission whose child is not durable must NOT lift the epoch"
+        );
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !drained.iter().any(|item| item.reason
+                == MasterContinuationReason::ScatterJoinComplete
+                && item.dedupe_key.as_str().ends_with("/1")),
+            "no phantom epoch-1 join is re-emitted; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
         );
     }
 }
