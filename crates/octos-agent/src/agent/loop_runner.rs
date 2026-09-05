@@ -727,7 +727,16 @@ impl Agent {
     /// Build a `ChatConfig` with optional `chat_max_tokens` / `chat_temperature`
     /// overrides from `AgentConfig`. Delegates to [`build_chat_config`].
     fn chat_config(&self) -> ChatConfig {
-        build_chat_config(&self.config)
+        build_chat_config(&self.config, self.is_local_provider())
+    }
+
+    /// True when the active LLM provider is the built-in local/self-hosted
+    /// provider (metadata name `"local"`). Local reasoning models (e.g. Qwen
+    /// on llama.cpp) need Pi-aligned defaults (#2229) — server-sampled
+    /// temperature and no overall wall-clock cap — while cloud providers keep
+    /// the conservative defaults. An explicit operator override always wins.
+    pub(super) fn is_local_provider(&self) -> bool {
+        self.llm.provider_metadata().provider == "local"
     }
 
     /// Decide what to surface when the loop detector fires.
@@ -3978,16 +3987,24 @@ fn shell_retry_limit_message(content: &str) -> String {
 /// without constructing a full `Agent` — in particular the cloud-safety
 /// invariant (#2172): an unset `chat_temperature` must leave the built-in
 /// `0.0` default untouched, so cloud requests are byte-for-byte unchanged.
-fn build_chat_config(config: &crate::AgentConfig) -> ChatConfig {
+///
+/// `local_provider` (#2229): for the local/self-hosted provider, an unset
+/// `chat_temperature` leaves temperature UNSET rather than defaulting to `0.0`,
+/// so the server samples (Pi parity) — forced greedy degenerates local
+/// reasoning models. Cloud (`local_provider = false`) is unchanged.
+fn build_chat_config(config: &crate::AgentConfig, local_provider: bool) -> ChatConfig {
     let mut c = ChatConfig::default();
     if let Some(max) = config.chat_max_tokens {
         c.max_tokens = Some(max);
     }
-    // Temperature override. Unset → keep the built-in default (0.0), so cloud
-    // requests are unchanged; set → override, primarily to avoid forced-greedy
-    // repetition collapse on local models.
+    // Temperature. An explicit `chat_temperature` always wins. Otherwise: on a
+    // LOCAL provider leave it unset so the server samples (the request omits
+    // `temperature` via skip_serializing_if); on cloud keep the built-in `0.0`
+    // default so cloud requests are byte-for-byte unchanged.
     if let Some(temp) = config.chat_temperature {
         c.temperature = Some(temp);
+    } else if local_provider {
+        c.temperature = None;
     }
     // Extra sampler params (e.g. repeat_penalty) for OpenAI-compatible servers.
     // Unset → nothing added, cloud unchanged.

@@ -159,17 +159,37 @@ pub const VOICE_STREAM_TTFT_SECS: u64 = 10;
 /// Tightened inter-chunk idle timeout for voice fail-fast turns (10s).
 pub const VOICE_STREAM_IDLE_SECS: u64 = 10;
 
+/// Pure clamp behind the `env_secs_*` readers: apply `[min, 86_400]` to a
+/// parsed value, or fall back to `default_secs` when the var was absent or
+/// unparseable. Extracted so the clamp is unit-testable without touching the
+/// process environment.
+fn clamp_env_secs(parsed: Option<u64>, default_secs: u64, min: u64) -> u64 {
+    parsed.map(|v| v.clamp(min, 86_400)).unwrap_or(default_secs)
+}
+
 /// Read an env-overridable seconds value, mirroring the convention in
 /// `octos-cli/src/session_actor.rs` (`std::env::var(...).parse()` with a clamp
 /// so a misconfigured value cannot disable the guard entirely). A parsed `0`
-/// is clamped up to `1` so the timeout is always live.
+/// is clamped up to `1` so the timeout is always live. Use
+/// [`env_secs_allow_zero_or`] for knobs whose contract makes `0` mean
+/// "disabled".
 fn env_secs_or(var: &str, default_secs: u64) -> std::time::Duration {
-    let secs = std::env::var(var)
+    let parsed = std::env::var(var)
         .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(|v| v.clamp(1, 86_400))
-        .unwrap_or(default_secs);
-    std::time::Duration::from_secs(secs)
+        .and_then(|raw| raw.parse::<u64>().ok());
+    std::time::Duration::from_secs(clamp_env_secs(parsed, default_secs, 1))
+}
+
+/// Like [`env_secs_or`] but honors `0` as a disable sentinel (floor is `0`,
+/// not `1`). Used for `OCTOS_LLM_CALL_MAX_SECS`, whose `0` value disables the
+/// overall wall-clock backstop (see `streaming.rs`; the idle/TTFT guards stay
+/// live). Clamping `0` up to `1` here would instead abort every stream after
+/// 1s (#2228).
+fn env_secs_allow_zero_or(var: &str, default_secs: u64) -> std::time::Duration {
+    let parsed = std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok());
+    std::time::Duration::from_secs(clamp_env_secs(parsed, default_secs, 0))
 }
 
 /// Like [`env_secs_or`] but returns a raw `u64` seconds value clamped to
@@ -224,7 +244,10 @@ impl Default for AgentConfig {
                 "OCTOS_LLM_STREAM_IDLE_SECS",
                 DEFAULT_LLM_STREAM_IDLE_SECS,
             ),
-            llm_call_max: env_secs_or("OCTOS_LLM_CALL_MAX_SECS", DEFAULT_LLM_CALL_MAX_SECS),
+            llm_call_max: env_secs_allow_zero_or(
+                "OCTOS_LLM_CALL_MAX_SECS",
+                DEFAULT_LLM_CALL_MAX_SECS,
+            ),
             human_approval_rules: None,
             voice_overall_deadline: env_secs_or(
                 "OCTOS_VOICE_LLM_DEADLINE_SECS",
@@ -1474,6 +1497,25 @@ mod profile_integration_tests {
     use octos_core::AgentId;
     use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
     use octos_memory::EpisodeStore;
+
+    #[test]
+    fn clamp_env_secs_floor_one_keeps_guard_live() {
+        // env_secs_or semantics: 0 floors to 1 so the guard is always live.
+        assert_eq!(clamp_env_secs(Some(0), 90, 1), 1);
+        assert_eq!(clamp_env_secs(Some(45), 90, 1), 45);
+        assert_eq!(clamp_env_secs(Some(99_999), 90, 1), 86_400);
+        assert_eq!(clamp_env_secs(None, 90, 1), 90);
+    }
+
+    #[test]
+    fn clamp_env_secs_floor_zero_allows_disable() {
+        // env_secs_allow_zero_or semantics (#2228): 0 passes through so the
+        // wall-clock cap can actually be disabled.
+        assert_eq!(clamp_env_secs(Some(0), 1200, 0), 0);
+        assert_eq!(clamp_env_secs(Some(1200), 1200, 0), 1200);
+        assert_eq!(clamp_env_secs(Some(99_999), 1200, 0), 86_400);
+        assert_eq!(clamp_env_secs(None, 1200, 0), 1200);
+    }
 
     struct NoopProvider;
 

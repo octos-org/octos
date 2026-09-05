@@ -1540,6 +1540,8 @@ pub(crate) fn reserve_named_peer_dir(
 #[derive(Debug)]
 pub(crate) struct StagedPeer {
     pub(crate) slug: String,
+    /// #2236 — the fenced-peer build-cache decision (Shared/RepoConfig/None).
+    pub(crate) build_cache: PeerBuildCache,
     /// Session topic the client opens (`peer-<slug>`).
     pub(crate) topic: String,
     /// `peers/<slug>/brief.md` under the profile data dir.
@@ -1594,7 +1596,7 @@ pub(crate) fn stage_peer(
         None => reserve_peer_dir(peers_root, seed)?,
     };
     // The fence: a worktree on branch `peer/<slug>` under the peer dir.
-    let cwd = if worktree {
+    let (cwd, build_cache) = if worktree {
         let worktree_path = peer_dir.join("wt");
         let branch = format!("peer/{slug}");
         // Best-effort re-validation immediately before handing the path to git:
@@ -1689,9 +1691,13 @@ pub(crate) fn stage_peer(
                 .args(["config", key, &value])
                 .output();
         }
-        worktree_path
+        // #2236 — wire the clone at the workspace's hot build cache BEFORE
+        // returning the path; the decision rides back to the caller for
+        // model_note + the peer_staged event detail.
+        let cache = wire_fenced_peer_build_cache(&worktree_path, workspace_root);
+        (worktree_path, cache)
     } else {
-        workspace_root.to_path_buf()
+        (workspace_root.to_path_buf(), PeerBuildCache::None)
     };
 
     // codex #6 — record the owner BEFORE brief.md (the visibility gate), atomic
@@ -1760,6 +1766,7 @@ pub(crate) fn stage_peer(
     Ok(StagedPeer {
         topic: format!("peer-{slug}"),
         worktree_branch: worktree.then(|| format!("peer/{slug}")),
+        build_cache,
         slug,
         brief_path,
         cwd,
@@ -2128,6 +2135,14 @@ pub(crate) fn build_peer_handoff_callback(
                 None => warning,
             });
         }
+        // #2236 — surface the build-cache decision in the same model_note
+        // field (newline-joined, existing content preserved).
+        if let Some(line) = staged.build_cache.note_line(&workspace_root) {
+            model_note = Some(match model_note {
+                Some(note) => format!("{note}\n{line}"),
+                None => line,
+            });
+        }
         // OLP L1 (slice 5): structured observability event. The lane is
         // the RESOLVED one (what record_peer_model_lane actually persisted);
         // an unset/invalid lane resolves to the primary model, which the
@@ -2141,9 +2156,14 @@ pub(crate) fn build_peer_handoff_callback(
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| peers_root.clone());
+            let staged_detail = if effective_worktree {
+                format!("peer staged{}", staged.build_cache.detail_suffix())
+            } else {
+                "peer staged".to_string()
+            };
             crate::obs_events::append_obs_event(
                 &data_dir,
-                &crate::obs_events::ObsEvent::new("peer_staged", "peer staged")
+                &crate::obs_events::ObsEvent::new("peer_staged", &staged_detail)
                     .goal_id(resolved_goal_id.as_deref())
                     .slug(Some(staged.slug.as_str()))
                     .session(Some(session_str))
@@ -2202,6 +2222,94 @@ pub(crate) fn read_peer_model_lane(peers_root: &Path, slug: &str) -> Option<Stri
 /// no-follow openat + renameat under the pinned dir fd). Both an unknown lane
 /// and a failed record are TRUTHFUL: they say the peer will run on the primary
 /// model, matching what the turn actually does.
+/// #2236 — the fenced-peer build-cache decision, for `model_note` and the
+/// `peer_staged` event detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerBuildCache {
+    /// `wt/.cargo/config.toml` written pointing at the workspace `target/`.
+    Shared,
+    /// Workspace root has no `Cargo.toml`: nothing written, no note.
+    None,
+    /// The repo's own `.cargo/config.toml` was cloned in: left untouched.
+    RepoConfig,
+}
+
+impl PeerBuildCache {
+    /// The `model_note` line for this decision (None = no note line).
+    pub(crate) fn note_line(&self, workspace_root: &Path) -> Option<String> {
+        match self {
+            PeerBuildCache::Shared => Some(format!(
+                "build cache: target-dir -> {}/target",
+                workspace_root.display()
+            )),
+            PeerBuildCache::RepoConfig => {
+                Some("build cache: repo has its own .cargo/config.toml, left untouched".to_string())
+            }
+            PeerBuildCache::None => None,
+        }
+    }
+
+    /// The `peer_staged` detail suffix for this decision.
+    pub(crate) fn detail_suffix(&self) -> &'static str {
+        match self {
+            PeerBuildCache::Shared => " (build cache: shared)",
+            PeerBuildCache::RepoConfig => " (build cache: repo-config)",
+            PeerBuildCache::None => "",
+        }
+    }
+}
+
+/// #2236 — after the fenced clone lands, point cargo at the WORKSPACE's hot
+/// `target/` (a fresh clone compiles from zero: 147s–500s per cargo run ate
+/// the #45 peer's entire 50-iteration budget). Writes `wt/.cargo/config.toml`
+/// with an absolute `build.target-dir`, and excludes the file via
+/// `wt/.git/info/exclude` so the fence's `git status` stays clean and no
+/// `git add` can pick it up. A repo-provided `.cargo/config.toml` is never
+/// overwritten (RepoConfig); a non-Cargo workspace writes nothing (None).
+/// No env vars: the peer's tool-process environment is not the stage's to own.
+pub(crate) fn wire_fenced_peer_build_cache(
+    worktree_path: &Path,
+    workspace_root: &Path,
+) -> PeerBuildCache {
+    if !workspace_root.join("Cargo.toml").is_file() {
+        return PeerBuildCache::None;
+    }
+    let cargo_dir = worktree_path.join(".cargo");
+    let config_path = cargo_dir.join("config.toml");
+    if config_path.exists() {
+        return PeerBuildCache::RepoConfig;
+    }
+    let body = format!(
+        "[build]\ntarget-dir = \"{}/target\"\n",
+        workspace_root.display()
+    );
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&cargo_dir)?;
+        std::fs::write(&config_path, body)
+    };
+    if write().is_err() {
+        return PeerBuildCache::None;
+    }
+    // Keep the fence's git view clean: exclude via .git/info/exclude (local,
+    // never committed, never pushed).
+    let exclude_path = worktree_path.join(".git").join("info").join("exclude");
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(parent) = exclude_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+        if !existing.lines().any(|l| l.trim() == ".cargo/config.toml") {
+            if !existing.ends_with('\n') && !existing.is_empty() {
+                existing.push('\n');
+            }
+            existing.push_str(".cargo/config.toml\n");
+            std::fs::write(&exclude_path, existing)?;
+        }
+        Ok(())
+    })();
+    PeerBuildCache::Shared
+}
+
 pub(crate) fn record_peer_model_lane(
     peers_root: &Path,
     slug: &str,
@@ -2931,6 +3039,251 @@ pub(crate) fn build_peer_list_callback(
             &awaiting_by_slug,
         ))
     })
+}
+
+#[cfg(test)]
+mod issue_2236_build_cache_tests {
+    use super::stage_peer;
+
+    /// Real temp git repo fixture (per the contract: real repos, no cargo run).
+    fn cargo_ws_repo(
+        with_cargo: bool,
+        with_repo_config: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        if with_cargo {
+            std::fs::write(ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        }
+        if with_repo_config {
+            std::fs::create_dir_all(ws.join(".cargo")).unwrap();
+            std::fs::write(ws.join(".cargo/config.toml"), "# repo's own\n").unwrap();
+        }
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&ws)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        if with_repo_config {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&ws)
+                    .args(["add", "."])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&ws)
+                    .args(["commit", "--quiet", "-m", "seed"])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        (tmp, ws)
+    }
+
+    // NOTE: stage_peer returns StagedPeer (private here), so the tests call it
+    // directly and read the staged dir from disk.
+
+    #[test]
+    fn fenced_peer_gets_shared_target_dir_config() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("p1"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let wt = peers_root.join(&staged.slug).join("wt");
+        let cfg = wt.join(".cargo").join("config.toml");
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        // #2236-r2 — the config is EXACTLY two lines: [build] + target-dir.
+        // Nothing else (CARGO_HOME, registry keys, …) may ride along.
+        assert_eq!(
+            body,
+            format!("[build]\ntarget-dir = \"{}/target\"\n", ws.display()),
+            "config must be exactly the two contract lines"
+        );
+        assert!(!body.contains("CARGO_HOME"), "no CARGO_HOME key");
+        assert!(!body.contains("registry"), "no registry key");
+        let exclude =
+            std::fs::read_to_string(wt.join(".git").join("info").join("exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|l| l.trim() == ".cargo/config.toml"),
+            "{exclude}"
+        );
+        // model_note rides on the StagedPeer decision; the tool-level note is
+        // asserted via the decision enum: Shared => note contains the line.
+        let note = staged.build_cache.note_line(&ws).unwrap();
+        assert!(note.contains("build cache: target-dir ->"), "{note}");
+    }
+
+    #[test]
+    fn fenced_peer_without_cargo_toml_writes_nothing() {
+        let (tmp, ws) = cargo_ws_repo(false, false);
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("p2"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let wt = peers_root.join(&staged.slug).join("wt");
+        assert!(!wt.join(".cargo").exists(), "no .cargo dir");
+        assert!(
+            staged.build_cache.note_line(&ws).is_none(),
+            "no build-cache note"
+        );
+    }
+
+    #[test]
+    fn fenced_peer_keeps_repo_cargo_config() {
+        let (tmp, ws) = cargo_ws_repo(true, true);
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("p3"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let wt = peers_root.join(&staged.slug).join("wt");
+        // #2236-r1 — normalize CRLF to LF on BOTH sides before comparing:
+        // on a Windows checkout with core.autocrlf, git materializes the
+        // committed config.toml with CRLF in one tree and LF in the other,
+        // so the raw byte comparison broke despite identical content. The
+        // contract's intent is "untouched", not "same EOL".
+        let read_norm = |p: &std::path::Path| {
+            std::fs::read(p)
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|b| *b != b'\r')
+                .collect::<Vec<u8>>()
+        };
+        let ours = read_norm(&wt.join(".cargo").join("config.toml"));
+        let repo = read_norm(&ws.join(".cargo").join("config.toml"));
+        assert_eq!(ours, repo, "repo config untouched (CRLF-normalized)");
+        let note = staged.build_cache.note_line(&ws).unwrap();
+        assert!(note.contains("left untouched"), "{note}");
+    }
+
+    #[test]
+    fn unfenced_peer_untouched_by_build_cache() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("p4"),
+            Some("m"),
+            "B.",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !ws.join(".cargo").join("config.toml").exists(),
+            "workspace untouched"
+        );
+        assert_eq!(staged.build_cache.detail_suffix(), "", "no suffix unfenced");
+    }
+
+    #[test]
+    fn peer_staged_detail_reports_build_cache() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("p5"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        // The detail is derived from the same decision the event carries.
+        let detail = format!("peer staged{}", staged.build_cache.detail_suffix());
+        assert_eq!(detail, "peer staged (build cache: shared)");
+    }
+
+    #[test]
+    fn fenced_peer_git_status_clean_after_config() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("p6"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let wt = peers_root.join(&staged.slug).join("wt");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            status.trim().is_empty(),
+            "git status must be clean: {status}"
+        );
+    }
 }
 
 #[cfg(test)]

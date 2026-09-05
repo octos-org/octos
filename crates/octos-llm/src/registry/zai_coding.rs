@@ -27,6 +27,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     // model, which the regular `zai`/`zhipu` families already handle.
     detect_patterns: &[],
     model_discovery: crate::discovery::ANTHROPIC_MODELS,
+    model_discovery_for_model: None,
     create,
 };
 

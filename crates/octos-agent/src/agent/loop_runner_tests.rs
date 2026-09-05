@@ -6557,7 +6557,7 @@ fn build_chat_config_keeps_default_temperature_when_unset() {
         chat_temperature: None,
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(chat.temperature, ChatConfig::default().temperature);
     assert_eq!(chat.temperature, Some(0.0));
 }
@@ -6568,7 +6568,7 @@ fn build_chat_config_applies_temperature_override() {
         chat_temperature: Some(0.7),
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(chat.temperature, Some(0.7));
 }
 
@@ -6582,7 +6582,7 @@ fn build_chat_config_threads_sampling_params() {
         chat_sampling_params: Some(sp),
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(
         chat.sampling_params
             .as_ref()
@@ -6590,7 +6590,7 @@ fn build_chat_config_threads_sampling_params() {
         Some(&serde_json::json!(1.1))
     );
     assert_eq!(
-        build_chat_config(&AgentConfig::default()).sampling_params,
+        build_chat_config(&AgentConfig::default(), false).sampling_params,
         None
     );
 }
@@ -6603,9 +6603,34 @@ fn build_chat_config_applies_max_tokens_override_independently() {
         chat_temperature: Some(0.5),
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(chat.max_tokens, Some(4096));
     assert_eq!(chat.temperature, Some(0.5));
+}
+
+#[test]
+fn build_chat_config_local_provider_unsets_temperature() {
+    // #2229: on a local provider with no explicit chat_temperature, temperature
+    // is left UNSET (None) so the server samples — the request omits it — rather
+    // than forcing greedy 0.0 (which degenerates local reasoning models).
+    let cfg = AgentConfig {
+        chat_temperature: None,
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg, true);
+    assert_eq!(chat.temperature, None);
+    // Cloud path is unchanged: still the built-in 0.0.
+    assert_eq!(build_chat_config(&cfg, false).temperature, Some(0.0));
+}
+
+#[test]
+fn build_chat_config_local_provider_respects_explicit_temperature() {
+    // An explicit override always wins, even on local.
+    let cfg = AgentConfig {
+        chat_temperature: Some(0.6),
+        ..AgentConfig::default()
+    };
+    assert_eq!(build_chat_config(&cfg, true).temperature, Some(0.6));
 }
 
 // --- #2174: conversation-loop recovery from a degenerate empty MaxTokens ---
@@ -6774,6 +6799,29 @@ fn should_preserve_both_turns_increments_when_turns_overlap() {
 
     drop(turn_a);
     drop(turn_b);
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.counters.rate_limited, 3);
+    assert_eq!(shared.counters.network, 3);
+}
+
+#[test]
+fn should_preserve_both_turns_increments_when_dropped_in_reverse_order() {
+    // Reverse-order twin of
+    // `should_preserve_both_turns_increments_when_turns_overlap` (#2221):
+    // dropping turn B first exercises the same delta merge from the other
+    // side — `rate_limited`, the bucket BOTH turns incremented, must still
+    // accumulate 2 + 1 regardless of which drop runs the merge first.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let mut turn_a = PersistentRetryStateGuard::new(Some(handle.clone()));
+    let mut turn_b = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    turn_a.counters.rate_limited += 2;
+    turn_b.counters.rate_limited += 1;
+    turn_b.counters.network += 3;
+
+    drop(turn_b);
+    drop(turn_a);
 
     let shared = handle.lock().unwrap();
     assert_eq!(shared.counters.rate_limited, 3);
