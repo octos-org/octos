@@ -22,7 +22,7 @@ use super::monitor_runtime::{
 };
 use super::supervisor_store::{
     ArtifactRecord as SupervisorArtifactRecord, ChildAgentRecord, ChildStatus,
-    CoalescedTombstoneEntry, ContinuationStatus, GroupStatus, HeartbeatPing,
+    CoalescedTombstoneEntry, CohortEpochAdmission, ContinuationStatus, GroupStatus, HeartbeatPing,
     PendingContinuationRecord, SupervisedGroupRecord, SupervisorEvent, SupervisorMetadata,
     SupervisorState, SupervisorStore, TerminalKind, TerminalState,
 };
@@ -1121,7 +1121,7 @@ pub(crate) struct NativeSpecialistRunResult {
 pub(crate) fn upsert_background_task_agent(
     task: &octos_agent::BackgroundTask,
     runtime_profile_id: Option<&str>,
-) -> Option<(SessionKey, Value)> {
+) -> Result<Option<(SessionKey, Value)>, RpcError> {
     default_agent_orchestrator().upsert_background_task_agent(task, runtime_profile_id)
 }
 
@@ -1130,13 +1130,15 @@ impl InProcessAgentOrchestrator {
         &self,
         task: &octos_agent::BackgroundTask,
         runtime_profile_id: Option<&str>,
-    ) -> Option<(SessionKey, Value)> {
-        let session_id = background_task_session_id(task)?;
+    ) -> Result<Option<(SessionKey, Value)>, RpcError> {
+        let Some(session_id) = background_task_session_id(task) else {
+            return Ok(None);
+        };
         let (cwd, workspace_scope) = match background_task_workspace(task) {
             Ok(workspace) => workspace,
             Err(error) => {
                 tracing::warn!(task_id = %task.id, %error, "invalid task workspace; skipping mirror");
-                return None;
+                return Ok(None);
             }
         };
         // #1707 round 5 (board item #7) — IDEMPOTENCY GATE for stale terminal
@@ -1219,7 +1221,7 @@ impl InProcessAgentOrchestrator {
                     profile_id,
                     workspace_scope.as_ref(),
                 );
-                return None;
+                return Ok(None);
             }
         }
         // mini5 soak fix: AppUI/TUI sessions use BARE session keys ("q5",
@@ -1250,29 +1252,8 @@ impl InProcessAgentOrchestrator {
         let task_id = task.id.parse::<TaskId>().ok();
         let last_task = background_task_last_task(task);
 
-        // #15 R12-1 — a NON-gated terminal mirror (the "delivered in-memory,
-        // persisted-but-never-drained" shape: the record was restored, the
-        // mark is non-gating) refreshes the output mirror by OVERWRITE: the
-        // restored record's output is derived from the persisted summary and
-        // may be stale relative to the re-forwarded task's richer
-        // `final_output`. Runs BEFORE the upsert so the mirror write is not
-        // disturbed by the upsert itself; a first-seen agent simply has no
-        // record yet and the refresh is a no-op (the upsert's own
-        // `set_agent_output_if_empty` then fills it).
-        if task.status.is_terminal()
-            && let Some(final_output) = task.final_output.as_deref()
-            && !final_output.trim().is_empty()
-        {
-            let _ = self.set_agent_output_forced(
-                &agent_id,
-                &session_id,
-                profile_id.as_str(),
-                final_output,
-            );
-        }
-
         let orchestrator = self;
-        let mut agent = orchestrator.upsert_agent_scoped(
+        orchestrator.upsert_agent_scoped(
             AgentUpsert {
                 agent_id: agent_id.clone(),
                 parent_agent_id: Some("master".to_owned()),
@@ -1291,13 +1272,23 @@ impl InProcessAgentOrchestrator {
                 profile_id: profile_id.clone(),
             },
             workspace_scope,
-        );
+        )?;
+        // Refresh output only after checked admission succeeds.
+        if task.status.is_terminal()
+            && let Some(final_output) = task.final_output.as_deref()
+            && !final_output.trim().is_empty()
+        {
+            let _ = self.set_agent_output_forced(
+                &agent_id,
+                &session_id,
+                profile_id.as_str(),
+                final_output,
+            );
+        }
+
         if !artifacts.is_empty() {
-            if let Ok(updated) =
-                orchestrator.set_agent_artifacts(&agent_id, &session_id, &profile_id, artifacts)
-            {
-                agent = updated;
-            }
+            let _ =
+                orchestrator.set_agent_artifacts(&agent_id, &session_id, &profile_id, artifacts);
         }
         // Mini4 re-review follow-up: surface the child's supervisor-recorded
         // final output on the mirrored agent record so `agent/output/read` (the
@@ -1313,7 +1304,18 @@ impl InProcessAgentOrchestrator {
                 );
             }
         }
-        Some((session_id, agent))
+        // Serialize after the successful output/artifact refresh so observers
+        // publish the same snapshot exposed by agent/output/read.
+        let state = self.state();
+        let agent = get_agent(
+            &state,
+            &AgentRequest {
+                agent_id,
+                session_id: Some(session_id.clone()),
+                profile_id,
+            },
+        )?;
+        Ok(Some((session_id, autonomy_agent_json(agent))))
     }
 }
 
@@ -1366,7 +1368,10 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
             // Mirror the terminal agent record; the upsert's terminal
             // transition enqueues the autonomous ChildCompleted re-entry
             // under the resolved profile.
-            let _ = upsert_background_task_agent(&event.task, runtime_profile_id);
+            if let Err(error) = upsert_background_task_agent(&event.task, runtime_profile_id) {
+                tracing::warn!(task_id = %event.task.id, error = %error.message,
+                    "terminal task mirror admission failed");
+            }
         }
         octos_agent::TerminalOutcome::Failed(signal) => {
             // Synth-ack-as-prompt-selection: only the ack-emitted failures
@@ -2770,7 +2775,7 @@ impl InProcessAgentOrchestrator {
         Ok(autonomy_goal_json(&snapshot))
     }
 
-    pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Value {
+    pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Result<Value, RpcError> {
         let scope = WorkspaceScope::from_raw(upsert.cwd.as_deref());
         self.upsert_agent_scoped(upsert, scope)
     }
@@ -2779,183 +2784,87 @@ impl InProcessAgentOrchestrator {
         &self,
         upsert: AgentUpsert,
         workspace_scope: Option<WorkspaceScope>,
-    ) -> Value {
+    ) -> Result<Value, RpcError> {
         let now = now_ms();
         let mut state = self.state();
-        let previous_status = state
-            .agents
-            .get(&upsert.agent_id)
-            .map(|agent| agent.status.clone());
-        let (agent, payload, transitioned_terminal) = {
-            // Refs #2102 (Gap 3): live spawn admission. A NEW agent record
-            // entering an ALREADY-JOINED group bumps the join epoch BEFORE
-            // the entry is created, under the same state lock — the crash
-            // window is empty and the bump is single-writer.
-            let existing = state.agents.contains_key(&upsert.agent_id);
-            if !existing {
-                let group = format!(
-                    "agent-group:{}:{}:{}",
-                    upsert.profile_id,
-                    upsert.session_id,
-                    upsert.parent_agent_id.as_deref().unwrap_or("master")
-                );
-                // #19 (round-4 B1) — the admission check and the epoch bump
-                // are scoped to the agent's OWN (group, cwd) cohort: a new
-                // admission under workspace B must NOT bump workspace A's
-                // join epoch, and B's own bump fires only when B's cohort
-                // already joined.
-                let cohort_key =
-                    scatter_cohort_key(&group, scatter_scope_hash(workspace_scope.as_ref()));
-                let already_joined = state
-                    .scatter_join_state
-                    .get(&cohort_key)
-                    .is_some_and(|s| s.last_joined_key.is_some());
-                if already_joined {
-                    // #20 (round-4 B2) — ATOMIC admission. Compute the bumped
-                    // epoch WITHOUT mutating memory, then write ONE checked
-                    // durable admission record binding the cohort, the child
-                    // identity, and the new epoch. ONLY on `Ok` do we bump the
-                    // in-memory epoch and fall through to the child insert;
-                    // on `Err` we skip the bump and the insert entirely (the
-                    // admission fails observably, no half-state). This
-                    // replaces the #15b two-step (bump → best-effort
-                    // `GroupEpochBumped` → insert) whose crash windows could
-                    // lose a join or fabricate a phantom one.
-                    let current_epoch = state
-                        .scatter_join_state
-                        .get(&cohort_key)
-                        .map(|s| s.join_epoch)
-                        .unwrap_or(0);
-                    let new_epoch = current_epoch + 1;
-                    let cwd_hash = scatter_scope_hash(workspace_scope.as_ref());
-                    // Test hook: simulate a crash exactly at the durable
-                    // admission write.
-                    #[cfg(test)]
-                    if state.force_admission_persist_failure {
-                        state.force_admission_persist_failure = false;
-                        tracing::warn!(
-                            agent_id = %upsert.agent_id,
-                            group = %group,
-                            new_epoch,
-                            "forced cohort-admission persist failure (test hook); \
-                             admission blocked"
-                        );
-                        return json!({
-                            "agent_id": upsert.agent_id,
-                            "admitted": false,
-                            "error": "cohort admission persist failed (forced test hook)",
-                        });
-                    }
-                    // #23: keep this checked single-event append under the
-                    // state lock so competing admissions cannot select the
-                    // same next epoch. Moving it outside needs a reservation
-                    // and revision protocol; the store emits one event write.
-                    let admission = state.supervisor_store.as_ref().map(|store| {
-                        store.record_cohort_admission(
-                            group.as_str(),
-                            cwd_hash,
-                            upsert.agent_id.as_str(),
-                            new_epoch,
-                            now_ms_u64(),
-                        )
-                    });
-                    match admission {
-                        Some(Ok(_row)) => {
-                            // Admission durable — now bump memory + insert.
-                            let join_state = state
-                                .scatter_join_state
-                                .entry(cohort_key.clone())
-                                .or_default();
-                            join_state.join_epoch = join_state.join_epoch.max(new_epoch);
-                        }
-                        Some(Err(err)) => {
-                            // The durable admission FAILED — do NOT bump the
-                            // in-memory epoch and do NOT insert the child: a
-                            // crash now would restart at the OLD epoch with no
-                            // admission record, so no phantom join is possible.
-                            tracing::warn!(
-                                ?err,
-                                agent_id = %upsert.agent_id,
-                                group = %group,
-                                cwd_hash,
-                                new_epoch,
-                                "cohort admission persist failed; admission blocked \
-                                 (no epoch bump, no child insert)"
-                            );
-                            return json!({
-                                "agent_id": upsert.agent_id,
-                                "admitted": false,
-                                "error": format!("cohort admission persist failed: {err}"),
-                            });
-                        }
-                        None => {
-                            // No supervisor store (pure in-memory runtime): keep
-                            // the prior behavior — bump in memory only.
-                            let join_state = state
-                                .scatter_join_state
-                                .entry(cohort_key.clone())
-                                .or_default();
-                            join_state.join_epoch = join_state.join_epoch.max(new_epoch);
-                        }
-                    }
-                }
-            }
-            let entry = state
-                .agents
-                .entry(upsert.agent_id.clone())
-                .or_insert_with(|| AutonomyAgentRecord {
-                    agent_id: upsert.agent_id.clone(),
-                    parent_agent_id: upsert.parent_agent_id.clone(),
-                    session_id: upsert.session_id.clone(),
-                    task_id: upsert.task_id.clone(),
-                    path: upsert.path.clone(),
-                    role: upsert.role.clone(),
-                    nickname: upsert.nickname.clone(),
-                    backend_kind: upsert.backend_kind.clone(),
-                    status: upsert.status.clone(),
-                    last_task: upsert.last_task.clone(),
-                    cwd: upsert.cwd.clone(),
-                    workspace_scope: workspace_scope.clone(),
-                    profile_id: upsert.profile_id.clone(),
-                    output: String::new(),
-                    artifacts: Vec::new(),
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                    context_contract: None,
-                    restored: false,
-                });
-            entry.parent_agent_id = upsert.parent_agent_id;
-            entry.session_id = upsert.session_id;
-            entry.task_id = upsert.task_id;
-            entry.path = upsert.path;
-            entry.role = upsert.role;
-            entry.nickname = upsert.nickname;
-            entry.backend_kind = upsert.backend_kind;
-            entry.status = upsert.status;
-            entry.last_task = upsert.last_task;
-            entry.cwd = upsert.cwd;
-            entry.workspace_scope = workspace_scope;
-            entry.profile_id = upsert.profile_id;
-            entry.updated_at_ms = now;
-            // A live upsert means the agent is active in THIS lifetime — it
-            // must reappear in `agent/list` even if the id was boot-restored.
-            entry.restored = false;
-            let transitioned_terminal = is_agent_terminal_status(&entry.status)
-                && previous_status.as_deref().is_none_or(|status| {
-                    !is_agent_terminal_status(status) || status != entry.status
-                });
-            (
-                entry.clone(),
-                autonomy_agent_json(entry),
-                transitioned_terminal,
-            )
-        };
+        let previous = state.agents.get(&upsert.agent_id);
+        let previous_status = previous.map(|agent| agent.status.clone());
+        let existing = previous.is_some();
+        // Stage a complete candidate without publishing any live admission.
+        let mut agent = previous.cloned().unwrap_or_else(|| AutonomyAgentRecord {
+            agent_id: upsert.agent_id.clone(),
+            parent_agent_id: upsert.parent_agent_id.clone(),
+            session_id: upsert.session_id.clone(),
+            task_id: upsert.task_id.clone(),
+            path: upsert.path.clone(),
+            role: upsert.role.clone(),
+            nickname: upsert.nickname.clone(),
+            backend_kind: upsert.backend_kind.clone(),
+            status: upsert.status.clone(),
+            last_task: upsert.last_task.clone(),
+            cwd: upsert.cwd.clone(),
+            workspace_scope: workspace_scope.clone(),
+            profile_id: upsert.profile_id.clone(),
+            output: String::new(),
+            artifacts: Vec::new(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            context_contract: None,
+            restored: false,
+        });
+        agent.parent_agent_id = upsert.parent_agent_id;
+        agent.session_id = upsert.session_id;
+        agent.task_id = upsert.task_id;
+        agent.path = upsert.path;
+        agent.role = upsert.role;
+        agent.nickname = upsert.nickname;
+        agent.backend_kind = upsert.backend_kind;
+        agent.status = upsert.status;
+        agent.last_task = upsert.last_task;
+        agent.cwd = upsert.cwd;
+        agent.workspace_scope = workspace_scope;
+        agent.profile_id = upsert.profile_id;
+        agent.updated_at_ms = now;
+        agent.restored = false;
+
+        let cwd_hash = scatter_scope_hash(agent.workspace_scope.as_ref());
+        let cohort_key = scatter_cohort_key(&agent_continuation_group_id(&agent), cwd_hash);
+        let cohort = (!existing)
+            .then(|| state.scatter_join_state.get(&cohort_key))
+            .flatten()
+            .filter(|join| join.last_joined_key.is_some())
+            .map(|join| CohortEpochAdmission {
+                cwd_hash,
+                epoch: join.join_epoch.saturating_add(1),
+            });
+        // The full child and optional epoch are one checked ledger event. A
+        // write failure cannot leave a valid epoch-only admission behind.
+        // Keep the append under the state lock so two admissions cannot pick
+        // the same next epoch. No-store runtimes explicitly admit in memory.
+        #[cfg(test)]
+        if state.force_admission_persist_failure {
+            state.force_admission_persist_failure = false;
+            return Err(agent_persist_error(
+                &agent,
+                std::io::Error::other("forced admission persist failure"),
+            ));
+        }
+        persist_agent_admission(&state, &agent, cohort.clone())
+            .map_err(|error| agent_persist_error(&agent, error))?;
+        if let Some(cohort) = cohort {
+            let join = state.scatter_join_state.entry(cohort_key).or_default();
+            join.join_epoch = join.join_epoch.max(cohort.epoch);
+        }
+        let transitioned_terminal = is_agent_terminal_status(&agent.status)
+            && previous_status
+                .as_deref()
+                .is_none_or(|status| !is_agent_terminal_status(status) || status != agent.status);
+        let payload = autonomy_agent_json(&agent);
+        state.agents.insert(agent.agent_id.clone(), agent.clone());
         if transitioned_terminal {
             enqueue_agent_terminal_continuations(&mut state, &agent);
-        } else if !is_agent_terminal_status(&agent.status) {
-            persist_agent_started(&state, &agent);
         }
-        payload
+        Ok(payload)
     }
 
     pub(crate) async fn run_native_specialist(
@@ -3020,6 +2929,40 @@ impl InProcessAgentOrchestrator {
                 ));
             }
         }
+        // #1127 codex P2 follow-up to #991 / M15-B: arm the
+        // cancellation handle BEFORE we publish the agent as `running`
+        // and emit the AGENT_UPDATED event. A client that sees the
+        // running event and immediately calls `interrupt_agent` /
+        // `close_agent` must hit a registered token. With the prior
+        // ordering (register after publish + after worker construction)
+        // the notification was lost and the worker ran to completion
+        // even though the agent's terminal status had been stamped.
+        let cancel_token = self.register_agent_cancellation(&agent_id);
+
+        let workspace_scope = WorkspaceScope::from_path(&cwd);
+        let initial_agent = match self.upsert_agent_scoped(
+            AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: parent_agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: None,
+                path,
+                role: role.clone(),
+                nickname: nickname.clone(),
+                backend_kind: NATIVE_SPECIALIST_BACKEND_KIND.to_owned(),
+                status: "running".to_owned(),
+                last_task: Some(task.clone()),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                profile_id: profile_id.clone(),
+            },
+            workspace_scope,
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                self.deregister_agent_cancellation(&agent_id);
+                return Err(error);
+            }
+        };
         let supervisor = tools.supervisor();
         let raw_task_id = supervisor.register_with_lineage(
             "native_agent",
@@ -3073,34 +3016,9 @@ impl InProcessAgentOrchestrator {
             );
         }
 
-        // #1127 codex P2 follow-up to #991 / M15-B: arm the
-        // cancellation handle BEFORE we publish the agent as `running`
-        // and emit the AGENT_UPDATED event. A client that sees the
-        // running event and immediately calls `interrupt_agent` /
-        // `close_agent` must hit a registered token. With the prior
-        // ordering (register after publish + after worker construction)
-        // the notification was lost and the worker ran to completion
-        // even though the agent's terminal status had been stamped.
-        let cancel_token = self.register_agent_cancellation(&agent_id);
-
-        let workspace_scope = WorkspaceScope::from_path(&cwd);
-        let initial_agent = self.upsert_agent_scoped(
-            AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: parent_agent_id.clone(),
-                session_id: session_id.clone(),
-                task_id: task_id.clone(),
-                path,
-                role,
-                nickname: nickname.clone(),
-                backend_kind: NATIVE_SPECIALIST_BACKEND_KIND.to_owned(),
-                status: "running".to_owned(),
-                last_task: Some(task.clone()),
-                cwd: Some(cwd.to_string_lossy().into_owned()),
-                profile_id: profile_id.clone(),
-            },
-            workspace_scope,
-        );
+        if let Some(agent) = self.state().agents.get_mut(&agent_id) {
+            agent.task_id = task_id.clone();
+        }
         // #1021 / M17-C — native specialists currently run on the parent session's context manager without forking; from the dispatch contract's perspective that is `external_context_unmanaged` with `risk: "medium"`. When the native runner starts forking child contexts via `ContextManager::from_forked_child_context` this should switch to `managed_payload(context_ref)` with `risk: "low"` (see #1022).
         let native_contract = DispatchContextContract::external_unmanaged(
             "native_specialist_context_not_yet_managed",
@@ -3364,20 +3282,21 @@ impl InProcessAgentOrchestrator {
         };
         let agent = state
             .agents
-            .get_mut(agent_id)
+            .get(agent_id)
             .ok_or_else(|| agent_not_found_error(&request))?;
         ensure_agent_control_scope(agent, Some(session_id), profile_id)?;
+        let mut agent = agent.clone();
         agent.status = status.to_owned();
         if let Some(last_task) = last_task {
             agent.last_task = Some(last_task);
         }
         agent.updated_at_ms = now_ms();
-        let agent = agent.clone();
+        persist_agent_started(&state, &agent)
+            .map_err(|error| agent_persist_error(&agent, error))?;
+        state.agents.insert(agent_id.to_owned(), agent.clone());
         let payload = autonomy_agent_json(&agent);
         if is_agent_terminal_status(&agent.status) {
             enqueue_agent_terminal_continuations(&mut state, &agent);
-        } else {
-            persist_agent_started(&state, &agent);
         }
         Ok(payload)
     }
@@ -10282,7 +10201,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             }),
             cwd: request.cwd.filter(|cwd| !cwd.is_empty()),
             profile_id: request.profile_id.clone(),
-        });
+        })?;
         Ok(json!({
             "session_id": request.session_id,
             "profile_id": request.profile_id,
@@ -12611,7 +12530,7 @@ struct AutonomyRuntimeState {
     #[cfg(test)]
     force_scatter_persist_failure: bool,
     /// #20 (round-4 B2) — test-only switch that makes the CHECKED cohort-
-    /// admission write (`record_cohort_admission`) fail BEFORE touching the
+    /// admission write (`record_agent_admitted`) fail BEFORE touching the
     /// store, so the admission path's genuine `Err` handling (no in-memory
     /// bump, no child insert, no half-state) is exercised end-to-end.
     /// Self-disarms after one use; per-instance, like the other force hooks.
@@ -13105,22 +13024,26 @@ fn legacy_peer_workspace_provenance(child: &ChildAgentRecord) -> bool {
     }
 }
 
+fn workspace_scope_for_child(child: &ChildAgentRecord) -> std::io::Result<Option<WorkspaceScope>> {
+    match supervisor_metadata_str(&child.metadata, "workspace_scope") {
+        Some(key) => WorkspaceScope::from_key(key),
+        None if legacy_peer_workspace_provenance(child) => child
+            .workspace_path
+            .as_deref()
+            .map(WorkspaceScope::from_peer_stamp)
+            .transpose()
+            .map(Option::flatten),
+        None => Ok(WorkspaceScope::from_raw(child.workspace_path.as_deref())),
+    }
+}
+
 impl WorkspaceCompat {
     fn build(snapshot: &SupervisorState) -> std::io::Result<Self> {
         let mut compat = Self::default();
         for (key, child) in &snapshot.children {
             let peer = legacy_peer_workspace_provenance(child);
             let explicit = supervisor_metadata_str(&child.metadata, "workspace_scope");
-            let scope = match explicit {
-                Some(key) => WorkspaceScope::from_key(key)?,
-                None if peer => child
-                    .workspace_path
-                    .as_deref()
-                    .map(WorkspaceScope::from_peer_stamp)
-                    .transpose()?
-                    .flatten(),
-                None => WorkspaceScope::from_raw(child.workspace_path.as_deref()),
-            };
+            let scope = workspace_scope_for_child(child)?;
             compat.add(
                 child.group_id.as_str(),
                 scatter_scope_hash(scope.as_ref()),
@@ -13137,6 +13060,47 @@ impl WorkspaceCompat {
                 compat.peers.insert(key.clone());
             }
             compat.children.insert(key.clone(), scope);
+        }
+        // A checked same-ID child update may replace the last child or
+        // ChildCompleted snapshot from an older workspace. The atomic store
+        // event retains only actually observed old scope/provenance values;
+        // use those to keep old scatter IDs attached to their original scope.
+        for child in snapshot.children.values() {
+            for observation in child
+                .metadata
+                .get("workspace_history")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let mut historical = ChildAgentRecord::new(&child.group_id, &child.child_id, 0);
+                historical.workspace_path = observation
+                    .get("workspace_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                historical.label = observation
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                for key in ["workspace_scope", "backend_kind", "role", "nickname"] {
+                    if let Some(value) = observation.get(key) {
+                        historical.metadata.insert(key.into(), value.clone());
+                    }
+                }
+                let scope = workspace_scope_for_child(&historical)?;
+                compat.add(
+                    &child.group_id,
+                    scatter_scope_hash(scope.as_ref()),
+                    scope.clone(),
+                )?;
+                if supervisor_metadata_str(&historical.metadata, "workspace_scope").is_none() {
+                    compat.add(
+                        &child.group_id,
+                        scatter_cwd_hash(&historical.workspace_path),
+                        scope,
+                    )?;
+                }
+            }
         }
         for record in snapshot.continuations.values() {
             if supervisor_metadata_str(&record.metadata, "reason") != Some("scatter_join_complete")
@@ -13364,13 +13328,17 @@ mod workspace_r5_tests {
         let session = SessionKey::with_profile("workspace-r5", "api", "mixed");
         let orch = InProcessAgentOrchestrator::default();
         orch.configure_supervisor_store(dir.path()).unwrap();
-        orch.upsert_agent(native(&session, "native", "/tmp/ws", "running"));
-        orch.upsert_agent(native(&session, "other", "/tmp/other", "completed"));
+        orch.upsert_agent(native(&session, "native", "/tmp/ws", "running"))
+            .unwrap();
+        orch.upsert_agent(native(&session, "other", "/tmp/other", "completed"))
+            .unwrap();
         let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
         let task = peer(&session, &stamp);
         orch.upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap()
             .unwrap();
-        orch.upsert_agent(native(&session, "native", "/tmp/ws", "completed"));
+        orch.upsert_agent(native(&session, "native", "/tmp/ws", "completed"))
+            .unwrap();
         orch.clear_pending_terminal_continuations_for_session(
             &session,
             "workspace-r5",
@@ -13395,10 +13363,12 @@ mod workspace_r5_tests {
     fn workspace_r5_legacy_peer_hex_is_real_cwd_and_native_cohort() {
         let session = SessionKey::with_profile("workspace-r5", "api", "legacy");
         let orch = InProcessAgentOrchestrator::default();
-        orch.upsert_agent(native(&session, "native", "/tmp/ws", "running"));
+        orch.upsert_agent(native(&session, "native", "/tmp/ws", "running"))
+            .unwrap();
         let task = peer(&session, "2f746d702f7773");
         let (_, json) = orch
             .upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap()
             .unwrap();
         assert_eq!(json["cwd"], "/tmp/ws", "cwd must remain a real path");
         assert_eq!(
@@ -13418,6 +13388,7 @@ mod workspace_r5_tests {
         orch.configure_supervisor_store(dir.path()).unwrap();
         let (_, json) = orch
             .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .unwrap()
             .unwrap();
         assert_eq!(
             json["cwd"], root,
@@ -13474,15 +13445,18 @@ mod workspace_r5_tests {
         let session = SessionKey::with_profile("workspace-r5", "api", "distinct");
         let runtime = InProcessAgentOrchestrator::default();
         runtime.configure_supervisor_store(dir.path()).unwrap();
-        runtime.upsert_agent(native(
-            &session,
-            "literal-hex",
-            "2f746d702f7773",
-            "completed",
-        ));
+        runtime
+            .upsert_agent(native(
+                &session,
+                "literal-hex",
+                "2f746d702f7773",
+                "completed",
+            ))
+            .unwrap();
         let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
         runtime
             .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .unwrap()
             .unwrap();
         let restarted = InProcessAgentOrchestrator::default();
         restarted.configure_supervisor_store(dir.path()).unwrap();
@@ -13525,6 +13499,7 @@ mod workspace_r5_tests {
         let child_id = background_task_agent_id(&task);
         runtime
             .upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap()
             .unwrap();
         let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
         let store = SupervisorStore::new(root);
@@ -13567,6 +13542,66 @@ mod workspace_r5_tests {
         }
         assert!(!old_scatter.is_empty());
         (session, group_id, old_scatter, 7, child_id)
+    }
+
+    #[test]
+    fn admission_r5_legacy_scatter_scope_survives_child_workspace_update() {
+        for corrected in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (session, _, old_id, _, child_id) =
+                legacy_store(dir.path(), false, "2f746d702f7773");
+            let runtime = InProcessAgentOrchestrator::default();
+            runtime.configure_supervisor_store(dir.path()).unwrap();
+            let previous = runtime.state().agents[&child_id].clone();
+            let mut update = native(&session, &child_id, "/tmp/other", "running");
+            update.backend_kind = previous.backend_kind;
+            update.role = previous.role;
+            update.nickname = previous.nickname;
+            runtime.upsert_agent(update.clone()).unwrap();
+            if corrected {
+                update.status = "failed".into();
+                runtime.upsert_agent(update).unwrap();
+            }
+            drop(runtime);
+            let fresh = InProcessAgentOrchestrator::default();
+            fresh.configure_supervisor_store(dir.path()).unwrap();
+            let before: Vec<_> = fresh
+                .state()
+                .continuations
+                .pending_items()
+                .cloned()
+                .collect();
+            let old = before
+                .iter()
+                .find(|item| item.dedupe_key.as_str() == old_id)
+                .unwrap();
+            assert_eq!(
+                item_workspace(old),
+                Some("/tmp/ws"),
+                "old carrier keeps its historical workspace"
+            );
+            fresh.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some("/tmp/ws"),
+                "test",
+            );
+            assert!(
+                !fresh
+                    .state()
+                    .continuations
+                    .pending_items()
+                    .any(|item| item.dedupe_key.as_str() == old_id)
+            );
+            assert_eq!(
+                fresh.state().agents[&child_id]
+                    .workspace_scope
+                    .as_ref()
+                    .unwrap()
+                    .key(),
+                "/tmp/other"
+            );
+        }
     }
 
     #[test]
@@ -13888,6 +13923,7 @@ mod workspace_r5_tests {
         producer.configure_supervisor_store(source.path()).unwrap();
         producer
             .upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap()
             .unwrap();
         let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -13945,19 +13981,26 @@ mod workspace_r5_tests {
         let display = root.to_string_lossy();
         let runtime = InProcessAgentOrchestrator::default();
         runtime.configure_supervisor_store(dir.path()).unwrap();
-        runtime.upsert_agent_scoped(
-            native(&session, "native", &display, "running"),
-            WorkspaceScope::from_path(root),
-        );
-        runtime.upsert_agent(native(&session, "lossy-neighbor", &display, "completed"));
+        runtime
+            .upsert_agent_scoped(
+                native(&session, "native", &display, "running"),
+                WorkspaceScope::from_path(root),
+            )
+            .unwrap();
+        runtime
+            .upsert_agent(native(&session, "lossy-neighbor", &display, "completed"))
+            .unwrap();
         let stamp = crate::peers::workspace_scope_encode(root).unwrap();
         runtime
             .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .unwrap()
             .unwrap();
-        runtime.upsert_agent_scoped(
-            native(&session, "native", &display, "completed"),
-            WorkspaceScope::from_path(root),
-        );
+        runtime
+            .upsert_agent_scoped(
+                native(&session, "native", &display, "completed"),
+                WorkspaceScope::from_path(root),
+            )
+            .unwrap();
         let restarted = InProcessAgentOrchestrator::default();
         restarted.configure_supervisor_store(dir.path()).unwrap();
         {
@@ -17251,43 +17294,75 @@ fn background_task_artifacts(task: &octos_agent::BackgroundTask) -> Vec<AgentArt
         .collect()
 }
 
-fn persist_agent_started(state: &AutonomyRuntimeState, agent: &AutonomyAgentRecord) {
+fn agent_persist_error(agent: &AutonomyAgentRecord, error: std::io::Error) -> RpcError {
+    tracing::warn!(agent_id = %agent.agent_id, session = %agent.session_id,
+        profile = %agent.profile_id, %error, "agent admission/child snapshot persist failed; publication blocked");
+    autonomy_error(
+        kinds::AGENT_CONTROL_UNAVAILABLE,
+        format!("agent admission/child snapshot persist failed: {error}"),
+        Some(&agent.session_id),
+        Some(&agent.profile_id),
+        Some(("agent_id", agent.agent_id.as_str())),
+        true,
+    )
+}
+
+fn persist_agent_admission(
+    state: &AutonomyRuntimeState,
+    agent: &AutonomyAgentRecord,
+    cohort: Option<CohortEpochAdmission>,
+) -> std::io::Result<()> {
     let Some(store) = state.supervisor_store.as_ref() else {
-        return;
+        return Ok(());
     };
     let group_id = agent_continuation_group_id(agent);
     let observed_at_ms = now_ms_u64();
     let mut group = SupervisedGroupRecord::new(group_id.clone(), observed_at_ms);
     group.parent_session_id = Some(agent.session_id.to_string());
     group.objective = agent.last_task.clone();
-    let _ = store.record_group_registered(group);
-
     let mut child = ChildAgentRecord::new(group_id, agent.agent_id.clone(), observed_at_ms);
     child.label = Some(agent.nickname.clone());
     child.profile_id = Some(agent.profile_id.clone());
     child.task = agent.last_task.clone();
     child.workspace_path = agent.cwd.clone();
-    child.status = ChildStatus::Running;
     child.metadata = supervisor_metadata_for_agent(agent);
-    let _ = store.record_child_started(child);
+    child.terminal = match agent.status.as_str() {
+        "completed" => Some(TerminalState::completed(
+            observed_at_ms,
+            agent.last_task.clone(),
+        )),
+        "failed" => Some(TerminalState::failed(
+            observed_at_ms,
+            None,
+            agent.last_task.clone(),
+        )),
+        "interrupted" | "closed" => Some(TerminalState::cancelled(
+            observed_at_ms,
+            agent.last_task.clone(),
+        )),
+        _ => None,
+    };
+    child.status = match agent.status.as_str() {
+        "completed" => ChildStatus::Completed,
+        "failed" => ChildStatus::Failed,
+        "interrupted" | "closed" => ChildStatus::Cancelled,
+        _ => ChildStatus::Running,
+    };
+    store.record_agent_admitted(group, child, cohort)?;
+    Ok(())
+}
+
+fn persist_agent_started(
+    state: &AutonomyRuntimeState,
+    agent: &AutonomyAgentRecord,
+) -> std::io::Result<()> {
+    persist_agent_admission(state, agent, None)
 }
 
 fn persist_agent_terminal(state: &AutonomyRuntimeState, agent: &AutonomyAgentRecord) {
-    let Some(store) = state.supervisor_store.as_ref() else {
-        return;
-    };
-    persist_agent_started(state, agent);
-    let group_id = agent_continuation_group_id(agent);
-    let finished_at_ms = now_ms_u64();
-    let terminal = match agent.status.as_str() {
-        "completed" => TerminalState::completed(finished_at_ms, agent.last_task.clone()),
-        "failed" => TerminalState::failed(finished_at_ms, None, agent.last_task.clone()),
-        "interrupted" | "closed" => {
-            TerminalState::cancelled(finished_at_ms, agent.last_task.clone())
-        }
-        _ => return,
-    };
-    let _ = store.record_child_terminal(group_id, agent.agent_id.clone(), terminal);
+    if let Err(error) = persist_agent_started(state, agent) {
+        tracing::warn!(agent_id = %agent.agent_id, %error, "terminal child snapshot persist failed");
+    }
 }
 
 fn persist_agent_heartbeat(
@@ -17301,7 +17376,10 @@ fn persist_agent_heartbeat(
     let Some(store) = state.supervisor_store.as_ref() else {
         return;
     };
-    persist_agent_started(state, agent);
+    if let Err(error) = persist_agent_started(state, agent) {
+        tracing::warn!(agent_id = %agent.agent_id, %error, "heartbeat child snapshot persist failed");
+        return;
+    }
     let group_id = agent_continuation_group_id(agent);
     let mut metadata = SupervisorMetadata::new();
     metadata.insert("backend_kind".into(), json!(agent.backend_kind));
@@ -18532,9 +18610,11 @@ fn supervisor_metadata_bool(metadata: &SupervisorMetadata, key: &str) -> Option<
 
 fn supervisor_metadata_for_agent(agent: &AutonomyAgentRecord) -> SupervisorMetadata {
     let mut metadata = SupervisorMetadata::new();
-    if let Some(scope) = agent.workspace_scope.as_ref() {
-        metadata.insert("workspace_scope".into(), json!(scope.key()));
-    }
+    // Explicit null also replaces an older scoped snapshot on a checked update.
+    metadata.insert(
+        "workspace_scope".into(),
+        json!(agent.workspace_scope.as_ref().map(WorkspaceScope::key)),
+    );
     metadata.insert("session_id".into(), json!(agent.session_id));
     metadata.insert("profile_id".into(), json!(agent.profile_id));
     metadata.insert("role".into(), json!(agent.role));
@@ -21846,6 +21926,185 @@ mod tests {
         }
     }
 
+    fn obstruct_admission_store(orch: &InProcessAgentOrchestrator, root: &Path) -> PathBuf {
+        orch.configure_supervisor_store(root).unwrap();
+        let events = orch
+            .state()
+            .supervisor_store
+            .as_ref()
+            .unwrap()
+            .events_path()
+            .to_path_buf();
+        std::fs::create_dir_all(&events).unwrap();
+        events
+    }
+
+    #[test]
+    fn admission_r5_generic_spawn_rejects_child_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let orch = InProcessAgentOrchestrator::default();
+        let events = obstruct_admission_store(&orch, dir.path());
+        let result = orch.spawn_agent(SpawnAgentRequest {
+            session_id: SessionKey::with_profile("tenant-a", "api", "admission-r5"),
+            profile_id: "tenant-a".into(),
+            parent_agent_id: Some("master".into()),
+            role: "reviewer".into(),
+            nickname: "reviewer".into(),
+            backend_kind: "native".into(),
+            task: "review".into(),
+            cwd: None,
+        });
+        assert!(
+            result.is_err(),
+            "a failed child write must reject spawn: {result:?}"
+        );
+        assert!(orch.state().agents.is_empty());
+        assert!(orch.state().scatter_join_state.is_empty());
+        assert!(orch.state().continuations.pending_items().next().is_none());
+        assert!(events.is_dir());
+    }
+
+    #[test]
+    fn admission_r5_mirror_error_is_observable_and_terminal_retry_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let orch = InProcessAgentOrchestrator::default();
+        let events = obstruct_admission_store(&orch, dir.path());
+        let source = octos_agent::TaskSupervisor::new();
+        let session = SessionKey::with_profile("tenant-a", "api", "mirror-admission-r5");
+        let id = source.register("shell", "mirror-r5", Some(&session.0));
+        source.mark_completed(&id, Vec::new());
+        let task = source.get_task(&id).unwrap();
+        let error = orch
+            .upsert_background_task_agent(&task, None)
+            .expect_err("mirror rejection differs from a stale gate");
+        assert!(error.message.contains("persist failed"));
+        assert!(orch.state().agents.is_empty());
+        assert!(orch.state().continuations.pending_items().next().is_none());
+        std::fs::remove_dir(&events).unwrap();
+        orch.upsert_background_task_agent(&task, None)
+            .unwrap()
+            .expect("retry admitted");
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).unwrap();
+        assert_eq!(
+            fresh
+                .state()
+                .agents
+                .get(&background_task_agent_id(&task))
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn admission_r5_failed_status_update_preserves_live_and_durable_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).unwrap();
+        let candidate = sample_agent("status-r5", "tenant-a");
+        orch.state()
+            .agents
+            .insert(candidate.agent_id.clone(), candidate.clone());
+        persist_agent_started(&orch.state(), &candidate).unwrap();
+        let store = SupervisorStore::new(dir.path());
+        let saved = dir.path().join("saved-events");
+        std::fs::rename(store.events_path(), &saved).unwrap();
+        std::fs::create_dir(store.events_path()).unwrap();
+        let error = orch
+            .set_agent_status(
+                &candidate.agent_id,
+                &candidate.session_id,
+                &candidate.profile_id,
+                "failed",
+                Some("new failed summary".into()),
+            )
+            .unwrap_err();
+        assert!(error.message.contains("persist failed"));
+        assert_eq!(
+            orch.state().agents.get(&candidate.agent_id).unwrap().status,
+            "running"
+        );
+        assert!(orch.state().continuations.pending_items().next().is_none());
+        std::fs::remove_dir(store.events_path()).unwrap();
+        std::fs::rename(saved, store.events_path()).unwrap();
+        let durable = store.load_state().unwrap();
+        assert_eq!(
+            durable.children.values().next().unwrap().status,
+            ChildStatus::Running
+        );
+        assert!(durable.children.values().next().unwrap().terminal.is_none());
+    }
+
+    struct AdmissionCountingProvider(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for AdmissionCountingProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            tools: &[octos_llm::ToolSpec],
+            config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            NativeMockProvider {
+                content: Ok("done".into()),
+            }
+            .chat(messages, tools, config)
+            .await
+        }
+        fn model_id(&self) -> &str {
+            "admission-counting"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_r5_native_rejects_before_worker_or_running_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let orch = InProcessAgentOrchestrator::default();
+        obstruct_admission_store(&orch, &dir.path().join("supervisor"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = Arc::new(ToolRegistry::with_builtins(dir.path()));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = orch
+            .run_native_specialist(NativeSpecialistLaunchRequest {
+                agent_id: Some("rejected-native".into()),
+                parent_agent_id: Some("master".into()),
+                session_id: SessionKey::with_profile("tenant-a", "api", "admission-r5"),
+                profile_id: "tenant-a".into(),
+                role: "reviewer".into(),
+                nickname: "reviewer".into(),
+                task: "review".into(),
+                cwd: dir.path().to_path_buf(),
+                llm: Arc::new(AdmissionCountingProvider(calls.clone())),
+                memory,
+                tools: tools.clone(),
+                system_prompt: None,
+                agent_config: None,
+                task_ledger_path: None,
+                event_tx: Some(tx),
+                dispatch_policy: None,
+            })
+            .await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "rejected admission must never poll a worker"
+        );
+        assert!(
+            result.is_err(),
+            "native launch must return the persistence error: {result:?}"
+        );
+        assert!(orch.state().agents.is_empty());
+        assert!(orch.state().cancellations.is_empty());
+        assert!(tools.supervisor().get_all_tasks().is_empty());
+        assert!(rx.try_recv().is_err(), "no successful agent notification");
+    }
+
     #[tokio::test]
     async fn native_specialist_run_is_model_backed_and_emits_appui_events() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -23480,9 +23739,13 @@ mod tests {
             workspace_root: None,
         };
 
-        let (_, agent) = upsert_background_task_agent(&task, None).expect("task should mirror");
+        let (_, agent) = upsert_background_task_agent(&task, None)
+            .unwrap()
+            .expect("task should mirror");
         // Second upsert (status refresh) must not duplicate the output.
-        upsert_background_task_agent(&task, None).expect("re-upsert mirrors");
+        upsert_background_task_agent(&task, None)
+            .unwrap()
+            .expect("re-upsert mirrors");
 
         let agent_id = agent["agent_id"].as_str().expect("agent id").to_owned();
         let output = default_agent_orchestrator()
@@ -23550,8 +23813,9 @@ mod tests {
             workspace_root: None,
         };
 
-        let (mirrored_session, agent) =
-            upsert_background_task_agent(&task, None).expect("task should mirror");
+        let (mirrored_session, agent) = upsert_background_task_agent(&task, None)
+            .unwrap()
+            .expect("task should mirror");
 
         assert_eq!(mirrored_session, session_id);
         assert_eq!(agent["status"], json!("completed"));
@@ -23607,11 +23871,11 @@ mod tests {
         };
 
         // First terminal transition (completed) enqueues ChildCompleted.
-        orchestrator.upsert_agent(upsert("completed"));
+        orchestrator.upsert_agent(upsert("completed")).unwrap();
         // A terminal-status CHANGE (completed → failed) would re-enqueue a
         // ChildCompleted under the auto key (different `status`/`summary`
         // metadata). The explicit identity key must collapse it.
-        orchestrator.upsert_agent(upsert("failed"));
+        orchestrator.upsert_agent(upsert("failed")).unwrap();
 
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
@@ -23662,9 +23926,9 @@ mod tests {
         // scatter). NO drain, NO tombstones — then the process "exits".
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("agent-1", "running"));
-        first.upsert_agent(upsert("agent-2", "running"));
-        first.upsert_agent(upsert("agent-1", "completed"));
+        first.upsert_agent(upsert("agent-1", "running")).unwrap();
+        first.upsert_agent(upsert("agent-2", "running")).unwrap();
+        first.upsert_agent(upsert("agent-1", "completed")).unwrap();
         let pending = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-sj",
@@ -23685,7 +23949,7 @@ mod tests {
         // already terminal) reaches all-terminal and the ScatterJoinComplete
         // must enqueue DESPITE agent-1's child mark — the child mark only
         // suppresses agent-1's OWN ChildCompleted re-enqueue.
-        fresh.upsert_agent(upsert("agent-2", "completed"));
+        fresh.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = fresh.drain_ready_continuations_for_session(
             &session_id,
             "tenant-sj",
@@ -23751,12 +24015,20 @@ mod tests {
             } else {
                 "/tmp/ws-b"
             };
-            first.upsert_agent(upsert(agent, "running", cwd));
+            first.upsert_agent(upsert(agent, "running", cwd)).unwrap();
         }
-        first.upsert_agent(upsert("ws-a-1", "completed", "/tmp/ws-a"));
-        first.upsert_agent(upsert("ws-a-2", "completed", "/tmp/ws-a"));
-        first.upsert_agent(upsert("ws-b-1", "completed", "/tmp/ws-b"));
-        first.upsert_agent(upsert("ws-b-2", "completed", "/tmp/ws-b"));
+        first
+            .upsert_agent(upsert("ws-a-1", "completed", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("ws-a-2", "completed", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("ws-b-1", "completed", "/tmp/ws-b"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("ws-b-2", "completed", "/tmp/ws-b"))
+            .unwrap();
         {
             let state = first.state();
             for cwd in ["/tmp/ws-a", "/tmp/ws-b"] {
@@ -23876,10 +24148,18 @@ mod tests {
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
         // Workspace A: two children join at epoch 0 and drain.
-        first.upsert_agent(upsert("a-1", "running", "/tmp/ws-a"));
-        first.upsert_agent(upsert("a-2", "running", "/tmp/ws-a"));
-        first.upsert_agent(upsert("a-1", "completed", "/tmp/ws-a"));
-        first.upsert_agent(upsert("a-2", "completed", "/tmp/ws-a"));
+        first
+            .upsert_agent(upsert("a-1", "running", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("a-2", "running", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("a-1", "completed", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("a-2", "completed", "/tmp/ws-a"))
+            .unwrap();
         let drained_first = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-wb",
@@ -23895,7 +24175,9 @@ mod tests {
         // Now a NEW child is admitted under workspace B. Pre-#19 the
         // group-keyed `last_joined_key.is_some()` saw A's join and bumped the
         // SHARED epoch to 1; the fix keeps A at epoch 0 and B untouched.
-        first.upsert_agent(upsert("b-1", "running", "/tmp/ws-b"));
+        first
+            .upsert_agent(upsert("b-1", "running", "/tmp/ws-b"))
+            .unwrap();
         {
             let state = first.state();
             let cohort_a =
@@ -23916,7 +24198,9 @@ mod tests {
             );
         }
         // B completes its roster → B joins at its OWN epoch 0.
-        first.upsert_agent(upsert("b-1", "completed", "/tmp/ws-b"));
+        first
+            .upsert_agent(upsert("b-1", "completed", "/tmp/ws-b"))
+            .unwrap();
         {
             let state = first.state();
             let cohort_b =
@@ -24016,18 +24300,38 @@ mod tests {
         first.configure_supervisor_store(dir.path()).expect("store");
         // Workspace A: epoch-0 join (a-1, a-2), then a-3's re-admission bumps
         // A's cohort to epoch 1 and its completion persists the epoch-1 join.
-        first.upsert_agent(upsert("a-1", "running", "/tmp/ws-a"));
-        first.upsert_agent(upsert("a-2", "running", "/tmp/ws-a"));
-        first.upsert_agent(upsert("a-1", "completed", "/tmp/ws-a"));
-        first.upsert_agent(upsert("a-2", "completed", "/tmp/ws-a"));
+        first
+            .upsert_agent(upsert("a-1", "running", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("a-2", "running", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("a-1", "completed", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("a-2", "completed", "/tmp/ws-a"))
+            .unwrap();
         // Workspace B: epoch-0 join (b-1, b-2).
-        first.upsert_agent(upsert("b-1", "running", "/tmp/ws-b"));
-        first.upsert_agent(upsert("b-2", "running", "/tmp/ws-b"));
-        first.upsert_agent(upsert("b-1", "completed", "/tmp/ws-b"));
-        first.upsert_agent(upsert("b-2", "completed", "/tmp/ws-b"));
+        first
+            .upsert_agent(upsert("b-1", "running", "/tmp/ws-b"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("b-2", "running", "/tmp/ws-b"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("b-1", "completed", "/tmp/ws-b"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("b-2", "completed", "/tmp/ws-b"))
+            .unwrap();
         // A re-admission → bump to epoch 1 → A's epoch-1 join.
-        first.upsert_agent(upsert("a-3", "running", "/tmp/ws-a"));
-        first.upsert_agent(upsert("a-3", "completed", "/tmp/ws-a"));
+        first
+            .upsert_agent(upsert("a-3", "running", "/tmp/ws-a"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("a-3", "completed", "/tmp/ws-a"))
+            .unwrap();
         // Drain in a LOOP (SF1 epoch-ordered turns): A's epoch-0 children are
         // folded into A's LATEST (epoch-1) join carrier while B's epoch-0
         // join delivers as its own item keyed under B's cwd_hash — one turn
@@ -24247,11 +24551,11 @@ mod tests {
         // the process "exits" in the crash window.
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("agent-1", "running"));
-        first.upsert_agent(upsert("agent-2", "running"));
-        first.upsert_agent(upsert("agent-1", "completed"));
+        first.upsert_agent(upsert("agent-1", "running")).unwrap();
+        first.upsert_agent(upsert("agent-2", "running")).unwrap();
+        first.upsert_agent(upsert("agent-1", "completed")).unwrap();
         first.set_force_scatter_persist_failure_for_test(true);
-        first.upsert_agent(upsert("agent-2", "completed"));
+        first.upsert_agent(upsert("agent-2", "completed")).unwrap();
         {
             let state = first.state();
             let join_group = format!("agent-group:tenant-spf:{}:master", session_id);
@@ -24380,6 +24684,7 @@ mod tests {
         let task = make_task(None);
         let (_, agent) = first
             .upsert_background_task_agent(&task, None)
+            .unwrap()
             .expect("task should mirror");
         let agent_id = agent["agent_id"].as_str().expect("agent id").to_owned();
         drop(first);
@@ -24417,11 +24722,16 @@ mod tests {
         let refreshed = make_task(Some(
             "Status: SUCCESS\n\nREVIEW BODY: refreshed after restart",
         ));
+        let (_, event_agent) = fresh
+            .upsert_background_task_agent(&refreshed, None)
+            .unwrap()
+            .expect("the Queued-seeded mark must NOT gate the terminal re-forward");
         assert!(
-            fresh
-                .upsert_background_task_agent(&refreshed, None)
-                .is_some(),
-            "the Queued-seeded mark must NOT gate the terminal re-forward"
+            event_agent["output_tail"]
+                .as_str()
+                .unwrap()
+                .contains("REVIEW BODY: refreshed after restart"),
+            "the successful notification must carry the refreshed output: {event_agent}"
         );
         let output = fresh
             .read_agent_output(AgentOutputRequest {
@@ -24484,10 +24794,10 @@ mod tests {
             profile_id: "tenant-sc".to_owned(),
         };
 
-        orchestrator.upsert_agent(upsert("failed"));
+        orchestrator.upsert_agent(upsert("failed")).unwrap();
         // No drain: the failed ChildCompleted is still pending when the
         // correction lands.
-        orchestrator.upsert_agent(upsert("completed"));
+        orchestrator.upsert_agent(upsert("completed")).unwrap();
 
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
@@ -24544,7 +24854,7 @@ mod tests {
             profile_id: "tenant-rw".to_owned(),
         };
 
-        orchestrator.upsert_agent(upsert("completed"));
+        orchestrator.upsert_agent(upsert("completed")).unwrap();
         // Drain claims the identity key (records the recently-claimed guard).
         let first = orchestrator.drain_ready_continuations_for_session(
             &session_id,
@@ -24559,7 +24869,7 @@ mod tests {
             "the initial terminal mark drains"
         );
         // IMMEDIATELY correct the status — well inside the 2s reclaim window.
-        orchestrator.upsert_agent(upsert("failed"));
+        orchestrator.upsert_agent(upsert("failed")).unwrap();
         let second = orchestrator.drain_ready_continuations_for_session(
             &session_id,
             "tenant-rw",
@@ -24609,10 +24919,10 @@ mod tests {
 
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("failed"));
+        first.upsert_agent(upsert("failed")).unwrap();
         // Correct before any drain: the pending payload is replaced AND the
         // durable record is persisted with attempt=2.
-        first.upsert_agent(upsert("completed"));
+        first.upsert_agent(upsert("completed")).unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-sr",
@@ -24651,7 +24961,7 @@ mod tests {
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-sr");
         assert_eq!(baseline, 0, "nothing undelivered to recover at boot");
         fresh.forget_agent_for_test(&agent_id);
-        fresh.upsert_agent(upsert("completed"));
+        fresh.upsert_agent(upsert("completed")).unwrap();
         // The agent record was forgotten → treated as a NEW admission into
         // the already-joined group, which correctly bumps the epoch and
         // enqueues a new-epoch ScatterJoinComplete (exactly 1 item). The
@@ -24664,7 +24974,7 @@ mod tests {
         );
         // A NEW correction (back to failed) still re-enters and delivers.
         fresh.forget_agent_for_test(&agent_id);
-        fresh.upsert_agent(upsert("failed"));
+        fresh.upsert_agent(upsert("failed")).unwrap();
         let corrected = fresh.drain_ready_continuations_for_session(
             &session_id,
             "tenant-sr",
@@ -24733,12 +25043,24 @@ mod tests {
         // - child B: completed (attempt 1) — with A, two same-scope pending
         //   ChildCompleted items and NO scatter (C never goes terminal, so the
         //   group never joins and no ScatterJoinComplete can be the carrier).
-        orchestrator.upsert_agent(upsert("agent-a", "running"));
-        orchestrator.upsert_agent(upsert("agent-b", "running"));
-        orchestrator.upsert_agent(upsert("agent-c", "running"));
-        orchestrator.upsert_agent(upsert("agent-a", "failed"));
-        orchestrator.upsert_agent(upsert("agent-a", "completed"));
-        orchestrator.upsert_agent(upsert("agent-b", "completed"));
+        orchestrator
+            .upsert_agent(upsert("agent-a", "running"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-b", "running"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-c", "running"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-a", "failed"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-a", "completed"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-b", "completed"))
+            .unwrap();
 
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
@@ -24872,10 +25194,18 @@ mod tests {
         // revision 2 — the mark now sits ABOVE 1 so the purge's old
         // reset-to-1 is observable. Child Y keeps the group from joining
         // (no scatter noise in the assertions).
-        orchestrator.upsert_agent(upsert("agent-x", "running"));
-        orchestrator.upsert_agent(upsert("agent-y", "running"));
-        orchestrator.upsert_agent(upsert("agent-x", "completed"));
-        orchestrator.upsert_agent(upsert("agent-x", "failed"));
+        orchestrator
+            .upsert_agent(upsert("agent-x", "running"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-y", "running"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-x", "completed"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("agent-x", "failed"))
+            .unwrap();
         assert_eq!(
             orchestrator.delivered_child_mark_for_test(&child_x_key),
             Some(("failed".to_owned(), 2, false)),
@@ -24903,7 +25233,9 @@ mod tests {
         // the old reset-to-1 would have allocated attempt 2, colliding with
         // the purged record's event id, and even attempt 2 behind the
         // tombstone would be rank-dropped on replay).
-        orchestrator.upsert_agent(upsert("agent-x", "completed"));
+        orchestrator
+            .upsert_agent(upsert("agent-x", "completed"))
+            .unwrap();
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
             "tenant-u2",
@@ -24971,7 +25303,7 @@ mod tests {
 
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("completed"));
+        first.upsert_agent(upsert("completed")).unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-dd",
@@ -25009,7 +25341,7 @@ mod tests {
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd");
         assert_eq!(baseline, 0, "nothing undelivered to recover at boot");
         fresh.forget_agent_for_test(&agent_id);
-        fresh.upsert_agent(upsert("completed"));
+        fresh.upsert_agent(upsert("completed")).unwrap();
         // The agent record was forgotten → treated as a NEW admission into
         // the already-joined group, which correctly bumps the epoch and
         // enqueues a new-epoch ScatterJoinComplete (exactly 1 item). The
@@ -25023,7 +25355,7 @@ mod tests {
 
         // A genuine correction (different terminal status) still re-enters.
         fresh.forget_agent_for_test(&agent_id);
-        fresh.upsert_agent(upsert("failed"));
+        fresh.upsert_agent(upsert("failed")).unwrap();
         assert!(
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd")
                 > baseline,
@@ -25059,10 +25391,10 @@ mod tests {
         // drains; mark everything delivered so nothing replays.
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("agent-1", "running"));
-        first.upsert_agent(upsert("agent-2", "running"));
-        first.upsert_agent(upsert("agent-1", "completed"));
-        first.upsert_agent(upsert("agent-2", "completed"));
+        first.upsert_agent(upsert("agent-1", "running")).unwrap();
+        first.upsert_agent(upsert("agent-2", "running")).unwrap();
+        first.upsert_agent(upsert("agent-1", "completed")).unwrap();
+        first.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-rs",
@@ -25102,7 +25434,9 @@ mod tests {
         fresh_b
             .configure_supervisor_store(dir.path())
             .expect("store");
-        fresh_b.upsert_agent(upsert("agent-3", "completed"));
+        fresh_b
+            .upsert_agent(upsert("agent-3", "completed"))
+            .unwrap();
         let drained_b = fresh_b.drain_ready_continuations_for_session(
             &session_id,
             "tenant-rs",
@@ -25185,20 +25519,22 @@ mod tests {
         let session_id = SessionKey::with_profile("tenant-co", "api", "coalesce");
         for idx in 0..3 {
             let agent_id = format!("task-coalesce-{idx}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: format!("co-{idx}"),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(format!("done {idx}")),
-                cwd: None,
-                profile_id: "tenant-co".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("co-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {idx}")),
+                    cwd: None,
+                    profile_id: "tenant-co".to_owned(),
+                })
+                .unwrap();
         }
         let pending_before =
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-co");
@@ -25263,20 +25599,22 @@ mod tests {
             .expect("store");
         for idx in 0..3 {
             let agent_id = format!("task-restart-{idx}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: format!("rs-{idx}"),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(format!("done {idx}")),
-                cwd: None,
-                profile_id: "tenant-rs".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("rs-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {idx}")),
+                    cwd: None,
+                    profile_id: "tenant-rs".to_owned(),
+                })
+                .unwrap();
         }
         let pending_before =
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-rs");
@@ -25377,20 +25715,22 @@ mod tests {
             .expect("store");
         for idx in 0..3 {
             let agent_id = format!("task-abort-{idx}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: format!("ab-{idx}"),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(format!("done {idx}")),
-                cwd: None,
-                profile_id: "tenant-ab".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("ab-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {idx}")),
+                    cwd: None,
+                    profile_id: "tenant-ab".to_owned(),
+                })
+                .unwrap();
         }
         let pending_before =
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ab");
@@ -25470,20 +25810,22 @@ mod tests {
         let session_id = SessionKey::with_profile("tenant-ls", "api", "latest-scatter");
         for idx in 0..3 {
             let agent_id = format!("task-latest-{idx}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: format!("ls-{idx}"),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(format!("done {idx}")),
-                cwd: None,
-                profile_id: "tenant-ls".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("ls-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {idx}")),
+                    cwd: None,
+                    profile_id: "tenant-ls".to_owned(),
+                })
+                .unwrap();
         }
 
         let drained = orchestrator.drain_ready_continuations_for_session(
@@ -25543,20 +25885,22 @@ mod tests {
         let session_id = SessionKey::with_profile("tenant-uc", "api", "unique-count");
         for idx in 0..3 {
             let agent_id = format!("task-unique-{idx}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: format!("uc-{idx}"),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(format!("done {idx}")),
-                cwd: None,
-                profile_id: "tenant-uc".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("uc-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {idx}")),
+                    cwd: None,
+                    profile_id: "tenant-uc".to_owned(),
+                })
+                .unwrap();
         }
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
@@ -25587,20 +25931,22 @@ mod tests {
         for cwd in ["/tmp/ug-a", "/tmp/ug-b"] {
             for idx in 0..2 {
                 let agent_id = format!("task-{cwd}-{idx}").replace('/', "-");
-                orchestrator.upsert_agent(AgentUpsert {
-                    agent_id: agent_id.clone(),
-                    parent_agent_id: Some("master".to_owned()),
-                    session_id: session_id.clone(),
-                    task_id: None,
-                    path: format!("master/{agent_id}"),
-                    role: "background_task".to_owned(),
-                    nickname: agent_id.clone(),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                    status: "completed".to_owned(),
-                    last_task: Some(format!("done {agent_id}")),
-                    cwd: Some(cwd.to_owned()),
-                    profile_id: "tenant-ug".to_owned(),
-                });
+                orchestrator
+                    .upsert_agent(AgentUpsert {
+                        agent_id: agent_id.clone(),
+                        parent_agent_id: Some("master".to_owned()),
+                        session_id: session_id.clone(),
+                        task_id: None,
+                        path: format!("master/{agent_id}"),
+                        role: "background_task".to_owned(),
+                        nickname: agent_id.clone(),
+                        backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                        status: "completed".to_owned(),
+                        last_task: Some(format!("done {agent_id}")),
+                        cwd: Some(cwd.to_owned()),
+                        profile_id: "tenant-ug".to_owned(),
+                    })
+                    .unwrap();
             }
         }
         let first = orchestrator.drain_ready_continuations_for_session(
@@ -25641,20 +25987,22 @@ mod tests {
         let summary: String = "s".repeat(COALESCED_CHILD_SUMMARY_CHARS + 20);
         for idx in 0..60 {
             let agent_id = format!("task-nt-{idx}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: format!("nt-{idx}"),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(summary.clone()),
-                cwd: None,
-                profile_id: "tenant-nt".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("nt-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(summary.clone()),
+                    cwd: None,
+                    profile_id: "tenant-nt".to_owned(),
+                })
+                .unwrap();
         }
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
@@ -25716,20 +26064,22 @@ mod tests {
             .expect("store");
         for idx in 0..3 {
             let agent_id = format!("task-tf-{idx}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: format!("tf-{idx}"),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(format!("done {idx}")),
-                cwd: None,
-                profile_id: "tenant-tf".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("tf-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {idx}")),
+                    cwd: None,
+                    profile_id: "tenant-tf".to_owned(),
+                })
+                .unwrap();
         }
         orchestrator.set_force_tombstone_failure_once_for_test(true);
         let drained = orchestrator.drain_ready_continuations_for_session(
@@ -25792,20 +26142,22 @@ mod tests {
         for parent in ["master-a", "master-b"] {
             for idx in 0..2 {
                 let agent_id = format!("task-{parent}-{idx}");
-                orchestrator.upsert_agent(AgentUpsert {
-                    agent_id: agent_id.clone(),
-                    parent_agent_id: Some(parent.to_owned()),
-                    session_id: session_id.clone(),
-                    task_id: None,
-                    path: format!("{parent}/{agent_id}"),
-                    role: "background_task".to_owned(),
-                    nickname: format!("{parent}-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                    status: "completed".to_owned(),
-                    last_task: Some(format!("done {agent_id}")),
-                    cwd: None,
-                    profile_id: "tenant-bg".to_owned(),
-                });
+                orchestrator
+                    .upsert_agent(AgentUpsert {
+                        agent_id: agent_id.clone(),
+                        parent_agent_id: Some(parent.to_owned()),
+                        session_id: session_id.clone(),
+                        task_id: None,
+                        path: format!("{parent}/{agent_id}"),
+                        role: "background_task".to_owned(),
+                        nickname: format!("{parent}-{idx}"),
+                        backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                        status: "completed".to_owned(),
+                        last_task: Some(format!("done {agent_id}")),
+                        cwd: None,
+                        profile_id: "tenant-bg".to_owned(),
+                    })
+                    .unwrap();
             }
         }
 
@@ -25885,20 +26237,22 @@ mod tests {
         for cwd in ["/tmp/ws-a", "/tmp/ws-b"] {
             for idx in 0..2 {
                 let agent_id = format!("task-{cwd}-{idx}").replace('/', "-");
-                orchestrator.upsert_agent(AgentUpsert {
-                    agent_id: agent_id.clone(),
-                    parent_agent_id: Some("master".to_owned()),
-                    session_id: session_id.clone(),
-                    task_id: None,
-                    path: format!("master/{agent_id}"),
-                    role: "background_task".to_owned(),
-                    nickname: agent_id.clone(),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                    status: "completed".to_owned(),
-                    last_task: Some(format!("done {agent_id}")),
-                    cwd: Some(cwd.to_owned()),
-                    profile_id: "tenant-bw".to_owned(),
-                });
+                orchestrator
+                    .upsert_agent(AgentUpsert {
+                        agent_id: agent_id.clone(),
+                        parent_agent_id: Some("master".to_owned()),
+                        session_id: session_id.clone(),
+                        task_id: None,
+                        path: format!("master/{agent_id}"),
+                        role: "background_task".to_owned(),
+                        nickname: agent_id.clone(),
+                        backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                        status: "completed".to_owned(),
+                        last_task: Some(format!("done {agent_id}")),
+                        cwd: Some(cwd.to_owned()),
+                        profile_id: "tenant-bw".to_owned(),
+                    })
+                    .unwrap();
             }
         }
 
@@ -26082,7 +26436,7 @@ mod tests {
         // A pending burst: three children, undelivered — 3 ChildCompleted +
         // 1 ScatterJoinComplete (all-terminal edge on the third upsert).
         for agent_id in ["agent-1", "agent-2", "agent-3"] {
-            orchestrator.upsert_agent(upsert(agent_id));
+            orchestrator.upsert_agent(upsert(agent_id)).unwrap();
         }
         let pending_before = orchestrator
             .pending_continuation_count_for_session_for_test(&session_id, "tenant-stop");
@@ -26113,7 +26467,7 @@ mod tests {
 
         // A same-status re-forward of one purged child in the SAME process
         // must not re-enqueue: the purge stamped its delivered mark.
-        orchestrator.upsert_agent(upsert("agent-1"));
+        orchestrator.upsert_agent(upsert("agent-1")).unwrap();
         assert_eq!(
             orchestrator
                 .pending_continuation_count_for_session_for_test(&session_id, "tenant-stop"),
@@ -26140,7 +26494,7 @@ mod tests {
         // `delivered_terminal_mark_is_durable_across_fresh_roster_and_process`
         // pins; the purge never suppresses genuinely new work.
         fresh.forget_agent_for_test("agent-2");
-        fresh.upsert_agent(upsert("agent-2"));
+        fresh.upsert_agent(upsert("agent-2")).unwrap();
         let reenqueue =
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-stop");
         assert_eq!(
@@ -26196,7 +26550,9 @@ mod tests {
         // completion of a group bumps the join epoch, #2102).
         for profile_id in ["tenant-scope-a", "tenant-scope-b"] {
             for idx in 0..2 {
-                orchestrator.upsert_agent(upsert(&format!("agent-{profile_id}-{idx}"), profile_id));
+                orchestrator
+                    .upsert_agent(upsert(&format!("agent-{profile_id}-{idx}"), profile_id))
+                    .unwrap();
             }
         }
         assert_eq!(
@@ -26286,10 +26642,14 @@ mod tests {
         for cwd in ["/tmp/ws-a", "/tmp/ws-b"] {
             for idx in 0..2 {
                 let agent_id = format!("agent-{}-{idx}", cwd.replace('/', "-"));
-                orchestrator.upsert_agent(upsert(&agent_id, Some(cwd)));
+                orchestrator
+                    .upsert_agent(upsert(&agent_id, Some(cwd)))
+                    .unwrap();
             }
         }
-        orchestrator.upsert_agent(upsert("agent-unstamped", None));
+        orchestrator
+            .upsert_agent(upsert("agent-unstamped", None))
+            .unwrap();
         // ws-a: 2 child + 2 epoch-bumped joins; ws-b: same; unstamped: 1
         // child + 1 join (the unstamped child joins its own group).
         assert_eq!(
@@ -26406,7 +26766,9 @@ mod tests {
         let sink = orchestrator.clone();
         supervisor.set_on_terminal(move |event| {
             if matches!(event.outcome, octos_agent::TerminalOutcome::Completed) {
-                let _ = sink.upsert_background_task_agent(&event.task, Some(profile));
+                let _ = sink
+                    .upsert_background_task_agent(&event.task, Some(profile))
+                    .unwrap();
             }
         });
         task_id
@@ -26647,8 +27009,12 @@ mod tests {
         // records.
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("task-stale-a", "completed"));
-        first.upsert_agent(upsert("task-stale-b", "completed"));
+        first
+            .upsert_agent(upsert("task-stale-a", "completed"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("task-stale-b", "completed"))
+            .unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-stale",
@@ -26740,6 +27106,7 @@ mod tests {
             assert!(
                 fresh
                     .upsert_background_task_agent(&task, Some("tenant-stale"))
+                    .unwrap()
                     .is_none(),
                 "stale re-forward of {task_id} against a store-seeded mark must be gated out"
             );
@@ -26781,7 +27148,7 @@ mod tests {
         // and the joined-group state exist; drain + tombstone.
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("task-old"));
+        first.upsert_agent(upsert("task-old")).unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-fresh",
@@ -26817,6 +27184,7 @@ mod tests {
         assert!(
             fresh
                 .upsert_background_task_agent(&task, Some("tenant-fresh"))
+                .unwrap()
                 .is_some(),
             "an in-process (non-seeded) mark must NEVER gate the upsert"
         );
@@ -29894,6 +30262,7 @@ mod tests {
         // Reconcile under the profile the turn actually runs under ("coding"),
         // exactly as `forward_task_progress_to_channel` now threads it.
         let (mirrored_session, agent) = upsert_background_task_agent(&task, Some("coding"))
+            .unwrap()
             .expect("terminal background task should mirror to an agent record");
         assert_eq!(mirrored_session, session_id);
         assert_eq!(
@@ -29955,20 +30324,22 @@ mod tests {
     fn unscoped_due_loop_targets_surfaces_continuation_a_scoped_connection_skips() {
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_id = SessionKey("gap1-unscoped-sweep".into());
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-x".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-x".into(),
-            role: "worker".into(),
-            nickname: "Xena".into(),
-            backend_kind: "native".into(),
-            status: "completed".into(),
-            last_task: Some("done".into()),
-            cwd: None,
-            profile_id: "coding".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-x".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-x".into(),
+                role: "worker".into(),
+                nickname: "Xena".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("done".into()),
+                cwd: None,
+                profile_id: "coding".into(),
+            })
+            .unwrap();
 
         // A connection scoped to a DIFFERENT profile never surfaces it — this
         // is the gap: with no coding-scoped connection open, nothing drains it.
@@ -30003,20 +30374,22 @@ mod tests {
         let deferred = SessionKey("gap1-deferred-no-workspace".into());
         let runnable = SessionKey("gap1-runnable-has-workspace".into());
         for (session, agent_id) in [(&deferred, "child-d"), (&runnable, "child-r")] {
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.to_string(),
-                parent_agent_id: Some("master".into()),
-                session_id: session.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "worker".into(),
-                nickname: "w".into(),
-                backend_kind: "native".into(),
-                status: "completed".into(),
-                last_task: Some("done".into()),
-                cwd: None,
-                profile_id: "coding".into(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.to_string(),
+                    parent_agent_id: Some("master".into()),
+                    session_id: session.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "worker".into(),
+                    nickname: "w".into(),
+                    backend_kind: "native".into(),
+                    status: "completed".into(),
+                    last_task: Some("done".into()),
+                    cwd: None,
+                    profile_id: "coding".into(),
+                })
+                .unwrap();
         }
 
         // Only `runnable` passes the predicate; `deferred` must be skipped
@@ -30049,8 +30422,8 @@ mod tests {
             profile_id: "tenant-a".into(),
         };
 
-        orchestrator.upsert_agent(upsert.clone());
-        orchestrator.upsert_agent(upsert);
+        orchestrator.upsert_agent(upsert.clone()).unwrap();
+        orchestrator.upsert_agent(upsert).unwrap();
 
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
@@ -30071,34 +30444,38 @@ mod tests {
         let orchestrator = InProcessAgentOrchestrator::default();
         let session_a = SessionKey::with_profile("tenant-a", "api", "scope-a");
         let session_b = SessionKey::with_profile("tenant-b", "api", "scope-b");
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-a".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_a.clone(),
-            task_id: None,
-            path: "master/child-a".into(),
-            role: "worker".into(),
-            nickname: "Ada".into(),
-            backend_kind: "native".into(),
-            status: "completed".into(),
-            last_task: Some("done a".into()),
-            cwd: None,
-            profile_id: "tenant-a".into(),
-        });
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-b".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_b.clone(),
-            task_id: None,
-            path: "master/child-b".into(),
-            role: "worker".into(),
-            nickname: "Hypatia".into(),
-            backend_kind: "native".into(),
-            status: "completed".into(),
-            last_task: Some("done b".into()),
-            cwd: None,
-            profile_id: "tenant-b".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-a".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_a.clone(),
+                task_id: None,
+                path: "master/child-a".into(),
+                role: "worker".into(),
+                nickname: "Ada".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("done a".into()),
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-b".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_b.clone(),
+                task_id: None,
+                path: "master/child-b".into(),
+                role: "worker".into(),
+                nickname: "Hypatia".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("done b".into()),
+                cwd: None,
+                profile_id: "tenant-b".into(),
+            })
+            .unwrap();
 
         let busy = orchestrator.drain_ready_continuations_for_session(
             &session_a,
@@ -37097,20 +37474,22 @@ mod tests {
             .configure_supervisor_store(&store_dir)
             .expect("configure store");
         let session_id = SessionKey::with_profile("tenant-a", "api", "restore-agents");
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-restore".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-restore".into(),
-            role: "reviewer".into(),
-            nickname: "Curie".into(),
-            backend_kind: "native".into(),
-            status: "running".into(),
-            last_task: Some("review auth module".into()),
-            cwd: Some("/tmp/project".into()),
-            profile_id: "tenant-a".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-restore".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-restore".into(),
+                role: "reviewer".into(),
+                nickname: "Curie".into(),
+                backend_kind: "native".into(),
+                status: "running".into(),
+                last_task: Some("review auth module".into()),
+                cwd: Some("/tmp/project".into()),
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
         orchestrator
             .set_agent_artifacts(
                 "child-restore",
@@ -37128,20 +37507,22 @@ mod tests {
             .expect("persist artifact");
         // A sibling that finished BEFORE the restart must keep its real
         // terminal status through the replay.
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-done".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-done".into(),
-            role: "reviewer".into(),
-            nickname: "Noether".into(),
-            backend_kind: "native".into(),
-            status: "completed".into(),
-            last_task: Some("review persistence module".into()),
-            cwd: Some("/tmp/project".into()),
-            profile_id: "tenant-a".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-done".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-done".into(),
+                role: "reviewer".into(),
+                nickname: "Noether".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("review persistence module".into()),
+                cwd: Some("/tmp/project".into()),
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
 
         let restarted = InProcessAgentOrchestrator::default();
         restarted
@@ -37199,20 +37580,22 @@ mod tests {
 
         // A live upsert reusing the id makes the agent current again — it
         // must reappear in the roster.
-        restarted.upsert_agent(AgentUpsert {
-            agent_id: "child-restore".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-restore".into(),
-            role: "reviewer".into(),
-            nickname: "Curie".into(),
-            backend_kind: "native".into(),
-            status: "running".into(),
-            last_task: Some("second review pass".into()),
-            cwd: Some("/tmp/project".into()),
-            profile_id: "tenant-a".into(),
-        });
+        restarted
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-restore".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-restore".into(),
+                role: "reviewer".into(),
+                nickname: "Curie".into(),
+                backend_kind: "native".into(),
+                status: "running".into(),
+                last_task: Some("second review pass".into()),
+                cwd: Some("/tmp/project".into()),
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
         let relisted = restarted
             .list_agents(AgentListRequest {
                 session_id: Some(session_id),
@@ -37320,20 +37703,22 @@ mod tests {
             .configure_supervisor_store(&store_dir)
             .expect("configure store");
         let session_id = SessionKey::with_profile("tenant-a", "api", "durable");
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-a".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-a".into(),
-            role: "worker".into(),
-            nickname: "Ada".into(),
-            backend_kind: "native".into(),
-            status: "completed".into(),
-            last_task: Some("durable review done".into()),
-            cwd: None,
-            profile_id: "tenant-a".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-a".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-a".into(),
+                role: "worker".into(),
+                nickname: "Ada".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("durable review done".into()),
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 2);
 
         let restarted = InProcessAgentOrchestrator::default();
@@ -39417,20 +39802,22 @@ mod tests {
 
         // A staged peer, registered against the MASTER's session by #1868 and
         // mirrored here through `upsert_background_task_agent`.
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "peer-reviewer".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/peer-reviewer".into(),
-            role: "peer".into(),
-            nickname: "reviewer".into(),
-            backend_kind: PEER_HANDOFF_BACKEND_KIND.into(),
-            status: "running".into(),
-            last_task: None,
-            cwd: None,
-            profile_id: "tenant-a".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "peer-reviewer".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/peer-reviewer".into(),
+                role: "peer".into(),
+                nickname: "reviewer".into(),
+                backend_kind: PEER_HANDOFF_BACKEND_KIND.into(),
+                status: "running".into(),
+                last_task: None,
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
 
         assert!(
             !orchestrator.is_goal_dispatch_in_flight(&session_id),
@@ -39440,20 +39827,22 @@ mod tests {
         );
 
         // A genuine sub-agent on the same session still protects it.
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-running".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-running".into(),
-            role: "worker".into(),
-            nickname: "Ada".into(),
-            backend_kind: "native".into(),
-            status: "running".into(),
-            last_task: None,
-            cwd: None,
-            profile_id: "tenant-a".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-running".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-running".into(),
+                role: "worker".into(),
+                nickname: "Ada".into(),
+                backend_kind: "native".into(),
+                status: "running".into(),
+                last_task: None,
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
         assert!(
             orchestrator.is_goal_dispatch_in_flight(&session_id),
             "a real sub-agent must still hold the marker",
@@ -39478,20 +39867,22 @@ mod tests {
 
         // A child is RUNNING for this session — the parent turn is legitimately
         // blocked on it, emitting no tokens.
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-running".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-running".into(),
-            role: "worker".into(),
-            nickname: "Ada".into(),
-            backend_kind: "native".into(),
-            status: "running".into(),
-            last_task: None,
-            cwd: None,
-            profile_id: "tenant-a".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-running".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-running".into(),
+                role: "worker".into(),
+                nickname: "Ada".into(),
+                backend_kind: "native".into(),
+                status: "running".into(),
+                last_task: None,
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
         assert!(
             orchestrator.is_goal_dispatch_in_flight(&session_id),
             "a session with live supervised children must stay protected even \
@@ -39501,20 +39892,22 @@ mod tests {
 
         // Child reaches a terminal state: nothing is running, the aged marker
         // is abandoned again and the session is rescued as #2004 intends.
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-running".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-running".into(),
-            role: "worker".into(),
-            nickname: "Ada".into(),
-            backend_kind: "native".into(),
-            status: "completed".into(),
-            last_task: None,
-            cwd: None,
-            profile_id: "tenant-a".into(),
-        });
+        orchestrator
+            .upsert_agent(AgentUpsert {
+                agent_id: "child-running".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-running".into(),
+                role: "worker".into(),
+                nickname: "Ada".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: None,
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
         assert!(
             !orchestrator.is_goal_dispatch_in_flight(&session_id),
             "once every child is terminal the stale marker must stop holding the \
@@ -41003,8 +41396,12 @@ mod tests {
         orchestrator
             .configure_supervisor_store(dir.path())
             .expect("store");
-        orchestrator.upsert_agent(upsert("task-x", "x done"));
-        orchestrator.upsert_agent(upsert("task-y", "y done"));
+        orchestrator
+            .upsert_agent(upsert("task-x", "x done"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("task-y", "y done"))
+            .unwrap();
 
         // First drain: the two-child burst folds into ONE carrier counting
         // X and Y once each.
@@ -41046,7 +41443,9 @@ mod tests {
                 "the claimed carrier must requeue for redelivery"
             );
         }
-        orchestrator.upsert_agent(upsert("task-x", "x re-forwarded"));
+        orchestrator
+            .upsert_agent(upsert("task-x", "x re-forwarded"))
+            .unwrap();
 
         // Second drain: the carrier re-folds X's re-forwarded report. The
         // persisted child-id set must seed the dedup so X is NOT counted a
@@ -41116,8 +41515,8 @@ mod tests {
         // the "drained but never executed" pre-crash state.
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("task-a", "a done"));
-        first.upsert_agent(upsert("task-b", "b done"));
+        first.upsert_agent(upsert("task-a", "a done")).unwrap();
+        first.upsert_agent(upsert("task-b", "b done")).unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-cs",
@@ -41145,8 +41544,8 @@ mod tests {
         second
             .configure_supervisor_store(dir.path())
             .expect("store");
-        second.upsert_agent(upsert("task-c", "c done"));
-        second.upsert_agent(upsert("task-d", "d done"));
+        second.upsert_agent(upsert("task-c", "c done")).unwrap();
+        second.upsert_agent(upsert("task-d", "d done")).unwrap();
         let drained = second.drain_ready_continuations_for_session(
             &session_id,
             "tenant-cs",
@@ -41243,8 +41642,12 @@ mod tests {
         orchestrator
             .configure_supervisor_store(dir.path())
             .expect("store");
-        orchestrator.upsert_agent(upsert("task-a", "completed"));
-        orchestrator.upsert_agent(upsert("task-b", "failed"));
+        orchestrator
+            .upsert_agent(upsert("task-a", "completed"))
+            .unwrap();
+        orchestrator
+            .upsert_agent(upsert("task-b", "failed"))
+            .unwrap();
 
         // The burst folds into ONE carrier keyed on task-b (fold order:
         // A first, then B — the oldest-first batch makes the LAST-pending
@@ -41285,7 +41688,9 @@ mod tests {
         // request — and the pending CARRIER (the epoch-1 scatter row that
         // folded task-b) must have its `coalesced_*` payload RE-ATTACHED to
         // the corrected child row rather than vanishing with the replace.
-        orchestrator.upsert_agent(upsert("task-b", "completed"));
+        orchestrator
+            .upsert_agent(upsert("task-b", "completed"))
+            .unwrap();
 
         // Peek BEFORE the drain: the fold at drain time would absorb the
         // corrected child row into a carrier and erase the 1:1 correction
@@ -41446,20 +41851,22 @@ mod tests {
             .configure_supervisor_store(dir.path())
             .expect("store");
         for agent_id in ["agent-p1", "agent-p2"] {
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.to_owned(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: agent_id.to_owned(),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                last_task: Some(format!("done {agent_id}")),
-                cwd: None,
-                profile_id: "tenant-spr".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.to_owned(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: agent_id.to_owned(),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {agent_id}")),
+                    cwd: None,
+                    profile_id: "tenant-spr".to_owned(),
+                })
+                .unwrap();
         }
         assert!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-spr")
@@ -41527,7 +41934,9 @@ mod tests {
                     calls.fetch_add(1, Ordering::SeqCst);
                     events.lock().unwrap().push(event.clone());
                     let runtime = target.lock().unwrap().clone();
-                    let _ = runtime.upsert_background_task_agent(&event.task, Some(profile));
+                    let _ = runtime
+                        .upsert_background_task_agent(&event.task, Some(profile))
+                        .unwrap();
                 }
             })
         };
@@ -41538,7 +41947,9 @@ mod tests {
                 if task.status == octos_agent::TaskStatus::Completed {
                     calls.fetch_add(1, Ordering::SeqCst);
                     let runtime = target.lock().unwrap().clone();
-                    let _ = runtime.upsert_background_task_agent(task, Some(profile));
+                    let _ = runtime
+                        .upsert_background_task_agent(task, Some(profile))
+                        .unwrap();
                 }
             })
         };
@@ -41690,10 +42101,10 @@ mod tests {
         // forced to fail — marks stay unset — and the process "exits".
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("agent-1", "running"));
-        first.upsert_agent(upsert("agent-2", "running"));
-        first.upsert_agent(upsert("agent-1", "completed"));
-        first.upsert_agent(upsert("agent-2", "completed"));
+        first.upsert_agent(upsert("agent-1", "running")).unwrap();
+        first.upsert_agent(upsert("agent-2", "running")).unwrap();
+        first.upsert_agent(upsert("agent-1", "completed")).unwrap();
+        first.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-me",
@@ -41708,7 +42119,7 @@ mod tests {
             drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
         );
         // Re-admission bumps the epoch IN MEMORY and persists the marker.
-        first.upsert_agent(upsert("agent-3", "running"));
+        first.upsert_agent(upsert("agent-3", "running")).unwrap();
         assert_eq!(
             first
                 .state()
@@ -41722,7 +42133,7 @@ mod tests {
             "re-admission into an already-joined group bumps the epoch to 1"
         );
         first.set_force_scatter_persist_failure_for_test(true);
-        first.upsert_agent(upsert("agent-3", "completed"));
+        first.upsert_agent(upsert("agent-3", "completed")).unwrap();
         drop(first);
 
         // Fresh orchestrator B on the same store: the epoch marker (1) must
@@ -41848,10 +42259,10 @@ mod tests {
         // join NORMALLY (no forced failure). Crash.
         let first = InProcessAgentOrchestrator::default();
         first.configure_supervisor_store(dir.path()).expect("store");
-        first.upsert_agent(upsert("agent-1", "running"));
-        first.upsert_agent(upsert("agent-2", "running"));
-        first.upsert_agent(upsert("agent-1", "completed"));
-        first.upsert_agent(upsert("agent-2", "completed"));
+        first.upsert_agent(upsert("agent-1", "running")).unwrap();
+        first.upsert_agent(upsert("agent-2", "running")).unwrap();
+        first.upsert_agent(upsert("agent-1", "completed")).unwrap();
+        first.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = first.drain_ready_continuations_for_session(
             &session_id,
             "tenant-mn",
@@ -41864,8 +42275,8 @@ mod tests {
                 .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
             "epoch-0 join drained"
         );
-        first.upsert_agent(upsert("agent-3", "running"));
-        first.upsert_agent(upsert("agent-3", "completed"));
+        first.upsert_agent(upsert("agent-3", "running")).unwrap();
+        first.upsert_agent(upsert("agent-3", "completed")).unwrap();
         drop(first);
 
         // Restart: the epoch-1 scatter is still Queued in the store (never
@@ -42299,22 +42710,24 @@ mod tests {
             .expect("store");
         for index in 0..total_children {
             let agent_id = format!("child-{index:04}");
-            orchestrator.upsert_agent(AgentUpsert {
-                agent_id: agent_id.clone(),
-                parent_agent_id: Some("master".to_owned()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: format!("master/{agent_id}"),
-                role: "background_task".to_owned(),
-                nickname: agent_id.clone(),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
-                status: "completed".to_owned(),
-                // Short summary keeps the run fast; the CHAR budget is not
-                // what this test exercises.
-                last_task: Some("ok".to_owned()),
-                cwd: None,
-                profile_id: "tenant-cp".to_owned(),
-            });
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: agent_id.clone(),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    // Short summary keeps the run fast; the CHAR budget is not
+                    // what this test exercises.
+                    last_task: Some("ok".to_owned()),
+                    cwd: None,
+                    profile_id: "tenant-cp".to_owned(),
+                })
+                .unwrap();
         }
 
         let drained = orchestrator.drain_ready_continuations_for_session(
@@ -42413,10 +42826,10 @@ mod tests {
         // epoch-0 join drains, so the cohort has a `last_joined_key`.
         let orch = InProcessAgentOrchestrator::default();
         orch.configure_supervisor_store(dir.path()).expect("store");
-        orch.upsert_agent(upsert("agent-1", "running"));
-        orch.upsert_agent(upsert("agent-2", "running"));
-        orch.upsert_agent(upsert("agent-1", "completed"));
-        orch.upsert_agent(upsert("agent-2", "completed"));
+        orch.upsert_agent(upsert("agent-1", "running")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "running")).unwrap();
+        orch.upsert_agent(upsert("agent-1", "completed")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = orch.drain_ready_continuations_for_session(
             &session_id,
             profile,
@@ -42443,14 +42856,9 @@ mod tests {
         // must NOT bump the epoch or insert the child.
         orch.set_force_admission_persist_failure_for_test(true);
         let result = orch.upsert_agent(upsert("agent-3", "running"));
-        assert_eq!(
-            result.get("admitted").and_then(|v| v.as_bool()),
-            Some(false),
-            "the blocked admission is observable in the returned payload: {result}"
-        );
         assert!(
-            result.get("error").is_some(),
-            "the failure payload carries an error field: {result}"
+            result.is_err(),
+            "blocked admission must return an error: {result:?}"
         );
         assert!(
             !orch.state().agents.contains_key("agent-3"),
@@ -42515,10 +42923,10 @@ mod tests {
         // Epoch-0 join drains (cohort joined, epoch 0 durable + delivered).
         let orch = InProcessAgentOrchestrator::default();
         orch.configure_supervisor_store(dir.path()).expect("store");
-        orch.upsert_agent(upsert("agent-1", "running"));
-        orch.upsert_agent(upsert("agent-2", "running"));
-        orch.upsert_agent(upsert("agent-1", "completed"));
-        orch.upsert_agent(upsert("agent-2", "completed"));
+        orch.upsert_agent(upsert("agent-1", "running")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "running")).unwrap();
+        orch.upsert_agent(upsert("agent-1", "completed")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = orch.drain_ready_continuations_for_session(
             &session_id,
             profile,
@@ -42602,10 +43010,10 @@ mod tests {
         // Epoch-0 join drains.
         let orch = InProcessAgentOrchestrator::default();
         orch.configure_supervisor_store(dir.path()).expect("store");
-        orch.upsert_agent(upsert("agent-1", "running"));
-        orch.upsert_agent(upsert("agent-2", "running"));
-        orch.upsert_agent(upsert("agent-1", "completed"));
-        orch.upsert_agent(upsert("agent-2", "completed"));
+        orch.upsert_agent(upsert("agent-1", "running")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "running")).unwrap();
+        orch.upsert_agent(upsert("agent-1", "completed")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = orch.drain_ready_continuations_for_session(
             &session_id,
             profile,
@@ -42621,7 +43029,7 @@ mod tests {
 
         // Re-admit agent-3 (bumps epoch to 1), then force its epoch-1 scatter
         // persist to fail. The key lands in `pending_unpersisted_scatters`.
-        orch.upsert_agent(upsert("agent-3", "running"));
+        orch.upsert_agent(upsert("agent-3", "running")).unwrap();
         assert_eq!(
             orch.state()
                 .scatter_join_state
@@ -42631,7 +43039,7 @@ mod tests {
             "re-admission bumps the epoch to 1"
         );
         orch.set_force_scatter_persist_failure_for_test(true);
-        orch.upsert_agent(upsert("agent-3", "completed"));
+        orch.upsert_agent(upsert("agent-3", "completed")).unwrap();
         let epoch1_key = format!(
             "scatter_join/{group}/{session}/{profile}/{cwd}/1",
             group = group,
@@ -42650,7 +43058,7 @@ mod tests {
         // CORRECTION for agent-1 (completed → failed) — re-enters
         // `enqueue_agent_terminal_continuations`, whose entry pass retries
         // the pending epoch-1 scatter persist durably and clears the marker.
-        orch.upsert_agent(upsert("agent-1", "failed"));
+        orch.upsert_agent(upsert("agent-1", "failed")).unwrap();
         assert!(
             !orch
                 .state()
@@ -42735,15 +43143,23 @@ mod tests {
         orch.configure_supervisor_store(dir.path()).expect("store");
 
         // Session A: agents a1/a2 fold into a carrier with ids {a1, a2}.
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a1", "running"));
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "running"));
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a1", "completed"));
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "failed"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a1", "running"))
+            .unwrap();
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "running"))
+            .unwrap();
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a1", "completed"))
+            .unwrap();
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "failed"))
+            .unwrap();
         // Session B: agents b1/b2 fold into a carrier with ids {b1, b2}.
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b1", "running"));
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b2", "running"));
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b1", "completed"));
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b2", "failed"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b1", "running"))
+            .unwrap();
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b2", "running"))
+            .unwrap();
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b1", "completed"))
+            .unwrap();
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b2", "failed"))
+            .unwrap();
 
         // Drain each session once so its burst folds into one carrier, then
         // reinsert that (still-undelivered) carrier as pending.
@@ -42778,7 +43194,8 @@ mod tests {
         // rebuilt a2 row must carry ONLY {a1, a2} — session B's carrier
         // (also pending, also carrying coalesced_child_ids) must NOT be
         // grafted onto it.
-        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "completed"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "completed"))
+            .unwrap();
 
         let a2_key = {
             let state = orch.state();
@@ -42869,11 +43286,11 @@ mod tests {
 
         let orch = InProcessAgentOrchestrator::default();
         orch.configure_supervisor_store(dir.path()).expect("store");
-        orch.upsert_agent(upsert("agent-1", "running"));
-        orch.upsert_agent(upsert("agent-2", "running"));
+        orch.upsert_agent(upsert("agent-1", "running")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "running")).unwrap();
         // Drain the epoch-0 join so the cohort sits at a joined epoch-0.
-        orch.upsert_agent(upsert("agent-1", "completed"));
-        orch.upsert_agent(upsert("agent-2", "completed"));
+        orch.upsert_agent(upsert("agent-1", "completed")).unwrap();
+        orch.upsert_agent(upsert("agent-2", "completed")).unwrap();
         let drained = orch.drain_ready_continuations_for_session(
             &session_id,
             profile,
@@ -42892,10 +43309,10 @@ mod tests {
         // BEFORE the new child's scatter computation, so the retry is the
         // armed one) fails; the key must REMAIN pending and NO mark may
         // advance for the epoch-1 key.
-        orch.upsert_agent(upsert("agent-3", "running"));
+        orch.upsert_agent(upsert("agent-3", "running")).unwrap();
         orch.set_force_scatter_persist_failure_for_test(true);
         orch.set_force_scatter_retry_failure_once_for_test(true);
-        orch.upsert_agent(upsert("agent-3", "completed"));
+        orch.upsert_agent(upsert("agent-3", "completed")).unwrap();
         let epoch1_key = format!(
             "scatter_join/{group}/{session}/{profile}/{cwd}/1",
             group = group,
@@ -42920,7 +43337,7 @@ mod tests {
         // Next site: a same-group terminal correction re-enters the enqueue
         // pass — this retry SUCCEEDS (hooks are one-shot), the key leaves
         // the pending map, and the mark lands exactly once.
-        orch.upsert_agent(upsert("agent-1", "failed"));
+        orch.upsert_agent(upsert("agent-1", "failed")).unwrap();
         assert!(
             !orch
                 .state()
@@ -42990,7 +43407,7 @@ mod tests {
         // Attempt 1: first terminal delivery (`failed`) — queued, persisted,
         // drained, and its turn STARTS (the durable record holds attempt 1
         // while the turn is in flight).
-        orch.upsert_agent(upsert("failed"));
+        orch.upsert_agent(upsert("failed")).unwrap();
         let drained = orch.drain_ready_continuations_for_session(
             &session_id,
             "tenant-b4",
@@ -43010,7 +43427,7 @@ mod tests {
         // While that turn runs, the verdict is CORRECTED to `completed`: the
         // correction arm replaces the pending payload and durably persists
         // attempt 2 (the store record now sits at attempt 2, Queued).
-        orch.upsert_agent(upsert("completed"));
+        orch.upsert_agent(upsert("completed")).unwrap();
         {
             let state = orch.state();
             let group = format!("agent-group:tenant-b4:{}:master", session_id.0);

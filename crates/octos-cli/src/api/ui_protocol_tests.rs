@@ -13181,20 +13181,22 @@ fn appui_task_artifacts_resolve_agent_task_artifacts() {
     let session_id = SessionKey::with_profile(profile_id, "api", "agent-artifacts");
     let task_id = TaskId::new();
     let orchestrator = InProcessAgentOrchestrator::default();
-    orchestrator.upsert_agent(AgentUpsert {
-        agent_id: "agent-1".into(),
-        parent_agent_id: Some("master".into()),
-        session_id: session_id.clone(),
-        task_id: Some(task_id.clone()),
-        path: "master/agent-1".into(),
-        role: "worker".into(),
-        nickname: "Worker".into(),
-        backend_kind: "native".into(),
-        status: "completed".into(),
-        last_task: Some("summarize".into()),
-        cwd: None,
-        profile_id: profile_id.into(),
-    });
+    orchestrator
+        .upsert_agent(AgentUpsert {
+            agent_id: "agent-1".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.clone()),
+            path: "master/agent-1".into(),
+            role: "worker".into(),
+            nickname: "Worker".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("summarize".into()),
+            cwd: None,
+            profile_id: profile_id.into(),
+        })
+        .unwrap();
     orchestrator
         .set_agent_artifacts(
             "agent-1",

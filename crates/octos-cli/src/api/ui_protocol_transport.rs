@@ -4667,7 +4667,14 @@ fn forward_task_progress_to_channel(
     };
     forward_task_progress_json_to_channel(tx, progress_dropped, task, "task_progress", json);
 
-    if let Some((session_id, agent)) = upsert_background_task_agent(task, runtime_profile_id) {
+    let mirrored = match upsert_background_task_agent(task, runtime_profile_id) {
+        Ok(mirrored) => mirrored,
+        Err(error) => {
+            tracing::warn!(task_id = %task.id, error = %error.message, "task progress mirror admission failed");
+            return;
+        }
+    };
+    if let Some((session_id, agent)) = mirrored {
         let event = json!({
             "type": "agent_updated",
             "session_id": session_id,
@@ -4717,9 +4724,13 @@ fn forward_terminal_agent_update_durable(
     if !task.status.is_terminal() {
         return;
     }
-    let Some((session_id, agent_value)) = upsert_background_task_agent(task, runtime_profile_id)
-    else {
-        return;
+    let (session_id, agent_value) = match upsert_background_task_agent(task, runtime_profile_id) {
+        Ok(Some(mirrored)) => mirrored,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(task_id = %task.id, error = %error.message, "durable terminal mirror admission failed");
+            return;
+        }
     };
     let Ok(agent) = serde_json::from_value::<octos_core::ui_protocol::UiAgentRecord>(agent_value)
     else {
@@ -29862,7 +29873,7 @@ async fn run_m15_live_subagent_fixture_turn(
 
     for spec in specs {
         let artifact_path = artifact_dir.join(spec.artifact_file);
-        let agent = default_agent_orchestrator().upsert_agent(AgentUpsert {
+        let agent = match default_agent_orchestrator().upsert_agent(AgentUpsert {
             agent_id: spec.agent_id.to_owned(),
             parent_agent_id: Some("master".to_owned()),
             session_id: session_id.clone(),
@@ -29875,7 +29886,17 @@ async fn run_m15_live_subagent_fixture_turn(
             last_task: Some("Running live code review check".to_owned()),
             cwd: Some(workdir.to_string_lossy().into_owned()),
             profile_id: profile_id.clone(),
-        });
+        }) {
+            Ok(agent) => agent,
+            Err(error) => {
+                joins.abort_all();
+                while joins.join_next().await.is_some() {}
+                return M9FixtureOutcome::Errored {
+                    code: "m15_subagent_admission_failed",
+                    message: error.message,
+                };
+            }
+        };
         let _ = send_raw_notification_ephemeral(
             ws,
             octos_core::ui_protocol::methods::AGENT_UPDATED,
@@ -30242,8 +30263,13 @@ async fn seed_m9_task_output_fixture(
         ))
         .map_err(|error| format!("failed to enable task persistence: {error}"))?;
     supervisor.set_on_change(move |task| {
-        let Some((event_session_id, agent_value)) = upsert_background_task_agent(task, None) else {
-            return;
+        let (event_session_id, agent_value) = match upsert_background_task_agent(task, None) {
+            Ok(Some(mirrored)) => mirrored,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(task_id = %task.id, error = %error.message, "fixture mirror admission failed");
+                return;
+            }
         };
         let Ok(agent) = serde_json::from_value::<UiAgentRecord>(agent_value) else {
             return;

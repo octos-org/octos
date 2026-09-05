@@ -1801,7 +1801,12 @@ fn forward_task_status_to_actor_inbox(
     // `upsert_background_task_agent` resolves the right profile here; the
     // AppUI/serve bare-key path threads its runtime profile explicitly
     // (see `forward_task_progress_to_channel`).
-    let _ = upsert_background_task_agent(task, None);
+    if let Err(error) = upsert_background_task_agent(task, None) {
+        // This observer mirrors an existing source task. Report failure while
+        // still forwarding that task's truthful status to its owning actor.
+        tracing::warn!(task_id = %task.id, error = %error.message,
+            "background task mirror admission failed");
+    }
 
     let task_json = sanitize_task_for_response(data_dir, task);
     let Ok(json) = serde_json::to_string(&task_json) else {

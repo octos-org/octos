@@ -2480,8 +2480,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
-    crate::autonomy::agent_orchestrator::default_agent_orchestrator().upsert_agent(
-        crate::autonomy::agent_orchestrator::AgentUpsert {
+    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+        .upsert_agent(crate::autonomy::agent_orchestrator::AgentUpsert {
             agent_id: agent_id.clone(),
             parent_agent_id: Some("master".into()),
             session_id: session_id.clone(),
@@ -2494,8 +2494,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
             last_task: Some("review finished".into()),
             cwd: None,
             profile_id: MAIN_PROFILE_ID.into(),
-        },
-    );
+        })
+        .unwrap();
 
     for _ in 0..10 {
         tokio::time::advance(Duration::from_millis(250)).await;

@@ -156,7 +156,9 @@ pub(crate) async fn run_supervised_cli_specialist(
                 .push(artifact.path.clone());
         }
     }
-    let initial_agent = orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None));
+    let initial_agent = orchestrator
+        .upsert_agent(upsert_for_spec(&request.spec, "running", None))
+        .map_err(|error| error.message)?;
     // #1021 / M17-C — CLI specialists are spawned as external subprocesses that never consume the Octos prompt context manager, so the dispatch contract is `external_context_unmanaged` with `risk: "medium"`. Stamping it here surfaces `context_mode` / `context_refs` on every subsequent `agent/updated` event so AppUI clients can audit context regime per child without polling the MCP path.
     let cli_contract = DispatchContextContract::external_unmanaged(
         "cli_specialist_does_not_consume_managed_payload",
@@ -243,7 +245,9 @@ pub(crate) async fn run_supervised_mcp_specialist(
         return Err("MCP specialist timeout must be greater than zero".to_owned());
     }
 
-    let initial_agent = orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None));
+    let initial_agent = orchestrator
+        .upsert_agent(upsert_for_spec(&request.spec, "running", None))
+        .map_err(|error| error.message)?;
     // #1021 / M17-C — MCP supervised specialists dispatch through an external transport that does not yet wire a managed context payload, so the contract is `external_context_unmanaged` with `risk: "medium"`. The same contract is forwarded into the dispatch request below so the remote side and the AppUI event ledger agree on context regime.
     let context_contract = DispatchContextContract::external_unmanaged(
         "supervised_mcp_specialist_context_payload_not_wired",
@@ -943,6 +947,72 @@ printf 'done\n'
                 context_contract: None,
             }
         }
+    }
+
+    fn obstruct_admission_store(orchestrator: &InProcessAgentOrchestrator, root: &Path) {
+        orchestrator.configure_supervisor_store(root).unwrap();
+        let store = crate::autonomy::supervisor_store::SupervisorStore::new(root);
+        std::fs::create_dir_all(store.events_path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admission_r5_cli_does_not_spawn_after_failed_child_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            &dir,
+            "rejected",
+            "#!/bin/sh\nprintf started > worker-started\n",
+        );
+        let orchestrator = InProcessAgentOrchestrator::default();
+        obstruct_admission_store(&orchestrator, &dir.path().join("supervisor"));
+        let sink = RecordingSink::default();
+        let result = run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                sample_spec(&dir, "rejected-cli"),
+                CliAgentCommandConfig::new(script).cwd(dir.path()),
+            ),
+        )
+        .await;
+        assert!(
+            !dir.path().join("worker-started").exists(),
+            "rejected admission launched a subprocess"
+        );
+        assert!(result.is_err());
+        assert!(
+            sink.events().is_empty(),
+            "rejected admission published agent events"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_r5_mcp_does_not_dispatch_after_failed_child_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedMcpBackend::default());
+        *backend.artifact.lock().unwrap() = Some(dir.path().join("mcp-report.md"));
+        let orchestrator = InProcessAgentOrchestrator::default();
+        obstruct_admission_store(&orchestrator, &dir.path().join("supervisor"));
+        let sink = RecordingSink::default();
+        let result = run_supervised_mcp_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedMcpSpecialist::new(
+                sample_spec(&dir, "rejected-mcp"),
+                backend.clone(),
+                "agent/run",
+                json!({"prompt": "review"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            0,
+            "rejected admission dispatched backend"
+        );
+        assert!(result.is_err());
+        assert!(sink.events().is_empty());
     }
 
     #[tokio::test]

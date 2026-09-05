@@ -300,6 +300,13 @@ pub struct PendingContinuationRecord {
     pub metadata: SupervisorMetadata,
 }
 
+/// Optional cohort epoch committed with a complete child admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CohortEpochAdmission {
+    pub cwd_hash: u64,
+    pub epoch: u64,
+}
+
 // Several variants carry their full record by value (group/child/artifact/
 // continuation) because events are persisted and replayed as self-contained
 // payloads; boxing would complicate serde round-trips for no hot-path win.
@@ -316,6 +323,14 @@ pub enum SupervisorEvent {
     },
     ChildStarted {
         child: ChildAgentRecord,
+    },
+    /// A checked admission or update. The complete child and its optional
+    /// cohort binding share one ledger row, including terminal-first mirrors.
+    AgentAdmitted {
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        #[serde(default)]
+        cohort: Option<CohortEpochAdmission>,
     },
     Heartbeat {
         ping: HeartbeatPing,
@@ -472,6 +487,13 @@ impl SupervisorState {
                 }
             }
             SupervisorEvent::ChildStarted { child } => self.upsert_child(child.clone()),
+            SupervisorEvent::AgentAdmitted {
+                group,
+                child,
+                cohort,
+            } => {
+                self.apply_agent_admitted(group.clone(), child.clone(), cohort.as_ref());
+            }
             SupervisorEvent::Heartbeat { ping } => self.apply_heartbeat(ping.clone()),
             SupervisorEvent::ChildTerminal {
                 group_id,
@@ -571,6 +593,121 @@ impl SupervisorState {
                 group.updated_at_ms = group.updated_at_ms.max(*observed_at_ms);
             }
         }
+    }
+
+    fn apply_agent_admitted(
+        &mut self,
+        mut group: SupervisedGroupRecord,
+        mut child: ChildAgentRecord,
+        cohort: Option<&CohortEpochAdmission>,
+    ) {
+        let group_id = group.group_id.clone();
+        let observed_at_ms = group.updated_at_ms.max(child.updated_at_ms);
+        // Admission callers build a fresh group description. Preserve prior
+        // registration data and admission/epoch history when merging it.
+        // Remember supplied child ids after merging so a newly seen child
+        // still reopens an automatically completed group.
+        let declared_children = std::mem::take(&mut group.child_ids);
+        if let Some(existing) = self.groups.get(&group_id) {
+            group.created_at_ms = group.created_at_ms.min(existing.created_at_ms);
+            group.child_ids = existing.child_ids.clone();
+            group.supervisor_id = group
+                .supervisor_id
+                .or_else(|| existing.supervisor_id.clone());
+            group.parent_session_id = group
+                .parent_session_id
+                .or_else(|| existing.parent_session_id.clone());
+            group.parent_turn_id = group
+                .parent_turn_id
+                .or_else(|| existing.parent_turn_id.clone());
+            group.objective = group.objective.or_else(|| existing.objective.clone());
+            // Existing group metadata may include replay-derived state. A
+            // child update must not replace that with an older group view.
+            group.metadata.extend(existing.metadata.clone());
+            if group.terminal.is_none() {
+                group.terminal = existing.terminal.clone();
+                group.status = existing.status.clone();
+            }
+        }
+        self.upsert_group(group);
+        for child_id in declared_children {
+            self.remember_child(&group_id, &child_id, observed_at_ms);
+        }
+
+        if let Some(existing) = self.children.get(&child_key(&group_id, &child.child_id)) {
+            // A durable update can replace the last current observation of
+            // an older workspace. Retain only its small provenance record so
+            // restore can still interpret legacy cohort hashes exactly.
+            let scope_changed = child.metadata.get("workspace_scope").is_some_and(|scope| {
+                existing
+                    .metadata
+                    .get("workspace_scope")
+                    .unwrap_or(&serde_json::Value::Null)
+                    != scope
+            });
+            let workspace_changed =
+                existing.workspace_path != child.workspace_path || scope_changed;
+            let mut workspace_history = existing
+                .metadata
+                .get("workspace_history")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if workspace_changed {
+                let observation = serde_json::json!({
+                    "workspace_path": existing.workspace_path,
+                    "workspace_scope": existing.metadata.get("workspace_scope"),
+                    "backend_kind": existing.metadata.get("backend_kind"),
+                    "role": existing.metadata.get("role"),
+                    "nickname": existing.metadata.get("nickname"),
+                    "label": existing.label,
+                });
+                if !workspace_history.contains(&observation) {
+                    workspace_history.push(observation);
+                }
+            }
+            // Status/workspace and explicitly supplied metadata belong to
+            // the candidate. Observations accumulated by other events must
+            // survive a candidate that does not carry them.
+            child.started_at_ms = child.started_at_ms.min(existing.started_at_ms);
+            if child.last_heartbeat.is_none() {
+                child.last_heartbeat = existing.last_heartbeat.clone();
+            }
+            let mut supplied_metadata = std::mem::take(&mut child.metadata);
+            // History is derived from actual prior records, never replaced
+            // by the candidate's potentially incomplete view of the child.
+            supplied_metadata.remove("workspace_history");
+            child.metadata = existing.metadata.clone();
+            child.metadata.extend(supplied_metadata);
+            if workspace_changed {
+                child.metadata.insert(
+                    "workspace_history".into(),
+                    serde_json::Value::Array(workspace_history),
+                );
+            }
+        }
+        let child_id = child.child_id.clone();
+        self.upsert_child(child);
+        if let Some(cohort) = cohort {
+            let group = self.ensure_group(&group_id, observed_at_ms);
+            let key = format!("admissions#{}", cohort.cwd_hash);
+            let entry = format!("{child_id}:{}", cohort.epoch);
+            let mut admissions: Vec<String> = group
+                .metadata
+                .get(&key)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(|value| value.split(',').map(str::to_owned).collect())
+                .unwrap_or_default();
+            if !admissions.contains(&entry) {
+                admissions.push(entry);
+                group
+                    .metadata
+                    .insert(key, serde_json::Value::from(admissions.join(",")));
+            }
+            group.updated_at_ms = group.updated_at_ms.max(observed_at_ms);
+        }
+        self.recompute_group_terminal(&group_id);
     }
 
     fn upsert_group(&mut self, group: SupervisedGroupRecord) {
@@ -1321,6 +1458,34 @@ impl SupervisorStore {
     ) -> io::Result<SupervisorEventLedgerRow> {
         let event_id = format!("child_started:{}:{}", child.group_id, child.child_id);
         self.append_event(event_id, SupervisorEvent::ChildStarted { child })
+    }
+
+    /// Commit the complete child and optional cohort epoch in one row.
+    /// A post-write I/O error may leave this complete event durable, but
+    /// replay can never observe only one half of its child/epoch payload.
+    pub fn record_agent_admitted(
+        &self,
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        cohort: Option<CohortEpochAdmission>,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        if group.group_id != child.group_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent admission group does not match the child's group",
+            ));
+        }
+        // The locked sequence allocator supplies a fresh event id. Unlike
+        // ChildStarted's stable id, it allows later checked child updates,
+        // including multiple updates within the same millisecond.
+        self.append_event(
+            "",
+            SupervisorEvent::AgentAdmitted {
+                group,
+                child,
+                cohort,
+            },
+        )
     }
 
     pub fn record_heartbeat(&self, ping: HeartbeatPing) -> io::Result<SupervisorEventLedgerRow> {
@@ -2356,6 +2521,8 @@ mod tests {
         pub(super) syncs: usize,
         fail_after_first_row: bool,
         fail_flush: bool,
+        fail_before_write: bool,
+        fail_write_after_bytes: Option<usize>,
     }
 
     /// Wrap the actual append handle, so counts follow real file operations
@@ -2394,6 +2561,13 @@ mod tests {
         fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
             let mut probe = self.probe.lock().unwrap();
             probe.writes += 1;
+            if std::mem::take(&mut probe.fail_before_write) {
+                return Err(io::Error::other("injected failure before ledger write"));
+            }
+            if let Some(bytes) = probe.fail_write_after_bytes.take() {
+                self.inner.write_all(&buf[..bytes.min(buf.len())])?;
+                return Err(io::Error::other("injected torn ledger row"));
+            }
             if std::mem::take(&mut probe.fail_after_first_row) {
                 let first_row_end = buf.iter().position(|&byte| byte == b'\n').unwrap() + 1;
                 self.inner
@@ -3800,6 +3974,401 @@ mod tests {
 
         assert_append_io(&store, 1, 1, 1);
         assert_eq!(live_ledger_rows(&store), vec![row]);
+    }
+
+    fn agent_admission_event(
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        cohort: Option<(u64, u64)>,
+    ) -> SupervisorEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "agent_admitted",
+            "payload": {
+                "group": group,
+                "child": child,
+                "cohort": cohort.map(|(cwd_hash, epoch)| {
+                    serde_json::json!({ "cwd_hash": cwd_hash, "epoch": epoch })
+                }),
+            },
+        }))
+        .expect("atomic agent admission event must deserialize")
+    }
+
+    fn append_agent_admission(
+        store: &SupervisorStore,
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        cohort: Option<(u64, u64)>,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        let SupervisorEvent::AgentAdmitted {
+            group,
+            child,
+            cohort,
+        } = agent_admission_event(group, child, cohort)
+        else {
+            unreachable!("agent admission helper built a different event")
+        };
+        store.record_agent_admitted(group, child, cohort)
+    }
+
+    #[test]
+    fn agent_admission_one_event_restores_child_and_epoch() {
+        let dir = TestDir::new("atomic-agent-admission");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        child.workspace_path = Some("/workspace".to_owned());
+        child
+            .metadata
+            .insert("workspace_scope".into(), serde_json::json!("scope-v1"));
+        let row = append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            Some((7, 2)),
+        )
+        .unwrap();
+
+        assert_append_io(&store, 1, 1, 1);
+        assert_eq!(live_ledger_rows(&store), vec![row.clone()]);
+        assert_eq!(
+            serde_json::from_str::<SupervisorEventLedgerRow>(&serde_json::to_string(&row).unwrap())
+                .unwrap(),
+            row
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.children[&child_key("g", "child")], child);
+        assert_eq!(restored.groups["g"].metadata["admissions#7"], "child:2");
+        assert_eq!(restored.groups["g"].child_ids, vec!["child"]);
+    }
+
+    #[test]
+    fn agent_admission_rejects_mismatched_group_before_append() {
+        let dir = TestDir::new("admission-mismatched-group");
+        let store = SupervisorStore::new(&dir.path);
+        let error = store
+            .record_agent_admitted(
+                SupervisedGroupRecord::new("group-a", 10),
+                ChildAgentRecord::new("group-b", "child", 10),
+                Some(CohortEpochAdmission {
+                    cwd_hash: 7,
+                    epoch: 1,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_append_io(&store, 0, 0, 0);
+        assert!(!store.events_path().exists());
+        let restored = store.load_state().unwrap();
+        assert!(restored.groups.is_empty());
+        assert!(restored.children.is_empty());
+    }
+
+    #[test]
+    fn agent_admission_preserves_prior_group_metadata_and_children() {
+        let dir = TestDir::new("admission-preserves-group");
+        let store = SupervisorStore::new(&dir.path);
+        let mut old_group = SupervisedGroupRecord::new("g", 1);
+        old_group.parent_session_id = Some("session".to_owned());
+        old_group
+            .metadata
+            .insert("identity".into(), serde_json::json!("original"));
+        old_group
+            .metadata
+            .insert("join_epoch#8".into(), serde_json::json!(9));
+        store.record_group_registered(old_group).unwrap();
+        for (child_id, epoch) in [("child:a", 1), ("child:b", 2)] {
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", epoch + 10),
+                ChildAgentRecord::new("g", child_id, epoch + 10),
+                Some((7, epoch)),
+            )
+            .unwrap();
+        }
+        store.snapshot_now().unwrap();
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let group = &restored.groups["g"];
+        assert_eq!(group.created_at_ms, 1);
+        assert_eq!(group.parent_session_id.as_deref(), Some("session"));
+        assert_eq!(group.metadata["identity"], "original");
+        assert_eq!(group.metadata["join_epoch#8"], 9);
+        assert_eq!(group.metadata["admissions#7"], "child:a:1,child:b:2");
+        assert_eq!(group.child_ids, vec!["child:a", "child:b"]);
+        assert_eq!(restored.children.len(), 2);
+    }
+
+    #[test]
+    fn agent_admission_allows_updates_after_child_started_at_same_timestamp() {
+        let dir = TestDir::new("admission-update");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        store.record_child_started(child.clone()).unwrap();
+        child.task = Some("first update".to_owned());
+        let first = append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        child.task = Some("second update".to_owned());
+        let second = append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(first.event_id, second.event_id);
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.children[&child_key("g", "child")], child);
+        assert_eq!(restored.groups["g"].child_ids, vec!["child"]);
+    }
+
+    #[test]
+    fn agent_admission_update_preserves_heartbeat_and_independent_metadata() {
+        let dir = TestDir::new("admission-preserves-child-observations");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        child.workspace_path = Some("/old-workspace".to_owned());
+        child
+            .metadata
+            .insert("artifact_refs".into(), serde_json::json!(["artifact-a"]));
+        child
+            .metadata
+            .insert("workspace_scope".into(), serde_json::json!("old-scope"));
+        store.record_child_started(child).unwrap();
+        let ping = test_ping("g", "child", "ping", 20);
+        store.record_heartbeat(ping.clone()).unwrap();
+        let mut update = ChildAgentRecord::new("g", "child", 30);
+        update.status = ChildStatus::Starting;
+        update.task = Some("updated task".to_owned());
+        update
+            .metadata
+            .insert("workspace_scope".into(), serde_json::Value::Null);
+        append_agent_admission(&store, SupervisedGroupRecord::new("g", 30), update, None).unwrap();
+
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let child = &restored.children[&child_key("g", "child")];
+        assert_eq!(child.started_at_ms, 10);
+        assert_eq!(child.updated_at_ms, 30);
+        assert_eq!(child.last_heartbeat, Some(ping));
+        assert_eq!(
+            child.metadata["artifact_refs"],
+            serde_json::json!(["artifact-a"])
+        );
+        assert_eq!(child.metadata["workspace_scope"], serde_json::Value::Null);
+        assert_eq!(child.workspace_path, None);
+        assert_eq!(child.status, ChildStatus::Starting);
+        assert_eq!(child.task.as_deref(), Some("updated task"));
+    }
+
+    #[test]
+    fn agent_admission_workspace_history_survives_later_terminal_update() {
+        let dir = TestDir::new("admission-workspace-history");
+        let store = SupervisorStore::new(&dir.path);
+        let earlier = serde_json::json!({
+            "workspace_path": "/earlier", "workspace_scope": "earlier-scope",
+            "backend_kind": "native", "role": "worker", "nickname": "earlier", "label": "Earlier"
+        });
+        let prior = serde_json::json!({
+            "workspace_path": "2f746d702f7773", "workspace_scope": null,
+            "backend_kind": "background_task", "role": "peer", "nickname": "peer_handoff", "label": "Peer A"
+        });
+        let mut old = ChildAgentRecord::new("g", "child", 10);
+        old.workspace_path = Some("2f746d702f7773".to_owned());
+        old.label = Some("Peer A".to_owned());
+        old.metadata
+            .insert("backend_kind".into(), serde_json::json!("background_task"));
+        old.metadata
+            .insert("role".into(), serde_json::json!("peer"));
+        old.metadata
+            .insert("nickname".into(), serde_json::json!("peer_handoff"));
+        old.metadata.insert(
+            "workspace_history".into(),
+            serde_json::json!([earlier.clone()]),
+        );
+        store.record_child_started(old).unwrap();
+        for now in [20, 30] {
+            let mut current = ChildAgentRecord::new("g", "child", now);
+            current.workspace_path = Some("/current".to_owned());
+            current
+                .metadata
+                .insert("workspace_scope".into(), serde_json::json!("current-scope"));
+            current.metadata.insert(
+                "workspace_history".into(),
+                serde_json::json!(["unobserved override"]),
+            );
+            if now == 30 {
+                current.status = ChildStatus::Completed;
+                current.terminal = Some(TerminalState::completed(now, None));
+            }
+            append_agent_admission(&store, SupervisedGroupRecord::new("g", now), current, None)
+                .unwrap();
+        }
+        store.snapshot_now().unwrap();
+
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let child = &restored.children[&child_key("g", "child")];
+        assert_eq!(child.workspace_path.as_deref(), Some("/current"));
+        assert_eq!(child.metadata["workspace_scope"], "current-scope");
+        assert_eq!(child.status, ChildStatus::Completed);
+        assert_eq!(
+            child.metadata["workspace_history"],
+            serde_json::json!([earlier, prior])
+        );
+    }
+
+    #[test]
+    fn agent_admission_workspace_history_records_scope_changes_once() {
+        let dir = TestDir::new("admission-workspace-history-scope");
+        let store = SupervisorStore::new(&dir.path);
+        for (now, scope) in [
+            (10, Some("scope-a")),
+            (20, None),
+            (30, Some("scope-a")),
+            (40, None),
+        ] {
+            let mut child = ChildAgentRecord::new("g", "child", now);
+            child.workspace_path = Some("/same".to_owned());
+            child
+                .metadata
+                .insert("workspace_scope".into(), serde_json::json!(scope));
+            append_agent_admission(&store, SupervisedGroupRecord::new("g", now), child, None)
+                .unwrap();
+        }
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let child = &restored.children[&child_key("g", "child")];
+        assert_eq!(child.metadata["workspace_scope"], serde_json::Value::Null);
+        let history = child.metadata["workspace_history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["workspace_scope"], "scope-a");
+        assert_eq!(history[1]["workspace_scope"], serde_json::Value::Null);
+        assert!(
+            history
+                .iter()
+                .all(|observation| observation["workspace_path"] == "/same")
+        );
+        assert!(
+            history
+                .iter()
+                .all(|observation| observation.as_object().unwrap().len() == 6)
+        );
+    }
+
+    #[test]
+    fn agent_admission_first_terminal_snapshot_stays_terminal() {
+        let dir = TestDir::new("terminal-agent-admission");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        child.status = ChildStatus::Completed;
+        child.terminal = Some(TerminalState::completed(10, Some("done".to_owned())));
+        append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            Some((7, 1)),
+        )
+        .unwrap();
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.children[&child_key("g", "child")], child);
+        assert_eq!(restored.groups["g"].status, GroupStatus::Completed);
+    }
+
+    #[test]
+    fn agent_admission_prewrite_failure_has_no_replay_state() {
+        let dir = TestDir::new("admission-prewrite-failure");
+        let store = SupervisorStore::new(&dir.path);
+        store.append_io.lock().unwrap().fail_before_write = true;
+        assert!(
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", 10),
+                ChildAgentRecord::new("g", "child", 10),
+                Some((7, 1)),
+            )
+            .is_err()
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(restored.children.is_empty());
+        assert!(restored.groups.is_empty());
+        assert!(fs::read(store.events_path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_admission_torn_write_never_replays_half_an_admission() {
+        let dir = TestDir::new("admission-torn-write");
+        let store = SupervisorStore::new(&dir.path);
+        store.append_io.lock().unwrap().fail_write_after_bytes = Some(40);
+        assert!(
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", 10),
+                ChildAgentRecord::new("g", "child", 10),
+                Some((7, 1)),
+            )
+            .is_err()
+        );
+        let partial = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(partial.children.is_empty());
+        assert!(partial.groups.is_empty());
+        append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            ChildAgentRecord::new("g", "child", 10),
+            Some((7, 1)),
+        )
+        .unwrap();
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(restored.children.contains_key(&child_key("g", "child")));
+        assert_eq!(restored.groups["g"].metadata["admissions#7"], "child:1");
+    }
+
+    #[test]
+    fn agent_admission_postwrite_error_still_replays_a_complete_event() {
+        let dir = TestDir::new("admission-postwrite-failure");
+        let store = SupervisorStore::new(&dir.path);
+        store.append_io.lock().unwrap().fail_flush = true;
+        assert!(
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", 10),
+                ChildAgentRecord::new("g", "child", 10),
+                Some((7, 1)),
+            )
+            .is_err()
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(restored.children.contains_key(&child_key("g", "child")));
+        assert_eq!(restored.groups["g"].metadata["admissions#7"], "child:1");
+    }
+
+    #[test]
+    fn agent_admission_keeps_legacy_epoch_event_shapes_readable() {
+        let legacy = [
+            serde_json::json!({"type":"group_epoch_bumped", "payload":{
+                "group_id":"legacy", "new_epoch":2, "observed_at_ms":10
+            }}),
+            serde_json::json!({"type":"cohort_admission", "payload":{
+                "group_id":"legacy", "child_id":"old", "new_epoch":3, "observed_at_ms":11
+            }}),
+        ];
+        let mut state = SupervisorState::default();
+        for value in legacy {
+            let event: SupervisorEvent = serde_json::from_value(value).unwrap();
+            state.apply_event(&event, 11);
+        }
+        state.apply_event(
+            &agent_admission_event(
+                SupervisedGroupRecord::new("legacy", 12),
+                ChildAgentRecord::new("legacy", "new", 12),
+                None,
+            ),
+            12,
+        );
+        assert_eq!(state.groups["legacy"].metadata["join_epoch#0"], 2);
+        assert_eq!(state.groups["legacy"].metadata["admissions#0"], "old:3");
+        assert!(state.children.contains_key(&child_key("legacy", "new")));
     }
 
     #[test]
