@@ -12995,15 +12995,19 @@ fn scatter_cohort_key(group_id: &str, cwd_hash: u64) -> String {
     format!("{group_id}#{cwd_hash}")
 }
 
-/// #19 (round-4 B1) — parse the `cwd_hash` segment (5th `/`-separated
-/// segment) out of a persisted scatter join key, the inverse of the
-/// formatting in the enqueue paths. Unparseable/short keys fall back to the
-/// NONE-workspace cohort hash so legacy records still seed SOME cohort
-/// (single-workspace stores behave exactly as before).
+/// #19 (round-4 B1) — parse the `cwd_hash` segment out of a persisted
+/// scatter join key, the inverse of the formatting in the enqueue paths.
+/// #25 round 2 (outer-loop 22:02 item 2): parsed from the RIGHT — the
+/// key is `…/{cwd_hash}/{epoch}` with only its TAIL segments positional
+/// (a group id may itself contain `/`), so the hash is the
+/// second-to-last segment, same direction as the epoch parse below it.
+/// Unparseable/short keys fall back to the NONE-workspace cohort hash
+/// so legacy records still seed SOME cohort (single-workspace stores
+/// behave exactly as before).
 fn cwd_hash_from_join_key(join_key: &str) -> u64 {
     join_key
-        .split('/')
-        .nth(4)
+        .rsplit('/')
+        .nth(1)
         .and_then(|segment| segment.parse::<u64>().ok())
         .unwrap_or_else(|| scatter_cwd_hash(&None))
 }
@@ -14913,11 +14917,12 @@ fn coalesce_terminal_continuations(
         .unwrap_or_default();
     let mut lines: Vec<String> = existing_lines;
     // Should-fix 2 — `coalesced_count` counts UNIQUE child agent ids among
-    // folded `ChildCompleted` rows (deduped per fold; a previously folded
-    // carrier's base count carries over as before). Folded
-    // `ScatterJoinComplete` items are CONTROL rows — rendered compactly,
-    // never counted as child terminations.
-    let mut folded = existing_count;
+    // folded `ChildCompleted` rows (deduped per fold). Since #25 the value
+    // is re-derived as the UNION size after the primary seed + absorbed-
+    // carrier union below (the absorbed `coalesced_count` is never summed
+    // in — dedupe, not sum). Folded `ScatterJoinComplete` items are CONTROL
+    // rows — rendered compactly, never counted as child terminations.
+    let mut folded;
     let mut omitted = existing_omitted;
     // #15 SF2 — the RE-FOLD must not RE-COUNT a child already folded in an
     // earlier generation. The folded child-id set is persisted alongside the
@@ -14938,6 +14943,72 @@ fn coalesce_terminal_continuations(
                 .collect()
         })
         .unwrap_or_default();
+    // #25 (round-4 Blocker #18-B3) — UNION the metadata of ABSORBED
+    // carriers: a batch item that is ITSELF a former carrier (it carries
+    // `coalesced_child_ids` / `coalesced_children` from an earlier fold)
+    // previously rendered only as a control row / single child line, so
+    // tombstoning it DROPPED its folded children (the "换 carrier" crash:
+    // carrier1 folds A/B, dies undelivered, restore re-enqueues it, and the
+    // next fold picks the NEW max-sequence scatter as carrier — carrier1's
+    // A/B payload vanished with its tombstone). Union each absorbed
+    // carrier's structured child-id set and text lines into the new
+    // carrier's seed BEFORE the batch's fresh children insert, and carry
+    // over its omitted-summary / truncation flags. The absorbed
+    // `coalesced_count` is deliberately NOT summed in — the count is
+    // re-derived as the UNION size below (dedupe, not sum). Seed order:
+    // (1) the primary's own existing metadata (re-fold case), (2) each
+    // absorbed carrier's metadata (here), (3) the current batch's fresh
+    // children (the loop below). Unioning runs unconditionally — an aborted
+    // fold never reaches the tombstones, so no absorbed carrier's payload
+    // is lost by seeding data that the abort would leave redundant.
+    let mut absorbed_ids_truncated = false;
+    let mut absorbed_children_truncated = false;
+    for item in &batch {
+        let Some(absorbed_ids) = item.metadata.get("coalesced_child_ids") else {
+            continue;
+        };
+        // An absorbed carrier's own CHILD row (below) still contributes its
+        // identity to the union — it is itself a child report of the scope —
+        // while its folded children re-associate here.
+        for id in absorbed_ids.split(',').filter(|id| !id.is_empty()) {
+            counted_children.insert(id.to_owned());
+        }
+        if item.metadata.contains_key("coalesced_child_ids_truncated") {
+            absorbed_ids_truncated = true;
+        }
+        if item.metadata.contains_key("coalesced_children_truncated") {
+            absorbed_children_truncated = true;
+        }
+        if let Some(absorbed_text) = item.metadata.get("coalesced_children") {
+            for line in absorbed_text.split(" | ").filter(|line| !line.is_empty()) {
+                // Dedupe identical lines (the union may overlap the
+                // primary's own seed on a re-fold of related carriers).
+                if !lines.iter().any(|existing| existing == line) {
+                    rendered += line.len();
+                    lines.push(line.to_owned());
+                }
+            }
+        }
+        if let Some(absorbed_omitted) = item
+            .metadata
+            .get("omitted_summary_count")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            omitted += absorbed_omitted;
+        }
+    }
+    // The union is authoritative for the count: an absorbed carrier's
+    // children re-associated above are part of the folded set even where
+    // the #15b id-cap had cut them from the ABSORBED record's id list
+    // (its `coalesced_count` kept the true total). Re-deriving from the
+    // set keeps `count == ids.len()` exactly — never LESS than what the
+    // persisted id list shows.
+    folded = counted_children.len();
+    if absorbed_children_truncated {
+        primary
+            .metadata
+            .insert("coalesced_children_truncated".to_owned(), "true".to_owned());
+    }
     let mut folded_keys: Vec<String> = Vec::new();
     for item in &batch {
         // Every folded line carries its group AND workspace so the carrier
@@ -15008,6 +15079,8 @@ fn coalesce_terminal_continuations(
         }
         folded_keys.push(item.dedupe_key.as_str().to_owned());
     }
+    // Written AFTER the batch loop: the union pre-pass already re-derived
+    // the count from the absorbed set, and fresh children bump it there.
     primary
         .metadata
         .insert("coalesced_count".to_owned(), folded.to_string());
@@ -15041,8 +15114,11 @@ fn coalesce_terminal_continuations(
     // `coalesced_count` above still holds the TRUE unique total. Re-fold
     // dedup seeds from this truncated set, so a cut id that reappears later
     // is re-counted — a deliberate over-report bias (see the cap constants).
-    let child_ids_truncated = child_ids.len() > COALESCED_CHILD_IDS_MAX;
-    if child_ids_truncated {
+    // An absorbed carrier whose OWN id list was truncated (#15b) may have
+    // folded children its persisted set no longer shows; the flag unions
+    // in so the disclosure is never lost on a carrier swap (#25).
+    let child_ids_truncated = absorbed_ids_truncated || child_ids.len() > COALESCED_CHILD_IDS_MAX;
+    if child_ids.len() > COALESCED_CHILD_IDS_MAX {
         child_ids.truncate(COALESCED_CHILD_IDS_MAX);
     }
     primary
@@ -15319,7 +15395,135 @@ fn enqueue_agent_terminal_continuations(
             // could collide on one event id, and replay dedup would swallow
             // one write behind the other.
             let revision = next_continuation_attempt(state, &child_key);
-            let child = build_child_terminal_request(agent, &group_id, &child_key);
+            let mut child = build_child_terminal_request(agent, &group_id, &child_key);
+            // #25 (round-4 Blocker #18-B3) — a correction landing on a
+            // pending CARRIER (the still-undelivered fold target) must NOT
+            // drop the folded payload: `replace_pending_payload` removes
+            // the old item wholesale, so its `coalesced_*` metadata is
+            // captured here FIRST and re-attached to the rebuilt request.
+            // The correction changes ONLY the carrier-child's own verdict —
+            // the structured child-id set and count are unchanged (they are
+            // identity, not status) — with a human-readable note line
+            // appended instead of text surgery on the rendered rows.
+            //
+            // The pending carrier may sit under a DIFFERENT dedupe key than
+            // the corrected child: the fold at drain time takes every
+            // same-scope terminal item into its batch, so the in-memory
+            // carrier is already claimed (its record stays Queued in the
+            // store, but pending_by_key no longer holds it). We find the
+            // carrier by CONTENT (any pending terminal item for this session
+            // whose metadata already carries `coalesced_child_ids`) rather
+            // than by key — the fold's `take_pending_terminal_for_scope`
+            // removes ALL same-scope rows, so the carrier is the only
+            // pending item that can have folded children.
+            //
+            // #25 round 2 (outer-loop 22:46 bounce): `pending_items()` is a
+            // GLOBAL queue — the old unscoped `.find()` would graft another
+            // session's (or another group/workspace's) folded payload onto
+            // THIS correction. The carrier must sit in the SAME
+            // (session, profile, group, workspace) scope as the corrected
+            // child — exactly the scope `take_pending_terminal_for_scope`
+            // folds by — and among the scope's carriers we prefer the one
+            // whose folded id set actually CONTAINS this child.
+            let carrier_scope = |pending: &QueuedMasterContinuation| {
+                pending.session_id.as_str() == agent.session_id.0.as_str()
+                    && pending.profile_id.as_str() == agent.profile_id.as_str()
+                    && matches!(
+                        pending.reason,
+                        MasterContinuationReason::ChildCompleted
+                            | MasterContinuationReason::ScatterJoinComplete
+                    )
+                    && pending.group_id.as_str() == group_id.as_str()
+                    && item_workspace(pending)
+                        == agent.cwd.as_deref().filter(|value| !value.is_empty())
+            };
+            let carried_coalesced = state
+                .continuations
+                .pending_items()
+                .filter(|pending| {
+                    carrier_scope(pending) && pending.metadata.contains_key("coalesced_child_ids")
+                })
+                // Preference pass: a carrier whose folded ids name THIS
+                // child is THE carrier its verdict row lives in; a scope
+                // can hold at most one carrier with folded children, but
+                // prefer-by-content keeps the pick unambiguous if a
+                // correction ever races a second fold.
+                .max_by_key(|pending| {
+                    pending
+                        .metadata
+                        .get("coalesced_child_ids")
+                        .is_some_and(|ids| ids.contains(&agent.agent_id))
+                })
+                .map(|pending| {
+                    (
+                        pending.metadata.get("coalesced_child_ids").cloned(),
+                        pending.metadata.get("coalesced_children").cloned(),
+                        pending.metadata.get("coalesced_count").cloned(),
+                        pending.metadata.get("omitted_summary_count").cloned(),
+                        pending.metadata.get("coalesce_generation").cloned(),
+                        pending
+                            .metadata
+                            .get("coalesced_child_ids_truncated")
+                            .cloned(),
+                        pending
+                            .metadata
+                            .get("coalesced_children_truncated")
+                            .cloned(),
+                    )
+                });
+            if let Some((
+                child_ids,
+                children,
+                count,
+                omitted,
+                generation,
+                ids_truncated,
+                children_truncated,
+            )) = carried_coalesced
+            {
+                if let Some(child_ids) = child_ids {
+                    child = child.with_metadata("coalesced_child_ids", child_ids);
+                }
+                // The correction note rides INSIDE the children text as an
+                // appended line (no surgery on the rendered rows), so a later
+                // fold's absorbed-carrier line merge carries it forward
+                // instead of dropping it with the replaced item. The line is
+                // appended even when the old carrier had no text yet (a
+                // control row folded to ids-only), so the note is never lost.
+                let children = match children {
+                    Some(children) => format!(
+                        "{children} | carrier child {child_key} verdict corrected: {}",
+                        agent.status
+                    ),
+                    None => format!(
+                        "carrier child {child_key} verdict corrected: {}",
+                        agent.status
+                    ),
+                };
+                child = child.with_metadata("coalesced_children", children);
+                if let Some(count) = count {
+                    child = child.with_metadata("coalesced_count", count);
+                }
+                if let Some(omitted) = omitted {
+                    child = child.with_metadata("omitted_summary_count", omitted);
+                }
+                if let Some(generation) = generation {
+                    child = child.with_metadata("coalesce_generation", generation);
+                }
+                if let Some(flag) = ids_truncated {
+                    child = child.with_metadata("coalesced_child_ids_truncated", flag);
+                }
+                if let Some(flag) = children_truncated {
+                    child = child.with_metadata("coalesced_children_truncated", flag);
+                }
+                child = child.with_metadata(
+                    "coalesced_correction_note",
+                    format!(
+                        "carrier child {child_key} verdict corrected: {}",
+                        agent.status
+                    ),
+                );
+            }
             let outcome = state.continuations.replace_pending_payload(child);
             let mut delivered = false;
             match &outcome {
@@ -15844,7 +16048,14 @@ fn retry_pending_unpersisted_scatters(state: &mut AutonomyRuntimeState) {
             );
             continue;
         }
-        match persist_scatter_queued_checked(state, &continuation, 1) {
+        // #25 round 2 (outer-loop 22:02 item 3): the attempt comes from the
+        // UNIFIED `continuation_revisions` allocator — the same source the
+        // Duplicate arm of `enqueue_and_persist_continuation` uses — NOT a
+        // hardcoded 1. A retry whose key was already persisted-and-marked
+        // (then re-enqueued under a fresh epoch) would otherwise re-stamp
+        // attempt 1, colliding with the #11 event-id namespace.
+        let attempt = next_continuation_attempt(state, &join_key);
+        match persist_scatter_queued_checked(state, &continuation, attempt) {
             Ok(()) => {
                 let cohort_key = scatter_cohort_key(
                     continuation.group_id.as_str(),
@@ -15857,7 +16068,13 @@ fn retry_pending_unpersisted_scatters(state: &mut AutonomyRuntimeState) {
                     .next()
                     .and_then(|segment| segment.parse::<u64>().ok())
                     .unwrap_or(0);
-                advance_scatter_marks_after_persist(state, &cohort_key, &join_key, join_epoch, 1);
+                advance_scatter_marks_after_persist(
+                    state,
+                    &cohort_key,
+                    &join_key,
+                    join_epoch,
+                    attempt,
+                );
                 state.pending_unpersisted_scatters.remove(&join_key);
             }
             Err(err) => {
@@ -39894,6 +40111,332 @@ mod tests {
         );
     }
 
+    /// #25 (round-4 Blocker #18-B3, "换 carrier" crash/replay) — children
+    /// task-a/task-b fold into carrier1 (their ChildCompleted rows are
+    /// tombstoned durably); the orchestrator then crashes with carrier1's
+    /// durable record still Queued (drained, never delivered, never
+    /// tombstoned). A fresh orchestrator restores carrier1 WITH its folded
+    /// A/B metadata; task-c/task-d complete and fold — the NEW carrier
+    /// (max-sequence pick) absorbs carrier1. The absorbed carrier's folded
+    /// children must UNION into the new carrier: without the fix the new
+    /// carrier kept only C/D and carrier1's tombstone deleted A/B's payload
+    /// for good.
+    #[test]
+    fn carrier_swap_crash_replay_keeps_folded_children() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-cs", "api", "carrier-swap");
+        let upsert = |agent_id: &str, last_task: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: "completed".to_owned(),
+            last_task: Some(last_task.to_owned()),
+            cwd: None,
+            profile_id: "tenant-cs".to_owned(),
+        };
+
+        // Orchestrator A: task-a/task-b complete → the burst folds into ONE
+        // carrier. The fold tombstones A/B's rows and durably persists the
+        // carrier; the drain claims it WITHOUT tombstoning its own record —
+        // the "drained but never executed" pre-crash state.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("task-a", "a done"));
+        first.upsert_agent(upsert("task-b", "b done"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-cs",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "A/B burst folds into one carrier");
+        let carrier1 = &drained[0];
+        assert_eq!(
+            carrier1.metadata.get("coalesced_count").map(String::as_str),
+            Some("2"),
+            "carrier1 folded A and B"
+        );
+        assert!(
+            carrier1.metadata.contains_key("coalesced_child_ids"),
+            "carrier1 carries the structured child-id set"
+        );
+        // NO mark_continuation_completed(carrier1): the crash happens before
+        // carrier1's turn ran, so its durable record stays Queued.
+
+        // Orchestrator B (restart): carrier1 is restored as pending WITH its
+        // A/B metadata. task-c/task-d complete and fold; the fold absorbs
+        // carrier1 — the new carrier MUST carry the union {A, B, C, D}.
+        let second = InProcessAgentOrchestrator::default();
+        second
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        second.upsert_agent(upsert("task-c", "c done"));
+        second.upsert_agent(upsert("task-d", "d done"));
+        let drained = second.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-cs",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            drained.len(),
+            1,
+            "the C/D fold absorbs the restored carrier1 into one carrier; got {:?}",
+            drained
+                .iter()
+                .map(|i| (i.reason.clone(), i.dedupe_key.as_str().to_owned()))
+                .collect::<Vec<_>>(),
+        );
+        let carrier2 = &drained[0];
+        assert_eq!(
+            carrier2.metadata.get("coalesced_count").map(String::as_str),
+            Some("4"),
+            "the new carrier counts the UNION {{A, B, C, D}}, not just {{C, D}}; metadata {:?}",
+            carrier2.metadata,
+        );
+        let ids = carrier2
+            .metadata
+            .get("coalesced_child_ids")
+            .expect("union child-id set persisted");
+        for child in ["task-a", "task-b", "task-c", "task-d"] {
+            assert_eq!(
+                ids.matches(child).count(),
+                1,
+                "coalesced_child_ids contains {child} exactly once (union, deduped): {ids}"
+            );
+        }
+        let text = carrier2
+            .metadata
+            .get("coalesced_children")
+            .expect("union children text persisted");
+        for child in ["task-a", "task-b", "task-c", "task-d"] {
+            assert!(
+                text.contains(child),
+                "coalesced_children names {child}: {text}"
+            );
+        }
+
+        // The master consumes carrier2 and records completion; a SECOND
+        // restart over the fully-tombstoned store must re-emit NOTHING for
+        // any of the four child keys (each tombstoned exactly once).
+        for item in &drained {
+            second.mark_continuation_completed(item, Some("processed".into()));
+        }
+        drop(second);
+        let third = InProcessAgentOrchestrator::default();
+        third.configure_supervisor_store(dir.path()).expect("store");
+        let reemitted = third.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-cs",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            reemitted.is_empty(),
+            "nothing re-emitted for A/B/C/D after delivery + restart; got {reemitted:?}"
+        );
+    }
+
+    /// #25 (round-4 Blocker #18-B3, fold-then-correction) — task-a/task-b
+    /// fold into a carrier that is still PENDING (claimed but its record
+    /// was never tombstoned, so the correction arm's replace path finds it
+    /// in the pending set) when a status correction for the carrier child
+    /// lands (failed → completed re-forward). The rebuilt request must
+    /// RE-ATTACH the folded payload: `coalesced_child_ids` still lists A
+    /// and B, `coalesced_count` is unchanged, and the correction note names
+    /// the corrected child.
+    #[test]
+    fn correction_on_carrier_keeps_folded_payload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-cc", "api", "carrier-correction");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: "tenant-cc".to_owned(),
+        };
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        orchestrator.upsert_agent(upsert("task-a", "completed"));
+        orchestrator.upsert_agent(upsert("task-b", "failed"));
+
+        // The burst folds into ONE carrier keyed on task-b (fold order:
+        // A first, then B — the oldest-first batch makes the LAST-pending
+        // child the fallback carrier when no scatter exists). The drain
+        // claims it but its record stays Queued and its reinsert below puts
+        // it back pending — the undelivered carrier the correction targets.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-cc",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "A/B burst folds into one carrier");
+        let carrier = drained.into_iter().next().expect("carrier");
+        let carrier_key = carrier.dedupe_key.as_str().to_owned();
+        assert_eq!(
+            carrier.reason,
+            MasterContinuationReason::ScatterJoinComplete,
+            "the max-sequence scatter is the carrier (both children terminal): {carrier_key}"
+        );
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some("2"),
+        );
+        {
+            let mut state = orchestrator.state();
+            assert!(
+                matches!(
+                    state.continuations.reinsert(carrier),
+                    ReinsertOutcome::Requeued
+                ),
+                "the undelivered carrier must be pending when the correction lands"
+            );
+        }
+
+        // Status correction on the FOLDED child task-b: failed → completed.
+        // The delivered mark differs, so the correction arm rebuilds the
+        // request — and the pending CARRIER (the epoch-1 scatter row that
+        // folded task-b) must have its `coalesced_*` payload RE-ATTACHED to
+        // the corrected child row rather than vanishing with the replace.
+        orchestrator.upsert_agent(upsert("task-b", "completed"));
+
+        // Peek BEFORE the drain: the fold at drain time would absorb the
+        // corrected child row into a carrier and erase the 1:1 correction
+        // shape this test asserts. The corrected task-b row must sit in the
+        // pending set with its own verdict flipped...
+        let (corrected_key, corrected_meta, carrier_meta) = {
+            let state = orchestrator.state();
+            let corrected = state
+                .continuations
+                .pending_items()
+                .find(|item| {
+                    item.reason == MasterContinuationReason::ChildCompleted
+                        && item
+                            .child_agent_id
+                            .as_ref()
+                            .is_some_and(|id| id.as_str() == "task-b")
+                })
+                .expect("the corrected task-b row is pending after the replace");
+            let carrier = state
+                .continuations
+                .pending_items()
+                .find(|item| item.dedupe_key.as_str() == carrier_key.as_str())
+                .expect("the epoch-1 scatter carrier is still pending");
+            (
+                corrected.dedupe_key.as_str().to_owned(),
+                corrected.metadata.clone(),
+                carrier.metadata.clone(),
+            )
+        };
+        assert_eq!(
+            corrected_meta.get("status").map(String::as_str),
+            Some("completed"),
+            "the corrected verdict is on the child row itself: {corrected_key}"
+        );
+        // ...and the still-pending carrier must STILL carry the folded
+        // payload (ids for A and B, the count, the verdict note) — the
+        // correction did not strip the carrier's `coalesced_*` metadata.
+        let ids = carrier_meta
+            .get("coalesced_child_ids")
+            .expect("the pending carrier keeps its folded child-id set");
+        assert_eq!(
+            ids.matches("task-a").count(),
+            1,
+            "the carrier preserves folded child A: {ids}"
+        );
+        assert_eq!(
+            ids.matches("task-b").count(),
+            1,
+            "the carrier preserves folded child B: {ids}"
+        );
+        assert_eq!(
+            carrier_meta.get("coalesced_count").map(String::as_str),
+            Some("2"),
+            "the structured count is identity — unchanged by the verdict fix"
+        );
+        // The correction note lands on the CORRECTED child row (task-b),
+        // not the carrier — the carrier keeps the folded payload unchanged.
+        let note = corrected_meta
+            .get("coalesced_correction_note")
+            .unwrap_or_else(|| panic!("the correction note records the verdict change; corrected_meta={corrected_meta:?}"));
+        assert!(
+            note.contains("task-b") && note.contains("completed"),
+            "the note names the corrected child and its new verdict: {note}"
+        );
+
+        // The subsequent drain folds the corrected carrier (with its A/B
+        // payload) + the corrected child row into ONE carrier keyed on the
+        // epoch-1 join: the payload is never dropped, and B's corrected
+        // verdict rides along.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-cc",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // The scatter carrier was CLAIMED during the earlier drain (its
+        // record stays Queued in the store, but pending_by_key no longer
+        // holds it), so the drain yields the carrier AS-IS alongside the
+        // corrected child row — the fold only happens within one drain's
+        // batch. What matters: BOTH items carry the full folded payload.
+        assert_eq!(
+            drained.len(),
+            2,
+            "the corrected carrier + corrected child row deliver as two items; got {drained:?}"
+        );
+        let folded_carrier = drained
+            .iter()
+            .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .expect("the epoch-1 scatter carrier is delivered");
+        let folded_ids = folded_carrier
+            .metadata
+            .get("coalesced_child_ids")
+            .expect("the folded carrier keeps the union id set");
+        assert_eq!(
+            folded_ids.matches("task-a").count(),
+            1,
+            "task-a survives correction-then-fold: {folded_ids}"
+        );
+        assert_eq!(
+            folded_ids.matches("task-b").count(),
+            1,
+            "task-b survives correction-then-fold: {folded_ids}"
+        );
+        // The scatter carrier was claimed BEFORE the correction landed, so
+        // the note rides on the corrected CHILD row (not the carrier). The
+        // carrier's own `coalesced_children` still shows the ORIGINAL
+        // verdict for task-b (failed); the corrected row carries the note.
+        let corrected_row = drained
+            .iter()
+            .find(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .expect("the corrected task-b row is delivered");
+        assert!(
+            corrected_row
+                .metadata
+                .get("coalesced_children")
+                .is_some_and(|text| text.contains("corrected: completed")),
+            "the correction note survives on the corrected child row: {:?}",
+            corrected_row.metadata.get("coalesced_children"),
+        );
+    }
+
     /// #15 SF3 — the /stop purge's tombstone batch now mirrors the fold
     /// path's exactly-once retry. With the (shared, self-disarming)
     /// `force_tombstone_failure_once` hook armed, the purge's first batch
@@ -40790,6 +41333,263 @@ mod tests {
         assert_eq!(
             epoch1_joins, 1,
             "the retried epoch-1 join re-enqueues EXACTLY once after restart, never duplicated"
+        );
+    }
+
+    /// #25 round 2 (outer-loop 22:46 bounce) — the correction arm's carrier
+    /// capture is SCOPE-FILTERED: `pending_items()` is a global queue, so a
+    /// correction in session A must never graft session B's folded payload
+    /// (nor another group's, nor another workspace's) onto A's corrected
+    /// child row. Two sessions each hold a pending carrier with folded ids;
+    /// correcting session A's child must leave A's row carrying ONLY A's
+    /// ids and session B's carrier UNTOUCHED.
+    #[test]
+    fn correction_does_not_graft_foreign_session_carrier() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let upsert_for = |profile: &str, session_name: &str, agent_id: &str, status: &str| {
+            let session_id = SessionKey::with_profile(profile, "api", session_name);
+            AgentUpsert {
+                agent_id: agent_id.to_owned(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id,
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: agent_id.to_owned(),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: status.to_owned(),
+                last_task: Some(format!("summary-{agent_id}")),
+                cwd: None,
+                profile_id: profile.to_owned(),
+            }
+        };
+
+        let session_a = SessionKey::with_profile("tenant-cc2", "api", "cross-a");
+        let session_b = SessionKey::with_profile("tenant-cc2", "api", "cross-b");
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).expect("store");
+
+        // Session A: agents a1/a2 fold into a carrier with ids {a1, a2}.
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a1", "running"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "running"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a1", "completed"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "failed"));
+        // Session B: agents b1/b2 fold into a carrier with ids {b1, b2}.
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b1", "running"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b2", "running"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b1", "completed"));
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-b", "b2", "failed"));
+
+        // Drain each session once so its burst folds into one carrier, then
+        // reinsert that (still-undelivered) carrier as pending.
+        let mut carriers = std::collections::HashMap::new();
+        for (session, name) in [(&session_a, "a"), (&session_b, "b")] {
+            let drained = orch.drain_ready_continuations_for_session(
+                session,
+                "tenant-cc2",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            let carrier = drained
+                .into_iter()
+                .find(|item| item.metadata.contains_key("coalesced_child_ids"))
+                .expect("each session folds one carrier");
+            carriers.insert(name.to_string(), carrier);
+        }
+        {
+            let mut state = orch.state();
+            for (_, carrier) in carriers.iter() {
+                assert!(
+                    matches!(
+                        state.continuations.reinsert(carrier.clone()),
+                        ReinsertOutcome::Requeued
+                    ),
+                    "the undelivered carrier must be pending when the correction lands"
+                );
+            }
+        }
+
+        // STATUS CORRECTION in session A only: a2 failed → completed. The
+        // rebuilt a2 row must carry ONLY {a1, a2} — session B's carrier
+        // (also pending, also carrying coalesced_child_ids) must NOT be
+        // grafted onto it.
+        orch.upsert_agent(upsert_for("tenant-cc2", "cross-a", "a2", "completed"));
+
+        let a2_key = {
+            let state = orch.state();
+            let group = format!("agent-group:tenant-cc2:{}:master", session_a.0);
+            let corrected = state
+                .continuations
+                .pending_items()
+                .find(|item| {
+                    item.reason == MasterContinuationReason::ChildCompleted
+                        && item.group_id.as_str() == group
+                        && item.metadata.contains_key("coalesced_child_ids")
+                })
+                .expect("the corrected a2 row sits pending with re-attached metadata");
+            let ids = corrected
+                .metadata
+                .get("coalesced_child_ids")
+                .expect("re-attached id set");
+            assert!(
+                ids.contains("a1") && ids.contains("a2"),
+                "the corrected row carries session A's folded ids: {ids}"
+            );
+            assert!(
+                !ids.contains("b1") && !ids.contains("b2"),
+                "session B's ids must NOT be grafted onto session A's correction: {ids}"
+            );
+            corrected.dedupe_key.as_str().to_owned()
+        };
+
+        // And session B's carrier is UNTOUCHED: still pending, still holding
+        // {b1, b2}, no correction note.
+        {
+            let state = orch.state();
+            let b_carrier = state
+                .continuations
+                .pending_items()
+                .find(|item| {
+                    item.session_id.as_str() == session_b.0.as_str()
+                        && item.metadata.contains_key("coalesced_child_ids")
+                        && item.dedupe_key.as_str() != a2_key
+                })
+                .expect("session B's carrier is still pending");
+            let ids = b_carrier
+                .metadata
+                .get("coalesced_child_ids")
+                .expect("b carrier ids");
+            assert!(
+                ids.contains("b1")
+                    && ids.contains("b2")
+                    && !ids.contains("a1")
+                    && !ids.contains("a2"),
+                "session B's carrier keeps exactly its own ids: {ids}"
+            );
+            assert!(
+                b_carrier
+                    .metadata
+                    .get("coalesced_children")
+                    .is_none_or(|text| !text.contains("corrected")),
+                "no correction note leaks into session B's carrier"
+            );
+        }
+    }
+
+    /// #25 round 2 (outer-loop 22:02 item 1) — the retry pass itself can
+    /// fail: with `force_scatter_retry_failure_once` armed, the FIRST retry
+    /// at a site fails and the key STAYS in `pending_unpersisted_scatters`;
+    /// the NEXT site's retry succeeds, the record lands durably, and the
+    // marks advance exactly once (no double stamp).
+    #[test]
+    fn scatter_retry_failure_once_keeps_key_pending_until_next_site() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-spr3";
+        let session_id = SessionKey::with_profile(profile, "api", "scatter-retry2");
+        let group = format!("agent-group:{profile}:{}:master", session_id.0);
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: profile.to_owned(),
+        };
+
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).expect("store");
+        orch.upsert_agent(upsert("agent-1", "running"));
+        orch.upsert_agent(upsert("agent-2", "running"));
+        // Drain the epoch-0 join so the cohort sits at a joined epoch-0.
+        orch.upsert_agent(upsert("agent-1", "completed"));
+        orch.upsert_agent(upsert("agent-2", "completed"));
+        let drained = orch.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "epoch-0 join drained"
+        );
+
+        // Epoch-1 scatter persist fails → key lands pending. Arm the RETRY
+        // hook too: the first retry site (this upsert's entry pass happens
+        // BEFORE the new child's scatter computation, so the retry is the
+        // armed one) fails; the key must REMAIN pending and NO mark may
+        // advance for the epoch-1 key.
+        orch.upsert_agent(upsert("agent-3", "running"));
+        orch.set_force_scatter_persist_failure_for_test(true);
+        orch.set_force_scatter_retry_failure_once_for_test(true);
+        orch.upsert_agent(upsert("agent-3", "completed"));
+        let epoch1_key = format!(
+            "scatter_join/{group}/{session}/{profile}/{cwd}/1",
+            group = group,
+            session = session_id.0,
+            profile = profile,
+            cwd = scatter_cwd_hash(&None),
+        );
+        assert!(
+            orch.state()
+                .pending_unpersisted_scatters
+                .contains_key(&epoch1_key),
+            "the failed FIRST retry keeps the epoch-1 key pending for the next site"
+        );
+        assert!(
+            !orch
+                .state()
+                .delivered_scatter_marks
+                .contains_key(&epoch1_key),
+            "a failed retry must NOT stamp the durable scatter mark"
+        );
+
+        // Next site: a same-group terminal correction re-enters the enqueue
+        // pass — this retry SUCCEEDS (hooks are one-shot), the key leaves
+        // the pending map, and the mark lands exactly once.
+        orch.upsert_agent(upsert("agent-1", "failed"));
+        assert!(
+            !orch
+                .state()
+                .pending_unpersisted_scatters
+                .contains_key(&epoch1_key),
+            "the second retry site clears the pending key"
+        );
+        assert!(
+            orch.state()
+                .delivered_scatter_marks
+                .contains_key(&epoch1_key),
+            "the successful retry stamps the durable scatter mark"
+        );
+
+        // Restart: exactly one epoch-1 join re-emits (Queued record), and
+        // the retried record's attempt is allocator-derived, not hardcoded.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let epoch1_joins = drained
+            .iter()
+            .filter(|item| {
+                item.reason == MasterContinuationReason::ScatterJoinComplete
+                    && item.dedupe_key.as_str().ends_with("/1")
+            })
+            .count();
+        assert_eq!(
+            epoch1_joins, 1,
+            "the retried epoch-1 join re-emits exactly once after restart"
         );
     }
 }
