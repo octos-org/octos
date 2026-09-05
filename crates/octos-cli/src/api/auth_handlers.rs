@@ -4573,20 +4573,43 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let clone_path = clone_dir.join("mine.wav");
         std::fs::write(&clone_path, b"fake").unwrap();
-        let json = format!(
-            r#"{{
-              "default_voice": "doubao",
-              "models_base_path": "{base}",
-              "voices": {{
-                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
-                "ghost":  {{ "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] }},
-                "other-clone": {{ "ref_audio": "{clone}", "ref_text": "z", "aliases": [] }}
-              }}
-            }}"#,
-            base = dir.to_string_lossy(),
-            clone = clone_path.to_string_lossy()
-        );
+        let json = readiness_registry_json(&dir.to_string_lossy(), &clone_path.to_string_lossy());
         octos_llm::ominix::VoicesRegistry::parse(&json).unwrap()
+    }
+
+    fn readiness_registry_json(base: &str, clone: &str) -> String {
+        serde_json::json!({
+            "default_voice": "doubao",
+            "models_base_path": base,
+            "voices": {
+                "doubao": { "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] },
+                "ghost": { "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] },
+                "other-clone": { "ref_audio": clone, "ref_text": "z", "aliases": [] }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn should_preserve_paths_when_serializing_readiness_registry_fixture() {
+        // These are serialization inputs, not directories to create: Windows
+        // paths and JSON-special characters are exercised on every test host.
+        for (base, clone) in [
+            (r"C:\Users\ci\models", r"C:\Users\ci\profiles\mine.wav"),
+            (r"\\server\voices\models", r"\\server\voices\mine.wav"),
+            (
+                r#"/models/"quoted"\backslash"#,
+                r#"/voices/"mine"\audio.wav"#,
+            ),
+        ] {
+            let json = readiness_registry_json(base, clone);
+            let registry = octos_llm::ominix::VoicesRegistry::parse(&json)
+                .expect("readiness fixture paths must produce valid JSON");
+            assert_eq!(registry.models_base_path, base);
+            assert_eq!(registry.voices["other-clone"].ref_audio, clone);
+            assert_eq!(registry.default_voice, "doubao");
+            assert_eq!(registry.voices["doubao"].aliases, ["vivian"]);
+        }
     }
 
     #[test]
