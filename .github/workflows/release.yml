@@ -17,14 +17,41 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_VERSION: "1.97.1"
   FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
   SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home"
 
 jobs:
+  check-version:
+    name: Verify tag matches workspace version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Compare release tag and Cargo workspace version
+        if: github.event_name == 'push' || inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::release tag $TAG does not match workspace version v$version"
+            exit 1
+          fi
+
   build-macos-arm:
+    needs: check-version
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos-arm'
     runs-on: macos-14
     steps:
@@ -34,6 +61,8 @@ jobs:
           # otherwise we build main's HEAD but publish under the tag.
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Set build metadata
@@ -70,6 +99,7 @@ jobs:
           path: octos-bundle-aarch64-apple-darwin.tar.gz
 
   build-linux-x86:
+    needs: check-version
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-x86'
     runs-on: ubuntu-latest
     steps:
@@ -79,6 +109,8 @@ jobs:
           # otherwise we build main's HEAD but publish under the tag.
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Set build metadata
@@ -115,6 +147,7 @@ jobs:
           path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
 
   build-linux-arm:
+    needs: check-version
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'linux-arm'
     runs-on: ubuntu-24.04-arm
     steps:
@@ -124,6 +157,8 @@ jobs:
           # otherwise we build main's HEAD but publish under the tag.
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: arm64-release
@@ -162,6 +197,7 @@ jobs:
           path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
 
   build-windows:
+    needs: check-version
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
     steps:
@@ -171,6 +207,8 @@ jobs:
           # otherwise we build main's HEAD but publish under the tag.
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release
@@ -248,12 +286,8 @@ jobs:
     if: ${{ !failure() && !cancelled() && (github.event_name == 'push' || inputs.tag != '') }}
     needs: [build-macos-arm, build-linux-x86, build-linux-arm, build-windows]
     runs-on: ubuntu-latest
-    # actions:write lets the post-release step dispatch publish-packages.yml — a
-    # release CREATED by GITHUB_TOKEN does NOT fire `release: published`, so we
-    # must trigger the package publishers explicitly.
     permissions:
       contents: write
-      actions: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -297,12 +331,47 @@ jobs:
           files: release-assets/*
           body_path: RELEASE_NOTES.md
 
-      - name: Trigger package publishers
-        # A release created by GITHUB_TOKEN does NOT emit `release: published`,
-        # so publish-packages.yml never auto-fires. Dispatch it explicitly with
-        # the tag. It self-gates on `vars.PUBLISH_PACKAGES == 'true'`, so this is
-        # a no-op until packaging is opted in.
+  verify-release:
+    name: Verify GitHub release assets
+    needs: publish
+    if: ${{ !failure() && !cancelled() && (github.event_name == 'push' || inputs.tag != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Verify complete release and readable archives
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
-        run: gh workflow run publish-packages.yml --repo "${{ github.repository }}" -f tag="$TAG"
+        run: |
+          set -euo pipefail
+          actual=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          expected='octos-bundle-aarch64-apple-darwin.tar.gz
+          octos-bundle-aarch64-unknown-linux-gnu.tar.gz
+          octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+          octos-bundle-x86_64-pc-windows-msvc.zip
+          install.sh
+          install.ps1
+          deploy.ps1
+          octos-doctor.sh'
+          while IFS= read -r asset; do
+            asset=$(echo "$asset" | xargs)
+            [ -z "$asset" ] && continue
+            echo "$actual" | grep -Fx "$asset" >/dev/null \
+              || { echo "::error::release $TAG is missing $asset"; exit 1; }
+          done <<< "$expected"
+
+          mkdir verify
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'octos-bundle-x86_64-unknown-linux-gnu.tar.gz' --dir verify
+          tar -tzf verify/octos-bundle-x86_64-unknown-linux-gnu.tar.gz >/dev/null
+
+  package-publishers:
+    name: Publish npm and Homebrew packages
+    needs: verify-release
+    if: ${{ !failure() && !cancelled() && (github.event_name == 'push' || inputs.tag != '') }}
+    uses: ./.github/workflows/publish-packages.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit
