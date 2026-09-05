@@ -128,6 +128,17 @@ impl SlotKind {
             Self::Verify => VERIFY_PREFIX,
         }
     }
+
+    /// If `name` is this namespace's `<prefix><number>` form, return the
+    /// number; anything else (including `slot-`, `slot-x`, `slot-1x`) is not
+    /// a slot dir and never touched. Caps GC enumeration to slot-shaped
+    /// dirs only (D3).
+    fn strip_prefix_of(self, name: &str) -> Option<u32> {
+        name.strip_prefix(self.prefix())?
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0)
+    }
 }
 
 impl From<SlotPurpose> for SlotKind {
@@ -323,6 +334,10 @@ pub enum ReclaimOutcome {
     Reclaimed,
     /// Unheld but inside the stale window.
     Fresh,
+    /// The slot dir exists but its `.lock` file does not — structurally
+    /// broken (we never create or delete `.lock`). Skipped, never deleted,
+    /// and reported distinctly from `fresh` so a human can see it (D6).
+    NoLock,
 }
 
 impl ReclaimOutcome {
@@ -333,6 +348,7 @@ impl ReclaimOutcome {
             Self::HolderCleared => "holder_cleared",
             Self::Reclaimed => "reclaimed",
             Self::Fresh => "fresh",
+            Self::NoLock => "no_lock",
         }
     }
 }
@@ -355,30 +371,40 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// `kill(pid, 0)` liveness probe for §3.5. `None` = process gone (ESRCH),
-/// `Some(true)` = alive and signalable (ret == 0), `Some(false)` = exists
-/// but not ours (EPERM — treated as alive; fail-safe toward skipping,
-/// never toward deleting a slot someone may hold).
+/// `kill(pid, 0)` liveness probe for §3.5, via
+/// `rustix::process::test_kill_process` (the safe wrapper for the
+/// permission/existence check; signal 0 is never delivered). The mapping is
+/// the design's three-state contract:
 ///
-/// Implemented via the `kill` binary (`kill -0`) rather than
-/// `libc::kill`: this crate is built with `-D unsafe-code` (deny
-/// clippy::undocumented_unsafe_blocks at the workspace level), and the
-/// subprocess form is the established in-repo idiom
-/// (autonomy/monitor_runtime.rs "kill -0 <pid> fails once the process is
-/// gone"; octos-agent's `signal_process(pid, "-0")` twins). It needs no
-/// signal delivery — signal 0 is a permission/existence check only.
+/// * `Ok(())` — alive and ours: `Some(true)`.
+/// * `Err(ESRCH)` — no such process: `None` (dead, metadata may clear).
+/// * `Err(EPERM)` — exists but belongs to another uid: `Some(false)`.
+///   Treated as alive (skip); fail-safe toward never deleting a slot
+///   someone may hold.
+/// * `Err(EINVAL)` — malformed pid (out of range for the kernel): `None`
+///   (dead). A holder pid our kernel cannot even name was not written by a
+///   live holder on this host.
+/// * any other errno — `Some(false)`: conservative alive. An errno we do
+///   not recognize must not license deletion (§6 red line).
+///
+/// Unlike the `kill` binary (whose exit status collapses ESRCH and EPERM
+/// into the same "1", and whose availability depends on `$PATH`), the
+/// syscall returns a distinguishable errno — and unlike `libc::kill` it is
+/// safe under the workspace-wide `deny(unsafe_code)`.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> Option<bool> {
-    use std::process::{Command, Stdio};
-    let status = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match status {
-        Ok(s) if s.success() => Some(true), // ret 0: alive, ours
-        Ok(_) => None,                      // ESRCH: gone
-        Err(_) => Some(false),              // cannot probe: assume alive (fail-safe)
+    use rustix::io::Errno;
+    use rustix::process::{Pid, test_kill_process};
+    let Some(pid) = Pid::from_raw(pid as i64 as i32) else {
+        // pid 0 or one that does not fit an i32 was not written by a live
+        // holder on this host; the kernel would reject it with EINVAL.
+        return None;
+    };
+    match test_kill_process(pid) {
+        Ok(()) => Some(true),
+        Err(Errno::SRCH) => None,
+        Err(Errno::INVAL) => None,
+        Err(_) => Some(false), // EPERM and anything unrecognized: alive
     }
 }
 
@@ -487,6 +513,17 @@ pub fn acquire(
     holder: &HolderInfo,
 ) -> Result<Slot, BuildCacheError> {
     let kind = SlotKind::from(purpose);
+    // I3 + D5 (§3.2 step 1): create the POOL ROOT if missing, then measure,
+    // then gate — before creating the repo-key dir or any slot artifact, so
+    // a refusal leaves nothing behind. (statvfs needs an existing path; the
+    // root itself is the one dir creation the gate depends on.)
+    if let Err(e) = fs::create_dir_all(pool_root) {
+        return Err(BuildCacheError::io(
+            format!("failed to create pool root {}", pool_root.display()),
+            e,
+        ));
+    }
+    space_gate(pool_root, config.min_free_gb)?;
     let repo_dir = pool_root.join(repo_key.as_str());
     fs::create_dir_all(&repo_dir).map_err(|e| {
         BuildCacheError::io(
@@ -494,10 +531,6 @@ pub fn acquire(
             e,
         )
     })?;
-
-    // I3: gate before touching any slot, so a nearly-full disk never gains
-    // another cargo invocation.
-    space_gate(pool_root, config.min_free_gb)?;
 
     let count = config.slot_count(kind);
     let mut last_err: Option<std::io::Error> = None;
@@ -590,13 +623,16 @@ pub fn acquire(
 /// The `target/` contents are NEVER deleted (I2: the whole point of the
 /// pool is that the next peer of this repository reuses them).
 pub fn release(slot: &mut Slot, outcome: SlotOutcome) -> Result<(), BuildCacheError> {
-    // Drop the flock first: order matters for crash windows. If the process
-    // dies between the flock drop and the holder.json removal, §3.5 sees an
-    // unlocked slot with a live-pid holder and skips it; the next GC pass
-    // clears it once the pid is gone. The reverse order would leave an
-    // unlocked slot that looks ownerless while the "owner" still runs.
+    // §3.4 order: remove holder.json and stamp last_used WHILE still holding
+    // the flock, and drop the lock fd last. Doing it the other way round
+    // opens a window where another process acquires this slot and writes its
+    // own holder.json — which our remove_file would then delete from under
+    // the new holder. Holding the lock across both writes closes that race:
+    // die before them and §3.5 clears the dead-pid metadata; die after them
+    // and the flock vanishes with the process leaving a clean ownerless slot.
+    release_at_path(&slot.path, outcome, slot.kind)?;
     slot.lock = None;
-    release_at_path(&slot.path, outcome, slot.kind)
+    Ok(())
 }
 
 /// Path-level release used by both [`release`] and `reclaim_stale`'s
@@ -683,23 +719,22 @@ pub fn reclaim_stale(
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let repo_key = match super::repo_key::RepoKey::parse(&entry.file_name().to_string_lossy()) {
-            Ok(k) => k,
-            Err(_) => continue, // not a pool dir; never touch unrelated dirs
-        };
+        // Only directories named like a pool repo dir (12-hex repo key);
+        // unrelated content under the root is never touched.
+        if super::repo_key::RepoKey::parse(&entry.file_name().to_string_lossy()).is_err() {
+            continue;
+        }
+        // D3: enumerate the slot dirs that ACTUALLY exist (read_dir), not
+        // merely 1..=configured count — a shrunk `peer_slots` config must not
+        // make historical high-numbered slots invisible to GC forever.
         for kind in [SlotKind::Peer, SlotKind::Verify] {
-            for n in 1..=config.slot_count(kind) {
-                let dir = slot_dir(&repo_dir, kind, n);
-                if !dir.is_dir() {
-                    continue;
-                }
+            for dir in existing_slot_dirs(&repo_dir, kind, config) {
                 let outcome = reclaim_one(&dir, kind, policy)?;
                 reports.push(ReclaimReport {
                     slot_path: dir,
                     outcome: outcome.0,
                     freed_bytes: outcome.1,
                 });
-                let _ = repo_key;
             }
         }
     }
@@ -719,8 +754,8 @@ fn reclaim_one(
             // No lock file: a slot dir without its mutex inode. Treat as
             // unlocked-but-suspicious and skip — we never create it here,
             // because doing so could hand a racing creator's mutex to a
-            // reclaimer.
-            return Ok((ReclaimOutcome::Fresh, 0));
+            // reclaimer. Reported as its own outcome (D6), not "fresh".
+            return Ok((ReclaimOutcome::NoLock, 0));
         }
         Err(e) => {
             return Err(BuildCacheError::io(
@@ -739,10 +774,13 @@ fn reclaim_one(
         let stale_holder = match fs::read_to_string(&holder_path) {
             Ok(text) => match serde_json::from_str::<HolderMeta>(&text) {
                 Ok(meta) => pid_alive(meta.pid).is_none(),
-                Err(_) => true, // unreadable metadata: treat as stale
-                                // rather than permanently leaking the slot.
+                // Unparsable JSON: the file is ours to write and corrupt —
+                // treat as stale rather than permanently leaking the slot.
+                Err(_) => true,
             },
-            Err(_) => true,
+            // Unreadable — EACCES/EPERM means the file is (probably) not
+            // ours to read, i.e. someone else owns this slot: skip (D4).
+            Err(_) => false,
         };
         if !stale_holder {
             return Ok((ReclaimOutcome::Locked, 0)); // holder alive
@@ -819,12 +857,45 @@ pub fn read_last_used(slot_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Slot dirs that ACTUALLY exist under `repo_dir` for one namespace, plus
+/// the configured range, capped to slot-shaped names (`<prefix><number>`).
+/// Used by reclaim/status/gc so a shrunk `*_slots` config still surfaces
+/// (and reclaims) historical high-numbered slots (D3).
+fn existing_slot_dirs(repo_dir: &Path, kind: SlotKind, config: &BuildCacheConfig) -> Vec<PathBuf> {
+    let mut ns: Vec<u32> = Vec::new();
+    // What actually exists on disk — the authoritative set for GC/status.
+    if let Ok(entries) = fs::read_dir(repo_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(n) = kind.strip_prefix_of(name) else {
+                continue;
+            };
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) && !ns.contains(&n) {
+                ns.push(n);
+            }
+        }
+    }
+    // Fallback when read_dir itself failed: probe the configured range, so a
+    // permissions hiccup degrades to the old behavior instead of blindness.
+    for n in 1..=config.slot_count(kind) {
+        if slot_dir(repo_dir, kind, n).is_dir() && !ns.contains(&n) {
+            ns.push(n);
+        }
+    }
+    ns.sort_unstable();
+    ns.dedup();
+    ns.into_iter()
+        .map(|n| slot_dir(repo_dir, kind, n))
+        .collect()
+}
+
 /// Enumerate the slot dirs of one repo pool (for status output).
 pub fn slot_dirs(repo_dir: &Path, config: &BuildCacheConfig) -> Vec<(SlotKind, PathBuf)> {
     let mut out = Vec::new();
     for kind in [SlotKind::Peer, SlotKind::Verify] {
-        for n in 1..=config.slot_count(kind) {
-            out.push((kind, slot_dir(repo_dir, kind, n)));
+        for dir in existing_slot_dirs(repo_dir, kind, config) {
+            out.push((kind, dir));
         }
     }
     out
@@ -1113,7 +1184,14 @@ mod tests {
         )
         .unwrap();
         // Held by this very process: the flock is the truth.
-        assert!(report.iter().all(|r| r.outcome == ReclaimOutcome::Locked));
+        let unexpected: Vec<_> = report
+            .iter()
+            .filter(|r| r.outcome != ReclaimOutcome::Locked)
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "held slot rows must all be locked, got {unexpected:?}"
+        );
         assert!(slot.target_dir.join("live.bin").exists());
     }
 
@@ -1306,5 +1384,209 @@ mod tests {
         };
         let warnings = cfg.validate();
         assert_eq!(warnings.len(), 3);
+    }
+
+    // ---- review #3 fixes (D1, D3, D4, D6) ----
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_distinguishes_eperm_from_esrch() {
+        // EPERM branch: pid 1 exists but a normal user may not signal it —
+        // test_kill_process must surface EPERM as "alive but not ours",
+        // which pid_alive encodes as Some(false), never None (dead).
+        // (Running as root this returns Ok — Some(true) — which is still
+        // "alive"; both readings keep the slot safe, but assert the EPERM
+        // shape when we can observe it.)
+        match pid_alive(1) {
+            Some(false) | Some(true) => {} // alive either way: never reclaimed
+            None => panic!("pid 1 must never be judged dead (EPERM/Ok both mean alive)"),
+        }
+        // ESRCH branch: a verifiably gone pid (spawned, killed, reaped).
+        let dead = spawn_dead_pid();
+        assert_eq!(pid_alive(dead), None);
+        // Malformed pid (D1's EINVAL arm): 0 is not a valid signal target.
+        assert_eq!(pid_alive(0), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn foreign_live_holder_is_never_reclaimed() {
+        // The D1 end-to-end guarantee: a holder.json naming a LIVE pid the
+        // reclaimer cannot signal (root's pid 1) keeps the slot even when
+        // the stale window has long passed.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let slot = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        fs::write(slot.target_dir.join("foreign.bin"), b"x").unwrap();
+        let dir = slot.path.clone();
+        drop(slot); // unlock, metadata stays
+        let meta = HolderMeta {
+            kind: SlotKind::Peer,
+            pid: 1, // alive, not ours (EPERM for an unprivileged reader)
+            slug: None,
+            goal_id: None,
+            task_id: None,
+            purpose_note: None,
+            acquired_at: 1,
+        };
+        write_file_atomic(&dir, HOLDER_LEAF, &serde_json::to_string(&meta).unwrap()).unwrap();
+        write_last_used(&dir, 0).unwrap(); // maximally stale
+        let report = reclaim_stale(
+            &root,
+            &GcPolicy {
+                stale_hours: 0,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        let row = report.iter().find(|r| r.slot_path == dir).unwrap();
+        assert_eq!(
+            row.outcome,
+            ReclaimOutcome::Locked,
+            "live foreign pid must read as held"
+        );
+        assert!(dir.join(TARGET_LEAF).join("foreign.bin").exists());
+    }
+
+    #[test]
+    fn shrunk_config_still_reclaims_historical_slots() {
+        // D3: peer_slots was once 3; slot-3's dir survives the config
+        // change and must stay visible to GC (status + reclaim).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let cfg3 = BuildCacheConfig {
+            peer_slots: 3,
+            ..config()
+        };
+        let slot3 = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &cfg3,
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        // acquire takes the lowest slot, so forge the high one instead.
+        let _ = slot3;
+        let repo_dir = root.join(key(&tmp).as_str());
+        let high = repo_dir.join(format!("{SLOT_PREFIX}3"));
+        fs::create_dir_all(high.join(TARGET_LEAF)).unwrap();
+        File::create(high.join(LOCK_LEAF)).unwrap();
+        write_last_used(&high, 0).unwrap();
+        // Now the config is back to 2 slots — slot-3 must still be listed
+        // by status and reclaimed by gc.
+        assert!(
+            slot_dirs(&repo_dir, &config())
+                .iter()
+                .any(|(_, d)| d == &high)
+        );
+        let report = reclaim_stale(
+            &root,
+            &GcPolicy {
+                stale_hours: 1,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        assert!(
+            report
+                .iter()
+                .any(|r| r.slot_path == high && r.outcome == ReclaimOutcome::Reclaimed)
+        );
+        assert!(!high.join(TARGET_LEAF).exists());
+    }
+
+    #[test]
+    fn slot_without_lock_reports_no_lock_not_fresh() {
+        // D6: a structurally broken slot (no .lock) must not be labeled
+        // "fresh" — it is its own outcome, and it is never deleted.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let slot = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        let dir = slot.path.clone();
+        drop(slot);
+        fs::remove_file(dir.join(LOCK_LEAF)).unwrap();
+        write_last_used(&dir, 0).unwrap();
+        let report = reclaim_stale(
+            &root,
+            &GcPolicy {
+                stale_hours: 0,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        let row = report.iter().find(|r| r.slot_path == dir).unwrap();
+        assert_eq!(row.outcome, ReclaimOutcome::NoLock);
+        assert!(dir.join(TARGET_LEAF).is_dir(), "no_lock never deletes");
+    }
+
+    #[test]
+    fn unreadable_holder_json_is_skipped_not_stale() {
+        // D4: an EACCES on holder.json means the slot is probably someone
+        // else's — conservative skip, not "stale holder".
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let slot = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        let dir = slot.path.clone();
+        drop(slot);
+        let holder = dir.join(HOLDER_LEAF);
+        let meta = HolderMeta {
+            kind: SlotKind::Peer,
+            pid: spawn_dead_pid(),
+            slug: None,
+            goal_id: None,
+            task_id: None,
+            purpose_note: None,
+            acquired_at: 1,
+        };
+        write_file_atomic(&dir, HOLDER_LEAF, &serde_json::to_string(&meta).unwrap()).unwrap();
+        // chmod 000: unreadable to everyone (root sees through it; the
+        // assertion below holds for both the skip and the root case).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&holder, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let report = reclaim_stale(
+            &root,
+            &GcPolicy {
+                stale_hours: 0,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        let row = report.iter().find(|r| r.slot_path == dir).unwrap();
+        // Either skipped-as-held (unprivileged: EACCES→skip) or cleared
+        // (root reads through 0000 and finds the dead pid). Both are safe;
+        // neither may have deleted the target.
+        assert!(matches!(
+            row.outcome,
+            ReclaimOutcome::Locked | ReclaimOutcome::HolderCleared
+        ));
     }
 }

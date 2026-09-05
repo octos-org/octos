@@ -130,7 +130,12 @@ libc = { workspace = true }
 # safe `openat` wrapper (workspace-wide `deny(unsafe_code)` rules out
 # raw `libc::openat`) anchors each step to a parent fd so the
 # relationship survives mid-walk swaps.
-rustix = { version = "1.1", features = ["fs"] }
+# `fs` for the preview walk above; `process` adds
+# `rustix::process::test_kill_process` — the kill(pid, 0) liveness probe in
+# `src/build_cache/pool.rs` (review #3 D1). Unlike the `kill` binary, the
+# syscall returns a distinguishable errno (ESRCH vs EPERM), and unlike
+# `libc::kill` it is safe under the workspace-wide deny(unsafe_code).
+rustix = { version = "1.1", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
