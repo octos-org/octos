@@ -38057,3 +38057,367 @@ fn result_owner_contract_27h_r1() {
         std::any::type_name_of_val(&octos_agent::result_md_owner_content_is_peer),
     );
 }
+
+// ---------------------------------------------------------------------------
+// #48b — serve/UI forwarder path: `fallback_switch` rows from
+// `spawn_router_failover_forwarder` (same shape as the gateway path).
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_ui_48b {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn stub_router() -> Arc<octos_llm::AdaptiveRouter> {
+        Arc::new(octos_llm::AdaptiveRouter::new(
+            vec![Arc::new(Wave4AStubProvider {
+                name: "a",
+                model: "m1",
+            })],
+            &[],
+            octos_llm::AdaptiveConfig::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-own".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some(session_id.0.clone()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let events = read_events(data_dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "ui path writes one row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-other".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder =
+            spawn_router_failover_forwarder_for_test(ws, ledger, session_id, Some(router.clone()));
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some("some-other-session".to_string()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "other-session failover must not write rows on the ui path"
+        );
+    }
+
+    /// #48c-r1 — None originator: no `events.jsonl` row, but the client
+    /// NOTICE still passes through (the Codex P1 notice filter is
+    /// verbatim-untouched for None; only the event write is stricter).
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-none".to_owned());
+        let router = stub_router();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        // No RouterContext => originating_session_id is None.
+        router.publish_failover_for_subscribers("a", "b", "quota", 120);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "None-originator failover must not write rows on the ui path (#48c strict event gate)"
+        );
+        // The notice still passes through, verbatim pre-#48c behavior.
+        // The wire carries serialized WS text frames; decode the envelope to
+        // confirm the RouterFailover notice survived the None gate.
+        let noticed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(axum::extract::ws::Message::Text(text)) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if v.get("method").and_then(|t| t.as_str()) == Some("router/failover")
+                                || v.get("type").and_then(|t| t.as_str()) == Some("router/failover")
+                            {
+                                return v;
+                            }
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("notification channel closed without a RouterFailover notice"),
+                }
+            }
+        })
+        .await
+        .expect("None-originator failover notice still forwarded");
+        let params = noticed.get("params").cloned().unwrap_or_default();
+        assert_eq!(
+            params.get("session_id").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str()),
+            "notice targets THIS session: {noticed}"
+        );
+        assert_eq!(
+            params.get("from_provider").and_then(|s| s.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            params.get("to_provider").and_then(|s| s.as_str()),
+            Some("b")
+        );
+    }
+}
+
+/// #48b — doc pin: the obs_events header lists both new kinds.
+#[test]
+fn obs_events_doc_lists_new_kinds() {
+    let src = include_str!("../obs_events.rs");
+    assert!(src.contains("fallback_switch"), "doc lists fallback_switch");
+    assert!(
+        src.contains("malformed_exhausted"),
+        "doc lists malformed_exhausted"
+    );
+}
+
+/// #48b — marker-prefixed terminal message produces exactly the
+/// malformed_exhausted decision (and the CLI appends ONLY that row).
+mod obs_malformed_exhausted_48b {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn count_turn_error_rows(data_dir: &std::path::Path) -> usize {
+        read_events(data_dir)
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("turn_error"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+        // #48c — REAL agent error → terminal path → events.jsonl, no
+        // hand-built message: a provider that always returns MalformedArgs
+        // drives the loop_runner to exhaustion, the REAL error is classified
+        // through `classify_runtime_error_message`, and the Errored terminal
+        // appends exactly one malformed_exhausted row to a temp ledger dir.
+        struct AlwaysMalformedProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for AlwaysMalformedProvider {
+            fn provider_name(&self) -> &str {
+                "always-malformed"
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Err(eyre::Report::new(octos_llm::StreamError::MalformedArgs {
+                    tool_id: "call_bad".to_string(),
+                    tool_name: "shell".to_string(),
+                    error: "expected `,` or `}` at line 1 column 4123".to_string(),
+                }))
+            }
+            fn model_id(&self) -> &str {
+                "always-malformed"
+            }
+        }
+        let provider: std::sync::Arc<dyn octos_llm::LlmProvider> =
+            std::sync::Arc::new(AlwaysMalformedProvider);
+        let tools = octos_agent::ToolRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+        let memory = std::sync::Arc::new(
+            octos_memory::EpisodeStore::open(dir.path().join("memory"))
+                .await
+                .unwrap(),
+        );
+        let agent = octos_agent::Agent::new(
+            octos_core::AgentId::new("mfe-real"),
+            provider,
+            tools,
+            memory,
+        );
+        // The REAL exhausted error (marker prefix comes from the loop_runner
+        // return, NOT from this test's format!).
+        let error = agent
+            .process_message("never produces valid JSON", &[], vec![])
+            .await
+            .expect_err("exhausted malformed budget terminates the turn");
+        let message = classify_runtime_error_message(&error);
+        assert!(
+            message.starts_with(octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER),
+            "real classified error carries the marker: {message}"
+        );
+
+        // Terminal path with a temp ledger data_dir.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let session_id = SessionKey("tenant-a:api:mfe-real".to_owned());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+        let turn_error_before = count_turn_error_rows(data_dir.path());
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("runtime_error", message.as_str())),
+            None,
+            None,
+        )
+        .await;
+        // Drain the ws notifications so the runtime doesn't complain.
+        while rx.try_recv().is_ok() {}
+
+        let rows = read_events(data_dir.path());
+        // The pair of helpers are pinned to a REAL use: total row count and
+        // the turn_error count (unchanged) come from the same read.
+        assert!(
+            !rows.is_empty(),
+            "terminal wrote at least the malformed_exhausted row"
+        );
+        let mfe: Vec<_> = rows
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("malformed_exhausted"))
+            .collect();
+        assert_eq!(
+            mfe.len(),
+            1,
+            "exactly one malformed_exhausted row: {rows:?}"
+        );
+        assert_eq!(
+            mfe[0].get("detail").and_then(|d| d.as_str()),
+            Some("feedback_limit=3 observed_malformed=4"),
+            "detail verbatim from the real error"
+        );
+        assert_eq!(
+            mfe[0].get("session").and_then(|s| s.as_str()),
+            Some("tenant-a:api:mfe-real")
+        );
+        assert_eq!(
+            count_turn_error_rows(data_dir.path()),
+            turn_error_before,
+            "no turn_error row added for this terminal"
+        );
+    }
+
+    /// #48c — the critical test above must use the REAL agent error path
+    /// (no hand-built marker message). This pins the SOURCE — scoped to
+    /// ONLY the target function body (contract v3.1), not the whole file:
+    /// from `fn obs_malformed_exhausted_event_on_errored_terminal` to the
+    /// next `#[` or `fn ` after it.
+    #[test]
+    fn obs_malformed_exhausted_terminal_test_uses_real_agent_error() {
+        let src = include_str!("ui_protocol_tests.rs");
+        let start = src
+            .find("fn obs_malformed_exhausted_event_on_errored_terminal")
+            .expect("target fn exists");
+        let rest = &src[start + 1..];
+        // Scope: the target function body ends at the NEXT attribute or fn.
+        let end_rel = rest
+            .find("\n    #[")
+            .or_else(|| rest.find("\n    fn "))
+            .or_else(|| rest.find("\n}"))
+            .expect("target fn body ends somewhere");
+        let body = &src[start..start + 1 + end_rel];
+        // It drives the real loop_runner.
+        assert!(
+            body.contains("process_message"),
+            "the critical test must drive the real agent loop: {body}"
+        );
+        // It reads the real events file.
+        assert!(
+            body.contains("events.jsonl"),
+            "the critical test must read events.jsonl"
+        );
+        // No hand-built marker message feeding the terminal.
+        assert!(
+            !body.contains("format!(\"{} feedback_limit"),
+            "the critical test must not hand-build the marker message"
+        );
+    }
+
+    #[test]
+    fn obs_no_malformed_exhausted_when_marker_not_prefix() {
+        let message = format!(
+            "ordinary error mentioning {} mid-text",
+            octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER
+        );
+        assert!(
+            malformed_exhausted_detail_for_terminal(&message).is_none(),
+            "marker buried mid-text must not trigger"
+        );
+    }
+}

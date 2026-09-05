@@ -4206,7 +4206,7 @@ async fn outbound_forwarder(params: ForwarderParams) {
 }
 
 /// Wave-4 B3.4 — params for the per-actor failover forwarder task.
-struct FailoverForwarderParams {
+pub(crate) struct FailoverForwarderParams {
     rx: tokio::sync::broadcast::Receiver<FailoverEvent>,
     out_tx: mpsc::Sender<OutboundMessage>,
     /// `SessionKey::to_string()` — used to filter the broadcast stream
@@ -4216,6 +4216,9 @@ struct FailoverForwarderParams {
     session_key: SessionKey,
     channel: String,
     chat_id: String,
+    /// #48a — profile data dir for the OLP observability event sink
+    /// (`events.jsonl`). Passed from the actor's own `data_dir` at spawn.
+    profile_data_dir: std::path::PathBuf,
 }
 
 /// Wave-4 B3.4 — long-lived task that forwards `RouterFailoverEvent`
@@ -4238,6 +4241,11 @@ struct FailoverForwarderParams {
 /// the actor's `out_tx` closes (send returns Err). `Lagged(n)` is logged
 /// but DOES NOT terminate — the next `recv()` returns the next live
 /// event.
+#[cfg(test)]
+pub(crate) async fn forward_router_failovers_for_test(params: FailoverForwarderParams) {
+    forward_router_failovers(params).await
+}
+
 async fn forward_router_failovers(params: FailoverForwarderParams) {
     use tokio::sync::broadcast::error::RecvError;
     let FailoverForwarderParams {
@@ -4247,6 +4255,7 @@ async fn forward_router_failovers(params: FailoverForwarderParams) {
         session_key,
         channel,
         chat_id,
+        profile_data_dir,
     } = params;
     let mut last_push: Option<std::time::Instant> = None;
     loop {
@@ -4288,6 +4297,24 @@ async fn forward_router_failovers(params: FailoverForwarderParams) {
         };
         if originator != &session_id {
             continue;
+        }
+
+        // #48a — OLP observability: every REAL lane switch of THIS session
+        // appends a `fallback_switch` event row, best-effort, BEFORE the
+        // client-notice debounce below (a suppressed notice must not
+        // suppress the event row; other sessions' events were dropped above
+        // and never reach this write).
+        {
+            let detail = format!(
+                "router failover: {} -> {} ({}, {}ms)",
+                event.from_provider, event.to_provider, event.reason, event.elapsed_ms
+            );
+            crate::obs_events::append_obs_event(
+                &profile_data_dir,
+                &crate::obs_events::ObsEvent::new("fallback_switch", &detail)
+                    .session(Some(&session_id))
+                    .model_lane(Some(&event.to_provider)),
+            );
         }
 
         // Debounce: at most one push per FAILOVER_PUSH_DEBOUNCE window.
@@ -5786,6 +5813,8 @@ impl SessionActor {
             let channel = self.channel.clone();
             let chat_id = self.chat_id.clone();
             let session_key = self.session_key.clone();
+            // #48a — the actor's data_dir rides along for the obs sink.
+            let profile_data_dir = self.data_dir.clone();
             tokio::spawn(forward_router_failovers(FailoverForwarderParams {
                 rx,
                 out_tx,
@@ -5793,6 +5822,7 @@ impl SessionActor {
                 session_key,
                 channel,
                 chat_id,
+                profile_data_dir,
             }))
         });
         let idle_sleep = tokio::time::sleep(self.idle_timeout);

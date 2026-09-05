@@ -9742,3 +9742,172 @@ async fn should_wire_goal_task_row_observers_when_gateway_actor_is_spawned() {
     drop(tx);
     handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// #48a — OLP observability: `fallback_switch` event rows from the failover
+// forwarder. Best-effort, per-session, written on every REAL lane switch
+// regardless of the client-notice debounce.
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_48a {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    async fn spawn_forwarder(
+        data_dir: &std::path::Path,
+    ) -> (
+        tokio::sync::broadcast::Sender<octos_llm::adaptive::FailoverEvent>,
+        mpsc::Receiver<OutboundMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let (out_tx, out_rx) = mpsc::channel(4);
+        let session_key = test_session_key(data_dir);
+        let handle = tokio::spawn(crate::session_actor::forward_router_failovers_for_test(
+            crate::session_actor::FailoverForwarderParams {
+                rx,
+                out_tx,
+                session_id: session_key.to_string(),
+                session_key,
+                channel: "telegram".to_string(),
+                chat_id: "c1".to_string(),
+                profile_data_dir: data_dir.to_path_buf(),
+            },
+        ));
+        (tx, out_rx, handle)
+    }
+
+    fn own_event(session: &str) -> octos_llm::adaptive::FailoverEvent {
+        octos_llm::adaptive::FailoverEvent {
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            reason: "quota".into(),
+            elapsed_ms: 120,
+            originating_session_id: Some(session.to_string()),
+            originating_turn_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_writes_own_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one fallback_switch row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            rows[0].get("model_lane").and_then(|s| s.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            rows[0].get("detail").and_then(|s| s.as_str()),
+            Some("router failover: a -> b (quota, 120ms)")
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_other_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let other = own_event("some-other-session");
+        tx.send(other).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "other-session failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_none_originator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let mut none_event = own_event("unused");
+        none_event.originating_session_id = None;
+        tx.send(none_event).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "None-originator failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_write_failure_does_not_block_notice() {
+        // data_dir points at a path that cannot host events.jsonl (a FILE
+        // where a directory is needed): the write fails, the notice still
+        // goes out, and the forwarder task stays alive.
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not-a-dir").unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(&blocker).await;
+        // The forwarder's session identity derives from the blocker path
+        // (its "data dir"); the event's originator must match THAT session.
+        let sid = test_session_key(&blocker).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        let push = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("notice must still be sent when the obs write fails")
+            .expect("channel open");
+        assert!(
+            push.content.starts_with("↺ Router failover:"),
+            "{}",
+            push.content
+        );
+        // The forwarder did NOT exit (still joinable, not finished).
+        assert!(
+            !handle.is_finished(),
+            "write failure must not kill the forwarder"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_written_even_when_notice_debounced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        // Two rapid events — inside the debounce window.
+        tx.send(own_event(&sid)).unwrap();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 2, "both real switches write rows: {events:?}");
+        // Client notice: exactly ONE (the second was debounced).
+        let mut notices = 0;
+        while out_rx.try_recv().is_ok() {
+            notices += 1;
+        }
+        assert_eq!(notices, 1, "debounce still collapses the client push");
+    }
+}

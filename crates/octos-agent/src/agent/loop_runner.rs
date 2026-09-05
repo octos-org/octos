@@ -1449,6 +1449,20 @@ impl Agent {
                                     attempts = malformed_feedback_used,
                                     "malformed tool-call feedback budget exhausted — terminating turn (#27d)"
                                 );
+                                // #48b — return the exhausted error DIRECTLY
+                                // (never into the retry dispatch): the stable
+                                // MARKER prefix lets the CLI's terminal path
+                                // emit `malformed_exhausted` instead of a
+                                // generic turn_error row.
+                                return Err(attach_partial_usage(
+                                    eyre::eyre!(
+                                        "{} feedback_limit={} observed_malformed={}: {e:#}",
+                                        crate::MALFORMED_TOOLCALL_EXHAUSTED_MARKER,
+                                        MALFORMED_TOOLCALL_FEEDBACK_LIMIT,
+                                        malformed_feedback_used
+                                    ),
+                                    turn.total_usage().clone(),
+                                ));
                             }
                             if self.failfast_llm_bail(&e) {
                                 return Err(attach_partial_usage(e, turn.total_usage().clone()));

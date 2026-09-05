@@ -6896,3 +6896,31 @@ fn should_write_nowhere_when_no_handle_attached() {
     guard.counters.internal += 1;
     drop(guard); // must not panic
 }
+
+/// #48b — the exhausted error text STARTS WITH the stable marker and carries
+/// the limit/observed payload (the CLI terminal path keys on this prefix to
+/// emit `malformed_exhausted` instead of a generic turn_error row).
+#[tokio::test]
+async fn malformed_exhaustion_error_carries_marker() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MalformedThenOkProvider {
+        malformed_first: StdMutex::new(10), // never self-corrects → exhausted
+        ok_response: plain_text_response("unreachable"),
+    });
+    let tools = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("malformed-marker"), provider, tools, memory);
+    let err = agent
+        .process_message("never produces valid JSON", &[], vec![])
+        .await
+        .expect_err("exhausted malformed budget terminates the turn");
+    let text = err.to_string();
+    assert!(
+        text.starts_with(crate::MALFORMED_TOOLCALL_EXHAUSTED_MARKER),
+        "must START with the marker: {text}"
+    );
+    assert!(
+        text.contains("feedback_limit=3 observed_malformed=4"),
+        "carries the limit/observed payload: {text}"
+    );
+}

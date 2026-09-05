@@ -67,6 +67,12 @@ pub mod validators;
 pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
+/// #48b — stable prefix marking that a turn terminated because the
+/// malformed tool-call self-correction budget was exhausted. The CLI's
+/// terminal-error path `starts_with` this marker to emit the
+/// `malformed_exhausted` OLP event INSTEAD of a generic turn_error row.
+pub const MALFORMED_TOOLCALL_EXHAUSTED_MARKER: &str =
+    "malformed tool-call feedback budget exhausted";
 
 pub use abi_schema::{
     COMPACTION_POLICY_SCHEMA_VERSION, COST_ATTRIBUTION_SCHEMA_VERSION,

@@ -35742,6 +35742,20 @@ struct TurnCompletionDetails {
 /// `None` for paths that do not run the LLM (slash command, review/start
 /// scatter-join, M9 fixture replays).
 #[allow(clippy::too_many_arguments)]
+/// #48b — the Errored-terminal observability decision: returns the
+/// `malformed_exhausted` event DETAIL (the marker's payload — from just
+/// after the marker up to the first `:`, i.e. `feedback_limit=3
+/// observed_malformed=4`) when the terminal message STARTS WITH the marker
+/// (prefix only — a marker buried mid-text does not trigger), else None
+/// (the ordinary turn_error path applies unchanged).
+fn malformed_exhausted_detail_for_terminal(message: &str) -> Option<String> {
+    let rest = message.strip_prefix(octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER)?;
+    let rest = rest.trim_start();
+    let detail = rest.split(':').next().unwrap_or("").trim();
+    (!detail.is_empty()).then(|| detail.to_owned())
+}
+
+#[allow(clippy::too_many_arguments)] // #48b: pre-existing 9-arg terminal emitter; not widened by this change
 async fn try_emit_terminal(
     turn_state: &TokioMutex<TurnState>,
     expected_reason: TerminalReason,
@@ -35823,6 +35837,25 @@ async fn try_emit_terminal(
         }
         TerminalReason::Errored => {
             let (code, message) = error_payload.unwrap_or(("runtime_error", "turn failed"));
+            // #48b — OLP observability: when the terminal error CARRIES the
+            // malformed-exhausted marker as a PREFIX, emit ONLY the
+            // `malformed_exhausted` event row (detail derived from the
+            // marker's payload) — no turn_error row for this terminal; the
+            // marker in the middle of an ordinary message does not trigger.
+            if let Some(detail) = malformed_exhausted_detail_for_terminal(message) {
+                if let Some(data_dir) = ledger.config_data_dir() {
+                    crate::obs_events::append_obs_event(
+                        &data_dir,
+                        &crate::obs_events::ObsEvent::new("malformed_exhausted", &detail)
+                            .session(Some(session_id.0.as_str())),
+                    );
+                }
+                let _ = send_turn_error(ws, ledger, session_id, turn_id, code, message);
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+                return;
+            }
             let _ = send_turn_error(ws, ledger, session_id, turn_id, code, message);
         }
         TerminalReason::Interrupted => {
@@ -38300,6 +38333,16 @@ fn emit_router_status_durable(
 /// Returns the `JoinHandle` so the caller can stop *and await* the
 /// forwarder when the turn ends. Returns `None` when no router is
 /// attached.
+#[cfg(test)]
+pub(crate) fn spawn_router_failover_forwarder_for_test(
+    ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
+    session_id: SessionKey,
+    router: Option<Arc<octos_llm::AdaptiveRouter>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_router_failover_forwarder(ws, ledger, session_id, router)
+}
+
 fn spawn_router_failover_forwarder(
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
@@ -38321,6 +38364,34 @@ fn spawn_router_failover_forwarder(
                     if let Some(originating) = event.originating_session_id.as_deref() {
                         if originating != session_id_str {
                             continue;
+                        }
+                    }
+                    // #48c — the EVENT row is stricter than the notice
+                    // filter above (which stays verbatim): only an
+                    // EXPLICIT own-session stamp writes a row. None and
+                    // other sessions write nothing.
+                    let own_session_event =
+                        event.originating_session_id.as_deref() == Some(session_id_str.as_str());
+                    if own_session_event {
+                        // #48b — OLP observability: same-shaped
+                        // `fallback_switch` row as the gateway path, written
+                        // BEFORE the durable client notice; best-effort (an
+                        // unwritable data_dir or a None data_dir skips the
+                        // row and never blocks the notice).
+                        if let Some(data_dir) = ledger.config_data_dir() {
+                            let detail = format!(
+                                "router failover: {} -> {} ({}, {}ms)",
+                                event.from_provider,
+                                event.to_provider,
+                                event.reason,
+                                event.elapsed_ms
+                            );
+                            crate::obs_events::append_obs_event(
+                                &data_dir,
+                                &crate::obs_events::ObsEvent::new("fallback_switch", &detail)
+                                    .session(Some(&session_id_str))
+                                    .model_lane(Some(&event.to_provider)),
+                            );
                         }
                     }
                     let notif = UiNotification::RouterFailover(
