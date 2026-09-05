@@ -25181,11 +25181,24 @@ async fn check_spawn_only_sent_file_hydration(file_count: usize) {
     let (shifted_index, _) = verify_history(&shifted, &canonical_id, &canonical_media);
     assert_eq!(shifted_index, original_index + 2);
     let key = session.session_id.clone();
+    let old_memory = Arc::downgrade(&state.profiles[octos_core::MAIN_PROFILE_ID].memory);
     session.close().await.unwrap();
     drop(session);
     drop(runtime);
     drop(state);
     drop(factory);
+    // Cache Drop aborts its asynchronous sweeper; the executor must poll
+    // cancellation before that task releases its cached profile/store. Unlike
+    // an OS process restart, dropping these handles alone is not a completed
+    // shutdown. Observe release rather than racing Linux's exclusive DB lock
+    // or weakening the cold-open check with an in-memory fallback.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while old_memory.upgrade().is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old store must be released before cold bootstrap");
     let reopened_factory = TestAgentFactory::new(
         Arc::new(MediaModel(std::sync::atomic::AtomicUsize::new(1))),
         data.path().to_owned(),

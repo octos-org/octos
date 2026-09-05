@@ -3587,6 +3587,46 @@ artifact-pair soak has completed. Optional llama/CUDA coverage remains outside
 the default/release feature proof. Removing the implicit goal budget and making
 chat a daemon-only thin client are not part of this release change.
 
+## Integrated candidate mini3 soak (2026-09-05, 23:38–23:49 UTC)
+
+A fresh isolated run on mini3 completed 30 main rounds plus four peer rounds.
+Both drivers and all seven independent acceptance gates passed: admission
+completion, canonical final answers, TUI final visibility, background exactly
+once, native monitor lifecycle, transcript integrity and peer receipt recovery.
+Coverage included automatic/manual compaction, goal wake, parallel tools,
+client restart, four daemon restarts and K3 → GLM-5.3 → K3.
+
+This run used locally built integrated candidates, not published artifacts:
+
+- Octos `2.0.3-rc.11`, source `e6168cf92`, binary SHA256
+  `e4319c6c85fc471479c0f68e6cfe083c1298758133694d080ec67175aacf98c0`.
+- OctosCode `0.3.0-rc.10`, source `7c56b43`, binary SHA256
+  `5c9add9b50b4cd5da0f3b0f711df7799c90060aad2190d6241c4598d08880aa0`.
+  Its final backend dependency pin is still a release sequencing gate.
+
+The cache audit found 80 manifests paired with 80 provider-usage observations,
+76 nonzero cache-read observations and 1,556,224 cached tokens, with no unpaired
+manifests. All six literal cache-privacy checks passed. Temporary provider
+profile copies were removed; the existing remote profile and binary/harness
+hashes remained unchanged. A fresh process check found no owned test binaries
+running. Exported evidence passed an exact known-provider-secret scan.
+
+Evidence is retained under the RC integration root above (`mini3-evidence/`
+and `mini3-remote-verification.log`). Archive SHA256:
+`3df7e8405a6fbaae1b3232f90bf6199a7326e087f64323889ac06b101fde1273`.
+The archive excludes binaries, profile directories and the original payload;
+the inactive Unix control socket is not archivable and is not acceptance data.
+
+Ubuntu CI subsequently exposed two cold-reopen test races: dropping a cache
+aborts its asynchronous sweeper but does not synchronously release that task's
+profile/episode-store references. The tests now observe a weak store reference
+becoming unowned, with a five-second failure deadline, before opening a fresh
+factory. An immediate-release assertion reproduced both failures locally;
+the corrected tests and strict CLI/all-target clippy passed. No in-memory
+fallback or database-lock retry masks the cold-open assertion. Changes after
+the soaked production commit are module ordering, this test-only cleanup and
+acceptance documentation; final CI/approval/merge/release remain separate gates.
+
 ## Definition of done
 
 The original OUP/OctosCode milestone required the following properties. Current
