@@ -3565,6 +3565,15 @@ Local integration evidence is retained under
   cases were filtered on this Mac because GNU flock/stat are unavailable;
   unfiltered Ubuntu CI remains required before merge.
 - `octoscode-clippy-1.log`: strict all-target clippy passed.
+- Subsequent `octos-minimal-tests.log`: 1,682 passed, six ignored.
+  `octos-release-matrix-clippy.log`: strict combined channel/release-feature
+  clippy passed. The isolated FFI build exposed API-gated peer-registry helpers
+  that default-feature and unit-test builds masked. Recovery now keeps its
+  shared registry available to non-API gateway actors, and required matrix CI
+  separately compiles/lints the minimal production library.
+  `octos-minimal-lib-clippy-2.log` and `octos-abi-tests-2.log` passed after this
+  fix. The C header compiled with warnings denied; `uniffi-python-test.log`
+  passed real localhost C/Python partial-answer and success controls.
 - The additional reserved-sampler and hydration-queue regressions have separate
   red/green logs. The release PR records subsequent checks of the final commit.
 - Known mini credential byte-pattern scans found no password or host matches in

@@ -42,7 +42,6 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, PeerStagedEvent, RpcError,
     UserQuestionRespondParams,
 };
-#[cfg(any(feature = "api", test))]
 use tracing::warn;
 
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
@@ -163,19 +162,16 @@ pub(crate) fn peer_wire_registry() -> &'static PeerWireRegistry {
 /// staging, dropped by `take` on the close path. Holding it anywhere shorter
 /// (the staging closure, the turn's supervisor) would put it out of scope
 /// while the peer is still working, which is the defect.
-#[cfg(any(feature = "api", test))]
 pub(crate) struct PeerTaskBinding {
     task_id: String,
     _liveness: octos_agent::TaskLivenessLease,
 }
 
-#[cfg(any(feature = "api", test))]
 #[derive(Default)]
 pub(crate) struct PeerTaskRegistry {
     pub(crate) by_key: std::sync::Mutex<HashMap<String, PeerTaskBinding>>,
 }
 
-#[cfg(any(feature = "api", test))]
 impl PeerTaskRegistry {
     /// Bind `key` to a supervisor task id and take a liveness lease on it. A
     /// re-stage under the same key overwrites, mirroring
@@ -234,7 +230,6 @@ impl PeerTaskRegistry {
     }
 }
 
-#[cfg(any(feature = "api", test))]
 pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
     static PEER_TASK_REGISTRY: OnceLock<PeerTaskRegistry> = OnceLock::new();
     PEER_TASK_REGISTRY.get_or_init(PeerTaskRegistry::default)
@@ -292,7 +287,6 @@ pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
 /// a non-peer or unprofiled session.
-#[cfg(any(feature = "api", test))]
 pub(crate) fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
     // NOT a peer session. The overwhelmingly common case, and the only one where
     // `None` is uninteresting — every caller correctly skips peer bookkeeping.

@@ -549,6 +549,11 @@ jobs:
         with:
           shared-key: matrix-feature
 
+      # Workspace/all-target builds can unify the api or cfg(test) gates and
+      # hide missing symbols in FFI consumers of the minimal production lib.
+      - name: Clippy minimal octos-cli production library
+        run: cargo clippy -p octos-cli --lib --no-default-features -- -D warnings
+
       - name: Clippy octos-cli with matrix feature
         run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
 

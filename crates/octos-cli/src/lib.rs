@@ -76,13 +76,11 @@ pub mod memory_refresh;
 pub mod monitor;
 #[cfg(feature = "api")]
 pub mod otp;
-// Peer-agent staging / addressing / parked-prompt plumbing. Deliberately NOT
-// `api`-gated (Phase 3 of goal-in-chat): `octos chat --peers` hosts peers
-// in-process and needs the SAME process-global wire registry + staging layer
-// the serve WS path uses. Everything AppState/WebSocket-shaped stayed in
-// `api::ui_protocol`; see the module doc for the exact split.
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod obs_events;
+// Peer recovery is also used by gateway actors without `api`. The remaining
+// staging and OUP transport helpers are intentionally dormant in that build.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) mod peers;
 pub use octos_services::persona_service;
 #[cfg(feature = "api")]
