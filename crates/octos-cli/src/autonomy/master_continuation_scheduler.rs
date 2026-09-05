@@ -355,6 +355,16 @@ pub(crate) struct QueuedMasterContinuation {
     pub(crate) redelivery_attempts: u32,
 }
 
+/// #1707: the item's workspace scope, from its `workspace` metadata with an
+/// empty string treated as absent — so `None == None` and a blank stamp never
+/// splits a scope that the enqueue side deliberately left unset.
+pub(crate) fn item_workspace(item: &QueuedMasterContinuation) -> Option<&str> {
+    item.metadata
+        .get("workspace")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+}
+
 impl QueuedMasterContinuation {
     pub(crate) fn is_for_session(&self, session_id: &MasterContinuationSessionId) -> bool {
         self.session_id == *session_id
@@ -742,6 +752,71 @@ impl MasterContinuationScheduler {
             self.heap.push(entry);
         }
         drained
+    }
+
+    /// Number of pending `ChildCompleted` items for `session_id` +
+    /// `profile_id` scoped to one continuation group and workspace (#1707).
+    /// `workspace` is matched against the item's `workspace` metadata with an
+    /// empty string treated as absent (`None == None` matches).
+    pub(crate) fn pending_child_completed_count_for_scope(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+        group_id: &str,
+        workspace: Option<&str>,
+    ) -> usize {
+        self.pending_by_key
+            .values()
+            .filter(|item| {
+                item.session_id.as_str() == session_id
+                    && item.profile_id.as_str() == profile_id
+                    && item.reason == MasterContinuationReason::ChildCompleted
+                    && item.group_id.as_str() == group_id
+                    && item_workspace(item) == workspace
+            })
+            .count()
+    }
+
+    /// Remove every pending `ChildCompleted` / `ScatterJoinComplete` item for
+    /// `session_id` + `profile_id` + `group_id` + `workspace` (#1707:
+    /// terminal coalescing is scope-batched so a burst from another group or
+    /// another workspace is never tombstoned into a carrier whose prompt only
+    /// describes the carrier's own group). Heap entries for the removed keys
+    /// go stale and are skipped by `entry_matches_pending`; claims are
+    /// recorded so a same-key re-enqueue inside the reclaim window collapses.
+    /// Returned oldest-first.
+    pub(crate) fn take_pending_terminal_for_scope(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        group_id: &str,
+        workspace: Option<&str>,
+    ) -> Vec<QueuedMasterContinuation> {
+        let keys = self
+            .pending_by_key
+            .values()
+            .filter(|item| {
+                item.session_id.as_str() == session_id
+                    && item.profile_id.as_str() == profile_id
+                    && matches!(
+                        item.reason,
+                        MasterContinuationReason::ChildCompleted
+                            | MasterContinuationReason::ScatterJoinComplete
+                    )
+                    && item.group_id.as_str() == group_id
+                    && item_workspace(item) == workspace
+            })
+            .map(|item| item.dedupe_key.clone())
+            .collect::<Vec<_>>();
+        let mut taken = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(item) = self.pending_by_key.remove(&key) {
+                self.record_external_claim(&item);
+                taken.push(item);
+            }
+        }
+        taken.sort_by_key(|item| item.sequence);
+        taken
     }
 
     #[cfg(test)]

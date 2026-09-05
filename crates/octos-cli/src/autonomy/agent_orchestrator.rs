@@ -14,7 +14,7 @@ use super::goal_loop_runtime::{
 use super::master_continuation_scheduler::{
     MAX_REDELIVERY_ATTEMPTS, MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome,
     MasterContinuationReason, MasterContinuationRequest, MasterContinuationRuntimeState,
-    MasterContinuationScheduler, QueuedMasterContinuation, ReinsertOutcome,
+    MasterContinuationScheduler, QueuedMasterContinuation, ReinsertOutcome, item_workspace,
 };
 use super::monitor_runtime::{
     MonitorBatchDirective, MonitorMode, MonitorRateDecision, MonitorRateWindow, MonitorSink,
@@ -1802,6 +1802,7 @@ impl InProcessAgentOrchestrator {
         let mut state = self.state();
         state.supervisor_store = Some(store);
         restore_runtime_from_supervisor_state(&mut state, &supervisor_state);
+        seed_delivered_terminal_marks(&mut state, &supervisor_state);
         for continuation in supervisor_state.continuations.values() {
             if continuation.status == ContinuationStatus::Completed {
                 continue;
@@ -3237,6 +3238,7 @@ impl InProcessAgentOrchestrator {
                 }
             }
         }
+        coalesce_terminal_continuations(state, session_id, profile_id, &mut kept);
         kept
     }
 
@@ -9358,6 +9360,14 @@ impl InProcessAgentOrchestrator {
         self.state().continuations.enqueue(request);
     }
 
+    /// Test-only: drop an agent from the in-memory roster WITHOUT touching
+    /// the supervisor store — models a terminal mirror arriving for an agent
+    /// the roster no longer holds (restart replay / re-forward).
+    #[cfg(test)]
+    pub(crate) fn forget_agent_for_test(&self, agent_id: &str) {
+        self.state().agents.remove(agent_id);
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_continuation_count_for_session_for_test(
         &self,
@@ -11773,6 +11783,21 @@ struct AutonomyRuntimeState {
     /// skip an already-joined epoch even across a restart. Defaults are
     /// additive — legacy persisted state deserializes with epoch 0 / None.
     scatter_join_state: HashMap<String, ScatterJoinState>,
+    /// Durable "already told the master" marks for child terminal events:
+    /// `child/<group>/<session>/<agent>` dedupe key → the terminal status that
+    /// was last enqueued as a `ChildCompleted`. Seeded from the supervisor
+    /// store's persisted ChildCompleted continuations in
+    /// `configure_supervisor_store` and updated on every enqueue.
+    ///
+    /// Why: `pending_by_key` only collapses duplicates while an item is
+    /// PENDING. A terminal mirror that arrives for an agent the in-memory
+    /// roster no longer holds (restart replay, a task-status re-forward into
+    /// a fresh roster) looks like a first-seen transition and re-enqueued a
+    /// ChildCompleted + ScatterJoinComplete per agent — observed as 84 stale
+    /// master re-entries (one turn each) after a goal was cleared on a
+    /// 40-peer session. Keyed on status so a genuine failed→completed
+    /// correction (#2054) still re-enters.
+    delivered_terminal_marks: HashMap<String, String>,
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
     /// #1977 — durable monitor records (specs + wake accounting). The live
@@ -13324,11 +13349,207 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
     (verdict, usage)
 }
 
+/// Seed `delivered_terminal_marks` from every persisted `ChildCompleted`
+/// continuation (any status: queued ones are re-enqueued by the caller and
+/// collapse through `pending_by_key`; started/completed ones were already
+/// delivered). The persisted `continuation_id` IS the dedupe key.
+fn seed_delivered_terminal_marks(
+    state: &mut AutonomyRuntimeState,
+    supervisor_state: &SupervisorState,
+) {
+    for record in supervisor_state.continuations.values() {
+        if supervisor_metadata_str(&record.metadata, "reason") != Some("child_completed") {
+            continue;
+        }
+        let status = supervisor_metadata_str(&record.metadata, "payload:status")
+            .unwrap_or("completed")
+            .to_owned();
+        state
+            .delivered_terminal_marks
+            .insert(record.continuation_id.clone(), status);
+    }
+}
+
+/// Upper bound on the folded `coalesced_children` metadata rendered into a
+/// single master re-entry prompt.
+const COALESCED_CHILDREN_MAX_CHARS: usize = 6_000;
+const COALESCED_CHILD_SUMMARY_CHARS: usize = 160;
+
+fn is_terminal_kind_continuation(item: &QueuedMasterContinuation) -> bool {
+    matches!(
+        item.reason,
+        MasterContinuationReason::ChildCompleted | MasterContinuationReason::ScatterJoinComplete
+    )
+}
+
+/// Fold the pending `ChildCompleted` / `ScatterJoinComplete` items of ONE
+/// scope — `(session, profile, group, workspace)` (#1707) — into ONE master
+/// re-entry. The drain site hands the master one continuation per turn; a
+/// burst of N terminal marks (peers landing together, or a replayed backlog)
+/// otherwise costs N full LLM turns that each say "a child finished". The
+/// carrier is picked from `kept` FIRST: the first `ScatterJoinComplete` when
+/// one is present (its prompt asks for the joined answer), else the first
+/// terminal item. Only terminal items matching the carrier's group AND
+/// workspace fold into it — terminal items from another group or workspace
+/// stay in `kept` and deliver on later turns (per-scope batching, so a burst
+/// from another group is never tombstoned into a carrier whose prompt only
+/// describes its own group). The folded batch is summarized into
+/// `coalesced_children` / `coalesced_count` metadata and tombstoned in the
+/// supervisor store so a restart does not replay them.
+fn coalesce_terminal_continuations(
+    state: &mut AutonomyRuntimeState,
+    session_id: &SessionKey,
+    profile_id: &str,
+    kept: &mut Vec<QueuedMasterContinuation>,
+) {
+    if !kept.iter().any(is_terminal_kind_continuation) {
+        return;
+    }
+    // Pick the carrier from `kept` FIRST (before any folding decision) so its
+    // (group, workspace) scope bounds the whole batch: terminal items outside
+    // the carrier scope deliver on later turns untouched.
+    let carrier_pos = kept
+        .iter()
+        .position(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+        .or_else(|| kept.iter().position(is_terminal_kind_continuation))
+        .expect("terminal item present");
+    let carrier_group = kept[carrier_pos].group_id.as_str().to_owned();
+    let carrier_workspace = item_workspace(&kept[carrier_pos]).map(str::to_owned);
+    let same_scope = |item: &QueuedMasterContinuation| {
+        is_terminal_kind_continuation(item)
+            && item.group_id.as_str() == carrier_group.as_str()
+            && item_workspace(item) == carrier_workspace.as_deref()
+    };
+    // Only fold when MORE THAN ONE child of the carrier scope is reporting.
+    // A single child's natural pair (its ChildCompleted, then the group's
+    // ScatterJoinComplete) keeps the established two-step contract untouched.
+    let child_reports = kept
+        .iter()
+        .filter(|item| item.reason == MasterContinuationReason::ChildCompleted && same_scope(item))
+        .count()
+        + state.continuations.pending_child_completed_count_for_scope(
+            &session_id.to_string(),
+            profile_id,
+            carrier_group.as_str(),
+            carrier_workspace.as_deref(),
+        );
+    if child_reports < 2 {
+        return;
+    }
+    let extras = state.continuations.take_pending_terminal_for_scope(
+        &session_id.to_string(),
+        profile_id,
+        carrier_group.as_str(),
+        carrier_workspace.as_deref(),
+    );
+    let mut batch: Vec<QueuedMasterContinuation> = Vec::new();
+    let mut others: Vec<QueuedMasterContinuation> = Vec::new();
+    let mut primary_slot: Option<usize> = None;
+    for item in kept.drain(..) {
+        if same_scope(&item) {
+            if primary_slot.is_none() {
+                primary_slot = Some(others.len());
+            }
+            batch.push(item);
+        } else {
+            others.push(item);
+        }
+    }
+    batch.extend(extras);
+    let slot = primary_slot.unwrap_or(0);
+    if batch.len() < 2 {
+        if let Some(only) = batch.pop() {
+            others.insert(slot, only);
+        }
+        *kept = others;
+        return;
+    }
+    let primary_idx = batch
+        .iter()
+        .position(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+        .unwrap_or(0);
+    let mut primary = batch.remove(primary_idx);
+    let now = now_ms_u64();
+    let mut lines: Vec<String> = Vec::new();
+    let mut rendered = 0usize;
+    let mut folded = 0usize;
+    for item in batch {
+        folded += 1;
+        let child = item
+            .child_agent_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned())
+            .unwrap_or_else(|| item.group_id.as_str().to_owned());
+        let status = item.metadata.get("status").cloned().unwrap_or_default();
+        let summary = item
+            .metadata
+            .get("summary")
+            .map(|text| {
+                text.chars()
+                    .take(COALESCED_CHILD_SUMMARY_CHARS)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        // Every folded line carries its group AND workspace so the carrier
+        // prompt preserves full scope identity for each folded child (#1707:
+        // the blocker's "完整保留每项的 group/workspace"). Workspace is
+        // rendered as `none` when absent — the whole batch shares the
+        // carrier's workspace, so this stays informative, not noisy.
+        let line = format!(
+            "{child} [{reason} {status}] {summary} [group {group}] [workspace {workspace}]",
+            reason = master_continuation_reason_wire_name(&item.reason),
+            group = item.group_id.as_str(),
+            workspace = item_workspace(&item).unwrap_or("none"),
+        );
+        if rendered + line.len() <= COALESCED_CHILDREN_MAX_CHARS {
+            rendered += line.len();
+            lines.push(line);
+        }
+        if let Some(store) = state.supervisor_store.as_ref() {
+            let _ = store.record_continuation_completed(
+                item.group_id.as_str(),
+                item.dedupe_key.as_str(),
+                now,
+                Some(format!("coalesced into {}", primary.dedupe_key.as_str())),
+            );
+        }
+    }
+    primary
+        .metadata
+        .insert("coalesced_count".to_owned(), folded.to_string());
+    primary
+        .metadata
+        .insert("coalesced_children".to_owned(), lines.join(" | "));
+    tracing::info!(
+        session_key = %session_id.0,
+        profile_id = %profile_id,
+        carrier = %primary.dedupe_key.as_str(),
+        folded,
+        "coalesced terminal child continuations into one master re-entry"
+    );
+    others.insert(slot, primary);
+    *kept = others;
+}
+
 fn enqueue_agent_terminal_continuations(
     state: &mut AutonomyRuntimeState,
     agent: &AutonomyAgentRecord,
 ) {
     let group_id = agent_continuation_group_id(agent);
+    let child_key = child_completed_dedupe_key(&group_id, &agent.session_id.0, &agent.agent_id);
+    if state
+        .delivered_terminal_marks
+        .get(&child_key)
+        .is_some_and(|status| status == &agent.status)
+    {
+        tracing::debug!(
+            agent_id = %agent.agent_id,
+            status = %agent.status,
+            "terminal mark already delivered to the master; skipping ChildCompleted / \
+             ScatterJoinComplete re-enqueue (durable dedupe)"
+        );
+        return;
+    }
     let mut child = MasterContinuationRequest::new(
         group_id.clone(),
         agent.session_id.to_string(),
@@ -13346,11 +13567,7 @@ fn enqueue_agent_terminal_continuations(
     // metadata drift (status/summary/nickname/role), which the auto-derived
     // `stable_dedupe_key` would otherwise fold into the key and split into
     // distinct entries.
-    .with_dedupe_key(child_completed_dedupe_key(
-        &group_id,
-        &agent.session_id.0,
-        &agent.agent_id,
-    ))
+    .with_dedupe_key(child_key.clone())
     .with_metadata("status", agent.status.clone())
     .with_metadata("nickname", agent.nickname.clone())
     .with_metadata("role", agent.role.clone());
@@ -13365,6 +13582,9 @@ fn enqueue_agent_terminal_continuations(
         child = child.with_metadata("summary", last_task.chars().take(1200).collect::<String>());
     }
     enqueue_and_persist_continuation(state, child);
+    state
+        .delivered_terminal_marks
+        .insert(child_key, agent.status.clone());
     persist_agent_terminal(state, agent);
 
     // #1707: siblings for the scatter/gather join MUST share a workspace. Two
@@ -14779,6 +14999,17 @@ pub(crate) fn master_continuation_reason_name(reason: &MasterContinuationReason)
     }
 }
 
+/// Rendered when the drain site folded further terminal marks into this
+/// continuation (see `coalesce_terminal_continuations`).
+fn coalesced_children_note(continuation: &QueuedMasterContinuation) -> String {
+    match continuation.metadata.get("coalesced_count") {
+        Some(count) => format!(
+            "\n\nNOTE: {count} further child termination(s) were folded into this single notice (see `coalesced_children` in Metadata). Cover ALL of them in ONE update; no separate turn will arrive for them."
+        ),
+        None => String::new(),
+    }
+}
+
 pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
     // #1697 — the objective is rendered separately (escaped, fenced) in the
     // GoalContinue arm; keep it out of the raw metadata list there so the
@@ -14798,17 +15029,19 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
     };
     match &continuation.reason {
         MasterContinuationReason::ChildCompleted => format!(
-            "[system-internal]\nA supervised child agent finished.\n\nChild agent: {child}\nGroup: {group}\nMetadata:\n{metadata}\n\nGive the user a concise progress update. Mention what this child completed, whether follow-up work remains, and reference artifacts only when metadata or visible task state provides them.",
+            "[system-internal]\nA supervised child agent finished.\n\nChild agent: {child}\nGroup: {group}\nMetadata:\n{metadata}\n\nGive the user a concise progress update. Mention what this child completed, whether follow-up work remains, and reference artifacts only when metadata or visible task state provides them.{coalesced}",
             child = continuation
                 .child_agent_id
                 .as_ref()
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
             group = continuation.group_id.as_str(),
+            coalesced = coalesced_children_note(continuation),
         ),
         MasterContinuationReason::ScatterJoinComplete => format!(
-            "[system-internal]\nAll supervised child agents in this scatter-join group are terminal.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nProduce the joined answer for the user. Summarize each child result, call out unresolved failures or missing artifacts, and state the next concrete action if one is required.",
+            "[system-internal]\nAll supervised child agents in this scatter-join group are terminal.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nProduce the joined answer for the user. Summarize each child result, call out unresolved failures or missing artifacts, and state the next concrete action if one is required.{coalesced}",
             group = continuation.group_id.as_str(),
+            coalesced = coalesced_children_note(continuation),
         ),
         MasterContinuationReason::LoopFire => format!(
             "[system-internal]\nA scheduled /loop continuation fired.\n\nLoop: {loop_id}\nMetadata:\n{metadata}\n\nExecute the loop prompt now. Keep the answer brief unless the loop prompt requires a full report.",
@@ -19799,6 +20032,341 @@ mod tests {
             1,
             "explicit dedupe key must collapse terminal-status drift to one ChildCompleted; drained {:?}",
             drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// A terminal mirror for a child whose `ChildCompleted` was already
+    /// delivered must NOT re-enter the master — even from a fresh process on
+    /// the same supervisor store, and even when the in-memory roster no
+    /// longer holds the agent (the first-seen path that replayed 84 stale
+    /// re-entries in the field). A status CHANGE (failed) is a genuine
+    /// correction and still re-enters.
+    #[test]
+    fn delivered_terminal_mark_is_durable_across_fresh_roster_and_process() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-dd", "api", "durable-dedupe");
+        let agent_id = "task-durable-dedupe".to_owned();
+        let upsert = |status: &str| AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: "dd".to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{status}")),
+            cwd: None,
+            profile_id: "tenant-dd".to_owned(),
+        };
+
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("completed"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-dd",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+            vec![
+                MasterContinuationReason::ChildCompleted,
+                MasterContinuationReason::ScatterJoinComplete
+            ],
+            "a single child keeps its natural two-step delivery"
+        );
+        // The transport marks a drained continuation Completed after its turn;
+        // do the same so boot recovery has nothing undelivered to replay.
+        let store = SupervisorStore::new(dir.path());
+        for item in &drained {
+            store
+                .record_continuation_completed(
+                    item.group_id.as_str(),
+                    item.dedupe_key.as_str(),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("mark delivered");
+        }
+
+        // Fresh process, same store: the roster is restored from the store,
+        // then loses the record (models the field first-seen replay).
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let baseline =
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd");
+        assert_eq!(baseline, 0, "nothing undelivered to recover at boot");
+        fresh.forget_agent_for_test(&agent_id);
+        fresh.upsert_agent(upsert("completed"));
+        assert_eq!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd"),
+            baseline,
+            "an already-delivered terminal mark must not re-enqueue on replay"
+        );
+
+        // A genuine correction (different terminal status) still re-enters.
+        fresh.forget_agent_for_test(&agent_id);
+        fresh.upsert_agent(upsert("failed"));
+        assert!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd")
+                > baseline,
+            "a terminal-status correction must still reach the master"
+        );
+    }
+
+    /// A burst of terminal marks drains as ONE master re-entry: the carrier
+    /// is the ScatterJoinComplete, the rest ride along as
+    /// `coalesced_children`, and nothing is left pending. With the
+    /// one-per-turn drain (`max_items = 1`) this is what turns 2N turns into 1.
+    #[test]
+    fn terminal_continuations_coalesce_into_one_master_turn() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-co", "api", "coalesce");
+        for idx in 0..3 {
+            let agent_id = format!("task-coalesce-{idx}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: format!("co-{idx}"),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                last_task: Some(format!("done {idx}")),
+                cwd: None,
+                profile_id: "tenant-co".to_owned(),
+            });
+        }
+        let pending_before =
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-co");
+        assert!(
+            pending_before >= 4,
+            "expected a burst of child + scatter items, got {pending_before}"
+        );
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-co",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "exactly one carrier");
+        let carrier = &drained[0];
+        assert_eq!(
+            carrier.reason,
+            MasterContinuationReason::ScatterJoinComplete
+        );
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some((pending_before - 1).to_string().as_str())
+        );
+        let folded = carrier
+            .metadata
+            .get("coalesced_children")
+            .expect("folded list");
+        assert!(folded.contains("task-coalesce-0"), "{folded}");
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-co"),
+            0,
+            "nothing may remain queued after coalescing"
+        );
+        let prompt = master_continuation_prompt(carrier);
+        assert!(prompt.contains("coalesced_children"), "{prompt}");
+        assert!(prompt.contains("ONE update"), "{prompt}");
+    }
+
+    /// #1707: terminal coalescing batches by continuation GROUP. Two
+    /// parent groups landing in the same session/profile must NOT fold into
+    /// one carrier — each group's terminal burst gets its own carrier (one
+    /// per turn), and a carrier's folded children mention only its own
+    /// group's agent ids plus the group id on every folded line.
+    #[test]
+    fn terminal_coalesce_batches_by_group() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-bg", "api", "coalesce-group");
+        for parent in ["master-a", "master-b"] {
+            for idx in 0..2 {
+                let agent_id = format!("task-{parent}-{idx}");
+                orchestrator.upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some(parent.to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("{parent}/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: format!("{parent}-{idx}"),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {agent_id}")),
+                    cwd: None,
+                    profile_id: "tenant-bg".to_owned(),
+                });
+            }
+        }
+
+        let drain_one = || {
+            orchestrator.drain_ready_continuations_for_session(
+                &session_id,
+                "tenant-bg",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            )
+        };
+        let first = drain_one();
+        assert_eq!(first.len(), 1, "exactly one carrier per turn");
+        assert!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-bg")
+                > 0,
+            "the other group's burst must still be queued"
+        );
+        let second = drain_one();
+        assert_eq!(second.len(), 1, "the second group gets its own carrier");
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-bg"),
+            0,
+            "nothing may remain queued after both groups delivered"
+        );
+
+        for carrier in [&first[0], &second[0]] {
+            assert_eq!(
+                carrier.reason,
+                MasterContinuationReason::ScatterJoinComplete
+            );
+            let own_parent = if carrier.group_id.as_str().ends_with("master-a") {
+                "master-a"
+            } else {
+                "master-b"
+            };
+            let other_parent = if own_parent == "master-a" {
+                "master-b"
+            } else {
+                "master-a"
+            };
+            let folded = carrier
+                .metadata
+                .get("coalesced_children")
+                .expect("folded list");
+            assert!(
+                folded.contains(&format!("task-{own_parent}-")),
+                "carrier folds its own group's children: {folded}"
+            );
+            assert!(
+                !folded.contains(&format!("task-{other_parent}-")),
+                "carrier must never fold the other group's children: {folded}"
+            );
+            assert!(
+                folded
+                    .split(" | ")
+                    .all(|line| line.contains(&format!("[group {}]", carrier.group_id.as_str()))),
+                "every folded line carries the group id: {folded}"
+            );
+        }
+        assert_ne!(
+            first[0].group_id, second[0].group_id,
+            "the two carriers belong to different groups"
+        );
+    }
+
+    /// #1707: terminal coalescing batches by WORKSPACE inside one group.
+    /// Same parent, same session — but children completing under DIFFERENT
+    /// project cwds (sessions_in_cwd reuse) must never fold into each
+    /// other's carrier; each workspace's burst drains as its own carrier.
+    /// (Two children per workspace: with one child each nothing folds at all
+    /// — the single-child natural pair keeps the two-step contract.)
+    #[test]
+    fn terminal_coalesce_batches_by_workspace() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-bw", "api", "coalesce-ws");
+        for cwd in ["/tmp/ws-a", "/tmp/ws-b"] {
+            for idx in 0..2 {
+                let agent_id = format!("task-{cwd}-{idx}").replace('/', "-");
+                orchestrator.upsert_agent(AgentUpsert {
+                    agent_id: agent_id.clone(),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("master/{agent_id}"),
+                    role: "background_task".to_owned(),
+                    nickname: agent_id.clone(),
+                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    status: "completed".to_owned(),
+                    last_task: Some(format!("done {agent_id}")),
+                    cwd: Some(cwd.to_owned()),
+                    profile_id: "tenant-bw".to_owned(),
+                });
+            }
+        }
+
+        let drain_one = || {
+            orchestrator.drain_ready_continuations_for_session(
+                &session_id,
+                "tenant-bw",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            )
+        };
+        let first = drain_one();
+        assert_eq!(first.len(), 1, "exactly one carrier per turn");
+        assert!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-bw")
+                > 0,
+            "the other workspace's burst must still be queued"
+        );
+        let second = drain_one();
+        assert_eq!(second.len(), 1, "the other workspace gets its own carrier");
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-bw"),
+            0,
+            "nothing may remain queued after both workspaces delivered"
+        );
+
+        for carrier in [&first[0], &second[0]] {
+            assert_eq!(
+                carrier.reason,
+                MasterContinuationReason::ScatterJoinComplete
+            );
+            let own_ws = carrier
+                .metadata
+                .get("workspace")
+                .map(String::as_str)
+                .expect("carrier carries its workspace stamp");
+            let other_ws = if own_ws == "/tmp/ws-a" {
+                "/tmp/ws-b"
+            } else {
+                "/tmp/ws-a"
+            };
+            let folded = carrier
+                .metadata
+                .get("coalesced_children")
+                .expect("folded list");
+            assert_eq!(
+                carrier.metadata.get("coalesced_count").map(String::as_str),
+                Some("3"),
+                "each carrier folds its workspace's other ChildCompleted + \
+                 the remaining child + its ScatterJoinComplete, all same-scope"
+            );
+            for idx in 0..2 {
+                let own_child = format!("task-{own_ws}-{idx}").replace('/', "-");
+                let other_child = format!("task-{other_ws}-{idx}").replace('/', "-");
+                assert!(
+                    folded.contains(&own_child),
+                    "carrier folds its own workspace's child {own_child}: {folded}"
+                );
+                assert!(
+                    !folded.contains(&other_child),
+                    "carrier must never fold the other workspace's child {other_child}: {folded}"
+                );
+            }
+        }
+        assert_ne!(
+            first[0].metadata.get("workspace"),
+            second[0].metadata.get("workspace"),
+            "the two carriers belong to different workspaces"
         );
     }
 
