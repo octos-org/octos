@@ -9169,6 +9169,116 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
 }
 
 #[tokio::test]
+async fn profile_llm_fetch_models_r9s_claude_selection_probes_the_anthropic_root() {
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"claude-sonnet-4"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    // r9s serves claude-* over the Anthropic Messages protocol at a rewritten
+    // `{base}/anthropic` root — the probe must follow the SELECTED model
+    // (octos#2185), not the family-wide OpenAI declaration.
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "r9s",
+                "model_id": "claude-sonnet-4",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/v1")
+                }
+            },
+            "api_key": "r9s-secret-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    assert_eq!(result["models"], json!(["claude-sonnet-4"]));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/anthropic/v1/models");
+    assert!(
+        requests[0].authorization.is_none(),
+        "r9s claude-* speaks Anthropic Messages — never a Bearer probe"
+    );
+    assert_eq!(requests[0].x_api_key.as_deref(), Some("r9s-secret-key"));
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_r9s_non_claude_selection_keeps_the_openai_listing() {
+    let (root, captured) = spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"gpt-5"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "r9s",
+                "model_id": "gpt-5",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/v1")
+                }
+            },
+            "api_key": "r9s-secret-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/models");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer r9s-secret-key")
+    );
+}
+
+/// The admin REST `/api/my/provider-models` surface shares the per-model
+/// resolution verbatim with the AppUI RPC — including passing the selected
+/// model through (octos#2185).
+#[tokio::test]
+async fn admin_provider_models_r9s_claude_selection_probes_the_anthropic_root() {
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"claude-sonnet-4"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+
+    let response = crate::api::admin::provider_models(
+        axum::extract::State(state),
+        None,
+        axum::Json(crate::api::admin::TestProviderRequest {
+            provider: "r9s".into(),
+            model: "claude-sonnet-4".into(),
+            api_key: Some("r9s-secret-key".into()),
+            api_key_env: None,
+            base_url: Some(format!("{root}/v1")),
+            api_type: None,
+            profile_id: None,
+        }),
+    )
+    .await
+    .expect("provider-models result");
+
+    assert_eq!(response.0, vec!["claude-sonnet-4".to_string()]);
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/anthropic/v1/models");
+    assert!(
+        requests[0].authorization.is_none(),
+        "r9s claude-* speaks Anthropic Messages — never a Bearer probe"
+    );
+    assert_eq!(requests[0].x_api_key.as_deref(), Some("r9s-secret-key"));
+}
+
+#[tokio::test]
 async fn profile_llm_fetch_models_does_not_duplicate_version_segments_on_v4_roots() {
     let (root, captured) =
         spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"}]}"#).await;

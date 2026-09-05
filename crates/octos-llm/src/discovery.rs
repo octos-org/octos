@@ -14,8 +14,11 @@
 //! `create_provider_with_api_type`: an `api_type` of `anthropic` forces the
 //! Anthropic Messages strategy, everything else follows the family's declared
 //! protocol (unknown families fall back to OpenAI-compatible, exactly like the
-//! runtime's custom-provider fallback). URL joining is relative to the
-//! configured API root — no heuristic version stripping/appending.
+//! runtime's custom-provider fallback). Families whose protocol is selected by
+//! MODEL NAME (r9s: `claude-*` → Anthropic) additionally carry a per-model
+//! resolver so the probe follows the selected model's protocol AND rewritten
+//! API root. URL joining is relative to the configured API root — no
+//! heuristic version stripping/appending.
 //!
 //! Discovery is ADVISORY: `Unsupported` or a discovery-only 404 must never
 //! mark a configured model unavailable and must never block manual model-id
@@ -58,6 +61,38 @@ pub const OPENAI_MODELS: ModelDiscovery =
     ModelDiscovery::Supported(DiscoveryProtocol::OpenAICompatible);
 /// Shorthand for registry entries: Gemini listing discovery.
 pub const GEMINI_MODELS: ModelDiscovery = ModelDiscovery::Supported(DiscoveryProtocol::GeminiList);
+
+/// Per-model discovery resolver stored on
+/// [`crate::registry::ProviderEntry::model_discovery_for_model`], for families
+/// that pick the wire protocol by MODEL NAME (r9s serves `claude-*` over the
+/// Anthropic Messages API). Given the selected model and the configured base
+/// URL (`None` = the family default root), returns the listing strategy and,
+/// when that strategy speaks against a DIFFERENT root than the configured
+/// one, that root — mirroring the rewrite the family's `create` applies.
+pub type ModelDiscoveryForModel =
+    fn(model: &str, base_url: Option<&str>) -> (ModelDiscovery, Option<String>);
+
+/// The resolved discovery route: which listing strategy to speak AND, for
+/// per-model-protocol families, the API root to speak it against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryRoute {
+    /// The listing strategy the probe must use.
+    pub discovery: ModelDiscovery,
+    /// Rewritten API root from a per-model resolver (r9s `claude-*` →
+    /// `{base}/anthropic`). When set it WINS over the caller's base_url and
+    /// the family default — it is derived from them, never a third source.
+    pub base_url: Option<String>,
+}
+
+impl From<ModelDiscovery> for DiscoveryRoute {
+    /// A plain family-wide declaration routes with no root rewrite.
+    fn from(discovery: ModelDiscovery) -> Self {
+        DiscoveryRoute {
+            discovery,
+            base_url: None,
+        }
+    }
+}
 
 /// The typed result of one discovery attempt. Every failure carries a safe,
 /// redacted message (never a credential) so callers can show it verbatim.
@@ -122,7 +157,7 @@ impl DiscoveryOutcome {
     }
 }
 
-/// Resolve the discovery strategy for a selected route.
+/// Resolve the discovery route for a selected route + model.
 ///
 /// Mirrors `create_provider_with_api_type`'s precedence exactly: an explicit
 /// `api_type: "anthropic"` overrides any family (the runtime bypasses the
@@ -131,19 +166,48 @@ impl DiscoveryOutcome {
 /// `custom` families fall back to the OpenAI-compatible strategy, matching the
 /// runtime's custom-provider default. The protocol is never inferred from a
 /// single literal family id.
-pub fn resolve_model_discovery(family: Option<&str>, api_type: Option<&str>) -> ModelDiscovery {
+///
+/// Families that select the wire protocol by MODEL NAME (r9s: `claude-*` →
+/// Anthropic Messages at a rewritten `{base}/anthropic` root) carry a
+/// per-model resolver on their registry entry; a selected model is resolved
+/// through it so the probe follows the same protocol AND root the provider
+/// factory would use. No model yet (listing before selection) uses the
+/// family-wide declaration.
+pub fn resolve_model_discovery(
+    family: Option<&str>,
+    api_type: Option<&str>,
+    model: Option<&str>,
+    base_url: Option<&str>,
+) -> DiscoveryRoute {
     if api_type == Some("anthropic") {
-        return ANTHROPIC_MODELS;
+        return ANTHROPIC_MODELS.into();
     }
+    // Normalize like `discover_models` does before handing the base URL to a
+    // per-model resolver — an empty/whitespace override must fall through to
+    // the family default root, never reach the resolver as `Some("")`.
+    let base_url = base_url.map(str::trim).filter(|root| !root.is_empty());
     match family
         .map(str::trim)
         .filter(|f| !f.is_empty())
         .and_then(crate::registry::lookup)
     {
-        Some(entry) => entry.model_discovery,
+        Some(entry) => {
+            // The model is matched RAW (no trim), exactly like provider
+            // construction's `prefers_anthropic` — a whitespace-padded model
+            // is served OpenAI at runtime, so discovery must not diverge.
+            let model = model.filter(|m| !m.is_empty());
+            if let (Some(resolver), Some(model)) = (entry.model_discovery_for_model, model) {
+                let (discovery, base_url) = resolver(model, base_url);
+                return DiscoveryRoute {
+                    discovery,
+                    base_url,
+                };
+            }
+            entry.model_discovery.into()
+        }
         // Unknown family / `custom` without an anthropic override: the runtime
         // builds an OpenAI-compatible provider, so discovery matches that.
-        None => OPENAI_MODELS,
+        None => OPENAI_MODELS.into(),
     }
 }
 
@@ -164,28 +228,34 @@ pub fn models_url(root: &str, protocol: DiscoveryProtocol) -> String {
     }
 }
 
-/// Run one discovery attempt against the resolved strategy.
+/// Run one discovery attempt against the resolved route.
 ///
 /// `api_key` may be empty for keyless families — the auth header is then
 /// suppressed rather than sent as a literal `Bearer ` (mirroring the
-/// connection-test path). `base_url` wins over the family's registered
-/// default root. Never includes the credential in any returned message.
+/// connection-test path). The route's rewritten root (per-model families)
+/// wins, then `base_url`, then the family's registered default root. Never
+/// includes the credential in any returned message.
 pub async fn discover_models(
-    discovery: ModelDiscovery,
+    route: &DiscoveryRoute,
     api_key: &str,
     base_url: Option<&str>,
     family: Option<&str>,
 ) -> DiscoveryOutcome {
-    let protocol = match discovery {
+    let protocol = match route.discovery {
         ModelDiscovery::Unsupported(reason) => {
             return DiscoveryOutcome::Unsupported(reason.to_string());
         }
         ModelDiscovery::Supported(protocol) => protocol,
     };
-    let root = base_url
-        .map(str::trim)
-        .filter(|root| !root.is_empty())
-        .map(str::to_string)
+    let root = route
+        .base_url
+        .clone()
+        .or_else(|| {
+            base_url
+                .map(str::trim)
+                .filter(|root| !root.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| {
             family
                 .map(str::trim)
@@ -323,9 +393,12 @@ mod tests {
         // The registry entry — not a `provider == "anthropic"` literal —
         // declares the protocol, so the Anthropic-protocol zai family resolves
         // to the Anthropic Messages strategy even though its id differs.
-        assert_eq!(resolve_model_discovery(Some("zai"), None), ANTHROPIC_MODELS);
         assert_eq!(
-            resolve_model_discovery(Some("zai-coding"), None),
+            resolve_model_discovery(Some("zai"), None, None, None).discovery,
+            ANTHROPIC_MODELS
+        );
+        assert_eq!(
+            resolve_model_discovery(Some("zai-coding"), None, None, None).discovery,
             ANTHROPIC_MODELS
         );
     }
@@ -338,8 +411,8 @@ mod tests {
                 _ => "zai-coding",
             };
             assert_eq!(
-                resolve_model_discovery(Some(alias), None),
-                resolve_model_discovery(Some(canonical), None),
+                resolve_model_discovery(Some(alias), None, None, None),
+                resolve_model_discovery(Some(canonical), None, None, None),
                 "alias {alias} must resolve like {canonical}"
             );
         }
@@ -350,12 +423,12 @@ mod tests {
         // The runtime's `create_provider_with_api_type` bypasses the registry
         // for `api_type: "anthropic"`; discovery mirrors that override.
         assert_eq!(
-            resolve_model_discovery(Some("openai"), Some("anthropic")),
+            resolve_model_discovery(Some("openai"), Some("anthropic"), None, None).discovery,
             ANTHROPIC_MODELS
         );
         // And a registered Anthropic-protocol family stays on-strategy.
         assert_eq!(
-            resolve_model_discovery(Some("zai"), Some("anthropic")),
+            resolve_model_discovery(Some("zai"), Some("anthropic"), None, None).discovery,
             ANTHROPIC_MODELS
         );
     }
@@ -367,15 +440,15 @@ mod tests {
         // AnthropicProvider, so discovery must NOT take the bait either
         // (saved AppUI routes default api_type to "openai").
         assert_eq!(
-            resolve_model_discovery(Some("zai"), Some("openai")),
+            resolve_model_discovery(Some("zai"), Some("openai"), None, None).discovery,
             ANTHROPIC_MODELS
         );
         assert_eq!(
-            resolve_model_discovery(Some("zhipu"), Some("openai")),
+            resolve_model_discovery(Some("zhipu"), Some("openai"), None, None).discovery,
             OPENAI_MODELS
         );
         assert_eq!(
-            resolve_model_discovery(Some("anthropic"), Some("openai")),
+            resolve_model_discovery(Some("anthropic"), Some("openai"), None, None).discovery,
             // The literal anthropic family's native protocol is Messages, but
             // its route explicitly says the openai override… which for a
             // registered family is ignored at runtime — native rules.
@@ -385,26 +458,32 @@ mod tests {
 
     #[test]
     fn should_fall_back_to_openai_strategy_for_unknown_and_custom_families() {
-        assert_eq!(resolve_model_discovery(Some("custom"), None), OPENAI_MODELS);
         assert_eq!(
-            resolve_model_discovery(Some("custom"), Some("openai")),
+            resolve_model_discovery(Some("custom"), None, None, None).discovery,
             OPENAI_MODELS
         );
         assert_eq!(
-            resolve_model_discovery(Some("custom"), Some("anthropic")),
+            resolve_model_discovery(Some("custom"), Some("openai"), None, None).discovery,
+            OPENAI_MODELS
+        );
+        assert_eq!(
+            resolve_model_discovery(Some("custom"), Some("anthropic"), None, None).discovery,
             ANTHROPIC_MODELS
         );
         assert_eq!(
-            resolve_model_discovery(Some("not-a-family"), None),
+            resolve_model_discovery(Some("not-a-family"), None, None, None).discovery,
             OPENAI_MODELS
         );
-        assert_eq!(resolve_model_discovery(None, None), OPENAI_MODELS);
+        assert_eq!(
+            resolve_model_discovery(None, None, None, None).discovery,
+            OPENAI_MODELS
+        );
     }
 
     #[test]
     fn should_declare_unsupported_discovery_for_vertex() {
-        let discovery = resolve_model_discovery(Some("vertex"), None);
-        match discovery {
+        let discovery = resolve_model_discovery(Some("vertex"), None, None, None);
+        match discovery.discovery {
             ModelDiscovery::Unsupported(reason) => {
                 assert!(
                     reason.contains("manually"),
@@ -542,7 +621,7 @@ mod tests {
         // Base root exactly as the zai family spells it (no /v1 suffix).
         let url = format!("{root}/api/anthropic");
         let outcome = discover_models(
-            resolve_model_discovery(Some("zai"), Some("openai")),
+            &resolve_model_discovery(Some("zai"), Some("openai"), None, None),
             "zai-key-secret",
             Some(&url),
             Some("zai"),
@@ -572,7 +651,7 @@ mod tests {
         let (root, captured) = spawn_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"}]}"#).await;
         let url = format!("{root}/api/paas/v4");
         let outcome = discover_models(
-            resolve_model_discovery(Some("zhipu"), None),
+            &resolve_model_discovery(Some("zhipu"), None, None, None),
             "zhipu-key",
             Some(&url),
             Some("zhipu"),
@@ -593,7 +672,7 @@ mod tests {
     async fn should_map_401_to_authentication_failed_and_404_to_unsupported() {
         let (root, _) = spawn_fixture("401 Unauthorized", r#"{"error":{}}"#).await;
         let outcome = discover_models(
-            OPENAI_MODELS,
+            &OPENAI_MODELS.into(),
             "bad-key",
             Some(&format!("{root}/v1")),
             Some("openai"),
@@ -603,7 +682,7 @@ mod tests {
 
         let (root, _) = spawn_fixture("404 Not Found", "nope").await;
         let outcome = discover_models(
-            OPENAI_MODELS,
+            &OPENAI_MODELS.into(),
             "k",
             Some(&format!("{root}/v1")),
             Some("openai"),
@@ -618,7 +697,7 @@ mod tests {
     async fn should_map_rate_limit_transport_and_malformed_responses_distinctly() {
         let (root, _) = spawn_fixture("429 Too Many Requests", "{}").await;
         let outcome = discover_models(
-            OPENAI_MODELS,
+            &OPENAI_MODELS.into(),
             "k",
             Some(&format!("{root}/v1")),
             Some("openai"),
@@ -628,7 +707,7 @@ mod tests {
 
         // Nothing listens on port 1 — transport failure, not an auth problem.
         let outcome = discover_models(
-            OPENAI_MODELS,
+            &OPENAI_MODELS.into(),
             "k",
             Some("http://127.0.0.1:1/v1"),
             Some("openai"),
@@ -638,7 +717,7 @@ mod tests {
 
         let (root, _) = spawn_fixture("200 OK", "<html>not json</html>").await;
         let outcome = discover_models(
-            OPENAI_MODELS,
+            &OPENAI_MODELS.into(),
             "k",
             Some(&format!("{root}/v1")),
             Some("openai"),
@@ -649,7 +728,7 @@ mod tests {
         // Shape mismatch: 200 + JSON without the expected array.
         let (root, _) = spawn_fixture("200 OK", r#"{"models":"bogus"}"#).await;
         let outcome = discover_models(
-            OPENAI_MODELS,
+            &OPENAI_MODELS.into(),
             "k",
             Some(&format!("{root}/v1")),
             Some("openai"),
@@ -662,7 +741,7 @@ mod tests {
     async fn should_keep_empty_successful_catalogs_distinguishable_from_failures() {
         let (root, _) = spawn_fixture("200 OK", r#"{"data":[]}"#).await;
         let outcome = discover_models(
-            OPENAI_MODELS,
+            &OPENAI_MODELS.into(),
             "k",
             Some(&format!("{root}/v1")),
             Some("openai"),
@@ -677,7 +756,7 @@ mod tests {
     async fn should_return_declared_unsupported_without_any_outbound_request() {
         let (root, captured) = spawn_fixture("200 OK", r#"{"data":[]}"#).await;
         let outcome = discover_models(
-            resolve_model_discovery(Some("vertex"), None),
+            &resolve_model_discovery(Some("vertex"), None, None, None),
             "sa-json",
             Some(&root),
             Some("vertex"),
@@ -693,6 +772,109 @@ mod tests {
             captured.lock().await.is_empty(),
             "manual-only families must never be probed"
         );
+    }
+
+    /// r9s picks its wire protocol by model name (`claude-*` → Anthropic
+    /// Messages at `{base}/anthropic`); the discovery route must follow the
+    /// selected model, not the family-wide OpenAI declaration (octos#2185).
+    #[test]
+    fn should_resolve_r9s_discovery_per_model() {
+        // claude-* → Anthropic strategy against the rewritten root, derived
+        // from the configured base URL when one is set…
+        let route = resolve_model_discovery(
+            Some("r9s"),
+            None,
+            Some("claude-sonnet-4"),
+            Some("https://proxy.example.com/v1"),
+        );
+        assert_eq!(route.discovery, ANTHROPIC_MODELS);
+        assert_eq!(
+            route.base_url.as_deref(),
+            Some("https://proxy.example.com/anthropic")
+        );
+        // …and from the family default root when none is.
+        let route = resolve_model_discovery(Some("r9s"), None, Some("claude-sonnet-4"), None);
+        assert_eq!(route.discovery, ANTHROPIC_MODELS);
+        assert_eq!(
+            route.base_url.as_deref(),
+            Some("https://api.r9s.ai/anthropic")
+        );
+
+        // An empty/whitespace base_url override normalizes away BEFORE the
+        // resolver sees it — `Some("")` must never rewrite to "/anthropic"
+        // and strand the probe on a relative URL.
+        for base in [Some(""), Some("   ")] {
+            let route = resolve_model_discovery(Some("r9s"), None, Some("claude-sonnet-4"), base);
+            assert_eq!(
+                route.base_url.as_deref(),
+                Some("https://api.r9s.ai/anthropic"),
+                "empty base_url {base:?} must fall back to the family default root"
+            );
+        }
+        // A padded base_url is trimmed so the `/v1` suffix strip still lands.
+        let route = resolve_model_discovery(
+            Some("r9s"),
+            None,
+            Some("claude-sonnet-4"),
+            Some("  https://proxy.example.com/v1  "),
+        );
+        assert_eq!(
+            route.base_url.as_deref(),
+            Some("https://proxy.example.com/anthropic")
+        );
+
+        // A non-claude model keeps the family-wide OpenAI listing with no
+        // root rewrite — as does no model yet (listing before selection).
+        // Models are matched RAW like `create` does: a whitespace-padded
+        // model is served OpenAI at runtime, so discovery must not diverge.
+        for model in [
+            Some("gpt-5"),
+            Some("Claude-sonnet-4"),
+            Some(" claude-sonnet-4"),
+            None,
+            Some(""),
+        ] {
+            let route = resolve_model_discovery(Some("r9s"), None, model, None);
+            assert_eq!(
+                route,
+                OPENAI_MODELS.into(),
+                "model {model:?} must use the family-wide OpenAI route"
+            );
+        }
+
+        // The explicit api_type override still wins over per-model resolution,
+        // exactly like it bypasses the registry at runtime.
+        let route = resolve_model_discovery(Some("r9s"), Some("anthropic"), Some("gpt-5"), None);
+        assert_eq!(route.discovery, ANTHROPIC_MODELS);
+    }
+
+    /// The r9s claude probe must hit the Anthropic listing at the rewritten
+    /// root with Anthropic header semantics — never `{base}/models` with a
+    /// Bearer header (octos#2185).
+    #[tokio::test]
+    async fn should_probe_anthropic_root_for_r9s_claude_selection_without_bearer() {
+        let (root, captured) =
+            spawn_fixture("200 OK", r#"{"data":[{"id":"claude-sonnet-4"}]}"#).await;
+        // Configured base exactly as the r9s family spells it (`{base}/v1`).
+        let url = format!("{root}/v1");
+        let outcome = discover_models(
+            &resolve_model_discovery(Some("r9s"), None, Some("claude-sonnet-4"), Some(&url)),
+            "r9s-key",
+            Some(&url),
+            Some("r9s"),
+        )
+        .await;
+
+        assert_eq!(outcome.status_label(), "discovered");
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 1);
+        let only = &requests[0];
+        assert_eq!(only.path, "/anthropic/v1/models");
+        assert!(
+            only.authorization.is_none(),
+            "r9s claude-* must never get a Bearer probe"
+        );
+        assert_eq!(only.x_api_key.as_deref(), Some("r9s-key"));
     }
 
     #[test]

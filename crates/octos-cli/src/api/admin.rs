@@ -291,7 +291,7 @@ pub(crate) fn relocate_keychain_backed_secrets(
             env_vars,
             &key,
             profile_id,
-            cfg!(target_os = "macos"),
+            crate::auth::keychain::is_available(),
             crate::auth::keychain::set_secret,
         )
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -1209,12 +1209,17 @@ pub async fn provider_models(
     }
     // Protocol-aware discovery shared with the AppUI `profile/llm/
     // fetch_models` surface — the strategy resolves from the route (api_type
-    // override, then the family's declared protocol), never from the literal
-    // family id, so the two clients cannot drift.
-    let discovery =
-        octos_llm::discovery::resolve_model_discovery(Some(&req.provider), req.api_type.as_deref());
+    // override, then the family's declared protocol — per-model for families
+    // like r9s that pick the wire protocol by model name), never from the
+    // literal family id, so the two clients cannot drift.
+    let route = octos_llm::discovery::resolve_model_discovery(
+        Some(&req.provider),
+        req.api_type.as_deref(),
+        (!req.model.trim().is_empty()).then_some(req.model.trim()),
+        req.base_url.as_deref(),
+    );
     let outcome = octos_llm::discovery::discover_models(
-        discovery,
+        &route,
         &api_key,
         req.base_url.as_deref(),
         Some(&req.provider),
@@ -5531,12 +5536,27 @@ mod tests {
 
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
-        // The shared helper used by every profile/sub-account save path must
-        // refuse a raw SA JSON on a non-macOS host (where keychain storage
-        // isn't available) rather than let it fall through to plaintext config.
-        // On macOS it would relocate to the keychain instead, so only assert on
-        // the non-macOS path (the one CI runs and the plaintext risk lives on).
-        if cfg!(target_os = "macos") {
+        // #2234/45a — the availability predicate is now `keychain::is_available()`
+        // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
+        // never-plaintext contract holds where NO backend exists (unsupported
+        // platforms); on Linux the raw JSON is legitimately relocated into the
+        // file store and the env slot becomes a marker.
+        if crate::auth::keychain::is_available() {
+            // Store-backed host (macOS keychain / linux file): relocation
+            // succeeds and the plaintext is replaced by a marker.
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                "VERTEX_SA_JSON".to_string(),
+                r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
+            );
+            relocate_keychain_backed_secrets(&mut env, "sub-account-1")
+                .expect("store-backed host relocates raw SA JSON");
+            let stored = env.get("VERTEX_SA_JSON").expect("slot present");
+            assert!(
+                !stored.contains("private_key"),
+                "raw JSON must not persist as plaintext; got: {stored}"
+            );
+            assert!(stored.contains("keychain"), "marker present: {stored}");
             return;
         }
         let mut env = std::collections::HashMap::new();
@@ -5547,7 +5567,7 @@ mod tests {
         let res = relocate_keychain_backed_secrets(&mut env, "sub-account-1");
         assert!(
             res.is_err(),
-            "raw VERTEX_SA_JSON must be rejected off macOS, never saved as plaintext"
+            "raw VERTEX_SA_JSON must be rejected on hosts with no secret store"
         );
         // The raw value is left untouched (the caller bails before saving).
         assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
@@ -5556,22 +5576,44 @@ mod tests {
     #[test]
     fn relocate_rejects_service_account_json_under_custom_env_name_off_macos() {
         // The dashboard "Custom" bypass: SA JSON pasted under VERTEX_API_KEY
-        // (not the whitelisted name) must still be caught by content detection
-        // and rejected off macOS — never written to plaintext config.
-        if cfg!(target_os = "macos") {
-            return;
-        }
+        // (not the whitelisted name) must still be caught by content
+        // detection — never written to plaintext config.
+        //
+        // #2234/45a contract (same shape as the twin at ~L5533): the
+        // availability predicate is `keychain::is_available()`, NOT
+        // `cfg!(macos)`. On a store-backed host (linux file backend with an
+        // INJECTED temp root) the JSON is legitimately relocated: Ok, the
+        // slot becomes a keychain marker, the raw value never remains.
+        // Hosts with NO backend keep the rejection.
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
         let mut env = std::collections::HashMap::new();
         env.insert(
             "VERTEX_API_KEY".to_string(),
             r#"{"type":"service_account","private_key":"x"}"#.to_string(),
         );
         let res = relocate_keychain_backed_secrets(&mut env, "tenant-1");
-        assert!(
-            res.is_err(),
-            "SA JSON under a custom env name must be rejected off macOS"
-        );
-        assert!(env.get("VERTEX_API_KEY").unwrap().starts_with('{'));
+        let slot = env.get("VERTEX_API_KEY").expect("slot present");
+        if crate::auth::keychain::is_available() {
+            assert!(
+                res.is_ok(),
+                "store-backed host relocates SA JSON under a custom name"
+            );
+            assert!(
+                crate::auth::keychain::is_marker(slot),
+                "slot must be a keychain marker, got: {slot}"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the raw private key must never remain in the slot"
+            );
+        } else {
+            assert!(
+                res.is_err(),
+                "SA JSON under a custom env name must be rejected with no store"
+            );
+            assert!(slot.starts_with('{'), "raw value left untouched");
+        }
     }
 
     #[test]
