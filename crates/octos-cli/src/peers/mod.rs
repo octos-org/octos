@@ -360,39 +360,76 @@ pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 /// pointing at another peer's staged dir fails that match and is refused.
 pub(crate) const PEER_TASK_ID_LEAF: &str = "task-id";
 
-/// #14 (codex round 2) — persist the registration-time task-id binding.
-///
-/// Called from the `emit_staged` callback AFTER [`bind_peer_supervised_task`]
-/// returns the task id. Atomic + fd-anchored via [`peer_io`]; best-effort —
-/// a write failure (e.g. the staged dir vanished mid-staging) is logged and
-/// the peer runs with the wire-key + originator checks only (the same
-/// posture as legacy staging, which never wrote the leaf). Returns `true`
-/// when the binding landed.
-/// The `dead_code` allowance is for the default-feature build: the only
-/// production caller is the `api`-gated WS `emit_staged` callback; tests
-/// exercise it directly.
+/// New staging starts at `pending`; only a durably written task-id permits
+/// finalization to that id. An absent state leaf preserves legacy staging.
+const PEER_TASK_ID_STATE_LEAF: &str = "task-id-state";
+
+/// Registration-time task-id binding; callers must handle every write failure.
+/// `true` means both file data and its directory entry have been synced.
 #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
+#[must_use]
 pub(crate) fn persist_peer_task_id_binding(peers_root: &Path, slug: &str, task_id: &str) -> bool {
     let Some(dir) = staged_peer_dir(peers_root, slug) else {
         warn!(
             slug,
-            task_id,
-            "peer task-id binding NOT persisted: no staged dir; \
-             restore-time adoption falls back to wire-key + originator checks"
+            task_id, "peer task-id binding not persisted: no safe staged directory"
         );
         return false;
     };
-    if let Err(err) = peer_io::write_peer_file_atomic(&dir, PEER_TASK_ID_LEAF, task_id) {
-        warn!(
-            slug,
-            task_id,
-            error = %err,
-            "peer task-id binding NOT persisted; restore-time adoption falls \
-             back to wire-key + originator checks"
-        );
+    if let Err(error) = peer_io::write_peer_file_durable(&dir, PEER_TASK_ID_LEAF, task_id) {
+        warn!(slug, task_id, %error, "peer task-id binding not persisted");
         return false;
     }
     true
+}
+
+/// #22: gate automatic adoption BEFORE registering a new supervised task.
+///
+/// Policy: if the task-id write fails, keep the fully registered task under
+/// supervision but leave this slug unadoptable. This avoids pretending that
+/// two independent stores (task ledger and staged directory) can roll back
+/// atomically. Failure to persist the initial gate returns Err BEFORE any
+/// registration/binding, preserving #21's strict failure contract. Every
+/// post-registration crash window retains `pending` until the exact task-id
+/// is durable; Missing task-id can therefore never masquerade as legacy.
+#[cfg(any(feature = "api", test))]
+pub(crate) fn bind_staged_peer_supervised_task(
+    supervisor: &octos_agent::TaskSupervisor,
+    registry_key: String,
+    master_session: &str,
+    workspace_scope: Option<&str>,
+    peers_root: &Path,
+    slug: &str,
+) -> std::io::Result<Option<String>> {
+    let dir = staged_peer_dir(peers_root, slug).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no safe staged peer directory",
+        )
+    })?;
+    peer_io::write_peer_file_durable(&dir, PEER_TASK_ID_STATE_LEAF, "pending")?;
+    let Some(task_id) = bind_peer_supervised_task_with_workspace_strict(
+        supervisor,
+        registry_key,
+        master_session,
+        workspace_scope,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !persist_peer_task_id_binding(peers_root, slug, &task_id) {
+        warn!(slug, %task_id,
+            "peer remains fully supervised but automatic adoption is disabled: task-id write failed");
+    } else if let Err(error) =
+        peer_io::write_peer_file_durable(&dir, PEER_TASK_ID_STATE_LEAF, &task_id)
+    {
+        // If rename landed but directory fsync failed, the visible final state
+        // still names a durable task-id; after a crash it is either final or
+        // pending. Neither outcome permits legacy fallback.
+        warn!(slug, %task_id, %error,
+            "peer adoption gate finalization failed; task remains fully supervised");
+    }
+    Ok(Some(task_id))
 }
 
 /// #8 (continuation-replay review) — adopt orphaned `peer_handoff` tasks whose
@@ -432,8 +469,9 @@ pub(crate) fn persist_peer_task_id_binding(peers_root: &Path, slug: &str, task_i
 ///    task-id` ([`persist_peer_task_id_binding`]); when present, adoption
 ///    requires it to EQUAL the row's task id, so a parked row whose wire key
 ///    names a peer but whose task was never staged into THAT dir cannot claim
-///    its result. An ABSENT file means legacy (pre-#14) staging — the sweep
-///    falls back to checks 1+2 rather than stranding every older row.
+///    its result. An ABSENT file permits legacy (pre-#14) fallback to checks
+///    1+2 only for a unique Parked wire-key candidate with no new staging
+///    finalization gate. Invalid identity files never permit this fallback.
 ///
 /// ## B: settle-binding restoration BEFORE `mark_completed`
 ///
@@ -470,7 +508,20 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
     profile_data_dir: &Path,
     restored: &[octos_agent::BackgroundTask],
 ) -> usize {
+    use peer_io::PeerFileRead;
+
     let peers_root = profile_data_dir.join("peers");
+    // Freeze candidate counts before any terminal transition. Picking one
+    // ambiguous legacy row would let a later sweep consume the same result
+    // for its twin; leave ALL such candidates Parked until identity is known.
+    let mut candidates_by_wire_key = HashMap::<&str, usize>::new();
+    for task in restored.iter().filter(|task| {
+        task.tool_name == "peer_handoff" && task.status == octos_agent::TaskStatus::Parked
+    }) {
+        *candidates_by_wire_key
+            .entry(&task.tool_call_id)
+            .or_default() += 1;
+    }
     let mut adopted = 0usize;
     for task in restored {
         if task.tool_name != "peer_handoff" || task.status != octos_agent::TaskStatus::Parked {
@@ -524,11 +575,15 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
         // session, e.g. two masters staged into the same profile); with no
         // record, fall back to the installer's session.
         let task_master = task.parent_session_key.as_deref().unwrap_or("");
-        let originator_matches =
-            match peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL) {
-                Some(recorded) => recorded.trim() == task_master,
-                None => task_master == expected_master_session,
-            };
+        let originator_matches = match peer_io::read_peer_identity_file(&dir, "originator") {
+            PeerFileRead::Valid(recorded) => recorded.trim() == task_master,
+            PeerFileRead::Missing => task_master == expected_master_session,
+            PeerFileRead::Invalid(error) => {
+                warn!(task_id = %task.id, slug, %error,
+                        "invalid peer originator; refusing adoption, leaving Parked");
+                continue;
+            }
+        };
         if !originator_matches {
             debug!(
                 task_id = %task.id,
@@ -539,21 +594,40 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
             );
             continue;
         }
-        // #14 check 3 — exact-match the registration-time task-id binding
-        // when one was persisted (absent = legacy staging; wire-key +
-        // originator checks above carry those rows).
-        if let Some(recorded_id) =
-            peer_io::read_peer_file(&dir, PEER_TASK_ID_LEAF, peer_io::PEER_FILE_READ_CAP_SMALL)
-            && recorded_id.trim() != task.id
-        {
-            debug!(
-                task_id = %task.id,
-                recorded_id = %recorded_id.trim(),
-                slug,
-                "parked peer task id does not match the staged dir's task-id \
-                 binding; refusing adoption"
-            );
-            continue;
+        let has_task_id = match peer_io::read_peer_identity_file(&dir, PEER_TASK_ID_LEAF) {
+            PeerFileRead::Valid(recorded_id) if recorded_id.trim() == task.id => true,
+            PeerFileRead::Valid(recorded_id) => {
+                debug!(task_id = %task.id, recorded_id = %recorded_id.trim(), slug,
+                    "parked peer task id does not match the staged binding; refusing adoption");
+                continue;
+            }
+            PeerFileRead::Invalid(error) => {
+                warn!(task_id = %task.id, slug, %error,
+                    "invalid peer task-id; refusing adoption, leaving Parked");
+                continue;
+            }
+            PeerFileRead::Missing => {
+                if candidates_by_wire_key.get(task.tool_call_id.as_str()) != Some(&1) {
+                    warn!(task_id = %task.id, slug,
+                        "ambiguous legacy peer wire key; refusing adoption, leaving Parked");
+                    continue;
+                }
+                false
+            }
+        };
+        match peer_io::read_peer_identity_file(&dir, PEER_TASK_ID_STATE_LEAF) {
+            PeerFileRead::Missing => {} // Legacy staging has no finalization gate.
+            PeerFileRead::Valid(state) if has_task_id && state.trim() == task.id => {}
+            PeerFileRead::Valid(_) => {
+                warn!(task_id = %task.id, slug,
+                    "peer task-id binding is not finalized; refusing adoption, leaving Parked");
+                continue;
+            }
+            PeerFileRead::Invalid(error) => {
+                warn!(task_id = %task.id, slug, %error,
+                    "invalid peer adoption gate; refusing adoption, leaving Parked");
+                continue;
+            }
         }
         if !peer_io::peer_regular_file_exists(&dir, "result.md") {
             debug!(
@@ -789,6 +863,15 @@ pub(crate) mod peer_io {
     /// atomic writes to the same leaf never collide on the `O_EXCL` create.
     static TMP_UNIQ: AtomicU64 = AtomicU64::new(0);
 
+    /// Only a missing leaf in a successfully opened peer directory is legacy
+    /// absence. Safety failures and I/O errors must not weaken identity checks.
+    #[derive(Debug)]
+    pub(crate) enum PeerFileRead {
+        Missing,
+        Valid(String),
+        Invalid(std::io::Error),
+    }
+
     /// A `.<leaf>.tmp-<pid>-<uniq>` sibling name for the atomic temp file. The
     /// leading `.` keeps it out of `result-*` globs (e.g.
     /// `count_peer_result_versions`), which a bare `<leaf>.tmp` would otherwise
@@ -804,7 +887,40 @@ pub(crate) mod peer_io {
     /// symlinked dir/leaf, a FIFO/device/dir leaf, an over-cap file, invalid
     /// UTF-8, or any I/O error.
     pub(crate) fn read_peer_file(peer_dir: &Path, leaf: &str, cap: usize) -> Option<String> {
-        imp::read_peer_file(peer_dir, leaf, cap)
+        imp::read_peer_file(peer_dir, leaf, cap).ok().flatten()
+    }
+
+    pub(crate) fn read_peer_identity_file(peer_dir: &Path, leaf: &str) -> PeerFileRead {
+        match imp::read_peer_file(peer_dir, leaf, PEER_FILE_READ_CAP_SMALL) {
+            Ok(None) => PeerFileRead::Missing,
+            Ok(Some(content)) if !content.trim().is_empty() => PeerFileRead::Valid(content),
+            Ok(Some(_)) => PeerFileRead::Invalid(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty peer identity",
+            )),
+            Err(error) => PeerFileRead::Invalid(error),
+        }
+    }
+
+    fn read_regular_file(file: std::fs::File, cap: usize) -> std::io::Result<String> {
+        use std::io::Read;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer leaf is not a regular file",
+            ));
+        }
+        let mut content = String::new();
+        let read = file
+            .take((cap as u64).saturating_add(1))
+            .read_to_string(&mut content)?;
+        if read > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer leaf exceeds read cap",
+            ));
+        }
+        Ok(content)
     }
 
     /// Atomically replace a peer leaf file (temp + fsync + rename), every step
@@ -816,7 +932,19 @@ pub(crate) mod peer_io {
         leaf: &str,
         content: &str,
     ) -> std::io::Result<()> {
-        imp::write_peer_file_atomic(peer_dir, leaf, content)
+        imp::write_peer_file_atomic(peer_dir, leaf, content, false)
+    }
+
+    /// Identity writes require BOTH file data and the renamed directory entry
+    /// to be synced. Unlike ordinary peer output, directory-sync errors must
+    /// propagate to the registration/adoption gate.
+    #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
+    pub(crate) fn write_peer_file_durable(
+        peer_dir: &Path,
+        leaf: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
+        imp::write_peer_file_atomic(peer_dir, leaf, content, true)
     }
 
     /// Append `line` to a peer leaf file (the `turns.txt` index), anchored on
@@ -869,7 +997,7 @@ pub(crate) mod peer_io {
     #[cfg(unix)]
     mod imp {
         use std::ffi::CStr;
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::os::fd::OwnedFd;
         use std::os::unix::fs::OpenOptionsExt;
         use std::path::Path;
@@ -889,43 +1017,33 @@ pub(crate) mod peer_io {
                 .map(OwnedFd::from)
         }
 
-        pub(crate) fn read_peer_file(peer_dir: &Path, leaf: &str, cap: usize) -> Option<String> {
-            let dir = open_peer_dir(peer_dir).ok()?;
+        pub(crate) fn read_peer_file(
+            peer_dir: &Path,
+            leaf: &str,
+            cap: usize,
+        ) -> std::io::Result<Option<String>> {
+            let dir = open_peer_dir(peer_dir)?;
             // NONBLOCK: a FIFO opened plain `O_RDONLY` blocks until a writer
             // appears — a planted FIFO must never park the caller (#1824).
-            let fd = openat(
+            let fd = match openat(
                 &dir,
                 leaf,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                 Mode::empty(),
-            )
-            .ok()?;
-            let file = std::fs::File::from(fd);
-            // fstat the OPENED handle (no stat-by-path race). Regular files
-            // only: a FIFO/device/dir/socket is refused before any `read`.
-            let meta = file.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
-            let cap = cap as u64;
-            // Bound the ACTUAL read, not just the fstat snapshot: `take(cap+1)`
-            // detects an over-cap file (a full cap+1 bytes) and rejects it
-            // rather than serving a truncated prefix. Invalid UTF-8 → `None`
-            // (matching the prior `read_to_string`).
-            let mut content = String::new();
-            let read = Read::take(file, cap + 1)
-                .read_to_string(&mut content)
-                .ok()?;
-            if read as u64 > cap {
-                return None;
-            }
-            Some(content)
+            ) {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            // fstat and bounded read use the OPENED handle, never a path rewalk.
+            super::read_regular_file(std::fs::File::from(fd), cap).map(Some)
         }
 
         pub(crate) fn write_peer_file_atomic(
             peer_dir: &Path,
             leaf: &str,
             content: &str,
+            durable: bool,
         ) -> std::io::Result<()> {
             let dir = open_peer_dir(peer_dir)?;
             let tmp = super::tmp_name(leaf);
@@ -952,9 +1070,10 @@ pub(crate) mod peer_io {
                 let _ = unlinkat(&dir, tmp.as_str(), AtFlags::empty());
                 return Err(err.into());
             }
-            // Best-effort dir fsync so the rename entry itself is crash-durable
-            // (the tmp file's data was already fsync'd above).
-            let _ = fsync(&dir);
+            let synced = fsync(&dir);
+            if durable {
+                synced?;
+            }
             Ok(())
         }
 
@@ -1075,7 +1194,7 @@ pub(crate) mod peer_io {
 
     #[cfg(not(unix))]
     mod imp {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::path::Path;
 
         /// Refuse a symlinked peer dir; require a real directory. Non-unix
@@ -1088,31 +1207,38 @@ pub(crate) mod peer_io {
                 .unwrap_or(false)
         }
 
-        pub(crate) fn read_peer_file(peer_dir: &Path, leaf: &str, cap: usize) -> Option<String> {
-            if !peer_dir_ok(peer_dir) {
-                return None;
+        pub(crate) fn read_peer_file(
+            peer_dir: &Path,
+            leaf: &str,
+            cap: usize,
+        ) -> std::io::Result<Option<String>> {
+            let parent = std::fs::symlink_metadata(peer_dir)?;
+            if parent.file_type().is_symlink() || !parent.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "peer dir is not a real directory",
+                ));
             }
             let path = peer_dir.join(leaf);
-            let meta = std::fs::symlink_metadata(&path).ok()?;
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
             if meta.file_type().is_symlink() || !meta.is_file() {
-                return None;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "peer leaf is not a regular file",
+                ));
             }
-            let cap = cap as u64;
-            let file = std::fs::File::open(&path).ok()?;
-            let mut content = String::new();
-            let read = Read::take(file, cap + 1)
-                .read_to_string(&mut content)
-                .ok()?;
-            if read as u64 > cap {
-                return None;
-            }
-            Some(content)
+            super::read_regular_file(std::fs::File::open(&path)?, cap).map(Some)
         }
 
         pub(crate) fn write_peer_file_atomic(
             peer_dir: &Path,
             leaf: &str,
             content: &str,
+            durable: bool,
         ) -> std::io::Result<()> {
             if !peer_dir_ok(peer_dir) {
                 return Err(std::io::Error::new(
@@ -1144,6 +1270,11 @@ pub(crate) mod peer_io {
             if let Err(err) = std::fs::rename(&tmp, &path) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(err);
+            }
+            if durable {
+                // Platforms unable to sync directories fail closed for new
+                // supervised staging instead of claiming false durability.
+                std::fs::File::open(peer_dir)?.sync_all()?;
             }
             Ok(())
         }
@@ -1236,6 +1367,46 @@ mod peer_io_tests {
         peer_dir_count_prefixed, peer_dir_exists, peer_file_mtime, peer_regular_file_exists,
         read_peer_file, write_peer_file_atomic,
     };
+
+    #[test]
+    fn peer_identity_read_distinguishes_missing_valid_and_invalid() {
+        use super::peer_io::{PeerFileRead, read_peer_identity_file};
+        let dir = tempfile::tempdir().unwrap();
+        let peer = dir.path();
+        assert!(matches!(
+            read_peer_identity_file(peer, "originator"),
+            PeerFileRead::Missing
+        ));
+        std::fs::write(peer.join("originator"), "master\n").unwrap();
+        assert!(matches!(read_peer_identity_file(peer, "originator"),
+            PeerFileRead::Valid(value) if value == "master\n"));
+        for content in [
+            vec![0xff],
+            vec![b'x'; PEER_FILE_READ_CAP_SMALL + 1],
+            vec![b' '],
+        ] {
+            std::fs::write(peer.join("originator"), content).unwrap();
+            assert!(matches!(
+                read_peer_identity_file(peer, "originator"),
+                PeerFileRead::Invalid(_)
+            ));
+        }
+        // Missing PARENT and other open errors are not missing LEAF identity.
+        assert!(matches!(
+            read_peer_identity_file(&peer.join("missing-dir"), "originator"),
+            PeerFileRead::Invalid(_)
+        ));
+        assert!(matches!(
+            read_peer_identity_file(peer, "\0"),
+            PeerFileRead::Invalid(_)
+        ));
+        let linked = peer.join("linked-dir");
+        std::os::unix::fs::symlink(peer, &linked).unwrap();
+        assert!(matches!(
+            read_peer_identity_file(&linked, "task-id"),
+            PeerFileRead::Invalid(_)
+        ));
+    }
 
     // octos#1824: a symlinked leaf must NOT be followed — the anchored openat
     // is O_NOFOLLOW, so a `model`/`brief.md` symlink pointing at a real file
@@ -3255,6 +3426,335 @@ pub(crate) fn build_peer_list_callback(
 #[cfg(test)]
 mod peer_task_registry_tests {
     use super::*;
+
+    #[test]
+    fn peer_task_durable_identity_roundtrip_and_missing_new_id_refused() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        let peer = peers_root.join("durable");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(peer.join("brief.md"), "brief").unwrap();
+        std::fs::write(peer.join("result.md"), "result").unwrap();
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let ledger = data.path().join("tasks.jsonl");
+        supervisor.enable_persistence(&ledger).unwrap();
+        let key = peer_wire_key("identity-roundtrip", "durable");
+        let id = bind_staged_peer_supervised_task(
+            &supervisor,
+            key.clone(),
+            "identity-roundtrip:master",
+            Some("616263"),
+            &peers_root,
+            "durable",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(peer.join(PEER_TASK_ID_LEAF)).unwrap(),
+            id
+        );
+        assert_eq!(
+            std::fs::read_to_string(peer.join(PEER_TASK_ID_STATE_LEAF)).unwrap(),
+            id
+        );
+        assert_eq!(
+            peer_task_registry().take(&key).as_deref(),
+            Some(id.as_str())
+        );
+        supervisor.mark_parked(&id, "orphaned across restart".into());
+        let boot = octos_agent::TaskSupervisor::new();
+        boot.enable_persistence(&ledger).unwrap();
+        std::fs::remove_file(peer.join(PEER_TASK_ID_LEAF)).unwrap();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &boot,
+                "identity-roundtrip",
+                "identity-roundtrip:master",
+                data.path(),
+                &boot.get_all_tasks(),
+            ),
+            0,
+            "new staging cannot use missing-task-id legacy fallback"
+        );
+        assert!(persist_peer_task_id_binding(&peers_root, "durable", &id));
+        // Even an exact task-id cannot bypass unfinished or corrupt finalization.
+        for state in [b"pending".as_slice(), &[0xff]] {
+            std::fs::write(peer.join(PEER_TASK_ID_STATE_LEAF), state).unwrap();
+            assert_eq!(
+                adopt_parked_peer_tasks_with_results(
+                    &boot,
+                    "identity-roundtrip",
+                    "identity-roundtrip:master",
+                    data.path(),
+                    &boot.get_all_tasks(),
+                ),
+                0
+            );
+        }
+        std::fs::write(peer.join(PEER_TASK_ID_STATE_LEAF), &id).unwrap();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &boot,
+                "identity-roundtrip",
+                "identity-roundtrip:master",
+                data.path(),
+                &boot.get_all_tasks(),
+            ),
+            1
+        );
+        assert_eq!(
+            boot.get_task(&id).unwrap().status,
+            octos_agent::TaskStatus::Completed
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adopt_refuses_symlink_fifo_and_directory_identities() {
+        for leaf in ["originator", PEER_TASK_ID_LEAF] {
+            for kind in ["symlink", "fifo", "directory"] {
+                let data = tempfile::tempdir().unwrap();
+                let peer = data.path().join("peers/unsafe-identity");
+                std::fs::create_dir_all(&peer).unwrap();
+                std::fs::write(peer.join("brief.md"), "brief").unwrap();
+                std::fs::write(peer.join("result.md"), "result").unwrap();
+                let path = peer.join(leaf);
+                match kind {
+                    "symlink" => std::os::unix::fs::symlink("missing-target", &path).unwrap(),
+                    "fifo" => assert!(
+                        std::process::Command::new("mkfifo")
+                            .arg(&path)
+                            .status()
+                            .unwrap()
+                            .success()
+                    ),
+                    _ => std::fs::create_dir(&path).unwrap(),
+                }
+                let supervisor = octos_agent::TaskSupervisor::new();
+                let id = supervisor.register(
+                    "peer_handoff",
+                    &peer_wire_key("unsafe-identity", "unsafe-identity"),
+                    Some("unsafe-identity:master"),
+                );
+                supervisor.mark_parked(&id, "orphaned across restart".into());
+                assert_eq!(
+                    adopt_parked_peer_tasks_with_results(
+                        &supervisor,
+                        "unsafe-identity",
+                        "unsafe-identity:master",
+                        data.path(),
+                        &supervisor.get_all_tasks(),
+                    ),
+                    0,
+                    "{kind} {leaf} must fail closed"
+                );
+                assert_eq!(
+                    supervisor.get_task(&id).unwrap().status,
+                    octos_agent::TaskStatus::Parked
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn peer_task_identity_gate_write_failure_does_not_half_bind() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        let peer = peers_root.join("gate-write-fail");
+        std::fs::create_dir_all(peer.join("task-id-state")).unwrap();
+        std::fs::write(peer.join("brief.md"), "brief").unwrap();
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let ledger = data.path().join("tasks.jsonl");
+        supervisor.enable_persistence(&ledger).unwrap();
+        let key = peer_wire_key("identity-gate-fail", "gate-write-fail");
+        let result = bind_staged_peer_supervised_task(
+            &supervisor,
+            key.clone(),
+            "identity-gate-fail:master",
+            Some("616263"),
+            &peers_root,
+            "gate-write-fail",
+        );
+        assert!(
+            result.is_err(),
+            "the durable gate must precede registration"
+        );
+        assert!(supervisor.get_all_tasks().is_empty());
+        assert!(peer_task_registry().take(&key).is_none());
+        let boot = octos_agent::TaskSupervisor::new();
+        boot.enable_persistence(&ledger).unwrap();
+        assert!(boot.get_all_tasks().is_empty(), "no durable half-bound row");
+    }
+
+    #[test]
+    fn peer_task_id_write_failure_stays_unadoptable_after_restart() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        let peer = peers_root.join("id-write-fail");
+        // A directory at the destination deterministically fails rename,
+        // without depending on uid/root-specific permission behavior.
+        std::fs::create_dir_all(peer.join(PEER_TASK_ID_LEAF)).unwrap();
+        std::fs::write(peer.join("brief.md"), "brief").unwrap();
+        std::fs::write(peer.join("result.md"), "result").unwrap();
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let ledger = data.path().join("tasks.jsonl");
+        supervisor.enable_persistence(&ledger).unwrap();
+        let key = peer_wire_key("identity-write-fail", "id-write-fail");
+        let id = bind_staged_peer_supervised_task(
+            &supervisor,
+            key.clone(),
+            "identity-write-fail:master",
+            Some("616263"),
+            &peers_root,
+            "id-write-fail",
+        )
+        .unwrap()
+        .unwrap();
+        // Chosen #22 policy: supervision is fully bound, automatic adoption
+        // is disabled. No half-binding or fictitious rollback is reported.
+        assert_eq!(
+            supervisor.get_task(&id).unwrap().workspace_root.as_deref(),
+            Some("616263")
+        );
+        assert_eq!(
+            peer_task_registry().take(&key).as_deref(),
+            Some(id.as_str())
+        );
+        supervisor.mark_parked(&id, "orphaned across restart".into());
+        std::fs::remove_dir(peer.join(PEER_TASK_ID_LEAF)).unwrap();
+        let boot = octos_agent::TaskSupervisor::new();
+        boot.enable_persistence(&ledger).unwrap();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &boot,
+                "identity-write-fail",
+                "identity-write-fail:master",
+                data.path(),
+                &boot.get_all_tasks(),
+            ),
+            0,
+            "a failed new binding must not become legacy after restart"
+        );
+        assert_eq!(
+            boot.get_task(&id).unwrap().status,
+            octos_agent::TaskStatus::Parked
+        );
+    }
+
+    fn assert_invalid_identity_refuses_adoption(leaf: &str, content: &[u8]) {
+        let data = tempfile::tempdir().unwrap();
+        let peer = data.path().join("peers/invalid");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(peer.join("brief.md"), "brief").unwrap();
+        std::fs::write(peer.join("result.md"), "findings").unwrap();
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let id = supervisor.register(
+            "peer_handoff",
+            &peer_wire_key("invalid-identity", "invalid"),
+            Some("invalid-identity:master"),
+        );
+        supervisor.mark_parked(&id, "orphaned across restart".into());
+        std::fs::write(peer.join(leaf), content).unwrap();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &supervisor,
+                "invalid-identity",
+                "invalid-identity:master",
+                data.path(),
+                &supervisor.get_all_tasks(),
+            ),
+            0,
+            "an invalid {leaf} must never be treated as legacy absence",
+        );
+        assert_eq!(
+            supervisor.get_task(&id).unwrap().status,
+            octos_agent::TaskStatus::Parked
+        );
+    }
+
+    #[test]
+    fn adopt_refuses_non_utf8_originator() {
+        assert_invalid_identity_refuses_adoption("originator", &[0xff]);
+    }
+
+    #[test]
+    fn adopt_refuses_oversized_originator() {
+        assert_invalid_identity_refuses_adoption(
+            "originator",
+            &vec![b'x'; peer_io::PEER_FILE_READ_CAP_SMALL + 1],
+        );
+    }
+
+    #[test]
+    fn adopt_refuses_non_utf8_task_id() {
+        assert_invalid_identity_refuses_adoption(PEER_TASK_ID_LEAF, &[0xff]);
+    }
+
+    #[test]
+    fn adopt_refuses_oversized_task_id() {
+        assert_invalid_identity_refuses_adoption(
+            PEER_TASK_ID_LEAF,
+            &vec![b'x'; peer_io::PEER_FILE_READ_CAP_SMALL + 1],
+        );
+    }
+
+    #[test]
+    fn adopt_refuses_ambiguous_legacy_wire_key() {
+        let data = tempfile::tempdir().unwrap();
+        let peer = data.path().join("peers/shared");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(peer.join("brief.md"), "brief").unwrap();
+        std::fs::write(peer.join("result.md"), "shared result").unwrap();
+        std::fs::write(peer.join("originator"), "legacy:master").unwrap();
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let ids: Vec<_> = (0..2)
+            .map(|_| {
+                let id = supervisor.register(
+                    "peer_handoff",
+                    &peer_wire_key("legacy", "shared"),
+                    Some("legacy:master"),
+                );
+                supervisor.mark_parked(&id, "orphaned across restart".into());
+                id
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        for _ in 0..2 {
+            assert_eq!(
+                adopt_parked_peer_tasks_with_results(
+                    &supervisor,
+                    "legacy",
+                    "legacy:master",
+                    data.path(),
+                    &supervisor.get_all_tasks(),
+                ),
+                0,
+                "neither ambiguous legacy row can claim the shared result"
+            );
+            for id in &ids {
+                assert_eq!(
+                    supervisor.get_task(id).unwrap().status,
+                    octos_agent::TaskStatus::Parked
+                );
+            }
+        }
+        // A durable binding resolves the ambiguity to exactly one row.
+        std::fs::write(peer.join(PEER_TASK_ID_LEAF), &ids[0]).unwrap();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &supervisor,
+                "legacy",
+                "legacy:master",
+                data.path(),
+                &supervisor.get_all_tasks(),
+            ),
+            1
+        );
+        assert_eq!(
+            supervisor.get_task(&ids[1]).unwrap().status,
+            octos_agent::TaskStatus::Parked
+        );
+    }
 
     /// #8 (continuation-replay review) — a parked `peer_handoff` orphan whose
     /// `result.md` already sits on the blackboard must be ADOPTED

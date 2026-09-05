@@ -32106,36 +32106,17 @@ async fn run_standalone_turn(
             let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
                 Arc::new(move |event: PeerStagedEvent| {
                     let registry_key = peer_wire_key(&peer_task_profile, &event.slug);
-                    // #21 (round-4, codex #17 B3) — STRICT workspace-scoped
-                    // binding: the first durable task row carries the
-                    // workspace stamp (hex-encoded OsStr bytes — lossless for
-                    // non-UTF-8 roots), and a failed first write surfaces as
-                    // an Err so the peer is NEVER half-bound (the in-memory
-                    // row was rolled back inside the supervisor; the peer
-                    // runs unsupervised, which the warn below states). A cap
-                    // refusal maps to `Ok(None)` — the pre-#21 posture.
-                    match crate::peers::bind_peer_supervised_task_with_workspace_strict(
+                    // #22: the staged identity gate and the strict workspace
+                    // registration share one helper, also exercised by tests.
+                    match crate::peers::bind_staged_peer_supervised_task(
                         &peer_supervisor,
                         registry_key,
                         &event.session_id.0,
                         peer_task_scope.as_deref(),
+                        &peer_binding_peers_root,
+                        &event.slug,
                     ) {
-                        Ok(Some(task_id)) => {
-                            // Persist the task-id binding into the staged dir
-                            // so a later restore-time adoption can exact-match
-                            // the parked row against THIS staging — a forged
-                            // or stale wire key pointing at this dir's
-                            // result.md is refused instead of claiming its
-                            // result. Best-effort: a missing staged dir (or
-                            // failed write) falls back to the wire-key +
-                            // originator checks only, like legacy pre-#14
-                            // staging.
-                            crate::peers::persist_peer_task_id_binding(
-                                &peer_binding_peers_root,
-                                &event.slug,
-                                &task_id,
-                            );
-                        }
+                        Ok(Some(_)) => {}
                         Ok(None) => {
                             tracing::warn!(
                                 slug = %event.slug,
@@ -32149,9 +32130,8 @@ async fn run_standalone_turn(
                                 slug = %event.slug,
                                 master = %event.session_id,
                                 error = %err,
-                                "peer task registration ROLLED BACK (first durable \
-                                 write failed); peer runs UNSUPERVISED — no half-\
-                                 bound task row exists"
+                                "peer task binding failed (identity gate or workspace \
+                                 persistence); peer runs UNSUPERVISED"
                             );
                         }
                     }
