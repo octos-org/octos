@@ -343,6 +343,17 @@ pub enum SupervisorEvent {
         #[serde(default)]
         result: Option<String>,
     },
+    /// #15b — durable join-epoch bump marker. `upsert_agent` bumps a group's
+    /// join epoch IN MEMORY when a new agent is admitted into an
+    /// already-joined group; without this record a crash before the bumped
+    /// epoch's scatter persists would restart at the last persisted epoch and
+    /// the reconcile pass could never derive the lost epoch's join key.
+    /// `apply_event` upserts the group's `metadata["join_epoch"]` (max wins).
+    GroupEpochBumped {
+        group_id: String,
+        new_epoch: u64,
+        observed_at_ms: u64,
+    },
 }
 
 /// One folded-extra tombstone in a coalesced terminal-continuation fold
@@ -434,6 +445,27 @@ impl SupervisorState {
                 *completed_at_ms,
                 result.clone(),
             ),
+            SupervisorEvent::GroupEpochBumped {
+                group_id,
+                new_epoch,
+                observed_at_ms,
+            } => {
+                // #15b — durable epoch bump: max-upsert the group's
+                // `join_epoch` metadata so a restart restores the HIGHEST
+                // admitted epoch, not just the highest PERSISTED scatter.
+                let group = self.ensure_group(group_id, *observed_at_ms);
+                let existing = group
+                    .metadata
+                    .get("join_epoch")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                if *new_epoch > existing {
+                    group
+                        .metadata
+                        .insert("join_epoch".to_owned(), serde_json::Value::from(*new_epoch));
+                }
+                group.updated_at_ms = group.updated_at_ms.max(*observed_at_ms);
+            }
         }
     }
 
@@ -1036,6 +1068,29 @@ impl SupervisorStore {
     ) -> io::Result<SupervisorEventLedgerRow> {
         let event_id = format!("group_registered:{}", group.group_id);
         self.append_event(event_id, SupervisorEvent::GroupRegistered { group })
+    }
+
+    /// #15b — persist a join-epoch bump marker so a restart restores the
+    /// HIGHEST admitted epoch even when the bumped epoch's scatter record was
+    /// never persisted (crash between admission and the scatter write).
+    /// The event id is keyed on (group, epoch): replay dedup makes a retried
+    /// or double-written bump for the same epoch idempotent.
+    pub fn record_group_epoch_bump(
+        &self,
+        group_id: impl Into<String>,
+        new_epoch: u64,
+        observed_at_ms: u64,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        let group_id = group_id.into();
+        let event_id = format!("group_epoch_bumped:{group_id}:{new_epoch}");
+        self.append_event(
+            event_id,
+            SupervisorEvent::GroupEpochBumped {
+                group_id,
+                new_epoch,
+                observed_at_ms,
+            },
+        )
     }
 
     pub fn record_group_terminal(

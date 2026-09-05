@@ -2757,11 +2757,34 @@ impl InProcessAgentOrchestrator {
                     .get(&group)
                     .is_some_and(|s| s.last_joined_key.is_some());
                 if already_joined {
-                    state
-                        .scatter_join_state
-                        .entry(group)
-                        .or_default()
-                        .join_epoch += 1;
+                    let new_epoch = {
+                        let join_state = state.scatter_join_state.entry(group.clone()).or_default();
+                        join_state.join_epoch += 1;
+                        join_state.join_epoch
+                    };
+                    // #15b — persist the bumped epoch IMMEDIATELY (best-effort,
+                    // never blocks admission): the bump above is in-memory only,
+                    // so a crash before the new epoch's scatter record persists
+                    // would restart at the LAST PERSISTED scatter's epoch, whose
+                    // key is already in `delivered_scatter_marks` — the
+                    // reconcile pass would skip it and the bumped epoch's join
+                    // would be lost FOREVER. With this marker, the restore
+                    // seeds `join_epoch` as max(persisted scatter max, marker),
+                    // and `reconcile_missing_scatters_on_restore` derives the
+                    // bumped epoch's key (not delivered → re-emit). A lost
+                    // marker falls back to the pre-#15b behavior (old epoch).
+                    if let Some(store) = state.supervisor_store.as_ref()
+                        && let Err(err) =
+                            store.record_group_epoch_bump(group.as_str(), new_epoch, now_ms_u64())
+                    {
+                        tracing::warn!(
+                            ?err,
+                            group = %group,
+                            new_epoch,
+                            "join-epoch bump marker persist failed; a crash before the \
+                             new epoch's scatter persists could lose that epoch's join"
+                        );
+                    }
                 }
             }
             let entry = state
@@ -14290,6 +14313,12 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
 ///   roster members (handled by `restore_agents_from_supervisor_state`)
 ///   never pass through `upsert_agent`'s new-admission path, so no
 ///   spurious bump fires for them.
+/// - #15b — the group's durable `join_epoch` marker (`GroupEpochBumped`
+///   events) then lifts the restored `join_epoch` to the HIGHEST ADMITTED
+///   epoch when it exceeds the scatter-derived max (admission persisted, the
+///   bumped epoch's scatter crashed). `last_joined_key` still names the last
+///   JOINED key, so the reconcile pass re-derives the bumped epoch's
+///   undelivered key and re-emits the lost join.
 ///
 /// The persisted `continuation_id` IS the dedupe key in both cases.
 fn seed_delivered_terminal_marks(
@@ -14388,12 +14417,52 @@ fn seed_delivered_terminal_marks(
             .delivered_scatter_marks
             .insert(key, "joined".to_owned());
     }
+    // #15b — SECOND mark-seed pass after the durable `join_epoch` markers are
+    // applied: the marker can lift a group's restored `join_epoch` ABOVE the
+    // max persisted scatter epoch (bump persisted, scatter crashed). That
+    // exactly models the live post-join state — `last_joined_key` still names
+    // the LAST JOINED (older-epoch) key while `join_epoch` already names the
+    // bumped one — so `reconcile_missing_scatters_on_restore` derives the
+    // bumped epoch's key, finds it undelivered, and re-emits the lost join.
+    for group in supervisor_state.groups.values() {
+        if let Some(marker_epoch) = group
+            .metadata
+            .get("join_epoch")
+            .and_then(|value| value.as_u64())
+        {
+            let join_state = state
+                .scatter_join_state
+                .entry(group.group_id.clone())
+                .or_default();
+            join_state.join_epoch = join_state.join_epoch.max(marker_epoch);
+        }
+    }
 }
 
 /// Upper bound on the folded `coalesced_children` metadata rendered into a
 /// single master re-entry prompt.
 const COALESCED_CHILDREN_MAX_CHARS: usize = 6_000;
 const COALESCED_CHILD_SUMMARY_CHARS: usize = 160;
+/// #15b — hard caps on the coalesced payload's LINEAR growth (outer loop
+/// 15:25 closeout point 2). `coalesced_child_ids` and the id/status/group/
+/// workspace skeleton rows grow without bound as children fold in; cap the
+/// persisted id SET at 512 entries and the rendered skeleton ROWS at 1024
+/// lines, each disclosed via a `*_truncated` metadata flag.
+///
+/// Why truncate instead of externalizing the payload into the store: an
+/// external record would need a new read path at every prompt-render and a
+/// consistency window between carrier and payload; a 600+-child burst has
+/// never been observed in the field, and these caps already bound the
+/// worst-case metadata size.
+///
+/// `coalesced_count` is NEVER truncated (the true unique total) and the
+/// re-fold dedup seeds from the truncated set: a child id cut from the set
+/// that reappears in a later fold is counted a second time, so under
+/// truncation the count may slightly OVER-count — deliberately biased toward
+/// over-reporting, never under-reporting (a lost child notification is the
+/// failure this machinery exists to prevent).
+const COALESCED_CHILD_IDS_MAX: usize = 512;
+const COALESCED_CHILDREN_MAX_LINES: usize = 1024;
 
 fn is_terminal_kind_continuation(item: &QueuedMasterContinuation) -> bool {
     matches!(
@@ -14586,6 +14655,15 @@ fn coalesce_terminal_continuations(
     // restore the prior structured child-id set alongside the text/count so
     // a later retry of the same fold dedups against the same baseline.
     let existing_child_ids = primary.metadata.get("coalesced_child_ids").cloned();
+    // #15b — captured alongside for the fold-abort rollback.
+    let existing_ids_truncated = primary
+        .metadata
+        .get("coalesced_child_ids_truncated")
+        .cloned();
+    let existing_children_truncated = primary
+        .metadata
+        .get("coalesced_children_truncated")
+        .cloned();
     let mut rendered = existing_children
         .as_deref()
         .map(str::len)
@@ -14690,18 +14768,51 @@ fn coalesce_terminal_continuations(
     primary
         .metadata
         .insert("coalesced_count".to_owned(), folded.to_string());
+    // #15b — bound the skeleton-row count: the identity rows grow linearly
+    // with the folded-child count, so past 1024 lines the list is truncated
+    // and the omission is disclosed via `coalesced_children_truncated`; the
+    // prompt note (built from `coalesced_count`) tells the master the true
+    // total and that further children were omitted from the list.
+    let children_truncated = lines.len() > COALESCED_CHILDREN_MAX_LINES;
+    if children_truncated {
+        lines.truncate(COALESCED_CHILDREN_MAX_LINES);
+    }
     primary
         .metadata
         .insert("coalesced_children".to_owned(), lines.join(" | "));
+    if children_truncated {
+        primary
+            .metadata
+            .insert("coalesced_children_truncated".to_owned(), "true".to_owned());
+    } else {
+        primary.metadata.remove("coalesced_children_truncated");
+    }
     // #15 SF2 — persist the structured child-id set alongside the text so a
     // RE-fold (this process or a restored carrier) seeds its dedup set from
     // it and never re-counts a previously folded child. Sorted for a stable
     // persisted record.
     let mut child_ids: Vec<String> = counted_children.iter().cloned().collect();
     child_ids.sort();
+    // #15b — bound the persisted id set the same way (linear growth without
+    // a cap): keep the FIRST 512 sorted ids and disclose the truncation.
+    // `coalesced_count` above still holds the TRUE unique total. Re-fold
+    // dedup seeds from this truncated set, so a cut id that reappears later
+    // is re-counted — a deliberate over-report bias (see the cap constants).
+    let child_ids_truncated = child_ids.len() > COALESCED_CHILD_IDS_MAX;
+    if child_ids_truncated {
+        child_ids.truncate(COALESCED_CHILD_IDS_MAX);
+    }
     primary
         .metadata
         .insert("coalesced_child_ids".to_owned(), child_ids.join(","));
+    if child_ids_truncated {
+        primary.metadata.insert(
+            "coalesced_child_ids_truncated".to_owned(),
+            "true".to_owned(),
+        );
+    } else {
+        primary.metadata.remove("coalesced_child_ids_truncated");
+    }
     primary
         .metadata
         .insert("coalesce_generation".to_owned(), generation.to_string());
@@ -14776,6 +14887,27 @@ fn coalesce_terminal_continuations(
             }
             None => {
                 primary.metadata.remove("coalesced_child_ids");
+            }
+        }
+        // #15b — and the truncation flags with it.
+        match existing_ids_truncated {
+            Some(flag) => {
+                primary
+                    .metadata
+                    .insert("coalesced_child_ids_truncated".to_owned(), flag);
+            }
+            None => {
+                primary.metadata.remove("coalesced_child_ids_truncated");
+            }
+        }
+        match existing_children_truncated {
+            Some(flag) => {
+                primary
+                    .metadata
+                    .insert("coalesced_children_truncated".to_owned(), flag);
+            }
+            None => {
+                primary.metadata.remove("coalesced_children_truncated");
             }
         }
         if generation > 1 {
@@ -16858,8 +16990,32 @@ fn coalesced_children_note(continuation: &QueuedMasterContinuation) -> String {
             } else {
                 String::new()
             };
+            // #15b — when the payload caps cut the list itself, say so: the
+            // count stays the TRUE unique total even though the rendered list
+            // (and the persisted id set) stopped at the cap.
+            let lines_truncated = continuation
+                .metadata
+                .get("coalesced_children_truncated")
+                .is_some_and(|value| value == "true");
+            let truncation = if lines_truncated {
+                let listed = continuation
+                    .metadata
+                    .get("coalesced_children")
+                    .map(|text| text.split(" | ").filter(|line| !line.is_empty()).count())
+                    .unwrap_or(0);
+                let omitted_children = count
+                    .parse::<usize>()
+                    .ok()
+                    .map(|total| total.saturating_sub(listed))
+                    .unwrap_or(0);
+                format!(
+                    " {omitted_children} further children omitted from the list; coalesced_count holds the true total."
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "\n\nNOTE: {count} unique child termination(s) were folded into this single notice (see `coalesced_children` in Metadata). Cover ALL of them in ONE update; no separate turn will arrive for them.{omission}"
+                "\n\nNOTE: {count} unique child termination(s) were folded into this single notice (see `coalesced_children` in Metadata). Cover ALL of them in ONE update; no separate turn will arrive for them.{omission}{truncation}"
             )
         }
         None => String::new(),
@@ -39025,6 +39181,396 @@ mod tests {
                     || item.metadata.get("coalesced_count").map(String::as_str) == Some("0")),
             "no further folded children after the carrier; rest {:?}",
             rest.iter().map(|i| i.metadata.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// #15b closeout point 1 — multi-epoch crash join rebuild. Epoch 0 joins
+    /// and persists; re-admission of a third child bumps the epoch to 1
+    /// (durably, via the `GroupEpochBumped` marker); the third child goes
+    /// terminal but the epoch-1 scatter persist FAILS (forced) and the
+    /// process crashes. On restart the persisted scatter max is 0 (delivered),
+    /// yet the durable epoch marker must lift the restored `join_epoch` to 1
+    /// so `reconcile_missing_scatters_on_restore` derives the epoch-1 join
+    /// key (undelivered) and re-emits it. Without the marker the epoch-1
+    /// join was lost FOREVER.
+    #[test]
+    fn multi_epoch_scatter_persist_failure_then_restart_reemits_latest_join() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-me", "api", "multi-epoch");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: "tenant-me".to_owned(),
+        };
+
+        // Orchestrator A: two children complete and the epoch-0 join drains
+        // (persisted, marked, tombstoned). A THIRD child is then admitted,
+        // bumping the join epoch to 1 (the `GroupEpochBumped` marker lands in
+        // the store); the child completes but the epoch-1 scatter persist is
+        // forced to fail — marks stay unset — and the process "exits".
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("agent-1", "running"));
+        first.upsert_agent(upsert("agent-2", "running"));
+        first.upsert_agent(upsert("agent-1", "completed"));
+        first.upsert_agent(upsert("agent-2", "completed"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-me",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "epoch-0 join drained; got {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        // Re-admission bumps the epoch IN MEMORY and persists the marker.
+        first.upsert_agent(upsert("agent-3", "running"));
+        assert_eq!(
+            first
+                .state()
+                .scatter_join_state
+                .get(&format!("agent-group:tenant-me:{}:master", session_id))
+                .map(|s| s.join_epoch),
+            Some(1),
+            "re-admission into an already-joined group bumps the epoch to 1"
+        );
+        first.set_force_scatter_persist_failure_for_test(true);
+        first.upsert_agent(upsert("agent-3", "completed"));
+        drop(first);
+
+        // Fresh orchestrator B on the same store: the epoch marker (1) must
+        // outrank the persisted scatter max (0), so the reconcile pass
+        // derives the epoch-1 key — NOT delivered — and re-emits the join.
+        // Drain ONE item per turn (the production one-carrier-per-turn
+        // shape) so nothing folds.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let mut turns: Vec<Vec<QueuedMasterContinuation>> = Vec::new();
+        for _ in 0..8 {
+            let drained = fresh.drain_ready_continuations_for_session(
+                &session_id,
+                "tenant-me",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            if drained.is_empty() {
+                break;
+            }
+            turns.push(drained);
+        }
+        let epoch_of = |item: &QueuedMasterContinuation| {
+            item.dedupe_key
+                .as_str()
+                .rsplit('/')
+                .next()
+                .expect("epoch segment")
+                .parse::<u64>()
+                .expect("numeric epoch")
+        };
+        let epoch_of_str = |item: &QueuedMasterContinuation| {
+            item.dedupe_key
+                .as_str()
+                .rsplit('/')
+                .next()
+                .expect("epoch segment")
+                .to_owned()
+        };
+        // Turn 1: the restored epoch-0 scatter record re-enqueues (it
+        // persisted `Queued`; A never tombstoned it — only its MARKS were
+        // seeded) and delivers as a SUPERSEDED-epoch control row. This is
+        // the already-accepted SF1/Nit2 behavior (`restart_reenqueues_in_
+        // deterministic_epoch_order` drains persisted epochs 0/1/2; the Nit2
+        // dual-sink test allows one superseded epoch-0 control row).
+        let turn0 = &turns[0];
+        assert_eq!(turn0.len(), 1);
+        assert_eq!(
+            turn0[0].reason,
+            MasterContinuationReason::ScatterJoinComplete
+        );
+        assert_eq!(
+            epoch_of(&turn0[0]),
+            0,
+            "the superseded epoch-0 control row drains first (SF1 epoch order)"
+        );
+        // Turn 2: agent-3's ChildCompleted (persisted Queued, never
+        // delivered pre-crash) delivers.
+        let turn1 = &turns[1];
+        assert_eq!(turn1.len(), 1);
+        assert_eq!(turn1[0].reason, MasterContinuationReason::ChildCompleted);
+        // Turn 3: THE FIX — the reconcile pass re-emitted the lost epoch-1
+        // join (its persist failed pre-crash, so nothing for epoch 1 was in
+        // the store; only the `GroupEpochBumped` marker lifting the restored
+        // join_epoch above the delivered scatter max made this re-derivable).
+        let turn2 = &turns[2];
+        assert_eq!(turn2.len(), 1);
+        assert_eq!(
+            turn2[0].reason,
+            MasterContinuationReason::ScatterJoinComplete
+        );
+        assert_eq!(
+            epoch_of_str(&turn2[0]),
+            "1",
+            "the re-emitted join must carry the BUMPED epoch (1), not the persisted max (0)"
+        );
+        assert_eq!(
+            turn2[0]
+                .metadata
+                .get("terminal_children")
+                .map(String::as_str),
+            Some("3"),
+            "the rebuilt join must see all three terminal children"
+        );
+        // Everything else is silent: each record persisted and marked on its
+        // drain turn, so nothing remains.
+        assert_eq!(
+            turns.len(),
+            3,
+            "exactly three single-item turns; further turns {:?}",
+            &turns[3.min(turns.len())..],
+        );
+    }
+
+    /// #15b closeout point 1 (negative half) — when the bumped epoch's
+    /// scatter DOES persist (normal path, no failure), the durable epoch
+    /// marker equals the scatter-derived max, the derived key is already
+    /// delivered, and a restart must NOT re-emit a duplicate join.
+    #[test]
+    fn multi_epoch_normal_restart_does_not_reemit_latest_join() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-mn", "api", "multi-epoch-normal");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: "tenant-mn".to_owned(),
+        };
+
+        // Epoch 0 joins and drains. agent-1 and agent-2 are admitted and
+        // complete in the SAME turn (no bump between them — the bump fires
+        // only for a NEW admission into an ALREADY-JOINED group), so ONE
+        // epoch-0 join covers both. Then agent-3's re-admission bumps the
+        // epoch (marker persisted) and its completion persists the epoch-1
+        // join NORMALLY (no forced failure). Crash.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("agent-1", "running"));
+        first.upsert_agent(upsert("agent-2", "running"));
+        first.upsert_agent(upsert("agent-1", "completed"));
+        first.upsert_agent(upsert("agent-2", "completed"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-mn",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "epoch-0 join drained"
+        );
+        first.upsert_agent(upsert("agent-3", "running"));
+        first.upsert_agent(upsert("agent-3", "completed"));
+        drop(first);
+
+        // Restart: the epoch-1 scatter is still Queued in the store (never
+        // drained by A), so the restore re-enqueues it — and the marker-
+        // seeded epoch (1) derives EXACTLY its key, already delivered via
+        // `last_joined_key`/marks, so the reconcile pass adds NO duplicate.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-mn",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let mut join_epochs: Vec<u64> = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .map(|item| {
+                item.dedupe_key
+                    .as_str()
+                    .rsplit('/')
+                    .next()
+                    .expect("epoch segment")
+                    .parse::<u64>()
+                    .expect("numeric epoch")
+            })
+            .collect();
+        // The still-Queued epoch-0 scatter record ALSO re-enqueues and
+        // delivers as a SUPERSEDED-epoch control row (its marks were seeded,
+        // but the row was never tombstoned by A) — the already-accepted
+        // SF1/Nit2 behavior (`restart_reenqueues_in_deterministic_epoch_
+        // order` drains persisted epochs 0/1/2; the Nit2 dual-sink test
+        // allows one superseded epoch-0 control row). What must NOT happen
+        // is a DUPLICATE epoch-1 join: the marker-seeded epoch equals the
+        // scatter-derived max, so the reconcile pass derives exactly the
+        // delivered key and skips.
+        join_epochs.sort_unstable();
+        assert_eq!(
+            join_epochs,
+            vec![0, 1],
+            "restart delivers the superseded epoch-0 control row + the still-pending \
+             epoch-1 join, each exactly once — NO duplicate epoch-1; drained {:?}",
+            drained
+                .iter()
+                .map(|i| (i.reason.clone(), i.dedupe_key.as_str().to_owned()))
+                .collect::<Vec<_>>(),
+        );
+        let rest = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-mn",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            rest.is_empty(),
+            "no duplicate join after delivery; got {rest:?}"
+        );
+        // The master consumed the drained items: record their durable
+        // completion exactly as the dispatch path does, so the third boot
+        // seeds the epoch-1 scatter as DELIVERED and the marker (1) agrees
+        // with the persisted scatter max (1) — nothing left to rebuild.
+        for item in &drained {
+            fresh.mark_continuation_completed(item, None);
+        }
+        // And a SECOND restart over the now-tombstoned store re-emits nothing.
+        drop(fresh);
+        let third = InProcessAgentOrchestrator::default();
+        third.configure_supervisor_store(dir.path()).expect("store");
+        let drained = third.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-mn",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained.is_empty(),
+            "marker + delivered scatter max agree → no re-emission; got {drained:?}"
+        );
+    }
+
+    /// #15b closeout point 2 — the coalesced payload is BOUNDED. Folding
+    /// 1100 children (enough to exceed BOTH caps with one batch) must leave
+    /// `coalesced_count` at the true unique total while the persisted id set
+    /// stops at `COALESCED_CHILD_IDS_MAX` (512, flagged
+    /// `coalesced_child_ids_truncated`) and the rendered skeleton list stops
+    /// at `COALESCED_CHILDREN_MAX_LINES` (1024, flagged
+    /// `coalesced_children_truncated`), with the prompt note disclosing the
+    /// omitted children.
+    #[test]
+    fn coalesced_payload_bounds_truncate_ids_and_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-cp", "api", "payload-bounds");
+        let total_children = 1100usize;
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        for index in 0..total_children {
+            let agent_id = format!("child-{index:04}");
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("master/{agent_id}"),
+                role: "background_task".to_owned(),
+                nickname: agent_id.clone(),
+                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                status: "completed".to_owned(),
+                // Short summary keeps the run fast; the CHAR budget is not
+                // what this test exercises.
+                last_task: Some("ok".to_owned()),
+                cwd: None,
+                profile_id: "tenant-cp".to_owned(),
+            });
+        }
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-cp",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        assert_eq!(drained.len(), 1, "the whole burst folds into one carrier");
+        let carrier = &drained[0];
+        // The count is NEVER truncated: the true unique total.
+        assert_eq!(
+            carrier.metadata.get("coalesced_count").map(String::as_str),
+            Some(total_children.to_string().as_str()),
+            "coalesced_count holds the true unique total"
+        );
+        // The persisted id set stops at the cap and says so.
+        let ids = carrier
+            .metadata
+            .get("coalesced_child_ids")
+            .expect("structured child-id set persisted");
+        let id_count = ids.split(',').filter(|id| !id.is_empty()).count();
+        assert_eq!(
+            id_count, COALESCED_CHILD_IDS_MAX,
+            "the id set truncates at the cap; got {id_count}"
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("coalesced_child_ids_truncated")
+                .map(String::as_str),
+            Some("true"),
+            "the id-set truncation must be disclosed"
+        );
+        // The rendered skeleton list stops at the line cap and says so.
+        let children_text = carrier
+            .metadata
+            .get("coalesced_children")
+            .expect("coalesced children text persisted");
+        let line_count = children_text
+            .split(" | ")
+            .filter(|line| !line.is_empty())
+            .count();
+        assert_eq!(
+            line_count, COALESCED_CHILDREN_MAX_LINES,
+            "the skeleton list truncates at the line cap; got {line_count}"
+        );
+        assert_eq!(
+            carrier
+                .metadata
+                .get("coalesced_children_truncated")
+                .map(String::as_str),
+            Some("true"),
+            "the list truncation must be disclosed"
+        );
+        // The prompt note tells the master the list was cut and where the
+        // true total lives.
+        let prompt = master_continuation_prompt(carrier);
+        assert!(
+            prompt.contains("further children omitted from the list")
+                && prompt.contains("coalesced_count holds the true total"),
+            "the note must disclose the omitted children; prompt tail: {}",
+            &prompt[prompt.len().saturating_sub(400)..],
         );
     }
 }
