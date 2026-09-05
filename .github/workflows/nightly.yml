@@ -29,6 +29,19 @@ env:
   FEATURES: "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
 jobs:
+  # ARM64 workspace tests — retry-policy note (2026-09-03): the hosted ARM
+  # runner death problem remains unsolved at the infra level. Approaches tried:
+  #   - RUST_TEST_THREADS=1 serialise (#1890): disproven (time-to-death unchanged)
+  #   - timeout-minutes (#1891): disproven (enforced by the dying runner itself)
+  #   - step-count discriminator (c03a0604, reverted): 5/5 historical deaths
+  #     left a failed step, so the heuristic never fired
+  #   - log-absence discriminator: disproven — 9/9 attempts in the sampled
+  #     corpus carried complete ~1.6MB logs (BH3GEI review)
+  #   - job-annotation matching ("lost communication with the server"): the
+  #     reliable signature per review, unimplemented — revisit if deaths recur
+  # Current state: the nightly ARM64 lane runs WITHOUT auto-retry; a red
+  # nightly opens/updates the self-healing regression issue, which is the
+  # signal. Re-add a retry only with the annotation-based signature.
   check-arm:
     name: ARM64 workspace tests
     runs-on: ubuntu-24.04-arm
