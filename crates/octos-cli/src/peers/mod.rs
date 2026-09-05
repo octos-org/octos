@@ -251,27 +251,6 @@ pub(crate) fn bind_peer_supervised_task(
     Some(task_id)
 }
 
-/// #1707 round 5 codex round 2 (board item #13 round 2) — same binding as
-/// [`bind_peer_supervised_task`], PLUS stamping the task with the MASTER
-/// session's workspace root at registration time. The stamp becomes the
-/// background-task mirror's `cwd` (see `background_task_cwd`), which feeds
-/// the continuation queue's `workspace` metadata — the value the `/stop`
-/// terminal purge matches against the interrupted turn's
-/// `session_runtime.workspace_root`. Passing `None` (or empty) leaves the
-/// task unstamped and preserves the pre-#13r2 legacy derivation.
-#[cfg(any(feature = "api", test))]
-#[cfg_attr(feature = "api", allow(dead_code))]
-pub(crate) fn bind_peer_supervised_task_with_workspace(
-    supervisor: &octos_agent::TaskSupervisor,
-    registry_key: String,
-    master_session: &str,
-    master_workspace_root: Option<&str>,
-) -> Option<String> {
-    let task_id = bind_peer_supervised_task(supervisor, registry_key, master_session)?;
-    supervisor.set_workspace_root(&task_id, master_workspace_root);
-    Some(task_id)
-}
-
 /// #21 (round-4, codex #17 B3) — STRICT workspace-scoped binding: the FIRST
 /// durable task row already carries the workspace stamp, and a failed first
 /// write rolls the whole registration back (no half-bound task, no registry

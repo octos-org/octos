@@ -25372,7 +25372,7 @@ mod tests {
     /// orchestrator instance, not the process-global default.
     ///
     /// Returns the bound task id. The chain under test:
-    /// `bind_peer_supervised_task_with_workspace` (registration stamp from
+    /// `bind_peer_supervised_task_with_workspace_strict` (registration stamp from
     /// the master workspace root) → `mark_completed(output_files)` →
     /// supervisor `on_terminal` → mirror upsert → `background_task_cwd` →
     /// `workspace` metadata on the ChildCompleted.
@@ -25385,12 +25385,13 @@ mod tests {
         profile: &'static str,
         workspace: Option<&str>,
     ) -> String {
-        let task_id = crate::peers::bind_peer_supervised_task_with_workspace(
+        let task_id = crate::peers::bind_peer_supervised_task_with_workspace_strict(
             supervisor,
             registry_key,
             &session_id.to_string(),
             workspace,
         )
+        .expect("persist peer workspace")
         .expect("bind peer task");
         // The per-turn production wiring routes the terminal event through
         // `route_terminal_event_to_continuation_queue`; its Completed arm is
@@ -25410,9 +25411,9 @@ mod tests {
     /// #1707 round 5 codex round 2 (board item #13 ROUND 2) — the /stop purge
     /// must clear a `peer_handoff` child whose task was completed with EMPTY
     /// output files (the `retire_peer_supervised_task` close path). This test
-    /// drives the REAL source chain: `TaskSupervisor::register` +
-    /// `set_workspace_root` (what `bind_peer_supervised_task_with_workspace`
-    /// does at the WS `emit_staged` registration point) →
+    /// drives the REAL source chain: `TaskSupervisor::try_register_peer_with_workspace`
+    /// (what `bind_peer_supervised_task_with_workspace_strict` does at the WS
+    /// `emit_staged` registration point) →
     /// `mark_completed(task_id, Vec::new())` → supervisor terminal event →
     /// the mirror derives `cwd` from the REGISTRATION stamp (never from
     /// `output_files`) → the purge with the SAME workspace root clears the
