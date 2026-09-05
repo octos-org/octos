@@ -48,7 +48,8 @@ use tracing::warn;
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
 use crate::contracts::UiProtocolContractStores;
 
-pub(crate) mod host;
+mod recovery;
+pub(crate) use recovery::*;
 
 /// Cap a string at `cap` bytes on a char boundary; returns (text, truncated).
 ///
@@ -218,6 +219,18 @@ impl PeerTaskRegistry {
             .unwrap_or_else(|error| error.into_inner())
             .remove(key)
             .map(|bound| bound.task_id)
+    }
+
+    pub(crate) fn take_if_task(&self, key: &str, task_id: &str) -> Option<String> {
+        let mut map = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.get(key).is_some_and(|bound| bound.task_id == task_id) {
+            map.remove(key).map(|bound| bound.task_id)
+        } else {
+            None
+        }
     }
 }
 

@@ -248,8 +248,17 @@ impl RunIdCache {
     }
 }
 
+/// Opaque, per-application OUP persistence resources. Connections share them;
+/// independent in-process applications do not.
+#[derive(Default)]
+pub struct UiProtocolRuntimeResources {
+    ledger: std::sync::OnceLock<Arc<ui_protocol_ledger::UiProtocolLedger>>,
+    commit_observer: std::sync::OnceLock<octos_bus::MessageCommitObserver>,
+}
+
 /// Shared application state for API handlers.
 pub struct AppState {
+    pub ui_protocol: UiProtocolRuntimeResources,
     /// Per-profile runtime catalog. Built at startup from
     /// `ProfileStore::list()` — one [`ProfileRuntime`] per enabled
     /// profile with an active primary LLM. The `/api/chat` handler
@@ -467,7 +476,15 @@ impl AppState {
         let tmp =
             std::env::temp_dir().join(format!("octos-test-admin-token-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).ok();
+        Self::without_services(&tmp)
+    }
+
+    /// State for an embedded local OUP transport. No HTTP listener, account
+    /// services, login routes or gateway processes are started. Callers must
+    /// install a profile runtime before accepting session/open.
+    pub(crate) fn without_services(data_dir: &std::path::Path) -> Self {
         Self {
+            ui_protocol: UiProtocolRuntimeResources::default(),
             profiles: HashMap::new(),
             session_cache: Arc::new(SessionRuntimeCache::new(
                 64,
@@ -478,8 +495,8 @@ impl AppState {
             broadcaster: Arc::new(EventBroadcaster::new(16)),
             started_at: chrono::Utc::now(),
             auth_token: None,
-            admin_token_store: Arc::new(AdminTokenStore::new(&tmp)),
-            setup_state_store: Arc::new(SetupStateStore::new(&tmp)),
+            admin_token_store: Arc::new(AdminTokenStore::new(data_dir)),
+            setup_state_store: Arc::new(SetupStateStore::new(data_dir)),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,
@@ -515,7 +532,7 @@ impl AppState {
             appui_default_session_cwd: None,
             preview_tokens: Arc::new(PreviewTokens::new()),
             work_secret_store: Arc::new(
-                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(&tmp),
+                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(data_dir),
             ),
             // Tests don't spawn the sweeper. Tests that exercise the
             // sweeper either drive `sweep_expired_all` directly or

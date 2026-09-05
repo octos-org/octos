@@ -685,7 +685,7 @@ impl Tool for UpdateProfileTool {
                 "base_url": { "type": "string", "description": "Custom API base URL" },
                 "api_key_env": { "type": "string", "description": "Environment variable name for API key" },
                 "system_prompt": { "type": "string", "description": "Custom system prompt for the gateway" },
-                "max_iterations": { "type": "integer", "description": "Max tool-call iterations per message" },
+                "max_iterations": { "type": "integer", "description": "Max LLM-loop iterations per message; 0 means unlimited" },
                 "max_history": { "type": "integer", "description": "Max conversation history messages" },
                 "name": { "type": "string", "description": "Display name for the profile" },
                 "enabled": { "type": "boolean", "description": "Enable/disable auto-start" },

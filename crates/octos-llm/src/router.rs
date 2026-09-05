@@ -391,10 +391,27 @@ impl LlmProvider for ProviderRouter {
     fn provider_metadata_for_index(
         &self,
         provider_index: Option<usize>,
-    ) -> crate::ProviderMetadata {
+    ) -> crate::types::ProviderMetadata {
         self.active_provider()
-            .map(|p| p.provider_metadata_for_index(provider_index))
+            .map(|provider| provider.provider_metadata_for_index(provider_index))
             .unwrap_or_else(|_| self.provider_metadata())
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.active_provider()
+            .map(|provider| provider.provider_lane_count())
+            .unwrap_or(1)
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.active_provider()
+            .ok()
+            .and_then(|provider| provider.api_style())
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.active_provider()
+            .is_ok_and(|provider| provider.supports_semantic_checkpoint_hints())
     }
 
     fn report_late_failure(&self) {
@@ -753,5 +770,32 @@ mod tests {
         // "openai/gpt-4o" → no exact match → prefix split → "openai" → gpt-4o
         let resolved = router.resolve("openai/gpt-4o").unwrap();
         assert_eq!(resolved.model_id(), "gpt-4o");
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_tests {
+    use std::sync::Arc;
+
+    use super::ProviderRouter;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::TwoLaneStub;
+
+    #[test]
+    fn should_forward_provider_metadata_for_index_to_active_lane_when_wrapped() {
+        let router = ProviderRouter::new();
+        router.register("two-lane", Arc::new(TwoLaneStub));
+        router.set_active("two-lane");
+        let metadata = router.provider_metadata_for_index(Some(1));
+        assert_eq!(
+            (metadata.provider.as_str(), metadata.model.as_str()),
+            ("lane-b", "model-b"),
+            "slot 1 identity must survive the router: {metadata:?}"
+        );
+        assert_eq!(
+            router.provider_metadata().provider,
+            "lane-a",
+            "the router must report the active lane, not its own placeholder label"
+        );
     }
 }
