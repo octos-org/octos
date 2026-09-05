@@ -26,6 +26,7 @@ use super::supervisor_store::{
     PendingContinuationRecord, SupervisedGroupRecord, SupervisorEvent, SupervisorMetadata,
     SupervisorState, SupervisorStore, TerminalKind, TerminalState,
 };
+use super::workspace_scope::WorkspaceScope;
 use chrono::Utc;
 use octos_agent::tools::mcp_agent::DispatchContextContract;
 use octos_agent::{Agent, AgentConfig, RoleTemplate, SpawnOnlyFailureSignal, ToolRegistry};
@@ -1131,6 +1132,13 @@ impl InProcessAgentOrchestrator {
         runtime_profile_id: Option<&str>,
     ) -> Option<(SessionKey, Value)> {
         let session_id = background_task_session_id(task)?;
+        let (cwd, workspace_scope) = match background_task_workspace(task) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                tracing::warn!(task_id = %task.id, %error, "invalid task workspace; skipping mirror");
+                return None;
+            }
+        };
         // #1707 round 5 (board item #7) — IDEMPOTENCY GATE for stale terminal
         // re-forwards. A terminal mirror whose delivery mark already hit in a
         // PREVIOUS runtime lifetime (a restart replay, or a task-status
@@ -1206,8 +1214,11 @@ impl InProcessAgentOrchestrator {
                         );
                     }
                 }
-                let cwd = background_task_cwd(task);
-                self.reconcile_scatter_for_existing_group(&session_id, profile_id, cwd.as_deref());
+                self.reconcile_scatter_for_existing_group(
+                    &session_id,
+                    profile_id,
+                    workspace_scope.as_ref(),
+                );
                 return None;
             }
         }
@@ -1236,7 +1247,6 @@ impl InProcessAgentOrchestrator {
         let agent_id = background_task_agent_id(task);
         let status = background_task_agent_status(task);
         let artifacts = background_task_artifacts(task);
-        let cwd = background_task_cwd(task);
         let task_id = task.id.parse::<TaskId>().ok();
         let last_task = background_task_last_task(task);
 
@@ -1262,23 +1272,26 @@ impl InProcessAgentOrchestrator {
         }
 
         let orchestrator = self;
-        let mut agent = orchestrator.upsert_agent(AgentUpsert {
-            agent_id: agent_id.clone(),
-            parent_agent_id: Some("master".to_owned()),
-            session_id: session_id.clone(),
-            task_id,
-            path: format!("master/{agent_id}"),
-            role: task
-                .role
-                .clone()
-                .unwrap_or_else(|| "background_task".to_owned()),
-            nickname: background_task_nickname(task),
-            backend_kind: background_task_backend_kind(task),
-            status,
-            last_task,
-            cwd,
-            profile_id: profile_id.clone(),
-        });
+        let mut agent = orchestrator.upsert_agent_scoped(
+            AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session_id.clone(),
+                task_id,
+                path: format!("master/{agent_id}"),
+                role: task
+                    .role
+                    .clone()
+                    .unwrap_or_else(|| "background_task".to_owned()),
+                nickname: background_task_nickname(task),
+                backend_kind: background_task_backend_kind(task),
+                status,
+                last_task,
+                cwd,
+                profile_id: profile_id.clone(),
+            },
+            workspace_scope,
+        );
         if !artifacts.is_empty() {
             if let Ok(updated) =
                 orchestrator.set_agent_artifacts(&agent_id, &session_id, &profile_id, artifacts)
@@ -2120,10 +2133,15 @@ impl InProcessAgentOrchestrator {
     ) -> std::io::Result<()> {
         let store = SupervisorStore::new(root_dir);
         let supervisor_state = store.load_state()?;
+        let workspace_compat = WorkspaceCompat::build(&supervisor_state)?;
+        // Validate requests before installing any restored runtime state.
+        for continuation in supervisor_state.continuations.values() {
+            workspace_compat.request_scope(continuation)?;
+        }
         let mut state = self.state();
         state.supervisor_store = Some(store);
-        restore_runtime_from_supervisor_state(&mut state, &supervisor_state);
-        seed_delivered_terminal_marks(&mut state, &supervisor_state);
+        restore_runtime_from_supervisor_state(&mut state, &supervisor_state, &workspace_compat);
+        seed_delivered_terminal_marks(&mut state, &supervisor_state, &workspace_compat);
         // #15 SF1 — DETERMINISTIC restart re-enqueue order.
         // `supervisor_state.continuations` is a HashMap, so iterating
         // `.values()` enqueues in a nondeterministic order and the restored
@@ -2147,7 +2165,12 @@ impl InProcessAgentOrchestrator {
             )
         });
         for continuation in reenqueue {
-            if let Some(request) = master_continuation_request_from_persisted(continuation) {
+            if let Some(mut request) = master_continuation_request_from_persisted(continuation) {
+                if let Some(scope) = workspace_compat.request_scope(continuation)? {
+                    request = request
+                        .with_metadata("workspace_scope", scope.key())
+                        .with_metadata("workspace", scope.display_path());
+                }
                 let dedupe_key = request.stable_dedupe_key();
                 state.continuations.enqueue(request);
                 // #26 (round-4, #18 B4) — the restored item carries the
@@ -2748,6 +2771,15 @@ impl InProcessAgentOrchestrator {
     }
 
     pub(crate) fn upsert_agent(&self, upsert: AgentUpsert) -> Value {
+        let scope = WorkspaceScope::from_raw(upsert.cwd.as_deref());
+        self.upsert_agent_scoped(upsert, scope)
+    }
+
+    fn upsert_agent_scoped(
+        &self,
+        upsert: AgentUpsert,
+        workspace_scope: Option<WorkspaceScope>,
+    ) -> Value {
         let now = now_ms();
         let mut state = self.state();
         let previous_status = state
@@ -2772,7 +2804,8 @@ impl InProcessAgentOrchestrator {
                 // admission under workspace B must NOT bump workspace A's
                 // join epoch, and B's own bump fires only when B's cohort
                 // already joined.
-                let cohort_key = scatter_cohort_key(&group, scatter_cwd_hash(&upsert.cwd));
+                let cohort_key =
+                    scatter_cohort_key(&group, scatter_scope_hash(workspace_scope.as_ref()));
                 let already_joined = state
                     .scatter_join_state
                     .get(&cohort_key)
@@ -2794,7 +2827,7 @@ impl InProcessAgentOrchestrator {
                         .map(|s| s.join_epoch)
                         .unwrap_or(0);
                     let new_epoch = current_epoch + 1;
-                    let cwd_hash = scatter_cwd_hash(&upsert.cwd);
+                    let cwd_hash = scatter_scope_hash(workspace_scope.as_ref());
                     // Test hook: simulate a crash exactly at the durable
                     // admission write.
                     #[cfg(test)]
@@ -2882,6 +2915,7 @@ impl InProcessAgentOrchestrator {
                     status: upsert.status.clone(),
                     last_task: upsert.last_task.clone(),
                     cwd: upsert.cwd.clone(),
+                    workspace_scope: workspace_scope.clone(),
                     profile_id: upsert.profile_id.clone(),
                     output: String::new(),
                     artifacts: Vec::new(),
@@ -2900,6 +2934,7 @@ impl InProcessAgentOrchestrator {
             entry.status = upsert.status;
             entry.last_task = upsert.last_task;
             entry.cwd = upsert.cwd;
+            entry.workspace_scope = workspace_scope;
             entry.profile_id = upsert.profile_id;
             entry.updated_at_ms = now;
             // A live upsert means the agent is active in THIS lifetime — it
@@ -3048,20 +3083,24 @@ impl InProcessAgentOrchestrator {
         // even though the agent's terminal status had been stamped.
         let cancel_token = self.register_agent_cancellation(&agent_id);
 
-        let initial_agent = self.upsert_agent(AgentUpsert {
-            agent_id: agent_id.clone(),
-            parent_agent_id: parent_agent_id.clone(),
-            session_id: session_id.clone(),
-            task_id: task_id.clone(),
-            path,
-            role,
-            nickname: nickname.clone(),
-            backend_kind: NATIVE_SPECIALIST_BACKEND_KIND.to_owned(),
-            status: "running".to_owned(),
-            last_task: Some(task.clone()),
-            cwd: Some(cwd.to_string_lossy().into_owned()),
-            profile_id: profile_id.clone(),
-        });
+        let workspace_scope = WorkspaceScope::from_path(&cwd);
+        let initial_agent = self.upsert_agent_scoped(
+            AgentUpsert {
+                agent_id: agent_id.clone(),
+                parent_agent_id: parent_agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+                path,
+                role,
+                nickname: nickname.clone(),
+                backend_kind: NATIVE_SPECIALIST_BACKEND_KIND.to_owned(),
+                status: "running".to_owned(),
+                last_task: Some(task.clone()),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                profile_id: profile_id.clone(),
+            },
+            workspace_scope,
+        );
         // #1021 / M17-C — native specialists currently run on the parent session's context manager without forking; from the dispatch contract's perspective that is `external_context_unmanaged` with `risk: "medium"`. When the native runner starts forking child contexts via `ContextManager::from_forked_child_context` this should switch to `managed_payload(context_ref)` with `risk: "low"` (see #1022).
         let native_contract = DispatchContextContract::external_unmanaged(
             "native_specialist_context_not_yet_managed",
@@ -12698,7 +12737,7 @@ impl InProcessAgentOrchestrator {
         &self,
         session_id: &SessionKey,
         profile_id: &str,
-        cwd: Option<&str>,
+        workspace_scope: Option<&WorkspaceScope>,
     ) {
         let mut state = self.state();
         // #27 (round-4, #18 SF3) — retry site 2 (gated re-forward reconcile):
@@ -12706,7 +12745,6 @@ impl InProcessAgentOrchestrator {
         // this cohort's join, so a recovered store durably records it.
         retry_pending_unpersisted_scatters(&mut state);
         let group_id = format!("agent-group:{}:{}:master", profile_id, session_id);
-        let cwd = cwd.map(str::to_owned);
         let siblings = state
             .agents
             .values()
@@ -12714,7 +12752,7 @@ impl InProcessAgentOrchestrator {
                 candidate.session_id == *session_id
                     && candidate.profile_id == profile_id
                     && candidate.parent_agent_id.as_deref() == Some("master")
-                    && candidate.cwd == cwd
+                    && candidate.workspace_scope.as_ref() == workspace_scope
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -12728,7 +12766,7 @@ impl InProcessAgentOrchestrator {
         let Some(agent) = siblings.first().cloned() else {
             return;
         };
-        let cwd_hash = scatter_cwd_hash(&agent.cwd);
+        let cwd_hash = scatter_scope_hash(agent.workspace_scope.as_ref());
         // #19 (round-4 B1) — cohort-scoped join state.
         let join_group_key = scatter_cohort_key(group_id.as_str(), cwd_hash);
         let join_epoch = state
@@ -12808,7 +12846,14 @@ impl InProcessAgentOrchestrator {
         reason: &str,
     ) -> usize {
         let mut state = self.state();
-        let workspace = workspace.filter(|value| !value.is_empty());
+        let scope = match workspace.map(WorkspaceScope::from_argument).transpose() {
+            Ok(scope) => scope.flatten(),
+            Err(error) => {
+                tracing::warn!(%error, "invalid workspace purge argument; nothing cleared");
+                return 0;
+            }
+        };
+        let workspace = scope.as_ref().map(WorkspaceScope::key);
         let targets: Vec<QueuedMasterContinuation> = state
             .continuations
             .pending_items()
@@ -12888,21 +12933,16 @@ impl InProcessAgentOrchestrator {
                     }
                 }
                 MasterContinuationReason::ScatterJoinComplete => {
+                    let hash = scatter_cwd_hash(&item_workspace(item).map(str::to_owned));
+                    let proof_key = scatter_proof_key(item.dedupe_key.as_str(), hash);
                     state
                         .delivered_scatter_marks
-                        .insert(item.dedupe_key.as_str().to_owned(), "joined".to_owned());
-                    // #19 (round-4 B1) — stamp the mark under the COHORT the
-                    // join key itself names (its cwd_hash segment), not the
-                    // bare group.
-                    let cohort_key = scatter_cohort_key(
-                        item.group_id.as_str(),
-                        cwd_hash_from_join_key(item.dedupe_key.as_str()),
-                    );
+                        .insert(proof_key.clone(), "joined".to_owned());
                     state
                         .scatter_join_state
-                        .entry(cohort_key)
+                        .entry(scatter_cohort_key(item.group_id.as_str(), hash))
                         .or_default()
-                        .last_joined_key = Some(item.dedupe_key.as_str().to_owned());
+                        .last_joined_key = Some(proof_key);
                 }
                 // Unreachable per the filter above; keep the match total so
                 // a future reason variant compiles loudly here instead of
@@ -13017,6 +13057,243 @@ fn scatter_cwd_hash(cwd: &Option<String>) -> u64 {
     std::hash::Hasher::finish(&cwd_hasher)
 }
 
+fn scatter_scope_hash(scope: Option<&WorkspaceScope>) -> u64 {
+    scatter_cwd_hash(&scope.map(|scope| scope.key().to_owned()))
+}
+
+// Runtime proof keys use canonical scope hashes; durable IDs/revisions never
+// change. Keep parsing from the right because group/session IDs contain '/'.
+fn scatter_proof_key(key: &str, hash: u64) -> String {
+    let Some((prefix, epoch)) = key.rsplit_once('/') else {
+        return key.to_owned();
+    };
+    let Some((prefix, _)) = prefix.rsplit_once('/') else {
+        return key.to_owned();
+    };
+    format!("{prefix}/{hash}/{epoch}")
+}
+
+/// Boot-only aliases: old peer records hashed their wire spelling as cwd.
+/// Evidence comes from durable child provenance, never a global hex heuristic.
+/// Conflicting historical spellings fail restore closed instead of selecting
+/// another workspace. IDs, attempts and the store itself remain untouched.
+#[derive(Default)]
+struct WorkspaceCompat {
+    children: HashMap<String, Option<WorkspaceScope>>,
+    aliases: HashMap<(String, u64), Option<WorkspaceScope>>,
+    peers: std::collections::HashSet<String>,
+}
+
+// Peer registration with a master session derives a child_session_key, so
+// production mirrors normally persist backend "spawn_child_session". Its
+// server-generated tool nickname and role retain the legacy peer provenance.
+fn legacy_peer_workspace_provenance(child: &ChildAgentRecord) -> bool {
+    match supervisor_metadata_str(&child.metadata, "backend_kind") {
+        Some("task_supervisor:peer_handoff") => true,
+        Some("spawn_child_session")
+            if supervisor_metadata_str(&child.metadata, "role") == Some("background_task") =>
+        {
+            [
+                child.label.as_deref(),
+                supervisor_metadata_str(&child.metadata, "nickname"),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|label| label == "peer_handoff" || label.starts_with("peer_handoff "))
+        }
+        _ => false,
+    }
+}
+
+impl WorkspaceCompat {
+    fn build(snapshot: &SupervisorState) -> std::io::Result<Self> {
+        let mut compat = Self::default();
+        for (key, child) in &snapshot.children {
+            let peer = legacy_peer_workspace_provenance(child);
+            let explicit = supervisor_metadata_str(&child.metadata, "workspace_scope");
+            let scope = match explicit {
+                Some(key) => WorkspaceScope::from_key(key)?,
+                None if peer => child
+                    .workspace_path
+                    .as_deref()
+                    .map(WorkspaceScope::from_peer_stamp)
+                    .transpose()?
+                    .flatten(),
+                None => WorkspaceScope::from_raw(child.workspace_path.as_deref()),
+            };
+            compat.add(
+                child.group_id.as_str(),
+                scatter_scope_hash(scope.as_ref()),
+                scope.clone(),
+            )?;
+            if explicit.is_none() {
+                compat.add(
+                    child.group_id.as_str(),
+                    scatter_cwd_hash(&child.workspace_path),
+                    scope.clone(),
+                )?;
+            }
+            if peer {
+                compat.peers.insert(key.clone());
+            }
+            compat.children.insert(key.clone(), scope);
+        }
+        for record in snapshot.continuations.values() {
+            if supervisor_metadata_str(&record.metadata, "reason") != Some("scatter_join_complete")
+            {
+                continue;
+            }
+            let hash = cwd_hash_from_join_key(&record.continuation_id);
+            let explicit = supervisor_metadata_str(&record.metadata, "payload:workspace_scope");
+            // No path/source evidence means this hash cannot be decoded.
+            // Preserve its old cohort; guessing None could suppress an
+            // unrelated unscoped roster's join.
+            if explicit.is_none()
+                && supervisor_metadata_str(&record.metadata, "payload:workspace")
+                    .is_none_or(str::is_empty)
+                && !compat
+                    .aliases
+                    .contains_key(&(record.group_id.clone(), hash))
+            {
+                continue;
+            }
+            let scope = match explicit {
+                Some(key) => WorkspaceScope::from_key(key)?,
+                None => match compat.aliases.get(&(record.group_id.to_string(), hash)) {
+                    Some(scope) => scope.clone(),
+                    None => {
+                        let raw = supervisor_metadata_str(&record.metadata, "payload:workspace");
+                        // A legacy scatter itself proves the old spelling when
+                        // its payload/hash and a peer child's exact bytes agree.
+                        let peer_scope = snapshot.children.iter().find_map(|(key, child)| {
+                            let scope = compat.children.get(key)?.as_ref()?;
+                            (child.group_id == record.group_id
+                                && compat.peers.contains(key)
+                                && raw == Some(scope.legacy_hex().as_str())
+                                && hash == scatter_cwd_hash(&raw.map(str::to_owned)))
+                            .then(|| scope.clone())
+                        });
+                        peer_scope.or_else(|| WorkspaceScope::from_raw(raw))
+                    }
+                },
+            };
+            compat.add(record.group_id.as_str(), hash, scope)?;
+        }
+        // An admission's child binding is evidence even if that child's
+        // latest snapshot has already acquired explicit canonical metadata.
+        for group in snapshot.groups.values() {
+            for (key, value) in &group.metadata {
+                let Some(hash) = key
+                    .strip_prefix("admissions#")
+                    .and_then(|hash| hash.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                for entry in value.as_str().unwrap_or("").split(',') {
+                    let Some((id, _)) = entry.rsplit_once(':') else {
+                        continue;
+                    };
+                    let child_key = format!("{}/{id}", group.group_id);
+                    if compat.peers.contains(&child_key)
+                        && let Some(Some(scope)) = compat.children.get(&child_key).cloned()
+                        && hash != scatter_scope_hash(Some(&scope))
+                        && hash == scatter_cwd_hash(&Some(scope.legacy_hex()))
+                    {
+                        compat.add(&group.group_id, hash, Some(scope))?;
+                    }
+                }
+            }
+        }
+        // A bare historic epoch marker has no child binding. Recover an
+        // otherwise unknown hash only when a proven peer's bytes match it;
+        // never override an actual canonical/native cohort with a guessed
+        // legacy encoding (notably native relative hex-looking roots).
+        for group in snapshot.groups.values() {
+            for key in group.metadata.keys() {
+                let Some(hash) = key
+                    .strip_prefix("join_epoch#")
+                    .and_then(|hash| hash.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                if compat.aliases.contains_key(&(group.group_id.clone(), hash)) {
+                    continue;
+                }
+                for (child_key, child) in &snapshot.children {
+                    if child.group_id == group.group_id
+                        && compat.peers.contains(child_key)
+                        && let Some(Some(scope)) = compat.children.get(child_key).cloned()
+                        && hash == scatter_cwd_hash(&Some(scope.legacy_hex()))
+                    {
+                        compat.add(&group.group_id, hash, Some(scope))?;
+                    }
+                }
+            }
+        }
+        Ok(compat)
+    }
+
+    fn add(
+        &mut self,
+        group: &str,
+        hash: u64,
+        scope: Option<WorkspaceScope>,
+    ) -> std::io::Result<()> {
+        let key = (group.to_owned(), hash);
+        if self
+            .aliases
+            .get(&key)
+            .is_some_and(|existing| existing != &scope)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ambiguous legacy workspace cohort identity",
+            ));
+        }
+        self.aliases.insert(key, scope);
+        Ok(())
+    }
+
+    fn hash(&self, group: &str, old_hash: u64) -> u64 {
+        self.aliases
+            .get(&(group.to_owned(), old_hash))
+            .map_or(old_hash, |scope| scatter_scope_hash(scope.as_ref()))
+    }
+
+    fn request_scope(
+        &self,
+        record: &PendingContinuationRecord,
+    ) -> std::io::Result<Option<WorkspaceScope>> {
+        if let Some(key) = supervisor_metadata_str(&record.metadata, "payload:workspace_scope") {
+            return WorkspaceScope::from_key(key);
+        }
+        if let Some(child) = &record.child_id
+            && let Some(scope) = self.children.get(&format!("{}/{child}", record.group_id))
+        {
+            if let Some(raw) = supervisor_metadata_str(&record.metadata, "payload:workspace") {
+                return if self.peers.contains(&format!("{}/{child}", record.group_id)) {
+                    WorkspaceScope::from_peer_stamp(raw)
+                } else {
+                    Ok(WorkspaceScope::from_raw(Some(raw)))
+                };
+            }
+            return Ok(scope.clone());
+        }
+        if supervisor_metadata_str(&record.metadata, "reason") == Some("scatter_join_complete")
+            && let Some(scope) = self.aliases.get(&(
+                record.group_id.to_string(),
+                cwd_hash_from_join_key(&record.continuation_id),
+            ))
+        {
+            return Ok(scope.clone());
+        }
+        Ok(WorkspaceScope::from_raw(supervisor_metadata_str(
+            &record.metadata,
+            "payload:workspace",
+        )))
+    }
+}
+
 /// #19 (round-4 B1) — the COHORT key for scatter-join state. Before this fix
 /// `scatter_join_state`, the seeded max-epoch map, the `GroupEpochBumped`
 /// marker, and `last_joined_key` were keyed by the GROUP STRING ONLY, so two
@@ -13044,6 +13321,691 @@ fn cwd_hash_from_join_key(join_key: &str) -> u64 {
         .nth(1)
         .and_then(|segment| segment.parse::<u64>().ok())
         .unwrap_or_else(|| scatter_cwd_hash(&None))
+}
+
+#[cfg(test)]
+mod workspace_r5_tests {
+    use super::*;
+
+    fn native(session: &SessionKey, id: &str, root: &str, status: &str) -> AgentUpsert {
+        AgentUpsert {
+            agent_id: id.into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session.clone(),
+            task_id: None,
+            path: format!("master/{id}"),
+            role: "worker".into(),
+            nickname: id.into(),
+            backend_kind: NATIVE_SPECIALIST_BACKEND_KIND.into(),
+            status: status.into(),
+            last_task: Some(format!("report {id}")),
+            cwd: Some(root.into()),
+            profile_id: "workspace-r5".into(),
+        }
+    }
+
+    fn peer(session: &SessionKey, stamp: &str) -> octos_agent::BackgroundTask {
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let id = supervisor
+            .try_register_peer_with_workspace(
+                "peer_handoff",
+                "workspace-r5:peer:scope",
+                Some(&session.0),
+                Some(stamp),
+            )
+            .unwrap();
+        supervisor.mark_completed(&id, Vec::new());
+        supervisor.get_task(&id).unwrap()
+    }
+
+    #[test]
+    fn workspace_r5_mixed_native_peer_purge_and_other_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey::with_profile("workspace-r5", "api", "mixed");
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).unwrap();
+        orch.upsert_agent(native(&session, "native", "/tmp/ws", "running"));
+        orch.upsert_agent(native(&session, "other", "/tmp/other", "completed"));
+        let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
+        let task = peer(&session, &stamp);
+        orch.upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap();
+        orch.upsert_agent(native(&session, "native", "/tmp/ws", "completed"));
+        orch.clear_pending_terminal_continuations_for_session(
+            &session,
+            "workspace-r5",
+            Some(&stamp),
+            "stop",
+        );
+        let state = orch.state();
+        let pending: Vec<_> = state.continuations.pending_items().collect();
+        assert!(
+            !pending.is_empty(),
+            "the other workspace must remain queued"
+        );
+        assert!(
+            pending
+                .iter()
+                .all(|item| item_workspace(item) == Some("/tmp/other")),
+            "one production purge must remove BOTH peer and native items: {pending:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_r5_legacy_peer_hex_is_real_cwd_and_native_cohort() {
+        let session = SessionKey::with_profile("workspace-r5", "api", "legacy");
+        let orch = InProcessAgentOrchestrator::default();
+        orch.upsert_agent(native(&session, "native", "/tmp/ws", "running"));
+        let task = peer(&session, "2f746d702f7773");
+        let (_, json) = orch
+            .upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap();
+        assert_eq!(json["cwd"], "/tmp/ws", "cwd must remain a real path");
+        assert_eq!(
+            orch.state().continuations.pending_items().count(),
+            1,
+            "the running native sibling prevents a separate peer scatter"
+        );
+    }
+
+    #[test]
+    fn workspace_r5_new_peer_hex_looking_relative_root_is_not_decoded_twice() {
+        let session = SessionKey::with_profile("workspace-r5", "api", "relative");
+        let root = "2f746d702f7773";
+        let stamp = crate::peers::workspace_scope_encode(Path::new(root)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).unwrap();
+        let (_, json) = orch
+            .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .unwrap();
+        assert_eq!(
+            json["cwd"], root,
+            "new peer wire must distinguish literal hex-looking cwd"
+        );
+        let snapshot = SupervisorStore::new(dir.path()).load_state().unwrap();
+        assert_eq!(snapshot.children.len(), 1);
+        let child = snapshot.children.values().next().unwrap();
+        assert_eq!(
+            child.metadata.get("workspace_scope"),
+            Some(&json!(root)),
+            "the first durable child snapshot must preserve authoritative peer scope: {child:?}"
+        );
+        let restored = InProcessAgentOrchestrator::default();
+        restored.configure_supervisor_store(dir.path()).unwrap();
+        assert_eq!(
+            restored.state().agents.len(),
+            1,
+            "durable peer must restore its roster record"
+        );
+        assert!(
+            restored
+                .state()
+                .agents
+                .values()
+                .all(
+                    |agent| agent.workspace_scope == WorkspaceScope::from_path(Path::new(root))
+                        && agent.cwd.as_deref() == Some(root)
+                )
+        );
+        let orch = restored;
+        assert_eq!(
+            orch.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some("/tmp/ws"),
+                "wrong-scope"
+            ),
+            0
+        );
+        assert!(
+            orch.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some(&stamp),
+                "right-scope"
+            ) > 0
+        );
+    }
+
+    #[test]
+    fn workspace_r5_new_native_hex_root_and_peer_raw_root_restart_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey::with_profile("workspace-r5", "api", "distinct");
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        runtime.upsert_agent(native(
+            &session,
+            "literal-hex",
+            "2f746d702f7773",
+            "completed",
+        ));
+        let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
+        runtime
+            .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .unwrap();
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted.configure_supervisor_store(dir.path()).unwrap();
+        assert!(
+            restarted.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some(&stamp),
+                "stop"
+            ) > 0
+        );
+        let pending: Vec<_> = restarted
+            .state()
+            .continuations
+            .pending_items()
+            .cloned()
+            .collect();
+        assert!(!pending.is_empty());
+        assert!(
+            pending
+                .iter()
+                .all(|item| item_workspace(item) == Some("2f746d702f7773"))
+        );
+    }
+
+    // Write the exact pre-#30 spelling into a separate durable store. The
+    // fixture uses real producer records, then removes only new scope metadata
+    // and rewrites the historic peer cwd/hash (not delivery IDs or revisions).
+    fn legacy_store(
+        root: &Path,
+        completed: bool,
+        legacy_workspace: &str,
+    ) -> (SessionKey, String, String, u32, String) {
+        let source = tempfile::tempdir().unwrap();
+        let session = SessionKey::with_profile("workspace-r5", "api", "restart");
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(source.path()).unwrap();
+        let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
+        let task = peer(&session, &stamp);
+        let child_id = background_task_agent_id(&task);
+        runtime
+            .upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap();
+        let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
+        let store = SupervisorStore::new(root);
+        let old_hash = scatter_cwd_hash(&Some(legacy_workspace.into()));
+        let mut old_scatter = String::new();
+        let mut group_id = String::new();
+        for group in snapshot.groups.values() {
+            group_id = group.group_id.clone();
+            store.record_group_registered(group.clone()).unwrap();
+        }
+        for child in snapshot.children.values() {
+            let mut child = child.clone();
+            child.workspace_path = Some(legacy_workspace.into());
+            child.metadata.remove("workspace_scope");
+            store.record_child_started(child).unwrap();
+        }
+        for record in snapshot.continuations.values() {
+            let mut record = record.clone();
+            record.metadata.remove("payload:workspace_scope");
+            record
+                .metadata
+                .insert("payload:workspace".into(), json!(legacy_workspace));
+            if supervisor_metadata_str(&record.metadata, "reason") == Some("scatter_join_complete")
+            {
+                record.continuation_id = scatter_proof_key(&record.continuation_id, old_hash);
+                record
+                    .metadata
+                    .insert("dedupe_key".into(), json!(record.continuation_id));
+                old_scatter = record.continuation_id.clone();
+                record.status = if completed {
+                    ContinuationStatus::Completed
+                } else {
+                    ContinuationStatus::Queued
+                };
+            } else {
+                record.status = ContinuationStatus::Completed;
+            }
+            record.attempt = 7;
+            store.record_continuation_queued(record).unwrap();
+        }
+        assert!(!old_scatter.is_empty());
+        (session, group_id, old_scatter, 7, child_id)
+    }
+
+    #[test]
+    fn workspace_r5_legacy_completed_join_and_old_markers_do_not_duplicate() {
+        for marker in ["admission", "epoch"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (session, group, old_id, attempt, child_id) =
+                legacy_store(dir.path(), true, "2f746d702f7773");
+            let store = SupervisorStore::new(dir.path());
+            let old_hash = scatter_cwd_hash(&Some("2f746d702f7773".into()));
+            // Both historic marker formats must lift the CANONICAL cohort.
+            if marker == "admission" {
+                store
+                    .record_cohort_admission(&group, old_hash, &child_id, 2, 10)
+                    .unwrap();
+            } else {
+                store
+                    .record_group_epoch_bump(&group, old_hash, 2, 10)
+                    .unwrap();
+            }
+            let fresh = InProcessAgentOrchestrator::default();
+            fresh.configure_supervisor_store(dir.path()).unwrap();
+            let pending: Vec<_> = fresh
+                .state()
+                .continuations
+                .pending_items()
+                .cloned()
+                .collect();
+            assert_eq!(
+                pending.len(),
+                1,
+                "only the missing epoch 2 may rebuild: {marker}"
+            );
+            assert!(pending[0].dedupe_key.as_str().ends_with("/2"));
+            assert_eq!(item_workspace(&pending[0]), Some("/tmp/ws"));
+            assert_ne!(pending[0].dedupe_key.as_str(), old_id);
+            let canonical_hash = scatter_cwd_hash(&Some("/tmp/ws".into()));
+            assert_eq!(
+                cwd_hash_from_join_key(pending[0].dedupe_key.as_str()),
+                canonical_hash
+            );
+            assert_eq!(
+                fresh.state().scatter_join_state[&scatter_cohort_key(&group, canonical_hash)]
+                    .join_epoch,
+                2
+            );
+            let drained = fresh.drain_ready_continuations_for_session(
+                &session,
+                "workspace-r5",
+                MasterContinuationRuntimeState::idle(),
+                1,
+            );
+            assert_eq!(drained.len(), 1);
+            fresh.mark_continuation_completed(&drained[0], None);
+            drop(fresh);
+            let restarted = InProcessAgentOrchestrator::default();
+            restarted.configure_supervisor_store(dir.path()).unwrap();
+            assert_eq!(
+                restarted.state().continuations.pending_items().count(),
+                0,
+                "completed canonical epoch must not duplicate"
+            );
+            let durable = store.load_state().unwrap();
+            assert_eq!(
+                durable
+                    .continuations
+                    .values()
+                    .find(|record| record.continuation_id == old_id)
+                    .unwrap()
+                    .attempt,
+                attempt
+            );
+            assert_eq!(
+                durable
+                    .continuations
+                    .values()
+                    .find(|record| record.continuation_id == old_id)
+                    .unwrap()
+                    .status,
+                ContinuationStatus::Completed
+            );
+            assert_eq!(
+                durable
+                    .continuations
+                    .values()
+                    .filter(|record| supervisor_metadata_str(&record.metadata, "reason")
+                        == Some("scatter_join_complete"))
+                    .count(),
+                2,
+                "only the original old-hash epoch 0 and missing canonical epoch 2 exist"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_r5_legacy_queued_id_lifecycle_and_purge_survive_restart() {
+        for purge in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (session, _, old_id, attempt, child_id) =
+                legacy_store(dir.path(), false, "2f746d702f7773");
+            let fresh = InProcessAgentOrchestrator::default();
+            fresh.configure_supervisor_store(dir.path()).unwrap();
+            assert_eq!(
+                fresh.state().agents[&child_id].workspace_scope,
+                WorkspaceScope::from_path(Path::new("/tmp/ws"))
+            );
+            assert_eq!(
+                fresh.state().agents[&child_id].cwd.as_deref(),
+                Some("/tmp/ws")
+            );
+            let pending: Vec<_> = fresh
+                .state()
+                .continuations
+                .pending_items()
+                .cloned()
+                .collect();
+            assert_eq!(
+                pending.len(),
+                1,
+                "legacy queued join must suppress synthetic canonical duplicate"
+            );
+            assert_eq!(pending[0].dedupe_key.as_str(), old_id);
+            assert_eq!(item_workspace(&pending[0]), Some("/tmp/ws"));
+            assert_eq!(pending[0].persisted_attempt, attempt);
+            assert_eq!(
+                fresh.clear_pending_terminal_continuations_for_session(
+                    &session,
+                    "workspace-r5",
+                    Some("/tmp/other"),
+                    "wrong"
+                ),
+                0
+            );
+            if purge {
+                let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
+                assert_eq!(
+                    fresh.clear_pending_terminal_continuations_for_session(
+                        &session,
+                        "workspace-r5",
+                        Some(&stamp),
+                        "stop"
+                    ),
+                    1
+                );
+            } else {
+                let drained = fresh.drain_ready_continuations_for_session(
+                    &session,
+                    "workspace-r5",
+                    MasterContinuationRuntimeState::idle(),
+                    1,
+                );
+                assert_eq!(drained.len(), 1);
+                assert_eq!(drained[0].dedupe_key.as_str(), old_id);
+                fresh.mark_continuation_started(&drained[0]);
+                fresh.mark_continuation_completed(&drained[0], None);
+            }
+            let store = SupervisorStore::new(dir.path());
+            let durable = store.load_state().unwrap();
+            assert_eq!(
+                durable
+                    .continuations
+                    .values()
+                    .find(|record| record.continuation_id == old_id)
+                    .unwrap()
+                    .status,
+                ContinuationStatus::Completed
+            );
+            assert_eq!(
+                durable
+                    .continuations
+                    .values()
+                    .find(|record| record.continuation_id == old_id)
+                    .unwrap()
+                    .attempt,
+                attempt
+            );
+            let restarted = InProcessAgentOrchestrator::default();
+            restarted.configure_supervisor_store(dir.path()).unwrap();
+            assert_eq!(restarted.state().continuations.pending_items().count(), 0);
+            assert_eq!(
+                store.load_state().unwrap().continuations.len(),
+                durable.continuations.len(),
+                "restart must not synthesize another ID"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_r5_legacy_raw_peer_restart_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, _, _, _, _) = legacy_store(dir.path(), false, "/tmp/ws");
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        assert_eq!(runtime.state().continuations.pending_items().count(), 1);
+        let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
+        assert_eq!(
+            runtime.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some(&stamp),
+                "stop"
+            ),
+            1
+        );
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted.configure_supervisor_store(dir.path()).unwrap();
+        assert_eq!(restarted.state().continuations.pending_items().count(), 0);
+    }
+
+    #[test]
+    fn workspace_r5_old_markers_outlive_normalized_child_without_scatter() {
+        for admission in [false, true] {
+            let source = tempfile::tempdir().unwrap();
+            let (_, group_id, _, _, child_id) = legacy_store(source.path(), true, "2f746d702f7773");
+            let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let store = SupervisorStore::new(dir.path());
+            for group in snapshot.groups.values() {
+                store.record_group_registered(group.clone()).unwrap();
+            }
+            for child in snapshot.children.values() {
+                let mut child = child.clone();
+                child.workspace_path = Some("/tmp/ws".into());
+                child
+                    .metadata
+                    .insert("workspace_scope".into(), json!("/tmp/ws"));
+                store.record_child_started(child).unwrap();
+            }
+            let old_hash = scatter_cwd_hash(&Some("2f746d702f7773".into()));
+            if admission {
+                store
+                    .record_cohort_admission(&group_id, old_hash, &child_id, 3, 10)
+                    .unwrap();
+            } else {
+                store
+                    .record_group_epoch_bump(&group_id, old_hash, 3, 10)
+                    .unwrap();
+            }
+            let runtime = InProcessAgentOrchestrator::default();
+            runtime.configure_supervisor_store(dir.path()).unwrap();
+            let pending: Vec<_> = runtime
+                .state()
+                .continuations
+                .pending_items()
+                .cloned()
+                .collect();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].dedupe_key.as_str().ends_with("/3"));
+            assert_eq!(item_workspace(&pending[0]), Some("/tmp/ws"));
+        }
+    }
+
+    #[test]
+    fn workspace_r5_orphan_unknown_hash_cannot_suppress_unscoped_join() {
+        let source = tempfile::tempdir().unwrap();
+        let (_, _, old_id, _, _) = legacy_store(source.path(), true, "2f746d702f7773");
+        let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SupervisorStore::new(dir.path());
+        for group in snapshot.groups.values() {
+            store.record_group_registered(group.clone()).unwrap();
+        }
+        for child in snapshot.children.values() {
+            let mut child = child.clone();
+            child.workspace_path = None;
+            child.metadata.remove("workspace_scope");
+            child
+                .metadata
+                .insert("backend_kind".into(), json!(NATIVE_SPECIALIST_BACKEND_KIND));
+            store.record_child_started(child).unwrap();
+        }
+        for record in snapshot.continuations.values() {
+            let mut record = record.clone();
+            record.metadata.remove("payload:workspace");
+            record.metadata.remove("payload:workspace_scope");
+            store.record_continuation_queued(record).unwrap();
+        }
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        let pending: Vec<_> = runtime
+            .state()
+            .continuations
+            .pending_items()
+            .cloned()
+            .collect();
+        assert_eq!(
+            pending.len(),
+            1,
+            "an unrelated unknown-hash proof cannot mark the unscoped join delivered"
+        );
+        assert_eq!(
+            pending[0].reason,
+            MasterContinuationReason::ScatterJoinComplete
+        );
+        assert_eq!(item_workspace(&pending[0]), None);
+        assert_ne!(pending[0].dedupe_key.as_str(), old_id);
+        assert_eq!(
+            cwd_hash_from_join_key(pending[0].dedupe_key.as_str()),
+            scatter_cwd_hash(&None)
+        );
+    }
+
+    #[test]
+    fn workspace_r5_legacy_other_tool_hex_looking_cwd_stays_literal() {
+        let source = tempfile::tempdir().unwrap();
+        let session = SessionKey::with_profile("workspace-r5", "api", "other-tool");
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let id = supervisor
+            .try_register_peer_with_workspace(
+                "shell",
+                "other-tool-call",
+                Some(&session.0),
+                Some("2f746d702f7773"),
+            )
+            .unwrap();
+        supervisor.mark_completed(&id, Vec::new());
+        let task = supervisor.get_task(&id).unwrap();
+        let producer = InProcessAgentOrchestrator::default();
+        producer.configure_supervisor_store(source.path()).unwrap();
+        producer
+            .upsert_background_task_agent(&task, Some("workspace-r5"))
+            .unwrap();
+        let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SupervisorStore::new(dir.path());
+        for group in snapshot.groups.values() {
+            store.record_group_registered(group.clone()).unwrap();
+        }
+        for child in snapshot.children.values() {
+            let mut child = child.clone();
+            assert_eq!(
+                supervisor_metadata_str(&child.metadata, "backend_kind"),
+                Some("spawn_child_session")
+            );
+            child.metadata.remove("workspace_scope");
+            store.record_child_started(child).unwrap();
+        }
+        for record in snapshot.continuations.values() {
+            let mut record = record.clone();
+            record.metadata.remove("payload:workspace_scope");
+            store.record_continuation_queued(record).unwrap();
+        }
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        assert_eq!(runtime.state().agents.len(), 1);
+        assert_eq!(
+            runtime.state().agents[&background_task_agent_id(&task)].workspace_scope,
+            WorkspaceScope::from_raw(Some("2f746d702f7773"))
+        );
+        assert_eq!(
+            runtime.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some("/tmp/ws"),
+                "wrong"
+            ),
+            0
+        );
+        assert!(
+            runtime.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some("2f746d702f7773"),
+                "right"
+            ) > 0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_r5_non_utf8_native_peer_and_lossy_neighbor_stay_distinct() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey::with_profile("workspace-r5", "api", "exotic");
+        let root = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff-root"));
+        let display = root.to_string_lossy();
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        runtime.upsert_agent_scoped(
+            native(&session, "native", &display, "running"),
+            WorkspaceScope::from_path(root),
+        );
+        runtime.upsert_agent(native(&session, "lossy-neighbor", &display, "completed"));
+        let stamp = crate::peers::workspace_scope_encode(root).unwrap();
+        runtime
+            .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .unwrap();
+        runtime.upsert_agent_scoped(
+            native(&session, "native", &display, "completed"),
+            WorkspaceScope::from_path(root),
+        );
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted.configure_supervisor_store(dir.path()).unwrap();
+        {
+            let state = restarted.state();
+            assert_eq!(
+                state.agents["native"].workspace_scope,
+                WorkspaceScope::from_path(root),
+                "native roster must retain exact bytes across restart"
+            );
+            assert_eq!(
+                state.agents["lossy-neighbor"].workspace_scope,
+                WorkspaceScope::from_raw(Some(display.as_ref()))
+            );
+            let peer = state
+                .agents
+                .values()
+                .find(|agent| {
+                    agent.backend_kind == "spawn_child_session" && agent.nickname == "peer_handoff"
+                })
+                .unwrap();
+            assert_eq!(
+                peer.workspace_scope,
+                WorkspaceScope::from_path(root),
+                "peer roster must share native exact scope, not lossy cwd"
+            );
+        }
+
+        assert!(
+            restarted.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some(&stamp),
+                "stop"
+            ) > 0
+        );
+        let pending: Vec<_> = restarted
+            .state()
+            .continuations
+            .pending_items()
+            .cloned()
+            .collect();
+        assert!(!pending.is_empty());
+        assert!(
+            pending
+                .iter()
+                .all(|item| item_workspace(item) == Some(display.as_ref()))
+        );
+    }
 }
 
 /// #1707 round 3 (codex Blockers 3+4) — durable mark for one delivered
@@ -13085,6 +14047,7 @@ struct AutonomyAgentRecord {
     status: String,
     last_task: Option<String>,
     cwd: Option<String>,
+    workspace_scope: Option<WorkspaceScope>,
     profile_id: String,
     output: String,
     artifacts: Vec<AgentArtifactRecord>,
@@ -14531,6 +15494,7 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
 fn seed_delivered_terminal_marks(
     state: &mut AutonomyRuntimeState,
     supervisor_state: &SupervisorState,
+    workspace_compat: &WorkspaceCompat,
 ) {
     // Per COHORT (#19, round-4 B1), track the MAX-epoch scatter record so the
     // cohort's `last_joined_key` is the key that actually joined last (a
@@ -14599,18 +15563,28 @@ fn seed_delivered_terminal_marks(
                 // group never collapse into one entry.
                 let cohort_key = scatter_cohort_key(
                     record.group_id.as_str(),
-                    cwd_hash_from_join_key(&record.continuation_id),
+                    workspace_compat.hash(
+                        record.group_id.as_str(),
+                        cwd_hash_from_join_key(&record.continuation_id),
+                    ),
                 );
                 let join_state = state
                     .scatter_join_state
                     .entry(cohort_key.clone())
                     .or_default();
                 join_state.join_epoch = join_state.join_epoch.max(epoch);
+                let proof_key = scatter_proof_key(
+                    &record.continuation_id,
+                    workspace_compat.hash(
+                        record.group_id.as_str(),
+                        cwd_hash_from_join_key(&record.continuation_id),
+                    ),
+                );
                 let entry = max_epoch_per_cohort
                     .entry(cohort_key)
-                    .or_insert((epoch, record.continuation_id.clone()));
+                    .or_insert((epoch, proof_key.clone()));
                 if epoch > entry.0 {
-                    *entry = (epoch, record.continuation_id.clone());
+                    *entry = (epoch, proof_key.clone());
                 }
             }
             _ => {}
@@ -14680,7 +15654,10 @@ fn seed_delivered_terminal_marks(
                 }
             }
             if max_admitted_epoch > 0 {
-                let cohort_key = scatter_cohort_key(group.group_id.as_str(), cwd_hash);
+                let cohort_key = scatter_cohort_key(
+                    group.group_id.as_str(),
+                    workspace_compat.hash(group.group_id.as_str(), cwd_hash),
+                );
                 let join_state = state.scatter_join_state.entry(cohort_key).or_default();
                 join_state.join_epoch = join_state.join_epoch.max(max_admitted_epoch);
             }
@@ -14713,7 +15690,10 @@ fn seed_delivered_terminal_marks(
             let Some(marker_epoch) = value.as_u64() else {
                 continue;
             };
-            let cohort_key = scatter_cohort_key(group.group_id.as_str(), cwd_hash);
+            let cohort_key = scatter_cohort_key(
+                group.group_id.as_str(),
+                workspace_compat.hash(group.group_id.as_str(), cwd_hash),
+            );
             let join_state = state.scatter_join_state.entry(cohort_key).or_default();
             join_state.join_epoch = join_state.join_epoch.max(marker_epoch);
         }
@@ -15421,7 +16401,7 @@ fn enqueue_agent_terminal_continuations(
                     )
                     && pending.group_id.as_str() == group_id.as_str()
                     && item_workspace(pending)
-                        == agent.cwd.as_deref().filter(|value| !value.is_empty())
+                        == agent.workspace_scope.as_ref().map(WorkspaceScope::key)
             };
             let carried_coalesced = state
                 .continuations
@@ -15586,7 +16566,7 @@ fn enqueue_agent_terminal_continuations(
             candidate.session_id == agent.session_id
                 && candidate.profile_id == agent.profile_id
                 && candidate.parent_agent_id == agent.parent_agent_id
-                && candidate.cwd == agent.cwd
+                && candidate.workspace_scope == agent.workspace_scope
         })
         .collect::<Vec<_>>();
     if siblings.is_empty()
@@ -15606,7 +16586,7 @@ fn enqueue_agent_terminal_continuations(
     // check skips re-observation, restart-safe); a genuinely re-expanded
     // group gets a new epoch at spawn admission and joins again.
     let group_id = agent_continuation_group_id(agent);
-    let cwd_hash = scatter_cwd_hash(&agent.cwd);
+    let cwd_hash = scatter_scope_hash(agent.workspace_scope.as_ref());
     // #19 (round-4 B1) — cohort-scoped join state: two workspaces sharing one
     // group string track their epochs/marks independently.
     let join_group_key = scatter_cohort_key(group_id.as_str(), cwd_hash);
@@ -15701,6 +16681,10 @@ fn reconcile_missing_scatter(
     // #1707: same workspace stamp as the per-child ChildCompleted above.
     let scatter = match agent.cwd.as_deref().filter(|value| !value.is_empty()) {
         Some(cwd) => scatter.with_metadata("workspace", cwd.to_owned()),
+        None => scatter,
+    };
+    let scatter = match agent.workspace_scope.as_ref() {
+        Some(scope) => scatter.with_metadata("workspace_scope", scope.key().to_owned()),
         None => scatter,
     };
     let scatter_outcome = state.continuations.enqueue(scatter);
@@ -15806,6 +16790,13 @@ fn advance_scatter_marks_after_persist(
     state
         .continuation_revisions
         .insert(join_key.to_owned(), u64::from(attempt));
+    let proof_key = scatter_proof_key(
+        join_key,
+        join_group_key
+            .rsplit_once('#')
+            .and_then(|(_, hash)| hash.parse().ok())
+            .unwrap_or_else(|| cwd_hash_from_join_key(join_key)),
+    );
     let join_state = state
         .scatter_join_state
         .entry(join_group_key.to_owned())
@@ -15813,14 +16804,14 @@ fn advance_scatter_marks_after_persist(
     // Belt-and-braces: the enqueue path already seeded this epoch, but a
     // hand-built restore fixture may persist first.
     join_state.join_epoch = join_state.join_epoch.max(join_epoch);
-    join_state.last_joined_key = Some(join_key.to_owned());
+    join_state.last_joined_key = Some(proof_key.clone());
     // #1707 round 3 (codex Blocker 4): the scatter has its OWN durable mark —
     // a future crash window where the child record persisted but this scatter
     // record did NOT is recovered by the rebuild path, not by assuming the
     // child record implies the join.
     state
         .delivered_scatter_marks
-        .insert(join_key.to_owned(), "joined".to_owned());
+        .insert(proof_key, "joined".to_owned());
 }
 
 /// #1707 round 7 (board item #12) — boot-time rebuild pass: for every
@@ -15867,7 +16858,10 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
                 group_id,
                 agent.session_id.0.clone(),
                 agent.profile_id.clone(),
-                agent.cwd.clone(),
+                agent
+                    .workspace_scope
+                    .as_ref()
+                    .map(|scope| scope.key().to_owned()),
                 agent.parent_agent_id.clone(),
             ))
             .or_default()
@@ -15884,7 +16878,7 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
         let Some(agent) = siblings.first().cloned() else {
             continue;
         };
-        let cwd_hash = scatter_cwd_hash(&agent.cwd);
+        let cwd_hash = scatter_scope_hash(agent.workspace_scope.as_ref());
         // #19 (round-4 B1) — the cohort key IS the (group, cwd) identity this
         // loop iterates over, so each workspace cohort re-derives its OWN
         // epoch's join key.
@@ -16083,6 +17077,9 @@ fn build_child_terminal_request(
     // a continuation replayed under a wire session key that has since been
     // rebound to a DIFFERENT project (sessions_in_cwd reuse). Self-describing;
     // no behavior change on its own.
+    if let Some(scope) = agent.workspace_scope.as_ref() {
+        child = child.with_metadata("workspace_scope", scope.key().to_owned());
+    }
     if let Some(cwd) = agent.cwd.as_deref().filter(|value| !value.is_empty()) {
         child = child.with_metadata("workspace", cwd.to_owned());
     }
@@ -16212,33 +17209,23 @@ fn background_task_last_task(task: &octos_agent::BackgroundTask) -> Option<Strin
     Some(format!("{} {}", task.tool_name, task.status.as_str()))
 }
 
-fn background_task_cwd(task: &octos_agent::BackgroundTask) -> Option<String> {
-    // #1707 round 5 codex round 2 (board item #13 round 2) — the workspace
-    // stamp and the `/stop` purge argument must be the SAME VALUE: the purge
-    // matches against the interrupted turn's `session_runtime.workspace_root`
-    // (ui_protocol_transport.rs), so the stamp is taken from the task's
-    // registration-time `workspace_root` — stamped by the peer_handoff
-    // `emit_staged` callback from the same SessionRuntime instance — and only
-    // falls back to the legacy `output_files[0]` parent-dir derivation when
-    // the task carries no stamp. The legacy derivation is FALSIFIED for
-    // `peer_handoff` in production: the close path completes the task with
-    // EMPTY output files (`cwd=None`) and orphan adoption completes it with
-    // `<profile-data>/peers/<slug>/result.md` (`cwd=<…>/peers/<slug>`) —
-    // neither equalled the master's workspace root, so the scoped purge
-    // matched ZERO production peer items. Scatter cohort grouping and
-    // `persist_agent_started`'s `workspace_path` both read `agent.cwd`, so
-    // they inherit the same source automatically.
-    task.workspace_root
+fn background_task_workspace(
+    task: &octos_agent::BackgroundTask,
+) -> std::io::Result<(Option<String>, Option<WorkspaceScope>)> {
+    let scope = match task
+        .workspace_root
         .as_deref()
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            task.output_files
-                .first()
-                .and_then(|path| Path::new(path).parent())
-                .map(|path| path.to_string_lossy().into_owned())
-                .filter(|path| !path.is_empty())
-        })
+        .filter(|value| !value.is_empty())
+    {
+        Some(stamp) if task.tool_name == "peer_handoff" => WorkspaceScope::from_peer_stamp(stamp)?,
+        Some(root) => WorkspaceScope::from_argument(root)?,
+        None => task
+            .output_files
+            .first()
+            .and_then(|path| Path::new(path).parent())
+            .and_then(WorkspaceScope::from_path),
+    };
+    Ok((scope.as_ref().map(WorkspaceScope::display_path), scope))
 }
 
 fn background_task_artifacts(task: &octos_agent::BackgroundTask) -> Vec<AgentArtifactRecord> {
@@ -16670,9 +17657,10 @@ fn master_continuation_request_from_persisted(
 fn restore_runtime_from_supervisor_state(
     state: &mut AutonomyRuntimeState,
     supervisor_state: &SupervisorState,
+    workspace_compat: &WorkspaceCompat,
 ) {
     restore_autonomy_records_from_supervisor_state(state, supervisor_state);
-    restore_agents_from_supervisor_state(state, supervisor_state);
+    restore_agents_from_supervisor_state(state, supervisor_state, workspace_compat);
 }
 
 fn restore_autonomy_records_from_supervisor_state(
@@ -16911,6 +17899,7 @@ fn restore_loop_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
 fn restore_agents_from_supervisor_state(
     state: &mut AutonomyRuntimeState,
     supervisor_state: &SupervisorState,
+    workspace_compat: &WorkspaceCompat,
 ) {
     for child in supervisor_state.children.values() {
         let Some((session_id, profile_id)) =
@@ -16952,7 +17941,16 @@ fn restore_agents_from_supervisor_state(
                 .to_owned(),
             status,
             last_task: restored_agent_last_task(child),
-            cwd: child.workspace_path.clone(),
+            cwd: workspace_compat
+                .children
+                .get(&format!("{}/{}", child.group_id, child.child_id))
+                .and_then(|scope| scope.as_ref())
+                .map(WorkspaceScope::display_path),
+            workspace_scope: workspace_compat
+                .children
+                .get(&format!("{}/{}", child.group_id, child.child_id))
+                .cloned()
+                .flatten(),
             profile_id,
             output: restored_agent_output(child),
             artifacts,
@@ -17534,6 +18532,9 @@ fn supervisor_metadata_bool(metadata: &SupervisorMetadata, key: &str) -> Option<
 
 fn supervisor_metadata_for_agent(agent: &AutonomyAgentRecord) -> SupervisorMetadata {
     let mut metadata = SupervisorMetadata::new();
+    if let Some(scope) = agent.workspace_scope.as_ref() {
+        metadata.insert("workspace_scope".into(), json!(scope.key()));
+    }
     metadata.insert("session_id".into(), json!(agent.session_id));
     metadata.insert("profile_id".into(), json!(agent.profile_id));
     metadata.insert("role".into(), json!(agent.role));
@@ -20834,6 +21835,7 @@ mod tests {
             status: "running".into(),
             last_task: Some("testing".into()),
             cwd: None,
+            workspace_scope: None,
             profile_id: profile_id.to_owned(),
             output: String::new(),
             artifacts: Vec::new(),
@@ -22368,6 +23370,7 @@ mod tests {
         let mut child_a = sample_agent("child-a", "tenant-a");
         child_a.parent_agent_id = Some("master".into());
         child_a.cwd = Some("/projects/a".into());
+        child_a.workspace_scope = WorkspaceScope::from_raw(child_a.cwd.as_deref());
         let session_id = child_a.session_id.clone();
         // Stale terminal child from project B, already in the roster under the
         // SAME session key (a prior lifetime's workspace binding of the reused
@@ -22375,6 +23378,7 @@ mod tests {
         let mut stale_b = sample_agent("stale-b", "tenant-a");
         stale_b.parent_agent_id = Some("master".into());
         stale_b.cwd = Some("/projects/b".into());
+        stale_b.workspace_scope = WorkspaceScope::from_raw(stale_b.cwd.as_deref());
         stale_b.status = "completed".into();
         assert_eq!(stale_b.session_id, session_id, "same wire session key");
         orchestrator

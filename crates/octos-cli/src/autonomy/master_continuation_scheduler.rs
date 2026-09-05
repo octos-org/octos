@@ -363,12 +363,13 @@ pub(crate) struct QueuedMasterContinuation {
     pub(crate) persisted_attempt: u32,
 }
 
-/// #1707: the item's workspace scope, from its `workspace` metadata with an
-/// empty string treated as absent — so `None == None` and a blank stamp never
-/// splits a scope that the enqueue side deliberately left unset.
+/// Canonical workspace identity, with legacy `workspace` fallback for old
+/// callers. Producer/restore boundaries normalize known peer wire spellings.
+/// Empty strings remain absent so an unstamped item keeps the None scope.
 pub(crate) fn item_workspace(item: &QueuedMasterContinuation) -> Option<&str> {
     item.metadata
-        .get("workspace")
+        .get("workspace_scope")
+        .or_else(|| item.metadata.get("workspace"))
         .map(String::as_str)
         .filter(|value| !value.is_empty())
 }

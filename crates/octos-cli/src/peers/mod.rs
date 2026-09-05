@@ -291,18 +291,14 @@ pub(crate) fn bind_peer_supervised_task_with_workspace_strict(
 /// the stamp and the `/stop` purge argument disagree with each other on
 /// exotic cwds (stamp side: `None`; purge side: possibly `Some` via a
 /// different derivation — both endpoints silently losing the workspace
-/// identity). The scope is instead the hex encoding of the path's raw
+/// identity). New wire stamps are version-tagged hex encodings of the path's raw
 /// [`OsStr`] bytes: every representable path round-trips exactly, and two
 /// DIFFERENT non-UTF-8 roots encode to two DIFFERENT scopes (never
 /// accidentally clearing each other). An empty/absent root encodes to
 /// `None` (unstamped, legacy shape).
 #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
 pub(crate) fn workspace_scope_encode(root: &std::path::Path) -> Option<String> {
-    let bytes = root.as_os_str().as_encoded_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    crate::autonomy::workspace_scope::WorkspaceScope::peer_stamp(root)
 }
 
 /// #1868 Phase 1 — retire the task bound at staging, on the CLOSE path only.
@@ -4274,14 +4270,13 @@ mod peer_task_registry_tests {
         // A plain UTF-8 root round-trips its bytes.
         let plain = std::path::Path::new("/home/zhang/work/octos");
         let encoded = workspace_scope_encode(plain).expect("plain root encodes");
-        let decoded_bytes: Vec<u8> = (0..encoded.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).unwrap())
-            .collect();
+        let decoded = crate::autonomy::workspace_scope::WorkspaceScope::from_argument(&encoded)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            std::ffi::OsStr::from_bytes(&decoded_bytes).as_bytes(),
-            plain.as_os_str().as_bytes(),
-            "the hex encoding decodes back to the exact path bytes"
+            decoded,
+            crate::autonomy::workspace_scope::WorkspaceScope::from_path(plain).unwrap(),
+            "the tagged wire decodes back to the exact path scope"
         );
         // A NON-UTF-8 root (invalid UTF-8 byte 0xff) still encodes —
         // `to_str()` would have collapsed it to None.
