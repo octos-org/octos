@@ -769,6 +769,16 @@ jobs:
       - name: Build (octos-cli + all features)
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
+      # #2239: default-feature tests never compile the API's test-only secret
+      # hooks. Exercise those callers on Windows too, using isolated fixtures.
+      - name: Test API auth and secret-store fixtures
+        if: ${{ !cancelled() }}
+        run: cargo test -p octos-cli --features api --lib auth
+
+      - name: Test API credential relocation fixtures
+        if: ${{ !cancelled() }}
+        run: cargo test -p octos-cli --features api --lib relocate
+
       # Sharded per-crate tests — same rationale as the `check` job.
       #
       # Every test step runs even after an earlier one fails. GitHub aborts a

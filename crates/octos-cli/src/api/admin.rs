@@ -5536,6 +5536,9 @@ mod tests {
 
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         // #2234/45a — the availability predicate is now `keychain::is_available()`
         // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
         // never-plaintext contract holds where NO backend exists (unsupported
@@ -5585,8 +5588,9 @@ mod tests {
         // INJECTED temp root) the JSON is legitimately relocated: Ok, the
         // slot becomes a keychain marker, the raw value never remains.
         // Hosts with NO backend keep the rejection.
+        let secrets = tempfile::tempdir().unwrap();
         let _secrets_root =
-            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         let mut env = std::collections::HashMap::new();
         env.insert(
             "VERTEX_API_KEY".to_string(),
