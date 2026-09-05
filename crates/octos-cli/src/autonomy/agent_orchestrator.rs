@@ -1162,11 +1162,51 @@ impl InProcessAgentOrchestrator {
                 &background_task_agent_id(task),
                 &background_task_agent_status(task),
             ) {
+                // #1707 round 7 (board item #12, codex round-2 #7-gate
+                // residue) — the gate splits into TWO steps.
+                //
+                // Step 1 (admission, what the gate BLOCKS): the re-forward
+                // must not RE-ADMIT the agent record — the upsert would look
+                // like a new admission into an already-joined group, bump the
+                // scatter-join epoch, and re-emit a ScatterJoinComplete.
+                //
+                // Step 2 (reconciliation, what the gate must NOT skip): the
+                // mirrors and the scatter repair still run.
+                // `set_agent_output_if_empty` / `set_agent_artifacts` keep the
+                // readable output/artifact mirrors fresh for `agent/output/
+                // read`; `reconcile_scatter_for_existing_group` re-derives the
+                // group's join key so a scatter whose persist failed in a
+                // previous lifetime (child record durable, scatter record
+                // missing — the round-7 crash window) is re-emitted instead
+                // of being permanently suppressed by this very gate.
                 tracing::debug!(
                     task_id = %task.id,
                     session = %session_id,
-                    "stale terminal background-task re-forward suppressed (store-seeded \
-                     delivered mark already hit)"
+                    "stale terminal background-task re-forward suppressed for admission \
+                     (store-seeded delivered mark); output/artifact refresh and scatter \
+                     reconciliation still run"
+                );
+                let agent_id = background_task_agent_id(task);
+                let artifacts = background_task_artifacts(task);
+                if !artifacts.is_empty() {
+                    let _ = self.set_agent_artifacts(&agent_id, &session_id, profile_id, artifacts);
+                }
+                if let Some(final_output) = task.final_output.as_deref() {
+                    if !final_output.trim().is_empty() {
+                        let _ = self.set_agent_output_if_empty(
+                            &agent_id,
+                            &session_id,
+                            profile_id,
+                            final_output,
+                        );
+                    }
+                }
+                let cwd = background_task_cwd(task);
+                self.reconcile_scatter_for_existing_group(
+                    &session_id,
+                    profile_id,
+                    Some("master"),
+                    cwd.as_deref(),
                 );
                 return None;
             }
@@ -2006,6 +2046,17 @@ impl InProcessAgentOrchestrator {
                 state.continuations.enqueue(request);
             }
         }
+        // #1707 round 7 (board item #12, codex round-2 B4 residue): after the
+        // roster/marks are restored and the still-pending records are
+        // re-enqueued, ACTIVELY rebuild any missing scatter join. The crash
+        // window this closes: child-B's `ChildCompleted` record persisted, the
+        // paired scatter's persist FAILED (or the process exited between the
+        // two enqueues), and every later terminal re-forward was suppressed
+        // by the seeded-mark gate BEFORE the sibling/scatter reconciliation
+        // ran — so the join was never re-emitted. The pass runs once per boot
+        // over the restored groups (O(groups)) and only enqueues through the
+        // same checked-persist helper the live terminal path uses.
+        reconcile_missing_scatters_on_restore(&mut state);
         Ok(())
     }
 
@@ -11910,6 +11961,17 @@ impl InProcessAgentOrchestrator {
         self.state().reset_window_before_accounting = value;
     }
 
+    /// Test hook (#1707 round 7, board item #12): the next SCATTER persist
+    /// (`persist_scatter_queued_checked`) is treated as FAILED before the
+    /// store is touched, so the crash window "child persisted, scatter
+    /// persist failed, restart" is exercised — the join marks must NOT
+    /// advance and the restore rebuild pass must re-emit the missing
+    /// `ScatterJoinComplete`. Self-disarms after one use; per-instance.
+    #[cfg(test)]
+    pub(crate) fn set_force_scatter_persist_failure_for_test(&self, value: bool) {
+        self.state().force_scatter_persist_failure = value;
+    }
+
     /// Test accessor (codex round 2): the monitor's persisted rate-window count.
     #[cfg(test)]
     pub(crate) fn monitor_rate_count_for_test(&self, monitor_id: &str) -> Option<u32> {
@@ -12184,6 +12246,14 @@ struct AutonomyRuntimeState {
     /// `monitor/resume` landing in the unlocked gap (defect 2). Per-instance.
     #[cfg(test)]
     reset_window_before_accounting: bool,
+    /// #1707 round 7 (board item #12, codex round-2 B4 residue) — test-only
+    /// switch that makes the SCATTER persist (`persist_scatter_queued_checked`)
+    /// fail BEFORE touching the store, so the crash window "child record
+    /// persisted, scatter persist failed, restart" is exercised end-to-end
+    /// (marks NOT advanced; restore rebuild re-emits the join). Self-disarms
+    /// after one use; per-instance, like `force_coalesce_persist_failure`.
+    #[cfg(test)]
+    force_scatter_persist_failure: bool,
 }
 
 // Manual `Default` (NOT derived): the `#[cfg(test)]`-gated fields below
@@ -12226,6 +12296,8 @@ impl Default for AutonomyRuntimeState {
             force_tombstone_failure_once: false,
             #[cfg(test)]
             reset_window_before_accounting: false,
+            #[cfg(test)]
+            force_scatter_persist_failure: false,
         }
     }
 }
@@ -12265,6 +12337,96 @@ impl InProcessAgentOrchestrator {
             .delivered_child_marks
             .get(&child_key)
             .is_some_and(|mark| mark.seeded_from_store && mark.status == status)
+    }
+
+    /// #1707 round 7 (board item #12) — RECONCILIATION half of the stale-
+    /// terminal gate's two-step split. When the gate suppresses the agent
+    /// RECORD re-admission (a delivered mark from a previous runtime already
+    /// covers this verdict), the group's scatter join is still re-evaluated:
+    /// a crash window where the last child's `ChildCompleted` persisted but
+    /// the paired `ScatterJoinComplete` did NOT (round-7 B4 residue) must be
+    /// repaired here — the gate is exactly the path such a re-forward takes.
+    ///
+    /// Runs the same all-terminal sibling scan, join-key derivation, and
+    /// `already_joined` check as the tail of
+    /// [`enqueue_agent_terminal_continuations`], then enqueues through the
+    /// SAME checked-persist helper. Without an existing roster record for
+    /// this group (or with a non-terminal member) it is a no-op: the live
+    /// upsert path owns first-time joins.
+    pub(crate) fn reconcile_scatter_for_existing_group(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        parent_agent_id: Option<&str>,
+        cwd: Option<&str>,
+    ) {
+        let mut state = self.state();
+        let group_id = format!(
+            "agent-group:{}:{}:{}",
+            profile_id,
+            session_id,
+            parent_agent_id.unwrap_or("master")
+        );
+        let cwd = cwd.map(str::to_owned);
+        let siblings = state
+            .agents
+            .values()
+            .filter(|candidate| {
+                candidate.session_id == *session_id
+                    && candidate.profile_id == profile_id
+                    && candidate.parent_agent_id.as_deref()
+                        == Some(parent_agent_id.unwrap_or("master"))
+                    && candidate.cwd == cwd
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if siblings.is_empty()
+            || !siblings
+                .iter()
+                .all(|candidate| is_agent_terminal_status(&candidate.status))
+        {
+            return;
+        }
+        let Some(agent) = siblings.first().cloned() else {
+            return;
+        };
+        let join_group_key = group_id.clone();
+        let join_epoch = state
+            .scatter_join_state
+            .get(&join_group_key)
+            .map(|join_state| join_state.join_epoch)
+            .unwrap_or(0);
+        let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
+        let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
+        let join_key = format!(
+            "scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}",
+            group = group_id.as_str(),
+            session = agent.session_id.0,
+            profile = agent.profile_id,
+            cwd_hash = cwd_hash,
+            epoch = join_epoch,
+        );
+        let already_joined =
+            state
+                .scatter_join_state
+                .get(&join_group_key)
+                .is_some_and(|join_state| {
+                    join_state.last_joined_key.as_deref() == Some(join_key.as_str())
+                })
+                || state.delivered_scatter_marks.contains_key(&join_key);
+        if already_joined {
+            return;
+        }
+        reconcile_missing_scatter(
+            &mut state,
+            &agent,
+            group_id,
+            join_group_key,
+            join_key,
+            join_epoch,
+            siblings.len(),
+        );
     }
 
     /// #1707 round 5 (board item #7, /stop side A) — purge every PENDING
@@ -13918,15 +14080,23 @@ fn seed_delivered_terminal_marks(
                 let status = supervisor_metadata_str(&record.metadata, "payload:status")
                     .unwrap_or("completed")
                     .to_owned();
+                // #1707 round 7 (board item #12, codex round-2 #7-gate
+                // residue): provenance distinguishes DELIVERED records from
+                // merely PENDING ones. A `Completed` record is durable proof a
+                // PREVIOUS runtime delivered this verdict — the only mark
+                // shape the stale-reforward gate may act on (#7 round 2). A
+                // record still `Queued`/`Started` was persisted but never
+                // delivered: the pending re-enqueue above owns its delivery,
+                // so the mark must NOT gate a same-status terminal re-forward
+                // (which must still be free to refresh output/artifact
+                // mirrors and run the scatter reconciliation).
+                let delivered = record.status == ContinuationStatus::Completed;
                 state.delivered_child_marks.insert(
                     record.continuation_id.clone(),
                     DeliveredChildMark {
                         status,
                         revision: u64::from(record.attempt),
-                        // Durable proof a PREVIOUS runtime delivered this
-                        // verdict — the only mark shape the stale-reforward
-                        // gate may act on (#7 round 2).
-                        seeded_from_store: true,
+                        seeded_from_store: delivered,
                     },
                 );
             }
@@ -14638,6 +14808,52 @@ fn enqueue_agent_terminal_continuations(
     if already_joined {
         return;
     }
+    // #1707 round 7 (board item #12, codex round-2 B4 residue): the enqueue +
+    // checked persist + mark advance live in ONE shared helper —
+    // `reconcile_missing_scatter` — reused by the restore rebuild pass so a
+    // scatter whose persist failed before a crash is rebuilt with the EXACT
+    // same request shape and the same failure semantics (marks advance only
+    // on a successful durable write).
+    reconcile_missing_scatter(
+        state,
+        agent,
+        group_id,
+        join_group_key,
+        join_key,
+        join_epoch,
+        siblings.len(),
+    );
+}
+
+/// #1707 round 7 (board item #12) — enqueue the `ScatterJoinComplete` for an
+/// all-terminal group with a CHECKED persist, and advance the join marks
+/// (`last_joined_key` + `delivered_scatter_marks`) ONLY after the durable
+/// write returned `Ok`.
+///
+/// Replaces the fire-and-forget `enqueue_and_persist_continuation` the
+/// terminal path used before round 7: a swallowed persist error left
+/// in-memory join marks with no durable scatter record, and a crash in that
+/// window restarted with only the child marks seeded — the #7 gate then
+/// suppressed every terminal re-forward BEFORE the sibling/scatter
+/// reconciliation ran, so the missing scatter was never re-emitted. Now, on
+/// a persist `Err` the marks stay unset, so a later terminal re-forward of a
+/// sibling retries the join in-process, and a crash leaves the restore
+/// rebuild pass ([`reconcile_missing_scatters_on_restore`]) to re-derive and
+/// re-emit it.
+///
+/// `Duplicate` (the join is already pending in-memory) leaves the marks
+/// as-is: the durable mark for this epoch's key is either already seeded
+/// from the store (nothing to do) or will be set by the pass that first
+/// persists it.
+fn reconcile_missing_scatter(
+    state: &mut AutonomyRuntimeState,
+    agent: &AutonomyAgentRecord,
+    group_id: String,
+    join_group_key: String,
+    join_key: String,
+    join_epoch: u64,
+    terminal_children: usize,
+) {
     let scatter = MasterContinuationRequest::new(
         group_id,
         agent.session_id.to_string(),
@@ -14653,24 +14869,178 @@ fn enqueue_agent_terminal_continuations(
             .clone()
             .unwrap_or_else(|| "master".to_owned()),
     )
-    .with_metadata("terminal_children", siblings.len().to_string());
+    .with_metadata("terminal_children", terminal_children.to_string());
     // #1707: same workspace stamp as the per-child ChildCompleted above.
     let scatter = match agent.cwd.as_deref().filter(|value| !value.is_empty()) {
         Some(cwd) => scatter.with_metadata("workspace", cwd.to_owned()),
         None => scatter,
     };
-    let scatter_outcome = enqueue_and_persist_continuation(state, scatter);
-    let join_state = state.scatter_join_state.entry(join_group_key).or_default();
-    join_state.last_joined_key = Some(join_key.clone());
-    if !scatter_outcome.is_duplicate() {
-        // #1707 round 3 (codex Blocker 4): the scatter has its OWN durable
-        // mark now — a future crash window where the child record persisted
-        // but this scatter record did NOT is recovered by the seeding path,
-        // not by assuming the child record implies the join.
-        state
-            .delivered_scatter_marks
-            .insert(join_key, "joined".to_owned());
+    let scatter_outcome = state.continuations.enqueue(scatter);
+    let MasterContinuationEnqueueOutcome::Queued(continuation) = &scatter_outcome else {
+        // Already pending in-memory — the marks belong to whichever pass
+        // persists the durable record; leave them untouched.
+        return;
+    };
+    // #1707 round 7: the scatter is a FRESH key per epoch, so its first
+    // persist allocates through the SAME unified `continuation_revisions`
+    // allocator the child correction/coalesce-fold paths use (board item
+    // #11) — a fresh key yields 1, matching the first-delivery contract.
+    // Persisting through `persist_continuation_queued` (fixed attempt 1)
+    // would leave the unified counter unseeded for this key; a later
+    // fold of THIS carrier would then re-allocate attempt 1 and replay
+    // dedup would swallow the fold's carrier persist.
+    let attempt = next_continuation_attempt(state, &join_key);
+    match persist_scatter_queued_checked(state, continuation, attempt) {
+        Ok(()) => {
+            state
+                .continuation_revisions
+                .insert(join_key.clone(), u64::from(attempt));
+            let join_state = state.scatter_join_state.entry(join_group_key).or_default();
+            // Belt-and-braces: the enqueue path already seeded this epoch,
+            // but a hand-built restore fixture may call here first.
+            join_state.join_epoch = join_state.join_epoch.max(join_epoch);
+            join_state.last_joined_key = Some(join_key.clone());
+            // #1707 round 3 (codex Blocker 4): the scatter has its OWN
+            // durable mark now — a future crash window where the child
+            // record persisted but this scatter record did NOT is recovered
+            // by the rebuild path, not by assuming the child record implies
+            // the join.
+            state
+                .delivered_scatter_marks
+                .insert(join_key, "joined".to_owned());
+        }
+        Err(err) => {
+            // #1707 round 7 (board item #12): the persist FAILED — do NOT
+            // advance `last_joined_key` / `delivered_scatter_marks`. A later
+            // terminal re-forward of a sibling retries the join in this
+            // process; a crash before any retry is recovered by the restore
+            // rebuild pass re-deriving the same key.
+            tracing::warn!(
+                ?err,
+                join_key = %join_key,
+                attempt,
+                "scatter join persist failed; the join marks stay unset so a \
+                 later re-forward retries and a restart rebuilds it"
+            );
+        }
     }
+}
+
+/// #1707 round 7 (board item #12) — boot-time rebuild pass: for every
+/// restored group whose roster is ALL-terminal, re-derive the current-epoch
+/// join key and enqueue the missing `ScatterJoinComplete` when neither the
+/// in-memory `last_joined_key` nor a persisted scatter record (seeded into
+/// `delivered_scatter_marks`) proves this epoch already joined. Runs once per
+/// boot inside `configure_supervisor_store`, AFTER the roster restore, the
+/// mark seeding (which restores each group's `join_epoch` from persisted
+/// scatter records), and the pending-record re-enqueue — so a pending
+/// replayed scatter collapses as `Duplicate` here instead of double-queueing.
+///
+/// Scope guards:
+/// - pure in-memory runtimes (no supervisor store) have nothing durable to
+///   rebuild against — skip;
+/// - non-`agent-group:` groups (peer_send_input, goals, loops) have no
+///   scatter-join semantics — skip;
+/// - a group with a NON-terminal member is mid-flight — the live terminal
+///   path will join it when the last child lands.
+fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
+    if state.supervisor_store.is_none() {
+        return;
+    }
+    // Snapshot per-group representative agents. `HashMap::entry` keeps ONE
+    // agent per (group, session, profile, cwd, parent) cohort — the same
+    // shape the live sibling scan in `enqueue_agent_terminal_continuations`
+    // uses — and only cohorts whose every restored member is terminal are
+    // eligible.
+    // (group, session, profile, cwd, parent) — the cohort identity the live
+    // sibling scan filters on.
+    type ScatterCohortKey = (String, String, String, Option<String>, Option<String>);
+    let mut cohorts: HashMap<ScatterCohortKey, Vec<AutonomyAgentRecord>> = HashMap::new();
+    for agent in state.agents.values() {
+        let group_id = agent_continuation_group_id(agent);
+        if !group_id.starts_with("agent-group:") {
+            continue;
+        }
+        cohorts
+            .entry((
+                group_id,
+                agent.session_id.0.clone(),
+                agent.profile_id.clone(),
+                agent.cwd.clone(),
+                agent.parent_agent_id.clone(),
+            ))
+            .or_default()
+            .push(agent.clone());
+    }
+    for ((group_id, _session, _profile, _cwd, _parent), siblings) in cohorts {
+        if siblings.is_empty()
+            || !siblings
+                .iter()
+                .all(|candidate| is_agent_terminal_status(&candidate.status))
+        {
+            continue;
+        }
+        let Some(agent) = siblings.first().cloned() else {
+            continue;
+        };
+        let join_group_key = group_id.clone();
+        let join_epoch = state
+            .scatter_join_state
+            .get(&join_group_key)
+            .map(|join_state| join_state.join_epoch)
+            .unwrap_or(0);
+        let mut cwd_hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&agent.cwd, &mut cwd_hasher);
+        let cwd_hash = std::hash::Hasher::finish(&cwd_hasher);
+        let join_key = format!(
+            "scatter_join/{group}/{session}/{profile}/{cwd_hash}/{epoch}",
+            group = group_id.as_str(),
+            session = agent.session_id.0,
+            profile = agent.profile_id,
+            cwd_hash = cwd_hash,
+            epoch = join_epoch,
+        );
+        let already_joined =
+            state
+                .scatter_join_state
+                .get(&join_group_key)
+                .is_some_and(|join_state| {
+                    join_state.last_joined_key.as_deref() == Some(join_key.as_str())
+                })
+                || state.delivered_scatter_marks.contains_key(&join_key);
+        if already_joined {
+            continue;
+        }
+        reconcile_missing_scatter(
+            state,
+            &agent,
+            group_id,
+            join_group_key,
+            join_key,
+            join_epoch,
+            siblings.len(),
+        );
+    }
+}
+
+/// #1707 round 7 (board item #12) — CHECKED scatter persist. Thin wrapper
+/// over [`persist_continuation_queued_with_attempt`] carrying the test hook
+/// that simulates a crash exactly at the scatter's durable write: armed, the
+/// hook fails BEFORE touching the store (and self-disarms), so the caller's
+/// genuine `Err` handling (marks stay unset) is exercised end-to-end.
+fn persist_scatter_queued_checked(
+    state: &mut AutonomyRuntimeState,
+    continuation: &QueuedMasterContinuation,
+    attempt: u32,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if state.force_scatter_persist_failure {
+        state.force_scatter_persist_failure = false;
+        return Err(std::io::Error::other(
+            "forced scatter persist failure (test hook)",
+        ));
+    }
+    persist_continuation_queued_with_attempt(state, continuation, attempt)
 }
 
 /// Gap-1 step 3: explicit `ChildCompleted` dedupe key, symmetric to the
@@ -21267,7 +21637,247 @@ mod tests {
         assert_eq!(
             terminal_children,
             Some("2"),
-            "the restored sibling scan must see BOTH terminal children"
+            "the restored sibling scan must see BOTH terminal children; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// #1707 round 7 (board item #12, codex round-2 B4 residue): the EXACT
+    /// crash window — child-B's `ChildCompleted` record persisted but the
+    /// paired scatter's durable persist FAILED (forced by the test hook), so
+    /// the join marks were never advanced. After a restart, the restore
+    /// rebuild pass must re-derive the current-epoch join key and re-emit the
+    /// missing `ScatterJoinComplete` — even though no live terminal
+    /// transition happens in the new lifetime and the #7 gate would have
+    /// suppressed any re-forward before the scatter reconciliation ran.
+    #[test]
+    fn scatter_persist_failure_then_restart_reemits_join() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-spf", "api", "scatter-persist-crash");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: "tenant-spf".to_owned(),
+        };
+
+        // Orchestrator A: two children. Agent-1 completes first (its
+        // ChildCompleted persists; the sibling scan is not all-terminal yet,
+        // so no scatter). Arm the scatter-persist failure hook, then complete
+        // agent-2: its ChildCompleted persists, the scatter persist FAILS,
+        // and the join marks must NOT advance. Drop A without draining —
+        // the process "exits" in the crash window.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("agent-1", "running"));
+        first.upsert_agent(upsert("agent-2", "running"));
+        first.upsert_agent(upsert("agent-1", "completed"));
+        first.set_force_scatter_persist_failure_for_test(true);
+        first.upsert_agent(upsert("agent-2", "completed"));
+        {
+            let state = first.state();
+            let join_group = format!("agent-group:tenant-spf:{}:master", session_id);
+            let join_key_prefix = format!("scatter_join/{join_group}/");
+            assert!(
+                state
+                    .delivered_scatter_marks
+                    .keys()
+                    .all(|key| !key.starts_with(&join_key_prefix)),
+                "the failed scatter persist must NOT stamp a durable scatter mark"
+            );
+            assert!(
+                state
+                    .scatter_join_state
+                    .get(&join_group)
+                    .is_none_or(|join_state| join_state.last_joined_key.is_none()),
+                "the failed scatter persist must NOT advance last_joined_key"
+            );
+        }
+        drop(first);
+
+        // Fresh orchestrator B on the same store (the hook is per-instance,
+        // so B is clean): the restore rebuild pass must enqueue the missing
+        // ScatterJoinComplete for the all-terminal restored group. Nothing
+        // else runs in this lifetime — the pass alone must surface it.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-spf",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let scatters = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scatters.len(),
+            1,
+            "the restore rebuild must re-emit exactly one ScatterJoinComplete; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            scatters[0]
+                .metadata
+                .get("terminal_children")
+                .map(String::as_str),
+            Some("2"),
+            "the rebuilt join must count BOTH restored terminal children"
+        );
+        // The rebuilt scatter's persist (hook disarmed) advanced the marks:
+        // draining it again must not re-emit.
+        let redrained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-spf",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            redrained
+                .iter()
+                .all(|item| item.reason != MasterContinuationReason::ScatterJoinComplete),
+            "a successfully rebuilt join must not duplicate; redrained {:?}",
+            redrained
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// #1707 round 7 (board item #12, codex round-2 #7-gate residue): a child
+    /// record that stays `Queued` in the store (delivered in-memory but never
+    /// drained/tombstoned) seeds a mark with `seeded_from_store: FALSE` — it
+    /// is PENDING, not delivered. A same-status terminal re-forward of the
+    /// same background task must therefore pass the gate (no re-admission
+    /// concern: the roster record is already restored), refresh the output
+    /// mirror, and re-run the scatter reconciliation — while the pending
+    /// re-enqueue keeps the queue to ONE `ChildCompleted` (dedupe key), never
+    /// a duplicate.
+    #[test]
+    fn queued_record_seed_still_refreshes_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-qrs", "api", "queued-seed");
+        let now = Utc::now();
+        let make_task = |final_output: Option<&str>| octos_agent::BackgroundTask {
+            id: "bg-queued-1".into(),
+            tool_name: "review-child".into(),
+            tool_call_id: "call-queued-1".into(),
+            parent_session_key: Some(session_id.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Completed,
+            runtime_state: octos_agent::TaskRuntimeState::Completed,
+            runtime_detail: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            output_files: Vec::new(),
+            error: None,
+            final_output: final_output.map(str::to_owned),
+            failed_by_observer: false,
+            session_key: Some(session_id.to_string()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: Some(String::new()),
+            artifact_count: None,
+            runtime_policy_stamp: None,
+            projection_metadata: None,
+        };
+
+        // Orchestrator A: the task mirrors (ChildCompleted + scatter persist)
+        // but the queue is NEVER drained, so the child record stays `Queued`
+        // in the store. The mirror carries NO final output and an EMPTY
+        // summary, so the restored record's output (derived from the summary)
+        // is empty too — the refresh below is what must fill it. Drop A.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        let task = make_task(None);
+        let (_, agent) = first
+            .upsert_background_task_agent(&task, None)
+            .expect("task should mirror");
+        let agent_id = agent["agent_id"].as_str().expect("agent id").to_owned();
+        drop(first);
+
+        // Fresh orchestrator B on the same store: the Queued child record
+        // seeds a NON-gating mark and re-enqueues as pending. Re-forwarding
+        // the same terminal task (now WITH a final output) must NOT be
+        // gated: the output mirror refreshes, and the queue gains no
+        // duplicate ChildCompleted.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let group_id = format!("agent-group:tenant-qrs:{}:master", session_id);
+        let child_key = child_completed_dedupe_key(&group_id, &session_id.0, &agent_id);
+        assert!(
+            fresh
+                .state()
+                .delivered_child_marks
+                .get(&child_key)
+                .is_some_and(|mark| !mark.seeded_from_store),
+            "a still-Queued record must seed a NON-gating mark (pending, not delivered)"
+        );
+        // The restored record pre-fills its output from the persisted
+        // last-task summary (restore behavior, independent of this test).
+        // Empty it so the refresh below is what must fill the mirror.
+        fresh
+            .state()
+            .agents
+            .get_mut(&agent_id)
+            .expect("restored agent")
+            .output
+            .clear();
+        let refreshed = make_task(Some(
+            "Status: SUCCESS\n\nREVIEW BODY: refreshed after restart",
+        ));
+        assert!(
+            fresh
+                .upsert_background_task_agent(&refreshed, None)
+                .is_some(),
+            "the Queued-seeded mark must NOT gate the terminal re-forward"
+        );
+        let output = fresh
+            .read_agent_output(AgentOutputRequest {
+                agent_id: agent_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-qrs".to_owned(),
+                cursor: None,
+                limit: None,
+            })
+            .expect("agent output readable");
+        let text = output["text"].as_str().expect("text");
+        assert!(
+            text.contains("REVIEW BODY: refreshed after restart"),
+            "the re-forward must refresh the output mirror: {text:?}"
+        );
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-qrs",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let child_completed = drained
+            .iter()
+            .filter(|item| item.reason == MasterContinuationReason::ChildCompleted)
+            .count();
+        assert_eq!(
+            child_completed,
+            1,
+            "the restored pending record collapses with the re-forward — exactly one ChildCompleted; drained {:?}",
+            drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
         );
     }
 
