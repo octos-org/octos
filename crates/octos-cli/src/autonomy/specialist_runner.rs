@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::time::MissedTickBehavior;
 
 use super::agent_orchestrator::{AgentArtifactRecord, AgentUpsert, InProcessAgentOrchestrator};
+use super::workspace_scope::WorkspaceScope;
 use crate::cli_agent_adapter::{
     CliAgentCommandConfig, CliAgentProcess, CliAgentRunResult, CliAgentTermination,
 };
@@ -156,8 +157,16 @@ pub(crate) async fn run_supervised_cli_specialist(
                 .push(artifact.path.clone());
         }
     }
+    let workspace_scope = request
+        .spec
+        .cwd
+        .as_deref()
+        .and_then(WorkspaceScope::from_path);
     let initial_agent = orchestrator
-        .upsert_agent(upsert_for_spec(&request.spec, "running", None))
+        .upsert_agent_scoped(
+            upsert_for_spec(&request.spec, "running", None),
+            workspace_scope,
+        )
         .map_err(|error| error.message)?;
     // #1021 / M17-C — CLI specialists are spawned as external subprocesses that never consume the Octos prompt context manager, so the dispatch contract is `external_context_unmanaged` with `risk: "medium"`. Stamping it here surfaces `context_mode` / `context_refs` on every subsequent `agent/updated` event so AppUI clients can audit context regime per child without polling the MCP path.
     let cli_contract = DispatchContextContract::external_unmanaged(
@@ -245,8 +254,16 @@ pub(crate) async fn run_supervised_mcp_specialist(
         return Err("MCP specialist timeout must be greater than zero".to_owned());
     }
 
+    let workspace_scope = request
+        .spec
+        .cwd
+        .as_deref()
+        .and_then(WorkspaceScope::from_path);
     let initial_agent = orchestrator
-        .upsert_agent(upsert_for_spec(&request.spec, "running", None))
+        .upsert_agent_scoped(
+            upsert_for_spec(&request.spec, "running", None),
+            workspace_scope,
+        )
         .map_err(|error| error.message)?;
     // #1021 / M17-C — MCP supervised specialists dispatch through an external transport that does not yet wire a managed context payload, so the contract is `external_context_unmanaged` with `risk: "medium"`. The same contract is forwarded into the dispatch request below so the remote side and the AppUI event ledger agree on context regime.
     let context_contract = DispatchContextContract::external_unmanaged(
@@ -924,6 +941,41 @@ printf 'done\n'
         artifact: Mutex<Option<PathBuf>>,
     }
 
+    #[cfg(unix)]
+    struct OneTurnNativeProvider;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl octos_llm::LlmProvider for OneTurnNativeProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some("native done".to_owned()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "one-turn-native"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl McpAgentBackend for ScriptedMcpBackend {
         fn backend_label(&self) -> &'static str {
@@ -947,6 +999,226 @@ printf 'done\n'
                 context_contract: None,
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_r6_non_utf8_native_cli_mcp_share_one_purge_without_lossy_neighbor() {
+        use super::super::agent_orchestrator::NativeSpecialistLaunchRequest;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw_root = dir.path().join(OsStr::from_bytes(b"\xff-root"));
+        let lossy_neighbor = dir.path().join("\u{fffd}-root");
+        let raw_root_created = match std::fs::create_dir_all(&raw_root) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(92) => false,
+            Err(error) => panic!("create raw-byte workspace: {error}"),
+        };
+        std::fs::create_dir_all(&lossy_neighbor).unwrap();
+        assert_ne!(raw_root, lossy_neighbor);
+        assert_eq!(raw_root.to_string_lossy(), lossy_neighbor.to_string_lossy());
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path().join("supervisor"))
+            .unwrap();
+        let session = SessionKey::with_profile("tenant-a", "api", "specialist");
+
+        orchestrator
+            .run_native_specialist(NativeSpecialistLaunchRequest {
+                agent_id: Some("native-raw".to_owned()),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session.clone(),
+                profile_id: "tenant-a".to_owned(),
+                role: "reviewer".to_owned(),
+                nickname: "Native Raw".to_owned(),
+                task: "review raw workspace".to_owned(),
+                cwd: raw_root.clone(),
+                llm: Arc::new(OneTurnNativeProvider),
+                memory: Arc::new(
+                    octos_memory::EpisodeStore::open(dir.path().join("native-memory"))
+                        .await
+                        .unwrap(),
+                ),
+                tools: Arc::new(octos_agent::ToolRegistry::with_builtins(dir.path())),
+                system_prompt: None,
+                agent_config: None,
+                task_ledger_path: None,
+                event_tx: None,
+                dispatch_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let script = write_executable(
+            &dir,
+            "scope-agent",
+            "#!/bin/sh\nprintf done > cli-marker\nprintf 'cli done\\n'\n",
+        );
+        let sink = RecordingSink::default();
+        let mut cli_spec = sample_spec(&dir, "cli-raw");
+        cli_spec.cwd = Some(raw_root.clone());
+        cli_spec.artifacts.clear();
+        let raw_cli_result = run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                cli_spec,
+                CliAgentCommandConfig::new(&script).cwd(&raw_root),
+            ),
+        )
+        .await;
+        if raw_root_created {
+            raw_cli_result.unwrap();
+        } else {
+            assert!(
+                raw_cli_result.is_err(),
+                "a platform that rejects the raw directory must fail after runner admission"
+            );
+        }
+
+        let backend = Arc::new(ScriptedMcpBackend::default());
+        *backend.artifact.lock().unwrap() = Some(dir.path().join("mcp-report.md"));
+        let mut mcp_spec = sample_spec(&dir, "mcp-raw");
+        mcp_spec.cwd = Some(raw_root.clone());
+        mcp_spec.backend_kind = "mcp_test".to_owned();
+        mcp_spec.artifacts.clear();
+        run_supervised_mcp_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedMcpSpecialist::new(
+                mcp_spec,
+                backend,
+                "agent/run",
+                json!({"prompt": "review raw workspace"}),
+            )
+            .timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        let mut neighbor_spec = sample_spec(&dir, "cli-lossy-neighbor");
+        neighbor_spec.cwd = Some(lossy_neighbor.clone());
+        neighbor_spec.artifacts.clear();
+        run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                neighbor_spec,
+                CliAgentCommandConfig::new(script).cwd(&lossy_neighbor),
+            ),
+        )
+        .await
+        .unwrap();
+
+        if raw_root_created {
+            assert!(raw_root.join("cli-marker").is_file());
+        }
+        assert!(lossy_neighbor.join("cli-marker").is_file());
+        for agent_id in ["native-raw", "cli-raw", "mcp-raw", "cli-lossy-neighbor"] {
+            let status = orchestrator
+                .read_agent_status(AgentRequest {
+                    agent_id: agent_id.to_owned(),
+                    session_id: Some(session.clone()),
+                    profile_id: "tenant-a".to_owned(),
+                })
+                .unwrap();
+            assert_eq!(
+                status["agent"]["cwd"],
+                json!(lossy_neighbor.to_string_lossy()),
+                "display cwd changed for {agent_id}"
+            );
+        }
+
+        let raw_scope_key = WorkspaceScope::from_path(&raw_root).unwrap();
+        let neighbor_scope_key = WorkspaceScope::from_path(&lossy_neighbor).unwrap();
+        assert_ne!(raw_scope_key, neighbor_scope_key);
+        let snapshot =
+            super::super::supervisor_store::SupervisorStore::new(dir.path().join("supervisor"))
+                .load_state()
+                .unwrap();
+        let scatter_cohort = |scope: &WorkspaceScope| {
+            let mut rows = snapshot
+                .continuations
+                .values()
+                .filter(|record| record.continuation_id.starts_with("scatter_join/"))
+                .filter(|record| {
+                    record
+                        .metadata
+                        .get("payload:workspace_scope")
+                        .and_then(Value::as_str)
+                        == Some(scope.key())
+                })
+                .map(|record| {
+                    let mut segments = record.continuation_id.rsplit('/');
+                    let epoch = segments
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap();
+                    let cohort_hash = segments
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap();
+                    let terminal_children = record.metadata["payload:terminal_children"]
+                        .as_str()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap();
+                    (epoch, terminal_children, cohort_hash)
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+        let raw_scatter = scatter_cohort(&raw_scope_key);
+        assert_eq!(
+            raw_scatter
+                .iter()
+                .map(|(epoch, children, _)| (*epoch, *children))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2), (2, 3)],
+            "native, CLI, and MCP must advance one shared raw-byte cohort"
+        );
+        assert!(
+            raw_scatter
+                .iter()
+                .all(|(_, _, hash)| *hash == raw_scatter[0].2),
+            "all raw-byte scatter generations must use one cohort hash"
+        );
+        let neighbor_scatter = scatter_cohort(&neighbor_scope_key);
+        assert_eq!(
+            neighbor_scatter
+                .iter()
+                .map(|(epoch, children, _)| (*epoch, *children))
+                .collect::<Vec<_>>(),
+            vec![(0, 1)],
+            "the real U+FFFD directory must start an independent cohort"
+        );
+        assert_ne!(raw_scatter[0].2, neighbor_scatter[0].2);
+
+        let raw_scope = crate::peers::workspace_scope_encode(&raw_root).unwrap();
+        assert_eq!(
+            orchestrator.clear_pending_terminal_continuations_for_session(
+                &session,
+                "tenant-a",
+                Some(&raw_scope),
+                "stop raw",
+            ),
+            6,
+            "one /stop must purge native, CLI, and MCP continuations in the raw-byte cohort"
+        );
+        let neighbor_scope = crate::peers::workspace_scope_encode(&lossy_neighbor).unwrap();
+        assert_eq!(
+            orchestrator.clear_pending_terminal_continuations_for_session(
+                &session,
+                "tenant-a",
+                Some(&neighbor_scope),
+                "stop neighbor",
+            ),
+            2,
+            "the real U+FFFD neighbor must remain after purging the raw-byte cohort"
+        );
     }
 
     fn obstruct_admission_store(orchestrator: &InProcessAgentOrchestrator, root: &Path) {

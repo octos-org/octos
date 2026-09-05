@@ -2791,7 +2791,7 @@ impl InProcessAgentOrchestrator {
         self.upsert_agent_scoped(upsert, scope)
     }
 
-    fn upsert_agent_scoped(
+    pub(super) fn upsert_agent_scoped(
         &self,
         upsert: AgentUpsert,
         workspace_scope: Option<WorkspaceScope>,
