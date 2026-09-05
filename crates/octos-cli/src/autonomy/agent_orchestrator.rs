@@ -3502,6 +3502,11 @@ impl InProcessAgentOrchestrator {
         max_items: usize,
     ) -> Vec<QueuedMasterContinuation> {
         let mut state = self.state();
+        // #27 (round-4, #18 SF3) — retry site 3: re-attempt any scatter whose
+        // persist failed before this turn drains the queue, so a recovered
+        // store durably records the join BEFORE the in-memory item is consumed
+        // (consuming it would otherwise drop the last in-process retry hook).
+        retry_pending_unpersisted_scatters(&mut state);
         Self::drain_ready_continuations_locked(
             &mut state,
             session_id,
@@ -3545,6 +3550,9 @@ impl InProcessAgentOrchestrator {
         if in_flight_marker_is_held(&state, session_id) {
             return (Vec::new(), None);
         }
+        // #27 (round-4, #18 SF3) — retry site 3 (claim path): same pre-drain
+        // re-attempt as `drain_ready_continuations_for_session`.
+        retry_pending_unpersisted_scatters(&mut state);
         let kept = Self::drain_ready_continuations_locked(
             &mut state,
             session_id,
@@ -12205,6 +12213,14 @@ impl InProcessAgentOrchestrator {
         self.state().force_admission_persist_failure = value;
     }
 
+    /// Test hook (#27, #18 SF3): after a scatter persist failed and its key
+    /// landed in `pending_unpersisted_scatters`, the FIRST checked retry ALSO
+    /// fails, exercising the retry loop itself. Self-disarms after one use.
+    #[cfg(test)]
+    pub(crate) fn set_force_scatter_retry_failure_once_for_test(&self, value: bool) {
+        self.state().force_scatter_retry_failure_once = value;
+    }
+
     /// Test accessor (codex round 2): the monitor's persisted rate-window count.
     #[cfg(test)]
     pub(crate) fn monitor_rate_count_for_test(&self, monitor_id: &str) -> Option<u32> {
@@ -12376,6 +12392,17 @@ struct AutonomyRuntimeState {
     /// already emitted, so evicting it would re-admit the gated re-forward
     /// and resurrect the join (清理后重放不得复活).
     delivered_scatter_marks: HashMap<String, String>,
+    /// #27 (round-4, #18 SF3) — scatter join items whose enqueue SUCCEEDED
+    /// but whose checked persist FAILED, keyed by join key (= the item's
+    /// dedupe key). Carrying the `QueuedMasterContinuation` lets the retry
+    /// sites re-persist WITHOUT re-scanning the scheduler queue (the item is
+    /// still pending there, so a naive re-enqueue collapses to `Duplicate`
+    /// and the "later re-forward retries" assumption never fires). The three
+    /// retry sites — the same-group terminal upsert, the gated re-forward
+    /// reconcile, and the pre-drain pass — re-attempt the durable write for
+    /// every recorded item. NOT persisted: a crash is recovered by the
+    /// restore rebuild pass (#12), which re-derives the same key exactly once.
+    pending_unpersisted_scatters: std::collections::HashMap<String, QueuedMasterContinuation>,
     goals: HashMap<SessionKey, AutonomyGoalRecord>,
     loops: HashMap<String, AutonomyLoopRecord>,
     /// #1977 — durable monitor records (specs + wake accounting). The live
@@ -12520,6 +12547,12 @@ struct AutonomyRuntimeState {
     /// Self-disarms after one use; per-instance, like the other force hooks.
     #[cfg(test)]
     force_admission_persist_failure: bool,
+    /// #27 (round-4, #18 SF3) — test-only switch: after the armed scatter
+    /// persist fails and the key is recorded in `pending_unpersisted_scatters`,
+    /// the FIRST checked retry ALSO fails, so the retry loop itself (not just
+    /// the initial failure) is exercised. Self-disarms after one use.
+    #[cfg(test)]
+    force_scatter_retry_failure_once: bool,
 }
 
 // Manual `Default` (NOT derived): the `#[cfg(test)]`-gated fields below
@@ -12536,6 +12569,7 @@ impl Default for AutonomyRuntimeState {
             delivered_child_marks: HashMap::new(),
             continuation_revisions: HashMap::new(),
             delivered_scatter_marks: HashMap::new(),
+            pending_unpersisted_scatters: std::collections::HashMap::new(),
             goals: HashMap::new(),
             loops: HashMap::new(),
             monitors: HashMap::new(),
@@ -12566,6 +12600,8 @@ impl Default for AutonomyRuntimeState {
             force_scatter_persist_failure: false,
             #[cfg(test)]
             force_admission_persist_failure: false,
+            #[cfg(test)]
+            force_scatter_retry_failure_once: false,
         }
     }
 }
@@ -12634,6 +12670,10 @@ impl InProcessAgentOrchestrator {
         cwd: Option<&str>,
     ) {
         let mut state = self.state();
+        // #27 (round-4, #18 SF3) — retry site 2 (gated re-forward reconcile):
+        // re-attempt any previously-failed scatter persist before deriving
+        // this cohort's join, so a recovered store durably records it.
+        retry_pending_unpersisted_scatters(&mut state);
         let group_id = format!("agent-group:{}:{}:master", profile_id, session_id);
         let cwd = cwd.map(str::to_owned);
         let siblings = state
@@ -15234,6 +15274,12 @@ fn enqueue_agent_terminal_continuations(
     state: &mut AutonomyRuntimeState,
     agent: &AutonomyAgentRecord,
 ) {
+    // #27 (round-4, #18 SF3) — retry site 1: a terminal upsert is exactly the
+    // moment a previously-failed scatter persist for this (or a sibling)
+    // group should be re-attempted, since the in-memory queue already holds
+    // the item and a fresh enqueue would collapse to `Duplicate` without
+    // retrying the durable write.
+    retry_pending_unpersisted_scatters(state);
     let group_id = agent_continuation_group_id(agent);
     let child_key = child_completed_dedupe_key(&group_id, &agent.session_id.0, &agent.agent_id);
     let prior_mark = state.delivered_child_marks.get(&child_key).cloned();
@@ -15506,6 +15552,38 @@ fn reconcile_missing_scatter(
     let continuation = match &scatter_outcome {
         MasterContinuationEnqueueOutcome::Queued(continuation) => continuation.clone(),
         MasterContinuationEnqueueOutcome::Duplicate { .. } => {
+            // #27 (round-4, #18 SF3) — the enqueue collapsed to `Duplicate`
+            // because the item is ALREADY pending in-memory. If that pending
+            // item's persist previously FAILED (it is recorded in
+            // `pending_unpersisted_scatters`), this is exactly the case the
+            // naive "later re-forward retries" assumption missed: re-attempt
+            // the durable write now. When the key is NOT recorded, the marks
+            // belong to whichever pass persists it — leave them untouched.
+            let Some(pending) = state.pending_unpersisted_scatters.get(&join_key).cloned() else {
+                return;
+            };
+            let attempt = next_continuation_attempt(state, &join_key);
+            match persist_scatter_queued_checked(state, &pending, attempt) {
+                Ok(()) => {
+                    advance_scatter_marks_after_persist(
+                        state,
+                        &join_group_key,
+                        &join_key,
+                        join_epoch,
+                        attempt,
+                    );
+                    state.pending_unpersisted_scatters.remove(&join_key);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        join_key = %join_key,
+                        attempt,
+                        "scatter join persist retry (Duplicate path) failed; the key \
+                         stays pending for the next retry site"
+                    );
+                }
+            }
             return;
         }
     };
@@ -15527,15 +15605,31 @@ fn reconcile_missing_scatter(
                 join_epoch,
                 attempt,
             );
+            // #27 (round-4, #18 SF3) — a persist that finally succeeded clears
+            // the key from the pending-unpersisted map (no-op on first persist).
+            state.pending_unpersisted_scatters.remove(&join_key);
         }
         Err(err) => {
             // #1707 round 7 (board item #12): the persist FAILED — do NOT
             // advance `last_joined_key` / `delivered_scatter_marks`.
+            // #27 (round-4, #18 SF3): RECORD the item in
+            // `pending_unpersisted_scatters`. The in-memory item stays queued,
+            // so a later same-group terminal upsert collapses to `Duplicate`
+            // and the naive "re-forward retries" assumption never fires;
+            // the explicit retry sites (same-group terminal upsert, the
+            // Duplicate arm above, the gated re-forward reconcile, and the
+            // pre-drain pass) re-attempt the durable write for every recorded
+            // item. A crash before any retry is still recovered by the restore
+            // rebuild pass re-deriving the same key.
+            state
+                .pending_unpersisted_scatters
+                .insert(join_key.clone(), continuation.clone());
             tracing::warn!(
                 ?err,
                 join_key = %join_key,
                 attempt,
-                "scatter join persist failed (marks stay unset; a restart rebuilds it)"
+                "scatter join persist failed; recorded for in-process retry \
+                 (marks stay unset; a restart rebuilds it)"
             );
         }
     }
@@ -15694,6 +15788,88 @@ fn persist_scatter_queued_checked(
         ));
     }
     persist_continuation_queued_with_attempt(state, continuation, attempt)
+}
+
+/// #27 (round-4, #18 SF3) — re-attempt the durable persist for every scatter
+/// join key recorded in `pending_unpersisted_scatters` (enqueue succeeded,
+/// persist failed). The in-memory item is STILL queued, so a naive re-enqueue
+/// collapses to `Duplicate` and the "later re-forward retries" assumption
+/// never fires — this pass is what actually retries the write in-process.
+///
+/// Each recorded entry carries the still-pending `QueuedMasterContinuation`
+/// (inserted by `reconcile_missing_scatter`'s `Err` arm), so the pass
+/// re-persists it directly — no scheduler re-scan — via the shared
+/// `persist_scatter_queued_checked` at attempt 1 (a fresh key's first
+/// persist; replay dedup makes a re-persist of an already-durable record a
+/// no-op). On `Ok` the join marks advance EXACTLY as the original persist
+/// would have (`advance_scatter_marks_after_persist`) and the entry leaves
+/// the map; on `Err` it STAYS recorded so a later site retries again.
+/// Sites: the same-group terminal upsert (`enqueue_agent_terminal_continuations`),
+/// the gated re-forward reconcile (`reconcile_scatter_for_existing_group`),
+/// and the pre-drain pass (`drain_ready_continuations_for_session` /
+/// `drain_and_claim_ready_continuation_for_session`).
+///
+/// NOTE (锁内 I/O): this runs under the orchestrator state lock, like every
+/// other checked persist in this subsystem. Per the board the explicit retry
+/// is in-scope this round; the broader "persist outside the state lock"
+/// redesign is #23 SF2's concern and is deliberately NOT folded in here.
+fn retry_pending_unpersisted_scatters(state: &mut AutonomyRuntimeState) {
+    if state.pending_unpersisted_scatters.is_empty() || state.supervisor_store.is_none() {
+        return;
+    }
+    // Test hook: the FIRST retry also fails, exercising the retry loop.
+    #[cfg(test)]
+    let fail_first_retry = {
+        let armed = state.force_scatter_retry_failure_once;
+        if armed {
+            state.force_scatter_retry_failure_once = false;
+        }
+        armed
+    };
+    // Snapshot (join_key, item) pairs; BTreeMap for deterministic retry order.
+    let pending: std::collections::BTreeMap<String, QueuedMasterContinuation> = state
+        .pending_unpersisted_scatters
+        .iter()
+        .map(|(key, item)| (key.clone(), item.clone()))
+        .collect();
+    #[cfg(test)]
+    let mut fail_budget = fail_first_retry;
+    for (join_key, continuation) in pending {
+        #[cfg(test)]
+        if fail_budget {
+            fail_budget = false;
+            tracing::warn!(
+                join_key = %join_key,
+                "forced scatter retry failure (test hook); key stays pending"
+            );
+            continue;
+        }
+        match persist_scatter_queued_checked(state, &continuation, 1) {
+            Ok(()) => {
+                let cohort_key = scatter_cohort_key(
+                    continuation.group_id.as_str(),
+                    scatter_cwd_hash(&item_workspace(&continuation).map(str::to_owned)),
+                );
+                let join_epoch = continuation
+                    .dedupe_key
+                    .as_str()
+                    .rsplit('/')
+                    .next()
+                    .and_then(|segment| segment.parse::<u64>().ok())
+                    .unwrap_or(0);
+                advance_scatter_marks_after_persist(state, &cohort_key, &join_key, join_epoch, 1);
+                state.pending_unpersisted_scatters.remove(&join_key);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    join_key = %join_key,
+                    "scatter join persist retry failed; key stays pending for the \
+                     next retry site (a restart rebuilds it if the process exits)"
+                );
+            }
+        }
+    }
 }
 
 /// Gap-1 step 3: explicit `ChildCompleted` dedupe key, symmetric to the
@@ -40483,6 +40659,137 @@ mod tests {
                 && item.dedupe_key.as_str().ends_with("/1")),
             "no phantom epoch-1 join is re-emitted; drained {:?}",
             drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// #27 (round-4, #18 SF3) — a scatter whose persist failed is retried
+    /// IN-PROCESS once the store recovers, durably lands, and does NOT
+    /// duplicate on restart. With `force_scatter_persist_failure` armed, the
+    /// epoch-1 scatter enqueue succeeds but its persist fails (key recorded
+    /// in `pending_unpersisted_scatters`); the NEXT same-group terminal
+    /// upsert is the retry site, the record reaches the store, and a fresh
+    /// orchestrator over the same store re-emits NOTHING for the epoch-1 key.
+    #[test]
+    fn scatter_persist_failure_retries_in_process_when_store_recovers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-spr2";
+        let session_id = SessionKey::with_profile(profile, "api", "scatter-retry");
+        let group = format!("agent-group:{profile}:{session_id}:master");
+        let cohort_key = scatter_cohort_key(&group, scatter_cwd_hash(&None));
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("summary-{agent_id}")),
+            cwd: None,
+            profile_id: profile.to_owned(),
+        };
+
+        // Epoch-0 join drains.
+        let orch = InProcessAgentOrchestrator::default();
+        orch.configure_supervisor_store(dir.path()).expect("store");
+        orch.upsert_agent(upsert("agent-1", "running"));
+        orch.upsert_agent(upsert("agent-2", "running"));
+        orch.upsert_agent(upsert("agent-1", "completed"));
+        orch.upsert_agent(upsert("agent-2", "completed"));
+        let drained = orch.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "epoch-0 join drained"
+        );
+
+        // Re-admit agent-3 (bumps epoch to 1), then force its epoch-1 scatter
+        // persist to fail. The key lands in `pending_unpersisted_scatters`.
+        orch.upsert_agent(upsert("agent-3", "running"));
+        assert_eq!(
+            orch.state()
+                .scatter_join_state
+                .get(&cohort_key)
+                .map(|s| s.join_epoch),
+            Some(1),
+            "re-admission bumps the epoch to 1"
+        );
+        orch.set_force_scatter_persist_failure_for_test(true);
+        orch.upsert_agent(upsert("agent-3", "completed"));
+        let epoch1_key = format!(
+            "scatter_join/{group}/{session}/{profile}/{cwd}/1",
+            group = group,
+            session = session_id.0,
+            profile = profile,
+            cwd = scatter_cwd_hash(&None),
+        );
+        assert!(
+            orch.state()
+                .pending_unpersisted_scatters
+                .contains_key(&epoch1_key),
+            "the failed scatter persist records the epoch-1 key for retry"
+        );
+
+        // The retry site: a same-group terminal transition — a status
+        // CORRECTION for agent-1 (completed → failed) — re-enters
+        // `enqueue_agent_terminal_continuations`, whose entry pass retries
+        // the pending epoch-1 scatter persist durably and clears the marker.
+        orch.upsert_agent(upsert("agent-1", "failed"));
+        assert!(
+            !orch
+                .state()
+                .pending_unpersisted_scatters
+                .contains_key(&epoch1_key),
+            "the in-process retry persisted the scatter and cleared the marker"
+        );
+        assert!(
+            orch.state()
+                .delivered_scatter_marks
+                .contains_key(&epoch1_key),
+            "the retried persist advanced the scatter mark"
+        );
+        // The marks advanced: last_joined_key now names the epoch-1 key.
+        let cohort = scatter_cohort_key(&group, scatter_cwd_hash(&None));
+        assert_eq!(
+            orch.state()
+                .scatter_join_state
+                .get(&cohort)
+                .and_then(|s| s.last_joined_key.as_deref()),
+            Some(epoch1_key.as_str()),
+            "the retried persist advanced last_joined_key to the epoch-1 key"
+        );
+        drop(orch);
+
+        // Restart: the epoch-1 scatter record is durable now, so the restore
+        // seeds its marks and re-enqueues it EXACTLY ONCE (the still-Queued
+        // durable record), and the reconcile pass derives its key as ALREADY
+        // delivered — no duplicate epoch-1 join.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let drained = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let epoch1_joins = drained
+            .iter()
+            .filter(|item| {
+                item.reason == MasterContinuationReason::ScatterJoinComplete
+                    && item.dedupe_key.as_str().ends_with("/1")
+            })
+            .count();
+        assert_eq!(
+            epoch1_joins, 1,
+            "the retried epoch-1 join re-enqueues EXACTLY once after restart, never duplicated"
         );
     }
 }
