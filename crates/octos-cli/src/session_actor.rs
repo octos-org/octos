@@ -52,8 +52,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::autonomy::agent_orchestrator::{
-    default_agent_orchestrator, run_goal_completion_verifier_with_usage,
-    upsert_background_task_agent,
+    InProcessAgentOrchestrator, default_agent_orchestrator, run_goal_completion_verifier_with_usage,
 };
 use crate::autonomy::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
@@ -1778,6 +1777,22 @@ fn sanitize_task_for_response(
     })
 }
 
+// Install the actual gateway change/terminal sinks before persistence restore.
+fn install_gateway_task_status_sinks(
+    supervisor: &TaskSupervisor,
+    tx: mpsc::Sender<ActorMessage>,
+    data_dir: PathBuf,
+    orchestrator: InProcessAgentOrchestrator,
+) {
+    let change_runtime = orchestrator.clone();
+    supervisor.set_on_change(move |task| {
+        forward_task_status_to_actor_inbox(&change_runtime, &tx, &data_dir, task);
+    });
+    supervisor.set_on_terminal(move |event| {
+        orchestrator.route_terminal_event_to_continuation_queue(event, None);
+    });
+}
+
 /// Forward a `BackgroundTask` snapshot from the supervisor's
 /// `set_on_change` callback into the session actor's bounded inbox.
 ///
@@ -1792,6 +1807,7 @@ fn sanitize_task_for_response(
 /// **Non-terminal updates** are coalesce-friendly (the next update
 /// overwrites) and stay on the non-blocking `try_send` fast-path.
 fn forward_task_status_to_actor_inbox(
+    orchestrator: &InProcessAgentOrchestrator,
     tx: &tokio::sync::mpsc::Sender<ActorMessage>,
     data_dir: &Path,
     task: &octos_agent::BackgroundTask,
@@ -1801,7 +1817,7 @@ fn forward_task_status_to_actor_inbox(
     // `upsert_background_task_agent` resolves the right profile here; the
     // AppUI/serve bare-key path threads its runtime profile explicitly
     // (see `forward_task_progress_to_channel`).
-    if let Err(error) = upsert_background_task_agent(task, None) {
+    if let Err(error) = orchestrator.upsert_background_task_agent(task, None) {
         // This observer mirrors an existing source task. Report failure while
         // still forwarding that task's truthful status to its owning actor.
         tracing::warn!(task_id = %task.id, error = %error.message,
@@ -3413,13 +3429,14 @@ impl ActorFactory {
         // Cancelled) MUST NOT be silently dropped under inbox backpressure
         // (32 slots), or the UI / SSE consumers stay stuck on `running`.
         // See [`forward_task_status_to_actor_inbox`].
-        let status_tx = tx.clone();
-        let task_data_dir = self.data_dir.clone();
-        supervisor.set_on_change(move |task| {
-            forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
-        });
+        install_gateway_task_status_sinks(
+            &supervisor,
+            tx.clone(),
+            self.data_dir.clone(),
+            default_agent_orchestrator().clone(),
+        );
         // #2055 — create the goal-ledger task row at registration time,
-        // wired next to the unified terminal sink below (whose settle half,
+        // wired next to the unified terminal sink above (whose settle half,
         // #2054, flips the row at terminal). The gateway actor wires its
         // callbacks ONCE at init while goals come and go over the session's
         // life, so the goal binding resolves at CALLBACK time via
@@ -3458,21 +3475,9 @@ impl ActorFactory {
             session_key.profile_id().unwrap_or(MAIN_PROFILE_ID),
             &self.data_dir,
         );
-        // Gap-1 unification: the single terminal sink, also wired BEFORE
-        // `enable_persistence` (see the combined ordering note above). Routes
-        // BOTH success (ChildCompleted) AND failure (recovery) re-entry
-        // through ONE profile-resolving call into the master continuation
-        // queue. Runs alongside the legacy `on_change` →
-        // `upsert_background_task_agent` success path; shared dedupe keys
-        // collapse double delivery. Gateway session keys carry the profile
-        // (`profile:channel:chat`), so `None` lets the key-derived profile
-        // resolve inside the router — matching
-        // `forward_task_status_to_actor_inbox`'s `None` call.
-        supervisor.set_on_terminal(move |event| {
-            crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
-                event, None,
-            );
-        });
+        // Both task-status sinks are installed above, before the composed
+        // restore observer: installing that observer may synchronously adopt
+        // a task from a restore that already happened.
         if let Err(error) = supervisor.enable_persistence(&task_state_path) {
             warn!(
                 session = %session_key,

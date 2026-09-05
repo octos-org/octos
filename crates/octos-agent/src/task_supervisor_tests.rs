@@ -5077,3 +5077,176 @@ fn distinct_workspace_scopes_stay_distinct_on_task_rows() {
         "different workspace scopes stay different on the durable rows"
     );
 }
+
+// #34: equal timestamps are possible for a registered task and its terminal
+// snapshot. Exercise durable merges with exact timestamps, without sleeps.
+fn terminal_timestamp_rows() -> (BackgroundTask, BackgroundTask) {
+    let supervisor = TaskSupervisor::new();
+    let id = supervisor
+        .try_register_peer_with_workspace(
+            "peer_handoff",
+            "timestamp-tie",
+            Some("tenant:api:timestamp"),
+            Some("/tmp/timestamp-ws"),
+        )
+        .unwrap();
+    let spawned = supervisor.get_task(&id).unwrap();
+    supervisor.mark_completed(&id, vec!["result.md".into()]);
+    let mut completed = supervisor.get_task(&id).unwrap();
+    completed.updated_at = spawned.updated_at;
+    completed.completed_at = Some(spawned.updated_at);
+    (spawned, completed)
+}
+
+fn write_terminal_timestamp_rows(path: &PathBuf, rows: &[BackgroundTask]) {
+    let body = rows
+        .iter()
+        .map(|task| {
+            serde_json::to_string(&PersistedTaskRecord {
+                schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+                task: task.clone(),
+            })
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, format!("{body}\n")).unwrap();
+}
+
+#[test]
+fn terminal_timestamp_tie_restores_fast_stamped_completion() {
+    let (spawned, completed) = terminal_timestamp_rows();
+    for reverse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let rows = if reverse {
+            vec![completed.clone(), spawned.clone()]
+        } else {
+            vec![spawned.clone(), completed.clone()]
+        };
+        write_terminal_timestamp_rows(&path, &rows);
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&path).unwrap();
+        let task = restored.get_task(&spawned.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Completed, "reverse={reverse}");
+        assert_eq!(task.workspace_root, spawned.workspace_root);
+        assert_eq!(task.output_files, completed.output_files);
+        assert_eq!(task.updated_at, spawned.updated_at);
+    }
+}
+
+#[test]
+fn terminal_timestamp_tie_all_merge_sites_keep_ownership() {
+    let (spawned, completed) = terminal_timestamp_rows();
+    for mode in ["enable", "bulk", "single"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let mut foreign = completed.clone();
+        foreign.id = "foreign-task".into();
+        write_terminal_timestamp_rows(&path, &[completed.clone(), foreign]);
+        let supervisor = TaskSupervisor::new();
+        supervisor
+            .tasks
+            .lock()
+            .unwrap()
+            .insert(spawned.id.clone(), spawned.clone());
+        if mode == "enable" {
+            supervisor.enable_persistence(&path).unwrap();
+        } else {
+            *supervisor.persistence_path.lock().unwrap() = Some(path.clone());
+            if mode == "bulk" {
+                assert_eq!(supervisor.refresh_from_persistence().unwrap(), 1);
+            } else {
+                supervisor
+                    .refresh_task_from_persistence(&spawned.id)
+                    .unwrap();
+            }
+            assert!(
+                supervisor
+                    .refresh_task_from_persistence("foreign-task")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                supervisor.get_task("foreign-task").is_none(),
+                "refresh must not import foreign IDs"
+            );
+        }
+        assert_eq!(
+            supervisor.get_task(&spawned.id).unwrap().status,
+            TaskStatus::Completed,
+            "{mode}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            2,
+            "no replay rewrite: {mode}"
+        );
+    }
+}
+
+#[test]
+fn terminal_timestamp_tie_respects_final_and_observer_authority() {
+    let (spawned, completed) = terminal_timestamp_rows();
+    let mut observed = completed.clone();
+    observed.status = TaskStatus::Failed;
+    observed.runtime_state = TaskRuntimeState::Failed;
+    observed.failed_by_observer = true;
+    let mut owner_failed = observed.clone();
+    owner_failed.failed_by_observer = false;
+    let mut cancelled = completed.clone();
+    cancelled.status = TaskStatus::Cancelled;
+    cancelled.runtime_state = TaskRuntimeState::Cancelled;
+    let mut parked = spawned.clone();
+    parked.status = TaskStatus::Parked;
+    let mut older_completed = completed.clone();
+    older_completed.updated_at -= chrono::Duration::nanoseconds(1);
+    let mut newer_spawned = spawned.clone();
+    newer_spawned.updated_at += chrono::Duration::nanoseconds(1);
+    for (existing, candidate, expected) in [
+        (observed.clone(), completed.clone(), completed.clone()),
+        (
+            owner_failed.clone(),
+            completed.clone(),
+            owner_failed.clone(),
+        ),
+        (cancelled.clone(), completed.clone(), cancelled),
+        (observed, owner_failed.clone(), owner_failed.clone()),
+        (
+            owner_failed.clone(),
+            {
+                let mut row = owner_failed.clone();
+                row.failed_by_observer = true;
+                row
+            },
+            owner_failed,
+        ),
+        (parked, completed.clone(), completed.clone()),
+        (spawned.clone(), older_completed, spawned.clone()),
+        (completed.clone(), newer_spawned.clone(), newer_spawned),
+        (completed.clone(), spawned, completed),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        write_terminal_timestamp_rows(&path, &[existing.clone(), candidate.clone()]);
+        let rows = TaskSupervisor::load_persisted_tasks(&path).unwrap();
+        let actual = &rows[&existing.id];
+        assert_eq!(
+            (
+                actual.status.clone(),
+                actual.failed_by_observer,
+                actual.updated_at
+            ),
+            (
+                expected.status,
+                expected.failed_by_observer,
+                expected.updated_at
+            ),
+            "existing={:?}/{} candidate={:?}/{}",
+            existing.status,
+            existing.failed_by_observer,
+            candidate.status,
+            candidate.failed_by_observer
+        );
+    }
+}

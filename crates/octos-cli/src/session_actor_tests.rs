@@ -7391,7 +7391,12 @@ async fn terminal_task_status_survives_actor_inbox_backpressure() {
         octos_agent::TaskStatus::Completed,
         octos_agent::TaskRuntimeState::Completed,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain the filler so the spawned awaited send can proceed.
     let _ = rx.recv().await.expect("filler");
@@ -7427,7 +7432,12 @@ async fn non_terminal_task_status_drops_under_inbox_backpressure() {
         octos_agent::TaskStatus::Running,
         octos_agent::TaskRuntimeState::ExecutingTool,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain filler. There must be no durable retry queued behind it.
     let _ = rx.recv().await.expect("filler");
@@ -9742,4 +9752,203 @@ async fn should_wire_goal_task_row_observers_when_gateway_actor_is_spawned() {
 
     drop(tx);
     handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_delivers_one_profiled_carrier() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    use crate::autonomy::supervisor_store::SupervisorStore;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let profile = "gateway-dual-sink";
+    let session = SessionKey::with_profile(profile, "matrix", "completion");
+    assert_eq!(session.profile_id(), Some(profile));
+    let ids: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|call| {
+            let id = supervisor.register("shell", call, Some(&session.0));
+            supervisor.mark_running(&id);
+            id
+        })
+        .collect();
+    for id in &ids {
+        supervisor.mark_completed(id, vec![]);
+    }
+    let mut terminal_ids = std::collections::HashSet::new();
+    while let Ok(message) = rx.try_recv() {
+        if let ActorMessage::TaskStatusChanged { task_json } = message {
+            let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+            if row["lifecycle_state"] == "ready" {
+                terminal_ids.insert(row["id"].as_str().unwrap().to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        terminal_ids,
+        ids.into_iter().collect(),
+        "actual on_change inbox delivery"
+    );
+    assert_eq!(
+        runtime.pending_continuation_count_for_session_for_test(&session, profile),
+        3,
+        "two child verdicts and one final scatter; both real sinks share dedupe"
+    );
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                MAIN_PROFILE_ID,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let durable = SupervisorStore::new(dir.path()).load_state().unwrap();
+    assert_eq!(durable.children.len(), 2);
+    let drained = runtime.drain_ready_continuations_for_session(
+        &session,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(drained.len(), 1);
+    let carrier = &drained[0];
+    assert_eq!(
+        carrier.reason,
+        MasterContinuationReason::ScatterJoinComplete
+    );
+    assert_eq!(
+        carrier.metadata.get("coalesced_count").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        carrier
+            .metadata
+            .get("terminal_children")
+            .map(String::as_str),
+        Some("2")
+    );
+    for child in durable.children.values() {
+        assert!(carrier.metadata["coalesced_child_ids"].contains(&child.child_id));
+    }
+    runtime.mark_continuation_completed(carrier, None);
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let restarted = InProcessAgentOrchestrator::default();
+    restarted.configure_supervisor_store(dir.path()).unwrap();
+    assert_eq!(
+        restarted.pending_continuation_count_for_session_for_test(&session, profile),
+        0
+    );
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_filters_failure_recovery() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    for acked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        let supervisor = TaskSupervisor::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        install_gateway_task_status_sinks(
+            &supervisor,
+            tx,
+            dir.path().to_path_buf(),
+            runtime.clone(),
+        );
+        let profile = "gateway-failure-sink";
+        let session = SessionKey::with_profile(profile, "matrix", &format!("failure-{acked}"));
+        assert_eq!(session.profile_id(), Some(profile));
+        let id = supervisor.register("shell", "failure-call", Some(&session.0));
+        supervisor.mark_running(&id);
+        if acked {
+            supervisor.mark_synth_ack_emitted("failure-call");
+        }
+        supervisor.mark_failed(&id, "owner failed".into());
+        let mut saw_failed = false;
+        while let Ok(message) = rx.try_recv() {
+            if let ActorMessage::TaskStatusChanged { task_json } = message {
+                let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+                saw_failed |= row["id"] == id && row["status"] == "failed";
+            }
+        }
+        assert!(
+            saw_failed,
+            "on_change must project failures with or without ack"
+        );
+        assert!(
+            runtime
+                .drain_ready_continuations_for_session(
+                    &session,
+                    MAIN_PROFILE_ID,
+                    MasterContinuationRuntimeState::idle(),
+                    20
+                )
+                .is_empty()
+        );
+        let drained = runtime.drain_ready_continuations_for_session(
+            &session,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            20,
+        );
+        let recoveries = drained
+            .iter()
+            .filter(|item| {
+                matches!(&item.reason,
+            MasterContinuationReason::External(kind) if kind == "spawn_only_failure")
+            })
+            .count();
+        assert_eq!(
+            recoveries,
+            usize::from(acked),
+            "only the actual terminal sink can enqueue acked recovery"
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ScatterJoinComplete),
+            "on_change still mirrors unacked Failed child verdicts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_ignores_sessionless_reentry() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let completed = supervisor.register("shell", "sessionless-complete", None);
+    supervisor.mark_completed(&completed, vec![]);
+    let failed = supervisor.register("shell", "sessionless-fail", None);
+    supervisor.mark_synth_ack_emitted("sessionless-fail");
+    supervisor.mark_failed(&failed, "failed".into());
+    let mut delivered = 0;
+    while let Ok(message) = rx.try_recv() {
+        if matches!(message, ActorMessage::TaskStatusChanged { .. }) {
+            delivered += 1;
+        }
+    }
+    assert_eq!(
+        delivered, 2,
+        "truthful status delivery still reaches the actor"
+    );
+    assert_eq!(runtime.pending_continuation_count_for_test(), 0);
 }

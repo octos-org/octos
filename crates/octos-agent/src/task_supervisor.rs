@@ -790,6 +790,23 @@ struct PersistedTaskRecord {
     task: BackgroundTask,
 }
 
+// Wall-clock order remains authoritative across supervisors. On an exact
+// tie, accept only lifecycle progress supported by the live transition rules.
+fn task_snapshot_advances(candidate: &BackgroundTask, existing: &BackgroundTask) -> bool {
+    match candidate.updated_at.cmp(&existing.updated_at) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            (candidate.status.is_terminal() && !existing.status.is_terminal())
+                || (existing.status == TaskStatus::Failed
+                    && existing.failed_by_observer
+                    && (candidate.status == TaskStatus::Completed
+                        || (candidate.status == TaskStatus::Failed
+                            && !candidate.failed_by_observer)))
+        }
+    }
+}
+
 fn default_task_ledger_schema() -> u32 {
     CURRENT_TASK_LEDGER_SCHEMA
 }
@@ -1509,7 +1526,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             for (task_id, task) in restored {
                 match tasks.get(&task_id) {
-                    Some(existing) if existing.updated_at >= task.updated_at => {}
+                    Some(existing) if !task_snapshot_advances(&task, existing) => {}
                     _ => {
                         restored_won.insert(task_id.clone());
                         tasks.insert(task_id, task);
@@ -3769,7 +3786,7 @@ impl TaskSupervisor {
             // append to the SAME per-session ledger, so rows can interleave
             // such that an older snapshot lands after a newer one. (codex P2.)
             match restored.get(&record.task.id) {
-                Some(existing) if existing.updated_at >= record.task.updated_at => {}
+                Some(existing) if !task_snapshot_advances(&record.task, existing) => {}
                 _ => {
                     restored.insert(record.task.id.clone(), record.task);
                 }
@@ -3779,7 +3796,8 @@ impl TaskSupervisor {
     }
 
     /// Re-read the persistence ledger and merge any snapshot newer (by
-    /// `updated_at`) than the in-memory copy into `self.tasks`. Unlike
+    /// `updated_at`, with lifecycle progress breaking exact ties) than the
+    /// in-memory copy into `self.tasks`. Unlike
     /// [`Self::enable_persistence`] this does NOT run the orphan sweep, persist
     /// snapshots, or fire callbacks — it only freshens stale in-memory rows.
     ///
@@ -3811,7 +3829,7 @@ impl TaskSupervisor {
             // `cancel_task`/`relaunch_task` (oldest-first) would then fire the
             // wrong supervisor's token while the real worker runs on (codex P1).
             if let Some(existing) = tasks.get(&task_id) {
-                if task.updated_at > existing.updated_at {
+                if task_snapshot_advances(&task, existing) {
                     tasks.insert(task_id, task);
                     refreshed += 1;
                 }
@@ -3842,7 +3860,7 @@ impl TaskSupervisor {
                 // Update only if this supervisor already owns the task — never
                 // import an absent row (codex P1; see `refresh_from_persistence`).
                 if let Some(existing) = tasks.get(task_id) {
-                    if task.updated_at > existing.updated_at {
+                    if task_snapshot_advances(task, existing) {
                         tasks.insert(task_id.to_string(), task.clone());
                     }
                 }

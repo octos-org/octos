@@ -1359,69 +1359,79 @@ pub(crate) fn route_terminal_event_to_continuation_queue(
     event: &octos_agent::TerminalEvent,
     runtime_profile_id: Option<&str>,
 ) {
-    // #2054 settling does NOT live here (review round 2): this sink never
-    // fires for `cancel` (which emits only `notify_change`) and its
-    // once-per-task dedupe would swallow the owner's failed→complete
-    // correction. The goal-ledger settle rides the change feed instead —
-    // see `install_goal_task_row_settle_listener`.
-    match &event.outcome {
-        octos_agent::TerminalOutcome::Completed => {
-            // Mirror the terminal agent record; the upsert's terminal
-            // transition enqueues the autonomous ChildCompleted re-entry
-            // under the resolved profile.
-            if let Err(error) = upsert_background_task_agent(&event.task, runtime_profile_id) {
-                tracing::warn!(task_id = %event.task.id, error = %error.message,
+    default_agent_orchestrator()
+        .route_terminal_event_to_continuation_queue(event, runtime_profile_id);
+}
+
+impl InProcessAgentOrchestrator {
+    pub(crate) fn route_terminal_event_to_continuation_queue(
+        &self,
+        event: &octos_agent::TerminalEvent,
+        runtime_profile_id: Option<&str>,
+    ) {
+        // #2054 settling does NOT live here (review round 2): this sink never
+        // fires for `cancel` (which emits only `notify_change`) and its
+        // once-per-task dedupe would swallow the owner's failed→complete
+        // correction. The goal-ledger settle rides the change feed instead —
+        // see `install_goal_task_row_settle_listener`.
+        match &event.outcome {
+            octos_agent::TerminalOutcome::Completed => {
+                // Mirror the terminal agent record; the upsert's terminal
+                // transition enqueues the autonomous ChildCompleted re-entry
+                // under the resolved profile.
+                if let Err(error) =
+                    self.upsert_background_task_agent(&event.task, runtime_profile_id)
+                {
+                    tracing::warn!(task_id = %event.task.id, error = %error.message,
                     "terminal task mirror admission failed");
+                }
             }
-        }
-        octos_agent::TerminalOutcome::Failed(signal) => {
-            // Synth-ack-as-prompt-selection: only the ack-emitted failures
-            // get a recovery turn. The non-ack cases (the LLM already saw a
-            // sibling error or a `[VALIDATION FAILED]` synchronous result)
-            // are suppressed so we don't double-signal the model.
-            if !event.synth_ack_emitted {
-                tracing::debug!(
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure terminal event suppressed (synth-ack never emitted; prompt selection)"
-                );
-                return;
-            }
-            let Some(session_id) = background_task_session_id(&event.task) else {
-                tracing::debug!(
-                    task_id = %signal.task_id,
-                    "spawn_only failure terminal event has no resolvable session; skipping recovery enqueue"
-                );
-                return;
-            };
-            // Resolve the profile the SAME way the success side does (the
-            // threaded runtime profile, then the key-derived profile),
-            // never the `_main` fallback for a profile-bearing session.
-            let profile_id = runtime_profile_id
-                .filter(|profile| !profile.is_empty())
-                .or_else(|| session_id.profile_id())
-                .unwrap_or(MAIN_PROFILE_ID)
-                .to_owned();
-            let outcome = default_agent_orchestrator().enqueue_spawn_only_failure_continuation(
-                &session_id,
-                &profile_id,
-                signal,
-            );
-            if outcome.is_duplicate() {
-                tracing::debug!(
-                    session = %session_id,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
-                );
-            } else {
-                tracing::info!(
-                    session = %session_id,
-                    task_id = %signal.task_id,
-                    tool = %signal.tool_name,
-                    profile = %profile_id,
-                    "spawn_only failure recovery continuation queued (unified terminal sink)"
-                );
+            octos_agent::TerminalOutcome::Failed(signal) => {
+                // Synth-ack-as-prompt-selection: only the ack-emitted failures
+                // get a recovery turn. The non-ack cases (the LLM already saw a
+                // sibling error or a `[VALIDATION FAILED]` synchronous result)
+                // are suppressed so we don't double-signal the model.
+                if !event.synth_ack_emitted {
+                    tracing::debug!(
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure terminal event suppressed (synth-ack never emitted; prompt selection)"
+                    );
+                    return;
+                }
+                let Some(session_id) = background_task_session_id(&event.task) else {
+                    tracing::debug!(
+                        task_id = %signal.task_id,
+                        "spawn_only failure terminal event has no resolvable session; skipping recovery enqueue"
+                    );
+                    return;
+                };
+                // Resolve the profile the SAME way the success side does (the
+                // threaded runtime profile, then the key-derived profile),
+                // never the `_main` fallback for a profile-bearing session.
+                let profile_id = runtime_profile_id
+                    .filter(|profile| !profile.is_empty())
+                    .or_else(|| session_id.profile_id())
+                    .unwrap_or(MAIN_PROFILE_ID)
+                    .to_owned();
+                let outcome =
+                    self.enqueue_spawn_only_failure_continuation(&session_id, &profile_id, signal);
+                if outcome.is_duplicate() {
+                    tracing::debug!(
+                        session = %session_id,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        "spawn_only failure recovery continuation suppressed (duplicate dedupe key)"
+                    );
+                } else {
+                    tracing::info!(
+                        session = %session_id,
+                        task_id = %signal.task_id,
+                        tool = %signal.tool_name,
+                        profile = %profile_id,
+                        "spawn_only failure recovery continuation queued (unified terminal sink)"
+                    );
+                }
             }
         }
     }
