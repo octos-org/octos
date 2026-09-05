@@ -1291,12 +1291,13 @@ pub async fn remove_my_profile_skill(
 /// profiles saving different secrets under the same env var never overwrite a
 /// single shared keychain item (each profile reads back its own credential).
 ///
-/// `is_macos` and `set_secret` are injected for testability.
+/// `store_available` (a secret-store backend exists on this host) and
+/// `set_secret` are injected for testability.
 pub(crate) fn relocate_secret_to_keychain(
     env_vars: &mut HashMap<String, String>,
     key: &str,
     profile_id: &str,
-    is_macos: bool,
+    store_available: bool,
     set_secret: impl Fn(&str, &str) -> eyre::Result<()>,
 ) -> Result<(), String> {
     let Some(value) = env_vars.get(key) else {
@@ -1307,9 +1308,9 @@ pub(crate) fn relocate_secret_to_keychain(
     if !value.starts_with('{') {
         return Ok(());
     }
-    if !is_macos {
+    if !store_available {
         return Err(format!(
-            "{key}: keychain-backed credential storage is only supported on macOS"
+            "{key}: keychain-backed credential storage is unavailable on this host (no secret store backend)"
         ));
     }
     let account = crate::auth::keychain::scoped_account(key, profile_id);
@@ -6024,11 +6025,17 @@ mod tests {
         // Regression for the dashboard "Custom" bypass: a raw Vertex SA JSON
         // pasted under a CUSTOM env name (VERTEX_API_KEY, not the whitelisted
         // VERTEX_SA_JSON) via PUT /api/my/profile must never reach plaintext
-        // config. Off macOS it's rejected; on macOS it would be relocated to the
-        // keychain instead (skip — that hits the real keychain).
-        if cfg!(target_os = "macos") {
-            return;
-        }
+        // config.
+        //
+        // #2234/45a contract (same shape as the admin.rs twin): the
+        // availability predicate is `keychain::is_available()`, NOT
+        // `cfg!(macos)`. On a store-backed host (linux file backend with an
+        // INJECTED temp root — never the real keychain) the JSON is
+        // legitimately relocated: the call succeeds and the slot becomes a
+        // keychain marker, never the raw value. Hosts with NO backend keep
+        // the rejection.
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
         let (_dir, state, _user_store, profile_store) = temp_app_state();
         profile_store
             .save(&make_user_profile("tenant", "Tenant Owner"))
@@ -6050,15 +6057,35 @@ mod tests {
         )
         .await;
 
-        assert!(
-            res.is_err(),
-            "raw SA JSON under a custom env name must be rejected off macOS"
-        );
         let stored = profile_store.get("tenant").unwrap().expect("profile");
-        assert!(
-            !stored.config.env_vars.contains_key("VERTEX_API_KEY"),
-            "the private key must never be persisted to plaintext config"
-        );
+        let slot = stored
+            .config
+            .env_vars
+            .get("VERTEX_API_KEY")
+            .expect("slot present after either path");
+        if crate::auth::keychain::is_available() {
+            // Store-backed host: relocation succeeded, plaintext replaced by
+            // a keychain marker.
+            assert!(res.is_ok(), "store-backed host relocates the raw SA JSON");
+            assert!(
+                crate::auth::keychain::is_marker(slot),
+                "slot must be a keychain marker, got: {slot}"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the raw private key must never persist"
+            );
+        } else {
+            // No backend: rejected, slot untouched (raw value not persisted).
+            assert!(
+                res.is_err(),
+                "raw SA JSON under a custom env name must be rejected with no store"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the private key must never be persisted to plaintext config"
+            );
+        }
     }
 
     // Replacing `env_vars` wholesale must NOT clobber a real secret when the UI

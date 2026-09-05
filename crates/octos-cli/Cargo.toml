@@ -122,6 +122,7 @@ octos-fleet-worker.workspace = true
 # `tokio::fs::read` followed symlinks between the canonical-descendant
 # check and the read, opening a TOCTOU window.
 libc = { workspace = true }
+rpassword = { workspace = true }
 # `rustix::fs::openat` for the component-by-component path walk in
 # `src/api/preview.rs::open_no_follow_walk`. Codex round-2 BLOCKING #1
 # (issue #996): the previous `symlink_metadata`-then-`open` ancestor

@@ -252,6 +252,142 @@ fn resolve_chat_runtime_paths(
     }
 }
 
+/// Upper bound on retained per-run dirs under `data_dir/runtime/runs/`.
+const RETAINED_CHAT_RUN_DIRS: usize = 8;
+
+/// A run dir younger than this is never pruned, so a burst of new chats
+/// within a day cannot evict a session's dir via the retention window alone.
+const MIN_CHAT_RUN_DIR_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Lock file a live read-only chat holds inside its run dir for the whole
+/// session; the pruner treats a held lock as "still in use" regardless of age
+/// or position in the retention window.
+const CHAT_RUN_LOCK_FILE: &str = "session.lock";
+
+/// Age of a run dir from its id's embedded v7-UUID timestamp (NOT the dir
+/// mtime, which `cp -a`/`tar` can backdate and stray writes can refresh).
+/// `None` — non-v7 id or a future timestamp from clock skew — means "age
+/// unknown": the dir is kept rather than guessed at.
+fn chat_run_dir_age(name: &str) -> Option<std::time::Duration> {
+    let (secs, _) = uuid::Uuid::parse_str(name).ok()?.get_timestamp()?.to_unix();
+    let created = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(created)
+            .unwrap_or_default(),
+    )
+}
+
+/// Whether a live chat session holds `run_dir`'s [`CHAT_RUN_LOCK_FILE`].
+/// A missing lock file means no live session (only sessions create it); a
+/// lock released by process death acquires cleanly here and reads as dead.
+/// The probe is a SHARED lock on a read-only fd (an exclusive probe would
+/// need a writable fd, misreading an unwritable lock file as "dead"); any
+/// other open failure means "unknown" and errs toward keeping the dir.
+fn chat_run_dir_is_live(run_dir: &std::path::Path) -> bool {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .open(run_dir.join(CHAT_RUN_LOCK_FILE))
+    {
+        Ok(file) => fs2::FileExt::try_lock_shared(&file).is_err(),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Prune `data_dir/runtime/runs/` down to the newest
+/// [`RETAINED_CHAT_RUN_DIRS`] run dirs, never touching `current_run_id`, a
+/// live session's dir, or a dir younger than `min_age`.
+///
+/// Every read-only chat mints a private run dir and the skill bootstrap
+/// copies the full bundled skill-binary set (MB-scale × ~10 skills) into it,
+/// so without a bound each `octos chat --sandbox read-only` leaks one
+/// complete copy. Only octos-minted (UUID-named, symlink-free) dirs are
+/// candidates — anything else a user stashed there is left alone. The
+/// effective steady-state cap is `max(RETAINED_CHAT_RUN_DIRS, runs younger
+/// than min_age)`: the age floor protects live sessions at the cost of
+/// retaining a full day's worth of burst runs. Best-effort: a prune failure
+/// logs and never blocks chat startup.
+fn prune_stale_chat_run_dirs(
+    data_dir: &std::path::Path,
+    current_run_id: &str,
+    min_age: std::time::Duration,
+) {
+    let runs_dir = data_dir.join("runtime").join("runs");
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(entries) => entries,
+        // Missing dir is the common case (no read-only run yet) — not an error.
+        Err(_) => return,
+    };
+    // Run ids are v7 UUIDs in canonical lowercase-hyphenated spelling, so
+    // name order is creation order; anything else (a stashed dir, a braced or
+    // uppercase UUID spelling that would sort wrong) is not octos's to delete
+    // and never occupies a retention slot.
+    let mut run_dirs: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            uuid::Uuid::parse_str(name)
+                .map(|u| u.to_string() == *name)
+                .unwrap_or(false)
+        })
+        .collect();
+    run_dirs.sort();
+    let stale_from = run_dirs.len().saturating_sub(RETAINED_CHAT_RUN_DIRS);
+    for name in run_dirs.drain(..stale_from) {
+        if name == current_run_id {
+            continue;
+        }
+        let path = runs_dir.join(&name);
+        if chat_run_dir_age(&name).is_none_or(|age| age < min_age) {
+            continue;
+        }
+        if chat_run_dir_is_live(&path) {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(%error, dir = %name, "failed to prune stale chat run dir");
+        }
+    }
+}
+
+/// Hold an exclusive lock on this chat's run dir for the session's lifetime
+/// so the startup prune — here and in concurrent chats — never deletes a live
+/// session's skill bootstrap or spawn deliverables mid-run. Best-effort: a
+/// filesystem without lock support degrades to the [`MIN_CHAT_RUN_DIR_AGE`]
+/// floor. Workspace-write/dangerous sessions mint no run dir, so there is
+/// nothing to lock.
+fn lock_chat_run_dir(
+    data_dir: &std::path::Path,
+    run_id: &str,
+    permissions: octos_agent::EffectivePermissions,
+) -> Option<std::fs::File> {
+    if permissions.file_access.allows_write() {
+        return None;
+    }
+    let run_dir = data_dir.join("runtime").join("runs").join(run_id);
+    let file = match std::fs::create_dir_all(&run_dir).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(run_dir.join(CHAT_RUN_LOCK_FILE))
+    }) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, "failed to create chat run dir lock file; age floor still applies");
+            return None;
+        }
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Some(file),
+        Err(error) => {
+            tracing::warn!(%error, "failed to lock chat run dir; age floor still applies");
+            None
+        }
+    }
+}
+
 /// `--ask-for-approval` choices, mirroring codex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1312,12 +1448,14 @@ impl ChatCommand {
             self.sandbox,
             self.ask_for_approval,
         )?;
-        let runtime_paths = resolve_chat_runtime_paths(
-            &cwd,
-            &data_dir,
-            permissions,
-            &uuid::Uuid::now_v7().to_string(),
-        );
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let runtime_paths = resolve_chat_runtime_paths(&cwd, &data_dir, permissions, &run_id);
+        // Read-only chats mint one skill-bootstrap dir per run under
+        // `data_dir/runtime/runs/`. Hold this run's liveness lock for the
+        // session, then bound the accumulation (a no-op when the dir is
+        // absent, e.g. only workspace-write chats so far).
+        let _run_dir_lock = lock_chat_run_dir(&data_dir, &run_id, permissions);
+        prune_stale_chat_run_dirs(&data_dir, &run_id, MIN_CHAT_RUN_DIR_AGE);
         if permissions.is_dangerous() {
             // Codex-style one-line RED warning on stderr.
             eprintln!(
@@ -2644,6 +2782,282 @@ mod tests {
         assert_ne!(first.spawn_deliverable_dir, second.spawn_deliverable_dir);
         assert!(first.bootstrap_dir.starts_with(&data_dir));
         assert!(second.bootstrap_dir.starts_with(&data_dir));
+    }
+
+    /// Seed `data_dir/runtime/runs/` with `count` run dirs named by real v7
+    /// UUIDs (what chat mints), returning the names oldest-first — v7 name
+    /// order is creation order, the same order the pruner sorts by.
+    fn seed_run_dirs(data_dir: &std::path::Path, count: usize) -> Vec<String> {
+        let runs_dir = data_dir.join("runtime").join("runs");
+        let mut names: Vec<String> = (0..count)
+            .map(|_| uuid::Uuid::now_v7().to_string())
+            .collect();
+        names.sort();
+        for name in &names {
+            std::fs::create_dir_all(runs_dir.join(name).join("bootstrap")).unwrap();
+        }
+        names
+    }
+
+    /// A valid v7-UUID run-dir name whose embedded timestamp is `secs`
+    /// past the epoch — old no matter when the dir itself was created.
+    fn run_dir_name_with_epoch_secs(secs: u64) -> String {
+        let millis = secs * 1000;
+        // v7 layout: 48-bit unix-ms timestamp across the first two groups,
+        // then version/variant nibbles.
+        format!(
+            "{:08x}-{:04x}-7b3a-8f4c-9d2e1a0b3c4d",
+            millis >> 16,
+            millis & 0xffff
+        )
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_keeps_newest_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 4);
+
+        // Zero min-age: every seeded dir is a prune candidate.
+        prune_stale_chat_run_dirs(dir.path(), names.last().unwrap(), std::time::Duration::ZERO);
+
+        let runs_dir = dir.path().join("runtime").join("runs");
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(
+                runs_dir.join(name).exists(),
+                i >= 4,
+                "run dir {name} retained mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_never_removes_current_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 4);
+
+        // The current run is the OLDEST (e.g. the id was minted before a
+        // backlog of runs): past the retention window but protected by name.
+        prune_stale_chat_run_dirs(dir.path(), &names[0], std::time::Duration::ZERO);
+
+        assert!(
+            dir.path()
+                .join("runtime")
+                .join("runs")
+                .join(&names[0])
+                .exists()
+        );
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_keeps_young_dirs_past_the_retention_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 4);
+
+        // Realistic min-age: freshly-minted ids are too young to prune even
+        // though they overflow the retention window.
+        prune_stale_chat_run_dirs(dir.path(), names.last().unwrap(), MIN_CHAT_RUN_DIR_AGE);
+
+        for name in &names {
+            assert!(dir.path().join("runtime").join("runs").join(name).exists());
+        }
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_uses_embedded_v7_timestamp_over_dir_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        // 8 fresh runs fill the retention window; the 9th dir is FRESH on disk
+        // but carries an id timestamped weeks ago (e.g. restored from backup):
+        // the embedded timestamp, not the dir's on-disk freshness, rules.
+        let _fresh = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS);
+        let old_name = run_dir_name_with_epoch_secs(1_754_000_000);
+        std::fs::create_dir_all(dir.path().join("runtime").join("runs").join(&old_name)).unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), "current", MIN_CHAT_RUN_DIR_AGE);
+
+        assert!(
+            !dir.path()
+                .join("runtime")
+                .join("runs")
+                .join(&old_name)
+                .exists()
+        );
+        for name in &_fresh {
+            assert!(dir.path().join("runtime").join("runs").join(name).exists());
+        }
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_skips_a_live_sessions_locked_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 4);
+        // The oldest run is still live: it holds its session lock.
+        let live_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(
+                dir.path()
+                    .join("runtime")
+                    .join("runs")
+                    .join(&names[0])
+                    .join(CHAT_RUN_LOCK_FILE),
+            )
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&live_lock).unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), names.last().unwrap(), std::time::Duration::ZERO);
+
+        let runs_dir = dir.path().join("runtime").join("runs");
+        assert!(runs_dir.join(&names[0]).exists(), "live run dir pruned");
+        for name in &names[1..4] {
+            assert!(!runs_dir.join(name).exists(), "dead run dir {name} kept");
+        }
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_leaves_non_uuid_entries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 2);
+        // A stray file and a stray dir (user stash): neither is octos's to
+        // delete, and neither occupies a retention slot.
+        let runs_dir = dir.path().join("runtime").join("runs");
+        let stray_file = runs_dir.join("notes.txt");
+        let stray_dir = runs_dir.join("zzz-backup");
+        std::fs::write(&stray_file, b"keep me").unwrap();
+        std::fs::create_dir_all(&stray_dir).unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), names.last().unwrap(), std::time::Duration::ZERO);
+
+        assert!(stray_file.exists());
+        assert!(stray_dir.exists());
+        // Exactly the overflow beyond the newest 8 UUID-named dirs is gone.
+        assert!(!runs_dir.join(&names[0]).exists());
+        assert!(!runs_dir.join(&names[1]).exists());
+        assert!(runs_dir.join(names.last().unwrap()).exists());
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_protects_an_old_live_session_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        // The exact regressed scenario: a long-lived session whose id is OLDER
+        // than the age floor AND outside the retention window, still holding
+        // its lock. It must survive a prune with the production min-age.
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS);
+        let live_name = run_dir_name_with_epoch_secs(1_754_000_000);
+        let live_dir = dir.path().join("runtime").join("runs").join(&live_name);
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let live_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(live_dir.join(CHAT_RUN_LOCK_FILE))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&live_lock).unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), names.last().unwrap(), MIN_CHAT_RUN_DIR_AGE);
+
+        assert!(live_dir.exists(), "old but LIVE run dir pruned");
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_removes_a_dead_sessions_leftover_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS);
+        // A crashed session's dir: old id, leftover session.lock, no holder.
+        let dead_name = run_dir_name_with_epoch_secs(1_754_000_000);
+        let dead_dir = dir.path().join("runtime").join("runs").join(&dead_name);
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        std::fs::write(dead_dir.join(CHAT_RUN_LOCK_FILE), b"").unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), "current", MIN_CHAT_RUN_DIR_AGE);
+
+        assert!(!dead_dir.exists(), "dead run dir with stale lock kept");
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_keeps_dirs_with_unknown_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let _names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 1);
+        // A v4 UUID carries no timestamp: age is unknowable, so the dir is
+        // kept rather than guessed at — even with a zero min-age.
+        let v4_name = uuid::Uuid::new_v4().to_string();
+        let v4_dir = dir.path().join("runtime").join("runs").join(&v4_name);
+        std::fs::create_dir_all(&v4_dir).unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), "current", std::time::Duration::ZERO);
+
+        assert!(v4_dir.exists(), "timestamp-less run dir pruned");
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_ignores_noncanonical_uuid_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 2);
+        // Uppercase parses as a UUID but is not the spelling chat mints: left
+        // alone, and it does not occupy a retention slot.
+        let upper = run_dir_name_with_epoch_secs(1_754_000_000).to_uppercase();
+        let upper_dir = dir.path().join("runtime").join("runs").join(&upper);
+        std::fs::create_dir_all(&upper_dir).unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), names.last().unwrap(), std::time::Duration::ZERO);
+
+        assert!(upper_dir.exists(), "non-canonical uuid dir pruned");
+        // The retention window counts only canonical dirs: the two oldest
+        // overflow exactly as if the uppercase dir were absent.
+        let runs_dir = dir.path().join("runtime").join("runs");
+        assert!(!runs_dir.join(&names[0]).exists());
+        assert!(!runs_dir.join(&names[1]).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_stale_chat_run_dirs_never_follows_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = seed_run_dirs(dir.path(), RETAINED_CHAT_RUN_DIRS + 1);
+        // A UUID-named symlink INTO a real dir: pruning it must not delete
+        // the target, and the symlink itself is not a prune candidate.
+        let target = dir.path().join("real-data");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = dir
+            .path()
+            .join("runtime")
+            .join("runs")
+            .join(uuid::Uuid::now_v7().to_string());
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        prune_stale_chat_run_dirs(dir.path(), names.last().unwrap(), std::time::Duration::ZERO);
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn prune_stale_chat_run_dirs_tolerates_missing_runs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // No runs dir at all: the common no-read-only-run case is a no-op.
+        prune_stale_chat_run_dirs(dir.path(), "run-x", std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn lock_chat_run_dir_locks_only_read_only_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_only =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
+        let workspace_write =
+            resolve_chat_permissions(false, Some(ChatSandboxMode::WorkspaceWrite), None).unwrap();
+
+        // Workspace-write sessions mint no run dir, so there is nothing to lock.
+        assert!(lock_chat_run_dir(dir.path(), "run-a", workspace_write).is_none());
+        assert!(!dir.path().join("runtime").exists());
+
+        // A read-only session holds an exclusive lock for its lifetime.
+        let lock = lock_chat_run_dir(dir.path(), "run-a", read_only).expect("lock acquired");
+        assert!(
+            lock_chat_run_dir(dir.path(), "run-a", read_only).is_none(),
+            "second session must not acquire a live dir's lock"
+        );
+        drop(lock);
+        assert!(lock_chat_run_dir(dir.path(), "run-a", read_only).is_some());
     }
 
     #[test]

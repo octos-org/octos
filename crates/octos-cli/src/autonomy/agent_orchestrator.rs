@@ -5674,6 +5674,12 @@ impl InProcessAgentOrchestrator {
                     ));
                 }
             }
+            if goal.status == "archived" {
+                // #2237 — an archived goal is terminal and operator-only;
+                // point the model at the create path instead of a generic
+                // stale-verdict refusal.
+                return Err("goal is archived; create a new goal instead".to_owned());
+            }
             if goal.status == "complete" {
                 return Err("goal is already complete".to_owned());
             }
@@ -8959,6 +8965,15 @@ impl InProcessAgentOrchestrator {
     /// when no goal exists or replaces the current goal when it is complete").
     /// Always creates an `active`, model-attributed goal owned by `profile_id` —
     /// pause/resume/budget stay user-owned exactly as in `model_transition_goal`.
+    /// #2237 — the TERMINAL goal statuses. Admission (and terminal
+    /// replacement) must key on "is this goal unfinished", not on a single
+    /// literal: an OPERATOR-ARCHIVED goal is just as finished as a complete
+    /// one, and refusing it dead-locked the session (issue #2237: no new
+    /// goal, no goal_update, no `/goal stop`).
+    fn goal_status_is_terminal(status: &str) -> bool {
+        matches!(status, "complete" | "archived")
+    }
+
     pub(crate) fn model_create_goal(
         &self,
         session_id: &SessionKey,
@@ -8989,7 +9004,9 @@ impl InProcessAgentOrchestrator {
                             .to_owned(),
                     );
                 }
-                if existing.status != "complete" {
+                // #2237 — ANY terminal status (complete | archived) admits a
+                // new goal; only genuinely unfinished states refuse.
+                if !Self::goal_status_is_terminal(&existing.status) {
                     return Err(format!(
                         "cannot create a new goal because this session has an unfinished goal \
                          (status `{}`); complete or clear the existing goal first",
@@ -9942,10 +9959,9 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // preserves the update branch's cross-profile guard (which still fires
         // for a mismatched profile because we only remove on a match).
         if requested_status != Some("complete")
-            && state
-                .goals
-                .get(&key)
-                .is_some_and(|g| g.status == "complete" && g.profile_id == request.profile_id)
+            && state.goals.get(&key).is_some_and(|g| {
+                Self::goal_status_is_terminal(&g.status) && g.profile_id == request.profile_id
+            })
         {
             state.goals.remove(&key);
         }
@@ -23223,6 +23239,175 @@ mod tests {
                 transition_actor: None,
             })
             .expect("user replace still works");
+    }
+
+    /// #2237 — archived is TERMINAL: creating a new goal after an operator
+    /// archive must succeed, mint a FRESH goal id, and leave the archived
+    /// record's ledger untouched.
+    #[tokio::test]
+    async fn model_create_goal_admits_after_archived() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-arch");
+        let first = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "first objective", Some(2_000))
+            .expect("initial create");
+        let first_id = first["goal_id"].as_str().expect("id").to_owned();
+
+        // Operator archive (the only archived-reachable path, #25).
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                None,
+                "archive",
+                "test archive",
+                None,
+            )
+            .expect("operator archive");
+
+        // The admission that USED to refuse with (status `archived`).
+        let second = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "second objective", Some(2_000))
+            .expect("create after archive must be admitted (#2237)");
+        let second_id = second["goal_id"].as_str().expect("new id").to_owned();
+        assert_ne!(second_id, first_id, "terminal replacement mints a fresh id");
+        assert_eq!(second["status"], json!("active"));
+
+        // The archived record's ledger is untouched by design (Fix B drops
+        // the in-memory record and never edits the old ledger); the fresh
+        // id + active status above are the pinned observables.
+    }
+
+    /// #2237 — complete stays admissible (behavior unchanged, now pinned).
+    #[tokio::test]
+    async fn model_create_goal_admits_after_complete_unchanged() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-comp");
+        let first = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "first", Some(2_000))
+            .expect("create");
+        let first_id = first["goal_id"].as_str().expect("id").to_owned();
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect("complete");
+        let second = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "second", Some(2_000))
+            .expect("create after complete");
+        assert_ne!(
+            second["goal_id"].as_str().expect("id"),
+            first_id,
+            "fresh id minted"
+        );
+    }
+
+    /// #2237 — active still refuses, with the unchanged message.
+    #[tokio::test]
+    async fn model_create_goal_rejects_active_unchanged() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-active");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "one", None)
+            .expect("first");
+        let err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "two", None)
+            .expect_err("active refuses");
+        assert!(err.contains("unfinished goal (status `active`)"), "{err}");
+    }
+
+    /// #2237 — blocked and paused still refuse, each naming its status.
+    #[tokio::test]
+    async fn model_create_goal_rejects_blocked_and_paused() {
+        for (suffix, status) in [("blocked", "blocked"), ("paused", "paused")] {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let session_id = SessionKey::with_profile("tenant-a", "api", suffix);
+            orchestrator
+                .model_create_goal(&session_id, "tenant-a", "one", None)
+                .expect("first");
+            // blocked is model-reachable via model_transition_goal; paused is
+            // a user/backend state — set it through set_goal's status knob.
+            if status == "blocked" {
+                orchestrator
+                    .model_transition_goal(&session_id, "tenant-a", status, "test", None)
+                    .await
+                    .expect("blocked transition");
+            } else {
+                orchestrator
+                    .set_goal(GoalSetRequest {
+                        session_id: session_id.clone(),
+                        profile_id: "tenant-a".to_owned(),
+                        objective: "one".to_owned(),
+                        status: Some(status.to_owned()),
+                        token_budget: None,
+                        transition_actor: Some("backend".to_owned()),
+                    })
+                    .map(|_| ())
+                    .unwrap_or(());
+            }
+            let err = orchestrator
+                .model_create_goal(&session_id, "tenant-a", "two", None)
+                .expect_err("unfinished refuses");
+            assert!(
+                err.contains(&format!("status `{status}`")),
+                "{status} named in: {err}"
+            );
+        }
+    }
+
+    /// #2237 — budget_limited still refuses.
+    #[tokio::test]
+    async fn model_create_goal_rejects_budget_limited() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-budget");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "one", Some(1_000))
+            .expect("first");
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 1_000);
+        // Lower the budget below used → set_goal flips the goal to
+        // budget_limited (the pre-existing #2010 semantics, see the twin
+        // test `set_goal_flips_active_goal_to_budget_limited_when_budget_
+        // lowered_below_used`).
+        let _ = orchestrator.set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: "tenant-a".to_owned(),
+            objective: "one".to_owned(),
+            status: Some("budget_limited".to_owned()),
+            token_budget: Some(1_000),
+            transition_actor: Some("backend".to_owned()),
+        });
+        let err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "two", None)
+            .expect_err("budget_limited refuses");
+        assert!(err.contains("budget_limited"), "{err}");
+    }
+
+    /// #2237 — goal_update on an archived goal points at create-new instead
+    /// of a stale-verdict refusal.
+    #[tokio::test]
+    async fn goal_update_on_archived_says_create_new() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-update");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "objective", None)
+            .expect("create");
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                None,
+                "archive",
+                "test archive",
+                None,
+            )
+            .expect("archive");
+        let err = orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect_err("update on archived refuses");
+        assert!(
+            err.contains("goal is archived; create a new goal instead"),
+            "guidance message: {err}"
+        );
     }
 
     #[tokio::test]

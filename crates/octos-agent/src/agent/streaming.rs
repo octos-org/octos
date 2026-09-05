@@ -97,11 +97,27 @@ impl Agent {
                 StreamTimeouts {
                     first_token_grace_secs: self.config.llm_first_token_grace.as_secs(),
                     inter_chunk_idle_secs: self.config.llm_stream_idle.as_secs(),
-                    overall_max_secs: self.config.llm_call_max.as_secs(),
+                    overall_max_secs: self.effective_llm_call_max_secs(),
                 }
             };
         self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds)
             .await
+    }
+
+    /// Overall wall-clock cap for a normal (non-voice) turn.
+    ///
+    /// For a local provider (#2229) the cap is disabled by default (`0`) so a
+    /// slow-but-healthy reasoning stream is not guillotined mid-flight while
+    /// tokens are still flowing — Pi has no such cap, and the inter-chunk idle
+    /// and TTFT guards still catch a genuinely dead provider. An operator who
+    /// explicitly sets `OCTOS_LLM_CALL_MAX_SECS` gets exactly that value even on
+    /// local. Cloud keeps the `DEFAULT_LLM_CALL_MAX_SECS` (1200s) backstop.
+    fn effective_llm_call_max_secs(&self) -> u64 {
+        if self.is_local_provider() && std::env::var("OCTOS_LLM_CALL_MAX_SECS").is_err() {
+            0
+        } else {
+            self.config.llm_call_max.as_secs()
+        }
     }
 
     /// Test-only entry point: lets fixtures dial the timeouts down to
