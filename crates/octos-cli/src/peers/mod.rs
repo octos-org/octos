@@ -42,9 +42,7 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, PeerStagedEvent, RpcError,
     UserQuestionRespondParams,
 };
-#[cfg(any(feature = "api", test))]
-use tracing::warn;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
 use crate::contracts::UiProtocolContractStores;
@@ -298,6 +296,49 @@ pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
     format!("{profile_id}:peer:{slug}")
 }
 
+/// #14 (codex round 2) — durable task-id binding leaf in the staged dir.
+///
+/// Written at REGISTRATION time (see [`persist_peer_task_id_binding`]) so the
+/// restore-time adoption sweep can exact-match the parked row's task id
+/// against what the dir was staged FOR. A forged or stale `tool_call_id`
+/// pointing at another peer's staged dir fails that match and is refused.
+pub(crate) const PEER_TASK_ID_LEAF: &str = "task-id";
+
+/// #14 (codex round 2) — persist the registration-time task-id binding.
+///
+/// Called from the `emit_staged` callback AFTER [`bind_peer_supervised_task`]
+/// returns the task id. Atomic + fd-anchored via [`peer_io`]; best-effort —
+/// a write failure (e.g. the staged dir vanished mid-staging) is logged and
+/// the peer runs with the wire-key + originator checks only (the same
+/// posture as legacy staging, which never wrote the leaf). Returns `true`
+/// when the binding landed.
+/// The `dead_code` allowance is for the default-feature build: the only
+/// production caller is the `api`-gated WS `emit_staged` callback; tests
+/// exercise it directly.
+#[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
+pub(crate) fn persist_peer_task_id_binding(peers_root: &Path, slug: &str, task_id: &str) -> bool {
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        warn!(
+            slug,
+            task_id,
+            "peer task-id binding NOT persisted: no staged dir; \
+             restore-time adoption falls back to wire-key + originator checks"
+        );
+        return false;
+    };
+    if let Err(err) = peer_io::write_peer_file_atomic(&dir, PEER_TASK_ID_LEAF, task_id) {
+        warn!(
+            slug,
+            task_id,
+            error = %err,
+            "peer task-id binding NOT persisted; restore-time adoption falls \
+             back to wire-key + originator checks"
+        );
+        return false;
+    }
+    true
+}
+
 /// #8 (continuation-replay review) — adopt orphaned `peer_handoff` tasks whose
 /// result already sits on the blackboard.
 ///
@@ -319,6 +360,37 @@ pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 /// through [`staged_peer_dir`], so a malformed or hostile key can never steer
 /// the lookup out of `peers/`.
 ///
+/// #14 (codex round 2) — adoption-time IDENTITY validation, beyond the bare
+/// slug lookup the #8 sweep had:
+///
+/// 1. **Full wire-key match.** The row's `tool_call_id` must EQUAL
+///    `peer_wire_key(expected_profile, slug)` — the `rsplit` slug extraction
+///    alone left the prefix unverified, so a key forged under a DIFFERENT
+///    profile (`evil:peer:ourslug`) still resolved OUR staged dir.
+/// 2. **Originator cross-check.** The row's `parent_session_key` must equal
+///    the staged dir's `originator` record when that record exists; with no
+///    record (a profile-scoped `peer_prepare` records none — see
+///    `peer_send_input` authorization) it must equal `expected_master_session`
+///    instead. A stale row replayed under another session is refused.
+/// 3. **Persisted task-id binding.** Registration writes `peers/<slug>/
+///    task-id` ([`persist_peer_task_id_binding`]); when present, adoption
+///    requires it to EQUAL the row's task id, so a parked row whose wire key
+///    names a peer but whose task was never staged into THAT dir cannot claim
+///    its result. An ABSENT file means legacy (pre-#14) staging — the sweep
+///    falls back to checks 1+2 rather than stranding every older row.
+///
+/// ## B: settle-binding restoration BEFORE `mark_completed`
+///
+/// The change-feed settle listener resolves the task→goal binding from the
+/// IN-MEMORY `goal_task_ledger_bindings` map, which a restart empties. The
+/// staged dir's `goal` file (`goal_id\ntask_id`, written by [`stage_peer`])
+/// survives; when its task-id line matches THIS row (or is blank — the file
+/// predates the task-id column), the sweep re-stashes the binding via
+/// [`default_agent_orchestrator().record_goal_task_registration`] FIRST, so
+/// the adoption's terminal transition settles the goal ledger row instead of
+/// leaving it `running` forever. That recorder is idempotent per task id
+/// (re-stash installs a fresh generation), so double-binding is safe.
+///
 /// `TaskStatus::Parked` is NOT terminal, so `mark_completed` is the legal,
 /// documented adoption path. Filtering on `status == Parked` makes the sweep
 /// naturally idempotent: an already-adopted (Completed) row is skipped on any
@@ -329,6 +401,8 @@ pub(crate) fn peer_wire_key(profile_id: &str, slug: &str) -> String {
 /// the `api` feature.
 pub(crate) fn adopt_parked_peer_tasks_with_results(
     supervisor: &octos_agent::TaskSupervisor,
+    expected_profile: &str,
+    expected_master_session: &str,
     profile_data_dir: &Path,
     restored: &[octos_agent::BackgroundTask],
 ) -> usize {
@@ -358,6 +432,20 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
             );
             continue;
         }
+        // #14 check 1 — the FULL wire key must match what THIS profile would
+        // have minted for this slug. A prefix forged under another profile
+        // resolves the same staged dir post-rsplit, so the equality check is
+        // what fences it.
+        if task.tool_call_id != peer_wire_key(expected_profile, slug) {
+            debug!(
+                task_id = %task.id,
+                tool_call_id = %task.tool_call_id,
+                expected_profile,
+                "parked peer task wire key does not match the expected profile; \
+                 refusing adoption"
+            );
+            continue;
+        }
         let Some(dir) = staged_peer_dir(&peers_root, slug) else {
             debug!(
                 task_id = %task.id,
@@ -366,6 +454,43 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
             );
             continue;
         };
+        // #14 check 2 — the staged dir's originator must own this row. A
+        // recorded originator is authoritative (cross-session rows are
+        // refused even when the restoring session IS the supervisor's
+        // session, e.g. two masters staged into the same profile); with no
+        // record, fall back to the installer's session.
+        let task_master = task.parent_session_key.as_deref().unwrap_or("");
+        let originator_matches =
+            match peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL) {
+                Some(recorded) => recorded.trim() == task_master,
+                None => task_master == expected_master_session,
+            };
+        if !originator_matches {
+            debug!(
+                task_id = %task.id,
+                slug,
+                task_master,
+                "parked peer task's master session does not own the staged dir; \
+                 refusing adoption"
+            );
+            continue;
+        }
+        // #14 check 3 — exact-match the registration-time task-id binding
+        // when one was persisted (absent = legacy staging; wire-key +
+        // originator checks above carry those rows).
+        if let Some(recorded_id) =
+            peer_io::read_peer_file(&dir, PEER_TASK_ID_LEAF, peer_io::PEER_FILE_READ_CAP_SMALL)
+            && recorded_id.trim() != task.id
+        {
+            debug!(
+                task_id = %task.id,
+                recorded_id = %recorded_id.trim(),
+                slug,
+                "parked peer task id does not match the staged dir's task-id \
+                 binding; refusing adoption"
+            );
+            continue;
+        }
         if !peer_io::peer_regular_file_exists(&dir, "result.md") {
             debug!(
                 task_id = %task.id,
@@ -373,6 +498,27 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
                 "parked peer task has no result.md yet; leaving Parked (client may still adopt)"
             );
             continue;
+        }
+        // #14 B — restore the in-memory task→goal settle binding BEFORE the
+        // terminal transition, so the change-feed settle lands the ledger
+        // row. The `goal` file is authoritative only for the task it was
+        // staged with (its second line); a blank line predates the task-id
+        // column, and check 3 already vouched for the row when the `task-id`
+        // leaf exists.
+        if let Some(goal_body) =
+            peer_io::read_peer_file(&dir, "goal", peer_io::PEER_FILE_READ_CAP_SMALL)
+        {
+            let mut lines = goal_body.lines();
+            let goal_id = lines.next().map(str::trim).unwrap_or("");
+            let bound_task_id = lines.next().map(str::trim).unwrap_or("");
+            if !goal_id.is_empty() && (bound_task_id.is_empty() || bound_task_id == task.id) {
+                default_agent_orchestrator().record_goal_task_registration(
+                    profile_data_dir,
+                    expected_profile,
+                    goal_id,
+                    task,
+                );
+            }
         }
         let result_path = dir.join("result.md").display().to_string();
         supervisor.mark_completed(&task.id, vec![result_path]);
@@ -3096,7 +3242,13 @@ mod peer_task_registry_tests {
         // The restore observer fires with the rebuilt table; the production
         // sweep runs over exactly that snapshot.
         let table = restored_boot.get_all_tasks();
-        let adopted = adopt_parked_peer_tasks_with_results(&restored_boot, &data_dir, &table);
+        let adopted = adopt_parked_peer_tasks_with_results(
+            &restored_boot,
+            "adopt-a",
+            "adopt-a:local",
+            &data_dir,
+            &table,
+        );
 
         assert_eq!(adopted, 1, "only the peer WITH a result may be adopted");
         let done = restored_boot.get_task(&done_id).expect("done row");
@@ -3123,9 +3275,159 @@ mod peer_task_registry_tests {
         // supervisor) skips the now-Completed row instead of re-marking.
         let table = restored_boot.get_all_tasks();
         assert_eq!(
-            adopt_parked_peer_tasks_with_results(&restored_boot, &data_dir, &table),
+            adopt_parked_peer_tasks_with_results(
+                &restored_boot,
+                "adopt-a",
+                "adopt-a:local",
+                &data_dir,
+                &table,
+            ),
             0,
             "re-running the sweep must not re-adopt a Completed row"
+        );
+    }
+
+    /// #14 (codex round 2, item C) — identity validation: a parked row whose
+    /// wire key names a SAFE, staged, result-bearing slug but fails the
+    /// persisted task-id / originator cross-checks must NOT be adopted — a
+    /// forged or stale `tool_call_id` cannot claim another peer's staged
+    /// result, and two Parked rows cannot share one result. The honest twin
+    /// (wire key + originator + task-id all consistent) still adopts.
+    #[test]
+    fn forged_wire_key_adoption_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ledger = dir.path().join("tasks.jsonl");
+        let data_dir = dir.path().join("profile");
+        let peers_root = data_dir.join("peers");
+
+        // Staging turn: two same-profile peers, both parked by the restart
+        // sweep, both with results already on the blackboard. Only `honest`
+        // got the registration-time task-id binding; `forged` is legacy
+        // staging (no task-id leaf).
+        let staging = octos_agent::TaskSupervisor::new();
+        staging.enable_persistence(&ledger).unwrap();
+        let honest_id = bind_peer_supervised_task(
+            &staging,
+            peer_wire_key("forge-a", "honest"),
+            "forge-a:local",
+        )
+        .expect("bind honest peer");
+        let forged_id = bind_peer_supervised_task(
+            &staging,
+            peer_wire_key("forge-a", "forged"),
+            "forge-a:local",
+        )
+        .expect("bind forged peer");
+        for slug in ["honest", "forged"] {
+            std::fs::create_dir_all(peers_root.join(slug)).unwrap();
+            std::fs::write(peers_root.join(slug).join("brief.md"), "brief").unwrap();
+            std::fs::write(peers_root.join(slug).join("result.md"), "findings").unwrap();
+            std::fs::write(peers_root.join(slug).join("originator"), "forge-a:local").unwrap();
+        }
+        std::fs::write(peers_root.join("honest").join("task-id"), &honest_id).unwrap();
+
+        // Next boot: restore + park exactly like the orphan sweep.
+        let boot = octos_agent::TaskSupervisor::new();
+        boot.enable_persistence(&ledger).unwrap();
+        boot.mark_parked(&honest_id, "orphaned across restart".to_string());
+        boot.mark_parked(&forged_id, "orphaned across restart".to_string());
+
+        // A tampered task-id binding: a row whose wire key honestly names
+        // this staged dir but whose task was never staged INTO it (the file
+        // says another task owns the staging) must NOT claim the result —
+        // this is what kills forged/stale wire-key reuse when the binding
+        // exists.
+        std::fs::write(
+            peers_root.join("honest").join("task-id"),
+            "task-someone-else",
+        )
+        .unwrap();
+        let table = boot.get_all_tasks();
+        let tampered_row = table
+            .iter()
+            .find(|task| task.id == honest_id)
+            .expect("honest row")
+            .clone();
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &boot,
+                "forge-a",
+                "forge-a:local",
+                &data_dir,
+                std::slice::from_ref(&tampered_row),
+            ),
+            0,
+            "a row whose task id does not match the staged dir's task-id binding \
+             must NOT adopt the result",
+        );
+        assert_eq!(
+            boot.get_task(&honest_id).unwrap().status,
+            octos_agent::TaskStatus::Parked,
+        );
+        // Restore the truthful binding for the remaining checks.
+        std::fs::write(peers_root.join("honest").join("task-id"), &honest_id).unwrap();
+
+        // Forged profile prefix: `rsplit` would still extract `honest`, but
+        // the full-key equality check refuses it.
+        let mut wrong_profile = table
+            .iter()
+            .find(|task| task.id == honest_id)
+            .expect("honest row")
+            .clone();
+        wrong_profile.tool_call_id = peer_wire_key("evil-profile", "honest");
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &boot,
+                "forge-a",
+                "forge-a:local",
+                &data_dir,
+                &[wrong_profile],
+            ),
+            0,
+            "a wire key minted under another profile must NOT adopt",
+        );
+
+        // Cross-session row: the staged dir's originator is not this row's
+        // master session.
+        let mut foreign_master = table
+            .iter()
+            .find(|task| task.id == honest_id)
+            .expect("honest row")
+            .clone();
+        foreign_master.parent_session_key = Some("forge-a:other-master".to_string());
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &boot,
+                "forge-a",
+                "forge-a:local",
+                &data_dir,
+                &[foreign_master],
+            ),
+            0,
+            "a row whose master session is not the staged originator must NOT adopt",
+        );
+
+        // The honest twins — the row whose binding matches the `task-id`
+        // leaf (honest) AND the legacy row with no leaf at all (forged) —
+        // both adopt through the full sweep.
+        assert_eq!(
+            adopt_parked_peer_tasks_with_results(
+                &boot,
+                "forge-a",
+                "forge-a:local",
+                &data_dir,
+                &table,
+            ),
+            2,
+            "honest rows adopt: binding-matched and legacy (no task-id leaf) alike",
+        );
+        assert_eq!(
+            boot.get_task(&honest_id).unwrap().status,
+            octos_agent::TaskStatus::Completed,
+        );
+        assert_eq!(
+            boot.get_task(&forged_id).unwrap().status,
+            octos_agent::TaskStatus::Completed,
         );
     }
 
@@ -3149,7 +3451,13 @@ mod peer_task_registry_tests {
 
         let table = supervisor.get_all_tasks();
         assert_eq!(
-            adopt_parked_peer_tasks_with_results(&supervisor, &data_dir, &table),
+            adopt_parked_peer_tasks_with_results(
+                &supervisor,
+                "tenant:a",
+                "tenant:a:local:tui",
+                &data_dir,
+                &table,
+            ),
             0,
             "an unsafe slug must never be turned into a path lookup"
         );

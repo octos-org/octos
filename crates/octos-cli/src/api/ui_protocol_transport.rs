@@ -31499,15 +31499,22 @@ async fn run_standalone_turn(
                     .clone()
                     .map(|goal_id| (goal_id, goal_charge_profile.clone()))
             });
-        // #2056 round 2 (H2b) — the RECONCILE binding is resolved separately
-        // and WITHOUT the active-only filter above. Registration is right to
-        // refuse a non-active goal (no new work should be recorded against
-        // one); reconciliation is not — a paused or budget-limited goal keeps
-        // its ledger, and its stranded rows are still wrong. Resolved at
-        // callback time, on the same keys, so a goal that leaves `active`
-        // mid-turn is still reconciled at the next restore. The profile falls
-        // back exactly like `terminal_profile_id` below, because
-        // `goal_charge_profile` degrades to `_main` on a goal-less turn.
+        // #14 (codex round 2, item A) — the per-turn WS supervisor's restore
+        // observer is now the COMPOSED variant (goal resolvers + parked-peer
+        // adoption), identical to the gateway actor's
+        // `session_actor.rs` wiring. This is the supervisor `peer_handoff`
+        // ACTUALLY registers against: `emit_staged` below binds the peer task
+        // via `tool_registry.supervisor()` — i.e. THIS fresh per-turn
+        // supervisor from `snapshot_excluding` — so the goal-only install
+        // here previously left the WS restart-recovery path parking peer
+        // rows without ever adopting them. The extra restore consumer in
+        // `install_peer_restore_observers_composed` REPLACES the single
+        // `on_restore` slot, so the turn-scoped reconcile resolver below
+        // would be silently dropped if we installed it first — hence the
+        // hand-built restore callback that adopts first, then reconciles
+        // through this turn's resolver chain (goal-context key preferred,
+        // wire-key fallback — the #2056 round-2 H2b semantics preserved
+        // verbatim), both halves over the POST-adoption table.
         let restore_goal_key = goal_context.as_ref().map(|goal_ctx| {
             (
                 goal_ctx.goal_session_key.clone(),
@@ -31519,28 +31526,48 @@ async fn run_standalone_turn(
             .clone()
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
-        // Round 3 — the SHARED installer wires both halves (recorder +
-        // change-feed settle listener), with THIS turn's dispatch-time
-        // binding snapshot as the resolver. The settle rides the change
-        // feed as a NAMED listener (not the `on_terminal` sink below):
-        // `cancel` emits only `notify_change`, and the sink's once-per-task
-        // dedupe would swallow the owner's failed→complete correction.
-        // Inherited by nested child supervisors.
-        crate::autonomy::agent_orchestrator::install_goal_task_row_observers(
+        let peer_adopt_profile = session_runtime.profile.profile_id.clone();
+        let peer_adopt_data_dir = session_runtime.profile.data_dir.clone();
+        let peer_adopt_supervisor = task_supervisor.clone();
+        let peer_adopt_master = session_id.to_string();
+        let reconcile_supervisor = task_supervisor.clone();
+        crate::autonomy::agent_orchestrator::install_peer_restore_observers_composed(
             &task_supervisor,
             &session_runtime.profile.data_dir,
             move || register_goal_binding.clone(),
-            move || {
+            move |_restored| {
+                // B — adopt FIRST (its `mark_completed` re-stashes the
+                // task→goal binding from the staged dir's `goal` file), then
+                // reconcile the POST-adoption table so the adopted row's
+                // terminal verdict reaches the goal ledger.
+                crate::peers::adopt_parked_peer_tasks_with_results(
+                    &peer_adopt_supervisor,
+                    &peer_adopt_profile,
+                    &peer_adopt_master,
+                    &peer_adopt_data_dir,
+                    &peer_adopt_supervisor.get_all_tasks(),
+                );
                 let orchestrator = default_agent_orchestrator();
-                if let Some((goal_key, profile)) = restore_goal_key.as_ref()
-                    && let Some(goal_id) =
-                        orchestrator.bound_goal_id_under_goal_key(goal_key, profile)
-                {
-                    return Some((goal_id, profile.clone()));
+                let binding = if let Some((goal_key, profile)) = restore_goal_key.as_ref() {
+                    orchestrator
+                        .bound_goal_id_under_goal_key(goal_key, profile)
+                        .map(|goal_id| (goal_id, profile.clone()))
+                } else {
+                    None
                 }
-                orchestrator
-                    .bound_goal_id(&restore_wire_key, &restore_wire_profile)
-                    .map(|goal_id| (goal_id, restore_wire_profile.clone()))
+                .or_else(|| {
+                    orchestrator
+                        .bound_goal_id(&restore_wire_key, &restore_wire_profile)
+                        .map(|goal_id| (goal_id, restore_wire_profile.clone()))
+                });
+                if let Some((goal_id, profile)) = binding {
+                    orchestrator.reconcile_goal_task_rows_after_restore(
+                        &peer_adopt_data_dir,
+                        &profile,
+                        &goal_id,
+                        &reconcile_supervisor.get_all_tasks(),
+                    );
+                }
             },
         );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
@@ -32064,6 +32091,11 @@ async fn run_standalone_turn(
             // path: empty output files → `cwd=None`; orphan adoption:
             // `cwd=<profile-data>/peers/<slug>`).
             let peer_task_workspace = session_runtime.workspace_root.to_str().map(str::to_owned);
+            // #14 (codex round 2, item C) — the peers root for the
+            // registration-time task-id binding the restore-time adoption
+            // sweep exact-matches against (see
+            // `peers::persist_peer_task_id_binding`).
+            let peer_binding_peers_root = session_runtime.profile.data_dir.join("peers");
             let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
                 Arc::new(move |event: PeerStagedEvent| {
                     let registry_key = peer_wire_key(&peer_task_profile, &event.slug);
@@ -32071,14 +32103,26 @@ async fn run_standalone_turn(
                     // supervisor refuses. Binding that would make the close path
                     // try to retire a task that never existed. See
                     // `bind_peer_supervised_task` for the binding contract.
-                    if bind_peer_supervised_task_with_workspace(
+                    if let Some(task_id) = bind_peer_supervised_task_with_workspace(
                         &peer_supervisor,
                         registry_key,
                         &event.session_id.0,
                         peer_task_workspace.as_deref(),
-                    )
-                    .is_none()
-                    {
+                    ) {
+                        // Persist the task-id binding into the staged dir so a
+                        // later restore-time adoption can exact-match the
+                        // parked row against THIS staging — a forged or stale
+                        // wire key pointing at this dir's result.md is refused
+                        // instead of claiming its result. Best-effort: a
+                        // missing staged dir (or failed write) falls back to
+                        // the wire-key + originator checks only, like legacy
+                        // pre-#14 staging.
+                        crate::peers::persist_peer_task_id_binding(
+                            &peer_binding_peers_root,
+                            &event.slug,
+                            &task_id,
+                        );
+                    } else {
                         tracing::warn!(
                             slug = %event.slug,
                             master = %event.session_id,

@@ -1637,14 +1637,38 @@ pub(crate) fn install_goal_task_row_observers_resolving_at_callback(
     );
 }
 
+/// #14 (codex round 2, item A) — the WS per-turn path wires the composed
+/// installer with its OWN dispatch-time resolvers (the turn-scoped goal
+/// binding snapshot the gateway shape resolves at callback time), so it
+/// needs [`install_goal_task_row_observers_resolving_at_callback_composed`]
+/// under a callable name. Pure alias; the resolve-at-callback convenience
+/// above and the goal-only variant below both delegate to the same body.
+pub(crate) fn install_peer_restore_observers_composed(
+    supervisor: &octos_agent::TaskSupervisor,
+    profile_data_dir: &Path,
+    resolve_register_binding: impl Fn() -> Option<(String, String)> + Send + Sync + 'static,
+    on_restore: impl Fn(&[octos_agent::BackgroundTask]) + Send + Sync + 'static,
+) {
+    install_goal_task_row_observers_composed(
+        supervisor,
+        profile_data_dir,
+        resolve_register_binding,
+        on_restore,
+    );
+}
+
 /// #8 (continuation-replay review) — the adoption sibling of the goal-task-row
 /// restore observer, deliberately NOT folded into
 /// [`install_goal_task_row_observers`]: `on_restore` is a SINGLE-callback slot,
 /// so two installers must COMPOSE inside one callback rather than both call
 /// `set_on_restore`, and peer adoption has nothing to do with goal bookkeeping.
-/// This installer runs the goal reconciliation resolver first, then
-/// [`crate::peers::adopt_parked_peer_tasks_with_results`] on the same restored
-/// table — one `set_on_restore`, both consumers. Replaces
+/// This installer ADOPTS parked peer rows first
+/// ([`crate::peers::adopt_parked_peer_tasks_with_results`], which re-stashes
+/// each adopted task's goal binding from the staged dir's `goal` file), then
+/// runs the goal reconciliation over the POST-adoption table
+/// (`get_all_tasks()`) — one `set_on_restore`, both consumers, and the
+/// adopted rows reach the ledger as terminal (#14: the #8 order reconciled
+/// the PRE-adoption snapshot and settled nothing for them). Replaces
 /// [`install_goal_task_row_observers_resolving_at_callback`] at every call
 /// site whose supervisor can carry `peer_handoff` rows — same signature, same
 /// resolvers, so a site cannot drift onto the goal-only variant.
@@ -1663,17 +1687,46 @@ pub(crate) fn install_peer_restore_observers_resolving_at_callback(
 ) {
     let adoption_supervisor = supervisor.clone();
     let adoption_data_dir = profile_data_dir.to_path_buf();
+    let adoption_profile = profile_id.to_owned();
+    let adoption_master_session = session_id.to_string();
+    let reconcile_supervisor = supervisor.clone();
     install_goal_task_row_observers_resolving_at_callback_composed(
         supervisor,
         session_id,
         profile_id,
         profile_data_dir,
-        Some(Box::new(move |restored| {
+        // #14 (codex round 2) — the callback ORDER flips from #8's
+        // reconcile-then-adopt to ADOPT-then-reconcile. The `restored` slice
+        // is the PRE-adoption snapshot: feeding it to reconcile first settled
+        // nothing for the parked peer rows (they are non-terminal in it), and
+        // adoption's own `mark_completed` then fired the change-feed settle
+        // with the task→goal binding already lost to the restart — the row
+        // stayed `running` forever. Adoption first re-stashes the binding
+        // from the staged dir's `goal` file (see
+        // `adopt_parked_peer_tasks_with_results`), and reconcile afterwards
+        // sees the POST-adoption table (`get_all_tasks()` — the same public
+        // full snapshot `notify_restore` itself delivers; no new octos-agent
+        // API needed), where the adopted rows are terminal with bindings
+        // intact.
+        Some(Box::new(move |_restored| {
             crate::peers::adopt_parked_peer_tasks_with_results(
                 &adoption_supervisor,
+                &adoption_profile,
+                &adoption_master_session,
                 &adoption_data_dir,
-                restored,
+                &adoption_supervisor.get_all_tasks(),
             );
+            if let Some(goal_id) = default_agent_orchestrator().bound_goal_id(
+                &SessionKey(adoption_master_session.clone()),
+                &adoption_profile,
+            ) {
+                default_agent_orchestrator().reconcile_goal_task_rows_after_restore(
+                    &adoption_data_dir,
+                    &adoption_profile,
+                    &goal_id,
+                    &reconcile_supervisor.get_all_tasks(),
+                );
+            }
         })),
     );
 }
@@ -25927,6 +25980,245 @@ mod tests {
     // `on_restore` observer, so there is no new production call site and the
     // tests below drive `enable_persistence`, never the reconciler directly.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // #14 (codex round 2) — parked-peer adoption through the restore observer.
+    // -----------------------------------------------------------------------
+
+    /// #14 (item A) — the COMPOSED per-turn wiring: one `on_restore` callback
+    /// carrying BOTH the goal-task-row reconcile and the parked-peer
+    /// adoption, exactly as the WS per-turn block now installs it. Drives the
+    /// REAL path: a fresh supervisor over the shared ledger, the composed
+    /// installer, then `enable_persistence` — the restore observer must
+    /// adopt the parked peer row whose `result.md` is on the blackboard.
+    #[test]
+    fn ws_restore_composed_observer_adopts_parked_peer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-ws-restore";
+        let wire = SessionKey::with_profile(profile, "api", "ws-restore-composed");
+        let data_dir = dir.path().join("profile");
+        let peers_root = data_dir.join("peers");
+        let jsonl = dir.path().join("tasks.jsonl");
+
+        // Staging turn (the pre-restart supervisor): register + bind the peer
+        // task, persist the staged dir with brief + result + the task-id
+        // binding — what the WS `emit_staged` callback now writes.
+        let staging = octos_agent::TaskSupervisor::new();
+        staging
+            .enable_persistence(&jsonl)
+            .expect("staging persistence");
+        let task_id = crate::peers::bind_peer_supervised_task(
+            &staging,
+            crate::peers::peer_wire_key(profile, "ws-orphan"),
+            &wire.to_string(),
+        )
+        .expect("bind peer");
+        std::fs::create_dir_all(peers_root.join("ws-orphan")).unwrap();
+        std::fs::write(peers_root.join("ws-orphan").join("brief.md"), "brief").unwrap();
+        std::fs::write(peers_root.join("ws-orphan").join("result.md"), "findings").unwrap();
+        std::fs::write(
+            peers_root.join("ws-orphan").join("originator"),
+            wire.to_string(),
+        )
+        .unwrap();
+        assert!(crate::peers::persist_peer_task_id_binding(
+            &peers_root,
+            "ws-orphan",
+            &task_id,
+        ));
+        drop(staging);
+
+        // Next turn's fresh per-turn supervisor: restore parks the row, then
+        // the COMPOSED restore observer adopts it.
+        // Intermediate boot: the restart whose orphan sweep PARKS the peer
+        // row. The in-process bind keeps the row's liveness lease ALIVE (the
+        // sweep's live-worker exemption correctly does NOT park it — as the
+        // peers-module #8 tests reproduce), so park it by hand; the JSONL
+        // append is the durable part. Wired with the composed installer
+        // (goal-only halves inert here: no goal) so the restore has ALREADY
+        // been delivered when the NEXT boot replays — no stale undelivered
+        // flag.
+        let sweep_boot = octos_agent::TaskSupervisor::new();
+        install_peer_restore_observers_composed(&sweep_boot, &data_dir, || None, |_restored| {});
+        sweep_boot
+            .enable_persistence(&jsonl)
+            .expect("sweep boot restore");
+        sweep_boot.mark_parked(&task_id, "orphaned across restart".to_string());
+        drop(sweep_boot);
+
+        // Next turn's fresh per-turn supervisor: restoring the SHARED ledger
+        // fires the composed observer with the row Parked, and the adoption
+        // half adopts it.
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let adopt_supervisor = supervisor.clone();
+        let adopt_profile = profile.to_owned();
+        let adopt_master = wire.to_string();
+        let adopt_data_dir = data_dir.clone();
+        install_peer_restore_observers_composed(
+            &supervisor,
+            &data_dir,
+            || None,
+            move |_restored| {
+                crate::peers::adopt_parked_peer_tasks_with_results(
+                    &adopt_supervisor,
+                    &adopt_profile,
+                    &adopt_master,
+                    &adopt_data_dir,
+                    &adopt_supervisor.get_all_tasks(),
+                );
+            },
+        );
+        supervisor.enable_persistence(&jsonl).expect("restore");
+
+        let row = supervisor.get_task(&task_id).expect("peer row");
+        assert_eq!(
+            row.status,
+            octos_agent::TaskStatus::Completed,
+            "the composed per-turn restore observer must adopt the parked peer \
+             row whose result.md is already on the blackboard",
+        );
+        assert_eq!(
+            row.output_files,
+            vec![
+                peers_root
+                    .join("ws-orphan")
+                    .join("result.md")
+                    .display()
+                    .to_string()
+            ],
+        );
+    }
+
+    /// #14 (item B) — a goal-bound parked peer with a result settles its goal
+    /// ledger row through the COMPOSED gateway restore observer: adoption
+    /// runs FIRST (re-stashing the restart-lost task→goal binding from the
+    /// staged dir's `goal` file), reconcile sees the POST-adoption table, and
+    /// the ledger row flips to `complete` instead of idling `running`.
+    #[test]
+    fn parked_peer_with_result_and_goal_row_settles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = "tenant-peer-goal";
+        let wire = SessionKey::with_profile(profile, "api", "peer-goal-settle");
+        seed_goal(default_agent_orchestrator(), &wire, profile);
+        let goal_id = default_agent_orchestrator()
+            .goal_id_for_test(&wire)
+            .expect("goal id");
+        let jsonl = dir.path().join("tasks.jsonl");
+        let peers_root = dir.path().join("peers");
+
+        // ── boot 1 (staging turn) ─────────────────────────────────────────
+        let staging = octos_agent::TaskSupervisor::new();
+        wire_supervisor_for_goal_task_rows(&staging, &wire, profile, dir.path());
+        staging
+            .enable_persistence(&jsonl)
+            .expect("staging persistence");
+        let task_id = crate::peers::bind_peer_supervised_task(
+            &staging,
+            crate::peers::peer_wire_key(profile, "goal-orphan"),
+            &wire.to_string(),
+        )
+        .expect("bind peer");
+        std::fs::create_dir_all(peers_root.join("goal-orphan")).unwrap();
+        std::fs::write(peers_root.join("goal-orphan").join("brief.md"), "brief").unwrap();
+        std::fs::write(peers_root.join("goal-orphan").join("result.md"), "findings").unwrap();
+        std::fs::write(
+            peers_root.join("goal-orphan").join("originator"),
+            wire.to_string(),
+        )
+        .unwrap();
+        // `stage_peer`'s `goal` file: `goal_id\ntask_id` — the settle-binding
+        // source for the adoption.
+        std::fs::write(
+            peers_root.join("goal-orphan").join("goal"),
+            format!("{goal_id}\n{task_id}"),
+        )
+        .unwrap();
+        assert!(crate::peers::persist_peer_task_id_binding(
+            &peers_root,
+            "goal-orphan",
+            &task_id,
+        ));
+
+        // The crash window: the restart drops the in-memory settle binding;
+        // the ledger row stays `running`.
+        simulate_process_restart_losing_binding(&task_id);
+        {
+            let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+                .expect("ledger exists after registration");
+            assert_eq!(
+                ledger
+                    .get_task(&task_id)
+                    .expect("read row")
+                    .expect("registration created a task row")
+                    .status,
+                "running",
+                "precondition: the registration row is still running",
+            );
+        }
+        drop(staging);
+
+        // ── boot 2 (the restart whose orphan sweep PARKS the row) ─────────
+        // The in-process bind keeps the row's liveness lease ALIVE (the
+        // sweep's live-worker exemption correctly does NOT park it — as the
+        // peers-module #8 tests reproduce), so park it by hand; the JSONL
+        // append is the durable part. Wired with the REAL production gateway
+        // installer so its restore is delivered NOW (adoption finds no
+        // Parked row yet, no-op) — no stale undelivered flag for boot 3.
+        let sweep_boot = octos_agent::TaskSupervisor::new();
+        install_peer_restore_observers_resolving_at_callback(
+            &sweep_boot,
+            &wire,
+            profile,
+            dir.path(),
+        );
+        sweep_boot
+            .enable_persistence(&jsonl)
+            .expect("sweep boot restore");
+        sweep_boot.mark_parked(&task_id, "orphaned across restart".to_string());
+        drop(sweep_boot);
+
+        // ── boot 3 (gateway restore shape, post-park) ─────────────────────
+        let supervisor = octos_agent::TaskSupervisor::new();
+        install_peer_restore_observers_resolving_at_callback(
+            &supervisor,
+            &wire,
+            profile,
+            dir.path(),
+        );
+        supervisor.set_on_terminal(move |event| {
+            route_terminal_event_to_continuation_queue(event, None);
+        });
+        supervisor.enable_persistence(&jsonl).expect("restore");
+
+        // Adoption ran: the parked row completed with the blackboard result…
+        let row = supervisor.get_task(&task_id).expect("peer row");
+        assert_eq!(row.status, octos_agent::TaskStatus::Completed);
+        assert_eq!(
+            row.output_files,
+            vec![
+                peers_root
+                    .join("goal-orphan")
+                    .join("result.md")
+                    .display()
+                    .to_string()
+            ],
+        );
+        // …and the goal ledger row settled THROUGH the adoption: the binding
+        // was re-stashed before `mark_completed`, so the change-feed settle
+        // (synchronous in a non-tokio test) landed the terminal verdict.
+        let ledger = octos_fleet::GoalLedger::open(goal_task_ledger_path(dir.path(), &goal_id))
+            .expect("ledger");
+        assert_eq!(
+            ledger
+                .get_task(&task_id)
+                .expect("read row")
+                .expect("row")
+                .status,
+            "complete",
+            "the adoption's binding restore must settle the goal ledger row \
+             (the #8 order left it `running` forever)",
+        );
+    }
 
     /// Drop a task's in-memory settle binding, reproducing exactly what a
     /// process restart does to it: the JSONL keeps whatever transitions were
