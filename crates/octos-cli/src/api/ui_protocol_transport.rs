@@ -12676,14 +12676,19 @@ async fn raw_profile_llm_fetch_models(
 
     // Protocol-aware discovery, shared verbatim with the admin REST
     // `/api/my/provider-models` surface: the strategy resolves from the route
-    // (api_type override, then the family's declared protocol), and the typed
-    // outcome keeps "enter the model id manually" distinguishable from
+    // (api_type override, then the family's declared protocol — per-model for
+    // families like r9s that pick the wire protocol by model name), and the
+    // typed outcome keeps "enter the model id manually" distinguishable from
     // "credential/endpoint invalid" — instead of collapsing every failure
     // into an empty list + `provider_unavailable`.
-    let discovery =
-        octos_llm::discovery::resolve_model_discovery(Some(&family_id), api_type.as_deref());
+    let route = octos_llm::discovery::resolve_model_discovery(
+        Some(&family_id),
+        api_type.as_deref(),
+        nonempty(params.selection.model_id).as_deref(),
+        base_url.as_deref(),
+    );
     let outcome = octos_llm::discovery::discover_models(
-        discovery,
+        &route,
         &api_key,
         base_url.as_deref(),
         Some(&family_id),

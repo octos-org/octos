@@ -19,6 +19,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     // Groq hosts many open-source models — llama and mixtral are common.
     detect_patterns: &["llama", "mixtral"],
     model_discovery: crate::discovery::OPENAI_MODELS,
+    model_discovery_for_model: None,
     create,
 };
 

@@ -6557,7 +6557,7 @@ fn build_chat_config_keeps_default_temperature_when_unset() {
         chat_temperature: None,
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(chat.temperature, ChatConfig::default().temperature);
     assert_eq!(chat.temperature, Some(0.0));
 }
@@ -6568,7 +6568,7 @@ fn build_chat_config_applies_temperature_override() {
         chat_temperature: Some(0.7),
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(chat.temperature, Some(0.7));
 }
 
@@ -6582,7 +6582,7 @@ fn build_chat_config_threads_sampling_params() {
         chat_sampling_params: Some(sp),
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(
         chat.sampling_params
             .as_ref()
@@ -6590,7 +6590,7 @@ fn build_chat_config_threads_sampling_params() {
         Some(&serde_json::json!(1.1))
     );
     assert_eq!(
-        build_chat_config(&AgentConfig::default()).sampling_params,
+        build_chat_config(&AgentConfig::default(), false).sampling_params,
         None
     );
 }
@@ -6603,9 +6603,34 @@ fn build_chat_config_applies_max_tokens_override_independently() {
         chat_temperature: Some(0.5),
         ..AgentConfig::default()
     };
-    let chat = build_chat_config(&cfg);
+    let chat = build_chat_config(&cfg, false);
     assert_eq!(chat.max_tokens, Some(4096));
     assert_eq!(chat.temperature, Some(0.5));
+}
+
+#[test]
+fn build_chat_config_local_provider_unsets_temperature() {
+    // #2229: on a local provider with no explicit chat_temperature, temperature
+    // is left UNSET (None) so the server samples — the request omits it — rather
+    // than forcing greedy 0.0 (which degenerates local reasoning models).
+    let cfg = AgentConfig {
+        chat_temperature: None,
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg, true);
+    assert_eq!(chat.temperature, None);
+    // Cloud path is unchanged: still the built-in 0.0.
+    assert_eq!(build_chat_config(&cfg, false).temperature, Some(0.0));
+}
+
+#[test]
+fn build_chat_config_local_provider_respects_explicit_temperature() {
+    // An explicit override always wins, even on local.
+    let cfg = AgentConfig {
+        chat_temperature: Some(0.6),
+        ..AgentConfig::default()
+    };
+    assert_eq!(build_chat_config(&cfg, true).temperature, Some(0.6));
 }
 
 // --- #2174: conversation-loop recovery from a degenerate empty MaxTokens ---
@@ -6732,4 +6757,142 @@ async fn non_empty_max_tokens_returns_content_unchanged() {
     }])
     .await;
     assert_eq!(content, "partial but real");
+}
+
+// --- PersistentRetryStateGuard shared-handle write-back (#1655) ---
+
+#[test]
+fn should_not_write_back_when_turn_left_retry_state_unmodified() {
+    // A turn that observed no errors must not touch the shared handle at
+    // all: a concurrent turn's increments landed after this guard loaded,
+    // and an unconditional write-back would silently discard them.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    // Concurrent turn observes two rate-limits while `guard` is alive.
+    {
+        let mut shared = handle.lock().unwrap();
+        shared.counters.rate_limited = 2;
+    }
+
+    drop(guard);
+    assert_eq!(
+        handle.lock().unwrap().counters.rate_limited,
+        2,
+        "clean turn must not clobber concurrent increments"
+    );
+}
+
+#[test]
+fn should_preserve_both_turns_increments_when_turns_overlap() {
+    // Two turns sharing one handle, each observing different errors from
+    // the same base: the merged state must reflect BOTH turns' increments,
+    // so a bucket that crossed its limit cannot be rolled back to a
+    // pre-exhaustion count by the later drop.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let mut turn_a = PersistentRetryStateGuard::new(Some(handle.clone()));
+    let mut turn_b = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    turn_a.counters.rate_limited += 2;
+    turn_b.counters.rate_limited += 1;
+    turn_b.counters.network += 3;
+
+    drop(turn_a);
+    drop(turn_b);
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.counters.rate_limited, 3);
+    assert_eq!(shared.counters.network, 3);
+}
+
+#[test]
+fn should_preserve_both_turns_increments_when_dropped_in_reverse_order() {
+    // Reverse-order twin of
+    // `should_preserve_both_turns_increments_when_turns_overlap` (#2221):
+    // dropping turn B first exercises the same delta merge from the other
+    // side — `rate_limited`, the bucket BOTH turns incremented, must still
+    // accumulate 2 + 1 regardless of which drop runs the merge first.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let mut turn_a = PersistentRetryStateGuard::new(Some(handle.clone()));
+    let mut turn_b = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    turn_a.counters.rate_limited += 2;
+    turn_b.counters.rate_limited += 1;
+    turn_b.counters.network += 3;
+
+    drop(turn_b);
+    drop(turn_a);
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.counters.rate_limited, 3);
+    assert_eq!(shared.counters.network, 3);
+}
+
+#[test]
+fn should_write_back_exact_state_when_no_concurrent_writer() {
+    // Single-agent regression: with no concurrent writer the drop must
+    // reproduce today's byte-for-byte write-back, including the grace-call
+    // reset of `productive_tool_calls_since_last_grace` (a non-monotonic
+    // field, so a naive max-merge would corrupt it).
+    let handle = Arc::new(StdMutex::new(LoopRetryState {
+        productive_tool_calls_since_last_grace: 3,
+        ..Default::default()
+    }));
+    {
+        let mut guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+        guard.observe_budget_exhaustion(); // fires the grace call, resets the counter
+        guard.counters.timeout += 1;
+    }
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.productive_tool_calls_since_last_grace, 0);
+    assert_eq!(shared.grace_calls_fired, 1);
+    assert_eq!(shared.counters.timeout, 1);
+}
+
+#[test]
+fn should_recover_state_from_poisoned_retry_state_mutex() {
+    // A panic while holding the lock poisons the mutex; the guard must
+    // still recover the inner state (with a warning) rather than panic or
+    // discard it.
+    let handle = Arc::new(StdMutex::new(LoopRetryState {
+        grace_calls_fired: 7,
+        ..Default::default()
+    }));
+    let poisoned = handle.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = poisoned.lock().unwrap();
+        panic!("simulated panic while holding the retry-state lock");
+    }));
+    assert!(handle.is_poisoned());
+
+    let guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+    assert_eq!(guard.grace_calls_fired, 7);
+    drop(guard);
+    assert_eq!(
+        handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .grace_calls_fired,
+        7
+    );
+
+    // A DIRTY guard must also recover on drop: the write-back path takes
+    // the same poisoned lock and must merge, not panic.
+    {
+        let mut dirty = PersistentRetryStateGuard::new(Some(handle.clone()));
+        dirty.counters.timeout += 1;
+    }
+    let shared = handle.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(shared.grace_calls_fired, 7);
+    assert_eq!(shared.counters.timeout, 1);
+}
+
+#[test]
+fn should_write_nowhere_when_no_handle_attached() {
+    // Legacy reset-per-turn behaviour: without a handle the guard owns a
+    // fresh state and its drop touches nothing.
+    let mut guard = PersistentRetryStateGuard::new(None);
+    guard.counters.internal += 1;
+    drop(guard); // must not panic
 }

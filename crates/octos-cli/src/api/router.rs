@@ -22,6 +22,7 @@ use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
 use super::metrics;
+use super::private_asr;
 use super::purge;
 use super::session_ingress;
 use super::solo_auth;
@@ -392,6 +393,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/voice", put(auth_handlers::set_my_voice))
         // Per-tenant voice-assistant pre-flight: ASR + LLM + (route-aware) TTS.
         .route("/api/voice/readiness", get(auth_handlers::voice_readiness))
+        .route("/api/private-asr/grant", post(private_asr::browser_grant))
         // Generic profile-scoped text-to-speech synthesis.
         .route(
             "/api/voice/synthesize",

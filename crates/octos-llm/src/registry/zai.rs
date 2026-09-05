@@ -20,6 +20,7 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     // Z.AI hosts multiple model families — no simple detect pattern.
     detect_patterns: &[],
     model_discovery: crate::discovery::ANTHROPIC_MODELS,
+    model_discovery_for_model: None,
     create,
 };
 

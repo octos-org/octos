@@ -182,6 +182,11 @@ pub const SHELL_SPIRAL_VARIANT: &str = "shell_spiral";
 /// Per-variant counters. Each counter is bumped exactly once per observation
 /// and the corresponding limit from [`LoopRetryLimits`] is checked immediately
 /// so the caller never silently exceeds a bucket.
+///
+/// Fields are `pub` for direct reads and test/guard-path mutations, but the
+/// delta-merge (`saturating_add_turn_delta`) relies on every bucket being
+/// append-only: only ever increment, never decrement or reset (see its doc
+/// comment).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopRetryCounters {
     pub rate_limited: u32,
@@ -204,6 +209,71 @@ pub struct LoopRetryCounters {
     pub delegate_depth_exceeded: u32,
     pub internal: u32,
     pub shell_spiral: u32,
+}
+
+impl LoopRetryCounters {
+    /// Add another turn's per-bucket increments (`turn` relative to the
+    /// `base` it loaded from) onto `self` (#1655). Buckets only ever
+    /// increment, so `saturating_sub` yields the turn's own increments and
+    /// two overlapping turns both land in the merged state.
+    ///
+    /// Monotonicity is a load-bearing convention here (#2221): if a future
+    /// change ever decrements a bucket, `saturating_sub` clamps the negative
+    /// delta to zero and the decrement is silently dropped from the merge.
+    /// Bucket mutations must therefore only ever increment — all built-in
+    /// mutations go through `observe*` / `observe_shell_spiral`, which do.
+    fn saturating_add_turn_delta(&mut self, base: &Self, turn: &Self) {
+        self.rate_limited = self
+            .rate_limited
+            .saturating_add(turn.rate_limited.saturating_sub(base.rate_limited));
+        self.context_overflow = self
+            .context_overflow
+            .saturating_add(turn.context_overflow.saturating_sub(base.context_overflow));
+        self.authentication = self
+            .authentication
+            .saturating_add(turn.authentication.saturating_sub(base.authentication));
+        self.quota = self
+            .quota
+            .saturating_add(turn.quota.saturating_sub(base.quota));
+        self.invalid_request = self
+            .invalid_request
+            .saturating_add(turn.invalid_request.saturating_sub(base.invalid_request));
+        self.content_filtered = self
+            .content_filtered
+            .saturating_add(turn.content_filtered.saturating_sub(base.content_filtered));
+        self.provider_unavailable = self.provider_unavailable.saturating_add(
+            turn.provider_unavailable
+                .saturating_sub(base.provider_unavailable),
+        );
+        self.network = self
+            .network
+            .saturating_add(turn.network.saturating_sub(base.network));
+        self.timeout = self
+            .timeout
+            .saturating_add(turn.timeout.saturating_sub(base.timeout));
+        self.tool_execution = self
+            .tool_execution
+            .saturating_add(turn.tool_execution.saturating_sub(base.tool_execution));
+        self.plugin_spawn = self
+            .plugin_spawn
+            .saturating_add(turn.plugin_spawn.saturating_sub(base.plugin_spawn));
+        self.plugin_timeout = self
+            .plugin_timeout
+            .saturating_add(turn.plugin_timeout.saturating_sub(base.plugin_timeout));
+        self.plugin_protocol = self
+            .plugin_protocol
+            .saturating_add(turn.plugin_protocol.saturating_sub(base.plugin_protocol));
+        self.delegate_depth_exceeded = self.delegate_depth_exceeded.saturating_add(
+            turn.delegate_depth_exceeded
+                .saturating_sub(base.delegate_depth_exceeded),
+        );
+        self.internal = self
+            .internal
+            .saturating_add(turn.internal.saturating_sub(base.internal));
+        self.shell_spiral = self
+            .shell_spiral
+            .saturating_add(turn.shell_spiral.saturating_sub(base.shell_spiral));
+    }
 }
 
 /// Loop-level retry state machine. Owns one bounded counter per
@@ -318,6 +388,34 @@ impl LoopRetryState {
     /// `record_productive_tool_call`.
     pub fn counters(&self) -> LoopRetryCounters {
         self.counters
+    }
+
+    /// Merge the delta one turn applied on top of `base` (the state that
+    /// turn loaded) into `self`, which a concurrent turn may have advanced
+    /// since the load (#1655). Bucket counters and `grace_calls_fired` are
+    /// monotonic, so the turn's increments add onto whatever `self` holds
+    /// now — a later write-back can no longer roll a bucket back below a
+    /// count an earlier turn already reached.
+    /// `productive_tool_calls_since_last_grace` is NOT monotonic (a grace
+    /// call resets it to zero), so its delta is applied with signed
+    /// saturation. `limits` is static configuration, taken from `turn` —
+    /// identical to the legacy whole-state write-back in every real flow.
+    ///
+    /// When `self == base` (no concurrent writer) the result is exactly
+    /// `turn`, keeping single-agent behaviour byte-identical.
+    pub fn merge_turn_delta(&mut self, base: &Self, turn: &Self) {
+        self.counters
+            .saturating_add_turn_delta(&base.counters, &turn.counters);
+        self.grace_calls_fired = self.grace_calls_fired.saturating_add(
+            turn.grace_calls_fired
+                .saturating_sub(base.grace_calls_fired),
+        );
+        let productive_delta = i64::from(turn.productive_tool_calls_since_last_grace)
+            - i64::from(base.productive_tool_calls_since_last_grace);
+        self.productive_tool_calls_since_last_grace =
+            (i64::from(self.productive_tool_calls_since_last_grace) + productive_delta)
+                .clamp(0, i64::from(u32::MAX)) as u32;
+        self.limits = turn.limits;
     }
 
     /// Emit a structured `HarnessEventPayload::Retry` event carrying the
@@ -593,6 +691,108 @@ mod tests {
     }
 
     #[test]
+    fn should_merge_every_field_when_turn_delta_applied() {
+        // Field-coverage guard (#2221): the literals below name EVERY field
+        // of `LoopRetryState`, `LoopRetryCounters`, and `LoopRetryLimits`
+        // with no `..Default::default()` spread, so adding a field to any of
+        // the three structs fails THIS test's compilation — forcing the
+        // author to extend `merge_turn_delta` (and
+        // `LoopRetryCounters::saturating_add_turn_delta`) in the same commit.
+        // `turn` also gives each field a DISTINCT delta over `base`
+        // (2 + field offset), so the final whole-struct equality catches
+        // both a forgotten merge line (the field keeps self's value) and a
+        // mis-wired one (a copy-pasted line reading the wrong base/turn
+        // field lands the wrong delta).
+        let uniform_counters = |v: u32| LoopRetryCounters {
+            rate_limited: v,
+            context_overflow: v,
+            authentication: v,
+            quota: v,
+            invalid_request: v,
+            content_filtered: v,
+            provider_unavailable: v,
+            network: v,
+            timeout: v,
+            tool_execution: v,
+            plugin_spawn: v,
+            plugin_timeout: v,
+            plugin_protocol: v,
+            delegate_depth_exceeded: v,
+            internal: v,
+            shell_spiral: v,
+        };
+        let offset_counters = |v: u32| LoopRetryCounters {
+            rate_limited: v,
+            context_overflow: v + 1,
+            authentication: v + 2,
+            quota: v + 3,
+            invalid_request: v + 4,
+            content_filtered: v + 5,
+            provider_unavailable: v + 6,
+            network: v + 7,
+            timeout: v + 8,
+            tool_execution: v + 9,
+            plugin_spawn: v + 10,
+            plugin_timeout: v + 11,
+            plugin_protocol: v + 12,
+            delegate_depth_exceeded: v + 13,
+            internal: v + 14,
+            shell_spiral: v + 15,
+        };
+        let uniform_limits = |v: u32| LoopRetryLimits {
+            rate_limited: v,
+            context_overflow: v,
+            authentication: v,
+            quota: v,
+            invalid_request: v,
+            content_filtered: v,
+            provider_unavailable: v,
+            network: v,
+            timeout: v,
+            tool_execution: v,
+            plugin_spawn: v,
+            plugin_timeout: v,
+            plugin_protocol: v,
+            delegate_depth_exceeded: v,
+            internal: v,
+            shell_spiral: v,
+        };
+
+        let base = LoopRetryState {
+            counters: uniform_counters(1),
+            limits: uniform_limits(100),
+            productive_tool_calls_since_last_grace: 1,
+            grace_calls_fired: 1,
+        };
+        let turn = LoopRetryState {
+            counters: offset_counters(3),
+            limits: uniform_limits(200),
+            productive_tool_calls_since_last_grace: 4,
+            grace_calls_fired: 2,
+        };
+        let mut merged = LoopRetryState {
+            counters: uniform_counters(10),
+            limits: uniform_limits(300),
+            productive_tool_calls_since_last_grace: 5,
+            grace_calls_fired: 5,
+        };
+        merged.merge_turn_delta(&base, &turn);
+
+        let expected = LoopRetryState {
+            // 10 + ((3 + i) - 1) = 12 + i: each bucket gains exactly its OWN
+            // turn delta, so a cross-field mis-wire flips the value.
+            counters: offset_counters(12),
+            // Static configuration, taken wholesale from `turn`.
+            limits: uniform_limits(200),
+            // 5 + (4 - 1): signed delta for the non-monotonic field.
+            productive_tool_calls_since_last_grace: 8,
+            // 5 + (2 - 1): monotonic saturating delta.
+            grace_calls_fired: 6,
+        };
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
     fn legacy_retry_state_json_without_quota_field_deserializes() {
         // Codex round-6: `LoopRetryLimits` and `LoopRetryCounters` gained a
         // `quota` field in round-3. Without `#[serde(default)]`, retry-state
@@ -764,5 +964,67 @@ mod tests {
         for err in samples {
             let _ = state.observe(&err);
         }
+    }
+
+    #[test]
+    fn merge_turn_delta_adds_increments_onto_concurrently_advanced_state() {
+        // Two turns loaded the same base; each bumped different buckets.
+        // Merging turn B's delta onto the state turn A already wrote must
+        // preserve BOTH turns' increments (#1655).
+        let base = LoopRetryState::default();
+        let mut turn = base.clone();
+        turn.counters.rate_limited = 1;
+        turn.counters.network = 3;
+
+        let mut shared = LoopRetryState {
+            counters: LoopRetryCounters {
+                rate_limited: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        shared.merge_turn_delta(&base, &turn);
+        assert_eq!(shared.counters.rate_limited, 3);
+        assert_eq!(shared.counters.network, 3);
+    }
+
+    #[test]
+    fn merge_turn_delta_applies_grace_reset_as_negative_delta() {
+        // `productive_tool_calls_since_last_grace` resets to zero when a
+        // grace call fires — the one non-monotonic field. Its delta must
+        // subtract, not clamp at the base.
+        let base = LoopRetryState {
+            productive_tool_calls_since_last_grace: 3,
+            ..Default::default()
+        };
+        let mut turn = base.clone();
+        turn.observe_budget_exhaustion(); // grace: resets the counter, fires once
+
+        let mut shared = base.clone();
+        shared.merge_turn_delta(&base, &turn);
+        assert_eq!(shared.productive_tool_calls_since_last_grace, 0);
+        assert_eq!(shared.grace_calls_fired, 1);
+    }
+
+    #[test]
+    fn merge_turn_delta_is_identity_without_concurrent_writer() {
+        // Single-agent regression (#1655): when the shared state still
+        // equals what the turn loaded, the merge reproduces the turn's
+        // state exactly — byte-identical to the legacy write-back.
+        let base = LoopRetryState {
+            counters: LoopRetryCounters {
+                timeout: 2,
+                ..Default::default()
+            },
+            productive_tool_calls_since_last_grace: 4,
+            ..Default::default()
+        };
+        let mut turn = base.clone();
+        turn.counters.timeout = 3;
+        turn.observe_budget_exhaustion();
+
+        let mut shared = base.clone();
+        shared.merge_turn_delta(&base, &turn);
+        assert_eq!(shared, turn);
     }
 }
