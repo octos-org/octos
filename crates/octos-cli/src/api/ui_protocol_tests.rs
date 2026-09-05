@@ -15630,6 +15630,55 @@ async fn send_scope_error_does_not_close_when_unauthenticated() {
     assert!(rx.try_recv().is_err(), "no close frame expected");
 }
 
+/// #2040: a stdio connection must NEVER receive the 1008 auth-expiry close.
+/// The stdio dispatch passes the session/open CANDIDATE profile as the
+/// connection scope (so a successful open can rebind the connection), which
+/// routes a profile-segment mismatch through the AUTHENTICATED validator and
+/// tags the error `auth_scope_violation`. On a WS connection that tag
+/// enqueues a 1008 close ahead of the error envelope; on stdio the Close
+/// frame ends the writer loop (`write_stdio_message`), so pre-fix the error
+/// reply was never written and the whole transport died with the request
+/// unanswered.
+#[test]
+fn send_scope_error_on_stdio_answers_without_closing() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+    let ws = WsConnection::new_stdio(writer_tx);
+    // Mirror the stdio dispatch: the candidate profile is passed as the
+    // connection scope and the session_id segment disagrees with it.
+    let session_id = SessionKey::with_profile("nosuchprofile", "local", "tui");
+    let error = validate_session_scope(&session_id, Some("soak"), Some("soak"))
+        .expect_err("segment mismatch must fail validation");
+    assert!(is_auth_scope_violation(&error));
+
+    send_scope_error(&ws, "rpc-1".into(), error);
+
+    // The FIRST frame is the error envelope carrying the request id — not a
+    // Close, which the stdio writer loop treats as end-of-stream.
+    let message = writer_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("the mismatch must still be answered");
+    let WsMessage::Text(text) = message else {
+        panic!(
+            "expected the error envelope first, got a non-text frame \
+             (a Close would end the stdio writer loop)"
+        );
+    };
+    let frame: Value = serde_json::from_str(text.as_ref()).expect("valid JSON frame");
+    assert_eq!(frame["id"], json!("rpc-1"));
+    assert!(
+        frame["error"].is_object(),
+        "the reply carries the scope error: {frame}"
+    );
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "no close frame may follow — on stdio it terminates the writer loop"
+    );
+    assert!(
+        !ws.is_failed(),
+        "a rejected request must not kill the stdio transport"
+    );
+}
+
 #[test]
 fn resolve_router_for_session_rejects_cross_tenant_session_id() {
     // P1: a profile-scoped (tenant-B) connection must not resolve — and so
