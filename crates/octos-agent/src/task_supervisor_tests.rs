@@ -4964,6 +4964,17 @@ fn peer_workspace_stamp_survives_restart_on_first_durable_row() {
             Some("2f686f6d652f7773"),
         )
         .expect("strict registration succeeds");
+    let rows: Vec<PersistedTaskRecord> = std::fs::read_to_string(&ledger)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1, "registration must append exactly one row");
+    assert_eq!(
+        rows[0].task.workspace_root.as_deref(),
+        Some("2f686f6d652f7773"),
+        "a crash immediately after the first append must restore the stamp"
+    );
     assert_eq!(
         supervisor.get_task(&task_id).and_then(|t| t.workspace_root),
         Some("2f686f6d652f7773".to_owned()),
@@ -4985,6 +4996,8 @@ fn peer_workspace_stamp_survives_restart_on_first_durable_row() {
 /// `WorkspacePersistFailed` and leaves NO task row (no half-binding).
 #[test]
 fn peer_workspace_registration_rolls_back_on_failed_first_write() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let temp = tempfile::TempDir::new().unwrap();
     let supervisor = TaskSupervisor::new();
     let ledger = temp.path().join("tasks.jsonl");
@@ -4994,6 +5007,11 @@ fn peer_workspace_registration_rolls_back_on_failed_first_write() {
     std::fs::write(&ledger, "").unwrap();
     std::fs::remove_file(&ledger).unwrap();
     std::fs::create_dir_all(&ledger).unwrap();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let seen = notifications.clone();
+    supervisor.set_on_register(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
 
     let result = supervisor.try_register_peer_with_workspace(
         "peer_handoff",
@@ -5007,6 +5025,8 @@ fn peer_workspace_registration_rolls_back_on_failed_first_write() {
         }
         other => panic!("expected WorkspacePersistFailed, got {other:?}"),
     }
+    assert_eq!(notifications.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read_dir(&ledger).unwrap().count(), 0);
     let tasks: Vec<String> = supervisor
         .tasks
         .lock()
@@ -5022,6 +5042,20 @@ fn peer_workspace_registration_rolls_back_on_failed_first_write() {
         }),
         "the rolled-back registration leaves no task row; tasks: {tasks:?}"
     );
+}
+
+#[test]
+fn peer_workspace_registration_checks_first_write_even_without_scope() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+    assert!(matches!(
+        supervisor.try_register_peer_with_workspace("peer_handoff", "unstamped", None, None),
+        Err(RegisterTaskError::WorkspacePersistFailed { .. })
+    ));
+    assert!(supervisor.get_all_tasks().is_empty());
 }
 
 /// Test ③ (encoding side lives in octos-cli `peers` tests): two DIFFERENT

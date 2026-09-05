@@ -2345,8 +2345,8 @@ impl TaskSupervisor {
     ///
     /// This entry point closes the window structurally: the task is built
     /// WITH the workspace stamp, and the registration only completes if the
-    /// first `persist_snapshot` write SUCCEEDS. On failure the in-memory
-    /// insert is rolled back (no half-bound task) and
+    /// first `persist_snapshot` write SUCCEEDS. On failure the task is never
+    /// inserted or published to registration observers, and
     /// [`RegisterTaskError::WorkspacePersistFailed`] is returned. When the
     /// supervisor has NO persistence path configured the write is trivially
     /// "successful" (in-memory supervision only) and the registration
@@ -2362,44 +2362,17 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         workspace_scope: Option<&str>,
     ) -> Result<String, RegisterTaskError> {
-        let id =
-            self.register_full(tool_name, tool_call_id, session_key, None, None, None, None)?;
-        // Stamp BEFORE the first durable write: if a persist path exists,
-        // roll the stamp + the write into ONE atomic registration step.
-        if let Some(scope) = workspace_scope.filter(|value| !value.is_empty()) {
-            let snapshot = {
-                let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(task) = tasks.get_mut(&id) else {
-                    return Ok(id);
-                };
-                task.workspace_root = Some(scope.to_string());
-                // #21: the stamp must WIN the restore-side `updated_at`
-                // merge — `register_full`'s own snapshot (unstamped) shares
-                // this row's insert timestamp, and `load_persisted_tasks`
-                // keeps the FIRST row on a tie, which would resurrect the
-                // unstamped shape after a crash. Bump the row's clock so
-                // the stamped snapshot is strictly newer.
-                task.updated_at += chrono::Duration::milliseconds(1);
-                tasks.get(&id).cloned()
-            };
-            if let Some(task) = snapshot {
-                if let Err(error) = self.persist_snapshot_strict(&task) {
-                    // Roll back the insert: a task whose first durable row
-                    // could not be written must not exist in memory either
-                    // (the caller will surface the bind failure and never
-                    // retire/binding-reference the id).
-                    self.tasks
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id);
-                    return Err(RegisterTaskError::WorkspacePersistFailed {
-                        tool_call_id: tool_call_id.to_string(),
-                        source: error.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(id)
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            None,
+            None,
+            None,
+            None,
+            workspace_scope,
+            true,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2412,6 +2385,32 @@ impl TaskSupervisor {
         tool_input: Option<Value>,
         originating_client_message_id: Option<String>,
         parent_terminal_check_tool_call_id: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            task_ledger_path,
+            tool_input,
+            originating_client_message_id,
+            parent_terminal_check_tool_call_id,
+            None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_full_with_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+        tool_input: Option<Value>,
+        originating_client_message_id: Option<String>,
+        parent_terminal_check_tool_call_id: Option<&str>,
+        workspace_scope: Option<&str>,
+        require_persistence: bool,
     ) -> Result<String, RegisterTaskError> {
         // Codex P2 follow-up: early terminal-parent check, BEFORE the
         // fan-out cap path. The cap path has side effects (poisoning
@@ -2650,8 +2649,17 @@ impl TaskSupervisor {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
-            workspace_root: None,
+            workspace_root: workspace_scope
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
         };
+        // Read configuration before locking the task table: enable_persistence
+        // may consult the task table while holding the configuration lock.
+        let persistence_path = self
+            .persistence_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         // Codex P2 atomicity: when this is a child-task registration
         // that requested the parent-terminal guard, recheck parent
@@ -2685,9 +2693,22 @@ impl TaskSupervisor {
                 parent_status: status,
             });
         }
+        // Publish the task only after its first, already-stamped row has
+        // been accepted. Holding the task lock also prevents readers from
+        // observing an uncommitted registration.
+        if require_persistence {
+            Self::persist_snapshot_strict(persistence_path.as_ref(), &task).map_err(|error| {
+                RegisterTaskError::WorkspacePersistFailed {
+                    tool_call_id: tool_call_id.to_string(),
+                    source: error.to_string(),
+                }
+            })?;
+        }
         tasks.insert(id.clone(), task);
         drop(tasks);
-        self.persist_snapshot_by_id(&id);
+        if !require_persistence {
+            self.persist_snapshot_by_id(&id);
+        }
         record_child_session_lifecycle(
             "tracked",
             if session_key.is_some() {
@@ -3656,12 +3677,10 @@ impl TaskSupervisor {
     /// warning it away, so the strict registration entry point can roll the
     /// in-memory insert back and surface the failure. `Ok(())` when no
     /// persistence path is configured (in-memory supervision contract).
-    fn persist_snapshot_strict(&self, task: &BackgroundTask) -> std::io::Result<()> {
-        let path = self
-            .persistence_path
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+    fn persist_snapshot_strict(
+        path: Option<&PathBuf>,
+        task: &BackgroundTask,
+    ) -> std::io::Result<()> {
         let Some(path) = path else {
             return Ok(());
         };
@@ -3671,7 +3690,7 @@ impl TaskSupervisor {
         };
         let json = serde_json::to_string(&record)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Self::append_persisted_task(&path, &json)
+        Self::append_persisted_task(path, &json)
     }
 
     fn persist_snapshot(&self, task: &BackgroundTask) {
