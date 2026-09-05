@@ -32090,7 +32090,14 @@ async fn run_standalone_turn(
             // from `output_files[0]` never matched it in production (close
             // path: empty output files → `cwd=None`; orphan adoption:
             // `cwd=<profile-data>/peers/<slug>`).
-            let peer_task_workspace = session_runtime.workspace_root.to_str().map(str::to_owned);
+            // #21 (round-4, codex #17 B3) — LOSSLESS scope encoding: hex of
+            // the path's raw OsStr bytes (never `to_str()`, which collapses
+            // every non-UTF-8 root to None and desynced the stamp from the
+            // purge argument). The decode side (`/stop` purge) encodes its
+            // own `workspace_root` with the SAME helper, so both endpoints
+            // compare one representation.
+            let peer_task_scope =
+                crate::peers::workspace_scope_encode(&session_runtime.workspace_root);
             // #14 (codex round 2, item C) — the peers root for the
             // registration-time task-id binding the restore-time adoption
             // sweep exact-matches against (see
@@ -32099,36 +32106,54 @@ async fn run_standalone_turn(
             let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
                 Arc::new(move |event: PeerStagedEvent| {
                     let registry_key = peer_wire_key(&peer_task_profile, &event.slug);
-                    // `register` returns an EMPTY-STRING sentinel when the
-                    // supervisor refuses. Binding that would make the close path
-                    // try to retire a task that never existed. See
-                    // `bind_peer_supervised_task` for the binding contract.
-                    if let Some(task_id) = bind_peer_supervised_task_with_workspace(
+                    // #21 (round-4, codex #17 B3) — STRICT workspace-scoped
+                    // binding: the first durable task row carries the
+                    // workspace stamp (hex-encoded OsStr bytes — lossless for
+                    // non-UTF-8 roots), and a failed first write surfaces as
+                    // an Err so the peer is NEVER half-bound (the in-memory
+                    // row was rolled back inside the supervisor; the peer
+                    // runs unsupervised, which the warn below states). A cap
+                    // refusal maps to `Ok(None)` — the pre-#21 posture.
+                    match crate::peers::bind_peer_supervised_task_with_workspace_strict(
                         &peer_supervisor,
                         registry_key,
                         &event.session_id.0,
-                        peer_task_workspace.as_deref(),
+                        peer_task_scope.as_deref(),
                     ) {
-                        // Persist the task-id binding into the staged dir so a
-                        // later restore-time adoption can exact-match the
-                        // parked row against THIS staging — a forged or stale
-                        // wire key pointing at this dir's result.md is refused
-                        // instead of claiming its result. Best-effort: a
-                        // missing staged dir (or failed write) falls back to
-                        // the wire-key + originator checks only, like legacy
-                        // pre-#14 staging.
-                        crate::peers::persist_peer_task_id_binding(
-                            &peer_binding_peers_root,
-                            &event.slug,
-                            &task_id,
-                        );
-                    } else {
-                        tracing::warn!(
-                            slug = %event.slug,
-                            master = %event.session_id,
-                            "peer task registration refused by the supervisor; \
-                             peer runs UNSUPERVISED (no task row, no cancel token)"
-                        );
+                        Ok(Some(task_id)) => {
+                            // Persist the task-id binding into the staged dir
+                            // so a later restore-time adoption can exact-match
+                            // the parked row against THIS staging — a forged
+                            // or stale wire key pointing at this dir's
+                            // result.md is refused instead of claiming its
+                            // result. Best-effort: a missing staged dir (or
+                            // failed write) falls back to the wire-key +
+                            // originator checks only, like legacy pre-#14
+                            // staging.
+                            crate::peers::persist_peer_task_id_binding(
+                                &peer_binding_peers_root,
+                                &event.slug,
+                                &task_id,
+                            );
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                slug = %event.slug,
+                                master = %event.session_id,
+                                "peer task registration refused by the supervisor; \
+                                 peer runs UNSUPERVISED (no task row, no cancel token)"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                slug = %event.slug,
+                                master = %event.session_id,
+                                error = %err,
+                                "peer task registration ROLLED BACK (first durable \
+                                 write failed); peer runs UNSUPERVISED — no half-\
+                                 bound task row exists"
+                            );
+                        }
                     }
                     let _ = send_notification_durable(
                         &peer_ws,
@@ -34794,11 +34819,18 @@ async fn run_standalone_turn(
         // children inherited (the continuations' `payload:workspace` stamps
         // come from `agent.cwd`). An empty root string normalizes to `None`,
         // matching unstamped items only.
-        let purge_workspace = session_runtime.workspace_root.to_str();
+        //
+        // #21 (round-4, codex #17 B3) — BOTH endpoints now encode the root
+        // with `workspace_scope_encode` (hex of the raw OsStr bytes): the
+        // stamp side (peer task registration) and this purge side share one
+        // lossless representation, so a non-UTF-8 root stamps and purges as
+        // the SAME scope instead of one side collapsing to `None` via
+        // `to_str()` and silently widening the match.
+        let purge_workspace = crate::peers::workspace_scope_encode(&session_runtime.workspace_root);
         let purged = default_agent_orchestrator().clear_pending_terminal_continuations_for_session(
             &session_id,
             &session_runtime.profile.profile_id,
-            purge_workspace,
+            purge_workspace.as_deref(),
             "session_interrupt_stop",
         );
         if purged > 0 {

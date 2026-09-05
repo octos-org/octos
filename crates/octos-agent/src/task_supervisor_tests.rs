@@ -4941,3 +4941,105 @@ fn orphan_restart_parks_then_client_reattach_revives_full_chain() {
         "completed_at stamps the real terminal"
     );
 }
+
+// #21 (round-4, codex #17 B3) — the peer-task registration's FIRST durable
+// row carries the workspace stamp; a failed first write rolls the whole
+// registration back.
+
+/// Test ①: after the strict registration (and a simulated crash — a fresh
+/// supervisor over the same ledger), the restored task STILL carries the
+/// workspace scope. No second `set_workspace_root` write ever happened.
+#[test]
+fn peer_workspace_stamp_survives_restart_on_first_durable_row() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger).expect("persistence");
+
+    let task_id = supervisor
+        .try_register_peer_with_workspace(
+            "peer_handoff",
+            "tenant:peer:alpha",
+            Some("tenant:api:master"),
+            Some("2f686f6d652f7773"),
+        )
+        .expect("strict registration succeeds");
+    assert_eq!(
+        supervisor.get_task(&task_id).and_then(|t| t.workspace_root),
+        Some("2f686f6d652f7773".to_owned()),
+        "the stamp is on the in-memory row"
+    );
+    drop(supervisor);
+
+    // "Crash" + restart: the FIRST durable row already carried the scope.
+    let restored = TaskSupervisor::new();
+    restored.enable_persistence(&ledger).expect("restore");
+    assert_eq!(
+        restored.get_task(&task_id).and_then(|t| t.workspace_root),
+        Some("2f686f6d652f7773".to_owned()),
+        "the restored row keeps the workspace scope from the FIRST write"
+    );
+}
+
+/// Test ②: a failed first durable write returns
+/// `WorkspacePersistFailed` and leaves NO task row (no half-binding).
+#[test]
+fn peer_workspace_registration_rolls_back_on_failed_first_write() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let supervisor = TaskSupervisor::new();
+    let ledger = temp.path().join("tasks.jsonl");
+    supervisor.enable_persistence(&ledger).expect("persistence");
+    // enable_persistence with zero tasks never creates the ledger file —
+    // create it, then replace it with a directory → appends now fail.
+    std::fs::write(&ledger, "").unwrap();
+    std::fs::remove_file(&ledger).unwrap();
+    std::fs::create_dir_all(&ledger).unwrap();
+
+    let result = supervisor.try_register_peer_with_workspace(
+        "peer_handoff",
+        "tenant:peer:beta",
+        Some("tenant:api:master"),
+        Some("deadbeef"),
+    );
+    match result {
+        Err(RegisterTaskError::WorkspacePersistFailed { tool_call_id, .. }) => {
+            assert_eq!(tool_call_id, "tenant:peer:beta");
+        }
+        other => panic!("expected WorkspacePersistFailed, got {other:?}"),
+    }
+    let tasks: Vec<String> = supervisor
+        .tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        tasks.iter().all(|id| {
+            supervisor
+                .get_task(id)
+                .is_none_or(|t| t.tool_call_id != "tenant:peer:beta")
+        }),
+        "the rolled-back registration leaves no task row; tasks: {tasks:?}"
+    );
+}
+
+/// Test ③ (encoding side lives in octos-cli `peers` tests): two DIFFERENT
+/// scopes never alias — asserted here at the row level: distinct scopes
+/// produce distinct stamps, so the purge-side exact match cannot clear the
+/// other's items.
+#[test]
+fn distinct_workspace_scopes_stay_distinct_on_task_rows() {
+    let supervisor = TaskSupervisor::new();
+    let a = supervisor
+        .try_register_peer_with_workspace("peer_handoff", "t:peer:a", Some("t:api:m"), Some("aa"))
+        .expect("a registers");
+    let b = supervisor
+        .try_register_peer_with_workspace("peer_handoff", "t:peer:b", Some("t:api:m"), Some("bb"))
+        .expect("b registers");
+    assert_ne!(
+        supervisor.get_task(&a).and_then(|t| t.workspace_root),
+        supervisor.get_task(&b).and_then(|t| t.workspace_root),
+        "different workspace scopes stay different on the durable rows"
+    );
+}

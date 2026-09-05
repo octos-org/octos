@@ -237,6 +237,7 @@ pub(crate) fn peer_task_registry() -> &'static PeerTaskRegistry {
 /// close path try to retire a task that never existed. The peer then runs
 /// UNSUPERVISED (no task row, no cancel token); callers should say so loudly.
 #[cfg(any(feature = "api", test))]
+#[cfg_attr(feature = "api", allow(dead_code))]
 pub(crate) fn bind_peer_supervised_task(
     supervisor: &octos_agent::TaskSupervisor,
     registry_key: String,
@@ -259,6 +260,7 @@ pub(crate) fn bind_peer_supervised_task(
 /// `session_runtime.workspace_root`. Passing `None` (or empty) leaves the
 /// task unstamped and preserves the pre-#13r2 legacy derivation.
 #[cfg(any(feature = "api", test))]
+#[cfg_attr(feature = "api", allow(dead_code))]
 pub(crate) fn bind_peer_supervised_task_with_workspace(
     supervisor: &octos_agent::TaskSupervisor,
     registry_key: String,
@@ -268,6 +270,60 @@ pub(crate) fn bind_peer_supervised_task_with_workspace(
     let task_id = bind_peer_supervised_task(supervisor, registry_key, master_session)?;
     supervisor.set_workspace_root(&task_id, master_workspace_root);
     Some(task_id)
+}
+
+/// #21 (round-4, codex #17 B3) — STRICT workspace-scoped binding: the FIRST
+/// durable task row already carries the workspace stamp, and a failed first
+/// write rolls the whole registration back (no half-bound task, no registry
+/// entry). Returns the task id on success, `None` on refusal, and
+/// `Err(io)` when the durable write failed (the caller must surface the
+/// bind failure — the peer still stages, but unsupervised).
+#[cfg(any(feature = "api", test))]
+#[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
+pub(crate) fn bind_peer_supervised_task_with_workspace_strict(
+    supervisor: &octos_agent::TaskSupervisor,
+    registry_key: String,
+    master_session: &str,
+    master_workspace_scope: Option<&str>,
+) -> Result<Option<String>, std::io::Error> {
+    match supervisor.try_register_peer_with_workspace(
+        "peer_handoff",
+        &registry_key,
+        Some(master_session),
+        master_workspace_scope,
+    ) {
+        Ok(task_id) => {
+            peer_task_registry().bind(registry_key, task_id.clone());
+            Ok(Some(task_id))
+        }
+        Err(octos_agent::RegisterTaskError::WorkspacePersistFailed { source, .. }) => {
+            Err(std::io::Error::other(source))
+        }
+        // Cap/parent-terminal refusals: the supervisor refused the
+        // registration outright (same shape as the legacy empty-string
+        // sentinel) — not an I/O failure.
+        Err(_) => Ok(None),
+    }
+}
+
+/// #21 (round-4, codex #17 B3) — LOSSLESS workspace scope encoding.
+///
+/// `Path::to_str()` collapses every non-UTF-8 path to `None`, which made
+/// the stamp and the `/stop` purge argument disagree with each other on
+/// exotic cwds (stamp side: `None`; purge side: possibly `Some` via a
+/// different derivation — both endpoints silently losing the workspace
+/// identity). The scope is instead the hex encoding of the path's raw
+/// [`OsStr`] bytes: every representable path round-trips exactly, and two
+/// DIFFERENT non-UTF-8 roots encode to two DIFFERENT scopes (never
+/// accidentally clearing each other). An empty/absent root encodes to
+/// `None` (unstamped, legacy shape).
+#[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
+pub(crate) fn workspace_scope_encode(root: &std::path::Path) -> Option<String> {
+    let bytes = root.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// #1868 Phase 1 — retire the task bound at staging, on the CLOSE path only.
@@ -3720,5 +3776,104 @@ mod peer_task_registry_tests {
             Some("task-rebound"),
             "an EXISTING key still rebinds at capacity"
         );
+    }
+
+    /// #21 (round-4, codex #17 B3) — the workspace scope is a LOSSLESS hex
+    /// encoding of the path's raw OsStr bytes: non-UTF-8 roots survive
+    /// (never collapsing to None like `to_str()`), and two different roots
+    /// encode to two different scopes so one root's `/stop` purge can never
+    /// match the other's stamped items.
+    #[test]
+    fn workspace_scope_encoding_is_lossless_and_distinct() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            workspace_scope_encode(std::path::Path::new("")),
+            None,
+            "an empty root encodes to None (unstamped, legacy shape)"
+        );
+        // A plain UTF-8 root round-trips its bytes.
+        let plain = std::path::Path::new("/home/zhang/work/octos");
+        let encoded = workspace_scope_encode(plain).expect("plain root encodes");
+        let decoded_bytes: Vec<u8> = (0..encoded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(
+            std::ffi::OsStr::from_bytes(&decoded_bytes).as_bytes(),
+            plain.as_os_str().as_bytes(),
+            "the hex encoding decodes back to the exact path bytes"
+        );
+        // A NON-UTF-8 root (invalid UTF-8 byte 0xff) still encodes —
+        // `to_str()` would have collapsed it to None.
+        let exotic = std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe-root");
+        let exotic_scope =
+            workspace_scope_encode(std::path::Path::new(exotic)).expect("non-UTF-8 encodes");
+        assert_ne!(exotic_scope, "");
+        // Two DIFFERENT non-UTF-8 roots never alias.
+        let other = std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe-other");
+        let other_scope = workspace_scope_encode(std::path::Path::new(other)).expect("encodes");
+        assert_ne!(
+            exotic_scope, other_scope,
+            "two different non-UTF-8 roots encode to different scopes"
+        );
+        // And neither aliases the plain root's scope.
+        assert_ne!(exotic_scope, encoded);
+        assert_ne!(other_scope, encoded);
+    }
+
+    /// #21 (round-4, codex #17 B3) — the STRICT binding: the first durable
+    /// row carries the workspace scope; a supervisor refusal maps to
+    /// `Ok(None)` (pre-#21 posture); a failed first durable write maps to
+    /// `Err` with NO registry binding (the task row was rolled back inside
+    /// the supervisor).
+    #[cfg(any(feature = "api", test))]
+    #[test]
+    fn strict_workspace_binding_surfaces_write_failure_without_binding() {
+        use octos_agent::TaskSupervisor;
+
+        // No persistence path: the write is trivially Ok; the task binds.
+        let supervisor = TaskSupervisor::new();
+        let bound = bind_peer_supervised_task_with_workspace_strict(
+            &supervisor,
+            peer_wire_key("t", "strict-ok"),
+            "t:api:master",
+            Some("616263"),
+        )
+        .expect("in-memory registration succeeds");
+        assert!(bound.is_some(), "the task binds without a ledger");
+
+        // Corrupted ledger: the strict registration rolls back and the
+        // binding helper surfaces the io error (no registry entry).
+        let temp = tempfile::TempDir::new().unwrap();
+        let ledger = temp.path().join("tasks.jsonl");
+        let supervisor2 = TaskSupervisor::new();
+        supervisor2
+            .enable_persistence(&ledger)
+            .expect("persistence");
+        std::fs::write(&ledger, "").unwrap();
+        std::fs::remove_file(&ledger).unwrap();
+        std::fs::create_dir_all(&ledger).unwrap();
+        let refused = bind_peer_supervised_task_with_workspace_strict(
+            &supervisor2,
+            peer_wire_key("t", "strict-fail"),
+            "t:api:master",
+            Some("646566"),
+        );
+        match refused {
+            Err(err) => {
+                assert!(
+                    !err.to_string().is_empty(),
+                    "the write failure surfaces as an error: {err}"
+                );
+                assert!(
+                    peer_task_registry()
+                        .take(&peer_wire_key("t", "strict-fail"))
+                        .is_none(),
+                    "no registry binding exists for the rolled-back task"
+                );
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 }

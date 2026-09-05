@@ -107,6 +107,17 @@ pub enum RegisterTaskError {
         parent_tool_call_id: String,
         parent_status: TaskStatus,
     },
+    /// #21 (round-4, codex #17 B3) — the registration's FIRST durable
+    /// task-ledger write failed, so the task row (which must already carry
+    /// the workspace stamp: the crash window between a `workspace_root=None`
+    /// insert and a later `set_workspace_root` second write is exactly the
+    /// gap this variant exists to close) was ROLLED BACK: the in-memory
+    /// insert is removed and no half-bound task exists. The caller must
+    /// treat the bind as failed (no registry binding, no task id).
+    WorkspacePersistFailed {
+        tool_call_id: String,
+        source: String,
+    },
 }
 
 impl std::fmt::Display for RegisterTaskError {
@@ -127,6 +138,14 @@ impl std::fmt::Display for RegisterTaskError {
                 f,
                 "parent task (tool_call_id='{parent_tool_call_id}') is already {} — refusing child registration",
                 parent_status.as_str(),
+            ),
+            Self::WorkspacePersistFailed {
+                tool_call_id,
+                source,
+            } => write!(
+                f,
+                "task (tool_call_id='{tool_call_id}') registration rollback: the first durable \
+                 task-ledger write (including the workspace stamp) failed: {source}"
             ),
         }
     }
@@ -2314,6 +2333,75 @@ impl TaskSupervisor {
         )
     }
 
+    /// #21 (round-4, codex #17 B3) — STRICT peer-task registration whose
+    /// FIRST durable ledger row already carries the workspace stamp.
+    ///
+    /// The pre-#21 shape (`register` + `set_workspace_root`) persisted the
+    /// task row with `workspace_root: None` first and stamped the workspace
+    /// in a SECOND snapshot append; a crash between the two (or a failed
+    /// second write — which was only warned) left the restored task
+    /// unstamped, and the `/stop` purge / continuation workspace scoping
+    /// fell back to the never-matching `output_files` derivation.
+    ///
+    /// This entry point closes the window structurally: the task is built
+    /// WITH the workspace stamp, and the registration only completes if the
+    /// first `persist_snapshot` write SUCCEEDS. On failure the in-memory
+    /// insert is rolled back (no half-bound task) and
+    /// [`RegisterTaskError::WorkspacePersistFailed`] is returned. When the
+    /// supervisor has NO persistence path configured the write is trivially
+    /// "successful" (in-memory supervision only) and the registration
+    /// proceeds — the same no-store contract as every other register path.
+    ///
+    /// The stamp accepts a lossless-encoded workspace scope (see
+    /// `peers::workspace_scope_encode`); an empty string is normalized to
+    /// `None` (unstamped, legacy shape).
+    pub fn try_register_peer_with_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        workspace_scope: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        let id =
+            self.register_full(tool_name, tool_call_id, session_key, None, None, None, None)?;
+        // Stamp BEFORE the first durable write: if a persist path exists,
+        // roll the stamp + the write into ONE atomic registration step.
+        if let Some(scope) = workspace_scope.filter(|value| !value.is_empty()) {
+            let snapshot = {
+                let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(task) = tasks.get_mut(&id) else {
+                    return Ok(id);
+                };
+                task.workspace_root = Some(scope.to_string());
+                // #21: the stamp must WIN the restore-side `updated_at`
+                // merge — `register_full`'s own snapshot (unstamped) shares
+                // this row's insert timestamp, and `load_persisted_tasks`
+                // keeps the FIRST row on a tie, which would resurrect the
+                // unstamped shape after a crash. Bump the row's clock so
+                // the stamped snapshot is strictly newer.
+                task.updated_at += chrono::Duration::milliseconds(1);
+                tasks.get(&id).cloned()
+            };
+            if let Some(task) = snapshot {
+                if let Err(error) = self.persist_snapshot_strict(&task) {
+                    // Roll back the insert: a task whose first durable row
+                    // could not be written must not exist in memory either
+                    // (the caller will surface the bind failure and never
+                    // retire/binding-reference the id).
+                    self.tasks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
+                    return Err(RegisterTaskError::WorkspacePersistFailed {
+                        tool_call_id: tool_call_id.to_string(),
+                        source: error.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn register_full(
         &self,
@@ -3561,6 +3649,29 @@ impl TaskSupervisor {
         if let Some(task) = snapshot {
             self.persist_snapshot(&task);
         }
+    }
+
+    /// #21 (round-4, codex #17 B3) — CHECKED variant of
+    /// [`Self::persist_snapshot`]: returns the write error instead of
+    /// warning it away, so the strict registration entry point can roll the
+    /// in-memory insert back and surface the failure. `Ok(())` when no
+    /// persistence path is configured (in-memory supervision contract).
+    fn persist_snapshot_strict(&self, task: &BackgroundTask) -> std::io::Result<()> {
+        let path = self
+            .persistence_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let record = PersistedTaskRecord {
+            schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+            task: task.clone(),
+        };
+        let json = serde_json::to_string(&record)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Self::append_persisted_task(&path, &json)
     }
 
     fn persist_snapshot(&self, task: &BackgroundTask) {
