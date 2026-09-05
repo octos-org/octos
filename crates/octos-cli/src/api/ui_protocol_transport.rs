@@ -34710,6 +34710,29 @@ async fn run_standalone_turn(
         // LLM / web_search future at its next poll. Idempotent: already-
         // terminal tasks return `AlreadyTerminal` and are skipped.
         cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
+        // #1707 round 5 (board item #7): a terminal mirror that lands AFTER
+        // this interrupt (task-status re-forward, restart replay into a
+        // fresh runtime) must not re-enter the session as a
+        // ChildCompleted / ScatterJoinComplete continuation — the user just
+        // asked for everything to stop. Purge the session's pending
+        // terminal continuations under one state lock, tombstone them
+        // durably (single batched `record_continuations_coalesced`), and
+        // stamp the delivered marks so a same-process re-forward collapses.
+        // Scoped to the terminal pair only: GoalContinue/GoalWrapUp/LoopFire/
+        // External own their lifecycle (goal pause, loop delete, fleet
+        // outbox). Idempotent: a replayed interrupt finds nothing pending
+        // and returns 0.
+        let purged = default_agent_orchestrator().clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "session_interrupt_stop",
+        );
+        if purged > 0 {
+            tracing::info!(
+                session = %session_id,
+                purged,
+                "interrupt purged pending terminal continuations for the stopped session"
+            );
+        }
         // FIX-04: also flush any accumulated drops before the lifecycle
         // terminal so the client knows the cursor is incomplete.
         flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);

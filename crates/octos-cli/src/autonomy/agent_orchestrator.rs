@@ -1109,80 +1109,138 @@ pub(crate) struct NativeSpecialistRunResult {
     pub(crate) artifacts: Vec<AgentArtifactRecord>,
 }
 
+/// #1707 round 5 (board item #7) — process-singleton wrapper over
+/// [`InProcessAgentOrchestrator::upsert_background_task_agent`], the shape
+/// the two entry sinks (`forward_task_status_to_actor_inbox`,
+/// `route_terminal_event_to_continuation_queue`'s Completed arm) and the
+/// misc call sites already hold. The idempotency gate consults the SAME
+/// orchestrator the upsert targets — `self`, not a re-fetched singleton —
+/// so store-backed local orchestrators (tests, in-process peers) are gated
+/// against their OWN delivered marks, not the process global's.
 pub(crate) fn upsert_background_task_agent(
     task: &octos_agent::BackgroundTask,
     runtime_profile_id: Option<&str>,
 ) -> Option<(SessionKey, Value)> {
-    let session_id = background_task_session_id(task)?;
-    // mini5 soak fix: AppUI/TUI sessions use BARE session keys ("q5",
-    // "test1") with no `profile:channel:chat` prefix, so
-    // `SessionKey::profile_id()` is `None` and the terminal-agent
-    // continuation used to fall back to `MAIN_PROFILE_ID` ("_main"). But
-    // the owning turn actually runs under a real profile (e.g. "coding"
-    // resolved from the connection / `session/open` `profile_id`), and
-    // only THAT profile has a registered `ProfileRuntime`. Enqueuing the
-    // `ChildCompleted` / `ScatterJoinComplete` continuation under "_main"
-    // breaks re-entry two ways: a profile-scoped connection skips it in
-    // `due_loop_targets` (profile mismatch) and an unscoped connection
-    // drains it into a `run_standalone_turn` that fails closed with
-    // `runtime_unavailable` (no runtime for "_main"). Either way the
-    // task-completion notice never fires. Prefer the runtime profile the
-    // caller threads in (mirrors `set_on_failure_signal`'s
-    // `active_profile_id.or(routed_profile_id)` resolution); fall back to
-    // the key-derived profile for channel sessions whose key DOES carry
-    // it.
-    let profile_id = runtime_profile_id
-        .filter(|profile| !profile.is_empty())
-        .or_else(|| session_id.profile_id())
-        .unwrap_or(MAIN_PROFILE_ID)
-        .to_owned();
-    let agent_id = background_task_agent_id(task);
-    let status = background_task_agent_status(task);
-    let artifacts = background_task_artifacts(task);
-    let cwd = background_task_cwd(task);
-    let task_id = task.id.parse::<TaskId>().ok();
-    let last_task = background_task_last_task(task);
+    default_agent_orchestrator().upsert_background_task_agent(task, runtime_profile_id)
+}
 
-    let orchestrator = default_agent_orchestrator();
-    let mut agent = orchestrator.upsert_agent(AgentUpsert {
-        agent_id: agent_id.clone(),
-        parent_agent_id: Some("master".to_owned()),
-        session_id: session_id.clone(),
-        task_id,
-        path: format!("master/{agent_id}"),
-        role: task
-            .role
-            .clone()
-            .unwrap_or_else(|| "background_task".to_owned()),
-        nickname: background_task_nickname(task),
-        backend_kind: background_task_backend_kind(task),
-        status,
-        last_task,
-        cwd,
-        profile_id: profile_id.clone(),
-    });
-    if !artifacts.is_empty() {
-        if let Ok(updated) =
-            orchestrator.set_agent_artifacts(&agent_id, &session_id, &profile_id, artifacts)
-        {
-            agent = updated;
-        }
-    }
-    // Mini4 re-review follow-up: surface the child's supervisor-recorded
-    // final output on the mirrored agent record so `agent/output/read` (the
-    // TUI Tab agent view) has something to render. Idempotent — only fills
-    // an empty record, and only once the task carries a final output.
-    if let Some(final_output) = task.final_output.as_deref() {
-        if !final_output.trim().is_empty() {
-            let _ = orchestrator.set_agent_output_if_empty(
-                &agent_id,
+impl InProcessAgentOrchestrator {
+    pub(crate) fn upsert_background_task_agent(
+        &self,
+        task: &octos_agent::BackgroundTask,
+        runtime_profile_id: Option<&str>,
+    ) -> Option<(SessionKey, Value)> {
+        let session_id = background_task_session_id(task)?;
+        // #1707 round 5 (board item #7) — IDEMPOTENCY GATE for stale terminal
+        // re-forwards. A terminal mirror whose delivery mark already hit in a
+        // PREVIOUS runtime lifetime (a restart replay, or a task-status
+        // re-forward into a fresh runtime) must not be re-upserted: the upsert
+        // would look like a NEW agent admission into an already-joined group,
+        // bump the scatter-join epoch, and re-emit a ScatterJoinComplete the
+        // durable `last_joined_key` cannot swallow (the goal-clear incident's
+        // 84 stale continuations came partly from exactly this). The
+        // ChildCompleted side is already covered by `delivered_child_marks`;
+        // gating HERE — before the epoch bump — closes the scatter half.
+        // Because this is the shared sink for BOTH entry points
+        // (`forward_task_status_to_actor_inbox` and
+        // `route_terminal_event_to_continuation_queue`'s Completed arm), one
+        // gate covers both.
+        //
+        // #7 round 3 (outer-loop 08:48): the gate is provenance+status ONLY —
+        // a terminal passes through unless its delivered mark was
+        // store-seeded with the SAME status. Non-terminal tasks, in-process
+        // marks, and a status CHANGE (correction carries a different mark
+        // status) all pass through.
+        if task.status.is_terminal() {
+            let profile_id = runtime_profile_id
+                .filter(|profile| !profile.is_empty())
+                .or_else(|| session_id.profile_id())
+                .unwrap_or(MAIN_PROFILE_ID);
+            if self.should_skip_stale_terminal_upsert(
                 &session_id,
-                &profile_id,
-                final_output,
-            );
+                profile_id,
+                &background_task_agent_id(task),
+                &background_task_agent_status(task),
+            ) {
+                tracing::debug!(
+                    task_id = %task.id,
+                    session = %session_id,
+                    "stale terminal background-task re-forward suppressed (store-seeded \
+                     delivered mark already hit)"
+                );
+                return None;
+            }
         }
+        // mini5 soak fix: AppUI/TUI sessions use BARE session keys ("q5",
+        // "test1") with no `profile:channel:chat` prefix, so
+        // `SessionKey::profile_id()` is `None` and the terminal-agent
+        // continuation used to fall back to `MAIN_PROFILE_ID` ("_main"). But
+        // the owning turn actually runs under a real profile (e.g. "coding"
+        // resolved from the connection / `session/open` `profile_id`), and
+        // only THAT profile has a registered `ProfileRuntime`. Enqueuing the
+        // `ChildCompleted` / `ScatterJoinComplete` continuation under "_main"
+        // breaks re-entry two ways: a profile-scoped connection skips it in
+        // `due_loop_targets` (profile mismatch) and an unscoped connection
+        // drains it into a `run_standalone_turn` that fails closed with
+        // `runtime_unavailable` (no runtime for "_main"). Either way the
+        // task-completion notice never fires. Prefer the runtime profile the
+        // caller threads in (mirrors `set_on_failure_signal`'s
+        // `active_profile_id.or(routed_profile_id)` resolution); fall back to
+        // the key-derived profile for channel sessions whose key DOES carry
+        // it.
+        let profile_id = runtime_profile_id
+            .filter(|profile| !profile.is_empty())
+            .or_else(|| session_id.profile_id())
+            .unwrap_or(MAIN_PROFILE_ID)
+            .to_owned();
+        let agent_id = background_task_agent_id(task);
+        let status = background_task_agent_status(task);
+        let artifacts = background_task_artifacts(task);
+        let cwd = background_task_cwd(task);
+        let task_id = task.id.parse::<TaskId>().ok();
+        let last_task = background_task_last_task(task);
+
+        let orchestrator = self;
+        let mut agent = orchestrator.upsert_agent(AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id,
+            path: format!("master/{agent_id}"),
+            role: task
+                .role
+                .clone()
+                .unwrap_or_else(|| "background_task".to_owned()),
+            nickname: background_task_nickname(task),
+            backend_kind: background_task_backend_kind(task),
+            status,
+            last_task,
+            cwd,
+            profile_id: profile_id.clone(),
+        });
+        if !artifacts.is_empty() {
+            if let Ok(updated) =
+                orchestrator.set_agent_artifacts(&agent_id, &session_id, &profile_id, artifacts)
+            {
+                agent = updated;
+            }
+        }
+        // Mini4 re-review follow-up: surface the child's supervisor-recorded
+        // final output on the mirrored agent record so `agent/output/read` (the
+        // TUI Tab agent view) has something to render. Idempotent — only fills
+        // an empty record, and only once the task carries a final output.
+        if let Some(final_output) = task.final_output.as_deref() {
+            if !final_output.trim().is_empty() {
+                let _ = orchestrator.set_agent_output_if_empty(
+                    &agent_id,
+                    &session_id,
+                    &profile_id,
+                    final_output,
+                );
+            }
+        }
+        Some((session_id, agent))
     }
-    Some((session_id, agent))
 }
 
 /// Gap-1 unification: the SINGLE sink that routes terminal background
@@ -11790,7 +11848,8 @@ pub(crate) fn clear_default_agent_orchestrator_for_test() {
     default_agent_orchestrator().clear_for_test();
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+#[allow(clippy::derivable_impls)] // see the manual-Default comment below (#7 round 3)
 struct AutonomyRuntimeState {
     agents: HashMap<String, AutonomyAgentRecord>,
     /// Refs #2102 (Gap 3) — per-group scatter-join bookkeeping. `join_epoch`
@@ -11961,6 +12020,209 @@ struct AutonomyRuntimeState {
     reset_window_before_accounting: bool,
 }
 
+// Manual `Default` (NOT derived): the `#[cfg(test)]`-gated fields below
+// cannot coexist with `#[derive(Default)]`, so the cold path is spelled out —
+// every collection/flag defaults empty/zero. (#7 round 3 removed the last
+// non-zero init, `boot_instant_ms`; clippy's derive suggestion is a false
+// positive under cfg-gating.)
+#[allow(clippy::derivable_impls)]
+impl Default for AutonomyRuntimeState {
+    fn default() -> Self {
+        Self {
+            agents: HashMap::new(),
+            scatter_join_state: HashMap::new(),
+            delivered_child_marks: HashMap::new(),
+            delivered_scatter_marks: HashMap::new(),
+            goals: HashMap::new(),
+            loops: HashMap::new(),
+            monitors: HashMap::new(),
+            continuations: MasterContinuationScheduler::default(),
+            supervisor_store: None,
+            fleet_store: None,
+            cron_service: None,
+            fleet_pool: None,
+            fleet_ledger_data_dir: None,
+            next_goal_seq: 0,
+            next_loop_seq: 0,
+            next_monitor_seq: 0,
+            goal_event_generation: 0,
+            goal_event_scope_index: HashMap::new(),
+            goal_event_scope_fifo: std::collections::VecDeque::new(),
+            cancellations: HashMap::new(),
+            in_flight_goal_sessions: std::collections::HashMap::new(),
+            cleared_goal_tombstones: std::collections::HashMap::new(),
+            #[cfg(test)]
+            force_wake_persist_failure: false,
+            #[cfg(test)]
+            force_coalesce_persist_failure: false,
+            #[cfg(test)]
+            force_tombstone_failure_once: false,
+            #[cfg(test)]
+            reset_window_before_accounting: false,
+        }
+    }
+}
+
+impl InProcessAgentOrchestrator {
+    /// #1707 round 5 (board item #7, sink side B; round 3 = outer-loop 08:48
+    /// rejection fix) — the idempotency gate the SHARED background-task sink
+    /// ([`upsert_background_task_agent`]) calls before mirroring a terminal
+    /// task into this runtime. Returns `true` (skip the upsert) when the
+    /// child delivery mark derived with the SAME key the enqueue path would
+    /// use (`child/<group>/<session>/<agent>`, group =
+    /// `agent-group:<profile>:<session>:master` — the "master" parent default
+    /// of the upsert path) carries the SAME status AND was SEEDED FROM THE
+    /// STORE at boot — the durable proof a PREVIOUS runtime already delivered
+    /// this exact verdict.
+    ///
+    /// The gate is provenance+status ONLY: no timestamp comparison (round 3
+    /// removed the `terminal_ms` existence clause per outer-loop 08:48).
+    /// Everything else passes through: non-terminal callers never reach here;
+    /// marks created IN THIS PROCESS (first delivery, correction, /stop
+    /// purge) never gate a later upsert — an idempotent same-status
+    /// re-forward (e.g. the final_output mirror's re-upsert) still mirrors,
+    /// because the gate exists to kill CROSS-RESTART replays, not
+    /// same-lifetime refreshes; and status CORRECTIONS (mark carries a
+    /// different status, #1707 round 3) still upsert.
+    pub(crate) fn should_skip_stale_terminal_upsert(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        agent_id: &str,
+        status: &str,
+    ) -> bool {
+        let state = self.state();
+        let group_id = format!("agent-group:{profile_id}:{session_id}:master");
+        let child_key = child_completed_dedupe_key(&group_id, &session_id.0, agent_id);
+        state
+            .delivered_child_marks
+            .get(&child_key)
+            .is_some_and(|mark| mark.seeded_from_store && mark.status == status)
+    }
+
+    /// #1707 round 5 (board item #7, /stop side A) — purge every PENDING
+    /// `ChildCompleted` / `ScatterJoinComplete` continuation of a session
+    /// whose owning turn was interrupted (Esc / `/stop` /
+    /// `turn/interrupt`), tombstone them durably, and stamp the delivered
+    /// marks so a same-process re-forward of the underlying terminal task
+    /// does not re-enqueue them. Returns the number of items purged.
+    ///
+    /// Scope is DELIBERATELY narrow: `GoalContinue` / `GoalWrapUp` /
+    /// `LoopFire` / `External(_)` have their own lifecycle (goal pausing,
+    /// loop deletion, fleet outbox) and are NEVER touched here.
+    ///
+    /// Durable direction: the tombstone batch is checked and warned on
+    /// failure — a restart replaying the purged items (duplicate
+    /// notification) is the safe failure, silently dropping them is not.
+    /// The in-memory purge + marks happen regardless so THIS process stops
+    /// re-entering immediately.
+    pub(crate) fn clear_pending_terminal_continuations_for_session(
+        &self,
+        session_id: &SessionKey,
+        reason: &str,
+    ) -> usize {
+        let mut state = self.state();
+        let targets: Vec<QueuedMasterContinuation> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                item.session_id.as_str() == session_id.0
+                    && matches!(
+                        item.reason,
+                        MasterContinuationReason::ChildCompleted
+                            | MasterContinuationReason::ScatterJoinComplete
+                    )
+            })
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return 0;
+        }
+        let now = now_ms_u64();
+        let mut entries: Vec<CoalescedTombstoneEntry> = Vec::with_capacity(targets.len());
+        let mut purged = 0usize;
+        for item in &targets {
+            if state.continuations.cancel(&item.dedupe_key).is_none() {
+                continue;
+            }
+            purged += 1;
+            entries.push(CoalescedTombstoneEntry {
+                group_id: item.group_id.as_str().to_owned(),
+                continuation_id: item.dedupe_key.as_str().to_owned(),
+                completed_at_ms: now,
+                result: format!("discarded: {reason}"),
+            });
+            // Stamp the delivered mark so a same-process re-forward of the
+            // terminal task (the idempotency gate aside, the enqueue path
+            // itself consults these marks) does not re-enqueue what the user
+            // just asked to stop.
+            match &item.reason {
+                MasterContinuationReason::ChildCompleted => {
+                    if let Some(status) = item
+                        .metadata
+                        .get("status")
+                        .filter(|status| !status.is_empty())
+                    {
+                        state.delivered_child_marks.insert(
+                            item.dedupe_key.as_str().to_owned(),
+                            DeliveredChildMark {
+                                status: status.clone(),
+                                revision: 1,
+                                // A /stop purge is THIS process's verdict —
+                                // it must not gate later upserts like a
+                                // store-seeded (pre-boot) mark would.
+                                seeded_from_store: false,
+                            },
+                        );
+                    }
+                }
+                MasterContinuationReason::ScatterJoinComplete => {
+                    state
+                        .delivered_scatter_marks
+                        .insert(item.dedupe_key.as_str().to_owned(), "joined".to_owned());
+                    state
+                        .scatter_join_state
+                        .entry(item.group_id.as_str().to_owned())
+                        .or_default()
+                        .last_joined_key = Some(item.dedupe_key.as_str().to_owned());
+                }
+                // Unreachable per the filter above; keep the match total so
+                // a future reason variant compiles loudly here instead of
+                // silently inheriting the purge.
+                _ => {}
+            }
+        }
+        if entries.is_empty() {
+            return 0;
+        }
+        if let Some(store) = state.supervisor_store.as_ref() {
+            if let Err(err) = store.record_continuations_coalesced(&entries) {
+                // Checked, not swallowed: a restart replays the purged items
+                // from their still-Queued durable records (duplicate
+                // notification — the safe direction). The in-memory purge
+                // and delivered marks above still hold for THIS process.
+                tracing::warn!(
+                    ?err,
+                    session_key = %session_id.0,
+                    count = entries.len(),
+                    reason,
+                    "/stop purge tombstone batch failed; the purged continuations may \
+                     re-appear after a restart (safe direction — duplicate, not loss)"
+                );
+            }
+        }
+        if purged > 0 {
+            tracing::info!(
+                session_key = %session_id.0,
+                count = purged,
+                reason,
+                "/stop purged pending terminal continuations (tombstoned + marks stamped)"
+            );
+        }
+        purged
+    }
+}
+
 /// Refs #2102 (Gap 3): join bookkeeping for one scatter-join group.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct ScatterJoinState {
@@ -11980,6 +12242,18 @@ struct ScatterJoinState {
 struct DeliveredChildMark {
     status: String,
     revision: u64,
+    /// #7 round 2 (outer-loop rejection fix) — TRUE only when the mark was
+    /// seeded from the persistent store at boot ([`seed_delivered_terminal_
+    /// marks`]): that is the durable proof a PREVIOUS runtime already
+    /// delivered this verdict, which is the only legitimate signal for the
+    /// stale-reforward idempotency gate. A mark created IN THIS PROCESS
+    /// (first delivery, status correction, /stop purge) must NOT gate a
+    /// later upsert — e.g. the mirror test's idempotent re-upsert, or a
+    /// same-lifetime status refresh — because the timestamp alone cannot
+    /// distinguish "pre-boot replay" from "just delivered a moment ago"
+    /// (the lazy singleton boot makes `now < boot` routinely true for the
+    /// first fixture in a test process).
+    seeded_from_store: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -13451,6 +13725,10 @@ fn seed_delivered_terminal_marks(
                     DeliveredChildMark {
                         status,
                         revision: u64::from(record.attempt),
+                        // Durable proof a PREVIOUS runtime delivered this
+                        // verdict — the only mark shape the stale-reforward
+                        // gate may act on (#7 round 2).
+                        seeded_from_store: true,
                     },
                 );
             }
@@ -14025,6 +14303,7 @@ fn enqueue_agent_terminal_continuations(
                     DeliveredChildMark {
                         status: agent.status.clone(),
                         revision,
+                        seeded_from_store: false,
                     },
                 );
             }
@@ -14062,6 +14341,7 @@ fn enqueue_agent_terminal_continuations(
                     DeliveredChildMark {
                         status: agent.status.clone(),
                         revision: 1,
+                        seeded_from_store: false,
                     },
                 );
             }
@@ -21993,6 +22273,391 @@ mod tests {
     /// EXACTLY ONE recovery continuation, under the profile the turn ran as.
     /// A regression to zero would silently drop failure recovery on the
     /// gateway; a regression to two would double-deliver.
+    ///
+    /// #1707 round 5 (board item #7) — build the BackgroundTask shape the
+    /// stale/fresh idempotency-gate tests re-forward through the SHARED sink
+    /// (`upsert_background_task_agent`). Field shape mirrors
+    /// `failure_routing_enqueues_exactly_one_recovery_for_every_runtime_mode`;
+    /// `completed_at` is the knob the gate keys on.
+    #[cfg(test)]
+    fn sample_terminal_background_task(
+        session: &SessionKey,
+        task_id: &str,
+        completed_at: chrono::DateTime<Utc>,
+        status: octos_agent::TaskStatus,
+    ) -> octos_agent::BackgroundTask {
+        let runtime_state = match status {
+            octos_agent::TaskStatus::Completed => octos_agent::TaskRuntimeState::Completed,
+            octos_agent::TaskStatus::Failed => octos_agent::TaskRuntimeState::Failed,
+            octos_agent::TaskStatus::Cancelled => octos_agent::TaskRuntimeState::Cancelled,
+            _ => octos_agent::TaskRuntimeState::ExecutingTool,
+        };
+        octos_agent::BackgroundTask {
+            id: task_id.into(),
+            tool_name: "peer_handoff".into(),
+            tool_call_id: format!("call-{task_id}"),
+            parent_session_key: Some(session.to_string()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status,
+            runtime_state,
+            runtime_detail: None,
+            started_at: completed_at,
+            updated_at: completed_at,
+            completed_at: Some(completed_at),
+            output_files: vec![],
+            error: None,
+            final_output: None,
+            failed_by_observer: false,
+            session_key: Some(session.to_string()),
+            tool_input: Some(json!({"topic": "stale-replay"})),
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+            projection_metadata: None,
+        }
+    }
+
+    /// #1707 round 5 (board item #7, /stop side A) — the interrupt purge
+    /// drops every pending ChildCompleted/ScatterJoinComplete for the
+    /// session, tombstones the batch durably, and stamps the delivered
+    /// marks: a fresh runtime on the same store replays NOTHING for that
+    /// session, and a same-status re-forward of a purged child does not
+    /// re-enqueue.
+    #[test]
+    fn stop_purges_pending_terminal_and_tombstones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-stop", "api", "stop-purge");
+        let upsert = |agent_id: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: "completed".to_owned(),
+            last_task: Some(format!("done {agent_id}")),
+            cwd: None,
+            profile_id: "tenant-stop".to_owned(),
+        };
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        // A pending burst: three children, undelivered — 3 ChildCompleted +
+        // 1 ScatterJoinComplete (all-terminal edge on the third upsert).
+        for agent_id in ["agent-1", "agent-2", "agent-3"] {
+            orchestrator.upsert_agent(upsert(agent_id));
+        }
+        let pending_before = orchestrator
+            .pending_continuation_count_for_session_for_test(&session_id, "tenant-stop");
+        // 3 ChildCompleted + 3 ScatterJoinComplete: admitting a child into an
+        // already-joined group bumps the join epoch (#2102), so the 2nd and
+        // 3rd completions enqueue NEW-epoch joins alongside the epoch-0 one.
+        assert_eq!(
+            pending_before, 6,
+            "3 child completes + 3 epoch-bumped scatter joins must be pending pre-purge"
+        );
+
+        let purged = orchestrator.clear_pending_terminal_continuations_for_session(
+            &session_id,
+            "session_interrupt_stop",
+        );
+        assert_eq!(
+            purged, pending_before,
+            "the purge reports every item it dropped"
+        );
+        assert_eq!(
+            orchestrator
+                .pending_continuation_count_for_session_for_test(&session_id, "tenant-stop"),
+            0,
+            "nothing terminal stays pending after /stop"
+        );
+
+        // A same-status re-forward of one purged child in the SAME process
+        // must not re-enqueue: the purge stamped its delivered mark.
+        orchestrator.upsert_agent(upsert("agent-1"));
+        assert_eq!(
+            orchestrator
+                .pending_continuation_count_for_session_for_test(&session_id, "tenant-stop"),
+            0,
+            "a post-purge same-status re-forward collapses on the stamped marks"
+        );
+        drop(orchestrator);
+
+        // A fresh runtime on the same store: every purged record was
+        // tombstoned durably, so boot recovery re-enqueues NOTHING for the
+        // session.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        assert_eq!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-stop"),
+            0,
+            "a restart must not resurrect purged continuations (all tombstoned)"
+        );
+        // The delivered marks survive too: a roster-losing same-status
+        // re-forward (`forget_agent_for_test` models the restart-replay
+        // shape) stays silent on the CHILD side. The forgotten record IS a
+        // new admission into the already-joined group, so the epoch bump
+        // fires one new ScatterJoinComplete — exactly the round-3 semantics
+        // `delivered_terminal_mark_is_durable_across_fresh_roster_and_process`
+        // pins; the purge never suppresses genuinely new work.
+        fresh.forget_agent_for_test("agent-2");
+        fresh.upsert_agent(upsert("agent-2"));
+        let reenqueue =
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-stop");
+        assert_eq!(
+            reenqueue, 1,
+            "child re-forward after purge must not re-enqueue ChildCompleted \
+             (only the epoch-bumped scatter of the new admission)"
+        );
+        let reenqueue_reasons: Vec<_> = fresh
+            .state()
+            .continuations
+            .pending_items()
+            .map(|item| item.reason.clone())
+            .collect();
+        assert_eq!(
+            reenqueue_reasons,
+            vec![MasterContinuationReason::ScatterJoinComplete],
+            "the single re-enqueued item must be the new-epoch scatter, not a child re-entry"
+        );
+    }
+
+    /// #1707 round 5 (board item #7, sink side B) — a terminal mirror whose
+    /// delivered mark was SEEDED FROM THE STORE at boot (same status) must be
+    /// suppressed by the idempotency gate BEFORE the upsert (which would
+    /// otherwise bump the scatter-join epoch and re-emit a
+    /// ScatterJoinComplete — the goal-clear incident's stale re-entry).
+    /// (#7 round 3: the gate is provenance+status only; no timestamp clause.)
+    #[test]
+    fn stale_terminal_reforward_with_seeded_mark_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-stale", "api", "stale-reforward");
+        let upsert = |agent_id: &str, status: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: status.to_owned(),
+            last_task: Some(format!("done {agent_id}")),
+            cwd: None,
+            profile_id: "tenant-stale".to_owned(),
+        };
+
+        // Runtime A: two children complete, drain, and tombstone the
+        // deliveries so the delivered marks persist. The drain COALESCES the
+        // pending burst into ONE carrier (production parity), so the
+        // per-child delivered marks the boot seeder needs must be persisted
+        // explicitly — `coalesce_terminal_continuations` only tombstones the
+        // folded extras, it does not write per-child `child_completed`
+        // records.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("task-stale-a", "completed"));
+        first.upsert_agent(upsert("task-stale-b", "completed"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-stale",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            !drained.is_empty(),
+            "the completed burst must drain at least its carrier"
+        );
+        let store = SupervisorStore::new(dir.path());
+        let persist_child_completed_record = |agent_id: &str| {
+            let group_id = format!("agent-group:tenant-stale:{session_id}:master");
+            let child_key = format!("child/{group_id}/{session_id}/{agent_id}");
+            let mut metadata = SupervisorMetadata::new();
+            metadata.insert("session_id".into(), json!(session_id.to_string()));
+            metadata.insert("profile_id".into(), json!("tenant-stale"));
+            metadata.insert("reason".into(), json!("child_completed"));
+            metadata.insert("dedupe_key".into(), json!(child_key));
+            metadata.insert("payload:status".into(), json!("completed"));
+            store
+                .record_continuation_queued(PendingContinuationRecord {
+                    group_id,
+                    continuation_id: child_key,
+                    child_id: Some(agent_id.to_owned()),
+                    prompt: None,
+                    status: ContinuationStatus::Queued,
+                    queued_at_ms: now_ms_u64(),
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    result: None,
+                    attempt: 1,
+                    metadata,
+                })
+                .expect("persist child record");
+        };
+        persist_child_completed_record("task-stale-a");
+        persist_child_completed_record("task-stale-b");
+        for item in &drained {
+            store
+                .record_continuation_completed(
+                    item.group_id.as_str(),
+                    item.dedupe_key.as_str(),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("mark delivered");
+        }
+        // Tombstone the per-child records too, so boot recovery has nothing
+        // undelivered to replay (the delivered marks are seeded from these
+        // same records regardless of status).
+        for agent_id in ["task-stale-a", "task-stale-b"] {
+            let group_id = format!("agent-group:tenant-stale:{session_id}:master");
+            store
+                .record_continuation_completed(
+                    &group_id,
+                    format!("child/{group_id}/{session_id}/{agent_id}"),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("tombstone child record");
+        }
+        drop(first);
+
+        // Runtime B on the same store boots AFTER the tasks completed. The
+        // stale re-forward's delivered mark was SEEDED FROM THE STORE at
+        // B's boot (configure_supervisor_store) with the SAME status — the
+        // durable proof a previous runtime delivered it. The gate must
+        // suppress the upsert entirely — no epoch bump, no scatter
+        // re-emission, no ChildCompleted. (#7 round 3: provenance+status is
+        // the whole gate; no timestamp comparison.)
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        assert_eq!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-stale"),
+            0,
+            "nothing undelivered to recover at boot"
+        );
+
+        for task_id in ["stale-a", "stale-b"] {
+            let task = sample_terminal_background_task(
+                &session_id,
+                task_id,
+                Utc::now() - chrono::Duration::seconds(60),
+                octos_agent::TaskStatus::Completed,
+            );
+            assert!(
+                fresh
+                    .upsert_background_task_agent(&task, Some("tenant-stale"))
+                    .is_none(),
+                "stale re-forward of {task_id} against a store-seeded mark must be gated out"
+            );
+        }
+        assert_eq!(
+            fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-stale"),
+            0,
+            "the gate must leave NO new pending ChildCompleted/ScatterJoinComplete"
+        );
+    }
+
+    /// #1707 round 5 (board item #7, sink side B, over-fire guard) — a
+    /// terminal whose delivered mark was created IN THIS PROCESS (not
+    /// store-seeded) is a same-lifetime refresh, not a cross-restart
+    /// replay: the idempotency gate must NEVER fire on a non-seeded mark,
+    /// and the upsert must enqueue its continuations normally. (#7 round 3:
+    /// the gate has no timestamp clause; the mark's provenance flag is the
+    /// only reason this passes.)
+    #[test]
+    fn in_process_mark_does_not_gate_upsert() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_id = SessionKey::with_profile("tenant-fresh", "api", "fresh-terminal");
+        let upsert = |agent_id: &str| AgentUpsert {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: None,
+            path: format!("master/{agent_id}"),
+            role: "background_task".to_owned(),
+            nickname: agent_id.to_owned(),
+            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            status: "completed".to_owned(),
+            last_task: Some(format!("done {agent_id}")),
+            cwd: None,
+            profile_id: "tenant-fresh".to_owned(),
+        };
+
+        // One sibling completes in runtime A so the delivered-mark seeding
+        // and the joined-group state exist; drain + tombstone.
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        first.upsert_agent(upsert("task-old"));
+        let drained = first.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-fresh",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let store = SupervisorStore::new(dir.path());
+        for item in &drained {
+            store
+                .record_continuation_completed(
+                    item.group_id.as_str(),
+                    item.dedupe_key.as_str(),
+                    now_ms_u64(),
+                    None,
+                )
+                .expect("mark delivered");
+        }
+        drop(first);
+
+        // Runtime B: a NEW child completes whose delivered mark — if any
+        // exists by upsert time — was created IN THIS PROCESS, never seeded
+        // from the store. The gate must pass it through and the upsert must
+        // enqueue its ChildCompleted + the epoch-bumped ScatterJoinComplete.
+        let fresh = InProcessAgentOrchestrator::default();
+        fresh.configure_supervisor_store(dir.path()).expect("store");
+        let task = sample_terminal_background_task(
+            &session_id,
+            "new-live",
+            Utc::now(),
+            octos_agent::TaskStatus::Completed,
+        );
+        assert!(
+            fresh
+                .upsert_background_task_agent(&task, Some("tenant-fresh"))
+                .is_some(),
+            "an in-process (non-seeded) mark must NEVER gate the upsert"
+        );
+        let drained_b = fresh.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-fresh",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        let reasons = drained_b
+            .iter()
+            .map(|item| item.reason.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                MasterContinuationReason::ChildCompleted,
+                MasterContinuationReason::ScatterJoinComplete
+            ],
+            "the fresh terminal must enqueue its full two-step delivery"
+        );
+    }
+
     #[test]
     fn failure_routing_enqueues_exactly_one_recovery_for_every_runtime_mode() {
         let session_legacy = SessionKey::with_profile("tenant-legacy", "api", "fail-legacy");
