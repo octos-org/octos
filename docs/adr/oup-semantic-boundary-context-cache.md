@@ -3072,7 +3072,8 @@ programs and existing user sessions are not replaced or restarted.
 
 ### If6Q18 real 30+4 result: durable gates pass, native history still rejected
 
-The exact `fb09be104...b5d31c` / `2ac7cb1d...4c41ba` pair ran locally from
+The exact `fb09be1043117b69c138907f6974f05bc642a851e2986c56e17e7ce1c2b5d31c` /
+`2ac7cb1d3ce7df5182980e3ff6ffa52f7b576cd2bb04208d63167f45344c41ba` pair ran locally from
 2026-09-05 08:36:45–08:46:31 UTC for the original 30 rounds, then
 08:48:16–08:52:03 UTC for the four peer probes. Both drivers report `FAILS=0`.
 Independent durable audit passes all 36 main admissions and 33 exact labelled
