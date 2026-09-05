@@ -51,7 +51,7 @@ const MINIMAX_API_TYPES: &[ApiTypeOption] = &[
     ApiTypeOption {
         value: Some("anthropic"),
         display: "Anthropic",
-        description: "Messages API",
+        description: "Messages API (required for sk-cp- Coding-plan keys)",
         base_url: Some("https://api.minimaxi.com/anthropic"),
     },
 ];
@@ -66,7 +66,7 @@ const MINIMAX_CN_API_TYPES: &[ApiTypeOption] = &[
     ApiTypeOption {
         value: Some("anthropic"),
         display: "Anthropic",
-        description: "Messages API",
+        description: "Messages API (required for sk-cp- Coding-plan keys)",
         base_url: Some("https://api.minimaxi.com/anthropic"),
     },
 ];
