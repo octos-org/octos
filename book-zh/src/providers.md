@@ -26,7 +26,7 @@ Octos 开箱即用地支持 17 家 LLM 服务商。每个服务商需要一个�
 
 **`vertex`** 使用 Google 服务账号 JSON 认证（通过 `VERTEX_SA_JSON` 解析——钥匙串标记、配置值或环境变量），而非 API 密钥；GCP 项目从 JSON 中读取，区域固定为 `global`。必须显式选择（`provider: "vertex"`）——裸的 `gemini-*` 模型名仍会解析到 AI Studio 的 `gemini` 服务商。**`r9s`** 是多协议代理：`claude-*` 模型自动走 Anthropic Messages API，其余走 OpenAI Chat Completions。
 
-**`minimax-cn`** 是 MiniMax 的中国区服务商（`https://api.minimaxi.com/v1`，而非国际站 `https://api.minimax.io/v1`）。MiniMax Token 套餐订阅密钥由中国平台（platform.minimaxi.com）签发且有区域绑定，只能用于 `minimax-cn`；国际站密钥仍使用 `minimax`。
+**`minimax-cn`** 是 MiniMax 的中国区服务商（`https://api.minimaxi.com/v1`，而非国际站 `https://api.minimax.io/v1`）。MiniMax Token 套餐订阅密钥由中国平台（platform.minimaxi.com）签发且有区域绑定，只能用于 `minimax-cn`；国际站密钥仍使用 `minimax`。MiniMax Coding 套餐密钥（`sk-cp-` 前缀）还必须使用 Anthropic 协议：在 `octos init` 中选择 **Anthropic** 协议，或设置 `api_type: "anthropic"` 并将 `base_url` 指向 `https://api.minimaxi.com/anthropic`——走默认的 OpenAI 协议会返回 401（见 octos#2115）。
 
 其他任何 OpenAI 或 Anthropic 兼容端点（如 `wisemodel`、Together、Fireworks、Azure）可通过在服务商上设置 `base_url` 接入——见[自定义端点](#自定义端点)。
 

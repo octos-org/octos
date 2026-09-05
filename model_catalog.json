@@ -599,8 +599,8 @@
       "p95_ms": 0,
       "score": 0.0,
       "ds_output": 0,
-      "cost_in": 0.15,
-      "cost_out": 1.5,
+      "cost_in": 0.3,
+      "cost_out": 1.2,
       "context_window": 1000000,
       "max_output": 131072,
       "endpoints": [
