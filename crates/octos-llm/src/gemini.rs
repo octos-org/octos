@@ -2040,7 +2040,7 @@ mod tests {
         }))
         .expect("Gemini response role is optional");
 
-        let response = gemini_response_to_chat_response(api_response).unwrap();
+        let response = gemini_response_to_chat_response(api_response, "gemini", "test").unwrap();
         assert_eq!(response.content.as_deref(), Some("OK"));
     }
 
