@@ -430,12 +430,7 @@ impl CacheCommand {
         // one-shot CLI. (rustix `getppid` — std has no getppid; `None`
         // means the parent already exited, in which case the slot would
         // be immediately reap-able, so fall back to OUR pid and say so.)
-        let pid = pid
-            .or_else(|| {
-                rustix::process::getppid()
-                    .and_then(|p| u32::try_from(p.as_raw_nonzero().get()).ok())
-            })
-            .unwrap_or_else(std::process::id);
+        let pid = pid.or_else(parent_pid).unwrap_or_else(std::process::id);
 
         let holder = HolderInfo {
             purpose_note: Some(note.unwrap_or_else(|| "verify".to_owned())),
@@ -639,6 +634,20 @@ struct AcquireJson<'a> {
     /// held (#6 truth model). Mirrored here so scripts can assert the
     /// holder they expect.
     pid: u32,
+}
+
+/// Parent pid of this one-shot CLI (the invoking shell / outer-loop driver),
+/// used as the default holder pid for `octos cache acquire`. Unix only:
+/// std has no `getppid`, and `rustix` is a unix-only dependency; on other
+/// platforms the caller falls back to its own pid (or passes `--pid`).
+#[cfg(unix)]
+fn parent_pid() -> Option<u32> {
+    rustix::process::getppid().and_then(|p| u32::try_from(p.as_raw_nonzero().get()).ok())
+}
+
+#[cfg(not(unix))]
+fn parent_pid() -> Option<u32> {
+    None
 }
 
 /// Shell-quote a path for the RELEASE line so paths with spaces stay one
