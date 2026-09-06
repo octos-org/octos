@@ -2025,7 +2025,6 @@ async fn should_upsert_endpoint_edit_reload_dynamic_profile_runtime_for_next_tur
     // A turn in flight keeps its start-of-turn runtime; the test drops its
     // handle the same way a finished turn would, so the rebuild below can
     // take over the profile's data directory (single-writer redb).
-    let before_ptr = Arc::as_ptr(&before) as usize;
     drop(before);
 
     // Same model id, different endpoint: the cache MUST still be invalidated.
@@ -2053,11 +2052,8 @@ async fn should_upsert_endpoint_edit_reload_dynamic_profile_runtime_for_next_tur
     );
 
     let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
-    assert_ne!(
-        Arc::as_ptr(&after) as usize,
-        before_ptr,
-        "endpoint edit must rebuild the cached ProfileRuntime"
-    );
+    // 同 #2164 delete 测试的修复:地址断言在分配器复用下误报;下面的
+    // base_url 断言承载「重建自已提交文件」的语义(旧缓存不会带新端点)。
     assert_eq!(after.primary_model_id, "gpt-4o-mini");
     assert_eq!(
         after.config.base_url.as_deref(),
@@ -2098,7 +2094,6 @@ async fn should_delete_primary_promote_fallback_and_reload_dynamic_profile_runti
         .await
         .expect("bootstrap")
         .expect("runtime cached");
-    let before_ptr = Arc::as_ptr(&before) as usize;
     drop(before);
 
     let result = raw_profile_llm_delete(
@@ -2113,11 +2108,11 @@ async fn should_delete_primary_promote_fallback_and_reload_dynamic_profile_runti
     assert_eq!(result["restart_required"], json!(false), "{result}");
 
     let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
-    assert_ne!(
-        Arc::as_ptr(&after) as usize,
-        before_ptr,
-        "primary deletion must rebuild the cached ProfileRuntime"
-    );
+    // 外环 #4 附带修复:原断言 `assert_ne!(ptr)` 在 Arc 分配器复用 drop 后的
+    // 地址时误报「未重建」(FW 实测稳定复现:旧 ArcData 释放后新 bootstrap
+    // 常拿到同一地址)。重建语义由下面两行真正承载:promoted fallback 的
+    // model id 只能来自「从已提交文件重建」的 runtime —— 旧缓存若未被
+    // 驱逐,仍会报 gpt-4o-mini。runtime_disposition=="reloaded" 已断言。
     assert_eq!(
         after.primary_model_id, "deepseek-chat",
         "the promoted fallback must serve the next turn"

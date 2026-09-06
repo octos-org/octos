@@ -33461,7 +33461,35 @@ mod tests {
         std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "init"]);
-        run(&["checkout", "-q", "-b", branch]);
+        // 外环 #4 附带修复:机器级 `init.defaultBranch=main` 时 `checkout -b main`
+        // 撞已存在分支失败(#2164 期测试隐含默认分支非 main)。按期望分支
+        // 是否已存在决定 create/switch,两种 defaultBranch 配置都成立。
+        let current = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("git branch --show-current");
+        let current = String::from_utf8_lossy(&current.stdout).trim().to_string();
+        if current != branch {
+            let exists = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if exists {
+                run(&["checkout", "-q", branch]);
+            } else {
+                run(&["checkout", "-q", "-b", branch]);
+            }
+        }
     }
 
     /// #20c — the installed provider scans MULTIPLE goals' ledgers for the
