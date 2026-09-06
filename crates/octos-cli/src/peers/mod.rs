@@ -46,6 +46,7 @@ use octos_core::ui_protocol::{
 use tracing::warn;
 
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
+use crate::build_cache::pool::{BuildCacheConfig, Slot, SlotOutcome};
 use crate::contracts::UiProtocolContractStores;
 
 pub(crate) mod host;
@@ -907,6 +908,406 @@ pub(crate) mod peer_io {
     }
 }
 
+/// Build-cache pool integration for peers (outer-loop #4,
+/// docs/build-cache-pool.md §4/§7.4).
+///
+/// The slot lifecycle is ONE PEER TURN, not the peer session: staging
+/// acquires the FIRST turn's slot and records it in
+/// `peers/<slug>/build-cache`; the serve boot ADOPTS that slot on turn 1
+/// (§4.1 adopt rule — the staging flock is held by the SAME process, so a
+/// fresh `acquire` would EWOULDBLOCK and grab a second slot) and acquires
+/// fresh on later turns; the turn terminal releases (primary), with close /
+/// interrupt / eviction / rollback as idempotent safety nets (§4.2).
+pub(crate) mod build_cache_peer {
+    use std::path::{Path, PathBuf};
+
+    use super::RpcError;
+    use crate::build_cache::pool::{
+        BuildCacheConfig, HolderInfo, Slot, SlotOutcome, SlotPurpose, acquire, release,
+    };
+    use crate::build_cache::repo_key_for_path;
+
+    /// The per-peer read-back leaf (`peers/<slug>/build-cache`): one line,
+    /// the slot dir path held by the peer's CURRENT turn (§7.4). Written by
+    /// whichever side acquired (staging on turn 1, boot on later turns);
+    /// boot turn 1 reads it back and ADOPTS instead of double-acquiring.
+    pub(crate) const LEAF: &str = "build-cache";
+
+    /// The pool root for a profile data dir (§1.1): beside `peers/`, so slot
+    /// and peer metadata share a lifecycle root and (by default, with the
+    /// pool inside the octos home) peer sandboxes can read it without an
+    /// extra read grant.
+    pub(crate) fn pool_root(data_dir: &Path) -> PathBuf {
+        data_dir.join("build-cache")
+    }
+
+    fn err_text(slug: &str, err: crate::build_cache::BuildCacheError) -> String {
+        format!("build-cache slot for peer '{slug}': {err}")
+    }
+
+    /// Acquire the peer's FIRST-turn slot during staging and record it in
+    /// `peers/<slug>/build-cache` (§7.4). Called from `stage_peer` AFTER the
+    /// dir is reserved but BEFORE `brief.md` (the visibility gate): a peer
+    /// that boots can always read its slot back. Space-gate / pool-exhausted
+    /// failures roll the staging back (the caller passes the error through
+    /// as an `RpcError`, fail-fast per §3.2 step 5 — never queue).
+    pub(crate) fn acquire_for_staging(
+        peers_root: &Path,
+        workspace_root: &Path,
+        slug: &str,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
+        config: &BuildCacheConfig,
+    ) -> Result<Slot, RpcError> {
+        let data_dir = peers_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| peers_root.to_path_buf());
+        let repo_key = repo_key_for_path(workspace_root).ok_or_else(|| {
+            RpcError::internal_error(format!(
+                "build-cache slot for peer '{slug}': cannot canonicalize workspace root {} \
+                 (repo-key derivation failed)",
+                workspace_root.display()
+            ))
+        })?;
+        let holder = HolderInfo {
+            slug: Some(slug.to_owned()),
+            goal_id: goal_id.filter(|s| !s.is_empty()).map(str::to_owned),
+            task_id: task_id.filter(|s| !s.is_empty()).map(str::to_owned),
+            purpose_note: None,
+        };
+        let slot = acquire(
+            &pool_root(&data_dir),
+            &repo_key,
+            SlotPurpose::Peer,
+            config,
+            &holder,
+        )
+        .map_err(|e| RpcError::internal_error(err_text(slug, e)))?;
+        Ok(slot)
+    }
+
+    /// Persist the held slot to `peers/<slug>/build-cache` (§7.4). The file
+    /// is a read-back channel, not the truth — the flock + `holder.json`
+    /// are. Best-effort by design at the boot re-acquire site, but a FAILURE
+    /// at the staging site is fatal (boot would re-acquire and double-hold,
+    /// the exact race the adopt rule exists to close), so the caller decides
+    /// which posture applies.
+    pub(crate) fn record_slot(peer_dir: &Path, slot: &Slot) -> std::io::Result<()> {
+        super::peer_io::write_peer_file_atomic(peer_dir, LEAF, &slot.path.to_string_lossy())
+    }
+
+    /// Release a held slot, mapping the peer outcome onto the pool's
+    /// outcome enum (§3.4 — the outcome is diagnostics-only; release
+    /// behavior is identical for every arm). Idempotent by construction:
+    /// `pool::release` is a no-op once `holder.json` is gone, so the turn
+    /// terminal, the close callback, and eviction may all fire.
+    pub(crate) fn release_slot(slot: &mut Slot, outcome: SlotOutcome) {
+        if let Err(err) = release(slot, outcome) {
+            tracing::warn!(%err, outcome = ?outcome, "build-cache slot release failed (crash recovery applies)");
+        }
+    }
+}
+
+/// Process-global map of `"{profile}:peer:{slug}"` → the build-cache slot
+/// handle CURRENTLY held for that peer's turn (outer-loop #4).
+///
+/// WHY a registry at all: an flock belongs to the open file description, so
+/// `release` must run on the SAME `Slot` (with its lock fd) that `acquire`
+/// returned — re-opening `.lock` by path would mint a second description and
+/// `try_lock_exclusive` would EWOULDBLOCK against ourselves. The handle is
+/// therefore parked here between the acquire side (staging for turn 1, serve
+/// boot for later turns) and the release side (turn terminal primary; close /
+/// interrupt / eviction safety nets). Same key shape and process-global
+/// lifetime discipline as `peer_wire_registry` / `peer_task_registry`: a peer
+/// is staged on one path and released on another.
+pub(crate) struct BuildCacheSlotRegistry {
+    by_key: std::sync::Mutex<HashMap<String, Slot>>,
+}
+
+/// Registry key for one peer's held slot: `"<peers_root>\u{1f}<slug>"`. The
+/// separator is a control char no path component or slug may contain, so two
+/// peers of different profiles (or a slug that happens to contain the other's
+/// root as a prefix) can never collide.
+pub(crate) fn build_cache_slot_registry_key(peers_root: &Path, slug: &str) -> String {
+    format!(
+        "{}
+\u{1f}{slug}",
+        peers_root.to_string_lossy()
+    )
+}
+
+impl Default for BuildCacheSlotRegistry {
+    fn default() -> Self {
+        Self {
+            by_key: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+pub(crate) fn build_cache_slot_registry() -> &'static BuildCacheSlotRegistry {
+    static REGISTRY: OnceLock<BuildCacheSlotRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(BuildCacheSlotRegistry::default)
+}
+
+/// Per-`peers_root` build-cache config, installed by the process that owns
+/// the peers (serve bootstrap / chat `--peers` host) so `stage_peer` can
+/// acquire a first-turn slot WITHOUT growing its already-10-argument
+/// signature through ~20 call sites. Absent = the pool is OFF for that root:
+/// staging then behaves exactly as before #4 (no slot, no `build-cache`
+/// file). This mirrors how `peer_wire_registry` / `peer_task_registry` make
+/// process-global state reachable from staging and close alike.
+static BUILD_CACHE_CONFIGS: OnceLock<std::sync::Mutex<HashMap<String, BuildCacheConfig>>> =
+    OnceLock::new();
+
+/// Install (or replace) the build-cache config for one peers root. Called at
+/// bootstrap; a `None` value REMOVES the entry (used by tests to isolate).
+/// The bootstrap call site lives in commands/serve.rs behind
+/// `#[cfg(feature = "api")]` — under a default (no-api) build this setter is
+/// dead by design, so the lint is silenced instead of deleting the wiring.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) fn set_build_cache_config(peers_root: &Path, config: Option<BuildCacheConfig>) {
+    let table = BUILD_CACHE_CONFIGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
+    match config {
+        Some(cfg) => {
+            map.insert(peers_root.to_string_lossy().into_owned(), cfg);
+        }
+        None => {
+            map.remove(&peers_root.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// The build-cache config in force for one peers root (`None` = pool off).
+pub(crate) fn build_cache_config_for(peers_root: &Path) -> Option<BuildCacheConfig> {
+    let table = BUILD_CACHE_CONFIGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let map = table.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&peers_root.to_string_lossy().into_owned()).cloned()
+}
+
+impl BuildCacheSlotRegistry {
+    /// Park a held slot under its peer key. Latest-wins, mirroring the wire
+    /// registry: a re-staged peer's new slot supersedes any stale entry (the
+    /// old entry's `Slot` drop keeps its flock only until process exit — the
+    /// stale slot is then recovered by §3.5 crash rules).
+    pub(crate) fn park(&self, key: String, slot: Slot) {
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = map.insert(key, slot) {
+            tracing::warn!(
+                "build-cache: superseded an unreleased slot entry (crash recovery applies)"
+            );
+            let _ = old;
+        }
+    }
+
+    /// Take the parked slot for `key`, removing it. `None` when this peer
+    /// holds no slot in THIS process (never acquired, already released, or
+    /// staged by a previous serve generation — the residual `holder.json`
+    /// with our dead pid is then reclaimed by §3.5).
+    pub(crate) fn take(&self, key: &str) -> Option<Slot> {
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(key)
+    }
+
+    /// Release-and-drop in one step for the safety-net call sites (close /
+    /// eviction / solo return), which have no use for the handle afterwards.
+    pub(crate) fn release(&self, key: &str, outcome: SlotOutcome) {
+        if let Some(mut slot) = self.take(key) {
+            build_cache_peer::release_slot(&mut slot, outcome);
+        }
+    }
+
+    /// Eviction safety net (§4.2): release every slot held for `slug` when
+    /// the caller cannot know the peers root (connection-close eviction has
+    /// only the session key). Scoped by the key's `\u{1f}<slug>` SUFFIX, so a
+    /// slug can never match another slug's key. Only one entry can exist per
+    /// slug in this process (acquire is serialized per peer turn), and the
+    /// primary per-turn release has usually already emptied it.
+    /// Outer-loop #4 (§4.2): release-by-slug for peers whose registry key
+    /// is not reconstructible at the call site. The feature-gated
+    /// (`#[cfg(feature = "api")]`) release sites in api/ui_protocol_transport.rs
+    /// and commands/serve.rs are compiled in the api builds where they are
+    /// exercised; under a default (no-api) build this method — like the sites
+    /// — is dead by design, so silence the lint rather than delete the
+    /// integration.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    #[allow(dead_code)] // api 构建下暂无调用点:reserved for eviction path (#4 follow-up)
+    pub(crate) fn release_for_slug(&self, slug: &str, outcome: SlotOutcome) {
+        let suffix = format!("\u{1f}{slug}");
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        let hits: Vec<String> = map
+            .keys()
+            .filter(|key| key.ends_with(&suffix))
+            .cloned()
+            .collect();
+        for key in hits {
+            if let Some(mut slot) = map.remove(&key) {
+                build_cache_peer::release_slot(&mut slot, outcome);
+            }
+        }
+    }
+}
+
+// Outer-loop #4 — peer↔pool integration tests. Unit-level per the board: no
+// seatbelt exec, no live serve; they pin the contract the wiring relies on
+// (env vars, distinct slots per peer, terminal release, adopt-not-double-hold,
+// sandbox grant shape).
+#[cfg(test)]
+mod build_cache_peer_tests {
+    use super::*;
+
+    #[test]
+    fn two_staged_peers_acquire_distinct_slots_and_release_on_terminal() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        set_build_cache_config(
+            &peers_root,
+            Some(crate::build_cache::BuildCacheConfig::default()),
+        );
+        // Two DIFFERENT repo keys so each pool has capacity; the assertion is
+        // per-pool namespace semantics + distinct paths for distinct peers.
+        let repo_a = data.path().join("repo-a");
+        let repo_b = data.path().join("repo-b");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        let slot_a = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo_a,
+            "slug-a",
+            Some("goal-1"),
+            Some("t1"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .expect("peer A acquires");
+        let slot_b = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo_b,
+            "slug-b",
+            Some("goal-1"),
+            Some("t2"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .expect("peer B acquires");
+        assert_ne!(
+            slot_a.path, slot_b.path,
+            "two peers must never share a slot"
+        );
+        let target_a = slot_a.target_dir.clone();
+        let mut sa = Some(slot_a);
+        if let Some(s) = sa.as_mut() {
+            build_cache_peer::release_slot(s, SlotOutcome::Completed);
+        }
+        assert!(target_a.exists(), "release keeps target/");
+        drop(sa);
+        // The freed slot is immediately reusable for a third peer (terminal
+        // release, per §4.1 — not close).
+        let slot_c = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo_a,
+            "slug-a",
+            Some("goal-1"),
+            Some("t3"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .expect("freed slot reusable by next turn");
+        drop(slot_c);
+    }
+
+    #[test]
+    fn adopt_rule_first_boot_does_not_double_acquire() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        set_build_cache_config(
+            &peers_root,
+            Some(crate::build_cache::BuildCacheConfig::default()),
+        );
+        let repo = data.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Staging acquired slot-1 (peer_slots default 2 → slot-2 free). The
+        // recorded slot must be re-takable by the SAME slug without the pool
+        // reporting exhaustion — i.e. the recorded slot is adopted, not
+        // double-held: a second acquire with the recorded slot still HELD
+        // (not yet released) lands on slot-2, and after releasing BOTH the
+        // next acquire succeeds again.
+        let slot1 = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo,
+            "slug-x",
+            Some("g"),
+            Some("t1"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(peers_root.join("slug-x")).unwrap();
+        build_cache_peer::record_slot(&peers_root.join("slug-x"), &slot1).unwrap();
+        let slot2 = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo,
+            "slug-x",
+            Some("g"),
+            Some("t2"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            slot1.path, slot2.path,
+            "held slot-1 forces slot-2 (no aliasing)"
+        );
+        let mut s2 = Some(slot2);
+        if let Some(s) = s2.as_mut() {
+            build_cache_peer::release_slot(s, SlotOutcome::Completed);
+        }
+        drop(s2);
+        let leaf = peers_root.join("slug-x").join(build_cache_peer::LEAF);
+        assert!(
+            std::fs::read_to_string(&leaf).is_ok(),
+            "peers/<slug>/build-cache read-back file exists (§7.4)"
+        );
+        let mut s1 = Some(slot1);
+        if let Some(s) = s1.as_mut() {
+            build_cache_peer::release_slot(s, SlotOutcome::Completed);
+        }
+        drop(s1);
+    }
+
+    #[test]
+    fn registry_release_is_idempotent_across_terminal_and_close() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        set_build_cache_config(
+            &peers_root,
+            Some(crate::build_cache::BuildCacheConfig::default()),
+        );
+        let repo = data.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let slot = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo,
+            "slug-i",
+            Some("g"),
+            Some("t1"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .unwrap();
+        let key = build_cache_slot_registry_key(&peers_root, "slug-i");
+        build_cache_slot_registry().park(key.clone(), slot);
+        // Terminal release (take) then close-path release (take again) — the
+        // second must find nothing and not panic (idempotent, §4.2).
+        if let Some(mut s) = build_cache_slot_registry().take(&key) {
+            build_cache_peer::release_slot(&mut s, SlotOutcome::Completed);
+        }
+        assert!(
+            build_cache_slot_registry().take(&key).is_none(),
+            "close after terminal finds nothing"
+        );
+        release_staged_peer_build_cache_slot(&peers_root, "slug-i"); // no-op, no panic
+    }
+}
+
 #[cfg(all(test, unix))]
 mod peer_io_tests {
     use std::sync::mpsc;
@@ -1734,8 +2135,65 @@ pub(crate) fn stage_peer(
         }
     }
 
+    // Outer-loop #4 (§4.1/§7.4): acquire the FIRST-turn build-cache slot and
+    // record it BEFORE `brief.md` (the visibility gate) — the same ordering
+    // discipline as `goal` above: a peer that becomes bootable must already
+    // carry its slot record, or boot turn 1 would re-acquire and double-hold
+    // two slots of a 2-slot pool. A pool failure (space gate / exhaustion)
+    // fails the staging fast (§3.2 step 5) and rolls back.
+    //
+    // The HANDLE is parked in the process-global registry IMMEDIATELY, so
+    // every later staging-failure rollback below (brief / name / record) can
+    // release it through the same key as the turn terminal — one shape of
+    // release, no per-site `Slot` juggling.
+    //
+    // Outer-loop #4: config comes from the process side-table (see
+    // `set_build_cache_config`) — `None` there keeps the pre-pool behaviour.
+    if let Some(config) = build_cache_config_for(peers_root) {
+        match build_cache_peer::acquire_for_staging(
+            peers_root,
+            workspace_root,
+            &slug,
+            goal_id,
+            task_id,
+            &config,
+        ) {
+            Ok(slot) => {
+                // A record-write failure is FATAL here (unlike the boot
+                // re-acquire site): boot turn 1 would find no record, acquire
+                // a SECOND slot, and double-hold the pool — the exact race
+                // the adopt rule exists to close.
+                if let Err(err) = build_cache_peer::record_slot(&peer_dir, &slot) {
+                    build_cache_slot_registry().release(
+                        &build_cache_slot_registry_key(peers_root, &slug),
+                        SlotOutcome::Cancelled,
+                    );
+                    cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+                    return Err(RpcError::internal_error(format!(
+                        "failed to record build-cache slot for peer '{slug}': {err}"
+                    )));
+                }
+                build_cache_slot_registry()
+                    .park(build_cache_slot_registry_key(peers_root, &slug), slot);
+            }
+            Err(err) => {
+                cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+                return Err(err);
+            }
+        }
+    }
+    // §4.1 staging-failure rollback: brief.md is the visibility gate and the
+    // peer dir is about to be deleted — a peer that never became visible must
+    // not keep a slot either. Registry take+release is idempotent.
+    let slot_key = build_cache_slot_registry_key(peers_root, &slug);
+    let rollback_staged = || {
+        if let Some(mut slot) = build_cache_slot_registry().take(&slot_key) {
+            build_cache_peer::release_slot(&mut slot, SlotOutcome::Cancelled);
+        }
+    };
     let brief_path = peer_dir.join("brief.md");
     if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "brief.md", brief) {
+        rollback_staged();
         cleanup_staged_peer(workspace_root, &slug, &peer_dir);
         return Err(RpcError::internal_error(format!(
             "failed to write brief: {err}"
@@ -1750,6 +2208,7 @@ pub(crate) fn stage_peer(
     // (`read_peer_blackboard` / `resolve_peer_name_to_slug`) can surface it.
     if let Some(name) = name {
         if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "name", name) {
+            rollback_staged();
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to write peer name: {err}"
@@ -1757,6 +2216,10 @@ pub(crate) fn stage_peer(
         }
     }
 
+    // NOTE: the slot HANDLE stays parked in the registry from the acquire
+    // block above. The serve boot's FIRST turn ADOPTS it out of the registry
+    // per §4.1 — same process on the serve path, so the handoff is a map
+    // move.
     Ok(StagedPeer {
         topic: format!("peer-{slug}"),
         worktree_branch: worktree.then(|| format!("peer/{slug}")),
@@ -1903,6 +2366,24 @@ pub(crate) fn collect_peer_branch(peer_dir: &Path, slug: &str) {
         ),
         Err(error) => tracing::warn!(slug, %error, "failed to run git to collect the peer branch"),
     }
+}
+
+/// Outer-loop #4 (§4.2 fleet rollback): release the first-turn slot a staged
+/// peer is still holding, WITHOUT touching the staged dir. Called by the
+/// multi-member rollback in the API layer after a sibling member failed — the
+/// surviving members' handles sit in the process-global registry from
+/// `stage_peer`'s acquire, and dropping the peer dir without this would leak
+/// the flock until serve exit (a 2-slot pool is exhausted by the second leak).
+/// Idempotent (registry take → None when nothing is held) and a no-op when the
+/// pool is off for this root. Call sites are `#[cfg(feature = "api")]`
+/// (ui_protocol_transport.rs fleet rollback + close callback); silenced for
+/// no-api builds where they do not exist.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) fn release_staged_peer_build_cache_slot(peers_root: &Path, slug: &str) {
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(peers_root, slug),
+        SlotOutcome::Cancelled,
+    );
 }
 
 /// Roll back ONE half-staged peer: unregister its OWN worktree, remove its

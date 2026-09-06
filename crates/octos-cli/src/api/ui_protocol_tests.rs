@@ -9872,6 +9872,7 @@ async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() 
         None,
         Some(details.clone()),
         None,
+        None,
     )
     .await;
 
@@ -9932,6 +9933,7 @@ async fn try_emit_terminal_with_no_details_omits_token_fields() {
         &ledger,
         &session_id,
         &turn_id,
+        None,
         None,
         None,
         None,
@@ -37221,6 +37223,7 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(("interrupted", "turn interrupted by client")),
         None,
         Some(&buffer),
+        None,
     )
     .await;
 
@@ -37265,6 +37268,7 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(("interrupted", "turn interrupted by client")),
         None,
         Some(&buffer),
+        None,
     )
     .await;
     assert!(

@@ -484,6 +484,14 @@ pub struct Agent {
     /// vulnerable) originator file on every call. `None` for non-peer
     /// sessions.
     pub(super) originator_session: Option<String>,
+    /// Build-cache pool slot held by this peer's CURRENT turn (outer-loop
+    /// #4, docs/build-cache-pool.md §4). The slot lifecycle is ONE TURN, not
+    /// the peer session: the serve boot adopts/acquires it and the turn
+    /// terminal releases it. Threaded into `ToolContext.build_cache_slot`
+    /// for per-tool-call `CARGO_TARGET_DIR` injection (§7.4) — the serve
+    /// path shares one process across peers and the master, so this MUST
+    /// ride the tool context, never the process environment.
+    pub(super) build_cache_slot: Option<std::path::PathBuf>,
     /// Optional inference-time verifier plus structured TurnLedger. Absent
     /// by default so legacy agent loops do not spend verifier calls or write
     /// verifier sidecars unless a caller opts in explicitly.
@@ -593,6 +601,7 @@ impl Agent {
             goal_id: None,
             task_id: None,
             originator_session: None,
+            build_cache_slot: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -675,6 +684,7 @@ impl Agent {
             goal_id: None,
             task_id: None,
             originator_session: None,
+            build_cache_slot: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -1034,6 +1044,22 @@ impl Agent {
     /// The session that staged this peer, if any (peer sessions only).
     pub fn originator_session(&self) -> Option<&str> {
         self.originator_session.as_deref()
+    }
+
+    /// Builder: set the build-cache pool slot this peer's current turn holds
+    /// (outer-loop #4, docs/build-cache-pool.md §4/§7.4). Called by the peer
+    /// turn boot — serve adopts the staging slot on the first turn and
+    /// acquires fresh on later ones; solo acquires at `run_chat_peer` entry.
+    /// Threaded into `ToolContext.build_cache_slot` so the shell tool can
+    /// inject `CARGO_TARGET_DIR` per tool call (never a process env var).
+    pub fn with_build_cache_slot(mut self, slot: std::path::PathBuf) -> Self {
+        self.build_cache_slot = Some(slot);
+        self
+    }
+
+    /// The build-cache slot held by this peer's current turn, if any.
+    pub fn build_cache_slot(&self) -> Option<&std::path::Path> {
+        self.build_cache_slot.as_deref()
     }
 
     /// Guard C (issue #607): record this agent's spawn nesting depth so

@@ -921,6 +921,17 @@ impl ServeCommand {
                         tools = rt.tool_specs.specs().len(),
                         "ProfileRuntime bootstrapped for /api/chat",
                     );
+                    // Outer-loop #4 (§4.1/§7.2): install this profile's
+                    // build-cache pool config so `stage_peer` can acquire a
+                    // first-turn slot under `<data_dir>/build-cache/…`.
+                    // Absent `[build_cache]` keeps the pool OFF (the side
+                    // table returns None and staging is byte-for-byte
+                    // pre-pool). Same key derivation as every release site
+                    // (`<data_dir>/peers`), so acquire/release always agree.
+                    crate::peers::set_build_cache_config(
+                        &rt.data_dir.join("peers"),
+                        Some(profile.config.build_cache.clone().unwrap_or_default()),
+                    );
                     profile_runtimes.insert(profile.id.clone(), rt);
                 }
                 Err(error) => {

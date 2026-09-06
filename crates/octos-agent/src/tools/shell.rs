@@ -202,6 +202,7 @@ impl ShellTool {
         apply_quarto_tool_env(&mut cmd, &command, effective_cwd);
         apply_git_tool_env(&mut cmd, &command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        apply_build_cache_env(&mut cmd, ctx);
         apply_harness_event_sink_env(&mut cmd, ctx);
 
         let child = match cmd.spawn() {
@@ -769,6 +770,42 @@ fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command, ctx: &ToolCon
     }
 }
 
+/// Outer-loop #4 (docs/build-cache-pool.md §7.4): inject the build-cache
+/// pool slot's cargo env for a peer turn. `CARGO_TARGET_DIR=<slot>/target`
+/// redirects every cargo invocation into the shared per-repository pool slot
+/// the peer's CURRENT turn holds, and `CARGO_INCREMENTAL=0` is sent
+/// explicitly even when a machine-level `~/.cargo/config.toml` already sets
+/// it — the peer's CARGO_HOME is not under our control and the #1 incident
+/// measured 31 GB of incremental artifacts across 515 sessions.
+///
+/// PER TOOL CALL on purpose: on the serve path a peer shares the process
+/// with the master and every sibling peer, so `std::env::set_var` here would
+/// poison all of them. The slot rides `ToolContext.build_cache_slot`
+/// (populated by the peer turn boot), falling back to the task-local
+/// `TOOL_CTX` for legacy `execute()` callers — the same dual-read pattern as
+/// [`apply_harness_event_sink_env`].
+///
+/// Ordering vs `sanitize_command_env` (which runs before this in both the
+/// foreground and background paths): the sanitizer only strips
+/// secret/injection names (`BLOCKED_ENV_VARS`, registered provider keys,
+/// secret-looking names — see `subprocess_env.rs` / `env_hygiene.rs`), and
+/// neither `CARGO_TARGET_DIR` nor `CARGO_INCREMENTAL` is in that set, so a
+/// value set here survives; setting it AFTER the sanitizer keeps that
+/// property obvious rather than incidental.
+fn apply_build_cache_env(cmd: &mut tokio::process::Command, ctx: &ToolContext) {
+    let slot = ctx.build_cache_slot.clone().or_else(|| {
+        TOOL_CTX
+            .try_with(|inner| inner.build_cache_slot.clone())
+            .ok()
+            .flatten()
+    });
+    let Some(slot) = slot else {
+        return;
+    };
+    cmd.env("CARGO_TARGET_DIR", slot.join("target"))
+        .env("CARGO_INCREMENTAL", "0");
+}
+
 #[derive(Debug, Deserialize)]
 // #1770: unknown keys are usually a typo of a real parameter; rejecting
 // them (with a did-you-mean via `args::parse_tool_args`) lets the model
@@ -1105,6 +1142,7 @@ impl Tool for ShellTool {
         apply_quarto_tool_env(&mut cmd, &input.command, effective_cwd);
         apply_git_tool_env(&mut cmd, &input.command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        apply_build_cache_env(&mut cmd, ctx);
         apply_harness_event_sink_env(&mut cmd, ctx);
 
         let child = match cmd.spawn() {

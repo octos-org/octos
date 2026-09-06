@@ -13302,6 +13302,16 @@ async fn raw_peer_prepare(
         let member = match member.and_then(|inner| inner) {
             Ok(member) => member,
             Err(err) => {
+                // Outer-loop #4 (§4.2 fleet rollback): every ALREADY-staged
+                // member holds a first-turn slot from `stage_peer` — release
+                // them before the dirs go away, or the flocks leak until serve
+                // exit (a 2-slot pool is exhausted by the second leak).
+                for (staged_slug, staged_dir) in &staged {
+                    release_staged_peer_build_cache_slot(
+                        staged_dir.parent().unwrap_or(peers_root.as_path()),
+                        staged_slug,
+                    );
+                }
                 cleanup_staged_peers(&workspace_root, &staged).await;
                 return Err(err);
             }
@@ -14276,6 +14286,49 @@ mod peer_awaiting_wake_tests {
 /// aborts the agent task before it can report usage (and this path has no
 /// shared token tracker to read post-abort), so it still threads 0 and never
 /// reaches this writer — tracked as a follow-up.
+/// Outer-loop #4 (docs/build-cache-pool.md §4.2): safety-net release of a
+/// peer's held build-cache slot from the paths a turn does NOT end at the
+/// normal terminal — client interrupt (`try_emit_terminal` Interrupted arm),
+/// `peer_close` retiring a peer with a turn in flight, and connection-close
+/// session eviction. All are idempotent: the registry `take` returns `None`
+/// once the turn terminal (the primary, §4.1) has already released.
+/// `outcome` differs per site (Cancelled / Retired) purely for the release
+/// log; release behavior is identical (§3.4).
+fn release_peer_build_cache_slot(
+    peers_root: Option<&std::path::Path>,
+    session_id: &SessionKey,
+    outcome: crate::build_cache::pool::SlotOutcome,
+) {
+    // `None` = this terminal path has no peer context (a master session):
+    // slot holders are keyed by (peers_root, slug), so there is nothing to
+    // find and the release is a no-op.
+    let Some(peers_root) = peers_root else {
+        return;
+    };
+    let Some(slug) = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+    else {
+        return;
+    };
+    let key = build_cache_slot_registry_key(peers_root, slug);
+    build_cache_slot_registry().release(&key, outcome);
+}
+
+/// Interrupted-terminal variant (§4.2 row 2): both interrupt origins —
+/// `turn/interrupt` from the client and the `peer_close` abort — land in the
+/// same `TerminalReason::Interrupted` arm, so one hook covers both.
+fn release_peer_build_cache_slot_interrupted(
+    peers_root: Option<&std::path::Path>,
+    session_id: &SessionKey,
+) {
+    release_peer_build_cache_slot(
+        peers_root,
+        session_id,
+        crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
+}
+
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
@@ -14404,6 +14457,28 @@ fn write_peer_result_if_peer_session(
     // it committed exists. Best-effort and idempotent: the fetch is a forced
     // refspec, so re-running it per turn simply fast-forwards.
     collect_peer_branch(&peer_dir, slug);
+
+    // Outer-loop #4 (docs/build-cache-pool.md §4.1): THE primary slot
+    // release. "result.md written + branch collected" is this turn's
+    // terminal semantics, so the slot's ONE-TURN lifecycle ends here —
+    // NOT on peer close (a finished peer is typically never closed; with
+    // peer_slots=2 a close-only release deadlocks the third peer).
+    // Release is idempotent (`pool::release` no-ops without holder.json),
+    // so the close/interrupt/evict safety nets may fire afterwards.
+    // Outcome mapping per §4.1: Completed → Completed; Errored /
+    // RateLimited → Failed (an INTERRUPTED turn never reaches this writer
+    // — it releases at the interrupted terminal instead).
+    let slot_key = build_cache_slot_registry_key(&runtime.data_dir.join("peers"), slug);
+    if let Some(mut slot) = build_cache_slot_registry().take(&slot_key) {
+        let outcome = match outcome {
+            TurnTerminalOutcome::Completed => crate::build_cache::pool::SlotOutcome::Completed,
+            TurnTerminalOutcome::Errored | TurnTerminalOutcome::RateLimited => {
+                crate::build_cache::pool::SlotOutcome::Failed
+            }
+            TurnTerminalOutcome::Interrupted => crate::build_cache::pool::SlotOutcome::Cancelled,
+        };
+        crate::peers::build_cache_peer::release_slot(&mut slot, outcome);
+    }
 
     // Peer-agent-based goal: if this peer was staged under a goal context
     // (the `goal` file the master wrote at handoff), persist this turn's
@@ -15260,6 +15335,12 @@ fn build_peer_close_callback(
         if let Some(wire) = peer_wire_registry().resolve(&key) {
             evict_peer_wire_session(&wire);
         }
+        // Outer-loop #4 (§4.2): safety-net slot release (Retired). The
+        // PRIMARY release is the per-turn terminal; a peer whose last turn
+        // already finished finds nothing here (registry take → None), but a
+        // peer closed WITH a turn in flight — or one staged and never booted —
+        // would otherwise hold its flock until serve exit. Idempotent.
+        release_staged_peer_build_cache_slot(&peers_root, &slug);
         // Close succeeded (marker durable, queue cleared, wire evicted). Emit
         // the durable `peer/closed` so the client tears down the peer pane it
         // opened. Mirrors the `peer/staged` emit — routing keys off the
@@ -28000,6 +28081,8 @@ async fn run_m9_fixture_turn(
                     // M9 fixtures replay canned events; no live LLM token data.
                     None,
                     None,
+                    None,
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
             }
@@ -28015,6 +28098,8 @@ async fn run_m9_fixture_turn(
                 Some((code, message.as_str())),
                 None,
                 None,
+                None,
+                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
             .await;
         }
@@ -28048,6 +28133,8 @@ async fn run_m9_fixture_turn(
                 )),
                 None,
                 None,
+                None,
+                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
             .await;
         }
@@ -28862,6 +28949,8 @@ async fn run_native_code_review_turn(
                     Some(("runtime_unavailable", message.as_str())),
                     None,
                     None,
+                    None,
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -28879,6 +28968,8 @@ async fn run_native_code_review_turn(
                     Some(("runtime_unavailable", message.as_str())),
                     None,
                     None,
+                    None,
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -28902,6 +28993,8 @@ async fn run_native_code_review_turn(
                 Some(("permission_denied", message.as_str())),
                 None,
                 None,
+                None,
+                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -28931,6 +29024,8 @@ async fn run_native_code_review_turn(
                 Some(("runtime_unavailable", &error.to_string())),
                 None,
                 None,
+                None,
+                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29175,6 +29270,8 @@ async fn run_native_code_review_turn(
                     Some(("interrupted", "review/start interrupted by client")),
                     None,
                     None,
+                None,
+                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -29299,6 +29396,8 @@ async fn run_native_code_review_turn(
         // token data is in scope here.
         None,
         None,
+        None,
+        // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
     )
     .await;
     contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -30845,6 +30944,8 @@ async fn run_standalone_turn(
             Some(("runtime_unavailable", error.as_str())),
             None,
             steer_buffer.as_ref(),
+            None,
+            // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -30895,6 +30996,8 @@ async fn run_standalone_turn(
                 Some(("permission_denied", message.as_str())),
                 None,
                 steer_buffer.as_ref(),
+                None,
+                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -30924,12 +31027,21 @@ async fn run_standalone_turn(
                 Some(("runtime_unavailable", &error.to_string())),
                 None,
                 steer_buffer.as_ref(),
+                None,
+                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
             )
             .await;
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
     };
+    // Outer-loop #4 (§4.2): this turn's peers root — `Some` ONLY when this
+    // session is a peer (topic `peer-<slug>`) running under the profile's
+    // data dir. The interrupted-terminal release below keys the slot registry
+    // by exactly this root + slug; `None` keeps every master turn off the
+    // registry entirely.
+    let peers_root: Option<std::path::PathBuf> =
+        peer_slug_and_profile(&session_id).map(|_| session_runtime.profile.data_dir.join("peers"));
     // Per-project ledger isolation (#1666): every event this turn appends
     // must land under the session's per-cwd storage identity. `session/open`
     // registered it already for the normal flow; re-registering here is an
@@ -31263,6 +31375,8 @@ async fn run_standalone_turn(
             // reply is canned and no token meter ran.
             None,
             steer_buffer.as_ref(),
+            peers_root.as_deref(),
+            // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -32649,6 +32763,78 @@ async fn run_standalone_turn(
             {
                 request_agent = request_agent.with_originator_session(originator);
             }
+
+            // Outer-loop #4 (docs/build-cache-pool.md §4.1/§7.4): acquire
+            // (or ADOPT) this turn's build-cache slot. Slot lifecycle is ONE
+            // TURN: boot acquires, the turn terminal releases.
+            //
+            // ADOPT rule (§4.1/D2): on the FIRST turn the slot was already
+            // acquired by `stage_peer` IN THIS PROCESS, and an flock belongs
+            // to the open file description — a fresh `acquire` here would
+            // EWOULDBLOCK against ourselves and grab a SECOND slot (a 2-slot
+            // pool double-held by one peer). So when the registry holds a
+            // slot for this peer we take it over as-is; only when it does
+            // NOT (turn 2+, or a cross-process staging edge) do we acquire
+            // fresh, overwriting the `peers/<slug>/build-cache` record.
+            let slot_key = build_cache_slot_registry_key(&peers_root, slug);
+            let held_slot = match build_cache_slot_registry().take(&slot_key) {
+                Some(slot) => Some(slot),
+                None => {
+                    // Fresh acquire only when the pool is configured for this
+                    // root (serve bootstrap installs the profile config).
+                    build_cache_config_for(&peers_root).and_then(|config| {
+                        match build_cache_peer::acquire_for_staging(
+                            &peers_root,
+                            &session_runtime.workspace_root,
+                            slug,
+                            peer_io::read_peer_file(
+                                &peer_dir,
+                                "goal",
+                                peer_io::PEER_FILE_READ_CAP_SMALL,
+                            )
+                            .and_then(|body| {
+                                body.lines()
+                                    .next()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                            })
+                            .as_deref(),
+                            None,
+                            &config,
+                        ) {
+                            Ok(slot) => {
+                                // §7.4: the read-back file follows the
+                                // CURRENT holder. Best-effort — the flock is
+                                // the truth, and a stale record only costs a
+                                // later fresh acquire.
+                                if let Err(err) = build_cache_peer::record_slot(&peer_dir, &slot) {
+                                    tracing::warn!(%err, slug, "failed to record build-cache slot");
+                                }
+                                Some(slot)
+                            }
+                            Err(err) => {
+                                // Fail-open at the TURN level: the peer still
+                                // runs (compiling into its own cwd `target/`,
+                                // the pre-pool behaviour) — the pool error is
+                                // logged for the operator, and the next turn
+                                // retries the acquire.
+                                tracing::warn!(slug, error = %err.message, "build-cache slot unavailable; peer runs without a pooled target dir");
+                                None
+                            }
+                        }
+                    })
+                }
+            };
+            if let Some(slot) = held_slot.as_ref() {
+                request_agent = request_agent.with_build_cache_slot(slot.path.clone());
+            }
+            // Re-park the handle for the turn terminal to release: the agent
+            // itself only carries the PATH (for env injection); the fd stays
+            // here, where the terminal path can reach it.
+            if let Some(slot) = held_slot {
+                build_cache_slot_registry().park(slot_key.clone(), slot);
+            }
         }
     }
     // #1697 — pin the ACTIVE goal into the context window as a named prompt
@@ -33008,6 +33194,8 @@ async fn run_standalone_turn(
                     Some(("profile_config_unavailable", &error.to_string())),
                     None,
                     steer_buffer.as_ref(),
+                    peers_root.as_deref(),
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
                 contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -33074,6 +33262,8 @@ async fn run_standalone_turn(
             None,
             None,
             steer_buffer.as_ref(),
+            peers_root.as_deref(),
+            // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -33106,6 +33296,8 @@ async fn run_standalone_turn(
             Some(("voice_asr_unavailable", error_message)),
             None,
             None,
+            peers_root.as_deref(),
+            // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
         .await;
         contracts.scopes.evict_turn(&session_id, &turn_id);
@@ -34306,6 +34498,8 @@ async fn run_standalone_turn(
                     None,
                     Some(details),
                     steer_buffer.as_ref(),
+                    peers_root.as_deref(),
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
                 break;
@@ -34407,6 +34601,8 @@ async fn run_standalone_turn(
                     Some((code, wire_msg.as_str())),
                     None,
                     steer_buffer.as_ref(),
+                    peers_root.as_deref(),
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
                 )
                 .await;
                 break;
@@ -34774,6 +34970,8 @@ async fn run_standalone_turn(
             )),
             None,
             steer_buffer.as_ref(),
+            peers_root.as_deref(),
+            // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
         )
         .await;
         // codex #2 residual — a client-interrupted peer takes THIS branch, not
@@ -35751,6 +35949,11 @@ async fn try_emit_terminal(
     // flips to Terminal and BEFORE the terminal frame below — see
     // `settle_leftover_steers`.
     steer_buffer: Option<&octos_agent::SharedSteerBuffer>,
+    // Outer-loop #4 (§4.2): the peers root for a PEER session's build-cache
+    // slot release at the interrupted terminal. `None` on every path that
+    // cannot be a peer turn (M9 fixtures, review scatter-join, slash
+    // dispatch) — those sessions hold no slot, so the release no-ops.
+    peers_root: Option<&std::path::Path>,
 ) {
     // Single terminal gate: state → Terminal, then the steer settlement
     // (`turn/steer_dropped`), then — below — the terminal frame.
@@ -35823,6 +36026,14 @@ async fn try_emit_terminal(
         TerminalReason::Interrupted => {
             let (code, message) = error_payload.unwrap_or(("interrupted", "turn interrupted"));
             let _ = send_turn_error(ws, ledger, session_id, turn_id, code, message);
+            // Outer-loop #4 (§4.2): an INTERRUPTED turn never reaches
+            // `write_peer_result_if_peer_session` (it aborts the agent task
+            // before the done/error event), so the peer's held slot must be
+            // released HERE or one client interrupt leaks it until serve
+            // restart — with peer_slots=2, two interrupts pool-exhaust the
+            // fleet. Idempotent: a turn that already released at its terminal
+            // finds no registry entry.
+            release_peer_build_cache_slot_interrupted(peers_root, session_id);
         }
     }
 
