@@ -516,6 +516,13 @@ pub(crate) mod peer_io {
         imp::append_peer_line(peer_dir, leaf, line)
     }
 
+    /// Publish a local Cargo config without replacing either repository config
+    /// filename. `true` means both exclusion and publication succeeded; `false`
+    /// means repository-owned config exists (including a dangling symlink).
+    pub(crate) fn write_fenced_cargo_config(worktree: &Path, body: &str) -> std::io::Result<bool> {
+        imp::write_fenced_cargo_config(worktree, body)
+    }
+
     /// `true` when the peer leaf exists as a REGULAR file, resolved under the
     /// peer dir fd with a no-follow stat (`S_ISREG` required). A symlinked/FIFO/
     /// dir/device leaf — or a symlinked peer dir — reads as absent. Replaces the
@@ -559,10 +566,13 @@ pub(crate) mod peer_io {
         use std::ffi::CStr;
         use std::io::{Read, Write};
         use std::os::fd::OwnedFd;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         use std::path::Path;
 
-        use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fsync, openat, renameat, unlinkat};
+        use rustix::fs::{
+            AtFlags, Dir, FileType, Mode, OFlags, fsync, linkat, mkdirat, openat, renameat, statat,
+            unlinkat,
+        };
 
         /// Open the peer dir as an `O_NOFOLLOW|O_DIRECTORY` fd: a symlinked
         /// `<slug>` is refused here (belt-and-braces over `staged_peer_dir`'s
@@ -575,6 +585,114 @@ pub(crate) mod peer_io {
                 )
                 .open(peer_dir)
                 .map(OwnedFd::from)
+        }
+
+        fn open_child_dir(dir: &OwnedFd, leaf: &std::ffi::OsStr) -> std::io::Result<OwnedFd> {
+            Ok(openat(
+                dir,
+                leaf,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?)
+        }
+
+        fn create_child_dir(dir: &OwnedFd, leaf: &str) -> std::io::Result<OwnedFd> {
+            match mkdirat(dir, leaf, Mode::RWXU) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
+            }
+            open_child_dir(dir, leaf.as_ref())
+        }
+
+        fn cargo_config_exists(dir: &OwnedFd) -> std::io::Result<bool> {
+            for leaf in ["config", "config.toml"] {
+                match statat(dir, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(_) => return Ok(true),
+                    Err(rustix::io::Errno::NOENT) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(false)
+        }
+
+        pub(crate) fn write_fenced_cargo_config(
+            worktree: &Path,
+            body: &str,
+        ) -> std::io::Result<bool> {
+            // Pin the peer boundary first, then every untrusted descendant.
+            // A cloned .cargo symlink, or a concurrently replaced wt/.git/info,
+            // cannot redirect writes through a re-resolved path.
+            let peer = open_peer_dir(
+                worktree
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("worktree has no peer directory"))?,
+            )?;
+            let wt = open_child_dir(
+                &peer,
+                worktree
+                    .file_name()
+                    .ok_or_else(|| std::io::Error::other("worktree has no directory name"))?,
+            )?;
+            let cargo = create_child_dir(&wt, ".cargo")?;
+            if cargo_config_exists(&cargo)? {
+                return Ok(false);
+            }
+            let git = open_child_dir(&wt, ".git".as_ref())?;
+            let info = create_child_dir(&git, "info")?;
+            let fd = openat(
+                &info,
+                "exclude",
+                OFlags::WRONLY
+                    | OFlags::CREATE
+                    | OFlags::APPEND
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK,
+                Mode::RUSR | Mode::WUSR,
+            )?;
+            let mut exclude = std::fs::File::from(fd);
+            let metadata = exclude.metadata()?;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(std::io::Error::other(
+                    "Git exclude is not a private regular file",
+                ));
+            }
+            // Append only (bounded, no lossy read/overwrite of existing rules).
+            // Finish this BEFORE publishing config: failure must not produce an
+            // unexcluded local file while claiming the shared cache is ready.
+            exclude.write_all(b"\n.cargo/config.toml\n")?;
+            exclude.sync_all()?;
+            if cargo_config_exists(&cargo)? {
+                return Ok(false);
+            }
+            let temporary = super::tmp_name("config.toml");
+            let fd = openat(
+                &cargo,
+                temporary.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )?;
+            let mut file = std::fs::File::from(fd);
+            let result = (|| -> std::io::Result<bool> {
+                file.write_all(body.as_bytes())?;
+                file.sync_all()?;
+                // Atomic NO-REPLACE publication. rename would clobber a config
+                // created after the existence check; linkat returns EEXIST.
+                match linkat(
+                    &cargo,
+                    temporary.as_str(),
+                    &cargo,
+                    "config.toml",
+                    AtFlags::empty(),
+                ) {
+                    Ok(()) => Ok(true),
+                    Err(rustix::io::Errno::EXIST) => Ok(false),
+                    Err(error) => Err(error.into()),
+                }
+            })();
+            let _ = unlinkat(&cargo, temporary.as_str(), AtFlags::empty());
+            let _ = fsync(&cargo);
+            result
         }
 
         pub(crate) fn read_peer_file(peer_dir: &Path, leaf: &str, cap: usize) -> Option<String> {
@@ -765,6 +883,86 @@ pub(crate) mod peer_io {
     mod imp {
         use std::io::{Read, Write};
         use std::path::Path;
+
+        fn cache_dir_ok(path: &Path) -> std::io::Result<()> {
+            let metadata = std::fs::symlink_metadata(path)?;
+            #[cfg(windows)]
+            let reparse_point = {
+                use std::os::windows::fs::MetadataExt;
+                metadata.file_attributes() & 0x400 != 0
+            };
+            #[cfg(not(windows))]
+            let reparse_point = false;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() || reparse_point {
+                return Err(std::io::Error::other("cache path is not a real directory"));
+            }
+            Ok(())
+        }
+
+        fn cargo_config_exists(dir: &Path) -> std::io::Result<bool> {
+            for leaf in ["config", "config.toml"] {
+                match std::fs::symlink_metadata(dir.join(leaf)) {
+                    Ok(_) => return Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(false)
+        }
+
+        pub(crate) fn write_fenced_cargo_config(
+            worktree: &Path,
+            body: &str,
+        ) -> std::io::Result<bool> {
+            // Same checked-path fallback as other non-Unix peer I/O: reject
+            // symlinks/reparse points, but cannot eliminate check/open races.
+            cache_dir_ok(
+                worktree
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("worktree has no peer directory"))?,
+            )?;
+            cache_dir_ok(worktree)?;
+            let cargo = worktree.join(".cargo");
+            match std::fs::create_dir(&cargo) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            cache_dir_ok(&cargo)?;
+            if cargo_config_exists(&cargo)? {
+                return Ok(false);
+            }
+            let git = worktree.join(".git");
+            cache_dir_ok(&git)?;
+            let info = git.join("info");
+            match std::fs::create_dir(&info) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            cache_dir_ok(&info)?;
+            append_peer_line(&info, "exclude", "\n.cargo/config.toml\n")?;
+            if cargo_config_exists(&cargo)? {
+                return Ok(false);
+            }
+            let temporary = cargo.join(super::tmp_name("config.toml"));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            let result = (|| -> std::io::Result<bool> {
+                file.write_all(body.as_bytes())?;
+                file.sync_all()?;
+                match std::fs::hard_link(&temporary, cargo.join("config.toml")) {
+                    Ok(()) => Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })();
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            result
+        }
 
         /// Refuse a symlinked peer dir; require a real directory. Non-unix
         /// serve is dev-only (matching the `symlink_metadata` fallback
@@ -2235,9 +2433,9 @@ pub(crate) fn read_peer_model_lane(peers_root: &Path, slug: &str) -> Option<Stri
 pub(crate) enum PeerBuildCache {
     /// `wt/.cargo/config.toml` written pointing at the workspace `target/`.
     Shared,
-    /// Workspace root has no `Cargo.toml`: nothing written, no note.
+    /// Non-Cargo workspace or safe cache wiring declined: no shared-cache note.
     None,
-    /// The repo's own `.cargo/config.toml` was cloned in: left untouched.
+    /// The repo's own `.cargo/config{,.toml}` was cloned in: left untouched.
     RepoConfig,
 }
 
@@ -2249,9 +2447,10 @@ impl PeerBuildCache {
                 "build cache: target-dir -> {}/target",
                 workspace_root.display()
             )),
-            PeerBuildCache::RepoConfig => {
-                Some("build cache: repo has its own .cargo/config.toml, left untouched".to_string())
-            }
+            PeerBuildCache::RepoConfig => Some(
+                "build cache: repo has its own .cargo/config or config.toml, left untouched"
+                    .to_string(),
+            ),
             PeerBuildCache::None => None,
         }
     }
@@ -2271,8 +2470,10 @@ impl PeerBuildCache {
 /// the #45 peer's entire 50-iteration budget). Writes `wt/.cargo/config.toml`
 /// with an absolute `build.target-dir`, and excludes the file via
 /// `wt/.git/info/exclude` so the fence's `git status` stays clean and no
-/// `git add` can pick it up. A repo-provided `.cargo/config.toml` is never
-/// overwritten (RepoConfig); a non-Cargo workspace writes nothing (None).
+/// ordinary `git add` picks it up. Either repo-provided `.cargo/config` or
+/// `.cargo/config.toml` is preserved (RepoConfig); a non-Cargo workspace writes
+/// nothing (None). Unsafe paths/I/O failures decline sharing rather than
+/// following cloned symlinks or claiming an unexcluded config is ready.
 /// No env vars: the peer's tool-process environment is not the stage's to own.
 pub(crate) fn wire_fenced_peer_build_cache(
     worktree_path: &Path,
@@ -2281,40 +2482,27 @@ pub(crate) fn wire_fenced_peer_build_cache(
     if !workspace_root.join("Cargo.toml").is_file() {
         return PeerBuildCache::None;
     }
-    let cargo_dir = worktree_path.join(".cargo");
-    let config_path = cargo_dir.join("config.toml");
-    if config_path.exists() {
-        return PeerBuildCache::RepoConfig;
-    }
-    let body = format!(
-        "[build]\ntarget-dir = \"{}/target\"\n",
-        workspace_root.display()
-    );
-    let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&cargo_dir)?;
-        std::fs::write(&config_path, body)
-    };
-    if write().is_err() {
+    let Ok(workspace) = std::path::absolute(workspace_root) else {
         return PeerBuildCache::None;
+    };
+    let target = workspace.join("target");
+    let Some(target) = target.to_str() else {
+        return PeerBuildCache::None;
+    };
+    // JSON's emitted escapes are valid TOML basic-string escapes, but JSON
+    // allows literal DEL while TOML forbids it. Escape that additional byte to
+    // keep exactly two lines and round-trip Windows '\\', quotes and controls.
+    // Path::display would also silently lose non-UTF8.
+    let Ok(encoded) = serde_json::to_string(target) else {
+        return PeerBuildCache::None;
+    };
+    let encoded = encoded.replace('\u{7f}', "\\u007f");
+    let body = format!("[build]\ntarget-dir = {encoded}\n");
+    match peer_io::write_fenced_cargo_config(worktree_path, &body) {
+        Ok(true) => PeerBuildCache::Shared,
+        Ok(false) => PeerBuildCache::RepoConfig,
+        Err(_) => PeerBuildCache::None,
     }
-    // Keep the fence's git view clean: exclude via .git/info/exclude (local,
-    // never committed, never pushed).
-    let exclude_path = worktree_path.join(".git").join("info").join("exclude");
-    let _ = (|| -> std::io::Result<()> {
-        if let Some(parent) = exclude_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-        if !existing.lines().any(|l| l.trim() == ".cargo/config.toml") {
-            if !existing.ends_with('\n') && !existing.is_empty() {
-                existing.push('\n');
-            }
-            existing.push_str(".cargo/config.toml\n");
-            std::fs::write(&exclude_path, existing)?;
-        }
-        Ok(())
-    })();
-    PeerBuildCache::Shared
 }
 
 pub(crate) fn record_peer_model_lane(
@@ -3052,6 +3240,292 @@ pub(crate) fn build_peer_list_callback(
 mod issue_2236_build_cache_tests {
     use super::stage_peer;
 
+    #[cfg(unix)]
+    #[test]
+    fn should_preserve_dangling_config_symlink_without_writing_its_target() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        std::fs::create_dir_all(ws.join(".cargo")).unwrap();
+        let outside = tmp.path().join("absent-config");
+        std::os::unix::fs::symlink(&outside, ws.join(".cargo/config.toml")).unwrap();
+        commit_fixture(&ws);
+        let staged = stage_peer(
+            &tmp.path().join("peers"),
+            &ws,
+            "s",
+            Some("leaf"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !outside.exists(),
+            "a dangling config link is still repository-owned"
+        );
+        assert!(staged.cwd.join(".cargo/config.toml").is_symlink());
+        assert_eq!(staged.build_cache, super::PeerBuildCache::RepoConfig);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_decline_shared_cache_when_git_exclusion_crosses_symlinks() {
+        for poisoned in [".git", ".git/info", ".git/info/exclude"] {
+            let (tmp, ws) = cargo_ws_repo(true, false);
+            let wt = tmp.path().join("peer/wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let link = wt.join(poisoned);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            let target = if poisoned.ends_with("exclude") {
+                let target = outside.join("victim");
+                std::fs::write(&target, "original\n").unwrap();
+                target
+            } else {
+                outside.clone()
+            };
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert_eq!(
+                super::wire_fenced_peer_build_cache(&wt, &ws),
+                super::PeerBuildCache::None,
+                "{poisoned}"
+            );
+            assert!(
+                !wt.join(".cargo/config.toml").exists(),
+                "do not publish an unexcluded config: {poisoned}"
+            );
+            if poisoned.ends_with("exclude") {
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+            } else {
+                assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn should_decline_shared_cache_when_git_exclusion_cannot_be_written() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let wt = tmp.path().join("peer/wt");
+        std::fs::create_dir_all(wt.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            super::wire_fenced_peer_build_cache(&wt, &ws),
+            super::PeerBuildCache::None
+        );
+        assert!(!wt.join(".cargo/config.toml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_change_other_inode_links_when_git_exclude_is_hardlinked() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let wt = tmp.path().join("peer/wt");
+        std::fs::create_dir_all(wt.join(".git/info")).unwrap();
+        let outside = tmp.path().join("outside-exclude");
+        std::fs::write(&outside, "outside-rule\n").unwrap();
+        std::fs::hard_link(&outside, wt.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            super::wire_fenced_peer_build_cache(&wt, &ws),
+            super::PeerBuildCache::None
+        );
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside-rule\n");
+        assert!(!wt.join(".cargo/config.toml").exists());
+    }
+
+    #[test]
+    fn should_not_clobber_config_or_exclude_when_cache_wiring_is_repeated() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let wt = tmp.path().join("peer/wt");
+        std::fs::create_dir_all(wt.join(".git/info")).unwrap();
+        std::fs::write(
+            wt.join(".git/info/exclude"),
+            "existing-rule-without-newline",
+        )
+        .unwrap();
+        assert_eq!(
+            super::wire_fenced_peer_build_cache(&wt, &ws),
+            super::PeerBuildCache::Shared
+        );
+        let config = std::fs::read(wt.join(".cargo/config.toml")).unwrap();
+        let exclude = std::fs::read_to_string(wt.join(".git/info/exclude")).unwrap();
+        assert!(exclude.starts_with("existing-rule-without-newline\n"));
+        assert!(exclude.lines().any(|line| line == ".cargo/config.toml"));
+        assert_eq!(
+            super::wire_fenced_peer_build_cache(&wt, &ws),
+            super::PeerBuildCache::RepoConfig
+        );
+        assert_eq!(
+            std::fs::read(wt.join(".cargo/config.toml")).unwrap(),
+            config
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".git/info/exclude")).unwrap(),
+            exclude
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_decline_shared_cache_when_worktree_or_peer_boundary_is_symlinked() {
+        for parent_link in [false, true] {
+            let (tmp, ws) = cargo_ws_repo(true, false);
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(outside.join("wt/.git/info")).unwrap();
+            let peer = tmp.path().join("peer");
+            if parent_link {
+                std::os::unix::fs::symlink(&outside, &peer).unwrap();
+            } else {
+                std::fs::create_dir(&peer).unwrap();
+                std::os::unix::fs::symlink(outside.join("wt"), peer.join("wt")).unwrap();
+            }
+            assert_eq!(
+                super::wire_fenced_peer_build_cache(&peer.join("wt"), &ws),
+                super::PeerBuildCache::None
+            );
+            assert!(!outside.join("wt/.cargo").exists());
+        }
+    }
+
+    fn commit_fixture(ws: &std::path::Path) {
+        for args in [vec!["add", "."], vec!["commit", "--quiet", "-m", "fixture"]] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(ws)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn should_encode_target_path_when_fenced_workspace_contains_toml_metacharacters() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        // Backslashes are ordinary filename characters on Unix; this exercises
+        // the exact bytes that Windows paths contribute to TOML on every host.
+        #[cfg(unix)]
+        let name = "workspace\\Users\\fixture\"quoted";
+        #[cfg(not(unix))]
+        let name = "workspace";
+        let special_ws = tmp.path().join(name);
+        std::fs::rename(&ws, &special_ws).unwrap();
+        let staged = stage_peer(
+            &tmp.path().join("peers"),
+            &special_ws,
+            "s",
+            Some("encoded"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(staged.cwd.join(".cargo/config.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&body).expect("generated Cargo config must parse");
+        assert_eq!(
+            parsed["build"]["target-dir"].as_str(),
+            special_ws.join("target").to_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_encode_target_path_when_workspace_contains_delete_control_character() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let special_ws = tmp.path().join("control\u{7f}\n\tworkspace");
+        std::fs::rename(&ws, &special_ws).unwrap();
+        let staged = stage_peer(
+            &tmp.path().join("peers"),
+            &special_ws,
+            "s",
+            Some("controls"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(staged.cwd.join(".cargo/config.toml")).unwrap();
+        assert_eq!(body.lines().count(), 2, "only [build] and target-dir lines");
+        let parsed: toml::Value = toml::from_str(&body)
+            .expect("DEL must be escaped in TOML even though JSON allows it raw");
+        assert_eq!(
+            parsed["build"]["target-dir"].as_str(),
+            special_ws.join("target").to_str()
+        );
+    }
+
+    #[test]
+    fn should_preserve_legacy_config_when_fenced_repository_owns_cargo_settings() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        std::fs::create_dir_all(ws.join(".cargo")).unwrap();
+        std::fs::write(
+            ws.join(".cargo/config"),
+            "[build]\ntarget-dir = 'project-target'\n",
+        )
+        .unwrap();
+        commit_fixture(&ws);
+        let staged = stage_peer(
+            &tmp.path().join("peers"),
+            &ws,
+            "s",
+            Some("legacy"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(staged.build_cache, super::PeerBuildCache::RepoConfig);
+        assert!(!staged.cwd.join(".cargo/config.toml").exists());
+        let original: toml::Value =
+            toml::from_str(&std::fs::read_to_string(staged.cwd.join(".cargo/config")).unwrap())
+                .unwrap();
+        assert_eq!(
+            original["build"]["target-dir"].as_str(),
+            Some("project-target")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_write_outside_fence_when_cloned_cargo_directory_is_symlinked() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let outside = tmp.path().join("outside-fence");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join(".cargo")).unwrap();
+        commit_fixture(&ws);
+        let staged = stage_peer(
+            &tmp.path().join("peers"),
+            &ws,
+            "s",
+            Some("symlink"),
+            Some("m"),
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            staged.cwd.join(".cargo").is_symlink(),
+            "real git clone preserves the planted symlink"
+        );
+        assert!(
+            !outside.join("config.toml").exists(),
+            "cache staging must not write outside its fence"
+        );
+        assert_eq!(staged.build_cache, super::PeerBuildCache::None);
+    }
+
     /// Real temp git repo fixture (per the contract: real repos, no cargo run).
     fn cargo_ws_repo(
         with_cargo: bool,
@@ -3134,7 +3608,10 @@ mod issue_2236_build_cache_tests {
         // Nothing else (CARGO_HOME, registry keys, …) may ride along.
         assert_eq!(
             body,
-            format!("[build]\ntarget-dir = \"{}/target\"\n", ws.display()),
+            format!(
+                "[build]\ntarget-dir = {}\n",
+                serde_json::to_string(ws.join("target").to_str().unwrap()).unwrap()
+            ),
             "config must be exactly the two contract lines"
         );
         assert!(!body.contains("CARGO_HOME"), "no CARGO_HOME key");
