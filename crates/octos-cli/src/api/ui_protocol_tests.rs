@@ -2066,7 +2066,10 @@ async fn should_upsert_endpoint_edit_reload_dynamic_profile_runtime_for_next_tur
     // A turn in flight keeps its start-of-turn runtime; the test drops its
     // handle the same way a finished turn would, so the rebuild below can
     // take over the profile's data directory (single-writer redb).
-    let before_ptr = Arc::as_ptr(&before) as usize;
+    // A weak handle keeps the allocation identity reserved without keeping
+    // the runtime's single-writer episode store alive during reload. Saving
+    // only its address lets the allocator reuse it for the new runtime.
+    let before_identity = Arc::downgrade(&before);
     drop(before);
 
     // Same model id, different endpoint: the cache MUST still be invalidated.
@@ -2094,9 +2097,8 @@ async fn should_upsert_endpoint_edit_reload_dynamic_profile_runtime_for_next_tur
     );
 
     let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
-    assert_ne!(
-        Arc::as_ptr(&after) as usize,
-        before_ptr,
+    assert!(
+        !std::sync::Weak::ptr_eq(&before_identity, &Arc::downgrade(&after)),
         "endpoint edit must rebuild the cached ProfileRuntime"
     );
     assert_eq!(after.primary_model_id, "gpt-4o-mini");
@@ -2139,7 +2141,8 @@ async fn should_delete_primary_promote_fallback_and_reload_dynamic_profile_runti
         .await
         .expect("bootstrap")
         .expect("runtime cached");
-    let before_ptr = Arc::as_ptr(&before) as usize;
+    // Retain allocation identity, but allow the old store itself to close.
+    let before_identity = Arc::downgrade(&before);
     drop(before);
 
     let result = raw_profile_llm_delete(
@@ -2154,9 +2157,8 @@ async fn should_delete_primary_promote_fallback_and_reload_dynamic_profile_runti
     assert_eq!(result["restart_required"], json!(false), "{result}");
 
     let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
-    assert_ne!(
-        Arc::as_ptr(&after) as usize,
-        before_ptr,
+    assert!(
+        !std::sync::Weak::ptr_eq(&before_identity, &Arc::downgrade(&after)),
         "primary deletion must rebuild the cached ProfileRuntime"
     );
     assert_eq!(
