@@ -6020,6 +6020,8 @@ mod tests {
         );
     }
 
+    // No native Keychain writes without an isolated macOS integration fixture.
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn my_profile_rejects_service_account_json_under_custom_env_off_macos() {
         // Regression for the dashboard "Custom" bypass: a raw Vertex SA JSON
@@ -6034,6 +6036,7 @@ mod tests {
         // legitimately relocated: the call succeeds and the slot becomes a
         // keychain marker, never the raw value. Hosts with NO backend keep
         // the rejection.
+        #[cfg(target_os = "linux")]
         let _secrets_root =
             crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
         let (_dir, state, _user_store, profile_store) = temp_app_state();

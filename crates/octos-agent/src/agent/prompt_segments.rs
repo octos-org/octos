@@ -113,20 +113,42 @@ impl PromptSegments {
 
     /// Render the full prompt.
     pub(super) fn render(&self) -> String {
+        self.render_with_named_replacement(None)
+    }
+
+    /// Render a snapshot while replacing one named segment without mutating
+    /// the live Agent. OUP uses this to keep stable memory policy in System
+    /// while projecting the refreshed memory payload as tail context.
+    pub(super) fn render_replacing_named(&self, name: &str, replacement: &str) -> String {
+        self.render_with_named_replacement(Some((name, replacement)))
+    }
+
+    pub(super) fn named_content(&self, name: &str) -> Option<String> {
+        self.segments
+            .iter()
+            .find(|segment| segment.name.as_deref() == Some(name))
+            .map(|segment| segment.content.clone())
+    }
+
+    fn render_with_named_replacement(&self, replacement: Option<(&str, &str)>) -> String {
         let mut out = String::new();
         for seg in &self.segments {
-            if seg.content.is_empty() {
+            let content = replacement
+                .filter(|(name, _)| seg.name.as_deref() == Some(*name))
+                .map(|(_, content)| content)
+                .unwrap_or(&seg.content);
+            if content.is_empty() {
                 continue;
             }
             match seg.name {
                 // Anonymous content carries its own separators verbatim.
-                None => out.push_str(&seg.content),
+                None => out.push_str(content),
                 // Named content gets a separator unless it opens the prompt.
                 Some(_) => {
                     if !out.is_empty() {
                         out.push_str("\n\n");
                     }
-                    out.push_str(&seg.content);
+                    out.push_str(content);
                 }
             }
         }
@@ -172,6 +194,23 @@ mod tests {
 
         segs.set_named("memory", "memory v2".to_string());
         assert_eq!(segs.render(), "base\n\nbootstrap\n\nmemory v2\n\nskills");
+    }
+
+    #[test]
+    fn snapshot_replacement_does_not_mutate_live_named_segment() {
+        let mut segs = PromptSegments::from_base("base".to_string());
+        segs.set_named("memory", "volatile memory".to_string());
+        segs.append("tools");
+
+        assert_eq!(
+            segs.render_replacing_named("memory", "stable memory policy"),
+            "base\n\nstable memory policy\n\ntools"
+        );
+        assert_eq!(
+            segs.named_content("memory").as_deref(),
+            Some("volatile memory")
+        );
+        assert_eq!(segs.render(), "base\n\nvolatile memory\n\ntools");
     }
 
     #[test]

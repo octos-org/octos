@@ -5534,8 +5534,14 @@ mod tests {
         assert!(!base_url_targets_link_local("not a url"));
     }
 
+    // Native macOS Keychain writes need an explicit integration fixture;
+    // ordinary unit tests must never write into the developer's login store.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
+        #[cfg(target_os = "linux")]
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
         // #2234/45a — the availability predicate is now `keychain::is_available()`
         // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
         // never-plaintext contract holds where NO backend exists (unsupported
@@ -5573,6 +5579,7 @@ mod tests {
         assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_rejects_service_account_json_under_custom_env_name_off_macos() {
         // The dashboard "Custom" bypass: SA JSON pasted under VERTEX_API_KEY
@@ -5585,6 +5592,7 @@ mod tests {
         // INJECTED temp root) the JSON is legitimately relocated: Ok, the
         // slot becomes a keychain marker, the raw value never remains.
         // Hosts with NO backend keep the rejection.
+        #[cfg(target_os = "linux")]
         let _secrets_root =
             crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
         let mut env = std::collections::HashMap::new();

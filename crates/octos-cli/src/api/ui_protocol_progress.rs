@@ -112,6 +112,7 @@ pub(crate) fn map_progress_json(
         "token_budget_exceeded" => map_budget_stop(context, event, "token budget exceeded"),
         "activity_timeout_reached" => map_budget_stop(context, event, "activity timeout reached"),
         "llm_status" => map_simple_status(context, event, progress_kinds::STATUS),
+        "agent_progress" => map_simple_status(context, event, "agent_progress"),
         "stream_retry" => map_stream_retry(context, event),
         "thinking" => map_simple_status(context, event, progress_kinds::THINKING),
         "response" => map_simple_status(context, event, progress_kinds::RESPONSE),
@@ -936,6 +937,26 @@ mod tests {
             assert!(mapping.notifications.is_empty());
             assert_eq!(mapping.warning, None);
         }
+    }
+
+    #[test]
+    fn ui_protocol_progress_preserves_agent_step_token_time_status() {
+        let message = "Step 21 · 18432 tokens · 5m07s · 1 reflection";
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "agent_progress",
+                "message": message,
+                "iteration": 21,
+            }),
+        );
+
+        let status = mapping.status.expect("status mapping");
+        assert_eq!(status.event.metadata.kind, "agent_progress");
+        assert_eq!(status.event.metadata.message.as_deref(), Some(message));
+        assert_eq!(status.event.metadata.iteration, Some(21));
+        assert!(mapping.notifications.is_empty());
+        assert_eq!(mapping.warning, None);
     }
 
     #[test]
