@@ -503,6 +503,18 @@ struct FunctionCall {
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Automatic prompt-cache breakdown. `cached_tokens` counts the portion
+    /// of `prompt_tokens` served from the upstream provider's cache
+    /// (INCLUDED in `prompt_tokens`, unlike Anthropic's disjoint accounting).
+    /// Upstream providers that omit the object parse as `None`.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 fn openrouter_response_to_chat_response(
@@ -550,10 +562,23 @@ fn openrouter_response_to_chat_response(
         reasoning_content: reasoning.or(reasoning_content),
         tool_calls,
         stop_reason,
-        usage: TokenUsage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            ..Default::default()
+        usage: {
+            // OpenRouter reports cached tokens INSIDE prompt_tokens; the
+            // TokenUsage contract is disjoint (Anthropic-style: total
+            // prompt = input + cache_read), so subtract at the boundary.
+            // Same normalization as the shared SSE parse — a cache hit must
+            // not report different usage depending on the stream flag.
+            let cached = usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
+            TokenUsage {
+                input_tokens: usage.prompt_tokens.saturating_sub(cached),
+                output_tokens: usage.completion_tokens,
+                cache_read_tokens: cached,
+                ..Default::default()
+            }
         },
         provider_index: None,
     })
@@ -894,6 +919,78 @@ mod tests {
             Some("Compatible reasoning text.")
         );
         assert_eq!(chat.content.as_deref(), Some("Final answer."));
+    }
+
+    #[test]
+    fn test_api_response_cached_tokens_normalized_to_disjoint_accounting() {
+        // OpenRouter reports the cached portion INSIDE prompt_tokens; the
+        // TokenUsage contract is disjoint, so the total prompt is
+        // input + cache_read. The non-streaming path must normalize exactly
+        // like the shared SSE parse does (a cache hit must not change the
+        // reported usage with the stream flag).
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Hello!",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 75 }
+            }
+        });
+        let resp: ApiResponse = serde_json::from_value(json).unwrap();
+        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        assert_eq!(chat.usage.input_tokens, 25);
+        assert_eq!(chat.usage.cache_read_tokens, 75);
+    }
+
+    #[test]
+    fn test_api_response_cached_tokens_default_zero_when_details_missing() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Hello!",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        });
+        let resp: ApiResponse = serde_json::from_value(json).unwrap();
+        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        assert_eq!(chat.usage.input_tokens, 10);
+        assert_eq!(chat.usage.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn test_api_response_cached_tokens_clamped_when_above_prompt_tokens() {
+        // A buggy upstream reporting cached_tokens >= prompt_tokens must
+        // clamp input_tokens to 0 (saturating_sub), never wrap or panic.
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Hello!",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 100 }
+            }
+        });
+        let resp: ApiResponse = serde_json::from_value(json).unwrap();
+        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        assert_eq!(chat.usage.input_tokens, 0);
+        assert_eq!(chat.usage.cache_read_tokens, 100);
     }
 
     #[test]
