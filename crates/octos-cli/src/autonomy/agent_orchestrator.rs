@@ -34051,7 +34051,10 @@ mod tests {
         std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "init"]);
-        run(&["checkout", "-q", "-b", branch]);
+        // `-B` (create-or-reset), not `-b`: the platform default branch may
+        // already BE `branch` (Apple Git's system gitconfig sets
+        // `init.defaultBranch=main`), and `-b` would exit 128 there.
+        run(&["checkout", "-q", "-B", branch]);
     }
 
     /// #20c — the installed provider scans MULTIPLE goals' ledgers for the
