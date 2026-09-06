@@ -88,8 +88,13 @@ pub struct UpdateProfileRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub data_dir: Option<Option<String>>,
+    /// Parsed as opaque JSON on purpose: the typed round-trip happens in
+    /// `merge_profile_config_from_body` *after* the raw patch is merged over
+    /// the stored config (an invalid merged result is a 400), so a partial
+    /// nested-section patch (e.g. `{"email":{"smtp_host":…}}` without the
+    /// required `provider`) must still parse here (#1470).
     #[serde(default)]
-    pub config: Option<ProfileConfig>,
+    pub config: Option<serde_json::Value>,
     /// Set or update the email address for OTP login.
     #[serde(default)]
     pub email: Option<String>,
@@ -286,7 +291,7 @@ pub(crate) fn relocate_keychain_backed_secrets(
             env_vars,
             &key,
             profile_id,
-            cfg!(target_os = "macos"),
+            crate::auth::keychain::is_available(),
             crate::auth::keychain::set_secret,
         )
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -420,7 +425,8 @@ pub async fn update_profile(
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
     }
-    merge_profile_config_from_body(&mut profile.config, &body, false);
+    merge_profile_config_from_body(&mut profile.config, &body, false)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA
     // JSON) into the OS keychain before persisting, so an admin edit can't
     // write a private key into plaintext profile config.
@@ -1203,12 +1209,17 @@ pub async fn provider_models(
     }
     // Protocol-aware discovery shared with the AppUI `profile/llm/
     // fetch_models` surface — the strategy resolves from the route (api_type
-    // override, then the family's declared protocol), never from the literal
-    // family id, so the two clients cannot drift.
-    let discovery =
-        octos_llm::discovery::resolve_model_discovery(Some(&req.provider), req.api_type.as_deref());
+    // override, then the family's declared protocol — per-model for families
+    // like r9s that pick the wire protocol by model name), never from the
+    // literal family id, so the two clients cannot drift.
+    let route = octos_llm::discovery::resolve_model_discovery(
+        Some(&req.provider),
+        req.api_type.as_deref(),
+        (!req.model.trim().is_empty()).then_some(req.model.trim()),
+        req.base_url.as_deref(),
+    );
     let outcome = octos_llm::discovery::discover_models(
-        discovery,
+        &route,
         &api_key,
         req.base_url.as_deref(),
         Some(&req.provider),
@@ -1286,23 +1297,35 @@ pub(crate) fn merge_profile_config_from_body(
     config: &mut ProfileConfig,
     body: &str,
     env_vars_authoritative: bool,
-) {
+) -> Result<(), String> {
     let raw: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
-    if let Some(config_patch) = raw.get("config") {
-        if config_patch.is_object() {
-            let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
-            json_merge(&mut existing, config_patch);
-            if env_vars_authoritative {
-                if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
-                    if let Some(existing_obj) = existing.as_object_mut() {
-                        existing_obj.insert("env_vars".to_string(), env_vars.clone());
-                    }
-                }
-            }
-            if let Ok(merged) = serde_json::from_value(existing) {
-                *config = merged;
+    let Some(config_patch) = raw.get("config") else {
+        return Ok(());
+    };
+    if config_patch.is_null() {
+        return Ok(());
+    }
+    if !config_patch.is_object() {
+        return Err("config must be an object".into());
+    }
+    let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
+    json_merge(&mut existing, config_patch);
+    if env_vars_authoritative {
+        if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
+            if let Some(existing_obj) = existing.as_object_mut() {
+                existing_obj.insert("env_vars".to_string(), env_vars.clone());
             }
         }
+    }
+    // The request body parses `config` as opaque JSON (see UpdateProfileRequest),
+    // so this typed round-trip is the only validation gate: an invalid merged
+    // result must surface as an error instead of silently dropping the patch.
+    match serde_json::from_value(existing) {
+        Ok(merged) => {
+            *config = merged;
+            Ok(())
+        }
+        Err(e) => Err(format!("invalid config: {e}")),
     }
 }
 
@@ -5511,14 +5534,35 @@ mod tests {
         assert!(!base_url_targets_link_local("not a url"));
     }
 
+    // Native macOS Keychain writes need an explicit integration fixture;
+    // ordinary unit tests must never write into the developer's login store.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
-        // The shared helper used by every profile/sub-account save path must
-        // refuse a raw SA JSON on a non-macOS host (where keychain storage
-        // isn't available) rather than let it fall through to plaintext config.
-        // On macOS it would relocate to the keychain instead, so only assert on
-        // the non-macOS path (the one CI runs and the plaintext risk lives on).
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "linux")]
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+        // #2234/45a — the availability predicate is now `keychain::is_available()`
+        // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
+        // never-plaintext contract holds where NO backend exists (unsupported
+        // platforms); on Linux the raw JSON is legitimately relocated into the
+        // file store and the env slot becomes a marker.
+        if crate::auth::keychain::is_available() {
+            // Store-backed host (macOS keychain / linux file): relocation
+            // succeeds and the plaintext is replaced by a marker.
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                "VERTEX_SA_JSON".to_string(),
+                r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
+            );
+            relocate_keychain_backed_secrets(&mut env, "sub-account-1")
+                .expect("store-backed host relocates raw SA JSON");
+            let stored = env.get("VERTEX_SA_JSON").expect("slot present");
+            assert!(
+                !stored.contains("private_key"),
+                "raw JSON must not persist as plaintext; got: {stored}"
+            );
+            assert!(stored.contains("keychain"), "marker present: {stored}");
             return;
         }
         let mut env = std::collections::HashMap::new();
@@ -5529,31 +5573,55 @@ mod tests {
         let res = relocate_keychain_backed_secrets(&mut env, "sub-account-1");
         assert!(
             res.is_err(),
-            "raw VERTEX_SA_JSON must be rejected off macOS, never saved as plaintext"
+            "raw VERTEX_SA_JSON must be rejected on hosts with no secret store"
         );
         // The raw value is left untouched (the caller bails before saving).
         assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_rejects_service_account_json_under_custom_env_name_off_macos() {
         // The dashboard "Custom" bypass: SA JSON pasted under VERTEX_API_KEY
-        // (not the whitelisted name) must still be caught by content detection
-        // and rejected off macOS — never written to plaintext config.
-        if cfg!(target_os = "macos") {
-            return;
-        }
+        // (not the whitelisted name) must still be caught by content
+        // detection — never written to plaintext config.
+        //
+        // #2234/45a contract (same shape as the twin at ~L5533): the
+        // availability predicate is `keychain::is_available()`, NOT
+        // `cfg!(macos)`. On a store-backed host (linux file backend with an
+        // INJECTED temp root) the JSON is legitimately relocated: Ok, the
+        // slot becomes a keychain marker, the raw value never remains.
+        // Hosts with NO backend keep the rejection.
+        #[cfg(target_os = "linux")]
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
         let mut env = std::collections::HashMap::new();
         env.insert(
             "VERTEX_API_KEY".to_string(),
             r#"{"type":"service_account","private_key":"x"}"#.to_string(),
         );
         let res = relocate_keychain_backed_secrets(&mut env, "tenant-1");
-        assert!(
-            res.is_err(),
-            "SA JSON under a custom env name must be rejected off macOS"
-        );
-        assert!(env.get("VERTEX_API_KEY").unwrap().starts_with('{'));
+        let slot = env.get("VERTEX_API_KEY").expect("slot present");
+        if crate::auth::keychain::is_available() {
+            assert!(
+                res.is_ok(),
+                "store-backed host relocates SA JSON under a custom name"
+            );
+            assert!(
+                crate::auth::keychain::is_marker(slot),
+                "slot must be a keychain marker, got: {slot}"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the raw private key must never remain in the slot"
+            );
+        } else {
+            assert!(
+                res.is_err(),
+                "SA JSON under a custom env name must be rejected with no store"
+            );
+            assert!(slot.starts_with('{'), "raw value left untouched");
+        }
     }
 
     #[test]
@@ -5580,7 +5648,8 @@ mod tests {
             &mut config,
             r#"{"config":{"env_vars":{"SMTP_PASSWORD":"new"}}}"#,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             config.env_vars.get("SMTP_PASSWORD").map(String::as_str),
@@ -5601,17 +5670,47 @@ mod tests {
         config.env_vars.insert("A".into(), "a".into());
         config.env_vars.insert("B".into(), "b".into());
 
-        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true);
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true)
+            .unwrap();
         assert_eq!(config.env_vars.get("A").map(String::as_str), Some("a2"));
         assert!(
             !config.env_vars.contains_key("B"),
             "authoritative replace drops omitted keys"
         );
 
-        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true);
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true).unwrap();
         assert!(
             config.env_vars.is_empty(),
             "an explicit empty map clears all entries"
+        );
+    }
+
+    // The request struct parses `config` as opaque JSON, so the merged
+    // typed round-trip is the only validation gate: patches that produce an
+    // invalid config must error (the handlers map this to 400) instead of
+    // silently dropping the patch. A literal `null` config stays a no-op.
+    #[test]
+    fn merge_config_rejects_invalid_patches() {
+        let mut config = ProfileConfig::default();
+        assert!(merge_profile_config_from_body(&mut config, r#"{"config":null}"#, false).is_ok());
+
+        let err =
+            merge_profile_config_from_body(&mut config, r#"{"config":42}"#, false).unwrap_err();
+        assert_eq!(err, "config must be an object");
+
+        // Merges fine as JSON but the result fails ProfileConfig's typed
+        // deserialization (`smtp_port` must be a number).
+        let err = merge_profile_config_from_body(
+            &mut config,
+            r#"{"config":{"email":{"provider":"smtp","smtp_port":"abc"}}}"#,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("invalid config:"), "got: {err}");
+        assert_eq!(
+            config,
+            ProfileConfig::default(),
+            "failed merge must not mutate"
         );
     }
 

@@ -12,6 +12,9 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::vision;
 
+use crate::cache_manifest::{
+    PromptCacheInputManifest, prompt_cache_features_enabled, without_cache_markers,
+};
 use crate::config::ChatConfig;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::sse::SseEvent;
@@ -252,6 +255,26 @@ pub struct OpenAIProvider {
     /// registry entries (e.g. `"moonshot"`, `"deepseek"`) so providers are
     /// distinguishable in failover chains.
     provider_label: String,
+    /// OpenAI-only request affinity. Defaults to official-endpoint-only so
+    /// Kimi/DeepSeek/vLLM never see a reserved field they may reject; the
+    /// operator kill-switch (`OCTOS_PROMPT_CACHING`) is evaluated per request.
+    prompt_cache_affinity: bool,
+    /// Whether a builder call explicitly selected the affinity mode. An
+    /// explicit opt-in/out must survive either builder-call order (mirrors
+    /// `AnthropicProvider::prompt_caching_override`).
+    prompt_cache_affinity_override: Option<bool>,
+}
+
+const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Official-endpoint check tolerant of a trailing slash, surrounding
+/// whitespace, and case, so `https://api.openai.com/v1/` keeps affinity and
+/// is not tagged as a custom host.
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(OFFICIAL_OPENAI_BASE_URL)
 }
 
 impl OpenAIProvider {
@@ -270,8 +293,10 @@ impl OpenAIProvider {
             api_key: SecretString::from(api_key.into()),
             hints,
             model,
-            base_url: "https://api.openai.com/v1".to_string(),
+            base_url: OFFICIAL_OPENAI_BASE_URL.to_string(),
             provider_label: "openai".to_string(),
+            prompt_cache_affinity: true,
+            prompt_cache_affinity_override: None,
         }
     }
 
@@ -285,26 +310,31 @@ impl OpenAIProvider {
     /// Set a custom base URL (for Azure, local proxies, etc.).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         let url = base_url.into();
+        let official = is_official_openai_base_url(&url);
+        // Affinity is official-endpoint-only by default; an explicit builder
+        // choice survives either call order.
+        if self.prompt_cache_affinity_override.is_none() {
+            self.prompt_cache_affinity = official;
+        }
         // If using a non-default base URL, tag the provider_label to distinguish
         // it in the adaptive router (e.g., "moonshot@autodl" vs "moonshot").
-        if url != "https://api.openai.com/v1" {
-            if let Some(domain) = url
+        if !official
+            && let Some(domain) = url
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
                 .split('/')
                 .next()
-            {
-                // Use the domain name (minus TLD) as the tag.
-                // "www.autodl.art" → "autodl", "api.moonshot.ai" → "api"
-                let parts: Vec<&str> = domain.split('.').collect();
-                let short = if parts.len() >= 2 && parts[0] == "www" {
-                    parts[1] // skip "www", use "autodl"
-                } else {
-                    parts[0] // use "api" from "api.moonshot.ai"
-                };
-                if !self.provider_label.contains('@') {
-                    self.provider_label = format!("{}@{}", self.provider_label, short);
-                }
+        {
+            // Use the domain name (minus TLD) as the tag.
+            // "www.autodl.art" → "autodl", "api.moonshot.ai" → "api"
+            let parts: Vec<&str> = domain.split('.').collect();
+            let short = if parts.len() >= 2 && parts[0] == "www" {
+                parts[1] // skip "www", use "autodl"
+            } else {
+                parts[0] // use "api" from "api.moonshot.ai"
+            };
+            if !self.provider_label.contains('@') {
+                self.provider_label = format!("{}@{}", self.provider_label, short);
             }
         }
         // The DeepSeek `thinking` toggle is specific to DeepSeek's official API.
@@ -319,6 +349,34 @@ impl OpenAIProvider {
         }
         self.base_url = url;
         self
+    }
+
+    /// Explicit override for an endpoint known to implement OpenAI's
+    /// `prompt_cache_key` contract. Custom endpoints remain opt-out by
+    /// default; this explicit choice survives either builder-call order. The
+    /// operator kill-switch (`OCTOS_PROMPT_CACHING`) still applies per request.
+    pub fn with_prompt_cache_affinity(mut self, enabled: bool) -> Self {
+        self.prompt_cache_affinity = enabled;
+        self.prompt_cache_affinity_override = Some(enabled);
+        self
+    }
+
+    /// Affinity key for this request, if any. `features_enabled` is the
+    /// operator kill-switch (`OCTOS_PROMPT_CACHING`), passed in so the
+    /// decision is made per request — like the Responses provider — and stays
+    /// unit-testable without mutating process env.
+    fn prompt_cache_key_for<'a>(
+        &self,
+        config: &'a ChatConfig,
+        features_enabled: bool,
+    ) -> Option<&'a str> {
+        if !(self.prompt_cache_affinity && features_enabled) {
+            return None;
+        }
+        config
+            .prompt_cache_context
+            .as_ref()
+            .map(|context| context.affinity_key.as_str())
     }
 
     /// Override the auto-detected model hints.
@@ -364,17 +422,27 @@ impl OpenAIProvider {
             .json(request)
             .send()
             .await
-            .wrap_err("failed to send request to OpenAI")
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    false,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::OpenAiChatCompletions,
+                )
+            })
     }
 
     /// POST a streaming chat request (adds `stream` + `stream_options`).
     /// Factored for the same image-modality fallback as [`Self::post_chat`].
     async fn post_chat_stream(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
-        let mut body =
-            serde_json::to_value(request).wrap_err("failed to serialize OpenAI request")?;
-        let obj = body
-            .as_object_mut()
-            .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
+        let mut body = serde_json::to_value(request).wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::SerializeRequest)
+        })?;
+        let obj = body.as_object_mut().ok_or_else(|| {
+            eyre::Report::msg(
+                self.operational_message(crate::provider::OperationalStage::BuildRequestBody),
+            )
+        })?;
         obj.insert("stream".into(), true.into());
         obj.insert(
             "stream_options".into(),
@@ -393,7 +461,25 @@ impl OpenAIProvider {
             .json(&body)
             .send()
             .await
-            .wrap_err("failed to send streaming request to OpenAI")
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    true,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::OpenAiChatCompletions,
+                )
+            })
+    }
+
+    /// Lane-attributed wording for operational failures (see
+    /// [`crate::provider::operational_error_message`]).
+    fn operational_message(&self, stage: crate::provider::OperationalStage) -> String {
+        crate::provider::operational_error_message(
+            stage,
+            &self.provider_label,
+            &self.model,
+            crate::provider::ApiStyle::OpenAiChatCompletions,
+        )
     }
 
     /// Build the shared request struct used by both chat() and chat_stream().
@@ -407,7 +493,7 @@ impl OpenAIProvider {
         &'a self,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
-        config: &ChatConfig,
+        config: &'a ChatConfig,
         force_text_only: bool,
     ) -> OpenAIRequest<'a> {
         // Effective content hints: honour the configured `lacks_vision`, and
@@ -645,6 +731,62 @@ impl OpenAIProvider {
                 }
                 extra
             },
+            prompt_cache_key: self.prompt_cache_key_for(config, prompt_cache_features_enabled()),
+            tool_choice: config.tool_choice.openai_chat_wire(!tools.is_empty()),
+        }
+    }
+
+    fn prompt_cache_input_manifest(
+        &self,
+        request: &OpenAIRequest<'_>,
+        config: &ChatConfig,
+    ) -> PromptCacheInputManifest {
+        let normalized = without_cache_markers(
+            serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({})),
+        );
+        let mut stable = Vec::new();
+        let mut conversation = Vec::new();
+        if let Some(messages) = normalized
+            .get("messages")
+            .and_then(|value| value.as_array())
+        {
+            for (index, message) in messages.iter().enumerate() {
+                let role = message
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let segment = (format!("message:{index}:{role}"), message.clone());
+                if role == "system" || role == "developer" {
+                    stable.push(segment);
+                } else {
+                    conversation.push(segment);
+                }
+            }
+        }
+        if let Some(tools) = normalized.get("tools").and_then(|value| value.as_array()) {
+            stable.extend(
+                tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| (format!("tool:{index}"), tool.clone())),
+            );
+        }
+        let metadata = self.provider_metadata();
+        PromptCacheInputManifest::from_normalized_segments(
+            metadata.provider,
+            metadata.model,
+            config
+                .prompt_cache_context
+                .as_ref()
+                .map(|context| context.epoch_id.as_str()),
+            stable,
+            conversation,
+        )
+    }
+
+    fn trace_prompt_cache_input(&self, request: &OpenAIRequest<'_>, config: &ChatConfig) {
+        if tracing::enabled!(target: "octos.prompt_cache", tracing::Level::TRACE) {
+            self.prompt_cache_input_manifest(request, config).trace();
         }
     }
 }
@@ -664,6 +806,8 @@ const RESERVED_SAMPLING_KEYS: &[&str] = &[
     "thinking",
     "stream",
     "stream_options",
+    "prompt_cache_key",
+    "tool_choice",
 ];
 
 #[async_trait]
@@ -675,6 +819,7 @@ impl LlmProvider for OpenAIProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         let request = self.build_request(messages, tools, config, false);
+        self.trace_prompt_cache_input(&request, config);
         let mut response = self.post_chat(&request).await?;
 
         // Graceful image-modality fallback: a vision-capable model behind a
@@ -694,6 +839,7 @@ impl LlmProvider for OpenAIProvider {
                     "endpoint rejected image content (400); retrying text-only"
                 );
                 let retry = self.build_request(messages, tools, config, true);
+                self.trace_prompt_cache_input(&retry, config);
                 response = self.post_chat(&retry).await?;
             } else {
                 let body = crate::provider::truncate_error_body(&body);
@@ -702,6 +848,7 @@ impl LlmProvider for OpenAIProvider {
                     &body,
                     format!("{}/{}", self.provider_label, self.model),
                 )
+                .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
                 .into());
             }
         }
@@ -728,19 +875,19 @@ impl LlmProvider for OpenAIProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
             .into());
         }
 
-        let api_response: OpenAIResponse = response
-            .json()
-            .await
-            .wrap_err("failed to parse OpenAI response")?;
+        let api_response: OpenAIResponse = response.json().await.wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::ParseResponse)
+        })?;
 
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| eyre::eyre!("no choices in OpenAI response"))?;
+        let choice = api_response.choices.into_iter().next().ok_or_else(|| {
+            eyre::Report::msg(
+                self.operational_message(crate::provider::OperationalStage::NoChoices),
+            )
+        })?;
 
         let tool_calls = choice
             .message
@@ -796,10 +943,27 @@ impl LlmProvider for OpenAIProvider {
                     .as_ref()
                     .map(|d| d.cached_tokens)
                     .unwrap_or(0);
+                let cache_write = api_response
+                    .usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cache_write_tokens)
+                    .unwrap_or(0);
                 TokenUsage {
-                    input_tokens: api_response.usage.prompt_tokens.saturating_sub(cached),
+                    input_tokens: api_response
+                        .usage
+                        .prompt_tokens
+                        .saturating_sub(cached)
+                        .saturating_sub(cache_write),
                     output_tokens: api_response.usage.completion_tokens,
+                    reasoning_tokens: api_response
+                        .usage
+                        .completion_tokens_details
+                        .as_ref()
+                        .map(|details| details.reasoning_tokens)
+                        .unwrap_or(0),
                     cache_read_tokens: cached,
+                    cache_write_tokens: cache_write,
                     ..Default::default()
                 }
             },
@@ -814,6 +978,7 @@ impl LlmProvider for OpenAIProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         let request = self.build_request(messages, tools, config, false);
+        self.trace_prompt_cache_input(&request, config);
         let mut response = self.post_chat_stream(&request).await?;
 
         // Graceful image-modality fallback (see `chat()`): retry once
@@ -829,6 +994,7 @@ impl LlmProvider for OpenAIProvider {
                     "endpoint rejected image content (400); retrying text-only (stream)"
                 );
                 let retry = self.build_request(messages, tools, config, true);
+                self.trace_prompt_cache_input(&retry, config);
                 response = self.post_chat_stream(&retry).await?;
             } else {
                 let body = crate::provider::truncate_error_body(&text);
@@ -837,6 +1003,7 @@ impl LlmProvider for OpenAIProvider {
                     &body,
                     format!("{}/{}", self.provider_label, self.model),
                 )
+                .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
                 .into());
             }
         }
@@ -852,6 +1019,7 @@ impl LlmProvider for OpenAIProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
             .into());
         }
 
@@ -868,6 +1036,10 @@ impl LlmProvider for OpenAIProvider {
 
     fn provider_name(&self) -> &str {
         &self.provider_label
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        Some(crate::provider::ApiStyle::OpenAiChatCompletions)
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
@@ -912,6 +1084,14 @@ struct OpenAIRequest<'a> {
     /// are unchanged. See `ChatConfig::sampling_params` / issue #2172.
     #[serde(flatten)]
     extra_sampling: serde_json::Map<String, serde_json::Value>,
+    /// Official OpenAI affinity key. Omitted for every compatible/custom
+    /// endpoint unless the provider capability is explicitly enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
+    /// `ChatConfig.tool_choice` on the wire; absent for the default `auto`
+    /// so ordinary requests keep their exact prior shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -1164,12 +1344,24 @@ struct Usage {
     /// providers that omit the object parse as `None`.
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Reasoning is already included in completion_tokens; retain this
+    /// diagnostic breakdown without adding it to the billed output total.
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u32,
 }
 
 #[derive(Deserialize, Default)]
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 // --- Streaming SSE helpers (shared with OpenRouter) ---
@@ -1262,10 +1454,17 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
         let cached = usage["prompt_tokens_details"]["cached_tokens"]
             .as_u64()
             .unwrap_or(0) as u32;
+        let cache_write = usage["prompt_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .unwrap_or(0) as u32;
         events.push(StreamEvent::Usage(TokenUsage {
-            input_tokens: prompt.saturating_sub(cached),
+            input_tokens: prompt.saturating_sub(cached).saturating_sub(cache_write),
             output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32,
             cache_read_tokens: cached,
+            cache_write_tokens: cache_write,
             ..Default::default()
         }));
     }
@@ -1279,6 +1478,107 @@ mod tests {
     use crate::config::ChatConfig;
     use crate::provider::LlmProvider;
     use octos_core::{Message, MessageRole};
+
+    #[test]
+    fn provider_normalized_manifest_proves_same_epoch_append_only_prefix() {
+        let provider = OpenAIProvider::new("test-key", "gpt-5.4");
+        let config = ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "octos-affinity".to_owned(),
+                epoch_id: "epoch-one".to_owned(),
+                stable_prefix_hash: "agent-stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let first_messages = vec![
+            Message::system("TOPSECRET_SYSTEM_3892"),
+            Message::user("TOPSECRET_USER_1047"),
+        ];
+        let mut next_messages = first_messages.clone();
+        next_messages.push(Message::assistant("answer"));
+        next_messages.push(Message::user("next"));
+
+        let first_request = provider.build_request(&first_messages, &tools, &config, false);
+        let next_request = provider.build_request(&next_messages, &tools, &config, false);
+        let first = provider.prompt_cache_input_manifest(&first_request, &config);
+        let next = provider.prompt_cache_input_manifest(&next_request, &config);
+        let comparison = first.compare_prefix(&next);
+
+        assert_eq!(first.epoch_id.as_deref(), Some("epoch-one"));
+        assert_eq!(first.stable_prefix_hash, next.stable_prefix_hash);
+        assert_eq!(comparison.conversation_prefix_segments, 1);
+        assert_eq!(comparison.invalidation_reason, None);
+        assert!(comparison.reusable_normalized_bytes > 0);
+        let redacted = serde_json::to_string(&first).unwrap();
+        assert!(!redacted.contains("TOPSECRET_SYSTEM_3892"));
+        assert!(!redacted.contains("TOPSECRET_USER_1047"));
+    }
+
+    /// A custom base URL tags the router label (`moonshot-coding@api`), but
+    /// `provider_metadata()` reports the untagged lane. The manifest must use
+    /// the metadata label, otherwise usage rows (attributed through
+    /// `provider_metadata_for_index`) never match their manifest and the OUP
+    /// epoch reads a route change on every call.
+    #[test]
+    fn should_build_manifest_with_the_same_provider_label_as_provider_metadata_for_tagged_lane() {
+        let provider = OpenAIProvider::new("test-key", "k3")
+            .with_provider_label("moonshot-coding")
+            .with_base_url("https://api.kimi.com/coding/v1");
+        assert_eq!(provider.provider_name(), "moonshot-coding@api");
+        let config = ChatConfig::default();
+        let messages = vec![Message::system("stable"), Message::user("hello")];
+        let request = provider.build_request(&messages, &[], &config, false);
+        let manifest = provider.prompt_cache_input_manifest(&request, &config);
+
+        let metadata = provider.provider_metadata();
+        assert_eq!(metadata.provider, "moonshot-coding");
+        assert_eq!(manifest.provider, metadata.provider);
+        assert_eq!(manifest.model, metadata.model);
+        assert_eq!(
+            manifest.provider,
+            provider.provider_metadata_for_index(None).provider
+        );
+    }
+
+    /// `ChatConfig.tool_choice` used to be inert: no adapter serialized it,
+    /// so a "tools-disabled" round (the convergence reflection) still let
+    /// the model call tools. `none` must reach the wire, while the default
+    /// `auto` and tool-less requests keep their exact prior body.
+    #[test]
+    fn should_serialize_tool_choice_on_the_wire_only_when_explicit() {
+        let provider = OpenAIProvider::new("test-key", "gpt-5.4");
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let messages = vec![Message::user("hello")];
+        let auto = serde_json::to_value(provider.build_request(
+            &messages,
+            &tools,
+            &ChatConfig::default(),
+            false,
+        ))
+        .unwrap();
+        assert!(auto.get("tool_choice").is_none(), "{auto}");
+
+        let none = ChatConfig {
+            tool_choice: crate::ToolChoice::None,
+            ..Default::default()
+        };
+        let request =
+            serde_json::to_value(provider.build_request(&messages, &tools, &none, false)).unwrap();
+        assert_eq!(request["tool_choice"], "none");
+        let tool_less =
+            serde_json::to_value(provider.build_request(&messages, &[], &none, false)).unwrap();
+        assert!(tool_less.get("tool_choice").is_none(), "{tool_less}");
+    }
 
     #[test]
     fn tool_call_arguments_wire_passes_objects_through() {
@@ -1597,6 +1897,36 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_key_is_capability_gated_to_official_openai_endpoint() {
+        let config = ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "octos-stable-affinity".to_owned(),
+                epoch_id: "epoch".to_owned(),
+                stable_prefix_hash: "sha256:stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let messages = [msg("hello")];
+        let official = OpenAIProvider::new("key", "gpt-5").with_prompt_cache_affinity(true);
+        let official_body =
+            serde_json::to_value(official.build_request(&messages, &[], &config, false)).unwrap();
+        assert_eq!(official_body["prompt_cache_key"], "octos-stable-affinity");
+
+        for custom in [
+            OpenAIProvider::new("key", "kimi-k3").with_base_url("https://api.moonshot.ai/v1"),
+            OpenAIProvider::new("key", "deepseek-v4").with_base_url("https://api.deepseek.com/v1"),
+        ] {
+            let body =
+                serde_json::to_value(custom.build_request(&messages, &[], &config, false)).unwrap();
+            assert!(
+                body.get("prompt_cache_key").is_none(),
+                "compatible endpoints must not receive reserved OpenAI fields: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn build_request_emits_effort_and_thinking_for_deepseek_v4() {
         let p = OpenAIProvider::new("key", "deepseek-v4-pro");
         let cfg = ChatConfig {
@@ -1637,6 +1967,11 @@ mod tests {
         let p = OpenAIProvider::new("key", "gpt-4o");
         let mut sp = serde_json::Map::new();
         sp.insert("temperature".to_string(), serde_json::json!(1.9));
+        sp.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::json!("injected"),
+        );
+        sp.insert("tool_choice".to_string(), serde_json::json!("required"));
         sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
         let cfg = ChatConfig {
             temperature: Some(0.5),
@@ -1646,6 +1981,8 @@ mod tests {
         let msgs = [msg("hi")];
         let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
         assert_eq!(v["temperature"], serde_json::json!(0.5));
+        assert!(v.get("prompt_cache_key").is_none(), "{v}");
+        assert!(v.get("tool_choice").is_none(), "{v}");
         assert_eq!(v["repeat_penalty"], serde_json::json!(1.1));
     }
 
@@ -2325,6 +2662,87 @@ mod cache_usage_tests {
     use crate::config::ChatConfig;
     use octos_core::{Message, MessageRole};
 
+    fn reasoning_usage_cases() -> Vec<(serde_json::Value, u32)> {
+        use serde_json::json;
+        [
+            (Some(json!({"reasoning_tokens": 6})), 6),
+            (Some(json!({"reasoning_tokens": 0})), 0),
+            (None, 0),
+            (Some(serde_json::Value::Null), 0),
+            (Some(json!({})), 0),
+        ]
+        .into_iter()
+        .map(|(details, expected)| {
+            let mut usage = json!({
+                "prompt_tokens": 17,
+                "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 7}
+            });
+            if let Some(details) = details {
+                usage["completion_tokens_details"] = details;
+            }
+            (usage, expected)
+        })
+        .collect()
+    }
+
+    fn assert_reasoning_usage(usage: &TokenUsage, expected: u32) {
+        assert_eq!(usage.reasoning_tokens, expected);
+        // Reasoning is a component of completion_tokens, not extra output.
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_read_tokens, 7);
+        assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn should_preserve_reasoning_usage_from_sse_without_adding_to_output() {
+        for (usage, expected) in reasoning_usage_cases() {
+            let event = SseEvent {
+                event: None,
+                data: serde_json::json!({"choices": [], "usage": usage}).to_string(),
+            };
+            let events = parse_openai_sse_events(&event);
+            let usage = events
+                .iter()
+                .find_map(|event| match event {
+                    StreamEvent::Usage(usage) => Some(usage),
+                    _ => None,
+                })
+                .expect("usage event");
+            assert_reasoning_usage(usage, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_preserve_reasoning_usage_from_chat_without_adding_to_output() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (usage, expected) in reasoning_usage_cases() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"},
+                                 "finish_reason": "stop"}],
+                    "usage": usage
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = OpenAIProvider::new("fixture-fake-only", "fixture-model")
+                .with_base_url(server.uri());
+            let response = provider
+                .chat(&[], &[], &ChatConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(response.content.as_deref(), Some("ok"));
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            assert_reasoning_usage(&response.usage, expected);
+        }
+    }
+
     #[test]
     fn should_parse_cached_tokens_from_sse_usage() {
         let event = SseEvent {
@@ -2360,6 +2778,25 @@ mod cache_usage_tests {
             })
             .expect("usage event");
         assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn should_parse_cache_write_tokens_from_sse_usage_disjointly() {
+        let event = SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":20,"cache_write_tokens":30}}}"#.into(),
+        };
+        let events = parse_openai_sse_events(&event);
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, 20);
+        assert_eq!(usage.cache_write_tokens, 30);
     }
 
     #[tokio::test]
@@ -2400,5 +2837,174 @@ mod cache_usage_tests {
         // cached_tokens, TokenUsage does not — total = input + cache_read.
         assert_eq!(response.usage.input_tokens, 25);
         assert_eq!(response.usage.cache_read_tokens, 75);
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_affinity_tests {
+    use super::*;
+
+    fn affinity_config() -> ChatConfig {
+        ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "octos-stable-affinity".to_owned(),
+                epoch_id: "epoch".to_owned(),
+                stable_prefix_hash: "sha256:stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn body(provider: &OpenAIProvider, config: &ChatConfig) -> serde_json::Value {
+        serde_json::to_value(provider.build_request(&[Message::user("hello")], &[], config, false))
+            .unwrap()
+    }
+
+    #[test]
+    fn should_keep_explicit_affinity_opt_in_when_base_url_is_set_in_either_order() {
+        let config = affinity_config();
+        let opt_in_then_custom = OpenAIProvider::new("key", "kimi-k3")
+            .with_prompt_cache_affinity(true)
+            .with_base_url("https://api.moonshot.ai/v1");
+        let custom_then_opt_in = OpenAIProvider::new("key", "kimi-k3")
+            .with_base_url("https://api.moonshot.ai/v1")
+            .with_prompt_cache_affinity(true);
+        for provider in [opt_in_then_custom, custom_then_opt_in] {
+            let body = body(&provider, &config);
+            assert_eq!(
+                body["prompt_cache_key"], "octos-stable-affinity",
+                "an explicit opt-in must survive builder call ordering: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_explicit_affinity_opt_out_when_official_base_url_is_set_afterwards() {
+        let config = affinity_config();
+        let provider = OpenAIProvider::new("key", "gpt-5")
+            .with_prompt_cache_affinity(false)
+            .with_base_url("https://api.openai.com/v1");
+        let body = body(&provider, &config);
+        assert!(body.get("prompt_cache_key").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_honor_kill_switch_at_request_time_when_flipped_after_construction() {
+        let config = affinity_config();
+        // Same constructed provider, kill-switch flipped between requests:
+        // the decision must be made per request (as the Responses provider
+        // does), not baked in at construction.
+        let provider = OpenAIProvider::new("key", "gpt-5");
+        assert_eq!(
+            provider.prompt_cache_key_for(&config, true),
+            Some("octos-stable-affinity")
+        );
+        assert_eq!(
+            provider.prompt_cache_key_for(&config, false),
+            None,
+            "the operator kill-switch must be honored on the next request"
+        );
+        // An explicit opt-in is still subject to the operator kill-switch.
+        let opted_in = OpenAIProvider::new("key", "kimi-k3")
+            .with_base_url("https://api.moonshot.ai/v1")
+            .with_prompt_cache_affinity(true);
+        assert_eq!(
+            opted_in.prompt_cache_key_for(&config, true),
+            Some("octos-stable-affinity")
+        );
+        assert_eq!(opted_in.prompt_cache_key_for(&config, false), None);
+    }
+
+    #[test]
+    fn should_treat_trailing_slash_official_base_url_as_official() {
+        let config = affinity_config();
+        let provider =
+            OpenAIProvider::new("key", "gpt-5").with_base_url("https://api.openai.com/v1/");
+        let body = body(&provider, &config);
+        assert_eq!(
+            body["prompt_cache_key"], "octos-stable-affinity",
+            "a trailing slash must not disable official affinity: {body}"
+        );
+        assert_eq!(
+            provider.provider_name(),
+            "openai",
+            "the official endpoint must not be tagged as a custom host"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lane_attributed_operational_errors {
+    use octos_core::Message;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::OpenAIProvider;
+    use crate::config::ChatConfig;
+    use crate::error::{LlmError, LlmErrorKind};
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::assert_error_names_lane;
+    use crate::retry::RetryProvider;
+
+    const LANE: &str = "moonshot-coding@api/k3";
+    const STYLE: &str = "api_style=openai_chat_completions";
+    const FORBIDDEN: &[&str] = &["OpenAI response", "OpenAI request"];
+
+    async fn k3_lane_returning(status: u16, body: &str) -> (MockServer, OpenAIProvider) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body.to_owned()))
+            .mount(&server)
+            .await;
+        let provider = OpenAIProvider::new("key", "k3")
+            .with_base_url(server.uri())
+            .with_provider_label("moonshot-coding@api");
+        (server, provider)
+    }
+
+    #[tokio::test]
+    async fn should_name_k3_lane_when_response_body_is_malformed() {
+        let (_server, provider) = k3_lane_returning(200, "not json{").await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn should_name_k3_lane_when_choices_are_empty() {
+        let (_server, provider) = k3_lane_returning(
+            200,
+            r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0}}"#,
+        )
+        .await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn should_name_k3_lane_with_api_style_when_status_error_is_mapped() {
+        let (_server, provider) = k3_lane_returning(503, "upstream exploded").await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+        let llm = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<LlmError>())
+            .expect("status errors stay typed");
+        assert_eq!(llm.kind, LlmErrorKind::ServerError { status: 503 });
+        assert_eq!(
+            llm.provider, LANE,
+            "the HarnessError lane label is unchanged"
+        );
+        assert!(RetryProvider::should_failover(&err));
+        assert!(RetryProvider::is_retryable_error(&err));
     }
 }

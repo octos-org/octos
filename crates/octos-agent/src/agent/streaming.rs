@@ -76,6 +76,20 @@ impl Agent {
         iteration: u32,
         input_tokens_estimate: u32,
     ) -> Result<(ChatResponse, bool)> {
+        self.consume_stream_with_input_estimate_mode(stream, iteration, input_tokens_estimate, true)
+            .await
+    }
+
+    /// Variant used by internal convergence checkpoints. The response is
+    /// assembled normally, but private reflection text is not projected into
+    /// the user's streaming transcript.
+    pub(super) async fn consume_stream_with_input_estimate_mode(
+        &self,
+        stream: ChatStream,
+        iteration: u32,
+        input_tokens_estimate: u32,
+        emit_progress: bool,
+    ) -> Result<(ChatResponse, bool)> {
         // Thresholds flow from `AgentConfig` (env-overridable: see
         // `OCTOS_LLM_FIRST_TOKEN_GRACE_SECS` / `OCTOS_LLM_STREAM_IDLE_SECS` /
         // `OCTOS_LLM_CALL_MAX_SECS`). The first-token grace caps the
@@ -97,11 +111,33 @@ impl Agent {
                 StreamTimeouts {
                     first_token_grace_secs: self.config.llm_first_token_grace.as_secs(),
                     inter_chunk_idle_secs: self.config.llm_stream_idle.as_secs(),
-                    overall_max_secs: self.config.llm_call_max.as_secs(),
+                    overall_max_secs: self.effective_llm_call_max_secs(),
                 }
             };
-        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds)
-            .await
+        self.consume_stream_inner(
+            stream,
+            iteration,
+            input_tokens_estimate,
+            thresholds,
+            emit_progress,
+        )
+        .await
+    }
+
+    /// Overall wall-clock cap for a normal (non-voice) turn.
+    ///
+    /// For a local provider (#2229) the cap is disabled by default (`0`) so a
+    /// slow-but-healthy reasoning stream is not guillotined mid-flight while
+    /// tokens are still flowing — Pi has no such cap, and the inter-chunk idle
+    /// and TTFT guards still catch a genuinely dead provider. An operator who
+    /// explicitly sets `OCTOS_LLM_CALL_MAX_SECS` gets exactly that value even on
+    /// local. Cloud keeps the `DEFAULT_LLM_CALL_MAX_SECS` (1200s) backstop.
+    fn effective_llm_call_max_secs(&self) -> u64 {
+        if self.is_local_provider() && std::env::var("OCTOS_LLM_CALL_MAX_SECS").is_err() {
+            0
+        } else {
+            self.config.llm_call_max.as_secs()
+        }
     }
 
     /// Test-only entry point: lets fixtures dial the timeouts down to
@@ -116,7 +152,7 @@ impl Agent {
         input_tokens_estimate: u32,
         thresholds: StreamTimeouts,
     ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds)
+        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds, true)
             .await
     }
 
@@ -132,12 +168,15 @@ impl Agent {
         // <idle>s forever all terminate. Production thresholds come from
         // `AgentConfig` (env-overridable); test fixtures inject tiny values.
         thresholds: StreamTimeouts,
+        emit_progress: bool,
     ) -> Result<(ChatResponse, bool)> {
         // Clear any pending status line (e.g., "Thinking...")
-        self.reporter().report(ProgressEvent::Response {
-            content: String::new(),
-            iteration,
-        });
+        if emit_progress {
+            self.reporter().report(ProgressEvent::Response {
+                content: String::new(),
+                iteration,
+            });
+        }
 
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -284,26 +323,32 @@ impl Agent {
                 StreamEvent::ReasoningDelta(delta) => {
                     got_first_chunk = true;
                     reasoning.push_str(&delta);
-                    self.reporter().report(ProgressEvent::ReasoningChunk {
-                        text: delta.clone(),
-                        iteration,
-                    });
+                    if emit_progress {
+                        self.reporter().report(ProgressEvent::ReasoningChunk {
+                            text: delta.clone(),
+                            iteration,
+                        });
+                    }
                 }
                 StreamEvent::TextDelta(delta) => {
                     got_first_chunk = true;
                     let (content_part, reasoning_part) = think_splitter.feed(&delta);
                     if !reasoning_part.is_empty() {
                         reasoning.push_str(&reasoning_part);
-                        self.reporter().report(ProgressEvent::ReasoningChunk {
-                            text: reasoning_part,
-                            iteration,
-                        });
+                        if emit_progress {
+                            self.reporter().report(ProgressEvent::ReasoningChunk {
+                                text: reasoning_part,
+                                iteration,
+                            });
+                        }
                     }
                     if !content_part.is_empty() {
-                        self.reporter().report(ProgressEvent::StreamChunk {
-                            text: content_part.clone(),
-                            iteration,
-                        });
+                        if emit_progress {
+                            self.reporter().report(ProgressEvent::StreamChunk {
+                                text: content_part.clone(),
+                                iteration,
+                            });
+                        }
                         text.push_str(&content_part);
                     }
                 }
@@ -371,7 +416,7 @@ impl Agent {
         }
 
         let streamed = !text.is_empty() || !reasoning.is_empty();
-        if streamed {
+        if streamed && emit_progress {
             self.reporter()
                 .report(ProgressEvent::StreamDone { iteration });
         }

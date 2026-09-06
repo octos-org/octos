@@ -496,10 +496,24 @@ pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
 /// data-dir-level redb store (`admin_audit.redb`) with `DatabaseAlreadyOpen`,
 /// which a stdio client silently respawned in a loop. Taking this lock BEFORE
 /// any store open turns that into one clean, greppable refusal. The lock is
-/// released on process exit (fd close), so a legitimate relaunch AFTER the
-/// previous serve has exited acquires it cleanly (no stale-lock hazard).
+/// released explicitly when the guard drops, so a forked child's temporary
+/// duplicate descriptor cannot prolong ownership after normal serve shutdown.
+/// Closing the final descriptor also releases it on abrupt process exit.
 struct ServeDataDirLock {
     _file: std::fs::File,
+}
+
+impl Drop for ServeDataDirLock {
+    fn drop(&mut self) {
+        // Unix flock follows the shared open file description, not this one
+        // descriptor. Close-on-exec still leaves a fork-to-exec window where a
+        // child holds a reference. The guard owns the lock lifetime; explicitly
+        // end it before File::drop closes our descriptor. This guard is never
+        // cloned, and remains alive until the serve's stores have shut down.
+        if let Err(error) = fs2::FileExt::unlock(&self._file) {
+            tracing::warn!(%error, "failed to release serve single-writer lock");
+        }
+    }
 }
 
 /// Acquire the serve single-writer lock for `data_dir`, or return a clear error
@@ -924,9 +938,9 @@ impl ServeCommand {
                     // Outer-loop #4 (§4.1/§7.2): install this profile's
                     // build-cache pool config so `stage_peer` can acquire a
                     // first-turn slot under `<data_dir>/build-cache/…`.
-                    // Absent `[build_cache]` keeps the pool OFF (the side
-                    // table returns None and staging is byte-for-byte
-                    // pre-pool). Same key derivation as every release site
+                    // Absent `[build_cache]` uses pool defaults. Only roots
+                    // absent from the process side-table have no pool.
+                    // Same key derivation as every release site
                     // (`<data_dir>/peers`), so acquire/release always agree.
                     crate::peers::set_build_cache_config(
                         &rt.data_dir.join("peers"),
@@ -1414,6 +1428,7 @@ impl ServeCommand {
         .wrap_err("invalid AppUI browser-origin configuration")?;
 
         let state = Arc::new(AppState {
+            ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
             session_cache,
             profile_skill_mutation_locks: Arc::new(crate::api::ProfileSkillMutationLocks::new()),
@@ -2248,6 +2263,36 @@ mod tests {
         drop(first);
         let _relaunch = acquire_serve_data_dir_lock(dir.path())
             .expect("after the holder exits, a fresh serve acquires the lock");
+    }
+
+    /// Unix flock ownership follows the open file description, so a forked
+    /// child can briefly retain it even when its descriptor is close-on-exec.
+    /// `try_clone` reproduces that shared-description lifetime deterministically,
+    /// without needing another process or depending on scheduler timing.
+    // fs2's Solaris backend emulates flock with process-owned fcntl locks.
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    #[test]
+    fn should_release_serve_data_dir_lock_when_duplicate_descriptor_outlives_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_serve_data_dir_lock(dir.path()).expect("first serve acquires lock");
+        let inherited = first._file.try_clone().expect("duplicate lock descriptor");
+        assert!(
+            acquire_serve_data_dir_lock(dir.path()).is_err(),
+            "duplicating a descriptor must not release the live guard's lock"
+        );
+
+        drop(first);
+        let relaunch = acquire_serve_data_dir_lock(dir.path())
+            .expect("guard drop must unlock even while a duplicate descriptor remains open");
+        drop(inherited);
+        assert!(
+            acquire_serve_data_dir_lock(dir.path()).is_err(),
+            "closing the previous holder's duplicate must not unlock the new guard"
+        );
+
+        drop(relaunch);
+        let _next = acquire_serve_data_dir_lock(dir.path())
+            .expect("the new guard still releases its own lock on drop");
     }
 
     fn dashboard_smtp_test_env_lock() -> &'static std::sync::Mutex<()> {

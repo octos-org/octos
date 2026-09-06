@@ -1191,8 +1191,8 @@ pub(crate) fn upsert_background_task_agent(
 ///
 /// - **Success** (`TerminalOutcome::Completed`) → mirror the agent record
 ///   under the resolved runtime profile via [`upsert_background_task_agent`];
-///   its terminal transition enqueues a `ChildCompleted` (and, when all
-///   siblings are terminal, a `ScatterJoinComplete`) continuation. This is
+///   its terminal transition enqueues a `ChildCompleted` (and, when at least
+///   two non-peer siblings are all terminal, a `ScatterJoinComplete`). This is
 ///   exactly the success path the legacy `on_change` callback already
 ///   drives — the explicit `child/...` dedupe key (step 3) keeps the
 ///   strangler double-delivery collapsed to one continuation.
@@ -1507,28 +1507,6 @@ impl InProcessAgentOrchestrator {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_for_test(&self) {
-        *self.state() = AutonomyRuntimeState::default();
-        self.shared
-            .goal_scopes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        // #1973 fix D — a stashed retry must not leak across singleton tests.
-        self.shared
-            .fleet_wake_retry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        // #2055 — registration-time ledger bindings are equally per-test state.
-        self.shared
-            .goal_task_ledger_bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
     }
 
     /// #1666 residue — register (or clear) the per-project goal-store scope
@@ -2661,8 +2639,11 @@ impl InProcessAgentOrchestrator {
         };
         let cancelled = !self.state().cancellations.contains_key(&agent_id)
             && self.agent_status_is_terminal(&agent_id);
-        let (status, output, artifacts) = match result {
-            Ok(response) => {
+        let outcome = crate::conversation_outcome::ConversationOutcome::from_result(result);
+        let incomplete = outcome.is_incomplete();
+        let (status, output, artifacts) = match outcome {
+            crate::conversation_outcome::ConversationOutcome::Complete(response)
+            | crate::conversation_outcome::ConversationOutcome::Incomplete { partial: response } => {
                 let output = response.content.clone();
                 let artifacts = native_specialist_artifacts(
                     &cwd,
@@ -2672,13 +2653,17 @@ impl InProcessAgentOrchestrator {
                         .iter()
                         .chain(response.files_modified.iter()),
                 );
-                ("completed".to_owned(), output, artifacts)
+                (
+                    if incomplete { "failed" } else { "completed" }.to_owned(),
+                    crate::conversation_outcome::display_incomplete(output, incomplete),
+                    artifacts,
+                )
             }
-            Err(error) if cancelled => {
+            crate::conversation_outcome::ConversationOutcome::Failed(error) if cancelled => {
                 let output = format!("Native specialist cancelled: {error}");
                 ("interrupted".to_owned(), output, Vec::new())
             }
-            Err(error) => {
+            crate::conversation_outcome::ConversationOutcome::Failed(error) => {
                 let output = format!("Native specialist failed: {error}");
                 ("failed".to_owned(), output, Vec::new())
             }
@@ -2742,7 +2727,7 @@ impl InProcessAgentOrchestrator {
                         None,
                         None,
                         Some(output.chars().take(1200).collect()),
-                        Some(0),
+                        Some(artifacts.len() as u32),
                         None,
                     );
                 }
@@ -5673,6 +5658,12 @@ impl InProcessAgentOrchestrator {
                         "goal is no longer driven by fleet `{expected}`; transition refused"
                     ));
                 }
+            }
+            if goal.status == "archived" {
+                // #2237 — an archived goal is terminal and operator-only;
+                // point the model at the create path instead of a generic
+                // stale-verdict refusal.
+                return Err("goal is archived; create a new goal instead".to_owned());
             }
             if goal.status == "complete" {
                 return Err("goal is already complete".to_owned());
@@ -8959,6 +8950,15 @@ impl InProcessAgentOrchestrator {
     /// when no goal exists or replaces the current goal when it is complete").
     /// Always creates an `active`, model-attributed goal owned by `profile_id` —
     /// pause/resume/budget stay user-owned exactly as in `model_transition_goal`.
+    /// #2237 — the TERMINAL goal statuses. Admission (and terminal
+    /// replacement) must key on "is this goal unfinished", not on a single
+    /// literal: an OPERATOR-ARCHIVED goal is just as finished as a complete
+    /// one, and refusing it dead-locked the session (issue #2237: no new
+    /// goal, no goal_update, no `/goal stop`).
+    fn goal_status_is_terminal(status: &str) -> bool {
+        matches!(status, "complete" | "archived")
+    }
+
     pub(crate) fn model_create_goal(
         &self,
         session_id: &SessionKey,
@@ -8989,7 +8989,9 @@ impl InProcessAgentOrchestrator {
                             .to_owned(),
                     );
                 }
-                if existing.status != "complete" {
+                // #2237 — ANY terminal status (complete | archived) admits a
+                // new goal; only genuinely unfinished states refuse.
+                if !Self::goal_status_is_terminal(&existing.status) {
                     return Err(format!(
                         "cannot create a new goal because this session has an unfinished goal \
                          (status `{}`); complete or clear the existing goal first",
@@ -9942,10 +9944,9 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // preserves the update branch's cross-profile guard (which still fires
         // for a mismatched profile because we only remove on a match).
         if requested_status != Some("complete")
-            && state
-                .goals
-                .get(&key)
-                .is_some_and(|g| g.status == "complete" && g.profile_id == request.profile_id)
+            && state.goals.get(&key).is_some_and(|g| {
+                Self::goal_status_is_terminal(&g.status) && g.profile_id == request.profile_id
+            })
         {
             state.goals.remove(&key);
         }
@@ -11757,11 +11758,6 @@ pub(crate) fn default_agent_orchestrator() -> &'static InProcessAgentOrchestrato
     ORCHESTRATOR.get_or_init(InProcessAgentOrchestrator::default)
 }
 
-#[cfg(test)]
-pub(crate) fn clear_default_agent_orchestrator_for_test() {
-    default_agent_orchestrator().clear_for_test();
-}
-
 #[derive(Debug, Default)]
 struct AutonomyRuntimeState {
     agents: HashMap<String, AutonomyAgentRecord>,
@@ -13269,6 +13265,7 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         // One-shot: each verdict prompt embeds its own objective + evidence
         // and is never replayed, so skip prompt-cache writes.
         cache_retention: octos_llm::CacheRetention::None,
+        prompt_cache_context: None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
     let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {
@@ -13328,6 +13325,15 @@ fn enqueue_agent_terminal_continuations(
     state: &mut AutonomyRuntimeState,
     agent: &AutonomyAgentRecord,
 ) {
+    // A supervised peer row spans the peer's entire lifetime. Completed here
+    // means explicit peer_close, not newly available work: per-turn results
+    // already use the peer-fleet round gate. Keep the observation, not another
+    // pair of model turns after the master has gathered/retired the peer.
+    let is_peer = agent.backend_kind == PEER_HANDOFF_BACKEND_KIND;
+    if is_peer && matches!(agent.status.as_str(), "completed" | "closed") {
+        persist_agent_terminal(state, agent);
+        return;
+    }
     let group_id = agent_continuation_group_id(agent);
     let mut child = MasterContinuationRequest::new(
         group_id.clone(),
@@ -13366,6 +13372,11 @@ fn enqueue_agent_terminal_continuations(
     }
     enqueue_and_persist_continuation(state, child);
     persist_agent_terminal(state, agent);
+    // An abnormal peer lifetime (e.g. an orphan without result.md) still gets
+    // its existing per-child diagnostic. It is never an ordinary spawn join.
+    if is_peer {
+        return;
+    }
 
     // #1707: siblings for the scatter/gather join MUST share a workspace. Two
     // agents that merely reuse the same wire `session_id` across different
@@ -13380,12 +13391,17 @@ fn enqueue_agent_terminal_continuations(
         .values()
         .filter(|candidate| {
             candidate.session_id == agent.session_id
+                && candidate.backend_kind != PEER_HANDOFF_BACKEND_KIND
                 && candidate.profile_id == agent.profile_id
                 && candidate.parent_agent_id == agent.parent_agent_id
                 && candidate.cwd == agent.cwd
         })
         .collect::<Vec<_>>();
-    if siblings.is_empty()
+    // A singleton already receives its per-child notification above. Joining
+    // that same one result creates a second model turn with no new work or
+    // evidence (observed as two background-completion answers in real TUI).
+    // Preserve genuine multi-child joins, including their failure summaries.
+    if siblings.len() < 2
         || !siblings
             .iter()
             .all(|candidate| is_agent_terminal_status(&candidate.status))
@@ -13521,7 +13537,11 @@ fn background_task_agent_status(task: &octos_agent::BackgroundTask) -> String {
 }
 
 fn background_task_backend_kind(task: &octos_agent::BackgroundTask) -> String {
-    if task.child_session_key.is_some() {
+    // register() allocates a child_session_key for peers too. The typed tool
+    // identity must win: a peer row tracks its lifetime, not a spawned turn.
+    if task.tool_name == "peer_handoff" {
+        PEER_HANDOFF_BACKEND_KIND.to_owned()
+    } else if task.child_session_key.is_some() {
         "spawn_child_session".to_owned()
     } else {
         format!("task_supervisor:{}", task.tool_name)
@@ -15943,6 +15963,32 @@ mod tests {
         content: Result<String, String>,
     }
 
+    struct NativeTruncatedProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NativeTruncatedProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            tools: &[octos_llm::ToolSpec],
+            config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let mut response = NativeMockProvider {
+                content: Ok("actual unfinished specialist analysis".into()),
+            }
+            .chat(messages, tools, config)
+            .await?;
+            response.stop_reason = octos_llm::StopReason::MaxTokens;
+            Ok(response)
+        }
+        fn model_id(&self) -> &str {
+            "native-truncated"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait::async_trait]
     impl LlmProvider for NativeMockProvider {
         async fn chat(
@@ -18147,6 +18193,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_preserve_max_tokens_partial_in_failed_native_specialist() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "native-partial");
+        let tools = Arc::new(ToolRegistry::with_builtins(dir.path()));
+        let result = orchestrator
+            .run_native_specialist(NativeSpecialistLaunchRequest {
+                agent_id: Some("native-partial".into()),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                role: "reviewer".into(),
+                nickname: "Partial Reviewer".into(),
+                task: "review".into(),
+                cwd: dir.path().to_path_buf(),
+                llm: Arc::new(NativeTruncatedProvider),
+                memory: Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap()),
+                tools: tools.clone(),
+                system_prompt: None,
+                agent_config: None,
+                task_ledger_path: None,
+                event_tx: None,
+                dispatch_policy: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, "failed");
+        let output = orchestrator
+            .read_agent_output(AgentOutputRequest {
+                agent_id: result.agent_id.clone(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                cursor: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(
+            output["text"]
+                .as_str()
+                .unwrap()
+                .contains("actual unfinished specialist analysis"),
+            "actual partial output must survive failure: {output}"
+        );
+        assert!(output["text"].as_str().unwrap().contains("incomplete"));
+        assert!(
+            !result.artifacts.is_empty(),
+            "actual partial summary remains readable"
+        );
+        let task = tools
+            .supervisor()
+            .get_task(&result.task_id.unwrap().to_string())
+            .unwrap();
+        assert_eq!(task.status, octos_agent::TaskStatus::Failed);
+        assert_eq!(task.artifact_count, Some(result.artifacts.len() as u32));
+    }
+
+    #[tokio::test]
     async fn native_specialist_dispatch_policy_accepts_sandbox_requirement() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -19470,6 +19573,139 @@ mod tests {
     }
 
     #[test]
+    fn should_queue_only_child_notification_for_singleton_terminal() {
+        for status in ["completed", "failed", "interrupted", "closed"] {
+            for unrelated in ["none", "peer", "workspace", "profile", "parent", "session"] {
+                let temp = tempfile::tempdir().unwrap();
+                let orchestrator = InProcessAgentOrchestrator::default();
+                orchestrator
+                    .configure_supervisor_store(temp.path())
+                    .unwrap();
+                let mut child = sample_agent("only-background-child", "tenant-a");
+                child.parent_agent_id = Some("master".into());
+                child.backend_kind = "spawn_child_session".into();
+                child.cwd = Some("/projects/a".into());
+                let session = child.session_id.clone();
+                if unrelated != "none" {
+                    let mut other = child.clone();
+                    other.agent_id = "not-a-sibling".into();
+                    other.status = "completed".into();
+                    match unrelated {
+                        "peer" => other.backend_kind = PEER_HANDOFF_BACKEND_KIND.into(),
+                        "workspace" => other.cwd = Some("/projects/b".into()),
+                        "profile" => other.profile_id = "tenant-b".into(),
+                        "parent" => other.parent_agent_id = Some("other-parent".into()),
+                        "session" => other.session_id = SessionKey("other-session".into()),
+                        _ => unreachable!(),
+                    }
+                    orchestrator
+                        .state()
+                        .agents
+                        .insert(other.agent_id.clone(), other);
+                }
+                orchestrator
+                    .state()
+                    .agents
+                    .insert(child.agent_id.clone(), child);
+                orchestrator
+                    .set_agent_status("only-background-child", &session, "tenant-a", status, None)
+                    .unwrap();
+                let drained = orchestrator.drain_ready_continuations_for_session(
+                    &session,
+                    "tenant-a",
+                    MasterContinuationRuntimeState::idle(),
+                    usize::MAX,
+                );
+                assert_eq!(
+                    drained.len(),
+                    1,
+                    "singleton {status}, unrelated {unrelated}: one child outcome must not also schedule a joined answer: {drained:?}"
+                );
+                assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
+                assert_eq!(
+                    drained[0].metadata.get("status").map(String::as_str),
+                    Some(status)
+                );
+                let durable = SupervisorStore::new(temp.path()).load_state().unwrap();
+                assert_eq!(
+                    durable.continuations.len(),
+                    1,
+                    "no redundant join persisted for replay"
+                );
+                assert!(
+                    durable
+                        .children
+                        .values()
+                        .any(|child| child.terminal.is_some())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_keep_real_aggregate_join_for_two_non_peer_terminal_siblings() {
+        for status in ["completed", "failed", "interrupted", "closed"] {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let mut first = sample_agent("first-background-child", "tenant-a");
+            first.parent_agent_id = Some("master".into());
+            first.cwd = Some("/projects/a".into());
+            first.status = "completed".into();
+            let mut second = first.clone();
+            second.agent_id = "second-background-child".into();
+            second.status = "running".into();
+            let session = first.session_id.clone();
+            orchestrator
+                .state()
+                .agents
+                .insert(first.agent_id.clone(), first);
+            orchestrator
+                .state()
+                .agents
+                .insert(second.agent_id.clone(), second);
+            orchestrator
+                .set_agent_status(
+                    "second-background-child",
+                    &session,
+                    "tenant-a",
+                    status,
+                    None,
+                )
+                .unwrap();
+            let drained = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert_eq!(
+                drained.len(),
+                2,
+                "real aggregate join remains necessary for {status}"
+            );
+            assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
+            assert_eq!(
+                drained[0].metadata.get("status").map(String::as_str),
+                Some(status)
+            );
+            assert_eq!(
+                drained[1].reason,
+                MasterContinuationReason::ScatterJoinComplete
+            );
+            assert_eq!(
+                drained[1]
+                    .metadata
+                    .get("terminal_children")
+                    .map(String::as_str),
+                Some("2")
+            );
+            assert_eq!(
+                drained[1].metadata.get("workspace").map(String::as_str),
+                Some("/projects/a")
+            );
+        }
+    }
+
+    #[test]
     fn terminal_child_status_queues_master_continuations() {
         let orchestrator = InProcessAgentOrchestrator::default();
         let mut child_a = sample_agent("child-a", "tenant-a");
@@ -19532,6 +19768,172 @@ mod tests {
         );
     }
 
+    #[test]
+    fn peer_terminal_wake_should_classify_real_registration_before_child_session() {
+        let supervisor = octos_agent::TaskSupervisor::new();
+        for tool in ["peer_handoff", "spawn", "peer_handoff_other"] {
+            let id = supervisor.register(tool, tool, Some("peer-classification-master"));
+            let task = supervisor.get_task(&id).unwrap();
+            assert!(
+                task.child_session_key.is_some(),
+                "real registrations allocate a child session"
+            );
+            let is_peer = tool == "peer_handoff";
+            assert_eq!(
+                background_task_backend_kind(&task),
+                if is_peer {
+                    PEER_HANDOFF_BACKEND_KIND
+                } else {
+                    "spawn_child_session"
+                }
+            );
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let mut agent = sample_agent(&id, "peer-classification");
+            agent.backend_kind = background_task_backend_kind(&task);
+            let session = agent.session_id.clone();
+            orchestrator.state().agents.insert(id, agent);
+            assert_eq!(
+                session_has_live_supervised_work(&orchestrator.state(), &session),
+                !is_peer,
+                "peer lifetime must not pin a stale master marker; ordinary workers must still pin it"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_terminal_wake_should_persist_peer_terminal_without_generic_wakes() {
+        for status in ["completed", "failed", "interrupted", "closed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let orchestrator = InProcessAgentOrchestrator::default();
+            orchestrator
+                .configure_supervisor_store(temp.path())
+                .unwrap();
+            let mut peer = sample_agent("supervised-peer", "tenant-a");
+            peer.parent_agent_id = Some("master".into());
+            peer.backend_kind = PEER_HANDOFF_BACKEND_KIND.into();
+            let session = peer.session_id.clone();
+            orchestrator
+                .state()
+                .agents
+                .insert(peer.agent_id.clone(), peer);
+            orchestrator
+                .set_agent_status(
+                    "supervised-peer",
+                    &session,
+                    "tenant-a",
+                    status,
+                    Some("Peer lifecycle settled".into()),
+                )
+                .unwrap();
+            let drained = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            if matches!(status, "completed" | "closed") {
+                assert!(
+                    drained.is_empty(),
+                    "peer {status} must not schedule ordinary child/join replies: {drained:?}"
+                );
+            } else {
+                assert_eq!(
+                    drained.len(),
+                    1,
+                    "abnormal lifetime keeps one diagnostic, never a redundant join"
+                );
+                assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
+                assert_eq!(
+                    drained[0].metadata.get("status").map(String::as_str),
+                    Some(status)
+                );
+            }
+            let durable = SupervisorStore::new(temp.path()).load_state().unwrap();
+            assert_eq!(
+                durable.children.len(),
+                1,
+                "peer lifecycle remains observable and replayable"
+            );
+            assert!(
+                durable
+                    .children
+                    .values()
+                    .all(|child| child.terminal.is_some())
+            );
+            if matches!(status, "completed" | "closed") {
+                let reopened = InProcessAgentOrchestrator::default();
+                reopened.configure_supervisor_store(temp.path()).unwrap();
+                assert!(
+                    reopened
+                        .drain_ready_continuations_for_session(
+                            &session,
+                            "tenant-a",
+                            MasterContinuationRuntimeState::idle(),
+                            usize::MAX
+                        )
+                        .is_empty(),
+                    "restart must not resurrect close notifications"
+                );
+                assert_eq!(
+                    reopened.state().agents["supervised-peer"].backend_kind,
+                    PEER_HANDOFF_BACKEND_KIND
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn peer_terminal_wake_should_exclude_peer_lifetimes_from_background_scatter_join() {
+        for peer_status in ["running", "completed"] {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let mut worker = sample_agent("background-worker", "tenant-a");
+            worker.parent_agent_id = Some("master".into());
+            let session = worker.session_id.clone();
+            let mut peer = worker.clone();
+            peer.agent_id = "sovereign-peer".into();
+            peer.backend_kind = PEER_HANDOFF_BACKEND_KIND.into();
+            peer.status = peer_status.into();
+            let mut completed_worker = worker.clone();
+            completed_worker.agent_id = "completed-background-worker".into();
+            completed_worker.status = "completed".into();
+            orchestrator
+                .state()
+                .agents
+                .insert(completed_worker.agent_id.clone(), completed_worker);
+            orchestrator
+                .state()
+                .agents
+                .insert(worker.agent_id.clone(), worker);
+            orchestrator
+                .state()
+                .agents
+                .insert(peer.agent_id.clone(), peer);
+            orchestrator
+                .set_agent_status("background-worker", &session, "tenant-a", "completed", None)
+                .unwrap();
+            let drained = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert_eq!(
+                drained.len(),
+                2,
+                "an open peer must not block ordinary child/join notifications"
+            );
+            let join = drained
+                .iter()
+                .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+                .unwrap();
+            assert_eq!(
+                join.metadata.get("terminal_children").map(String::as_str),
+                Some("2"),
+                "closed peers must not inflate the worker group"
+            );
+        }
+    }
+
     /// #1707: the scatter/gather join is workspace-scoped. A stale terminal
     /// child left in the roster under the SAME wire `session_id` but a
     /// DIFFERENT project cwd (sessions_in_cwd reuse) must NOT be counted as a
@@ -19554,6 +19956,13 @@ mod tests {
         stale_b.cwd = Some("/projects/b".into());
         stale_b.status = "completed".into();
         assert_eq!(stale_b.session_id, session_id, "same wire session key");
+        let mut completed_a = child_a.clone();
+        completed_a.agent_id = "completed-a".into();
+        completed_a.status = "completed".into();
+        orchestrator
+            .state()
+            .agents
+            .insert(completed_a.agent_id.clone(), completed_a);
         orchestrator
             .state()
             .agents
@@ -19591,7 +20000,7 @@ mod tests {
                 MasterContinuationReason::ScatterJoinComplete
             ]
         );
-        // ...but scoped to project A ONLY: terminal_children == 1, NOT 2. The
+        // ...but scoped to project A ONLY: terminal_children == 2, NOT 3. The
         // cross-workspace `stale-b` is excluded from the sibling set.
         let scatter = drained
             .iter()
@@ -19602,7 +20011,7 @@ mod tests {
                 .metadata
                 .get("terminal_children")
                 .map(String::as_str),
-            Some("1"),
+            Some("2"),
             "cross-workspace stale sibling must not inflate the join count"
         );
         assert_eq!(
@@ -19740,13 +20149,7 @@ mod tests {
             .iter()
             .map(|item| item.reason.clone())
             .collect::<Vec<_>>();
-        assert_eq!(
-            reasons,
-            vec![
-                MasterContinuationReason::ChildCompleted,
-                MasterContinuationReason::ScatterJoinComplete
-            ]
-        );
+        assert_eq!(reasons, vec![MasterContinuationReason::ChildCompleted]);
     }
 
     /// Gap-1 step 3: the explicit `child/<group>/<session>/<agent_id>`
@@ -22799,12 +23202,8 @@ mod tests {
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
-        assert_eq!(
-            drained[1].reason,
-            MasterContinuationReason::ScatterJoinComplete
-        );
     }
 
     #[test]
@@ -22848,7 +23247,7 @@ mod tests {
             usize::MAX,
         );
         assert!(busy.is_empty());
-        assert_eq!(orchestrator.pending_continuation_count_for_test(), 4);
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 2);
 
         let drained_a = orchestrator.drain_ready_continuations_for_session(
             &session_a,
@@ -22856,13 +23255,17 @@ mod tests {
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        assert_eq!(drained_a.len(), 2);
+        assert_eq!(drained_a.len(), 1);
+        assert_eq!(
+            drained_a[0].reason,
+            MasterContinuationReason::ChildCompleted
+        );
         assert!(
             drained_a
                 .iter()
                 .all(|item| item.profile_id.as_str() == "tenant-a")
         );
-        assert_eq!(orchestrator.pending_continuation_count_for_test(), 2);
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
     }
 
     #[test]
@@ -23223,6 +23626,175 @@ mod tests {
                 transition_actor: None,
             })
             .expect("user replace still works");
+    }
+
+    /// #2237 — archived is TERMINAL: creating a new goal after an operator
+    /// archive must succeed, mint a FRESH goal id, and leave the archived
+    /// record's ledger untouched.
+    #[tokio::test]
+    async fn model_create_goal_admits_after_archived() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-arch");
+        let first = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "first objective", Some(2_000))
+            .expect("initial create");
+        let first_id = first["goal_id"].as_str().expect("id").to_owned();
+
+        // Operator archive (the only archived-reachable path, #25).
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                None,
+                "archive",
+                "test archive",
+                None,
+            )
+            .expect("operator archive");
+
+        // The admission that USED to refuse with (status `archived`).
+        let second = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "second objective", Some(2_000))
+            .expect("create after archive must be admitted (#2237)");
+        let second_id = second["goal_id"].as_str().expect("new id").to_owned();
+        assert_ne!(second_id, first_id, "terminal replacement mints a fresh id");
+        assert_eq!(second["status"], json!("active"));
+
+        // The archived record's ledger is untouched by design (Fix B drops
+        // the in-memory record and never edits the old ledger); the fresh
+        // id + active status above are the pinned observables.
+    }
+
+    /// #2237 — complete stays admissible (behavior unchanged, now pinned).
+    #[tokio::test]
+    async fn model_create_goal_admits_after_complete_unchanged() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-comp");
+        let first = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "first", Some(2_000))
+            .expect("create");
+        let first_id = first["goal_id"].as_str().expect("id").to_owned();
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect("complete");
+        let second = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "second", Some(2_000))
+            .expect("create after complete");
+        assert_ne!(
+            second["goal_id"].as_str().expect("id"),
+            first_id,
+            "fresh id minted"
+        );
+    }
+
+    /// #2237 — active still refuses, with the unchanged message.
+    #[tokio::test]
+    async fn model_create_goal_rejects_active_unchanged() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-active");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "one", None)
+            .expect("first");
+        let err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "two", None)
+            .expect_err("active refuses");
+        assert!(err.contains("unfinished goal (status `active`)"), "{err}");
+    }
+
+    /// #2237 — blocked and paused still refuse, each naming its status.
+    #[tokio::test]
+    async fn model_create_goal_rejects_blocked_and_paused() {
+        for (suffix, status) in [("blocked", "blocked"), ("paused", "paused")] {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let session_id = SessionKey::with_profile("tenant-a", "api", suffix);
+            orchestrator
+                .model_create_goal(&session_id, "tenant-a", "one", None)
+                .expect("first");
+            // blocked is model-reachable via model_transition_goal; paused is
+            // a user/backend state — set it through set_goal's status knob.
+            if status == "blocked" {
+                orchestrator
+                    .model_transition_goal(&session_id, "tenant-a", status, "test", None)
+                    .await
+                    .expect("blocked transition");
+            } else {
+                orchestrator
+                    .set_goal(GoalSetRequest {
+                        session_id: session_id.clone(),
+                        profile_id: "tenant-a".to_owned(),
+                        objective: "one".to_owned(),
+                        status: Some(status.to_owned()),
+                        token_budget: None,
+                        transition_actor: Some("backend".to_owned()),
+                    })
+                    .map(|_| ())
+                    .unwrap_or(());
+            }
+            let err = orchestrator
+                .model_create_goal(&session_id, "tenant-a", "two", None)
+                .expect_err("unfinished refuses");
+            assert!(
+                err.contains(&format!("status `{status}`")),
+                "{status} named in: {err}"
+            );
+        }
+    }
+
+    /// #2237 — budget_limited still refuses.
+    #[tokio::test]
+    async fn model_create_goal_rejects_budget_limited() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-budget");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "one", Some(1_000))
+            .expect("first");
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 1_000);
+        // Lower the budget below used → set_goal flips the goal to
+        // budget_limited (the pre-existing #2010 semantics, see the twin
+        // test `set_goal_flips_active_goal_to_budget_limited_when_budget_
+        // lowered_below_used`).
+        let _ = orchestrator.set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: "tenant-a".to_owned(),
+            objective: "one".to_owned(),
+            status: Some("budget_limited".to_owned()),
+            token_budget: Some(1_000),
+            transition_actor: Some("backend".to_owned()),
+        });
+        let err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "two", None)
+            .expect_err("budget_limited refuses");
+        assert!(err.contains("budget_limited"), "{err}");
+    }
+
+    /// #2237 — goal_update on an archived goal points at create-new instead
+    /// of a stale-verdict refusal.
+    #[tokio::test]
+    async fn goal_update_on_archived_says_create_new() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-update");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "objective", None)
+            .expect("create");
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                None,
+                "archive",
+                "test archive",
+                None,
+            )
+            .expect("archive");
+        let err = orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect_err("update on archived refuses");
+        assert!(
+            err.contains("goal is archived; create a new goal instead"),
+            "guidance message: {err}"
+        );
     }
 
     #[tokio::test]
@@ -30061,20 +30633,24 @@ mod tests {
             .configure_supervisor_store(&store_dir)
             .expect("configure store");
         let session_id = SessionKey::with_profile("tenant-a", "api", "durable");
-        orchestrator.upsert_agent(AgentUpsert {
-            agent_id: "child-a".into(),
-            parent_agent_id: Some("master".into()),
-            session_id: session_id.clone(),
-            task_id: None,
-            path: "master/child-a".into(),
-            role: "worker".into(),
-            nickname: "Ada".into(),
-            backend_kind: "native".into(),
-            status: "completed".into(),
-            last_task: Some("durable review done".into()),
-            cwd: None,
-            profile_id: "tenant-a".into(),
-        });
+        // Two independent singleton groups keep selective-completion coverage:
+        // completing one occurrence must not erase another pending child.
+        for id in ["child-a", "child-b"] {
+            orchestrator.upsert_agent(AgentUpsert {
+                agent_id: id.into(),
+                parent_agent_id: Some(format!("parent-{id}")),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: format!("parent-{id}/{id}"),
+                role: "worker".into(),
+                nickname: id.into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("durable review done".into()),
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            });
+        }
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 2);
 
         let restarted = InProcessAgentOrchestrator::default();
@@ -30090,6 +30666,7 @@ mod tests {
             1,
         );
         assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
         restarted.mark_continuation_started(&drained[0]);
         restarted.mark_continuation_completed(&drained[0], Some("processed".into()));
 
@@ -30101,6 +30678,18 @@ mod tests {
             replayed_after_completion.pending_continuation_count_for_test(),
             1
         );
+        let remaining = replayed_after_completion.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].reason,
+            MasterContinuationReason::ChildCompleted
+        );
+        assert_ne!(remaining[0].child_agent_id, drained[0].child_agent_id);
     }
 
     // ---------------- #991 / M15-B trait extension tests ----------------
@@ -33455,7 +34044,8 @@ mod tests {
                 "git {args:?} failed"
             );
         };
-        run(&["init", "-q"]);
+        // Independent of the developer's init.defaultBranch (often main).
+        run(&["init", "-q", "-b", "fixture-seed"]);
         run(&["config", "user.name", "octos-test"]);
         run(&["config", "user.email", "octos-test@example.invalid"]);
         std::fs::write(root.join("seed.txt"), "seed\n").unwrap();

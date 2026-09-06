@@ -177,6 +177,33 @@ impl ProgressReporter for ChannelStreamReporter {
                     json: payload.to_string(),
                 }
             }
+            ProgressEvent::AgentProgress {
+                iteration,
+                active_tokens,
+                elapsed,
+                checkpoints,
+                reflecting,
+            } => {
+                let mut payload = serde_json::json!({
+                    "type": "agent_progress",
+                    "message": octos_agent::progress::agent_progress_message(
+                        iteration,
+                        active_tokens,
+                        elapsed,
+                        checkpoints,
+                        reflecting,
+                    ),
+                    "iteration": iteration,
+                    "active_tokens": active_tokens,
+                    "elapsed_ms": elapsed.as_millis() as u64,
+                    "checkpoints": checkpoints,
+                    "reflecting": reflecting,
+                });
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             ProgressEvent::Response { iteration, .. } => {
                 let mut payload = serde_json::json!({"type": "response", "iteration": iteration});
                 inject_thread_id(&mut payload, thread_id);

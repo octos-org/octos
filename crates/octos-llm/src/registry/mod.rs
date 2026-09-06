@@ -147,6 +147,13 @@ pub struct ProviderEntry {
     /// [`crate::discovery::resolve_model_discovery`] — the protocol is never
     /// inferred from the family id string.
     pub model_discovery: crate::discovery::ModelDiscovery,
+    /// Per-model discovery resolver for families that pick the wire protocol
+    /// by MODEL NAME (r9s serves `claude-*` over the Anthropic Messages API at
+    /// a rewritten `{base}/anthropic` root). Consulted by
+    /// [`crate::discovery::resolve_model_discovery`] ahead of the family-wide
+    /// `model_discovery` when a model is selected and no `api_type` override
+    /// applies; `None` means the family-wide declaration always rules.
+    pub model_discovery_for_model: Option<crate::discovery::ModelDiscoveryForModel>,
     /// Factory function with full control over provider construction.
     pub create: fn(CreateParams) -> Result<Arc<dyn LlmProvider>>,
 }

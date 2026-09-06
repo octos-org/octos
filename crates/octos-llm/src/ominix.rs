@@ -390,14 +390,22 @@ impl VoicesRegistry {
     /// Like [`resolve`](Self::resolve), but only matches voices whose
     /// `ref_audio` path satisfies `is_visible`, so a tenant can't select a
     /// voice cloned by (and owned by) another profile.
+    ///
+    /// An exact canonical-id match wins over another voice's alias: with
+    /// `doubao.aliases = ["vivian"]` plus a separate `vivian` entry, the name
+    /// `vivian` resolves to the `vivian` entry, not to `doubao` (which sorts
+    /// earlier in the BTreeMap). An exact id whose ref is unusable falls
+    /// through to the alias pass.
     pub fn resolve_visible(&self, name: &str, is_visible: impl Fn(&str) -> bool) -> Option<String> {
+        let usable = |e: &VoiceEntry| self.ref_exists(e) && is_visible(&e.ref_audio);
+        if let Some(e) = self.voices.get(name) {
+            if usable(e) {
+                return Some(name.to_string());
+            }
+        }
         self.voices
             .iter()
-            .find(|(id, e)| {
-                (id.as_str() == name || e.aliases.iter().any(|a| a == name))
-                    && self.ref_exists(e)
-                    && is_visible(&e.ref_audio)
-            })
+            .find(|(_, e)| e.aliases.iter().any(|a| a == name) && usable(e))
             .map(|(id, _)| id.clone())
     }
 }
@@ -777,6 +785,48 @@ mod voices_tests {
         assert_eq!(reg.resolve("vivian").as_deref(), Some("doubao")); // alias → id
         assert_eq!(reg.resolve("ghost"), None); // ref missing
         assert_eq!(reg.resolve("nope"), None); // unknown
+    }
+
+    #[test]
+    fn resolve_prefers_exact_id_over_another_voice_alias() {
+        // doubao sorts before vivian in the BTreeMap and aliases ["vivian"];
+        // a separate canonical "vivian" entry must still win its own name.
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["doubao_ref.wav", "vivian_ref.wav"] {
+            let p = dir.path().join("ref_audios").join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"fake").unwrap();
+        }
+        let json = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": {base:?},
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "vivian": {{ "ref_audio": "ref_audios/vivian_ref.wav", "ref_text": "z", "aliases": [] }}
+              }}
+            }}"#,
+            base = dir.path().to_string_lossy()
+        );
+        let reg = VoicesRegistry::parse(&json).unwrap();
+        assert_eq!(reg.resolve("vivian").as_deref(), Some("vivian"));
+        // An unusable exact id (ref missing) still falls through to aliases.
+        let dir2 = tempfile::tempdir().unwrap();
+        let json2 = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": {base:?},
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "vivian": {{ "ref_audio": "ref_audios/vivian_ref.wav", "ref_text": "z", "aliases": [] }}
+              }}
+            }}"#,
+            base = dir2.path().to_string_lossy()
+        );
+        std::fs::create_dir_all(dir2.path().join("ref_audios")).unwrap();
+        std::fs::write(dir2.path().join("ref_audios/doubao_ref.wav"), b"fake").unwrap();
+        let reg2 = VoicesRegistry::parse(&json2).unwrap();
+        assert_eq!(reg2.resolve("vivian").as_deref(), Some("doubao"));
     }
 
     #[test]

@@ -465,6 +465,19 @@ pub trait Sandbox: Send + Sync {
     /// Wrap a shell command string into a sandboxed `Command`.
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command;
 
+    /// Wrap a shell call with its current harness-held build-cache slot.
+    /// Backends without a contextual slot grant keep their existing behavior.
+    /// A supporting backend treats this option as authoritative, including
+    /// None, without changing the shared sandbox or legacy wrap_command config.
+    fn wrap_command_with_build_cache_slot(
+        &self,
+        shell_command: &str,
+        cwd: &Path,
+        _slot: Option<&Path>,
+    ) -> Command {
+        self.wrap_command(shell_command, cwd)
+    }
+
     /// Whether this sandbox provides no confinement (runs commands directly).
     /// Lets callers that require confinement (e.g. the `mcp-serve` server path)
     /// fail closed when `SandboxMode::Auto` resolves to no backend. Real

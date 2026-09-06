@@ -139,6 +139,7 @@ fn push_regex_escaped(out: &mut String, ch: char) {
 }
 
 /// macOS sandbox using sandbox-exec.
+#[derive(Clone)]
 pub struct MacosSandbox {
     pub(crate) allow_network: bool,
     /// When non-empty, restrict file-read* to these paths + cwd.
@@ -202,6 +203,19 @@ impl Sandbox for MacosSandbox {
         // `(allow file-read*)`); a restricted-read profile would grant the write
         // but deny the read, so the worktree flow must fall back to scratch.
         self.read_allow_paths.is_empty()
+    }
+
+    fn wrap_command_with_build_cache_slot(
+        &self,
+        shell_command: &str,
+        cwd: &Path,
+        slot: Option<&Path>,
+    ) -> Command {
+        // Shared session/profile backends must never retain a turn's slot.
+        // None is authoritative too; legacy wrap_command keeps its config.
+        let mut per_call = self.clone();
+        per_call.build_cache_slot = slot.map(Path::to_path_buf);
+        per_call.wrap_command(shell_command, cwd)
     }
 
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {

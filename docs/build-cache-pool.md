@@ -285,3 +285,15 @@ peer 的 cwd 是它自己的 clone `peers/<slug>/wt`(peers/mod.rs:1597–1622),�
 - 环境注入:crates/octos-cli/src/commands/chat.rs:797–812 进程内 peer 驱动;:828 run_chat_peer;:854 create_sandbox;:875–882 Agent 装配;:886 goal 重水化。crates/octos-agent/src/tools/shell.rs:194 wrap_command;:201–204 与 :1104–1107 环境注入点;:327–332 apply_frontend_tool_env(范本);:754 apply_git_tool_env;:449–462 MAIN_TREE_SOVEREIGNTY_PROVIDER(host 装配范本)。crates/octos-agent/src/subprocess_env.rs:159–171 should_forward_env_name;:90–94 + :113–127 strict 变体保留 OCTOS_*。crates/octos-agent/src/tools/mod.rs:261 ToolContext;:341–348 goal/task/originator 字段(§7.4 传递层范本);agent/execution.rs:508–511 逐调用下发。
 - 路径与数据根:api/ui_protocol_transport.rs:13212 `runtime.data_dir.join("peers")`;:11525 同;crates/octos-cli/src/profiles.rs:164–166 data_dir 覆盖;:1894 resolve_data_dir;:1939 octos_home_dir;crates/octos-cli/src/config.rs:26 Config;:123/127 既有可选段形态;runtime/profile.rs:991–996 read_allow_paths 追加 home。
 - 空间与锁依赖:crates/octos-cli/Cargo.toml:59 fs2;:58 sha2;:24 octos-agent;:111/154 sysinfo(api-only);autonomy/monitor_runtime.rs:410–437 fs2::FileExt 用法与 MSRV 注释;api/admin.rs:3068–3082 df -Pk 版(不采用的对照);fs2-0.4.3/src/lib.rs:180 available_space(statvfs)。
+
+
+### #7 与上游 #2236 的语义合并
+
+`PeerBuildCache::Shared` 表示已从本池持有槽；不再生成指向 workspace 根 `target/` 的 Cargo 配置。每次工具调用仍通过 `CARGO_TARGET_DIR=<slot>/target`、`CARGO_INCREMENTAL=0` 使用该槽，沙箱只放行自己持有的槽。`RepoConfig` 保留仓库的 `.cargo/config.toml` 或旧式 `.cargo/config`，不注入池槽环境变量；未围栏、非 Cargo 或未注册池的根为 `None`。
+
+staging 与每轮 boot 均检查上述条件；首轮接手 registry 中的原句柄，后续从 clone 的 `remote.origin.url` 找回源仓库，避免按 clone 路径分裂池。配置切换后不再适用的 staged 槽立即释放。池耗尽、空间门或记录失败会报错，不退回池外 target；记录失败同时释放新槽。终态错误（包括 agent dispatch 前的 peer lifetime 持久化失败）与中断都幂等释放槽。
+
+serve 对省略的 `[build_cache]` 注册默认配置；side-table 未注册才表示该根不使用池，当前没有单独的 disabled 开关。`peer_staged` 的 shared / repo-config / 无后缀三态与 UI 协议保持兼容，Shared 的 note 改为准确说明槽池与环境注入。
+
+
+#7 复审补齐了实际 shell 沙箱接线：foreground/background 每次调用只解析一次 `ToolContext` / task-local 槽，向环境注入和 contextual sandbox wrapper 传同一个值。macOS wrapper 复制共享 backend 的配置后替换槽（`None` 也覆盖旧值），因此不会把上一轮或兄弟 peer 的槽留在共享对象中；直接使用旧 `wrap_command` 的调用者仍保留显式配置语义。原有 SBPL 路径校验与写入围栏继续生效，其他 backend 保持既有行为（此处未补非 macOS 的池外目录挂载）。真实 ShellTool 前台/后台回归检查了 slot1→slot2→None 的 SBPL/env 一致性；macOS kernel 回归验证自己的槽可写、兄弟槽及随后撤销的旧槽拒绝写入。

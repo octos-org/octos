@@ -1,32 +1,31 @@
 //! Chat command: interactive multi-turn conversation with an agent.
 
-use std::future::Future;
-use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+#[cfg(any(feature = "api", test))]
+use std::io::IsTerminal;
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "api")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Args, ValueEnum};
 use colored::Colorize;
 use eyre::{Result, WrapErr, eyre};
-use octos_agent::compaction::CompactionRunner;
-use octos_agent::{
-    Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, ConversationResponse,
-    HookExecutor, ProgressReporter, SilentReporter, ToolApprovalDecision, ToolApprovalRequest,
-    ToolApprovalRequester, ToolRegistry, UserQuestionOutcome, UserQuestionRequest,
-    UserQuestionRequester, read_workspace_policy,
-};
-use octos_core::ui_protocol::{PeerStagedEvent, UserQuestionAnswer};
-use octos_core::{AgentId, Message, MessageRole, SessionScope};
-use octos_llm::{
-    AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
-    RetryProvider,
-};
-use octos_memory::{EpisodeStore, MemoryStore};
+#[cfg(any(feature = "api", test))]
+use octos_agent::{ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester};
+#[cfg(feature = "api")]
+use octos_agent::{UserQuestionOutcome, UserQuestionRequest, UserQuestionRequester};
+#[cfg(feature = "api")]
+use octos_core::ui_protocol::UserQuestionAnswer;
+use octos_llm::{EmbeddingProvider, LlmProvider, OpenAIEmbedder};
+#[cfg(feature = "api")]
 use rustyline::DefaultEditor;
 
 use super::Executable;
 use crate::config::Config;
+
+#[cfg(feature = "api")]
+mod oup;
 
 /// Interactive multi-turn chat with an agent.
 ///
@@ -66,8 +65,10 @@ pub struct ChatCommand {
     #[arg(long = "api-type", visible_alias = "api-style")]
     pub api_type: Option<String>,
 
-    /// Maximum tool-call iterations per message (default: 20).
-    #[arg(long, default_value = "20")]
+    /// Maximum LLM-loop iterations per message. 0 (default) means unlimited;
+    /// cancellation, idle detection, tool timeouts and convergence checkpoints
+    /// remain active.
+    #[arg(long, default_value = "0")]
     pub max_iterations: u32,
 
     /// Verbose output (show tool outputs).
@@ -175,6 +176,9 @@ pub struct ChatCommand {
     /// Do NOT persist this run as an episode (ephemeral). Mirrors
     /// `claude --no-session-persistence`: by default a completed turn is
     /// saved to the episode store for future recall; this skips that write.
+    /// Chat history and context sidecars use a temporary runtime directory.
+    /// Shared profile memory, tools and skills remain available; explicit
+    /// memory, file, cron or goal writes are not disabled by this flag.
     ///
     /// This also lets many `octos chat` agents run CONCURRENTLY against one
     /// `--data-dir` (hence one shared `--profile`): a normal run takes an
@@ -208,48 +212,6 @@ pub enum ChatSandboxMode {
     WorkspaceWrite,
     /// No sandbox, host filesystem, network on, approvals never ("yolo").
     DangerFullAccess,
-}
-
-/// Host-managed paths used by a chat session.
-///
-/// `--sandbox read-only` constrains both agent tools and Octos's own startup
-/// work: bundled-skill bootstrap and spawned-worker deliverables must not
-/// create `cwd/.octos`. Existing project state remains readable for local
-/// plugins and bootstrap prompt files.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChatRuntimePaths {
-    /// Existing workspace-local state, read-only in a read-only session.
-    project_dir: PathBuf,
-    /// Root for host-generated bundled skills.
-    bootstrap_dir: PathBuf,
-    /// Per-chat root for spawn deliverables.
-    spawn_deliverable_dir: PathBuf,
-}
-
-fn resolve_chat_runtime_paths(
-    cwd: &std::path::Path,
-    data_dir: &std::path::Path,
-    permissions: octos_agent::EffectivePermissions,
-    run_id: &str,
-) -> ChatRuntimePaths {
-    let project_dir = cwd.join(".octos");
-    if permissions.file_access.allows_write() {
-        return ChatRuntimePaths {
-            bootstrap_dir: project_dir.clone(),
-            spawn_deliverable_dir: project_dir.join("spawn-deliverables"),
-            project_dir,
-        };
-    }
-
-    // Bootstrap performs direct filesystem writes. Keep every read-only chat
-    // in a private runtime subtree so concurrent sessions cannot race over
-    // generated bundled skills or see each other's plugin state.
-    let run_dir = data_dir.join("runtime").join("runs").join(run_id);
-    ChatRuntimePaths {
-        project_dir,
-        bootstrap_dir: run_dir.join("bootstrap"),
-        spawn_deliverable_dir: run_dir.join("spawn-deliverables"),
-    }
 }
 
 /// `--ask-for-approval` choices, mirroring codex.
@@ -293,6 +255,7 @@ impl From<ChatEffort> for octos_llm::ReasoningEffort {
 /// are two spellings of the same one-shot prompt, so supplying both is
 /// contradictory — fail closed. Returns the single effective one-shot message,
 /// or `None` for interactive mode (neither given).
+#[cfg(any(feature = "api", test))]
 fn reconcile_one_shot_prompt(
     message: Option<String>,
     prompt: Option<String>,
@@ -323,7 +286,8 @@ fn reconcile_one_shot_prompt(
 /// required (`create_provider_with_api_type` bails when it is missing), so
 /// blanking it would turn a provider swap into a hard error. Callers complete a
 /// cross-provider switch by also passing `--model`.
-fn detach_route_on_provider_override(config: &mut Config, cli_provider: Option<&str>) {
+#[cfg(any(feature = "api", test))]
+pub(crate) fn detach_route_on_provider_override(config: &mut Config, cli_provider: Option<&str>) {
     let detaches = matches!(
         (cli_provider, config.provider.as_deref()),
         (Some(cli), Some(cfg)) if cli != cfg
@@ -401,30 +365,8 @@ pub fn resolve_chat_permissions(
     Ok(permissions)
 }
 
-/// Bind every loaded [`octos_agent::plugins::PluginTool`] in `tools` to the
-/// resolved chat working directory.
-///
-/// yolo GAP #4: unlike `octos serve` (whose `SessionRuntime::bootstrap`
-/// calls `rebind_plugin_work_dirs`), `octos chat` loads plugins with
-/// `work_dir: None` and never rebinds them. `PluginTool::execute` derives
-/// its `current_dir`/`OCTOS_WORK_DIR` from `ctx.session_scope` ONLY when its
-/// own `work_dir` is unset — and under a Host-scope (`--yolo`) session the
-/// scope is deliberately omitted (so host-reaching file tools keep host
-/// access). With BOTH `work_dir: None` and `session_scope: None`, plugins run
-/// in the process LAUNCH directory instead of the requested `--cwd`, breaking
-/// relative plugin inputs/outputs.
-///
-/// Binding the work_dir at registration (via the registry's existing
-/// [`ToolRegistry::rebind_plugin_work_dirs`] path) fixes the Host case while
-/// staying a no-op for the Workspace case — there `work_dir` == `cwd` ==
-/// `scope.workspace()`, and `execute` prefers `work_dir` first, so the
-/// resolved directory is unchanged. Only plugin working directory is
-/// affected; the Host-scope decision for FILE tools is untouched.
-fn bind_chat_plugin_work_dirs(tools: &mut ToolRegistry, cwd: &std::path::Path) {
-    tools.rebind_plugin_work_dirs(cwd);
-}
-
 /// Exit commands.
+#[cfg(feature = "api")]
 const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 
 /// Serializes ALL interactive stdin prompts (approvals AND user questions):
@@ -434,12 +376,14 @@ const EXIT_COMMANDS: &[&str] = &["exit", "quit", "/exit", "/quit", ":q"];
 /// meant. One module-level lock shared by both requesters — a function-local
 /// `static` would be a *distinct* mutex per function and not serialize an
 /// approval against a question (codex review).
+#[cfg(any(feature = "api", test))]
 static CHAT_PROMPT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What the user answered at the CLI approval prompt. `ApproveSession`
 /// mirrors the TUI's `s` action / the serve `approval_scope: "session"`
 /// (`ApprovalScopeKind::ApproveForSession`): every later approval-gated
 /// request in this chat process auto-resolves without prompting.
+#[cfg(any(feature = "api", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliApprovalAnswer {
     ApproveOnce,
@@ -449,6 +393,7 @@ enum CliApprovalAnswer {
 
 /// Parse the `[y/s/N]` answer line. Empty / unrecognized input denies —
 /// same fail-closed default as the old `[y/N]` prompt.
+#[cfg(any(feature = "api", test))]
 fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => CliApprovalAnswer::ApproveOnce,
@@ -457,6 +402,7 @@ fn parse_cli_approval_answer(line: &str) -> CliApprovalAnswer {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 #[derive(Default)]
 struct CliApprovalRequester {
     /// Set once the user answers `s` — the CLI-chat equivalent of the serve
@@ -466,6 +412,7 @@ struct CliApprovalRequester {
     session_approved: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(any(feature = "api", test))]
 impl CliApprovalRequester {
     fn session_approved(&self) -> bool {
         self.session_approved
@@ -473,6 +420,7 @@ impl CliApprovalRequester {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 #[async_trait::async_trait]
 impl ToolApprovalRequester for CliApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
@@ -522,6 +470,7 @@ impl ToolApprovalRequester for CliApprovalRequester {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
     eprintln!();
     eprintln!("{}", "Approval required".yellow().bold());
@@ -545,8 +494,10 @@ fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
     }
 }
 
+#[cfg(feature = "api")]
 struct CliUserQuestionRequester;
 
+#[cfg(feature = "api")]
 #[async_trait::async_trait]
 impl UserQuestionRequester for CliUserQuestionRequester {
     async fn request_user_question(&self, request: UserQuestionRequest) -> UserQuestionOutcome {
@@ -559,6 +510,7 @@ impl UserQuestionRequester for CliUserQuestionRequester {
     }
 }
 
+#[cfg(feature = "api")]
 fn prompt_for_cli_user_question(request: UserQuestionRequest) -> UserQuestionOutcome {
     // No terminal to prompt on → let the tool degrade to its structured
     // fallback (the model re-asks in plain text) rather than block forever.
@@ -642,6 +594,7 @@ fn prompt_for_cli_user_question(request: UserQuestionRequest) -> UserQuestionOut
 /// first valid pick. The "Other" row is index `options.len() + 1` and is only
 /// honoured when the question allows free text. Pure so it can be unit-tested
 /// without stdin.
+#[cfg(any(feature = "api", test))]
 fn parse_question_selection(
     question: &octos_core::ui_protocol::UserQuestion,
     line: &str,
@@ -682,38 +635,17 @@ fn parse_question_selection(
     (selected_labels, other_picked)
 }
 
-async fn with_chat_approval<F, T>(
-    approval_requester: Arc<dyn ToolApprovalRequester>,
-    future: F,
-) -> T
-where
-    F: Future<Output = T>,
-{
-    // Scope BOTH the approval and the user-question requesters for the turn,
-    // so `ask_user_question` renders the interactive numbered prompt instead
-    // of degrading to Unsupported (the model re-asking in plain text).
-    let uq_requester: Arc<dyn UserQuestionRequester> = Arc::new(CliUserQuestionRequester);
-    octos_agent::tools::USER_QUESTION_CTX
-        .scope(
-            uq_requester,
-            octos_agent::tools::TOOL_APPROVAL_CTX.scope(approval_requester, future),
-        )
-        .await
-}
-
 /// The goal tools `octos chat --goals` registers. Also the exact set added to
 /// an allow-list profile surface so `filter_by_profile` keeps them.
+#[cfg(any(feature = "api", test))]
 const CHAT_GOAL_TOOLS: &[&str] = &["goal_get", "goal_create", "goal_update"];
 
 /// The peer tools `octos chat --peers` registers, and the exact set added to an
 /// allow-list profile surface.
 ///
-/// Deliberately three, not six. `peer_gather` and `peer_close` are read-only /
-/// lifecycle conveniences that would each drag more of the serve-side wiring in
-/// (`peer_close` needs the WS `peer/closed` + `approval/cancelled` emitters);
-/// `peer_send_input` needs a running peer's continuation queue, which chat's
-/// one-shot peer host has no drain for. Handoff → list → respond is the
-/// complete master↔peer loop, and nothing more is claimed.
+/// Preserve the lean default surface. The OUP backend also implements gather,
+/// close and follow-up input for profiles that explicitly allow those tools.
+#[cfg(any(feature = "api", test))]
 const CHAT_PEER_TOOLS: &[&str] = &["peer_handoff", "peer_list", "peer_respond"];
 
 /// Add `wanted` to an ALLOW-LIST profile surface, in place, without duplicates.
@@ -724,6 +656,7 @@ const CHAT_PEER_TOOLS: &[&str] = &["peer_handoff", "peer_list", "peer_respond"];
 /// identical with and without `--goals`). A deny list and the pass-through
 /// `Default` mode need no change (none of these names appear in either), and an
 /// EMPTY allow list is already pass-through, so both are left alone.
+#[cfg(any(feature = "api", test))]
 fn widen_allow_list(surface: &mut octos_agent::profile::ProfileTools, wanted: &[&str]) {
     if let octos_agent::profile::ProfileTools::AllowList { tools } = surface {
         if !tools.is_empty() {
@@ -738,245 +671,21 @@ fn widen_allow_list(surface: &mut octos_agent::profile::ProfileTools, wanted: &[
 
 /// Stable goal session key for `octos chat --goals`.
 ///
-/// Chat has no wire session, but the goal tools resolve their session from
-/// `ToolContext::parent_session_key`, and the orchestrator keys durable goal
-/// state by that session. Minting the SAME key on every run is precisely what
+/// Goal tools and the OUP dispatcher share this durable session identity.
+/// Minting the SAME key on every run is precisely what
 /// makes a chat goal outlive the process. Scoped by profile so two profiles
 /// don't share one goal; the `cli` segment keeps it from colliding with a
 /// `serve` wire session (`<profile>:local:<name>` / `<profile>:api:<name>`).
+#[cfg(any(feature = "api", test))]
 fn chat_goal_session_key(profile_id: &str) -> String {
     format!("{profile_id}:cli:chat")
 }
 
-/// Everything the in-process peer host needs to build and drive a peer agent.
-///
-/// Assembled in `ChatCommand::run` BEFORE the master agent consumes `llm` /
-/// `memory` / `agent_config`; every field is either an `Arc` or `Clone`, so the
-/// host is a cheap sibling of the master rather than a second bootstrap.
-struct ChatPeerHost {
-    rx: tokio::sync::mpsc::UnboundedReceiver<PeerStagedEvent>,
-    llm: Arc<dyn LlmProvider>,
-    memory: Arc<octos_memory::EpisodeStore>,
-    agent_config: AgentConfig,
-    sandbox_config: octos_agent::SandboxConfig,
-    permissions: octos_agent::policy::EffectivePermissions,
-    /// The MASTER's resolved profile. A peer must not see a wider tool surface
-    /// than the session that spawned it, so its registry is narrowed through
-    /// the same envelope (`filter_by_profile`).
-    profile: Arc<octos_agent::profile::ProfileDefinition>,
-    profile_id: String,
-    peers_root: PathBuf,
-    data_dir: PathBuf,
-    shutdown: Arc<AtomicBool>,
-}
-
-/// Drive staged peers, one task per peer, for the lifetime of the chat session.
-///
-/// Detached on purpose: `peer_handoff` returns to the model as soon as staging
-/// succeeds (that is its contract on the serve path too), and the master must
-/// stay responsive while a peer runs — otherwise it could never answer the
-/// peer's parked prompt, which is the entire point of the loop.
-fn spawn_chat_peer_host(mut host: ChatPeerHost) {
-    tokio::spawn(async move {
-        while let Some(event) = host.rx.recv().await {
-            if host.shutdown.load(Ordering::Acquire) {
-                break;
-            }
-            let slug = event.slug.clone();
-            let cwd = PathBuf::from(&event.cwd);
-            let llm = host.llm.clone();
-            let memory = host.memory.clone();
-            let agent_config = host.agent_config.clone();
-            let sandbox_config = host.sandbox_config.clone();
-            let permissions = host.permissions;
-            let profile = host.profile.clone();
-            let profile_id = host.profile_id.clone();
-            let peers_root = host.peers_root.clone();
-            let data_dir = host.data_dir.clone();
-            tokio::spawn(async move {
-                if let Err(error) = run_chat_peer(
-                    &slug,
-                    &cwd,
-                    llm,
-                    memory,
-                    agent_config,
-                    &sandbox_config,
-                    permissions,
-                    Some(&profile),
-                    &profile_id,
-                    &peers_root,
-                    &data_dir,
-                )
-                .await
-                {
-                    eprintln!("peer '{slug}' failed: {error}");
-                }
-            });
-        }
-    });
-}
-
-/// Run ONE staged peer to completion in this process.
-///
-/// The two things that make it a real peer rather than a sub-agent:
-///
-/// * its session key carries the `peer-<slug>` topic and is published in the
-///   process-global wire registry, so `peer_list` / `peer_respond` can find it;
-/// * its approval + user-question requesters PARK in the shared contract store
-///   instead of touching the console. Only the master talks to the terminal.
-#[allow(clippy::too_many_arguments)]
-async fn run_chat_peer(
-    slug: &str,
-    cwd: &Path,
-    llm: Arc<dyn LlmProvider>,
-    memory: Arc<octos_memory::EpisodeStore>,
-    agent_config: AgentConfig,
-    sandbox_config: &octos_agent::SandboxConfig,
-    permissions: octos_agent::policy::EffectivePermissions,
-    profile: Option<&octos_agent::profile::ProfileDefinition>,
-    profile_id: &str,
-    peers_root: &Path,
-    data_dir: &Path,
-) -> Result<()> {
-    let boot = crate::peers::host::read_peer_boot(peers_root, slug)
-        .ok_or_else(|| eyre::eyre!("peer '{slug}' is not a staged peer directory"))?;
-    let Some(brief) = boot.brief.clone() else {
-        return Err(eyre::eyre!("peer '{slug}' has no brief to run"));
-    };
-
-    // Publish the wire BEFORE the first turn: a peer that parks before it is
-    // registered is invisible to `peer_list` and unanswerable by `peer_respond`.
-    let session = crate::peers::host::register_peer_wire(profile_id, slug);
-
-    // The peer's own tool surface, rooted at ITS cwd (its worktree when the
-    // master asked for one). No peer tools: the depth-1 guard means a peer can
-    // never hand off, list, or respond.
-    let sandbox = octos_agent::create_sandbox(sandbox_config);
-    let mut peer_tools = ToolRegistry::with_builtins_and_permissions(cwd, sandbox, permissions);
-    // Goal tools so a goal-bound peer can read the objective and record its
-    // findings against the MASTER's goal — that is how work gets back.
-    peer_tools.register(
-        crate::goal_tool::GoalGetTool::new(profile_id.to_owned())
-            .with_data_dir(data_dir.to_path_buf()),
-    );
-    peer_tools.register(
-        crate::goal_tool::GoalUpdateTool::new(profile_id.to_owned())
-            .with_data_dir(data_dir.to_path_buf()),
-    );
-    // Narrow through the MASTER's profile envelope, last, exactly as the master
-    // registry does. Without this a `coding`-profile chat would hand its peers
-    // a WIDER tool surface than the session that spawned them. The goal tools
-    // survive because `--peers` requires `--goals`, which already widened the
-    // allow list for them.
-    if let Some(profile) = profile {
-        profile.apply_to_registry(&mut peer_tools);
-    }
-
-    let mut peer_agent = Agent::new(
-        AgentId::new(format!("peer-{slug}")),
-        llm,
-        peer_tools,
-        memory,
-    )
-    .with_config(agent_config)
-    .with_parent_session_key(session.to_string());
-    // Rehydrate the goal binding written by `stage_peer`, exactly as the serve
-    // peer boot does. Without it the peer's `goal_*` calls resolve to its own
-    // (goal-less) session and read empty state.
-    if let Some(goal_id) = boot.goal_id.clone() {
-        peer_agent = peer_agent.with_goal_id(goal_id);
-        if let Some(task_id) = boot.task_id.clone() {
-            peer_agent = peer_agent.with_task_id(task_id);
-        }
-    }
-    if let Some(originator) = boot.originator.clone() {
-        peer_agent = peer_agent.with_originator_session(originator);
-    }
-
-    // A parked peer must be ANNOUNCED — a silent block is indistinguishable
-    // from a hang, and the master has to know to run `peer_list`.
-    let notice: crate::peers::host::PeerParkNotice = Arc::new(|kind, slug, prompt| {
-        println!(
-            "\n{} peer '{}' is awaiting input ({}): {}\n  answer it with peer_respond (peer_list shows the ids)",
-            "⏸".yellow(),
-            slug,
-            kind.as_str(),
-            prompt
-        );
-    });
-    let approval: Arc<dyn ToolApprovalRequester> =
-        Arc::new(crate::peers::host::ParkingApprovalRequester::new(
-            session.clone(),
-            slug.to_owned(),
-            notice.clone(),
-        ));
-    let question: Arc<dyn UserQuestionRequester> = Arc::new(
-        crate::peers::host::ParkingQuestionRequester::new(session.clone(), slug.to_owned(), notice),
-    );
-
-    let outcome = octos_agent::tools::USER_QUESTION_CTX
-        .scope(
-            question,
-            octos_agent::tools::TOOL_APPROVAL_CTX
-                .scope(approval, peer_agent.process_message(&brief, &[], vec![])),
-        )
-        .await;
-
-    // The blackboard is the deliverable: `peer_list` reports `done` only once
-    // `result.md` exists, and `peer_gather` (serve-side) reads it. Write it for
-    // BOTH outcomes — a failed peer that leaves no trace looks like it never
-    // ran. Same fd-anchored atomic writer the serve path uses.
-    let body = match &outcome {
-        Ok(response) => response.content.clone(),
-        Err(error) => format!("peer turn failed: {error}"),
-    };
-    if let Some(dir) = crate::peers::staged_peer_dir(peers_root, slug) {
-        if let Err(error) = crate::peers::peer_io::write_peer_file_atomic(&dir, "result.md", &body)
-        {
-            tracing::warn!(%error, slug, "failed to record peer result");
-        }
-    }
-    println!(
-        "\n{} peer '{}' finished — read it with peer_list",
-        "✓".green(),
-        slug
-    );
-    outcome.map(|_| ())
-}
-
-async fn process_chat_turn(
-    agent: &Agent,
-    input: &str,
-    history: &[Message],
-    approval_requester: Arc<dyn ToolApprovalRequester>,
-) -> Result<ConversationResponse> {
-    // #2143: scope the whole turn so an AdaptiveRouter pins ONE route for it —
-    // readiness, history sizing, and the send all resolve to the same slot,
-    // instead of sizing for the conservative min-across-slots envelope. The
-    // serve/API paths already wrap their turns this way; the local `octos chat`
-    // coding harness (the local-model path these fixes target) did not.
-    octos_llm::with_router_context(
-        octos_llm::RouterContext::default(),
-        with_chat_approval(
-            approval_requester,
-            agent.process_message(input, history, vec![]),
-        ),
-    )
-    .await
-}
-
 /// Machine-readable result envelope for `octos chat --json --message`.
 ///
-/// Serialized as a single JSON object — the ONLY thing `--json` writes to
-/// stdout on success. Deliberately limited to the fields the completed
-/// [`ConversationResponse`] reports as ground truth (final text, answering
-/// model, token usage). Turn telemetry — a real terminal stop reason, the loop
-/// iteration count, the executed tool-call count — is intentionally omitted:
-/// `ConversationResponse` does not carry those, and deriving them from the
-/// message list is wrong in edge cases (budget / max-token cutoffs mislabel the
-/// stop reason; the loop detector inserts synthetic tool-result rows that
-/// overstate tool calls). Surfacing them correctly needs an octos-agent change
-/// to populate them at every turn return site — deferred to a follow-up.
+/// Text, answering model and token usage come from OUP's terminal and
+/// canonical persisted answer, never an inferred completion summary.
+#[cfg(any(feature = "api", test))]
 #[derive(Debug, serde::Serialize)]
 struct ChatJsonResult {
     /// Final assistant text for this turn.
@@ -989,37 +698,10 @@ struct ChatJsonResult {
     input_tokens: u32,
     /// Completion tokens produced across the turn.
     output_tokens: u32,
-    // NOTE: intentionally limited to fields `ConversationResponse` reports as
-    // ground truth. Turn telemetry (a real terminal `stop_reason`, the loop
-    // iteration count, executed tool-call count) is deferred to a follow-up:
-    // `ConversationResponse` does not carry those, and deriving them from
-    // `messages` is wrong in edge cases (budget/max-token cutoffs mislabel the
-    // stop reason; the loop detector inserts synthetic tool-result rows that
-    // overstate tool calls). Surfacing them correctly needs an octos-agent
-    // change to populate them at every turn return site.
 }
 
+#[cfg(any(feature = "api", test))]
 impl ChatJsonResult {
-    /// Build the envelope from a completed turn. `fallback_model` is the
-    /// configured model id, used only when the reply carries no provider
-    /// provenance.
-    fn from_response(response: &ConversationResponse, fallback_model: &str) -> Self {
-        // Prefer the provenance of the FINAL reply: adaptive failover can answer
-        // from a different lane than the primary provider, and the caller should
-        // see the model that actually produced the text.
-        let model = response
-            .provider_metadata
-            .as_ref()
-            .map(|m| m.model.clone())
-            .unwrap_or_else(|| fallback_model.to_string());
-        Self {
-            text: response.content.clone(),
-            model,
-            input_tokens: response.token_usage.input_tokens,
-            output_tokens: response.token_usage.output_tokens,
-        }
-    }
-
     /// Serialize to a single-line JSON string (nice for piping). This fixed
     /// string/number-only struct cannot realistically fail to serialize; if it
     /// ever did, fall back to a valid JSON error object so stdout stays
@@ -1030,11 +712,31 @@ impl ChatJsonResult {
     }
 }
 
-/// Emit `{"error": "<message>"}` on stdout (so a `--json` caller can always
-/// parse stdout) and flush. Used on the `--json` error paths before a
-/// non-zero exit; `serde_json` handles all string escaping.
-fn print_json_error(message: &str) {
-    let obj = serde_json::json!({ "error": message });
+/// Generic failures keep the existing one-object error shape. A failed OUP
+/// terminal additionally exposes its typed code, exact cumulative usage, and
+/// actual nonempty partial answer. It is never a successful result envelope.
+fn json_error_value(error: &eyre::Report) -> serde_json::Value {
+    let value = serde_json::json!({ "error": error.to_string() });
+    #[cfg(feature = "api")]
+    if let Some(failure) = error.downcast_ref::<crate::commands::oup_session::OupTurnFailure>() {
+        let mut value = value;
+        if let Some(terminal_error) = &failure.terminal_error {
+            value["code"] = serde_json::json!(terminal_error.code);
+        }
+        value["usage"] = serde_json::json!(failure.partial.usage);
+        if !failure.partial.text.trim().is_empty() {
+            value["partial"] = serde_json::json!({
+                "text": failure.partial.text,
+                "model": failure.partial.model,
+            });
+        }
+        return value;
+    }
+    value
+}
+
+fn print_json_error(error: &eyre::Report) {
+    let obj = json_error_value(error);
     println!("{obj}");
     let _ = io::stdout().flush();
 }
@@ -1061,7 +763,7 @@ impl Executable for ChatCommand {
         match outcome {
             Ok(()) => Ok(()),
             Err(error) if json => {
-                print_json_error(&error.to_string());
+                print_json_error(&error);
                 std::process::exit(1);
             }
             Err(error) => Err(error),
@@ -1070,1148 +772,17 @@ impl Executable for ChatCommand {
 }
 
 impl ChatCommand {
-    async fn run_async(mut self) -> Result<()> {
-        // `claude -p "…"` parity: fold a positional PROMPT into `--message` up
-        // front so every downstream `self.message` check (the `--json` guard
-        // just below and the one-shot dispatch) sees a single source of truth.
-        self.message = reconcile_one_shot_prompt(self.message.take(), self.prompt.take())?;
-
-        // `--json` is a one-shot, machine-readable mode: exactly one JSON
-        // object on stdout, and it requires `--message`. An interactive REPL
-        // cannot keep stdout pure (the readline prompt and per-turn framing
-        // would interleave with the JSON), so reject `--json` without
-        // `--message` up front — emitted as a JSON error so even this failure
-        // is parseable on stdout — before doing any provider/agent bootstrap.
-        if self.json && self.message.is_none() {
-            print_json_error("--json requires --message (interactive --json is not supported)");
-            std::process::exit(2);
+    async fn run_async(self) -> Result<()> {
+        #[cfg(feature = "api")]
+        {
+            self.run_oup().await
         }
-
-        let cwd = match self.cwd {
-            Some(p) => p,
-            None => std::env::current_dir().wrap_err("failed to get current directory")?,
-        };
-
-        // Resolve the canonical config context (data_dir, config_home,
-        // auth_home, is_default) once and run migrations.
-        let ctx = super::resolve_command_context(self.data_dir)?;
-        let data_dir = ctx.data_dir.clone();
-
-        // Load config. Precedence: an explicit `--config` wins; otherwise a
-        // stored serve/onboarding profile named by `--profile <id>` supplies its
-        // LLM provider/model + route + `env_vars` API key (so `octos chat
-        // --profile <id>` reuses an octoscode / `serve` profile without a
-        // separate flat config or a duplicated key); otherwise the ambient
-        // config context.
-        let serve_profile_config = load_serve_profile_config(self.profile.as_deref(), &data_dir)?;
-        let profile_is_serve = serve_profile_config.is_some();
-        let mut config = if let Some(config_path) = &self.config {
-            Config::from_file(config_path)?
-        } else if let Some(profile_config) = serve_profile_config {
-            profile_config
-        } else {
-            Config::load_with_context(&cwd, &ctx)?
-        };
-
-        // An explicit `--provider` that names a DIFFERENT provider than the
-        // inherited one does a clean switch: detach the profile's route so the
-        // new provider's defaults (or explicit `--base-url`/`--api-type`/key)
-        // apply, instead of silently keeping the old provider's key-env +
-        // endpoint. No-op when the provider matches or is unset.
-        detach_route_on_provider_override(&mut config, self.provider.as_deref());
-
-        let model = self.model.or(config.model.clone());
-        let base_url = self.base_url.or(config.base_url.clone());
-        let provider_name = self
-            .provider
-            .or(config.provider.clone())
-            .or_else(|| {
-                model
-                    .as_deref()
-                    .and_then(crate::config::detect_provider)
-                    .map(String::from)
-            })
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "no LLM provider configured. Run `octos init` or set provider in config.json"
-                )
-            })?;
-
-        // Create LLM provider (with optional failover chain). `--api-type`
-        // (alias `--api-style`) overrides config's `api_type` so a custom
-        // `--base-url` can pick the wire protocol without pretending to be a
-        // vendor via `--provider`.
-        let api_type = self.api_type.as_deref().or(config.api_type.as_deref());
-        let base_provider: Arc<dyn LlmProvider> =
-            create_provider_with_api_type(&provider_name, &config, model, base_url, api_type)?;
-        // Status line goes to stderr; suppress it entirely in `--json` mode to
-        // keep even stderr quiet for scripting.
-        if !self.json {
-            eprintln!("{}: {}", "Model".green(), base_provider.model_id());
+        #[cfg(not(feature = "api"))]
+        {
+            eyre::bail!(
+                "octos chat requires the OUP runtime; rebuild with default features or --features api"
+            )
         }
-        let model_id = base_provider.model_id().to_string();
-
-        // #2142: operator override of the primary's effective context window
-        // (config.llm.primary.context_window). Wraps the probed provider so it
-        // beats both the catalog and the runtime probe through the delegating
-        // stack.
-        let base_provider = crate::qos_catalog::apply_context_window_override(
-            base_provider,
-            config.context_window,
-            "primary",
-        );
-
-        let llm: Arc<dyn LlmProvider> = if self.no_retry {
-            base_provider
-        } else if config.fallback_models.is_empty() {
-            Arc::new(RetryProvider::new(base_provider))
-        } else {
-            let mut providers: Vec<Arc<dyn LlmProvider>> =
-                vec![Arc::new(RetryProvider::new(base_provider))];
-            for fb in &config.fallback_models {
-                let fb_config = if fb.api_key_env.is_some() {
-                    let mut c = config.clone();
-                    c.api_key_env = fb.api_key_env.clone();
-                    c
-                } else {
-                    config.clone()
-                };
-                match create_provider_with_api_type(
-                    &fb.provider,
-                    &fb_config,
-                    fb.model.clone(),
-                    fb.base_url.clone(),
-                    fb.api_type.as_deref(),
-                ) {
-                    Ok(p) => {
-                        // #2142: per-fallback context-window override.
-                        let p = crate::qos_catalog::apply_context_window_override(
-                            p,
-                            fb.context_window,
-                            "fallback",
-                        );
-                        providers.push(Arc::new(RetryProvider::new(p)));
-                    }
-                    Err(e) => {
-                        tracing::warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
-                    }
-                }
-            }
-            // Auto-enable adaptive routing when multiple providers exist
-            if providers.len() > 1 {
-                let adaptive_config = config
-                    .adaptive_routing
-                    .as_ref()
-                    .map(AdaptiveConfig::from)
-                    .unwrap_or_default();
-                tracing::info!("adaptive routing enabled ({} providers)", providers.len());
-                Arc::new(AdaptiveRouter::new(providers, &[], adaptive_config))
-            } else {
-                Arc::new(ProviderChain::new(providers))
-            }
-        };
-
-        // Episode store. Normally strict-open (the canonical single writer of
-        // `episodes.redb`, which takes an exclusive process lock). But an
-        // ephemeral run (`--no-session-persistence`) isn't going to save
-        // episodes anyway, so it opens via `open_or_degraded`: if another
-        // `octos chat` already holds the lock on this data dir, this run falls
-        // back to an in-memory episode handle instead of failing. That lets
-        // many ephemeral `octos chat` agents run concurrently against ONE
-        // `--data-dir` (hence one shared `--profile`) — e.g. a fan-out of
-        // review/edit agents — without the redb lock serializing them.
-        let memory = Arc::new(if self.no_session_persistence {
-            let store = EpisodeStore::open_or_degraded(&data_dir)
-                .await
-                .wrap_err("failed to open episode store")?;
-            if store.is_degraded() {
-                tracing::info!(
-                    "episode store on this data dir is held by another process; \
-                     running with an in-memory episode handle (no persistence/recall) \
-                     — expected when running concurrent `octos chat` agents"
-                );
-            }
-            store
-        } else {
-            EpisodeStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open episode store")?
-        });
-
-        // Resolve the runtime profile (M8.3). Order:
-        //   1. --profile CLI arg, if present;
-        //   2. `~/.octos/profile` symlink, if it exists (points at a
-        //      profile name or dir);
-        //   3. fallback to the built-in `coding` profile.
-        // The resolved profile's tool filter is applied after the full
-        // registry has been assembled, preserving the existing bootstrap
-        // path (plugins, MCP, pipelines etc. all register first).
-        // Tool surface: normal runtime-profile resolution. A stored serve profile
-        // (named by `--profile`, whose LLM config was loaded above) has no runtime
-        // tool-surface definition, so fall back to the default `coding` surface
-        // instead of erroring — gated on `profile_is_serve` so an actually-unknown
-        // profile name still fails loudly.
-        let (mut profile, profile_source_label) = match resolve_profile(&self.profile) {
-            Ok(resolved) => resolved,
-            Err(_) if profile_is_serve => {
-                tracing::info!(
-                    profile = self.profile.as_deref().unwrap_or_default(),
-                    "serve profile has no runtime tool-surface definition; \
-                     using the default `coding` tool surface"
-                );
-                (
-                    octos_agent::profile::ProfileDefinition::load("coding")
-                        .wrap_err("failed to load built-in coding profile")?
-                        .0,
-                    "coding (serve-profile default)",
-                )
-            }
-            Err(err) => return Err(err),
-        };
-        tracing::info!(
-            "profile resolved: name={} source={}",
-            profile.name,
-            profile_source_label
-        );
-
-        // Phase 1 — `--goals` must survive the profile's tool filter. The
-        // default `coding` surface is an ALLOW LIST (group:fs, group:runtime,
-        // group:search, group:memory, spawn, ask_user_question), so goal tools
-        // would be registered and then dropped from `specs()` by
-        // `filter_by_profile` — the model would never see them. Widen the list
-        // for exactly the three goal tools when the operator asked for goals.
-        // Deny lists and the pass-through `Default` mode need no change (the
-        // goal tools appear in neither), and an EMPTY allow list is already
-        // pass-through, so leave that alone too.
-        //
-        // Phase 3 widens the SAME list by exactly the peer tools when `--peers`
-        // is also set. `--peers` requires `--goals` (clap enforces it), so this
-        // never widens a surface the operator did not already opt into.
-        if self.goals {
-            let mut wanted: Vec<&str> = CHAT_GOAL_TOOLS.to_vec();
-            if self.peers {
-                wanted.extend_from_slice(CHAT_PEER_TOOLS);
-            }
-            widen_allow_list(&mut profile.tools, &wanted);
-        }
-
-        // yolo GAP #3: resolve the effective permissions from the CLI flags
-        // (codex parity: --yolo / --sandbox / --ask-for-approval). `octos
-        // chat` is inherently local single-user, so a dangerous profile
-        // legitimately resolves through RuntimeMode::Solo.
-        //
-        // Guardrails PRESERVED in yolo (codex parity): hooks
-        // `before_tool_call` deny still runs (wired further below); `ToolPolicy`
-        // deny lists still apply (resolved per-provider below); SSRF +
-        // `BLOCKED_ENV_VARS` are untouched (enforced inside the tools/sandbox
-        // regardless of profile). yolo only relaxes the approval prompt, the
-        // shell command policy (SafePolicy→AllowAll), the filesystem scope
-        // (workspace→host), and the sandbox (off) — nothing else.
-        let permissions = resolve_chat_permissions(
-            self.dangerously_bypass_approvals_and_sandbox,
-            self.sandbox,
-            self.ask_for_approval,
-        )?;
-        let runtime_paths = resolve_chat_runtime_paths(
-            &cwd,
-            &data_dir,
-            permissions,
-            &uuid::Uuid::now_v7().to_string(),
-        );
-        if permissions.is_dangerous() {
-            // Codex-style one-line RED warning on stderr.
-            eprintln!(
-                "{}",
-                "⚠ full access — can edit any file and run commands with network, \
-                 without approval; risk of data loss"
-                    .red()
-                    .bold()
-            );
-        }
-
-        // Create tool registry under the resolved permissions. The sandbox is
-        // derived from the config default with the permission profile applied
-        // (a dangerous profile disables the sandbox and forces network on).
-        let effective_sandbox_config = permissions.apply_to_sandbox(&config.sandbox);
-        let sandbox = octos_agent::create_sandbox(&effective_sandbox_config);
-        let mut tools = ToolRegistry::with_builtins_and_permissions(&cwd, sandbox, permissions);
-
-        // Open tool config store for user-customizable tool defaults
-        let tool_config = std::sync::Arc::new(
-            octos_agent::ToolConfigStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open tool config store")?,
-        );
-        tools.inject_tool_config(tool_config.clone());
-
-        // Override browser tool with configured timeout if set
-        if let Some(gw) = &config.gateway {
-            if let Some(secs) = gw.browser_timeout_secs {
-                tools.register(
-                    octos_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(secs))
-                        .with_config(tool_config.clone()),
-                );
-            }
-        }
-
-        // Resolve the embedding provider ONCE and share the handle across
-        // every consumer (spawn workers, pipeline workers, the chat agent)
-        // so they agree on the exact same embed-on-save + hybrid-recall
-        // behaviour — and the "pinning …" log fires once, not per site.
-        let embedder = create_embedder(&config);
-
-        // Register spawn tool for sync sub-agent support in chat mode.
-        // Background mode won't deliver results (dummy channel), but sync mode works fine.
-        let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(1);
-        let worker_prompt = super::load_prompt("worker", octos_agent::DEFAULT_WORKER_PROMPT);
-        let mut spawn_tool =
-            octos_agent::SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_tx)
-                .with_worker_prompt(worker_prompt)
-                .with_workspace_write_access(permissions.file_access.allows_write())
-                // #1607 (codex-review follow-up): thread the same sandbox the
-                // parent registry was built from so the spawn/agent_mcp child
-                // completion path confines workspace-declared `Command`
-                // validators instead of running them on the host.
-                .with_sandbox(effective_sandbox_config.clone());
-        if !permissions.file_access.allows_write() {
-            spawn_tool =
-                spawn_tool.with_deliverable_root(runtime_paths.spawn_deliverable_dir.clone());
-        }
-        if let Some(ref embedder) = embedder {
-            // Workers save episodes by default; without the embedder those
-            // episodes are stored vectorless and worker recall skips.
-            spawn_tool = spawn_tool.with_embedder(embedder.clone());
-        }
-        tools.register(spawn_tool);
-
-        // Register research synthesis tool (map-reduce over deep_search source files)
-        tools.register(octos_agent::SynthesizeResearchTool::new(
-            llm.clone(),
-            data_dir.clone(),
-        ));
-
-        // Create memory store and register memory bank tools
-        let memory_store = Arc::new(
-            MemoryStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open memory store")?,
-        );
-        tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
-        tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
-        tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
-        let memory_refresh_enabled =
-            crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref());
-        if memory_refresh_enabled {
-            tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
-        }
-
-        // Register MCP tools
-        if !config.mcp_servers.is_empty() {
-            match octos_agent::McpClient::start(&config.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => eprintln!("Warning: MCP initialization failed: {e}"),
-            }
-        }
-
-        // Bootstrap bundled app-skill binaries (deep_search, deep_crawl, etc.)
-        // before plugin loading. In a read-only chat this targets the data-dir
-        // runtime root; the workspace's existing `.octos` remains read-only.
-        let n = octos_agent::bootstrap::bootstrap_bundled_skills(&runtime_paths.bootstrap_dir);
-        if n > 0 {
-            eprintln!("Bootstrapped {n} app-skills");
-        }
-        let n = octos_agent::bootstrap::bootstrap_platform_skills(&runtime_paths.bootstrap_dir);
-        if n > 0 {
-            eprintln!("Bootstrapped {n} platform skills");
-        }
-        // Gap 4.1: bundle generic pipelines (deep_research) into the
-        // dedicated `<data_dir>/bundled-pipelines` dir so `run_pipeline` can
-        // always discover them, independent of per-profile skill deployment.
-        // The chat `RunPipelineTool` registers that dir as the LOWEST-
-        // precedence search path via `with_bundled_pipelines_root(data_dir)`
-        // (bootstrap-dir == search-dir); installed pipelines of the same name
-        // always win.
-        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&data_dir);
-        if n > 0 {
-            eprintln!("Bootstrapped {n} bundled pipelines");
-        }
-
-        // Load existing project plugins plus bundled skills from the host
-        // runtime root. Preserve project precedence so an operator-installed
-        // skill still wins over an Octos bundled fallback.
-        // Section B (codex review P1.1): honour `plugins.require_signed`
-        // from the resolved Config so an operator who opts into strict
-        // signing has it enforced on `octos chat` too.
-        let mut plugin_dirs = Config::plugin_dirs_from_project(&runtime_paths.project_dir);
-        for runtime_dir in Config::plugin_dirs_from_project(&runtime_paths.bootstrap_dir) {
-            if !plugin_dirs.contains(&runtime_dir) {
-                plugin_dirs.push(runtime_dir);
-            }
-        }
-        let mut plugin_result = octos_agent::PluginLoadResult::default();
-        if !plugin_dirs.is_empty() {
-            match octos_agent::PluginLoader::load_into_with_options(
-                &mut tools,
-                &plugin_dirs,
-                &[],
-                octos_agent::PluginLoadOptions {
-                    work_dir: None,
-                    synthesis_config: None,
-                    require_signed: config.plugins.require_signed,
-                    verified_cache_dir: None,
-                },
-            ) {
-                Ok(result) => plugin_result = result,
-                Err(e) => eprintln!("Warning: plugin loading failed: {e}"),
-            }
-            // SPEC-VENDOR-NODE-V1 HTTP tool discovery — sync `load_into_with_options`
-            // only handles static binary-protocol skills; this async pass walks the
-            // same dirs for `tool_discovery: Http { base_url }` manifests and
-            // registers their catalog-derived tools. Per @ymote's Finding 2 contract
-            // (preserved in the post-merge review), an unreachable bridge or
-            // unparseable catalog must hard-fail the boot rather than silently
-            // register zero tools and let the operator find out at first LLM call.
-            octos_agent::plugins::register_http_skills_on_startup(&mut tools, &plugin_dirs)
-                .await
-                .wrap_err("HTTP tool discovery failed at agent boot")?;
-        }
-
-        // Start MCP servers declared in skill manifests
-        if !plugin_result.mcp_servers.is_empty() {
-            match octos_agent::McpClient::start(&plugin_result.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => eprintln!("Warning: skill MCP initialization failed: {e}"),
-            }
-        }
-
-        // yolo GAP #2/#3: plugin tools are registered directly on `tools`
-        // above (chat does not go through `rebind_cwd_with_permissions`), so
-        // thread the session approval context into them here. Under `never` a
-        // high-risk plugin fails closed; under danger-full-access it
-        // auto-allows — matching the shell/coding tools built with the same
-        // permissions.
-        tools.apply_permissions_to_plugin_tools(permissions);
-
-        // Pipeline tool (DOT-based multi-step workflows, with plugin access).
-        // Section B (codex review follow-up): propagate
-        // `plugins.require_signed` so pipeline workers enforce the same
-        // gate as the main session.
-        //
-        // NEW-06 codex follow-up: also propagate the embedder so the
-        // pipeline-spawned worker `Agent` instances inherit the same
-        // hybrid scored + filtered episodic-memory recall the parent
-        // chat agent gets at the `agent = agent.with_embedder(..)` line
-        // below. Without this, `octos chat`'s pipeline workers fall back
-        // to the unfiltered cwd-only path in `EpisodeStore::find_relevant`
-        // and can pull in cross-domain episodes (the NEW-06 contamination
-        // root cause). Construction is extracted into
-        // [`build_run_pipeline_tool`] so the regression test in
-        // `octos-pipeline/tests/embedder_propagation.rs` can pin the
-        // wiring without instantiating the full chat command.
-        // Lean-profile gate: `run_pipeline` is marked spawn_only, and
-        // spawn_only tools survive `filter_by_profile` unconditionally —
-        // so a profile can only exclude the pipeline engine by never
-        // registering it. `ProfileTools::allows` mirrors the filter's
-        // name-matching (groups / wildcards / exact names), which keeps
-        // this gate and the registry narrowing below in agreement. The
-        // lean `coding` default excludes it; `coding-full` (and any
-        // profile without an explicit filter) keeps it.
-        if profile.tools.allows("run_pipeline") {
-            let pipeline_tool = build_run_pipeline_tool(
-                llm.clone(),
-                memory.clone(),
-                cwd.clone(),
-                data_dir.clone(),
-                tools.provider_policy().cloned(),
-                plugin_dirs.clone(),
-                config.plugins.require_signed,
-                embedder.clone(),
-                // #1607: same sandbox `octos chat` builds for its shell/exec tools
-                // (see `effective_sandbox_config` above), so pipeline command
-                // validators run under the identical backend.
-                effective_sandbox_config.clone(),
-            );
-            tools.register(pipeline_tool);
-            tools.mark_spawn_only(
-                "run_pipeline",
-                Some(
-                    "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
-                        .to_string(),
-                ),
-            );
-        }
-
-        // Phase 1 — durable GOALS in `octos chat` (opt-in via `--goals`).
-        //
-        // The goal state engine moved out of the api-gated tree (Phase 0), so
-        // these tools now compile without `--features api` and `octos chat` can
-        // carry an objective + token budget that SURVIVES the process: state
-        // lives in the profile's supervisor store, which we configure below, so
-        // a later `octos chat --goals` in the same profile rehydrates the same
-        // goal (`goal_get` re-reads objective, status, spend, and — when a
-        // ledger exists — peer findings written by a `serve`-side run).
-        //
-        // Phase 3 adds peers on top (`--peers`); the autonomous continuation
-        // loop is still `serve`-only.
-        let goal_session_key = if self.goals {
-            let profile_id = self
-                .profile
-                .clone()
-                .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_owned());
-            // Rehydrate persisted goals (and any pending continuations) before
-            // the first turn. A failure here is non-fatal: goals then behave as
-            // in-memory-only for this run rather than taking the session down.
-            let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
-            if let Err(error) = orchestrator.configure_supervisor_store(data_dir.join("supervisor"))
-            {
-                eprintln!(
-                    "warning: goal state could not be loaded from {}: {error} \
-                     (goals will not persist across runs)",
-                    data_dir.join("supervisor").display()
-                );
-            }
-            tools.register(
-                crate::goal_tool::GoalGetTool::new(profile_id.clone())
-                    .with_data_dir(data_dir.clone()),
-            );
-            tools.register(crate::goal_tool::GoalCreateTool::new(profile_id.clone()));
-            tools.register(
-                crate::goal_tool::GoalUpdateTool::new(profile_id.clone())
-                    .with_data_dir(data_dir.clone()),
-            );
-            // The goal tools resolve their session from
-            // `ToolContext::parent_session_key`. Chat has no wire session, so
-            // mint a stable one per profile: the SAME key every run is what
-            // makes the goal durable across invocations.
-            Some(chat_goal_session_key(&profile_id))
-        } else {
-            None
-        };
-
-        // Phase 3 — PEERS in `octos chat` (opt-in via `--peers`, which clap
-        // gates behind `--goals`).
-        //
-        // Three tools, one loop:
-        //   peer_handoff  stages `<data_dir>/peers/<slug>` and hands the staged
-        //                 event to the in-process host below, which opens a
-        //                 `peer-<slug>` session and runs the brief.
-        //   peer_list     joins the on-disk blackboard to the PROCESS-GLOBAL
-        //                 pending-prompt store, so a parked peer shows as
-        //                 `awaiting_input` with the prompt ids.
-        //   peer_respond  resolves that peer's parked oneshot — the peer's own
-        //                 requester is awaiting the very same store entry.
-        //
-        // `contract_stores()` and the peer wire registry are both process-global
-        // `OnceLock`s, which is exactly why this works without `serve`: master
-        // and peer share one registry with no wire between them.
-        let peer_staged_tx = if self.peers {
-            let profile_id = self
-                .profile
-                .clone()
-                .unwrap_or_else(|| octos_core::MAIN_PROFILE_ID.to_owned());
-            let master_session = chat_goal_session_key(&profile_id);
-            // `<data_dir>/peers`, NOT `<profile.data_dir>/peers` as serve uses.
-            // Two reasons: it matches Phase 1's `<data_dir>/supervisor`, and
-            // `peer_respond_resolve` derives the goal-ledger root as
-            // `peers_root.parent()` — which must be the SAME `data_dir` the
-            // goal tools were given, or a peer's escalation resolves into a
-            // ledger nobody reads.
-            //
-            // KNOWN DIVERGENCE: chat peers are therefore NOT scoped per
-            // profile on disk, so `peer_list` in one profile lists peers staged
-            // by another. The wire registry and `peer_respond`'s
-            // originator check ARE profile-scoped, so a cross-profile peer can
-            // be SEEN but never answered or resumed. Acceptable for a
-            // single-user CLI; revisit if chat grows real profile isolation.
-            let peers_root = data_dir.join("peers");
-            if let Err(error) = std::fs::create_dir_all(&peers_root) {
-                return Err(eyre::eyre!(
-                    "--peers needs a writable peers root at {}: {error}",
-                    peers_root.display()
-                ));
-            }
-            let lanes: Vec<String> = config
-                .sub_providers
-                .iter()
-                .map(|sp| sp.key.clone())
-                .collect();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PeerStagedEvent>();
-
-            // The `emit_staged` sink the WS path uses to push `peer/staged` at a
-            // client. Chat has no client: it tells the operator, then hands the
-            // peer to its own host.
-            let staged_tx = tx.clone();
-            let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> =
-                Arc::new(move |event: PeerStagedEvent| {
-                    println!(
-                        "\n{} peer '{}' staged at {} — running its brief now",
-                        "▸".cyan(),
-                        event.slug,
-                        event.cwd
-                    );
-                    // A closed receiver means the host loop is gone (shutdown).
-                    // The peer stays staged on disk and is still visible to
-                    // `peer_list`; it just will not be driven this run.
-                    if staged_tx.send(event).is_err() {
-                        eprintln!(
-                            "warning: peer host is not running; the peer was staged but not started"
-                        );
-                    }
-                });
-
-            tools.register(octos_agent::PeerHandoffTool::new(
-                crate::peers::build_peer_handoff_callback(
-                    peers_root.clone(),
-                    cwd.clone(),
-                    octos_core::SessionKey(master_session.clone()),
-                    profile_id.clone(),
-                    lanes.clone(),
-                    Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                    emit_staged,
-                ),
-            ));
-            tools.register(octos_agent::PeerListTool::new(
-                crate::peers::build_peer_list_callback(
-                    peers_root.clone(),
-                    lanes,
-                    crate::contracts::contract_stores(),
-                    profile_id.clone(),
-                ),
-            ));
-            // `peer_respond` needs an `approval/decided` sink. On the WS path
-            // that publishes the durable wire event plus an audit entry; chat
-            // has no wire, so it prints the decision and writes the SAME audit
-            // log (the audit trail is the part that must not depend on a client
-            // being attached).
-            let respond_peers_root = peers_root.clone();
-            let respond_origin = master_session.clone();
-            let respond_profile = profile_id.clone();
-            let respond_audit_dir = data_dir.clone();
-            let respond: octos_agent::PeerRespondCallback = Arc::new(
-                move |req: octos_agent::PeerRespondRequest| {
-                    let contracts = crate::contracts::contract_stores();
-                    let audit_dir = respond_audit_dir.clone();
-                    let on_decided =
-                        |event: &octos_core::ui_protocol::ApprovalDecidedEvent,
-                         tool_name: Option<&str>| {
-                            println!(
-                                "  {} approval {} {} (tool {})",
-                                "✓".green(),
-                                event.approval_id.0,
-                                event.decision.as_wire_str(),
-                                tool_name.unwrap_or("?")
-                            );
-                            if let Err(error) =
-                                contracts.audit_log(&audit_dir).record(event, tool_name)
-                            {
-                                tracing::warn!(%error, "failed to append peer approval audit entry");
-                            }
-                        };
-                    crate::peers::peer_respond_resolve(
-                        &respond_peers_root,
-                        &respond_origin,
-                        &respond_profile,
-                        &crate::contracts::contract_stores(),
-                        &on_decided,
-                        req,
-                    )
-                },
-            );
-            tools.register(octos_agent::PeerRespondTool::new(respond));
-            Some((tx, rx, profile_id, peers_root))
-        } else {
-            None
-        };
-
-        // Apply tool policy from config
-        if let Some(ref policy) = config.tool_policy {
-            tools.apply_policy(policy);
-        }
-
-        // Apply context-based tag filter
-        if !config.context_filter.is_empty() {
-            tools.set_context_filter(config.context_filter.clone());
-        }
-
-        // Apply provider-specific tool policy
-        if let Some(policy) = resolve_provider_policy(&config, &provider_name, &model_id) {
-            tools.set_provider_policy(policy);
-        }
-
-        // M8.3: narrow the tool registry through the resolved profile.
-        // Runs AFTER every other filter so profile narrowing is the final
-        // envelope and `spawn_only` tools are still preserved.
-        profile.apply_to_registry(&mut tools);
-
-        // Set up Ctrl+C handler
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
-        tokio::spawn(async move {
-            if let Ok(()) = tokio::signal::ctrl_c().await {
-                shutdown_clone.store(true, Ordering::Release);
-            }
-        });
-
-        // F-005: Build credential pool + content classifier at startup.
-        // Absent config → `None` so the agent falls back to the legacy
-        // single-credential flow and strong-only routing. Distinct
-        // names (`_init` suffix) keep these out of the way of other
-        // per-profile wiring that may land here later.
-        let _credential_pool_init =
-            super::build_credential_pool(config.credential_pool.as_ref(), &data_dir);
-        let _content_classifier_init: Option<Arc<octos_llm::ContentClassifier>> = config
-            .content_routing
-            .as_ref()
-            .filter(|cfg| cfg.enabled)
-            .map(|cfg| Arc::new(octos_llm::ContentClassifier::new(cfg.clone())));
-
-        // Create agent. In `--json` mode nothing may reach stdout except the
-        // final result object, so silence the console reporter — its spinner,
-        // `◆` answer preview, streamed chunks, and tool-progress lines all
-        // print to stdout.
-        let reporter: Arc<dyn ProgressReporter> = if self.json {
-            Arc::new(SilentReporter)
-        } else {
-            Arc::new(ConsoleReporter::new().with_verbose(self.verbose))
-        };
-        let agent_config = AgentConfig {
-            max_iterations: self.max_iterations,
-            // `--no-session-persistence` (claude parity): skip the episode write.
-            save_episodes: !self.no_session_persistence,
-            chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
-            chat_temperature: config.gateway.as_ref().and_then(|g| g.llm_temperature),
-            chat_sampling_params: config
-                .gateway
-                .as_ref()
-                .and_then(|g| g.llm_sampling_params.clone()),
-            // `--effort` (claude/codex parity) overrides `gateway.reasoning_effort`.
-            reasoning_effort: self
-                .effort
-                .map(octos_llm::ReasoningEffort::from)
-                .or_else(|| config.gateway.as_ref().and_then(|g| g.reasoning_effort)),
-            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
-            format_after_edit: config.format_after_edit,
-            ..Default::default()
-        };
-        // M8.2: load sub-agent manifests from `<cwd>/agents/` layered on
-        // top of the crate-shipped built-ins (research-worker, repo-editor).
-        // Missing dirs fall back to built-ins only.
-        let agents_dir = cwd.join("agents");
-        let agent_definitions = match octos_agent::agents::AgentDefinitions::load_dir(&agents_dir) {
-            Ok(defs) => Arc::new(defs),
-            Err(err) => {
-                eprintln!(
-                    "Warning: failed to load agent manifests from {}: {err}",
-                    agents_dir.display()
-                );
-                Arc::new(octos_agent::agents::AgentDefinitions::with_builtins())
-            }
-        };
-
-        // M8 fix-first item 8 (gap 4a): hard-validate the resolved profile's
-        // referenced agent ids against the loaded `AgentDefinitions`
-        // registry before bootstrapping. The validator helper has been
-        // present since M8.5 but bootstrap never invoked it; an unknown
-        // agent id silently let `spawn` succeed with a missing manifest.
-        // Bootstrap is the right place to fail fast on this.
-        profile
-            .validate_against_registry(&agent_definitions)
-            .wrap_err("profile references missing agent_definition ids")?;
-
-        // M8.3: share the resolved profile with the Agent so downstream
-        // code can introspect the envelope. The tool filter has already
-        // been applied above.
-        let profile_arc = Arc::new(profile);
-
-        // M8 fix-first item 8 (gap 1): the M8.4 FileStateCache helper
-        // exists and is consumed by file tools, but bootstrap never built
-        // an instance for the real chat agent. Construct one here so
-        // foreground reads short-circuit on unchanged files and the
-        // hand-off from `seed_from_replacement_refs` (M8.6) lands in a
-        // live cache.
-        let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
-
-        // M8 fix-first item 8 (gap 2): wire the M8.7 SubAgentOutputRouter
-        // and AgentSummaryGenerator into the real chat agent. Without
-        // this the spawn_only background branch silently skips disk
-        // routing and the periodic summary watcher.
-        let subagent_output_root = data_dir.join("subagent-outputs");
-        let subagent_output_router =
-            Arc::new(octos_agent::SubAgentOutputRouter::new(subagent_output_root));
-        // Dereference the Arc<TaskSupervisor> the registry hands back so
-        // `AgentSummaryGenerator::new` (which takes `TaskSupervisor` by
-        // value, leveraging its Clone impl that shares the inner state)
-        // gets a handle aliasing the same supervisor the registry uses.
-        let supervisor_for_summary = (*tools.supervisor()).clone();
-        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
-            llm.clone(),
-            subagent_output_router.clone(),
-            supervisor_for_summary,
-        ));
-
-        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
-        // construct the single filesystem contract for this solo
-        // session and stash it on the agent. `cwd` may have come from
-        // `--cwd` (potentially relative) or from `current_dir()`
-        // (always absolute). Absolutize defensively so the
-        // `SessionScope::solo` invariant holds without panicking on
-        // user input. Phase 2 PRs will start reading this from tools,
-        // pipelines, and plugins; today it is wired through but unused.
-        //
-        // Codex review note (Phase-1 LOW): surface a hard error when
-        // `cwd` is relative AND `current_dir()` fails so the
-        // `SessionScope::solo` `expect` below can never fire on a
-        // relative path. Mirroring `current_dir()` failures up as
-        // `wrap_err` is consistent with the existing fallback at the
-        // top of `run_async` that constructed `cwd` the same way.
-        let absolute_cwd: PathBuf = if cwd.is_absolute() {
-            cwd.clone()
-        } else {
-            std::env::current_dir()
-                .wrap_err("failed to absolutize --cwd: current_dir() unavailable")?
-                .join(&cwd)
-        };
-
-        // yolo GAP #4: bind every loaded `PluginTool` to the resolved chat
-        // cwd. Chat loads plugins with `work_dir: None` and does NOT go
-        // through `SessionRuntime::rebind_plugin_work_dirs`, so under a
-        // Host-scope (`--yolo`) session — where `session_scope` is left
-        // `None` so file tools keep host reach — `PluginTool::execute`
-        // would derive its `current_dir`/`OCTOS_WORK_DIR` from neither the
-        // scope nor a work_dir and fall back to the process LAUNCH dir,
-        // breaking relative plugin inputs/outputs under `--cwd`. Binding the
-        // work_dir here fixes the Host case and is a no-op behavioural change
-        // for Workspace scope (where `work_dir` == `scope.workspace()` ==
-        // `absolute_cwd` already). See `bind_chat_plugin_work_dirs`.
-        bind_chat_plugin_work_dirs(&mut tools, &absolute_cwd);
-
-        // PR-A: thread the per-profile plugin install directories
-        // through to the scope so `read_file` can reach the SKILL.md
-        // content the agent's system prompt auto-injects.
-        //
-        // Codex round-2 BLOCKER 2 (PR #1327 review): SKIP dirs that
-        // fail canonicalize (fail-closed). Keeping the raw path was a
-        // fail-open vulnerability — a later symlink replacement
-        // (`/tmp/missing -> /etc`) would canonicalise both sides to
-        // `/etc` and allow reads as `InSkillDir`. The shared helper in
-        // `octos-core` drops the entry and logs a warning per skip.
-        let canonical_skill_dirs: Vec<PathBuf> =
-            octos_core::canonicalize_skill_read_zones(&plugin_dirs);
-        // yolo GAP #3: mirror the serve path (session.rs) — a
-        // danger-full-access session resolves to `FilesystemScope::Host` and
-        // the file tools deliberately keep their absolute-host reach. They
-        // PREFER an attached `ctx.session_scope` over their `filesystem_scope`,
-        // so attaching a solo scope here would silently re-fence a session the
-        // operator explicitly opened up. Leave the scope unset under Host.
-        let session_scope = if permissions.filesystem_scope.is_host() {
-            tracing::debug!(
-                "skipping SessionScope: --yolo/danger-full-access grants Host \
-                 filesystem access — file tools must keep their host reach"
-            );
-            None
-        } else {
-            let base = SessionScope::solo(absolute_cwd.clone(), Vec::new()).expect(
-                "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
-            );
-            let scope = base
-                .with_skill_read_zones(canonical_skill_dirs)
-                .unwrap_or_else(|err| {
-                    eprintln!(
-                        "Warning: with_skill_read_zones rejected one or more plugin_dirs: {err}; \
-                         continuing without skill_read_zones (read_file may not reach SKILL.md references)"
-                    );
-                    SessionScope::solo(absolute_cwd.clone(), Vec::new())
-                        .expect("absolutized cwd still valid")
-                });
-            Some(Arc::new(scope))
-        };
-
-        // Phase 3 — start the in-process PEER HOST. It owns the receive half of
-        // the staged-peer channel `peer_handoff`'s `emit_staged` feeds, so it
-        // must outlive the master agent's construction below (which moves
-        // `llm` / `memory` / `agent_config`) — hence the clones.
-        if let Some((_tx, rx, peer_profile_id, peers_root)) = peer_staged_tx {
-            spawn_chat_peer_host(ChatPeerHost {
-                rx,
-                llm: llm.clone(),
-                memory: memory.clone(),
-                agent_config: agent_config.clone(),
-                sandbox_config: effective_sandbox_config.clone(),
-                permissions,
-                profile: profile_arc.clone(),
-                profile_id: peer_profile_id,
-                peers_root,
-                data_dir: data_dir.clone(),
-                shutdown: shutdown.clone(),
-            });
-        }
-
-        let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
-            .with_config(agent_config)
-            .with_reporter(reporter)
-            .with_shutdown(shutdown.clone())
-            .with_agent_definitions(agent_definitions)
-            .with_profile(profile_arc.clone())
-            .with_file_state_cache(file_state_cache)
-            .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator);
-        if let Some(session_scope) = session_scope {
-            agent = agent.with_session_scope(session_scope);
-        }
-        // Phase 1 — the goal tools resolve their session (hence the durable
-        // goal record) from `ToolContext::parent_session_key`. Without this the
-        // tools are registered but every call reports "no goal".
-        if let Some(ref key) = goal_session_key {
-            agent = agent.with_parent_session_key(key.clone());
-        }
-
-        // M8.3: if the profile declares a system_prompt_template, try to
-        // read it relative to `~/.octos/profiles/<name>/`. The path is a
-        // hint — missing files are a warning, not an error, so profiles
-        // referring to templates that ship separately keep working.
-        if let Some(template_rel) = profile_arc.system_prompt_template.as_ref() {
-            if let Some(prompt_text) =
-                super::load_profile_prompt_template(&profile_arc.name, template_rel)
-            {
-                agent.set_system_prompt(prompt_text);
-            }
-        }
-
-        // Load operator-provided bootstrap files from the project state. The
-        // runtime bootstrap root only holds generated bundled skills.
-        let bootstrap = super::load_bootstrap_files(&runtime_paths.project_dir);
-        if !bootstrap.is_empty() {
-            agent.append_system_prompt(&bootstrap);
-        }
-
-        // Inject the token-capped memory block (long-term memory + daily
-        // notes + bank summary; omissions are disclosed to the model) as a
-        // replaceable named segment between bootstrap and skill fragments.
-        // With memory refresh on, the capture policy rides the same segment
-        // and a provider re-renders it when MEMORY.md changes on disk or
-        // the date rolls over (one stat per turn otherwise).
-        let max_inject =
-            crate::config::MemoryConfig::effective_max_inject_tokens(config.memory.as_ref());
-        let memory_ctx = memory_store.get_injectable_context(max_inject).await;
-        agent.set_prompt_segment(
-            octos_agent::MEMORY_SEGMENT_NAME,
-            octos_agent::compose_memory_segment(&memory_ctx, memory_refresh_enabled),
-        );
-        if memory_refresh_enabled {
-            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
-                memory_store.clone(),
-                max_inject,
-                true,
-            )));
-        }
-
-        // Inject skill prompt fragments
-        for fragment in &plugin_result.prompt_fragments {
-            agent.append_system_prompt(fragment);
-        }
-
-        // Merge config hooks with skill-declared hooks
-        let mut all_hooks = config.hooks.clone();
-        all_hooks.extend(plugin_result.hooks);
-        if !all_hooks.is_empty() {
-            agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
-        }
-
-        // #1768: opt-in git-backed workspace snapshots before mutating
-        // tools. Uses a SEPARATE git dir under `<data_dir>/snapshots/` —
-        // the user's own repo/index is never touched. Silently unavailable
-        // when no git binary is on PATH (`SnapshotManager::new` returns
-        // `None` and logs once).
-        if let Some(snapshot_cfg) = config.snapshots.as_ref().filter(|cfg| cfg.enabled) {
-            if let Some(manager) = octos_agent::SnapshotManager::new(
-                data_dir.join("snapshots"),
-                cwd.clone(),
-                snapshot_cfg.keep_last,
-            ) {
-                agent = agent.with_snapshot_manager(Arc::new(manager));
-            }
-        }
-
-        if let Some(ref embedder) = embedder {
-            agent = agent.with_embedder(embedder.clone());
-        }
-
-        // Harness M6.3/M6.4: wire the declarative compaction runner when the
-        // workspace policy in the cwd declares a compaction block. Picks the
-        // LLM-iterative summarizer when the policy asks for it; falls back to
-        // extractive otherwise. No-op when the policy file is missing or
-        // declares no compaction.
-        match read_workspace_policy(&cwd) {
-            Ok(Some(workspace_policy)) => {
-                if let Some(compaction_policy) = workspace_policy.compaction.clone() {
-                    let runner = match compaction_policy.summarizer {
-                        CompactionSummarizerKind::LlmIterative => {
-                            CompactionRunner::with_provider(compaction_policy, agent.llm_provider())
-                        }
-                        CompactionSummarizerKind::Extractive => {
-                            CompactionRunner::new(compaction_policy)
-                        }
-                    }
-                    .with_workspace_policy(&workspace_policy);
-                    agent = agent
-                        .with_compaction_runner(Arc::new(runner))
-                        .with_compaction_workspace(workspace_policy);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("Warning: failed to read workspace policy for compaction: {error}");
-            }
-        }
-
-        let approval_requester: Arc<dyn ToolApprovalRequester> =
-            Arc::new(CliApprovalRequester::default());
-
-        // Single-message mode: send one message and exit.
-        if let Some(msg) = self.message {
-            let response =
-                process_chat_turn(&agent, &msg, &[], Arc::clone(&approval_requester)).await?;
-            if self.json {
-                // JSON mode: emit exactly one machine-readable result object on
-                // stdout (the reporter is silent and every status line goes to
-                // stderr). A turn failure propagates via `?` and is rendered as
-                // a JSON error at the `execute` boundary.
-                println!(
-                    "{}",
-                    ChatJsonResult::from_response(&response, &model_id).to_json_line()
-                );
-                let _ = io::stdout().flush();
-                return Ok(());
-            }
-            if !response.streamed {
-                println!("{}", response.content);
-            }
-            return Ok(());
-        }
-
-        // Set up readline
-        let history_dir = data_dir.join("history");
-        std::fs::create_dir_all(&history_dir).ok();
-        let history_path = history_dir.join("chat_history");
-
-        let mut rl = DefaultEditor::new().wrap_err("failed to initialize readline")?;
-        let _ = rl.load_history(&history_path);
-
-        // Banner
-        println!("{}", "octos chat".cyan().bold());
-        println!("{}", "(type /exit or Ctrl+C to quit)".dimmed());
-        println!();
-
-        // Conversation history
-        let mut history: Vec<Message> = Vec::new();
-
-        // Interactive loop — readline is blocking so we run it on a separate thread.
-        loop {
-            if shutdown.load(Ordering::Acquire) {
-                break;
-            }
-
-            // Spawn blocking readline on a separate thread
-            let (line_tx, line_rx) = tokio::sync::oneshot::channel();
-            let mut rl_moved = rl;
-            let readline_handle = tokio::task::spawn_blocking(move || {
-                let result = rl_moved.readline("you> ");
-                let _ = line_tx.send(result);
-                rl_moved
-            });
-
-            // Wait for user input
-            let readline_result = line_rx
-                .await
-                .unwrap_or(Err(rustyline::error::ReadlineError::Eof));
-
-            // Recover the Editor from the blocking thread
-            rl = readline_handle.await.unwrap_or_else(|_| {
-                rustyline::DefaultEditor::new().expect("failed to create editor")
-            });
-
-            let line = match readline_result {
-                Ok(line) => line,
-                Err(
-                    rustyline::error::ReadlineError::Interrupted
-                    | rustyline::error::ReadlineError::Eof,
-                ) => {
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("Input error: {e}");
-                    break;
-                }
-            };
-
-            let input = line.trim();
-            if input.is_empty() {
-                continue;
-            }
-
-            rl.add_history_entry(input).ok();
-
-            if EXIT_COMMANDS.contains(&input.to_lowercase().as_str()) {
-                break;
-            }
-
-            // Handle /config command
-            if input == "/config" || input.starts_with("/config ") {
-                let args = input.strip_prefix("/config").unwrap_or("").trim();
-                let response = tool_config.handle_config_command(args).await;
-                println!("{response}");
-                continue;
-            }
-
-            // Process message
-            let response =
-                match process_chat_turn(&agent, input, &history, Arc::clone(&approval_requester))
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("{}: {e}", "Error".red().bold());
-                        continue;
-                    }
-                };
-
-            // Append to history
-            history.push(Message {
-                role: MessageRole::User,
-                content: input.to_string(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            });
-            history.push(Message {
-                role: MessageRole::Assistant,
-                content: response.content.clone(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: None,
-                thread_id: None,
-                timestamp: chrono::Utc::now(),
-            });
-
-            // Print response (skip if already streamed to console)
-            if !response.streamed {
-                println!();
-                println!("{}: {}", "assistant".blue().bold(), response.content);
-            }
-            println!();
-        }
-
-        // Save history
-        let _ = rl.save_history(&history_path);
-        println!("{}", "Goodbye!".dimmed());
-
-        Ok(())
     }
 }
 
@@ -2227,6 +798,7 @@ impl ChatCommand {
 /// Returns the resolved [`octos_agent::profile::ProfileDefinition`] plus a
 /// human-readable source label (`cli`, `symlink`, or `default`) suitable for
 /// inclusion in the `profile resolved: ...` log line.
+#[cfg(feature = "api")]
 pub(crate) fn resolve_profile(
     cli_arg: &Option<String>,
 ) -> Result<(octos_agent::profile::ProfileDefinition, &'static str)> {
@@ -2291,7 +863,8 @@ pub(crate) fn resolve_profile(
 ///
 /// [`ProfileStore::get`](crate::profiles::ProfileStore::get) is a lock-free JSON
 /// read, so this is safe to call while a `serve` process holds the same data dir.
-fn load_serve_profile_config(
+#[cfg(any(feature = "api", test))]
+pub(crate) fn load_serve_profile_config(
     profile_arg: Option<&str>,
     data_dir: &std::path::Path,
 ) -> Result<Option<Config>> {
@@ -2486,57 +1059,11 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
     Some(Arc::new(e))
 }
 
-/// Build the [`octos_pipeline::RunPipelineTool`] used by the chat command,
-/// threading through the per-session policy / plugin dirs / signing gate /
-/// embedder.
-///
-/// NEW-06 codex follow-up — extracted into a stand-alone function so the
-/// regression test in `octos-pipeline/tests/embedder_propagation.rs` can
-/// pin the embedder propagation without instantiating the entire chat
-/// command (which depends on rustyline, hooks, profiles, MCP, etc.).
-///
-/// Keep the construction order byte-for-byte identical to the inline
-/// path it replaced — the policy/plugin builders rely on insertion order
-/// (`with_plugin_dirs` invalidates the plugin cache, etc.).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_run_pipeline_tool(
-    llm: Arc<dyn LlmProvider>,
-    memory: Arc<EpisodeStore>,
-    cwd: PathBuf,
-    data_dir: PathBuf,
-    provider_policy: Option<octos_agent::ToolPolicy>,
-    plugin_dirs: Vec<PathBuf>,
-    plugin_require_signed: bool,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
-    // #1607: session sandbox forwarded onto the pipeline executor so its
-    // terminal / per-node command validators run confined instead of on the
-    // host.
-    sandbox: octos_agent::SandboxConfig,
-) -> octos_pipeline::RunPipelineTool {
-    let mut pipeline_tool =
-        octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir.clone())
-            .with_provider_policy(provider_policy)
-            .with_plugin_dirs(plugin_dirs)
-            .with_plugin_require_signed(plugin_require_signed)
-            // #1607: confine pipeline command validators to the session sandbox.
-            .with_sandbox(sandbox)
-            // Gap 4.1 BLOCKER 2/3: `octos chat` bootstraps the bundle into
-            // `<data_dir>/bundled-pipelines` (see chat.rs above). Register that
-            // exact dir as the LOWEST-precedence discovery path so the bundled
-            // `deep_research` is discoverable (bootstrap-dir == search-dir) yet
-            // any installed `deep_research.dot` in `<data_dir>/{pipelines,skills}`
-            // still wins.
-            .with_bundled_pipelines_root(data_dir);
-    if let Some(embedder) = embedder {
-        pipeline_tool = pipeline_tool.with_embedder(embedder);
-    }
-    pipeline_tool
-}
-
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use octos_core::SessionScope;
 
     /// A profile-derived config carrying a full openai route.
     fn openai_route_config() -> Config {
@@ -2600,67 +1127,6 @@ mod tests {
         detach_route_on_provider_override(&mut config, Some("anthropic"));
         assert_eq!(config.base_url.as_deref(), Some("https://amb.example/v1"));
         assert_eq!(config.api_key_env.as_deref(), Some("AMBIENT_KEY"));
-    }
-
-    #[test]
-    fn read_only_runtime_paths_keep_host_state_outside_workspace() {
-        let workspace = PathBuf::from("/tmp/workspace");
-        let data_dir = PathBuf::from("/tmp/octos-data");
-        let permissions =
-            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
-
-        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
-
-        assert_eq!(paths.project_dir, workspace.join(".octos"));
-        assert_eq!(
-            paths.bootstrap_dir,
-            data_dir
-                .join("runtime")
-                .join("runs")
-                .join("run-123")
-                .join("bootstrap")
-        );
-        assert_eq!(
-            paths.spawn_deliverable_dir,
-            data_dir
-                .join("runtime")
-                .join("runs")
-                .join("run-123")
-                .join("spawn-deliverables")
-        );
-    }
-
-    #[test]
-    fn read_only_runtime_paths_are_isolated_per_chat_run() {
-        let workspace = PathBuf::from("/tmp/workspace");
-        let data_dir = PathBuf::from("/tmp/octos-data");
-        let permissions =
-            resolve_chat_permissions(false, Some(ChatSandboxMode::ReadOnly), None).unwrap();
-
-        let first = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-a");
-        let second = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-b");
-
-        assert_ne!(first.bootstrap_dir, second.bootstrap_dir);
-        assert_ne!(first.spawn_deliverable_dir, second.spawn_deliverable_dir);
-        assert!(first.bootstrap_dir.starts_with(&data_dir));
-        assert!(second.bootstrap_dir.starts_with(&data_dir));
-    }
-
-    #[test]
-    fn workspace_write_runtime_paths_preserve_project_state_locations() {
-        let workspace = PathBuf::from("/tmp/workspace");
-        let data_dir = PathBuf::from("/tmp/octos-data");
-        let permissions =
-            resolve_chat_permissions(false, Some(ChatSandboxMode::WorkspaceWrite), None).unwrap();
-
-        let paths = resolve_chat_runtime_paths(&workspace, &data_dir, permissions, "run-123");
-
-        assert_eq!(paths.project_dir, workspace.join(".octos"));
-        assert_eq!(paths.bootstrap_dir, workspace.join(".octos"));
-        assert_eq!(
-            paths.spawn_deliverable_dir,
-            workspace.join(".octos").join("spawn-deliverables")
-        );
     }
 
     #[test]
@@ -3002,6 +1468,60 @@ mod tests {
     // ---- `--json` result envelope ----
 
     #[test]
+    #[cfg(feature = "api")]
+    fn should_preserve_failed_turn_partial_in_json_without_claiming_success() {
+        use crate::commands::oup_session::{OupTurnFailure, OupTurnResult};
+        use octos_core::ui_protocol::{EnvelopeTokenUsage, TurnTerminalError};
+        for text in ["actual partial\n\"quoted\"", "", "  "] {
+            let error = eyre::Report::from(OupTurnFailure {
+                terminal_error: Some(TurnTerminalError {
+                    code: "output_truncated".into(),
+                    message: "incomplete".into(),
+                    data: None,
+                }),
+                partial: OupTurnResult {
+                    text: text.into(),
+                    model: None,
+                    interrupted: false,
+                    usage: EnvelopeTokenUsage {
+                        input_tokens: 17,
+                        output_tokens: 11,
+                        reasoning_tokens: 5,
+                        cache_read_tokens: 3,
+                        cache_write_tokens: 2,
+                    },
+                },
+            });
+            let value = json_error_value(&error);
+            assert_eq!(value["error"], "incomplete");
+            assert_eq!(value["code"], "output_truncated");
+            assert_eq!(value["usage"]["input_tokens"], 17);
+            assert_eq!(value["usage"]["output_tokens"], 11);
+            assert_eq!(value["usage"]["reasoning_tokens"], 5);
+            assert_eq!(value["usage"]["cache_read_tokens"], 3);
+            assert_eq!(value["usage"]["cache_write_tokens"], 2);
+            assert!(
+                value.get("text").is_none(),
+                "not a successful result envelope"
+            );
+            if text.trim().is_empty() {
+                assert!(value.get("partial").is_none(), "do not fabricate an answer");
+            } else {
+                assert_eq!(value["partial"]["text"], text);
+                assert!(
+                    value["partial"]["model"].is_null(),
+                    "unknown model must stay unknown"
+                );
+            }
+        }
+        let generic = eyre::eyre!("configuration failed");
+        assert_eq!(
+            json_error_value(&generic),
+            serde_json::json!({"error":"configuration failed"})
+        );
+    }
+
+    #[test]
     fn should_serialize_chat_json_result_with_expected_shape() {
         // The `--json` envelope is a single-line object with every documented
         // key, in declaration order, so an agent/script can parse it directly.
@@ -3011,7 +1531,7 @@ mod tests {
             input_tokens: 4582,
             output_tokens: 7,
         };
-        let json = serde_json::to_string(&result).expect("envelope must serialize");
+        let json = result.to_json_line();
         assert_eq!(
             json,
             r#"{"text":"hello world","model":"glm-5.2","input_tokens":4582,"output_tokens":7}"#
@@ -3023,48 +1543,6 @@ mod tests {
         assert_eq!(value["model"], "glm-5.2");
         assert_eq!(value["input_tokens"], 4582);
         assert_eq!(value["output_tokens"], 7);
-    }
-
-    #[test]
-    fn should_build_envelope_from_conversation_response() {
-        // The envelope carries ground-truth fields only: text + token usage pass
-        // through, and `model` comes from the final reply's provider provenance
-        // so adaptive failover is reported honestly — falling back to the
-        // configured id only when the reply carries no provenance.
-        let build = |provider_metadata: Option<octos_llm::ProviderMetadata>| ConversationResponse {
-            content: "final answer".to_string(),
-            reasoning_content: None,
-            provider_metadata,
-            token_usage: octos_core::TokenUsage {
-                input_tokens: 100,
-                output_tokens: 5,
-                ..Default::default()
-            },
-            estimated_spend_usd: None,
-            files_modified: vec![],
-            files_to_send: vec![],
-            streamed: false,
-            messages: vec![],
-            tool_results: vec![],
-            synthesized_from_spawn_only: false,
-            pending_approval: None,
-        };
-
-        // No provenance → fall back to the configured model id.
-        let fallback = build(None);
-        let envelope = ChatJsonResult::from_response(&fallback, "glm-5.2");
-        assert_eq!(envelope.text, "final answer");
-        assert_eq!(envelope.model, "glm-5.2");
-        assert_eq!(envelope.input_tokens, 100);
-        assert_eq!(envelope.output_tokens, 5);
-
-        // Failover: the reply came from a different lane than the configured id
-        // → report the model that actually answered, not the fallback.
-        let routed = build(Some(octos_llm::ProviderMetadata::new(
-            "zai", "glm-4.7", None,
-        )));
-        let envelope = ChatJsonResult::from_response(&routed, "glm-5.2");
-        assert_eq!(envelope.model, "glm-4.7");
     }
 
     // ---- #1570: [y/s/N] approval prompt + numbered user-question prompt ----
@@ -3272,307 +1750,6 @@ mod tests {
         );
         SessionScope::solo(absolute_cwd, Vec::new())
             .expect("SessionScope::solo accepts the absolutized path");
-    }
-
-    /// NEW-06 codex follow-up — when [`build_run_pipeline_tool`] is
-    /// given an embedder, the resulting [`octos_pipeline::RunPipelineTool`]
-    /// must carry it through so pipeline workers spawned from `octos chat`
-    /// inherit the contamination-safe hybrid memory recall path.
-    ///
-    /// Regression guard: if a future refactor drops the
-    /// `.with_embedder(...)` call on the chat construction path the
-    /// `embedder_for_test()` assertion below goes red.
-    #[tokio::test]
-    async fn build_run_pipeline_tool_propagates_embedder_when_present() {
-        use async_trait::async_trait;
-        use octos_llm::EmbeddingProvider;
-
-        struct StubEmbedder;
-        #[async_trait]
-        impl EmbeddingProvider for StubEmbedder {
-            async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
-                Ok(vec![vec![0.0]; texts.len()])
-            }
-            fn dimension(&self) -> usize {
-                1
-            }
-        }
-
-        struct MockLlm;
-        #[async_trait]
-        impl LlmProvider for MockLlm {
-            async fn chat(
-                &self,
-                _messages: &[octos_core::Message],
-                _tools: &[octos_llm::ToolSpec],
-                _config: &octos_llm::ChatConfig,
-            ) -> eyre::Result<octos_llm::ChatResponse> {
-                Ok(octos_llm::ChatResponse {
-                    content: Some("ok".into()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    stop_reason: octos_llm::StopReason::EndTurn,
-                    usage: octos_llm::TokenUsage::default(),
-                    provider_index: None,
-                })
-            }
-            fn provider_name(&self) -> &str {
-                "mock"
-            }
-            fn model_id(&self) -> &str {
-                "mock-1"
-            }
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
-        let llm = Arc::new(MockLlm) as Arc<dyn LlmProvider>;
-        let embedder = Arc::new(StubEmbedder) as Arc<dyn EmbeddingProvider>;
-
-        let tool = build_run_pipeline_tool(
-            llm,
-            memory,
-            std::env::temp_dir(),
-            std::env::temp_dir(),
-            None,
-            vec![],
-            false,
-            Some(embedder),
-            octos_agent::SandboxConfig::default(),
-        );
-
-        assert!(
-            tool.embedder_for_test().is_some(),
-            "build_run_pipeline_tool must call `.with_embedder(..)` when \
-             the caller supplies one — otherwise `octos chat` pipeline \
-             workers fall back to the unfiltered cwd-only memory recall \
-             path and re-introduce the NEW-06 contamination."
-        );
-    }
-
-    /// NEW-06 codex follow-up — without an embedder argument the helper
-    /// produces a tool that matches pre-fix behaviour byte-for-byte
-    /// (`embedder_for_test()` returns `None`). Locks the legacy fall-through
-    /// for callers that don't have an embedder configured.
-    #[tokio::test]
-    async fn build_run_pipeline_tool_defaults_to_no_embedder() {
-        use async_trait::async_trait;
-
-        struct MockLlm;
-        #[async_trait]
-        impl LlmProvider for MockLlm {
-            async fn chat(
-                &self,
-                _messages: &[octos_core::Message],
-                _tools: &[octos_llm::ToolSpec],
-                _config: &octos_llm::ChatConfig,
-            ) -> eyre::Result<octos_llm::ChatResponse> {
-                Ok(octos_llm::ChatResponse {
-                    content: Some("ok".into()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    stop_reason: octos_llm::StopReason::EndTurn,
-                    usage: octos_llm::TokenUsage::default(),
-                    provider_index: None,
-                })
-            }
-            fn provider_name(&self) -> &str {
-                "mock"
-            }
-            fn model_id(&self) -> &str {
-                "mock-1"
-            }
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
-        let llm = Arc::new(MockLlm) as Arc<dyn LlmProvider>;
-
-        let tool = build_run_pipeline_tool(
-            llm,
-            memory,
-            std::env::temp_dir(),
-            std::env::temp_dir(),
-            None,
-            vec![],
-            false,
-            None,
-            octos_agent::SandboxConfig::default(),
-        );
-
-        assert!(
-            tool.embedder_for_test().is_none(),
-            "build_run_pipeline_tool with `embedder = None` must not \
-             attach one — otherwise legacy callers that never configured \
-             an embedder would observe a behaviour change."
-        );
-    }
-
-    /// yolo GAP #4 (codex P2): a `PluginTool` loaded for a chat session with
-    /// an explicit cwd must be BOUND to that cwd, so `PluginTool::execute`
-    /// runs the plugin in `--cwd` even when the session scope is omitted
-    /// (Host/yolo). Before the fix, chat loaded plugins with `work_dir: None`
-    /// and never rebound them, so a Host-scope session (scope `None`) left the
-    /// plugin's `work_dir` `None` → the plugin ran in the process launch dir.
-    ///
-    /// This test replicates chat's plugin-load path (loader `work_dir: None`,
-    /// mirroring `run_async`), then applies the chat cwd-binding helper the
-    /// yolo path uses, and asserts the loaded plugin's `work_dir` == the
-    /// resolved cwd. Removing the `bind_chat_plugin_work_dirs` call makes this
-    /// fail (RED), pinning the fix.
-    #[cfg(unix)]
-    #[test]
-    fn should_bind_plugin_work_dir_to_cwd_for_host_scope_chat_session() {
-        use octos_agent::plugins::PluginTool;
-        use std::os::unix::fs::PermissionsExt;
-
-        // Plugin fixture: manifest + executable (mirrors loader.rs tests).
-        let root = tempfile::tempdir().expect("tempdir");
-        let plugin_dir = root.path().join("demo-plugin");
-        std::fs::create_dir(&plugin_dir).unwrap();
-        let manifest = r#"{
-            "name": "demo-plugin",
-            "version": "1.0",
-            "tools": [{"name": "demo_tool", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
-        }"#;
-        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
-        let exec_path = plugin_dir.join("demo-plugin");
-        std::fs::write(&exec_path, b"#!/bin/sh\necho ok").unwrap();
-        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // The resolved chat cwd (the `--cwd` the operator passed).
-        let cwd = root.path().join("work-here");
-        std::fs::create_dir(&cwd).unwrap();
-
-        // Load exactly as chat's `run_async` does: `work_dir: None`.
-        let mut tools = ToolRegistry::new();
-        let result = octos_agent::PluginLoader::load_into_with_options(
-            &mut tools,
-            &[root.path().to_path_buf()],
-            &[],
-            octos_agent::PluginLoadOptions {
-                work_dir: None,
-                synthesis_config: None,
-                require_signed: false,
-                verified_cache_dir: None,
-            },
-        )
-        .expect("plugin load");
-        assert_eq!(result.tool_count, 1, "fixture must register one tool");
-
-        // Sanity: straight off the loader (chat's pre-fix state) the tool is
-        // UNBOUND — this is the gap that breaks Host-scope plugin cwd.
-        let unbound = tools
-            .get("demo_tool")
-            .and_then(|t| {
-                t.as_any()
-                    .downcast_ref::<PluginTool>()
-                    .map(|p| p.work_dir().is_none())
-            })
-            .expect("demo_tool is a PluginTool");
-        assert!(unbound, "precondition: loader leaves plugin work_dir unset");
-
-        // Apply the chat cwd-binding (the fix run_async performs before it
-        // constructs the agent). This is the ONLY step under test.
-        bind_chat_plugin_work_dirs(&mut tools, &cwd);
-
-        let bound = tools
-            .get("demo_tool")
-            .and_then(|t| {
-                t.as_any()
-                    .downcast_ref::<PluginTool>()
-                    .map(|p| p.work_dir().map(|d| d.to_path_buf()))
-            })
-            .expect("demo_tool is a PluginTool");
-        assert_eq!(
-            bound.as_deref(),
-            Some(cwd.as_path()),
-            "chat must bind the plugin work_dir to --cwd so Host-scope (yolo) \
-             sessions run plugins in --cwd, not the process launch dir"
-        );
-    }
-
-    #[cfg(unix)]
-    struct AlwaysAskPolicy;
-
-    #[cfg(unix)]
-    impl octos_agent::policy::CommandPolicy for AlwaysAskPolicy {
-        fn check(&self, _command: &str, _cwd: &std::path::Path) -> octos_agent::policy::Decision {
-            octos_agent::policy::Decision::Ask
-        }
-    }
-
-    #[cfg(unix)]
-    struct RecordingApprovalRequester {
-        decision: ToolApprovalDecision,
-        requests: Arc<std::sync::Mutex<Vec<ToolApprovalRequest>>>,
-    }
-
-    #[cfg(unix)]
-    #[async_trait::async_trait]
-    impl ToolApprovalRequester for RecordingApprovalRequester {
-        async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
-            self.requests.lock().expect("requests lock").push(request);
-            self.decision
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn chat_approval_scope_resumes_ask_gated_shell_tool_once() {
-        use octos_agent::{ShellTool, Tool};
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let requester: Arc<dyn ToolApprovalRequester> = Arc::new(RecordingApprovalRequester {
-            decision: ToolApprovalDecision::Approve,
-            requests: Arc::clone(&requests),
-        });
-        let tool = ShellTool::new(tmp.path()).with_policy(Arc::new(AlwaysAskPolicy));
-
-        let result = with_chat_approval(
-            requester,
-            tool.execute(&serde_json::json!({"command": "printf approved"})),
-        )
-        .await
-        .expect("shell execution should return");
-
-        assert!(
-            result.success,
-            "approved command should run: {}",
-            result.output
-        );
-        assert!(result.output.contains("approved"), "{}", result.output);
-        let recorded = requests.lock().expect("requests lock");
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].tool_name, "shell");
-        assert_eq!(recorded[0].command.as_deref(), Some("printf approved"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn chat_approval_scope_denies_ask_gated_shell_tool_once() {
-        use octos_agent::{ShellTool, Tool};
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let requester: Arc<dyn ToolApprovalRequester> = Arc::new(RecordingApprovalRequester {
-            decision: ToolApprovalDecision::Deny,
-            requests: Arc::clone(&requests),
-        });
-        let tool = ShellTool::new(tmp.path()).with_policy(Arc::new(AlwaysAskPolicy));
-
-        let result = with_chat_approval(
-            requester,
-            tool.execute(&serde_json::json!({"command": "printf denied"})),
-        )
-        .await
-        .expect("shell execution should return");
-
-        assert!(!result.success, "denied command must not run");
-        assert!(!result.output.contains("denied\n"), "{}", result.output);
-        assert!(result.output.contains("Command denied by user approval"));
-        assert_eq!(requests.lock().expect("requests lock").len(), 1);
     }
 }
 
@@ -3925,129 +2102,6 @@ mod chat_peer_tests {
             ProfileTools::AllowList { tools: Vec::new() },
             "an empty allow list is already pass-through — widening it would \
              turn a permissive surface into a three-tool one",
-        );
-    }
-
-    /// A chat-hosted peer's session key must be a CHILD of the master's Phase-1
-    /// goal session, or the two halves of the loop are addressing different
-    /// conversations.
-    #[test]
-    fn should_root_a_hosted_peer_under_the_master_chat_session() {
-        let master = chat_goal_session_key("dev");
-        let peer = crate::peers::host::chat_peer_session_key("dev", "alpha");
-        assert_eq!(peer.base_key(), master);
-        assert_eq!(peer.topic(), Some("peer-alpha"));
-    }
-
-    /// Drive the REAL host entry point over a mock provider.
-    ///
-    /// Everything except the model call is production code: `stage_peer` writes
-    /// the staging, `run_chat_peer` reads the boot context, publishes the wire,
-    /// builds the peer agent, runs `brief.md` as the first turn, and records the
-    /// blackboard result. Three things must hold afterwards, and each has bitten
-    /// this area before:
-    ///   * the peer is REGISTERED (an unregistered peer is invisible to
-    ///     `peer_list` and unanswerable by `peer_respond`);
-    ///   * `result.md` exists (a peer whose work is never recorded reads as
-    ///     "never ran" — octos#1701);
-    ///   * `peer_list` renders it as `done`, which is what the master sees.
-    #[tokio::test]
-    async fn should_run_a_staged_peer_in_process_and_record_its_result() {
-        use async_trait::async_trait;
-
-        struct MockLlm;
-        #[async_trait]
-        impl LlmProvider for MockLlm {
-            async fn chat(
-                &self,
-                _messages: &[octos_core::Message],
-                _tools: &[octos_llm::ToolSpec],
-                _config: &octos_llm::ChatConfig,
-            ) -> Result<octos_llm::ChatResponse> {
-                Ok(octos_llm::ChatResponse {
-                    content: Some("peer deliverable".into()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    stop_reason: octos_llm::StopReason::EndTurn,
-                    usage: octos_llm::TokenUsage::default(),
-                    provider_index: None,
-                })
-            }
-            fn provider_name(&self) -> &str {
-                "mock"
-            }
-            fn model_id(&self) -> &str {
-                "mock-1"
-            }
-        }
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path().join("data");
-        let peers_root = data_dir.join("peers");
-        std::fs::create_dir_all(&peers_root).expect("peers root");
-        let workspace = temp.path().join("ws");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        // Process-global registries — a unique profile keeps concurrent tests
-        // from resolving each other's peers.
-        let profile = format!("chat-host-{}", uuid::Uuid::now_v7().simple());
-        let master = chat_goal_session_key(&profile);
-
-        let staged = crate::peers::stage_peer(
-            &peers_root,
-            &workspace,
-            "scout",
-            Some("scout"),
-            Some(master.as_str()),
-            "summarize the repo",
-            false,
-            None,
-            None,
-        )
-        .expect("stage");
-
-        let memory = Arc::new(EpisodeStore::open(temp.path()).await.expect("episodes"));
-        run_chat_peer(
-            &staged.slug,
-            &workspace,
-            Arc::new(MockLlm) as Arc<dyn LlmProvider>,
-            memory,
-            AgentConfig::default(),
-            &octos_agent::SandboxConfig::default(),
-            octos_agent::policy::EffectivePermissions::default(),
-            None,
-            &profile,
-            &peers_root,
-            &data_dir,
-        )
-        .await
-        .expect("the peer turn completes");
-
-        assert_eq!(
-            crate::peers::peer_trusted_session(&profile, &staged.slug),
-            Some(crate::peers::host::chat_peer_session_key(
-                &profile,
-                &staged.slug
-            )),
-            "the peer must be reachable through the wire registry — peer_list \
-             and peer_respond derive its trusted session from there",
-        );
-
-        let rows = crate::peers::read_peer_blackboard(&peers_root, None);
-        let row = rows
-            .iter()
-            .find(|row| row.slug == staged.slug)
-            .expect("the staged peer is on the blackboard");
-        assert_eq!(
-            row.result.as_deref(),
-            Some("peer deliverable"),
-            "the peer's turn output must land in result.md or its work is lost",
-        );
-
-        let listing =
-            crate::peers::compose_peer_list_text(&rows, &[], &std::collections::HashMap::new());
-        assert!(
-            listing.contains(&staged.slug) && listing.contains("done"),
-            "peer_list must show the finished peer as done: {listing}",
         );
     }
 }

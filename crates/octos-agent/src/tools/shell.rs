@@ -191,7 +191,12 @@ impl ShellTool {
         // `strip_trailing_ampersand`).
         let command = strip_trailing_ampersand(raw_command);
 
-        let mut cmd = self.sandbox.wrap_command(&command, effective_cwd);
+        let slot = resolve_build_cache_slot(ctx);
+        let mut cmd = self.sandbox.wrap_command_with_build_cache_slot(
+            &command,
+            effective_cwd,
+            slot.as_deref(),
+        );
         // We return immediately and never read the pipes, so piping stdout/
         // stderr risks a full-buffer deadlock in a chatty child. Discard the
         // std streams (in-command redirects like `> log 2>&1` still win).
@@ -202,7 +207,7 @@ impl ShellTool {
         apply_quarto_tool_env(&mut cmd, &command, effective_cwd);
         apply_git_tool_env(&mut cmd, &command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
-        apply_build_cache_env(&mut cmd, ctx);
+        apply_build_cache_env(&mut cmd, slot.as_deref());
         apply_harness_event_sink_env(&mut cmd, ctx);
 
         let child = match cmd.spawn() {
@@ -792,13 +797,17 @@ fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command, ctx: &ToolCon
 /// neither `CARGO_TARGET_DIR` nor `CARGO_INCREMENTAL` is in that set, so a
 /// value set here survives; setting it AFTER the sanitizer keeps that
 /// property obvious rather than incidental.
-fn apply_build_cache_env(cmd: &mut tokio::process::Command, ctx: &ToolContext) {
-    let slot = ctx.build_cache_slot.clone().or_else(|| {
+fn resolve_build_cache_slot(ctx: &ToolContext) -> Option<PathBuf> {
+    ctx.build_cache_slot.clone().or_else(|| {
         TOOL_CTX
             .try_with(|inner| inner.build_cache_slot.clone())
             .ok()
             .flatten()
-    });
+    })
+}
+
+/// Use the SAME resolved option as the sandbox wrapper for this call.
+fn apply_build_cache_env(cmd: &mut tokio::process::Command, slot: Option<&Path>) {
     let Some(slot) = slot else {
         return;
     };
@@ -1136,13 +1145,18 @@ impl Tool for ShellTool {
         // Spawn the child, grab its PID, then timeout on wait_with_output().
         // If timeout fires, kill by PID to prevent orphaned processes.
         // (wait_with_output() takes ownership of child, so we save the PID first.)
-        let mut cmd = self.sandbox.wrap_command(&input.command, effective_cwd);
+        let slot = resolve_build_cache_slot(ctx);
+        let mut cmd = self.sandbox.wrap_command_with_build_cache_slot(
+            &input.command,
+            effective_cwd,
+            slot.as_deref(),
+        );
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         apply_frontend_tool_env(&mut cmd, effective_cwd);
         apply_quarto_tool_env(&mut cmd, &input.command, effective_cwd);
         apply_git_tool_env(&mut cmd, &input.command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
-        apply_build_cache_env(&mut cmd, ctx);
+        apply_build_cache_env(&mut cmd, slot.as_deref());
         apply_harness_event_sink_env(&mut cmd, ctx);
 
         let child = match cmd.spawn() {
@@ -2779,5 +2793,220 @@ mod change_receipt_tests {
             .filter(|l| l.trim_start().starts_with("many/"))
             .count();
         assert_eq!(listed_count, 20, "exactly 20 listed (cap): {receipt}");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod build_cache_sandbox_handoff_tests {
+    use super::*;
+    use crate::sandbox::MacosSandbox;
+    use std::sync::Mutex;
+
+    fn macos(slot: Option<PathBuf>) -> MacosSandbox {
+        MacosSandbox {
+            allow_network: false,
+            read_allow_paths: Vec::new(),
+            workspace_write: true,
+            repo_git_write: None,
+            build_cache_slot: slot,
+            write_allow_globs: None,
+            toolchain_write_grants: Default::default(),
+        }
+    }
+
+    // Render with the REAL backend at ShellTool's wrapping boundary, then
+    // execute the harmless env receipt without seatbelt for deterministic
+    // foreground/background inspection. The kernel test below uses seatbelt.
+    struct RecordingMacos {
+        backend: MacosSandbox,
+        profiles: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingMacos {
+        fn record(
+            &self,
+            wrapped: tokio::process::Command,
+            command: &str,
+            cwd: &Path,
+        ) -> tokio::process::Command {
+            let profile = wrapped
+                .as_std()
+                .get_args()
+                .find(|arg| arg.to_string_lossy().contains("(deny default)"))
+                .expect("real macOS profile")
+                .to_string_lossy()
+                .into_owned();
+            self.profiles.lock().unwrap().push(profile);
+            let mut receipt = NoSandbox.wrap_command(command, cwd);
+            // Make None observable independently of the Cargo test runner's env.
+            receipt
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_INCREMENTAL");
+            receipt
+        }
+    }
+
+    impl Sandbox for RecordingMacos {
+        fn wrap_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
+            self.record(self.backend.wrap_command(command, cwd), command, cwd)
+        }
+        fn wrap_command_with_build_cache_slot(
+            &self,
+            command: &str,
+            cwd: &Path,
+            slot: Option<&Path>,
+        ) -> tokio::process::Command {
+            self.record(
+                self.backend
+                    .wrap_command_with_build_cache_slot(command, cwd, slot),
+                command,
+                cwd,
+            )
+        }
+    }
+
+    async fn check_shell_handoff(background: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("wt");
+        let slots: Vec<PathBuf> = (1..=3)
+            .map(|n| tmp.path().join(format!("pool/slot-{n}")))
+            .collect();
+        std::fs::create_dir_all(&cwd).unwrap();
+        for slot in &slots {
+            std::fs::create_dir_all(slot.join("target")).unwrap();
+        }
+        let profiles = Arc::new(Mutex::new(Vec::new()));
+        let shared: Arc<dyn Sandbox> = Arc::new(RecordingMacos {
+            backend: macos(Some(slots[2].clone())),
+            profiles: profiles.clone(),
+        });
+        let tool = ShellTool::new(&cwd).with_shared_sandbox(shared.clone());
+        // Explicit context wins over TLS; next call uses TLS; final call has
+        // neither. All use the SAME shared sandbox with a stale configured slot.
+        for (index, expected_slot) in [Some(&slots[0]), Some(&slots[1]), None]
+            .into_iter()
+            .enumerate()
+        {
+            let mut ctx = ToolContext::zero();
+            if index == 0 {
+                ctx.build_cache_slot = Some(slots[0].clone());
+            }
+            let mut tls = ToolContext::zero();
+            tls.build_cache_slot = Some(slots[1].clone());
+            let receipt = format!("receipt-{index}");
+            let command = if background {
+                format!(
+                    "printf '%s|%s' \"${{CARGO_TARGET_DIR-unset}}\" \"${{CARGO_INCREMENTAL-unset}}\" > {receipt}"
+                )
+            } else {
+                "printf '%s|%s' \"${CARGO_TARGET_DIR-unset}\" \"${CARGO_INCREMENTAL-unset}\""
+                    .to_string()
+            };
+            let args = serde_json::json!({"command": command, "background": background});
+            let result = if index < 2 {
+                TOOL_CTX
+                    .scope(tls, tool.execute_with_context(&ctx, &args))
+                    .await
+                    .unwrap()
+            } else {
+                tool.execute_with_context(&ctx, &args).await.unwrap()
+            };
+            assert!(result.success, "{}", result.output);
+            let expected = expected_slot
+                .map(|slot| format!("{}|0", slot.join("target").display()))
+                .unwrap_or_else(|| "unset|unset".to_owned());
+            if background {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if std::fs::read_to_string(cwd.join(&receipt)).ok().as_deref()
+                            == Some(expected.as_str())
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("background env receipt");
+            } else {
+                assert!(result.output.contains(&expected), "{}", result.output);
+            }
+            let profile = profiles.lock().unwrap().last().unwrap().clone();
+            for slot in &slots {
+                let canonical = std::fs::canonicalize(slot).unwrap();
+                let grant = format!("(allow file-write* (subpath \"{}\"))", canonical.display());
+                assert_eq!(
+                    profile.contains(&grant),
+                    expected_slot == Some(slot),
+                    "current slot only; profile: {profile}"
+                );
+                let read_grant =
+                    format!("(allow file-read* (subpath \"{}\"))", canonical.display());
+                assert_eq!(profile.contains(&read_grant), expected_slot == Some(slot));
+            }
+        }
+        // Contextual wrapping must not mutate the legacy configured grant.
+        shared.wrap_command("true", &cwd);
+        let stale = std::fs::canonicalize(&slots[2]).unwrap();
+        assert!(profiles.lock().unwrap().last().unwrap().contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            stale.display()
+        )));
+    }
+
+    #[tokio::test]
+    async fn build_cache_context_reaches_foreground_sandbox_without_stale_grants() {
+        check_shell_handoff(false).await;
+    }
+
+    #[tokio::test]
+    async fn build_cache_context_reaches_background_sandbox_without_stale_grants() {
+        check_shell_handoff(true).await;
+    }
+
+    #[tokio::test]
+    async fn build_cache_context_kernel_allows_own_slot_and_denies_sibling_then_revoked_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("wt");
+        let own = tmp.path().join("pool/slot-1");
+        let sibling = tmp.path().join("pool/slot-2");
+        for path in [&cwd, &own.join("target"), &sibling.join("target")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let tool = ShellTool::new(&cwd).with_shared_sandbox(Arc::new(macos(None)));
+        let mut ctx = ToolContext::zero();
+        ctx.build_cache_slot = Some(own.clone());
+        let own_result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"command": "printf pooled > \"$CARGO_TARGET_DIR/probe\""}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            own_result.success,
+            "own pooled target must be writable: {}",
+            own_result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(own.join("target/probe")).unwrap(),
+            "pooled"
+        );
+        let sibling_result = tool.execute_with_context(&ctx, &serde_json::json!({"command": "printf denied > \"$CARGO_TARGET_DIR/../../slot-2/target/probe\""})).await.unwrap();
+        assert!(!sibling_result.success);
+        assert!(!sibling.join("target/probe").exists());
+        let quoted = own
+            .join("target/revoked")
+            .to_string_lossy()
+            .replace('\'', "'\\''");
+        let revoked = tool
+            .execute_with_context(
+                &ToolContext::zero(),
+                &serde_json::json!({"command": format!("printf denied > '{quoted}'")}),
+            )
+            .await
+            .unwrap();
+        assert!(!revoked.success, "subsequent None must revoke the old slot");
+        assert!(!own.join("target/revoked").exists());
     }
 }

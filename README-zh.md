@@ -30,7 +30,7 @@ Octos 是一个开源 AI Agent 平台，能将任何 LLM 变成多频道、多�
 - **多 LLM DOT 流水线**：DOT 图定义工作流。逐节点模型选择。动态并行扇出，带有限流以保证 Fleet 稳定性。
 - **Swarm 调度器**：将契约扇出到 N 个子 Agent，聚合产物，通过校验器审核，汇总成本——已接入 `/api/swarm/dispatch`。
 - **3 层提供者故障转移**：RetryProvider → ProviderChain → AdaptiveRouter。Hedge 竞速、Lane 评分、熔断器。
-- **LRU 工具延迟加载**：约 15 个活跃工具，约 50 个按需可用。空闲工具自动淘汰。`spawn_only` 工具自动转后台执行。
+- **静态、按配置收窄的工具面**：每轮向模型发送全部已启用工具的完整 schema（无动态淘汰——prompt 前缀保持缓存稳定）。`coding` 等运行时配置可收窄启用集合，`coding-full` 恢复完整工具面。`spawn_only` 工具自动转后台执行。
 - **5 种队列模式**：Followup、Collect、Steer、Interrupt、Speculative——通过 `/queue` 控制 Agent 并发。
 - **任意频道会话控制**：`/new`、`/s <名称>`、`/sessions`、`/back`——在 Telegram、Discord、Slack、WhatsApp、Matrix、飞书中可用。
 - **Sticky thread_id + committed_seq**：每个 SSE 事件都绑定到 thread；按提交序号确定性回放（M8.10）。

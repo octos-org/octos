@@ -2230,6 +2230,102 @@ async fn send_completion_closes_stream() {
 }
 
 #[tokio::test]
+async fn should_close_incomplete_completion_with_error_not_success_done() {
+    let ch = ApiChannel::new(
+        8091,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        test_sessions(),
+        Some(TEST_PROFILE_ID.to_string()),
+    );
+    let (tx, mut rx) = new_sse_channel();
+    ch.pending.lock().await.insert("partial-chat".into(), tx);
+    ch.send(&OutboundMessage {
+        channel: "api".into(),
+        chat_id: "partial-chat".into(),
+        content: String::new(),
+        reply_to: None,
+        media: vec![],
+        metadata: serde_json::json!({"_completion": true, "thread_id": "partial-turn",
+            "outcome": "incomplete", "truncated": true, "error_code": "max_tokens",
+            "error": "Model output was truncated; the response is incomplete",
+            "tokens_in": 101, "tokens_out": 23, "cache_read_tokens": 17,
+            "cache_write_tokens": 19, "reasoning_tokens": 7, "committed_seq": 9}),
+    })
+    .await
+    .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    assert_eq!(
+        event["type"], "error",
+        "a truncated turn is not a successful done"
+    );
+    assert_eq!(event["outcome"], "incomplete");
+    assert_eq!(event["truncated"], true);
+    assert_eq!(event["code"], "max_tokens");
+    assert!(event["content"].as_str().unwrap().contains("incomplete"));
+    assert_eq!(event["tokens_in"], 101);
+    assert_eq!(event["tokens_out"], 23);
+    assert_eq!(event["cache_read_tokens"], 17);
+    assert_eq!(event["cache_write_tokens"], 19);
+    assert_eq!(event["reasoning_tokens"], 7);
+    assert_eq!(event["committed_seq"], 9);
+    assert!(matches!(
+        rx.recv().await,
+        Err(broadcast::error::RecvError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn should_deliver_incomplete_overflow_once_without_closing_primary_stream() {
+    let ch = ApiChannel::new(
+        8091,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        test_sessions(),
+        Some(TEST_PROFILE_ID.to_string()),
+    );
+    let (tx, mut primary) = new_sse_channel();
+    ch.pending.lock().await.insert("overflow-chat".into(), tx);
+    let (watch_tx, mut watcher) = new_sse_channel();
+    ch.watchers
+        .lock()
+        .await
+        .insert(watcher_key("overflow-chat", None), watch_tx);
+    ch.send(&OutboundMessage {
+        channel: "api".into(),
+        chat_id: "overflow-chat".into(),
+        content: String::new(),
+        reply_to: None,
+        media: vec![],
+        metadata: serde_json::json!({"thread_id": "overflow-turn", "_history_persisted": true,
+            "outcome": "incomplete", "truncated": true,
+            "_session_result": {"seq": 9, "role": "assistant", "content": "actual partial",
+                "outcome": "incomplete", "truncated": true, "error_code": "max_tokens",
+                "tokens_in": 101, "tokens_out": 23}}),
+    })
+    .await
+    .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&watcher.recv().await.unwrap()).unwrap();
+    assert_eq!(event["type"], "session_result");
+    assert_eq!(event["message"]["content"], "actual partial");
+    assert_eq!(event["message"]["outcome"], "incomplete");
+    assert_eq!(event["message"]["tokens_in"], 101);
+    assert!(
+        watcher.try_recv().is_err(),
+        "no duplicate final/error fanout"
+    );
+    assert!(ch.pending.lock().await.contains_key("overflow-chat"));
+    // broadcast_session_event sends the same one result to active SSE too.
+    let primary_event: serde_json::Value =
+        serde_json::from_str(&primary.recv().await.unwrap()).unwrap();
+    assert_eq!(primary_event["type"], "session_result");
+    assert!(matches!(
+        primary.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
 async fn done_event_carries_committed_seq_when_message_persisted() {
     // M8.10-A regression: the SSE `done` event must thread the committed
     // session sequence back to the web client so live-streamed bubbles can
