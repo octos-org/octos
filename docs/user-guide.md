@@ -246,7 +246,7 @@ Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`
 
 ## 3. Setting Up LLM Providers
 
-Octos supports 16 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
+Octos supports 17 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
 
 ### 3.1 Supported Providers
 

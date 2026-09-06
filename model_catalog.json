@@ -591,6 +591,28 @@
       "max_output": 131072
     },
     {
+      "provider": "minimax-cn/MiniMax-M3",
+      "type": "strong",
+      "default": true,
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.3,
+      "cost_out": 1.2,
+      "context_window": 1000000,
+      "max_output": 131072,
+      "endpoints": [
+        {
+          "id": "minimax-cn",
+          "label": "MiniMax China (Token Plan)",
+          "base_url": "https://api.minimaxi.com/v1",
+          "api_key_env": "MINIMAX_CN_API_KEY"
+        }
+      ]
+    },
+    {
       "provider": "moonshot/kimi-k2.5",
       "type": "fast",
       "default": true,
