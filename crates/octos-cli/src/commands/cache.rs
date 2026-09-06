@@ -1360,7 +1360,7 @@ mod tests {
         // Outside the pool root entirely (including via a plausible path).
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(matches!(
-            pool::release_detached(&pool_root, &elsewhere.path(), SlotOutcome::Completed),
+            pool::release_detached(&pool_root, elsewhere.path(), SlotOutcome::Completed),
             Err(BuildCacheError::SlotOutsidePool { .. })
         ));
 
