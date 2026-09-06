@@ -12,6 +12,8 @@
 //! fallbacks, the auth store, `keychain:` markers, MCP, plugins and skills.
 //! Handing out the same factory the stdio path drives keeps embedders in step.
 
+#![cfg(feature = "api")]
+
 use octos_cli::commands::acp::{AcpCommand, DEFAULT_MAX_ITERATIONS, SessionAgentFactory};
 use tempfile::TempDir;
 
@@ -44,17 +46,13 @@ fn should_build_a_factory_from_outside_the_crate() {
     );
 }
 
-/// `Default` has to carry the CLI's real defaults, not `u32::default()`.
-/// An embedder using struct-update syntax would otherwise silently get a
-/// zero-iteration agent that can't call a single tool.
+/// `Default` has to carry the CLI's real Codex-style default. `0` is an
+/// explicit sentinel meaning an unlimited interactive turn; it no longer
+/// means "zero calls allowed" at the budget gate.
 #[test]
 fn should_default_max_iterations_to_the_cli_value() {
     assert_eq!(AcpCommand::default().max_iterations, DEFAULT_MAX_ITERATIONS);
-    assert_ne!(
-        AcpCommand::default().max_iterations,
-        0,
-        "a zero-iteration agent cannot call a single tool",
-    );
+    assert_eq!(DEFAULT_MAX_ITERATIONS, 0);
 }
 
 /// No provider anywhere is a typed error, not a panic — an embedder needs to

@@ -122,6 +122,7 @@ octos-fleet-worker.workspace = true
 # `tokio::fs::read` followed symlinks between the canonical-descendant
 # check and the read, opening a TOCTOU window.
 libc = { workspace = true }
+rpassword = { workspace = true }
 # `rustix::fs::openat` for the component-by-component path walk in
 # `src/api/preview.rs::open_no_follow_walk`. Codex round-2 BLOCKING #1
 # (issue #996): the previous `symlink_metadata`-then-`open` ancestor
@@ -140,7 +141,9 @@ keyring = { workspace = true, features = ["apple-native"] }
 keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
-default = []
+# chat, ACP and serve use one OUP dispatcher. Minimal library builds can opt
+# out, but never silently fall back to independent chat/ACP agent loops.
+default = ["api"]
 # In-process llama.cpp GGUF embedding provider. Wires
 # `embedding.provider = "llamacpp"` in create_embedder. Cross-platform — no
 # target gate — and defaults to the CPU backend; add an accelerator explicitly.

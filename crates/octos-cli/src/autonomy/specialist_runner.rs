@@ -1025,6 +1025,42 @@ printf 'done\n'
             .configure_supervisor_store(dir.path().join("supervisor"))
             .unwrap();
         let session = SessionKey::with_profile("tenant-a", "api", "specialist");
+        // #39: joins require at least two ordinary children. Retire one seed
+        // verdict in each scope before the real runners execute, preserving
+        // their 6/2 pending purge counts without synthetic singleton joins.
+        for (id, root) in [("seed-raw", &raw_root), ("seed-neighbor", &lossy_neighbor)] {
+            orchestrator
+                .upsert_agent_scoped(
+                    AgentUpsert {
+                        agent_id: id.into(),
+                        parent_agent_id: Some("master".into()),
+                        session_id: session.clone(),
+                        task_id: None,
+                        path: format!("master/{id}"),
+                        role: "worker".into(),
+                        nickname: id.into(),
+                        backend_kind: "native".into(),
+                        status: "completed".into(),
+                        last_task: Some("seed completed before the runner burst".into()),
+                        cwd: Some(root.to_string_lossy().into_owned()),
+                        profile_id: "tenant-a".into(),
+                    },
+                    WorkspaceScope::from_path(root),
+                )
+                .unwrap();
+            let seeds = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                super::super::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert_eq!(seeds.len(), 1);
+            assert_eq!(
+                seeds[0].child_agent_id.as_ref().map(|id| id.as_str()),
+                Some(id)
+            );
+            orchestrator.mark_continuation_completed(&seeds[0], Some("seed consumed".into()));
+        }
 
         orchestrator
             .run_native_specialist(NativeSpecialistLaunchRequest {
@@ -1177,7 +1213,7 @@ printf 'done\n'
                 .iter()
                 .map(|(epoch, children, _)| (*epoch, *children))
                 .collect::<Vec<_>>(),
-            vec![(0, 1), (1, 2), (2, 3)],
+            vec![(0, 2), (1, 3), (2, 4)],
             "native, CLI, and MCP must advance one shared raw-byte cohort"
         );
         assert!(
@@ -1192,7 +1228,7 @@ printf 'done\n'
                 .iter()
                 .map(|(epoch, children, _)| (*epoch, *children))
                 .collect::<Vec<_>>(),
-            vec![(0, 1)],
+            vec![(0, 2)],
             "the real U+FFFD directory must start an independent cohort"
         );
         assert_ne!(raw_scatter[0].2, neighbor_scatter[0].2);

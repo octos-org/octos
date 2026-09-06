@@ -217,7 +217,7 @@ console.log(JSON.stringify({ output: result, success: true }));
 3. 技能二进制在后台运行至完成，期间发送协议 v2 事件；
 4. 完成（或失败）时，监督者提交带 `committed_seq` 的 `session_result` 事件，必要时按 M8.9 运行时失败恢复重新驱动 LLM。
 
-`spawn_only` 工具不会被 LRU 工具寄存器淘汰；其 `SKILL.md` 自动注入到系统提示，让 LLM 知道如何调用。
+`spawn_only` 工具在会话全程对模型可见；其 `SKILL.md` 自动注入到系统提示，让 LLM 知道如何调用。
 
 ---
 

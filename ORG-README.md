@@ -20,7 +20,7 @@ Connect your LLM API keys and messaging channels. Octos handles conversation rou
 - **Multi-tenant** — 200+ profiles on 16GB. Each profile is an isolated OS process. Family Plan sub-accounts
 - **Multi-LLM pipelines** — DOT graph workflows. Per-node model selection. Dynamic parallel fan-out
 - **Adaptive routing** — 3-layer failover with Hedge racing, Lane scoring, and circuit breakers
-- **LRU tool deferral** — 15 active tools for fast LLM reasoning, 34+ available on demand
+- **Profile-scoped tool surface** — every enabled tool's schema is sent each turn; the `coding` profile narrows the set, `coding-full` restores it
 - **14 channels** — Telegram, Discord, Slack, WhatsApp, Feishu, Email, WeCom, WeChat, Matrix, QQ Bot, Twilio, API, CLI
 - **3-layer memory** — Long-term (entity bank), episodic (task outcomes in redb), session (JSONL + LLM compaction)
 - **5 queue modes** — Followup, Collect, Steer, Interrupt, Speculative — per-session agent concurrency control

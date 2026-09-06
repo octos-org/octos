@@ -122,7 +122,7 @@ SHA-256 hash-based change detection. Hot-reload for system prompt; restart-requi
 - `Task` (octos-core): UUID v7 ID, kind (Code/Plan/Review/Custom), status, context
 - `Message` (octos-core): role (System/User/Assistant/Tool), content, tool_call_id. `MessageRole` has `as_str()` and `Display` impl.
 - `ChatResponse` (octos-llm): content, tool_calls, stop_reason, token usage
-- `AgentConfig` (octos-agent): max_iterations (default 50), max_tokens, save_episodes
+- `AgentConfig` (octos-agent): max_iterations (default 0 = unlimited for interactive chat/ACP; unattended gateway/session actors fall back to `UNATTENDED_MAX_ITERATIONS_FALLBACK` = 50 when `gateway.max_iterations` is unset), max_tokens, save_episodes
 - `truncate_utf8`/`truncated_utf8` (octos-core): Shared UTF-8 safe string truncation (in-place and copying variants)
 
 ## TDD - Test Driven Development

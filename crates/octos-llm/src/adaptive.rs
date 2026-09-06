@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eyre::Result;
-use futures::StreamExt;
 use octos_core::Message;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -19,9 +18,15 @@ use tracing::{debug, info, warn};
 use crate::config::ChatConfig;
 use crate::content_classifier::{ClassificationDecision, ContentClassifier};
 use crate::credential_pool::{CredentialPool, ErrorId, rotation_reason};
-use crate::provider::LlmProvider;
+use crate::provider::{
+    LANE_FAILED_FAIL_FAST, LANES_EXHAUSTED, LaneFailure, LlmProvider, attribute_lane_failures,
+};
 use crate::responsiveness::ResponsivenessObserver;
-use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
+#[cfg(test)]
+use crate::types::StreamEvent;
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, ToolSpec};
+#[cfg(test)]
+use futures::StreamExt;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -2231,11 +2236,22 @@ impl AdaptiveRouter {
                         "hedged race: primary failed, waiting for alternate"
                     ),
                 }
-                if result.is_ok() {
-                    return Some(result);
+                match result {
+                    Ok(resp) => Some(Ok(resp)),
+                    // Primary failed — try alternate sequentially (it was
+                    // cancelled by select); name both lanes if it fails too.
+                    Err(first) => Some(
+                        self.hedge_alternate(
+                            primary_idx,
+                            first,
+                            alternate_idx,
+                            messages,
+                            tools,
+                            config,
+                        )
+                        .await,
+                    ),
                 }
-                // Primary failed — try alternate sequentially (it was cancelled by select)
-                Some(self.try_chat(alternate_idx, messages, tools, config).await)
             }
             result = self.try_chat(alternate_idx, messages, tools, config) => {
                 match &result {
@@ -2250,11 +2266,46 @@ impl AdaptiveRouter {
                         "hedged race: alternate failed, waiting for primary"
                     ),
                 }
-                if result.is_ok() {
-                    return Some(result);
+                match result {
+                    Ok(resp) => Some(Ok(resp)),
+                    // Alternate failed — try primary sequentially; name both
+                    // lanes if it fails too.
+                    Err(first) => Some(
+                        self.hedge_alternate(
+                            alternate_idx,
+                            first,
+                            primary_idx,
+                            messages,
+                            tools,
+                            config,
+                        )
+                        .await,
+                    ),
                 }
-                // Alternate failed — try primary sequentially
-                Some(self.try_chat(primary_idx, messages, tools, config).await)
+            }
+        }
+    }
+
+    /// After the hedge winner failed, try the other lane sequentially. If it
+    /// fails too, the returned error names both lanes (the second failure
+    /// stays the typed carrier for classification).
+    async fn hedge_alternate(
+        &self,
+        failed_idx: usize,
+        first: eyre::Report,
+        next_idx: usize,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        match self.try_chat(next_idx, messages, tools, config).await {
+            Ok(resp) => Ok(resp),
+            Err(second) => {
+                let failures = [
+                    LaneFailure::capture(self.slots[failed_idx].provider.as_ref(), &first),
+                    LaneFailure::capture(self.slots[next_idx].provider.as_ref(), &second),
+                ];
+                Err(attribute_lane_failures(second, LANES_EXHAUSTED, &failures))
             }
         }
     }
@@ -2341,7 +2392,7 @@ impl AdaptiveRouter {
         }
 
         result.map(|mut response| {
-            response.provider_index = Some(idx);
+            response.provider_index = Some(self.flat_index(idx, response.provider_index));
             response
         })
     }
@@ -2418,9 +2469,23 @@ impl AdaptiveRouter {
     }
 
     fn stream_with_provider_index(&self, idx: usize, stream: ChatStream) -> ChatStream {
-        Box::pin(
-            futures::stream::once(async move { StreamEvent::ProviderIndex(idx) }).chain(stream),
-        )
+        crate::provider::stream_with_lane_offset(self.lane_offset(idx), stream)
+    }
+
+    /// Flat leaf-lane bookkeeping (see [`LlmProvider::provider_lane_count`]).
+    fn lane_counts(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.provider_lane_count())
+            .collect()
+    }
+
+    fn lane_offset(&self, idx: usize) -> usize {
+        crate::provider::lane_offset_for_slot(&self.lane_counts(), idx)
+    }
+
+    fn flat_index(&self, idx: usize, inner: Option<usize>) -> usize {
+        self.lane_offset(idx) + inner.unwrap_or(0)
     }
 }
 
@@ -2467,8 +2532,17 @@ impl LlmProvider for AdaptiveRouter {
         match self.try_chat(start_idx, messages, tools, config).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
+                let mut failures = vec![LaneFailure::capture(
+                    self.slots[start_idx].provider.as_ref(),
+                    &e,
+                )];
                 if self.slots.len() == 1 || fail_fast {
-                    return Err(e);
+                    let outcome = if fail_fast {
+                        LANE_FAILED_FAIL_FAST
+                    } else {
+                        LANES_EXHAUSTED
+                    };
+                    return Err(attribute_lane_failures(e, outcome, &failures));
                 }
 
                 warn!(
@@ -2521,11 +2595,17 @@ impl LlmProvider for AdaptiveRouter {
                                 error = %e,
                                 "adaptive router failover also failed"
                             );
+                            failures
+                                .push(LaneFailure::capture(self.slots[idx].provider.as_ref(), &e));
                             last_error = e;
                         }
                     }
                 }
-                Err(last_error)
+                Err(attribute_lane_failures(
+                    last_error,
+                    LANES_EXHAUSTED,
+                    &failures,
+                ))
             }
         }
     }
@@ -2550,8 +2630,17 @@ impl LlmProvider for AdaptiveRouter {
         {
             Ok(stream) => Ok(stream),
             Err(e) => {
+                let mut failures = vec![LaneFailure::capture(
+                    self.slots[start_idx].provider.as_ref(),
+                    &e,
+                )];
                 if self.slots.len() == 1 || fail_fast {
-                    return Err(e);
+                    let outcome = if fail_fast {
+                        LANE_FAILED_FAIL_FAST
+                    } else {
+                        LANES_EXHAUSTED
+                    };
+                    return Err(attribute_lane_failures(e, outcome, &failures));
                 }
 
                 warn!(
@@ -2597,11 +2686,17 @@ impl LlmProvider for AdaptiveRouter {
                                 error = %e,
                                 "adaptive router failover also failed"
                             );
+                            failures
+                                .push(LaneFailure::capture(self.slots[idx].provider.as_ref(), &e));
                             last_error = e;
                         }
                     }
                 }
-                Err(last_error)
+                Err(attribute_lane_failures(
+                    last_error,
+                    LANES_EXHAUSTED,
+                    &failures,
+                ))
             }
         }
     }
@@ -2665,11 +2760,39 @@ impl LlmProvider for AdaptiveRouter {
     }
 
     fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
-        let idx = provider_index.unwrap_or_else(|| self.pinned_slot().0);
+        let Some(index) = provider_index else {
+            let idx = self.identity_slot();
+            return self
+                .slots
+                .get(idx)
+                .map(|slot| slot.provider.provider_metadata_for_index(None))
+                .unwrap_or_else(|| self.provider_metadata());
+        };
+        match crate::provider::slot_for_lane_index(&self.lane_counts(), index) {
+            Some((slot, inner)) => self.slots[slot]
+                .provider
+                .provider_metadata_for_index(Some(inner)),
+            None => self.provider_metadata(),
+        }
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.lane_counts().iter().sum()
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        let idx = self.identity_slot();
+        self.slots[idx].provider.api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        // A call may hedge or fail over after the agent builds ChatConfig.
+        // Advertising the union of reachable lane capabilities ensures a
+        // semantic-aware winner receives its hints; concrete hosted lanes
+        // simply ignore the provider-neutral metadata.
         self.slots
-            .get(idx)
-            .map(|slot| slot.provider.provider_metadata())
-            .unwrap_or_else(|| self.provider_metadata())
+            .iter()
+            .any(|slot| slot.provider.supports_semantic_checkpoint_hints())
     }
 
     fn export_metrics(&self) -> Option<serde_json::Value> {

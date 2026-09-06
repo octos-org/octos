@@ -1327,8 +1327,8 @@ impl InProcessAgentOrchestrator {
 ///
 /// - **Success** (`TerminalOutcome::Completed`) → mirror the agent record
 ///   under the resolved runtime profile via [`upsert_background_task_agent`];
-///   its terminal transition enqueues a `ChildCompleted` (and, when all
-///   siblings are terminal, a `ScatterJoinComplete`) continuation. This is
+///   its terminal transition enqueues a `ChildCompleted` (and, when at least
+///   two non-peer siblings are all terminal, a `ScatterJoinComplete`). This is
 ///   exactly the success path the legacy `on_change` callback already
 ///   drives — the explicit `child/...` dedupe key (step 3) keeps the
 ///   strangler double-delivery collapsed to one continuation.
@@ -1857,28 +1857,6 @@ impl InProcessAgentOrchestrator {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_for_test(&self) {
-        *self.state() = AutonomyRuntimeState::default();
-        self.shared
-            .goal_scopes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        // #1973 fix D — a stashed retry must not leak across singleton tests.
-        self.shared
-            .fleet_wake_retry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        // #2055 — registration-time ledger bindings are equally per-test state.
-        self.shared
-            .goal_task_ledger_bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
     }
 
     /// #1666 residue — register (or clear) the per-project goal-store scope
@@ -2840,7 +2818,8 @@ impl InProcessAgentOrchestrator {
 
         let cwd_hash = scatter_scope_hash(agent.workspace_scope.as_ref());
         let cohort_key = scatter_cohort_key(&agent_continuation_group_id(&agent), cwd_hash);
-        let cohort = (!existing)
+        // Peers do not expand ordinary spawn cohorts, even after a join.
+        let cohort = (!existing && agent.backend_kind != PEER_HANDOFF_BACKEND_KIND)
             .then(|| state.scatter_join_state.get(&cohort_key))
             .flatten()
             .filter(|join| join.last_joined_key.is_some())
@@ -3096,8 +3075,11 @@ impl InProcessAgentOrchestrator {
         };
         let cancelled = !self.state().cancellations.contains_key(&agent_id)
             && self.agent_status_is_terminal(&agent_id);
-        let (status, output, artifacts) = match result {
-            Ok(response) => {
+        let outcome = crate::conversation_outcome::ConversationOutcome::from_result(result);
+        let incomplete = outcome.is_incomplete();
+        let (status, output, artifacts) = match outcome {
+            crate::conversation_outcome::ConversationOutcome::Complete(response)
+            | crate::conversation_outcome::ConversationOutcome::Incomplete { partial: response } => {
                 let output = response.content.clone();
                 let artifacts = native_specialist_artifacts(
                     &cwd,
@@ -3107,13 +3089,17 @@ impl InProcessAgentOrchestrator {
                         .iter()
                         .chain(response.files_modified.iter()),
                 );
-                ("completed".to_owned(), output, artifacts)
+                (
+                    if incomplete { "failed" } else { "completed" }.to_owned(),
+                    crate::conversation_outcome::display_incomplete(output, incomplete),
+                    artifacts,
+                )
             }
-            Err(error) if cancelled => {
+            crate::conversation_outcome::ConversationOutcome::Failed(error) if cancelled => {
                 let output = format!("Native specialist cancelled: {error}");
                 ("interrupted".to_owned(), output, Vec::new())
             }
-            Err(error) => {
+            crate::conversation_outcome::ConversationOutcome::Failed(error) => {
                 let output = format!("Native specialist failed: {error}");
                 ("failed".to_owned(), output, Vec::new())
             }
@@ -3177,7 +3163,7 @@ impl InProcessAgentOrchestrator {
                         None,
                         None,
                         Some(output.chars().take(1200).collect()),
-                        Some(0),
+                        Some(artifacts.len() as u32),
                         None,
                     );
                 }
@@ -6174,6 +6160,12 @@ impl InProcessAgentOrchestrator {
                         "goal is no longer driven by fleet `{expected}`; transition refused"
                     ));
                 }
+            }
+            if goal.status == "archived" {
+                // #2237 — an archived goal is terminal and operator-only;
+                // point the model at the create path instead of a generic
+                // stale-verdict refusal.
+                return Err("goal is archived; create a new goal instead".to_owned());
             }
             if goal.status == "complete" {
                 return Err("goal is already complete".to_owned());
@@ -9460,6 +9452,15 @@ impl InProcessAgentOrchestrator {
     /// when no goal exists or replaces the current goal when it is complete").
     /// Always creates an `active`, model-attributed goal owned by `profile_id` —
     /// pause/resume/budget stay user-owned exactly as in `model_transition_goal`.
+    /// #2237 — the TERMINAL goal statuses. Admission (and terminal
+    /// replacement) must key on "is this goal unfinished", not on a single
+    /// literal: an OPERATOR-ARCHIVED goal is just as finished as a complete
+    /// one, and refusing it dead-locked the session (issue #2237: no new
+    /// goal, no goal_update, no `/goal stop`).
+    fn goal_status_is_terminal(status: &str) -> bool {
+        matches!(status, "complete" | "archived")
+    }
+
     pub(crate) fn model_create_goal(
         &self,
         session_id: &SessionKey,
@@ -9490,7 +9491,9 @@ impl InProcessAgentOrchestrator {
                             .to_owned(),
                     );
                 }
-                if existing.status != "complete" {
+                // #2237 — ANY terminal status (complete | archived) admits a
+                // new goal; only genuinely unfinished states refuse.
+                if !Self::goal_status_is_terminal(&existing.status) {
                     return Err(format!(
                         "cannot create a new goal because this session has an unfinished goal \
                          (status `{}`); complete or clear the existing goal first",
@@ -10465,10 +10468,9 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
         // preserves the update branch's cross-profile guard (which still fires
         // for a mismatched profile because we only remove on a match).
         if requested_status != Some("complete")
-            && state
-                .goals
-                .get(&key)
-                .is_some_and(|g| g.status == "complete" && g.profile_id == request.profile_id)
+            && state.goals.get(&key).is_some_and(|g| {
+                Self::goal_status_is_terminal(&g.status) && g.profile_id == request.profile_id
+            })
         {
             state.goals.remove(&key);
         }
@@ -12326,11 +12328,6 @@ pub(crate) fn default_agent_orchestrator() -> &'static InProcessAgentOrchestrato
     ORCHESTRATOR.get_or_init(InProcessAgentOrchestrator::default)
 }
 
-#[cfg(test)]
-pub(crate) fn clear_default_agent_orchestrator_for_test() {
-    default_agent_orchestrator().clear_for_test();
-}
-
 #[derive(Debug)]
 #[allow(clippy::derivable_impls)] // see the manual-Default comment below (#7 round 3)
 struct AutonomyRuntimeState {
@@ -12704,13 +12701,14 @@ impl InProcessAgentOrchestrator {
             .values()
             .filter(|candidate| {
                 candidate.session_id == *session_id
+                    && candidate.backend_kind != PEER_HANDOFF_BACKEND_KIND
                     && candidate.profile_id == profile_id
                     && candidate.parent_agent_id.as_deref() == Some("master")
                     && candidate.workspace_scope.as_ref() == workspace_scope
             })
             .cloned()
             .collect::<Vec<_>>();
-        if siblings.is_empty()
+        if siblings.len() < 2
             || !siblings
                 .iter()
                 .all(|candidate| is_agent_terminal_status(&candidate.status))
@@ -13052,8 +13050,8 @@ struct WorkspaceCompat {
     peers: std::collections::HashSet<String>,
 }
 
-// Peer registration with a master session derives a child_session_key, so
-// production mirrors normally persist backend "spawn_child_session". Its
+// Before #2265, peer registration with a master session derived a child_session_key,
+// so mirrors persisted backend "spawn_child_session". Its
 // server-generated tool nickname and role retain the legacy peer provenance.
 fn legacy_peer_workspace_provenance(child: &ChildAgentRecord) -> bool {
     match supervisor_metadata_str(&child.metadata, "backend_kind") {
@@ -13357,7 +13355,20 @@ mod workspace_r5_tests {
         }
     }
 
-    fn peer(session: &SessionKey, stamp: &str) -> octos_agent::BackgroundTask {
+    // Scoped purge tests need the diagnostic from an abnormal peer lifetime.
+    fn failed_peer(session: &SessionKey, stamp: &str) -> octos_agent::BackgroundTask {
+        peer_outcome(session, stamp, false)
+    }
+
+    fn completed_peer(session: &SessionKey, stamp: &str) -> octos_agent::BackgroundTask {
+        peer_outcome(session, stamp, true)
+    }
+
+    fn peer_outcome(
+        session: &SessionKey,
+        stamp: &str,
+        completed: bool,
+    ) -> octos_agent::BackgroundTask {
         let supervisor = octos_agent::TaskSupervisor::new();
         let id = supervisor
             .try_register_peer_with_workspace(
@@ -13367,8 +13378,29 @@ mod workspace_r5_tests {
                 Some(stamp),
             )
             .unwrap();
-        supervisor.mark_completed(&id, Vec::new());
+        if completed {
+            supervisor.mark_completed(&id, Vec::new());
+        } else {
+            supervisor.mark_failed(&id, "workspace fixture peer failed".into());
+        }
         supervisor.get_task(&id).unwrap()
+    }
+
+    fn assert_child_items(runtime: &InProcessAgentOrchestrator, expected: &[&str]) {
+        let state = runtime.state();
+        let pending: Vec<_> = state.continuations.pending_items().collect();
+        assert_eq!(pending.len(), expected.len(), "{pending:?}");
+        for id in expected {
+            let item = pending
+                .iter()
+                .find(|item| {
+                    item.child_agent_id
+                        .as_ref()
+                        .is_some_and(|child| child.as_str() == *id)
+                })
+                .unwrap_or_else(|| panic!("missing child {id}: {pending:?}"));
+            assert_eq!(item.reason, MasterContinuationReason::ChildCompleted);
+        }
     }
 
     #[test]
@@ -13382,18 +13414,24 @@ mod workspace_r5_tests {
         orch.upsert_agent(native(&session, "other", "/tmp/other", "completed"))
             .unwrap();
         let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
-        let task = peer(&session, &stamp);
+        let task = failed_peer(&session, &stamp);
         orch.upsert_background_task_agent(&task, Some("workspace-r5"))
             .unwrap()
             .unwrap();
         orch.upsert_agent(native(&session, "native", "/tmp/ws", "completed"))
             .unwrap();
-        orch.clear_pending_terminal_continuations_for_session(
-            &session,
-            "workspace-r5",
-            Some(&stamp),
-            "stop",
+        let peer_id = background_task_agent_id(&task);
+        assert_child_items(&orch, &["native", "other", &peer_id]);
+        assert_eq!(
+            orch.clear_pending_terminal_continuations_for_session(
+                &session,
+                "workspace-r5",
+                Some(&stamp),
+                "stop",
+            ),
+            2
         );
+        assert_child_items(&orch, &["other"]);
         let state = orch.state();
         let pending: Vec<_> = state.continuations.pending_items().collect();
         assert!(
@@ -13414,17 +13452,28 @@ mod workspace_r5_tests {
         let orch = InProcessAgentOrchestrator::default();
         orch.upsert_agent(native(&session, "native", "/tmp/ws", "running"))
             .unwrap();
-        let task = peer(&session, "2f746d702f7773");
+        let task = completed_peer(&session, "2f746d702f7773");
         let (_, json) = orch
             .upsert_background_task_agent(&task, Some("workspace-r5"))
             .unwrap()
             .unwrap();
         assert_eq!(json["cwd"], "/tmp/ws", "cwd must remain a real path");
-        assert_eq!(
-            orch.state().continuations.pending_items().count(),
-            1,
-            "the running native sibling prevents a separate peer scatter"
-        );
+        let peer_id = background_task_agent_id(&task);
+        {
+            let state = orch.state();
+            assert_eq!(
+                state.agents[&peer_id].backend_kind,
+                PEER_HANDOFF_BACKEND_KIND
+            );
+            assert_eq!(
+                state.agents[&peer_id].workspace_scope,
+                WorkspaceScope::from_path(Path::new("/tmp/ws"))
+            );
+        }
+        assert_child_items(&orch, &[]);
+        orch.upsert_agent(native(&session, "native", "/tmp/ws", "completed"))
+            .unwrap();
+        assert_child_items(&orch, &["native"]);
     }
 
     #[test]
@@ -13435,8 +13484,10 @@ mod workspace_r5_tests {
         let dir = tempfile::tempdir().unwrap();
         let orch = InProcessAgentOrchestrator::default();
         orch.configure_supervisor_store(dir.path()).unwrap();
+        let task = failed_peer(&session, &stamp);
+        let peer_id = background_task_agent_id(&task);
         let (_, json) = orch
-            .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .upsert_background_task_agent(&task, Some("workspace-r5"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -13469,6 +13520,7 @@ mod workspace_r5_tests {
                 )
         );
         let orch = restored;
+        assert_child_items(&orch, &[&peer_id]);
         assert_eq!(
             orch.clear_pending_terminal_continuations_for_session(
                 &session,
@@ -13478,14 +13530,17 @@ mod workspace_r5_tests {
             ),
             0
         );
-        assert!(
+        assert_child_items(&orch, &[&peer_id]);
+        assert_eq!(
             orch.clear_pending_terminal_continuations_for_session(
                 &session,
                 "workspace-r5",
                 Some(&stamp),
                 "right-scope"
-            ) > 0
+            ),
+            1
         );
+        assert_child_items(&orch, &[]);
     }
 
     #[test]
@@ -13503,20 +13558,25 @@ mod workspace_r5_tests {
             ))
             .unwrap();
         let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
+        let task = failed_peer(&session, &stamp);
+        let peer_id = background_task_agent_id(&task);
         runtime
-            .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .upsert_background_task_agent(&task, Some("workspace-r5"))
             .unwrap()
             .unwrap();
         let restarted = InProcessAgentOrchestrator::default();
         restarted.configure_supervisor_store(dir.path()).unwrap();
-        assert!(
+        assert_child_items(&restarted, &["literal-hex", &peer_id]);
+        assert_eq!(
             restarted.clear_pending_terminal_continuations_for_session(
                 &session,
                 "workspace-r5",
                 Some(&stamp),
                 "stop"
-            ) > 0
+            ),
+            1
         );
+        assert_child_items(&restarted, &["literal-hex"]);
         let pending: Vec<_> = restarted
             .state()
             .continuations
@@ -13531,9 +13591,10 @@ mod workspace_r5_tests {
         );
     }
 
-    // Write the exact pre-#30 spelling into a separate durable store. The
-    // fixture uses real producer records, then removes only new scope metadata
-    // and rewrites the historic peer cwd/hash (not delivery IDs or revisions).
+    // Write historical scope spelling into a separate durable store. A real
+    // two-native scatter supplies the queued/completed carrier; the durable
+    // completed peer supplies legacy workspace evidence without generating a
+    // generic peer notification. IDs and revisions retain their old spelling.
     fn legacy_store(
         root: &Path,
         completed: bool,
@@ -13544,13 +13605,37 @@ mod workspace_r5_tests {
         let runtime = InProcessAgentOrchestrator::default();
         runtime.configure_supervisor_store(source.path()).unwrap();
         let stamp = crate::peers::workspace_scope_encode(Path::new("/tmp/ws")).unwrap();
-        let task = peer(&session, &stamp);
+        for id in ["legacy-native-a", "legacy-native-b"] {
+            runtime
+                .upsert_agent(native(&session, id, "/tmp/ws", "running"))
+                .unwrap();
+        }
+        let task = completed_peer(&session, &stamp);
         let child_id = background_task_agent_id(&task);
         runtime
             .upsert_background_task_agent(&task, Some("workspace-r5"))
             .unwrap()
             .unwrap();
+        for id in ["legacy-native-a", "legacy-native-b"] {
+            runtime
+                .upsert_agent(native(&session, id, "/tmp/ws", "completed"))
+                .unwrap();
+        }
         let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
+        assert_eq!(snapshot.children.len(), 3);
+        assert_eq!(snapshot.continuations.len(), 3);
+        let joins: Vec<_> = snapshot
+            .continuations
+            .values()
+            .filter(|record| {
+                supervisor_metadata_str(&record.metadata, "reason") == Some("scatter_join_complete")
+            })
+            .collect();
+        assert_eq!(joins.len(), 1);
+        assert_eq!(
+            supervisor_metadata_str(&joins[0].metadata, "payload:terminal_children"),
+            Some("2")
+        );
         let store = SupervisorStore::new(root);
         let old_hash = scatter_cwd_hash(&Some(legacy_workspace.into()));
         let mut old_scatter = String::new();
@@ -13561,18 +13646,24 @@ mod workspace_r5_tests {
         }
         for child in snapshot.children.values() {
             let mut child = child.clone();
-            child.workspace_path = Some(legacy_workspace.into());
+            if child.child_id == child_id {
+                assert_eq!(
+                    supervisor_metadata_str(&child.metadata, "backend_kind"),
+                    Some(PEER_HANDOFF_BACKEND_KIND)
+                );
+                child.workspace_path = Some(legacy_workspace.into());
+            }
             child.metadata.remove("workspace_scope");
             store.record_child_started(child).unwrap();
         }
         for record in snapshot.continuations.values() {
             let mut record = record.clone();
             record.metadata.remove("payload:workspace_scope");
-            record
-                .metadata
-                .insert("payload:workspace".into(), json!(legacy_workspace));
             if supervisor_metadata_str(&record.metadata, "reason") == Some("scatter_join_complete")
             {
+                record
+                    .metadata
+                    .insert("payload:workspace".into(), json!(legacy_workspace));
                 record.continuation_id = scatter_proof_key(&record.continuation_id, old_hash);
                 record
                     .metadata
@@ -13591,6 +13682,48 @@ mod workspace_r5_tests {
         }
         assert!(!old_scatter.is_empty());
         (session, group_id, old_scatter, 7, child_id)
+    }
+
+    #[test]
+    fn should_exclude_proven_legacy_peer_from_restored_native_join() {
+        let source = tempfile::tempdir().unwrap();
+        let (_, _, _, _, peer_id) = legacy_store(source.path(), false, "2f746d702f7773");
+        let snapshot = SupervisorStore::new(source.path()).load_state().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let store = SupervisorStore::new(destination.path());
+        for group in snapshot.groups.values() {
+            store.record_group_registered(group.clone()).unwrap();
+        }
+        for child in snapshot.children.values() {
+            let mut child = child.clone();
+            if child.child_id == peer_id {
+                child
+                    .metadata
+                    .insert("backend_kind".into(), json!("spawn_child_session"));
+                assert!(legacy_peer_workspace_provenance(&child));
+            }
+            store.record_child_started(child).unwrap();
+        }
+        let restored = InProcessAgentOrchestrator::default();
+        restored
+            .configure_supervisor_store(destination.path())
+            .unwrap();
+        let state = restored.state();
+        assert_eq!(
+            state.agents[&peer_id].backend_kind,
+            PEER_HANDOFF_BACKEND_KIND
+        );
+        assert_eq!(
+            state.agents[&peer_id].workspace_scope,
+            WorkspaceScope::from_raw(Some("/tmp/ws"))
+        );
+        let items: Vec<_> = state.continuations.pending_items().collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].reason,
+            MasterContinuationReason::ScatterJoinComplete
+        );
+        assert_eq!(items[0].metadata["terminal_children"], "2");
     }
 
     #[test]
@@ -13765,6 +13898,17 @@ mod workspace_r5_tests {
                 pending.len(),
                 1,
                 "only the missing epoch 2 may rebuild: {marker}"
+            );
+            assert_eq!(
+                pending[0].reason,
+                MasterContinuationReason::ScatterJoinComplete
+            );
+            assert_eq!(
+                pending[0]
+                    .metadata
+                    .get("terminal_children")
+                    .map(String::as_str),
+                Some("2")
             );
             assert!(pending[0].dedupe_key.as_str().ends_with("/2"));
             assert_eq!(item_workspace(&pending[0]), Some("/tmp/ws"));
@@ -13980,6 +14124,17 @@ mod workspace_r5_tests {
                 .cloned()
                 .collect();
             assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].reason,
+                MasterContinuationReason::ScatterJoinComplete
+            );
+            assert_eq!(
+                pending[0]
+                    .metadata
+                    .get("terminal_children")
+                    .map(String::as_str),
+                Some("2")
+            );
             assert!(pending[0].dedupe_key.as_str().ends_with("/3"));
             assert_eq!(item_workspace(&pending[0]), Some("/tmp/ws"));
         }
@@ -14026,6 +14181,13 @@ mod workspace_r5_tests {
         assert_eq!(
             pending[0].reason,
             MasterContinuationReason::ScatterJoinComplete
+        );
+        assert_eq!(
+            pending[0]
+                .metadata
+                .get("terminal_children")
+                .map(String::as_str),
+            Some("3")
         );
         assert_eq!(item_workspace(&pending[0]), None);
         assert_ne!(pending[0].dedupe_key.as_str(), old_id);
@@ -14122,8 +14284,10 @@ mod workspace_r5_tests {
             .upsert_agent(native(&session, "lossy-neighbor", &display, "completed"))
             .unwrap();
         let stamp = crate::peers::workspace_scope_encode(root).unwrap();
+        let task = failed_peer(&session, &stamp);
+        let peer_id = background_task_agent_id(&task);
         runtime
-            .upsert_background_task_agent(&peer(&session, &stamp), Some("workspace-r5"))
+            .upsert_background_task_agent(&task, Some("workspace-r5"))
             .unwrap()
             .unwrap();
         runtime
@@ -14149,7 +14313,8 @@ mod workspace_r5_tests {
                 .agents
                 .values()
                 .find(|agent| {
-                    agent.backend_kind == "spawn_child_session" && agent.nickname == "peer_handoff"
+                    agent.backend_kind == PEER_HANDOFF_BACKEND_KIND
+                        && agent.nickname == "peer_handoff"
                 })
                 .unwrap();
             assert_eq!(
@@ -14159,14 +14324,17 @@ mod workspace_r5_tests {
             );
         }
 
-        assert!(
+        assert_child_items(&restarted, &["native", "lossy-neighbor", &peer_id]);
+        assert_eq!(
             restarted.clear_pending_terminal_continuations_for_session(
                 &session,
                 "workspace-r5",
                 Some(&stamp),
                 "stop"
-            ) > 0
+            ),
+            2
         );
+        assert_child_items(&restarted, &["lossy-neighbor"]);
         let pending: Vec<_> = restarted
             .state()
             .continuations
@@ -15579,6 +15747,7 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         // One-shot: each verdict prompt embeds its own objective + evidence
         // and is never replayed, so skip prompt-cache writes.
         cache_retention: octos_llm::CacheRetention::None,
+        prompt_cache_context: None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
     let (verdict_text, usage) = match provider.chat(&messages, &[], &config).await {
@@ -16565,6 +16734,15 @@ fn enqueue_agent_terminal_continuations(
     // the item and a fresh enqueue would collapse to `Duplicate` without
     // retrying the durable write.
     retry_pending_unpersisted_scatters(state);
+    // A supervised peer row spans the peer's entire lifetime. Completed here
+    // means explicit peer_close, not newly available work: per-turn results
+    // already use the peer-fleet round gate. Keep the observation, not another
+    // pair of model turns after the master has gathered/retired the peer.
+    let is_peer = agent.backend_kind == PEER_HANDOFF_BACKEND_KIND;
+    if is_peer && matches!(agent.status.as_str(), "completed" | "closed") {
+        persist_agent_terminal(state, agent);
+        return;
+    }
     let group_id = agent_continuation_group_id(agent);
     let child_key = child_completed_dedupe_key(&group_id, &agent.session_id.0, &agent.agent_id);
     let prior_mark = state.delivered_child_marks.get(&child_key).cloned();
@@ -16783,6 +16961,11 @@ fn enqueue_agent_terminal_continuations(
             persist_agent_terminal(state, agent);
         }
     }
+    // An abnormal peer lifetime (e.g. an orphan without result.md) still gets
+    // its existing per-child diagnostic. It is never an ordinary spawn join.
+    if is_peer {
+        return;
+    }
 
     // #1707: siblings for the scatter/gather join MUST share a workspace. Two
     // agents that merely reuse the same wire `session_id` across different
@@ -16797,12 +16980,17 @@ fn enqueue_agent_terminal_continuations(
         .values()
         .filter(|candidate| {
             candidate.session_id == agent.session_id
+                && candidate.backend_kind != PEER_HANDOFF_BACKEND_KIND
                 && candidate.profile_id == agent.profile_id
                 && candidate.parent_agent_id == agent.parent_agent_id
                 && candidate.workspace_scope == agent.workspace_scope
         })
         .collect::<Vec<_>>();
-    if siblings.is_empty()
+    // A singleton already receives its per-child notification above. Joining
+    // that same one result creates a second model turn with no new work or
+    // evidence (observed as two background-completion answers in real TUI).
+    // Preserve genuine multi-child joins, including their failure summaries.
+    if siblings.len() < 2
         || !siblings
             .iter()
             .all(|candidate| is_agent_terminal_status(&candidate.status))
@@ -17008,7 +17196,7 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
     // agent per (group, session, profile, cwd, parent) cohort — the same
     // shape the live sibling scan in `enqueue_agent_terminal_continuations`
     // uses — and only cohorts whose every restored member is terminal are
-    // eligible.
+    // eligible. Like live delivery, a join requires two non-peer children.
     // (group, session, profile, cwd, parent) — the cohort identity the live
     // sibling scan filters on.
     // #15 R12-3 — `BTreeMap`, not `HashMap`: the rebuilt scatters enqueue in
@@ -17019,7 +17207,8 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
         std::collections::BTreeMap::new();
     for agent in state.agents.values() {
         let group_id = agent_continuation_group_id(agent);
-        if !group_id.starts_with("agent-group:") {
+        if !group_id.starts_with("agent-group:") || agent.backend_kind == PEER_HANDOFF_BACKEND_KIND
+        {
             continue;
         }
         cohorts
@@ -17037,7 +17226,7 @@ fn reconcile_missing_scatters_on_restore(state: &mut AutonomyRuntimeState) {
             .push(agent.clone());
     }
     for ((group_id, _session, _profile, _cwd, _parent), siblings) in cohorts {
-        if siblings.is_empty()
+        if siblings.len() < 2
             || !siblings
                 .iter()
                 .all(|candidate| is_agent_terminal_status(&candidate.status))
@@ -17305,7 +17494,11 @@ fn background_task_agent_status(task: &octos_agent::BackgroundTask) -> String {
 }
 
 fn background_task_backend_kind(task: &octos_agent::BackgroundTask) -> String {
-    if task.child_session_key.is_some() {
+    // register() allocates a child_session_key for peers too. The typed tool
+    // identity must win: a peer row tracks its lifetime, not a spawned turn.
+    if task.tool_name == "peer_handoff" {
+        PEER_HANDOFF_BACKEND_KIND.to_owned()
+    } else if task.child_session_key.is_some() {
         "spawn_child_session".to_owned()
     } else {
         format!("task_supervisor:{}", task.tool_name)
@@ -18129,9 +18322,17 @@ fn restore_agents_from_supervisor_state(
                 .clone()
                 .or_else(|| supervisor_metadata_str(&child.metadata, "nickname").map(str::to_owned))
                 .unwrap_or_else(|| child.child_id.clone()),
-            backend_kind: supervisor_metadata_str(&child.metadata, "backend_kind")
-                .unwrap_or("restored")
-                .to_owned(),
+            // #39: the same narrow provenance that decodes old peer scope
+            // also restores its logical lifetime identity. Historical peers
+            // must not become ordinary scatter members merely because their
+            // old producer preferred child_session_key over the tool name.
+            backend_kind: if legacy_peer_workspace_provenance(child) {
+                PEER_HANDOFF_BACKEND_KIND.to_owned()
+            } else {
+                supervisor_metadata_str(&child.metadata, "backend_kind")
+                    .unwrap_or("restored")
+                    .to_owned()
+            },
             status,
             last_task: restored_agent_last_task(child),
             cwd: workspace_compat
@@ -19960,6 +20161,32 @@ mod tests {
 
     struct NativeMockProvider {
         content: Result<String, String>,
+    }
+
+    struct NativeTruncatedProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NativeTruncatedProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            tools: &[octos_llm::ToolSpec],
+            config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let mut response = NativeMockProvider {
+                content: Ok("actual unfinished specialist analysis".into()),
+            }
+            .chat(messages, tools, config)
+            .await?;
+            response.stop_reason = octos_llm::StopReason::MaxTokens;
+            Ok(response)
+        }
+        fn model_id(&self) -> &str {
+            "native-truncated"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
     }
 
     #[async_trait::async_trait]
@@ -22346,6 +22573,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_preserve_max_tokens_partial_in_failed_native_specialist() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "native-partial");
+        let tools = Arc::new(ToolRegistry::with_builtins(dir.path()));
+        let result = orchestrator
+            .run_native_specialist(NativeSpecialistLaunchRequest {
+                agent_id: Some("native-partial".into()),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                role: "reviewer".into(),
+                nickname: "Partial Reviewer".into(),
+                task: "review".into(),
+                cwd: dir.path().to_path_buf(),
+                llm: Arc::new(NativeTruncatedProvider),
+                memory: Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap()),
+                tools: tools.clone(),
+                system_prompt: None,
+                agent_config: None,
+                task_ledger_path: None,
+                event_tx: None,
+                dispatch_policy: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, "failed");
+        let output = orchestrator
+            .read_agent_output(AgentOutputRequest {
+                agent_id: result.agent_id.clone(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                cursor: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(
+            output["text"]
+                .as_str()
+                .unwrap()
+                .contains("actual unfinished specialist analysis"),
+            "actual partial output must survive failure: {output}"
+        );
+        assert!(output["text"].as_str().unwrap().contains("incomplete"));
+        assert!(
+            !result.artifacts.is_empty(),
+            "actual partial summary remains readable"
+        );
+        let task = tools
+            .supervisor()
+            .get_task(&result.task_id.unwrap().to_string())
+            .unwrap();
+        assert_eq!(task.status, octos_agent::TaskStatus::Failed);
+        assert_eq!(task.artifact_count, Some(result.artifacts.len() as u32));
+    }
+
+    #[tokio::test]
     async fn native_specialist_dispatch_policy_accepts_sandbox_requirement() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -23669,6 +23953,141 @@ mod tests {
     }
 
     #[test]
+    fn should_queue_only_child_notification_for_singleton_terminal() {
+        for status in ["completed", "failed", "interrupted", "closed"] {
+            for unrelated in ["none", "peer", "workspace", "profile", "parent", "session"] {
+                let temp = tempfile::tempdir().unwrap();
+                let orchestrator = InProcessAgentOrchestrator::default();
+                orchestrator
+                    .configure_supervisor_store(temp.path())
+                    .unwrap();
+                let mut child = sample_agent("only-background-child", "tenant-a");
+                child.parent_agent_id = Some("master".into());
+                child.backend_kind = "spawn_child_session".into();
+                child.cwd = Some("/projects/a".into());
+                child.workspace_scope = WorkspaceScope::from_raw(child.cwd.as_deref());
+                let session = child.session_id.clone();
+                if unrelated != "none" {
+                    let mut other = child.clone();
+                    other.agent_id = "not-a-sibling".into();
+                    other.status = "completed".into();
+                    match unrelated {
+                        "peer" => other.backend_kind = PEER_HANDOFF_BACKEND_KIND.into(),
+                        "workspace" => other.cwd = Some("/projects/b".into()),
+                        "profile" => other.profile_id = "tenant-b".into(),
+                        "parent" => other.parent_agent_id = Some("other-parent".into()),
+                        "session" => other.session_id = SessionKey("other-session".into()),
+                        _ => unreachable!(),
+                    }
+                    other.workspace_scope = WorkspaceScope::from_raw(other.cwd.as_deref());
+                    orchestrator
+                        .state()
+                        .agents
+                        .insert(other.agent_id.clone(), other);
+                }
+                orchestrator
+                    .state()
+                    .agents
+                    .insert(child.agent_id.clone(), child);
+                orchestrator
+                    .set_agent_status("only-background-child", &session, "tenant-a", status, None)
+                    .unwrap();
+                let drained = orchestrator.drain_ready_continuations_for_session(
+                    &session,
+                    "tenant-a",
+                    MasterContinuationRuntimeState::idle(),
+                    usize::MAX,
+                );
+                assert_eq!(
+                    drained.len(),
+                    1,
+                    "singleton {status}, unrelated {unrelated}: one child outcome must not also schedule a joined answer: {drained:?}"
+                );
+                assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
+                assert_eq!(
+                    drained[0].metadata.get("status").map(String::as_str),
+                    Some(status)
+                );
+                let durable = SupervisorStore::new(temp.path()).load_state().unwrap();
+                assert_eq!(
+                    durable.continuations.len(),
+                    1,
+                    "no redundant join persisted for replay"
+                );
+                assert!(
+                    durable
+                        .children
+                        .values()
+                        .any(|child| child.terminal.is_some())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_keep_real_aggregate_join_for_two_non_peer_terminal_siblings() {
+        for status in ["completed", "failed", "interrupted", "closed"] {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let mut first = sample_agent("first-background-child", "tenant-a");
+            first.parent_agent_id = Some("master".into());
+            first.cwd = Some("/projects/a".into());
+            first.status = "completed".into();
+            let mut second = first.clone();
+            second.agent_id = "second-background-child".into();
+            second.status = "running".into();
+            let session = first.session_id.clone();
+            orchestrator
+                .state()
+                .agents
+                .insert(first.agent_id.clone(), first);
+            orchestrator
+                .state()
+                .agents
+                .insert(second.agent_id.clone(), second);
+            orchestrator
+                .set_agent_status(
+                    "second-background-child",
+                    &session,
+                    "tenant-a",
+                    status,
+                    None,
+                )
+                .unwrap();
+            let drained = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert_eq!(
+                drained.len(),
+                2,
+                "real aggregate join remains necessary for {status}"
+            );
+            assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
+            assert_eq!(
+                drained[0].metadata.get("status").map(String::as_str),
+                Some(status)
+            );
+            assert_eq!(
+                drained[1].reason,
+                MasterContinuationReason::ScatterJoinComplete
+            );
+            assert_eq!(
+                drained[1]
+                    .metadata
+                    .get("terminal_children")
+                    .map(String::as_str),
+                Some("2")
+            );
+            assert_eq!(
+                drained[1].metadata.get("workspace").map(String::as_str),
+                Some("/projects/a")
+            );
+        }
+    }
+
+    #[test]
     fn terminal_child_status_queues_master_continuations() {
         let orchestrator = InProcessAgentOrchestrator::default();
         let mut child_a = sample_agent("child-a", "tenant-a");
@@ -23731,6 +24150,241 @@ mod tests {
         );
     }
 
+    #[test]
+    fn peer_terminal_wake_should_classify_real_registration_before_child_session() {
+        let supervisor = octos_agent::TaskSupervisor::new();
+        for tool in ["peer_handoff", "spawn", "peer_handoff_other"] {
+            let id = supervisor.register(tool, tool, Some("peer-classification-master"));
+            let task = supervisor.get_task(&id).unwrap();
+            assert!(
+                task.child_session_key.is_some(),
+                "real registrations allocate a child session"
+            );
+            let is_peer = tool == "peer_handoff";
+            assert_eq!(
+                background_task_backend_kind(&task),
+                if is_peer {
+                    PEER_HANDOFF_BACKEND_KIND
+                } else {
+                    "spawn_child_session"
+                }
+            );
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let mut agent = sample_agent(&id, "peer-classification");
+            agent.backend_kind = background_task_backend_kind(&task);
+            let session = agent.session_id.clone();
+            orchestrator.state().agents.insert(id, agent);
+            assert_eq!(
+                session_has_live_supervised_work(&orchestrator.state(), &session),
+                !is_peer,
+                "peer lifetime must not pin a stale master marker; ordinary workers must still pin it"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_rejoin_native_cohort_when_peer_is_admitted_or_reforwarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey::with_profile("tenant-a", "api", "peer-admission");
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        for id in ["native-a", "native-b"] {
+            runtime
+                .upsert_agent(AgentUpsert {
+                    agent_id: id.into(),
+                    parent_agent_id: Some("master".into()),
+                    session_id: session.clone(),
+                    task_id: None,
+                    path: format!("master/{id}"),
+                    role: "worker".into(),
+                    nickname: id.into(),
+                    backend_kind: "native".into(),
+                    status: "completed".into(),
+                    last_task: None,
+                    cwd: None,
+                    profile_id: "tenant-a".into(),
+                })
+                .unwrap();
+        }
+        let joined = runtime.drain_ready_continuations_for_session(
+            &session,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(joined.len(), 1);
+        assert_eq!(
+            joined[0].reason,
+            MasterContinuationReason::ScatterJoinComplete
+        );
+        runtime.mark_continuation_completed(&joined[0], None);
+        let cohort = scatter_cohort_key(
+            &format!("agent-group:tenant-a:{session}:master"),
+            scatter_scope_hash(None),
+        );
+        let before = runtime.state().scatter_join_state[&cohort].join_epoch;
+        runtime
+            .upsert_agent(AgentUpsert {
+                agent_id: "peer".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session.clone(),
+                task_id: None,
+                path: "master/peer".into(),
+                role: "worker".into(),
+                nickname: "peer".into(),
+                backend_kind: PEER_HANDOFF_BACKEND_KIND.into(),
+                status: "completed".into(),
+                last_task: None,
+                cwd: None,
+                profile_id: "tenant-a".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.state().scatter_join_state[&cohort].join_epoch,
+            before,
+            "peer admission cannot expand an ordinary native cohort"
+        );
+        runtime.reconcile_scatter_for_existing_group(&session, "tenant-a", None);
+        assert_eq!(runtime.pending_continuation_count_for_test(), 0);
+        let reopened = InProcessAgentOrchestrator::default();
+        reopened.configure_supervisor_store(dir.path()).unwrap();
+        assert_eq!(reopened.pending_continuation_count_for_test(), 0);
+    }
+
+    #[test]
+    fn peer_terminal_wake_should_persist_peer_terminal_without_generic_wakes() {
+        for status in ["completed", "failed", "interrupted", "closed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let orchestrator = InProcessAgentOrchestrator::default();
+            orchestrator
+                .configure_supervisor_store(temp.path())
+                .unwrap();
+            let mut peer = sample_agent("supervised-peer", "tenant-a");
+            peer.parent_agent_id = Some("master".into());
+            peer.backend_kind = PEER_HANDOFF_BACKEND_KIND.into();
+            let session = peer.session_id.clone();
+            orchestrator
+                .state()
+                .agents
+                .insert(peer.agent_id.clone(), peer);
+            orchestrator
+                .set_agent_status(
+                    "supervised-peer",
+                    &session,
+                    "tenant-a",
+                    status,
+                    Some("Peer lifecycle settled".into()),
+                )
+                .unwrap();
+            let drained = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            if matches!(status, "completed" | "closed") {
+                assert!(
+                    drained.is_empty(),
+                    "peer {status} must not schedule ordinary child/join replies: {drained:?}"
+                );
+            } else {
+                assert_eq!(
+                    drained.len(),
+                    1,
+                    "abnormal lifetime keeps one diagnostic, never a redundant join"
+                );
+                assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
+                assert_eq!(
+                    drained[0].metadata.get("status").map(String::as_str),
+                    Some(status)
+                );
+            }
+            let durable = SupervisorStore::new(temp.path()).load_state().unwrap();
+            assert_eq!(
+                durable.children.len(),
+                1,
+                "peer lifecycle remains observable and replayable"
+            );
+            assert!(
+                durable
+                    .children
+                    .values()
+                    .all(|child| child.terminal.is_some())
+            );
+            if matches!(status, "completed" | "closed") {
+                let reopened = InProcessAgentOrchestrator::default();
+                reopened.configure_supervisor_store(temp.path()).unwrap();
+                assert!(
+                    reopened
+                        .drain_ready_continuations_for_session(
+                            &session,
+                            "tenant-a",
+                            MasterContinuationRuntimeState::idle(),
+                            usize::MAX
+                        )
+                        .is_empty(),
+                    "restart must not resurrect close notifications"
+                );
+                assert_eq!(
+                    reopened.state().agents["supervised-peer"].backend_kind,
+                    PEER_HANDOFF_BACKEND_KIND
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn peer_terminal_wake_should_exclude_peer_lifetimes_from_background_scatter_join() {
+        for peer_status in ["running", "completed"] {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let mut worker = sample_agent("background-worker", "tenant-a");
+            worker.parent_agent_id = Some("master".into());
+            let session = worker.session_id.clone();
+            let mut peer = worker.clone();
+            peer.agent_id = "sovereign-peer".into();
+            peer.backend_kind = PEER_HANDOFF_BACKEND_KIND.into();
+            peer.status = peer_status.into();
+            let mut completed_worker = worker.clone();
+            completed_worker.agent_id = "completed-background-worker".into();
+            completed_worker.status = "completed".into();
+            orchestrator
+                .state()
+                .agents
+                .insert(completed_worker.agent_id.clone(), completed_worker);
+            orchestrator
+                .state()
+                .agents
+                .insert(worker.agent_id.clone(), worker);
+            orchestrator
+                .state()
+                .agents
+                .insert(peer.agent_id.clone(), peer);
+            orchestrator
+                .set_agent_status("background-worker", &session, "tenant-a", "completed", None)
+                .unwrap();
+            let drained = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert_eq!(
+                drained.len(),
+                2,
+                "an open peer must not block ordinary child/join notifications"
+            );
+            let join = drained
+                .iter()
+                .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+                .unwrap();
+            assert_eq!(
+                join.metadata.get("terminal_children").map(String::as_str),
+                Some("2"),
+                "closed peers must not inflate the worker group"
+            );
+        }
+    }
+
     /// #1707: the scatter/gather join is workspace-scoped. A stale terminal
     /// child left in the roster under the SAME wire `session_id` but a
     /// DIFFERENT project cwd (sessions_in_cwd reuse) must NOT be counted as a
@@ -23755,6 +24409,13 @@ mod tests {
         stale_b.workspace_scope = WorkspaceScope::from_raw(stale_b.cwd.as_deref());
         stale_b.status = "completed".into();
         assert_eq!(stale_b.session_id, session_id, "same wire session key");
+        let mut completed_a = child_a.clone();
+        completed_a.agent_id = "completed-a".into();
+        completed_a.status = "completed".into();
+        orchestrator
+            .state()
+            .agents
+            .insert(completed_a.agent_id.clone(), completed_a);
         orchestrator
             .state()
             .agents
@@ -23792,7 +24453,7 @@ mod tests {
                 MasterContinuationReason::ScatterJoinComplete
             ]
         );
-        // ...but scoped to project A ONLY: terminal_children == 1, NOT 2. The
+        // ...but scoped to project A ONLY: terminal_children == 2, NOT 3. The
         // cross-workspace `stale-b` is excluded from the sibling set.
         let scatter = drained
             .iter()
@@ -23803,7 +24464,7 @@ mod tests {
                 .metadata
                 .get("terminal_children")
                 .map(String::as_str),
-            Some("1"),
+            Some("2"),
             "cross-workspace stale sibling must not inflate the join count"
         );
         assert_eq!(
@@ -23948,13 +24609,7 @@ mod tests {
             .iter()
             .map(|item| item.reason.clone())
             .collect::<Vec<_>>();
-        assert_eq!(
-            reasons,
-            vec![
-                MasterContinuationReason::ChildCompleted,
-                MasterContinuationReason::ScatterJoinComplete
-            ]
-        );
+        assert_eq!(reasons, vec![MasterContinuationReason::ChildCompleted]);
     }
 
     /// Gap-1 step 3: the explicit `child/<group>/<session>/<agent_id>`
@@ -24028,7 +24683,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -24112,7 +24767,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: Some(cwd.to_owned()),
@@ -24253,7 +24908,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: Some(cwd.to_owned()),
@@ -24312,6 +24967,13 @@ mod tests {
                 "workspace B's cohort has no join state yet (no fake bump entry)"
             );
         }
+        // Add a second ordinary child so B has a genuine aggregate join.
+        first
+            .upsert_agent(upsert("b-2", "running", "/tmp/ws-b"))
+            .unwrap();
+        first
+            .upsert_agent(upsert("b-2", "completed", "/tmp/ws-b"))
+            .unwrap();
         // B completes its roster → B joins at its OWN epoch 0.
         first
             .upsert_agent(upsert("b-1", "completed", "/tmp/ws-b"))
@@ -24404,7 +25066,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: Some(cwd.to_owned()),
@@ -24651,7 +25313,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -24902,7 +25564,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: "sc".to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{status}")),
             cwd: None,
@@ -24962,7 +25624,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: "rw".to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{status}")),
             cwd: None,
@@ -25025,7 +25687,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: "sr".to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{status}")),
             cwd: None,
@@ -25077,15 +25739,12 @@ mod tests {
         assert_eq!(baseline, 0, "nothing undelivered to recover at boot");
         fresh.forget_agent_for_test(&agent_id);
         fresh.upsert_agent(upsert("completed")).unwrap();
-        // The agent record was forgotten → treated as a NEW admission into
-        // the already-joined group, which correctly bumps the epoch and
-        // enqueues a new-epoch ScatterJoinComplete (exactly 1 item). The
-        // ChildCompleted re-enqueue is still suppressed by the durable mark.
+        // Forgetting and re-forwarding a singleton cannot create a scatter.
+        // Its ChildCompleted remains suppressed by the durable mark.
         assert_eq!(
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-sr"),
-            baseline + 1,
-            "same-status re-forward suppresses ChildCompleted but the epoch bump \
-             from the new admission produces exactly one new scatter"
+            baseline,
+            "same-status singleton re-forward remains suppressed without creating a scatter"
         );
         // A NEW correction (back to failed) still re-enters and delivers.
         fresh.forget_agent_for_test(&agent_id);
@@ -25137,7 +25796,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}-{status}")),
             cwd: None,
@@ -25292,7 +25951,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}-{status}")),
             cwd: None,
@@ -25409,7 +26068,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: "dd".to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{status}")),
             cwd: None,
@@ -25427,11 +26086,8 @@ mod tests {
         );
         assert_eq!(
             drained.iter().map(|i| i.reason.clone()).collect::<Vec<_>>(),
-            vec![
-                MasterContinuationReason::ChildCompleted,
-                MasterContinuationReason::ScatterJoinComplete
-            ],
-            "a single child keeps its natural two-step delivery"
+            vec![MasterContinuationReason::ChildCompleted],
+            "a singleton emits only its child verdict"
         );
         // The transport marks a drained continuation Completed after its turn;
         // do the same so boot recovery has nothing undelivered to replay.
@@ -25457,15 +26113,12 @@ mod tests {
         assert_eq!(baseline, 0, "nothing undelivered to recover at boot");
         fresh.forget_agent_for_test(&agent_id);
         fresh.upsert_agent(upsert("completed")).unwrap();
-        // The agent record was forgotten → treated as a NEW admission into
-        // the already-joined group, which correctly bumps the epoch and
-        // enqueues a new-epoch ScatterJoinComplete (exactly 1 item). The
-        // ChildCompleted re-enqueue is still suppressed by the durable mark.
+        // Forgetting and re-forwarding a singleton cannot create a scatter.
+        // Its ChildCompleted remains suppressed by the durable mark.
         assert_eq!(
             fresh.pending_continuation_count_for_session_for_test(&session_id, "tenant-dd"),
-            baseline + 1,
-            "same-status re-forward suppresses ChildCompleted but the epoch bump \
-             from the new admission produces exactly one new scatter"
+            baseline,
+            "same-status singleton re-forward stays retired without a scatter"
         );
 
         // A genuine correction (different terminal status) still re-enters.
@@ -25495,7 +26148,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -25643,7 +26296,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: format!("co-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(format!("done {idx}")),
                     cwd: None,
@@ -25723,7 +26376,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: format!("rs-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(format!("done {idx}")),
                     cwd: None,
@@ -25839,7 +26492,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: format!("ab-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(format!("done {idx}")),
                     cwd: None,
@@ -25934,7 +26587,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: format!("ls-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(format!("done {idx}")),
                     cwd: None,
@@ -25965,8 +26618,8 @@ mod tests {
             .expect("the scatter dedupe key's last segment is the join epoch");
         assert_eq!(
             epoch,
-            2,
-            "the carrier must be the LATEST-epoch scatter (0,1,2), not the oldest; key={}",
+            1,
+            "the carrier must be the LATEST-epoch scatter (0,1), not the oldest; key={}",
             carrier.dedupe_key.as_str()
         );
         assert_eq!(
@@ -26009,7 +26662,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: format!("uc-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(format!("done {idx}")),
                     cwd: None,
@@ -26028,15 +26681,15 @@ mod tests {
         assert_eq!(
             carrier.metadata.get("coalesced_count").map(String::as_str),
             Some("3"),
-            "3 child reports folded — the 2 superseded scatter control rows must NOT count"
+            "3 child reports folded — the superseded scatter control row must NOT count"
         );
         let folded = carrier
             .metadata
             .get("coalesced_children")
             .expect("folded list");
         assert!(
-            folded.matches("[scatter_join joined]").count() >= 2,
-            "both superseded scatters render as control rows: {folded}"
+            folded.matches("[scatter_join joined]").count() == 1,
+            "the superseded scatter renders as one control row: {folded}"
         );
 
         // Two distinct-cwd groups in ONE session: per-scope counts stay
@@ -26055,7 +26708,7 @@ mod tests {
                         path: format!("master/{agent_id}"),
                         role: "background_task".to_owned(),
                         nickname: agent_id.clone(),
-                        backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                        backend_kind: "spawn_child_session".to_owned(),
                         status: "completed".to_owned(),
                         last_task: Some(format!("done {agent_id}")),
                         cwd: Some(cwd.to_owned()),
@@ -26111,7 +26764,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: format!("nt-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(summary.clone()),
                     cwd: None,
@@ -26188,7 +26841,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: format!("tf-{idx}"),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(format!("done {idx}")),
                     cwd: None,
@@ -26266,7 +26919,7 @@ mod tests {
                         path: format!("{parent}/{agent_id}"),
                         role: "background_task".to_owned(),
                         nickname: format!("{parent}-{idx}"),
-                        backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                        backend_kind: "spawn_child_session".to_owned(),
                         status: "completed".to_owned(),
                         last_task: Some(format!("done {agent_id}")),
                         cwd: None,
@@ -26361,7 +27014,7 @@ mod tests {
                         path: format!("master/{agent_id}"),
                         role: "background_task".to_owned(),
                         nickname: agent_id.clone(),
-                        backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                        backend_kind: "spawn_child_session".to_owned(),
                         status: "completed".to_owned(),
                         last_task: Some(format!("done {agent_id}")),
                         cwd: Some(cwd.to_owned()),
@@ -26487,7 +27140,7 @@ mod tests {
         };
         octos_agent::BackgroundTask {
             id: task_id.into(),
-            tool_name: "peer_handoff".into(),
+            tool_name: "spawn".into(),
             tool_call_id: format!("call-{task_id}"),
             parent_session_key: Some(session.to_string()),
             child_session_key: None,
@@ -26537,7 +27190,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: "completed".to_owned(),
             last_task: Some(format!("done {agent_id}")),
             cwd: None,
@@ -26548,19 +27201,18 @@ mod tests {
         orchestrator
             .configure_supervisor_store(dir.path())
             .expect("store");
-        // A pending burst: three children, undelivered — 3 ChildCompleted +
-        // 1 ScatterJoinComplete (all-terminal edge on the third upsert).
+        // A pending burst: sequential terminal admissions produce three
+        // child verdicts and two genuine multi-child scatter joins.
         for agent_id in ["agent-1", "agent-2", "agent-3"] {
             orchestrator.upsert_agent(upsert(agent_id)).unwrap();
         }
         let pending_before = orchestrator
             .pending_continuation_count_for_session_for_test(&session_id, "tenant-stop");
-        // 3 ChildCompleted + 3 ScatterJoinComplete: admitting a child into an
-        // already-joined group bumps the join epoch (#2102), so the 2nd and
-        // 3rd completions enqueue NEW-epoch joins alongside the epoch-0 one.
+        // The second child forms epoch 0; admitting the third expands the
+        // joined cohort to epoch 1. The first singleton produces no scatter.
         assert_eq!(
-            pending_before, 6,
-            "3 child completes + 3 epoch-bumped scatter joins must be pending pre-purge"
+            pending_before, 5,
+            "3 child completes + 2 multi-child scatter joins must be pending pre-purge"
         );
 
         let purged = orchestrator.clear_pending_terminal_continuations_for_session(
@@ -26649,7 +27301,7 @@ mod tests {
             path: format!("master-{profile_id}/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: "completed".to_owned(),
             last_task: Some(format!("done {agent_id}")),
             cwd: None,
@@ -26660,9 +27312,8 @@ mod tests {
         orchestrator
             .configure_supervisor_store(dir.path())
             .expect("store");
-        // Two profiles, same bare session key: 2 children each → 2
-        // ChildCompleted + 2 ScatterJoinComplete per profile (the second
-        // completion of a group bumps the join epoch, #2102).
+        // Two profiles, same bare session key: each has two child verdicts
+        // and one aggregate scatter join.
         for profile_id in ["tenant-scope-a", "tenant-scope-b"] {
             for idx in 0..2 {
                 orchestrator
@@ -26673,14 +27324,14 @@ mod tests {
         assert_eq!(
             orchestrator
                 .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-a"),
-            4,
-            "profile A staged 2 child completes + 2 epoch-bumped scatter joins"
+            3,
+            "profile A staged 2 child completes + 1 multi-child scatter join"
         );
         assert_eq!(
             orchestrator
                 .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-b"),
-            4,
-            "profile B staged 2 child completes + 2 epoch-bumped scatter joins"
+            3,
+            "profile B staged 2 child completes + 1 multi-child scatter join"
         );
 
         // Purge with profile A only: A's items drop, B's are untouched even
@@ -26691,7 +27342,7 @@ mod tests {
             None,
             "session_interrupt_stop",
         );
-        assert_eq!(purged_a, 4, "the purge reports exactly A's pending items");
+        assert_eq!(purged_a, 3, "the purge reports exactly A's pending items");
         assert_eq!(
             orchestrator
                 .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-a"),
@@ -26701,7 +27352,7 @@ mod tests {
         assert_eq!(
             orchestrator
                 .pending_continuation_count_for_session_for_test(&session_id, "tenant-scope-b"),
-            4,
+            3,
             "profile B's pending items survive a purge scoped to profile A"
         );
 
@@ -26712,7 +27363,7 @@ mod tests {
             None,
             "session_interrupt_stop",
         );
-        assert_eq!(purged_b, 4, "the second purge reports exactly B's items");
+        assert_eq!(purged_b, 3, "the second purge reports exactly B's items");
         for profile_id in ["tenant-scope-a", "tenant-scope-b"] {
             assert_eq!(
                 orchestrator
@@ -26741,7 +27392,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: "completed".to_owned(),
             last_task: Some(format!("done {agent_id}")),
             cwd: cwd.map(str::to_owned),
@@ -26765,12 +27416,12 @@ mod tests {
         orchestrator
             .upsert_agent(upsert("agent-unstamped", None))
             .unwrap();
-        // ws-a: 2 child + 2 epoch-bumped joins; ws-b: same; unstamped: 1
-        // child + 1 join (the unstamped child joins its own group).
+        // Each stamped workspace has two child verdicts and one aggregate
+        // join. The unstamped singleton has only its child verdict.
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ws"),
-            10,
-            "4 per stamped workspace + 2 unstamped must be pending pre-purge"
+            7,
+            "3 per stamped workspace + 1 unstamped must be pending pre-purge"
         );
 
         // Purge with workspace /tmp/ws-a: only ws-a's items drop.
@@ -26780,10 +27431,10 @@ mod tests {
             Some("/tmp/ws-a"),
             "session_interrupt_stop",
         );
-        assert_eq!(purged_a, 4, "only ws-a's 2 child + 2 join items purge");
+        assert_eq!(purged_a, 3, "only ws-a's 2 child + 1 join items purge");
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ws"),
-            6,
+            4,
             "ws-b's and the unstamped items survive the ws-a purge"
         );
 
@@ -26805,12 +27456,12 @@ mod tests {
             "session_interrupt_stop",
         );
         assert_eq!(
-            purged_none, 2,
-            "the None purge matches exactly the unstamped child's pair"
+            purged_none, 1,
+            "the None purge matches exactly the unstamped child's single verdict"
         );
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-ws"),
-            4,
+            3,
             "ws-b's stamped items survive the None purge"
         );
 
@@ -26880,27 +27531,15 @@ mod tests {
         // the test-local instance.
         let sink = orchestrator.clone();
         supervisor.set_on_terminal(move |event| {
-            if matches!(event.outcome, octos_agent::TerminalOutcome::Completed) {
-                let _ = sink
-                    .upsert_background_task_agent(&event.task, Some(profile))
-                    .unwrap();
-            }
+            sink.upsert_background_task_agent(&event.task, Some(profile))
+                .unwrap();
         });
         task_id
     }
 
-    /// #1707 round 5 codex round 2 (board item #13 ROUND 2) — the /stop purge
-    /// must clear a `peer_handoff` child whose task was completed with EMPTY
-    /// output files (the `retire_peer_supervised_task` close path). This test
-    /// drives the REAL source chain: `TaskSupervisor::try_register_peer_with_workspace`
-    /// (what `bind_peer_supervised_task_with_workspace_strict` does at the WS
-    /// `emit_staged` registration point) →
-    /// `mark_completed(task_id, Vec::new())` → supervisor terminal event →
-    /// the mirror derives `cwd` from the REGISTRATION stamp (never from
-    /// `output_files`) → the purge with the SAME workspace root clears the
-    /// pending ChildCompleted. The pre-#13r2 code derived `cwd=None` for this
-    /// shape, so a `Some(ws)` purge matched NOTHING — `/stop` was a silent
-    /// no-op for live peer completions.
+    /// #39: failed peer lifetimes keep one diagnostic, scoped by the real
+    /// strict registration stamp even with empty output files. Successful
+    /// peer lifetimes now remain quiet and are covered separately below.
     #[test]
     fn stop_purge_clears_unstamped_peer_child_via_registered_workspace() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -26922,15 +27561,14 @@ mod tests {
             Some(workspace),
         );
 
-        // Live close path: completion with NO output files.
-        supervisor.mark_completed(&task_id, Vec::new());
+        // Abnormal lifetime: failure with NO output files still needs a scoped diagnostic.
+        supervisor.mark_failed(&task_id, "peer failed with no output files".into());
 
         let pending =
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile);
         assert_eq!(
-            pending, 2,
-            "one ChildCompleted + the epoch-0 ScatterJoinComplete (single-child \
-             group is all-terminal at once) must be pending pre-purge"
+            pending, 1,
+            "one failed-peer diagnostic must be pending pre-purge"
         );
         // The stamp came from the REGISTRATION workspace, not the (empty)
         // output files — the board-#13r2 falsified derivation.
@@ -26957,8 +27595,8 @@ mod tests {
             "session_interrupt_stop",
         );
         assert_eq!(
-            purged, 2,
-            "purge with the registered root must clear the peer child + join"
+            purged, 1,
+            "purge with the registered root must clear the failed-peer diagnostic"
         );
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
@@ -26990,11 +27628,11 @@ mod tests {
             Some(workspace),
         );
 
-        supervisor.mark_completed(&task_id, Vec::new());
+        supervisor.mark_failed(&task_id, "peer failed".into());
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
-            2,
-            "one ChildCompleted + the epoch-0 ScatterJoinComplete pre-purge"
+            1,
+            "one failed-peer diagnostic pre-purge"
         );
 
         let purged = orchestrator.clear_pending_terminal_continuations_for_session(
@@ -27009,20 +27647,15 @@ mod tests {
         );
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
-            2,
-            "the peer child + join survive a foreign-workspace purge"
+            1,
+            "the failed-peer diagnostic survive a foreign-workspace purge"
         );
     }
 
-    /// #1707 round 5 codex round 2 (board item #13 ROUND 2) — the orphan
-    /// ADOPTION path completes the parked task with
-    /// `output_files=[<profile-data>/peers/<slug>/result.md]`. The legacy
-    /// derivation would stamp `cwd=<…>/peers/<slug>` — never equal to the
-    /// master's workspace root — so the pre-#13r2 purge matched ZERO adopted
-    /// peer items. With the registration-time stamp the adopted child is
-    /// cleared by a purge with the SAME root, exactly like the close path.
+    /// Successful legacy adoption preserves the registered workspace in its
+    /// observation even though #2265 suppresses generic child/join wakes.
     #[test]
-    fn stop_purge_clears_adopted_peer_child() {
+    fn completed_peer_adoption_retains_registered_scope_without_generic_wakes() {
         let dir = tempfile::TempDir::new().unwrap();
         let profile = "tenant-peer-adopted";
         let session_id = SessionKey::with_profile(profile, "api", "peer-adopted");
@@ -27057,33 +27690,23 @@ mod tests {
         };
         assert_eq!(
             items.len(),
-            2,
-            "one ChildCompleted + the epoch-0 ScatterJoinComplete pending pre-purge"
+            0,
+            "adopted peer completion must not create generic child or scatter wakes"
         );
-        assert!(
-            items
-                .iter()
-                .all(|item| item_workspace(item) == Some(workspace)),
-            "every adopted-peer item must carry the REGISTERED workspace root, \
-             not the result.md parent dir ({}); the pre-#13r2 derivation \
-             stamped the peers dir and the purge missed it: {:?}",
-            result_md.parent().unwrap().display(),
-            items
-                .iter()
-                .map(|item| item_workspace(item).map(str::to_owned))
-                .collect::<Vec<_>>()
+        assert_eq!(
+            orchestrator.state().agents
+                [&background_task_agent_id(&supervisor.get_task(&task_id).unwrap())]
+                .workspace_scope,
+            WorkspaceScope::from_raw(Some(workspace)),
+            "completed peer observation retains the registered scope"
         );
-
         let purged = orchestrator.clear_pending_terminal_continuations_for_session(
             &session_id,
             profile,
             Some(workspace),
             "session_interrupt_stop",
         );
-        assert_eq!(
-            purged, 2,
-            "the adopted peer child + join purge under the registered root"
-        );
+        assert_eq!(purged, 0, "a completed peer has no generic wake to purge");
         assert_eq!(
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, profile),
             0,
@@ -27108,7 +27731,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("done {agent_id}")),
             cwd: None,
@@ -27252,7 +27875,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: "completed".to_owned(),
             last_task: Some(format!("done {agent_id}")),
             cwd: None,
@@ -30546,12 +31169,8 @@ mod tests {
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
-        assert_eq!(
-            drained[1].reason,
-            MasterContinuationReason::ScatterJoinComplete
-        );
     }
 
     #[test]
@@ -30599,7 +31218,7 @@ mod tests {
             usize::MAX,
         );
         assert!(busy.is_empty());
-        assert_eq!(orchestrator.pending_continuation_count_for_test(), 4);
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 2);
 
         let drained_a = orchestrator.drain_ready_continuations_for_session(
             &session_a,
@@ -30607,13 +31226,17 @@ mod tests {
             MasterContinuationRuntimeState::idle(),
             usize::MAX,
         );
-        assert_eq!(drained_a.len(), 2);
+        assert_eq!(drained_a.len(), 1);
+        assert_eq!(
+            drained_a[0].reason,
+            MasterContinuationReason::ChildCompleted
+        );
         assert!(
             drained_a
                 .iter()
                 .all(|item| item.profile_id.as_str() == "tenant-a")
         );
-        assert_eq!(orchestrator.pending_continuation_count_for_test(), 2);
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
     }
 
     #[test]
@@ -30974,6 +31597,175 @@ mod tests {
                 transition_actor: None,
             })
             .expect("user replace still works");
+    }
+
+    /// #2237 — archived is TERMINAL: creating a new goal after an operator
+    /// archive must succeed, mint a FRESH goal id, and leave the archived
+    /// record's ledger untouched.
+    #[tokio::test]
+    async fn model_create_goal_admits_after_archived() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-arch");
+        let first = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "first objective", Some(2_000))
+            .expect("initial create");
+        let first_id = first["goal_id"].as_str().expect("id").to_owned();
+
+        // Operator archive (the only archived-reachable path, #25).
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                None,
+                "archive",
+                "test archive",
+                None,
+            )
+            .expect("operator archive");
+
+        // The admission that USED to refuse with (status `archived`).
+        let second = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "second objective", Some(2_000))
+            .expect("create after archive must be admitted (#2237)");
+        let second_id = second["goal_id"].as_str().expect("new id").to_owned();
+        assert_ne!(second_id, first_id, "terminal replacement mints a fresh id");
+        assert_eq!(second["status"], json!("active"));
+
+        // The archived record's ledger is untouched by design (Fix B drops
+        // the in-memory record and never edits the old ledger); the fresh
+        // id + active status above are the pinned observables.
+    }
+
+    /// #2237 — complete stays admissible (behavior unchanged, now pinned).
+    #[tokio::test]
+    async fn model_create_goal_admits_after_complete_unchanged() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-comp");
+        let first = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "first", Some(2_000))
+            .expect("create");
+        let first_id = first["goal_id"].as_str().expect("id").to_owned();
+        orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect("complete");
+        let second = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "second", Some(2_000))
+            .expect("create after complete");
+        assert_ne!(
+            second["goal_id"].as_str().expect("id"),
+            first_id,
+            "fresh id minted"
+        );
+    }
+
+    /// #2237 — active still refuses, with the unchanged message.
+    #[tokio::test]
+    async fn model_create_goal_rejects_active_unchanged() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-active");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "one", None)
+            .expect("first");
+        let err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "two", None)
+            .expect_err("active refuses");
+        assert!(err.contains("unfinished goal (status `active`)"), "{err}");
+    }
+
+    /// #2237 — blocked and paused still refuse, each naming its status.
+    #[tokio::test]
+    async fn model_create_goal_rejects_blocked_and_paused() {
+        for (suffix, status) in [("blocked", "blocked"), ("paused", "paused")] {
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let session_id = SessionKey::with_profile("tenant-a", "api", suffix);
+            orchestrator
+                .model_create_goal(&session_id, "tenant-a", "one", None)
+                .expect("first");
+            // blocked is model-reachable via model_transition_goal; paused is
+            // a user/backend state — set it through set_goal's status knob.
+            if status == "blocked" {
+                orchestrator
+                    .model_transition_goal(&session_id, "tenant-a", status, "test", None)
+                    .await
+                    .expect("blocked transition");
+            } else {
+                orchestrator
+                    .set_goal(GoalSetRequest {
+                        session_id: session_id.clone(),
+                        profile_id: "tenant-a".to_owned(),
+                        objective: "one".to_owned(),
+                        status: Some(status.to_owned()),
+                        token_budget: None,
+                        transition_actor: Some("backend".to_owned()),
+                    })
+                    .map(|_| ())
+                    .unwrap_or(());
+            }
+            let err = orchestrator
+                .model_create_goal(&session_id, "tenant-a", "two", None)
+                .expect_err("unfinished refuses");
+            assert!(
+                err.contains(&format!("status `{status}`")),
+                "{status} named in: {err}"
+            );
+        }
+    }
+
+    /// #2237 — budget_limited still refuses.
+    #[tokio::test]
+    async fn model_create_goal_rejects_budget_limited() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-budget");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "one", Some(1_000))
+            .expect("first");
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 1_000);
+        // Lower the budget below used → set_goal flips the goal to
+        // budget_limited (the pre-existing #2010 semantics, see the twin
+        // test `set_goal_flips_active_goal_to_budget_limited_when_budget_
+        // lowered_below_used`).
+        let _ = orchestrator.set_goal(GoalSetRequest {
+            session_id: session_id.clone(),
+            profile_id: "tenant-a".to_owned(),
+            objective: "one".to_owned(),
+            status: Some("budget_limited".to_owned()),
+            token_budget: Some(1_000),
+            transition_actor: Some("backend".to_owned()),
+        });
+        let err = orchestrator
+            .model_create_goal(&session_id, "tenant-a", "two", None)
+            .expect_err("budget_limited refuses");
+        assert!(err.contains("budget_limited"), "{err}");
+    }
+
+    /// #2237 — goal_update on an archived goal points at create-new instead
+    /// of a stale-verdict refusal.
+    #[tokio::test]
+    async fn goal_update_on_archived_says_create_new() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "2237-update");
+        orchestrator
+            .model_create_goal(&session_id, "tenant-a", "objective", None)
+            .expect("create");
+        orchestrator
+            .operator_transition_goal(
+                &session_id,
+                "tenant-a",
+                None,
+                "archive",
+                "test archive",
+                None,
+            )
+            .expect("archive");
+        let err = orchestrator
+            .model_transition_goal(&session_id, "tenant-a", "complete", "done", None)
+            .await
+            .expect_err("update on archived refuses");
+        assert!(
+            err.contains("goal is archived; create a new goal instead"),
+            "guidance message: {err}"
+        );
     }
 
     #[tokio::test]
@@ -37818,22 +38610,26 @@ mod tests {
             .configure_supervisor_store(&store_dir)
             .expect("configure store");
         let session_id = SessionKey::with_profile("tenant-a", "api", "durable");
-        orchestrator
-            .upsert_agent(AgentUpsert {
-                agent_id: "child-a".into(),
-                parent_agent_id: Some("master".into()),
-                session_id: session_id.clone(),
-                task_id: None,
-                path: "master/child-a".into(),
-                role: "worker".into(),
-                nickname: "Ada".into(),
-                backend_kind: "native".into(),
-                status: "completed".into(),
-                last_task: Some("durable review done".into()),
-                cwd: None,
-                profile_id: "tenant-a".into(),
-            })
-            .unwrap();
+        // Two independent singleton groups keep selective-completion coverage:
+        // completing one occurrence must not erase another pending child.
+        for id in ["child-a", "child-b"] {
+            orchestrator
+                .upsert_agent(AgentUpsert {
+                    agent_id: id.into(),
+                    parent_agent_id: Some(format!("parent-{id}")),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    path: format!("parent-{id}/{id}"),
+                    role: "worker".into(),
+                    nickname: id.into(),
+                    backend_kind: "native".into(),
+                    status: "completed".into(),
+                    last_task: Some("durable review done".into()),
+                    cwd: None,
+                    profile_id: "tenant-a".into(),
+                })
+                .unwrap();
+        }
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 2);
 
         let restarted = InProcessAgentOrchestrator::default();
@@ -37849,6 +38645,7 @@ mod tests {
             1,
         );
         assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::ChildCompleted);
         restarted.mark_continuation_started(&drained[0]);
         restarted.mark_continuation_completed(&drained[0], Some("processed".into()));
 
@@ -37860,6 +38657,18 @@ mod tests {
             replayed_after_completion.pending_continuation_count_for_test(),
             1
         );
+        let remaining = replayed_after_completion.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].reason,
+            MasterContinuationReason::ChildCompleted
+        );
+        assert_ne!(remaining[0].child_agent_id, drained[0].child_agent_id);
     }
 
     // ---------------- #991 / M15-B trait extension tests ----------------
@@ -41222,7 +42031,8 @@ mod tests {
                 "git {args:?} failed"
             );
         };
-        run(&["init", "-q"]);
+        // Independent of the developer's init.defaultBranch (often main).
+        run(&["init", "-q", "-b", "fixture-seed"]);
         run(&["config", "user.name", "octos-test"]);
         run(&["config", "user.email", "octos-test@example.invalid"]);
         std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
@@ -41500,7 +42310,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: "completed".to_owned(),
             last_task: Some(last_task.to_owned()),
             cwd: None,
@@ -41617,7 +42427,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: "completed".to_owned(),
             last_task: Some(last_task.to_owned()),
             cwd: None,
@@ -41968,7 +42778,7 @@ mod tests {
             path: format!("master/{id}"),
             role: "background_task".into(),
             nickname: id.into(),
-            backend_kind: "task_supervisor:peer_handoff".into(),
+            backend_kind: "spawn_child_session".into(),
             status: status.into(),
             last_task: Some(format!("summary-{id}")),
             cwd: None,
@@ -42095,7 +42905,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: agent_id.to_owned(),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     last_task: Some(format!("done {agent_id}")),
                     cwd: None,
@@ -42109,12 +42919,11 @@ mod tests {
             "pending terminal items exist pre-purge"
         );
         orchestrator.set_force_tombstone_failure_once_for_test(true);
-        // 2 ChildCompleted + 2 scatter joins: admitting the second child
-        // bumps the join epoch (#2102), so its completion enqueues a NEW-epoch
-        // join alongside epoch 0's.
+        // Two child verdicts and one aggregate join: the first singleton
+        // emits no scatter; the second child forms the epoch-0 join.
         let pending_pre =
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-spr");
-        assert_eq!(pending_pre, 4, "2 children + 2 epoch-bumped joins pending");
+        assert_eq!(pending_pre, 3, "2 children + 1 multi-child join pending");
         let purged = orchestrator.clear_pending_terminal_continuations_for_session(
             &session_id,
             "tenant-spr",
@@ -42122,7 +42931,7 @@ mod tests {
             "turn/interrupt",
         );
         assert_eq!(
-            purged, 4,
+            purged, 3,
             "every pending terminal item of the session is purged"
         );
         drop(orchestrator);
@@ -42197,21 +43006,21 @@ mod tests {
             let sink = change_sink.clone();
             move |task| sink(task)
         });
-        for slug in ["ds-a", "ds-b"] {
-            let key = crate::peers::peer_wire_key(profile, slug);
-            let task_id = crate::peers::bind_peer_supervised_task_with_workspace_strict(
-                &supervisor,
-                key.clone(),
-                &session_id.0,
-                Some("/tmp/ws-nit2"),
-            )
-            .unwrap()
-            .unwrap();
-            supervisor.mark_completed(&task_id, Vec::new());
-            assert_eq!(
-                crate::peers::peer_task_registry().take(&key).as_deref(),
-                Some(task_id.as_str())
-            );
+        let ids: Vec<_> = ["ds-a", "ds-b"]
+            .into_iter()
+            .map(|call| {
+                supervisor
+                    .try_register_peer_with_workspace(
+                        "shell",
+                        call,
+                        Some(&session_id.0),
+                        Some("/tmp/ws-nit2"),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        for id in ids {
+            supervisor.mark_completed(&id, Vec::new());
         }
         assert_eq!(
             terminal_calls.load(Ordering::SeqCst),
@@ -42225,7 +43034,7 @@ mod tests {
         );
         assert_eq!(
             first.pending_continuation_count_for_session_for_test(&session_id, profile),
-            4
+            3
         );
         let terminal_events = events.lock().unwrap().clone();
 
@@ -42322,7 +43131,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -42479,7 +43288,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -42954,7 +43763,7 @@ mod tests {
                     path: format!("master/{agent_id}"),
                     role: "background_task".to_owned(),
                     nickname: agent_id.clone(),
-                    backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                    backend_kind: "spawn_child_session".to_owned(),
                     status: "completed".to_owned(),
                     // Short summary keeps the run fast; the CHAR budget is not
                     // what this test exercises.
@@ -43050,7 +43859,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -43148,7 +43957,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -43235,7 +44044,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -43364,7 +44173,7 @@ mod tests {
                 path: format!("master/{agent_id}"),
                 role: "background_task".to_owned(),
                 nickname: agent_id.to_owned(),
-                backend_kind: "task_supervisor:peer_handoff".to_owned(),
+                backend_kind: "spawn_child_session".to_owned(),
                 status: status.to_owned(),
                 last_task: Some(format!("summary-{agent_id}")),
                 cwd: None,
@@ -43508,7 +44317,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: agent_id.to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{agent_id}")),
             cwd: None,
@@ -43626,7 +44435,7 @@ mod tests {
             path: format!("master/{agent_id}"),
             role: "background_task".to_owned(),
             nickname: "stale".to_owned(),
-            backend_kind: "task_supervisor:peer_handoff".to_owned(),
+            backend_kind: "spawn_child_session".to_owned(),
             status: status.to_owned(),
             last_task: Some(format!("summary-{status}")),
             cwd: None,
@@ -43736,7 +44545,7 @@ mod tests {
             path: format!("master/{id}"),
             role: "background_task".into(),
             nickname: id.into(),
-            backend_kind: "task_supervisor:peer_handoff".into(),
+            backend_kind: "spawn_child_session".into(),
             status: status.into(),
             last_task: Some(format!("summary-{id}")),
             cwd: None,
@@ -44151,15 +44960,32 @@ mod tests {
                 .upsert_background_task_agent(task, Some(profile))
                 .unwrap();
         });
-        let wire = crate::peers::peer_wire_key(profile, "cancel-r5-child");
-        let task = crate::peers::bind_peer_supervised_task_with_workspace_strict(
-            &supervisor,
-            wire.clone(),
-            &session.0,
-            Some("/tmp/cancel-r5"),
-        )
-        .unwrap()
-        .unwrap();
+        let task = supervisor
+            .try_register_peer_with_workspace(
+                "shell",
+                "cancel-r5-child",
+                Some(&session.0),
+                Some("/tmp/cancel-r5"),
+            )
+            .unwrap();
+        let sibling = supervisor
+            .try_register_peer_with_workspace(
+                "shell",
+                "cancel-r5-sibling",
+                Some(&session.0),
+                Some("/tmp/cancel-r5"),
+            )
+            .unwrap();
+        supervisor.mark_completed(&sibling, Vec::new());
+        let prior = orch.drain_ready_continuations_for_session(
+            &session,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].reason, MasterContinuationReason::ChildCompleted);
+        orch.mark_continuation_completed(&prior[0], None);
         orch.set_force_scatter_persist_failure_for_test(true);
         supervisor.cancel(&task).unwrap();
         {
@@ -44185,10 +45011,6 @@ mod tests {
         );
         assert!(orch.state().pending_unpersisted_scatters.is_empty());
         retry_pending_unpersisted_scatters(&mut orch.state());
-        assert_eq!(
-            crate::peers::peer_task_registry().take(&wire).as_deref(),
-            Some(task.as_str())
-        );
         let fresh = InProcessAgentOrchestrator::default();
         fresh.configure_supervisor_store(dir.path()).unwrap();
         assert!(

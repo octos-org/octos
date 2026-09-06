@@ -44,6 +44,12 @@ Octos is a Rust-native AI agent platform that runs in three modes:
 - **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, DingTalk, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
 - **`octos chat`** — Interactive CLI chat for development and testing.
 
+Chat and `octos acp` use the same OUP session runtime as OctosCode, via an
+in-process connection. Both require the default `api` feature; no extra server
+process or network listener is required. They share OUP history, compaction,
+permissions and cancellation. ACP supports `session/load` replay and typed tool
+permissions; structured OUP user questions remain a terminal/OctosCode feature.
+
 ### Architecture
 
 ```
@@ -55,7 +61,7 @@ octos serve (control plane + dashboard, ~140 REST endpoints)
        │
        ├── LLM Provider (15 providers via AdaptiveRouter → ProviderChain → RetryProvider)
        ├── Tool Registry (~50 built-ins + plugins + 9 user-facing app-skills)
-       │     LRU deferral keeps ~15 active; spawn_only auto-routes to background
+       │     Full enabled tool set sent each turn; spawn_only auto-routes to background
        ├── Sandbox (bwrap / sandbox-exec / Docker / Windows AppContainer)
        ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
        ├── Swarm Dispatcher (/api/swarm/dispatch — fan-out to N sub-agents)
@@ -2141,7 +2147,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   ],
 
   // Agent settings
-  "max_iterations": 50,
+  "max_iterations": 0, // Unlimited interactive turn; spawn/MCP remain bounded
 
   // Embedding (for vector search in memory).
   // Remote, OpenAI-compatible:
@@ -2226,6 +2232,11 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 
 | Variable | Description |
 |----------|-------------|
+| **Long-running turns** | |
+| `OCTOS_CONVERGENCE_LLM_CALLS` | Tools-disabled reflection interval by LLM calls (default `20`) |
+| `OCTOS_CONVERGENCE_ACTIVE_TOKENS` | Reflection interval by uncached input + output tokens (default `100000`) |
+| `OCTOS_CONVERGENCE_SECS` | Reflection interval by elapsed seconds (default `300`) |
+| `OCTOS_FILE_CHURN_THRESHOLD` | Successful edits to one file before an early reflection; the second threshold also requests model/provider escalation (default `5`) |
 | **LLM Providers** | |
 | `ANTHROPIC_API_KEY` | Anthropic (Claude) API key |
 | `OPENAI_API_KEY` | OpenAI API key |
