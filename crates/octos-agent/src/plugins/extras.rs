@@ -51,8 +51,8 @@ pub struct SkillExtras {
 
 /// Resolve manifest extras against the skill directory.
 ///
-/// - MCP: resolves relative commands against `skill_dir`, looks up env var names
-///   from the process environment.
+/// - MCP: resolves relative commands and `./`/`../` arg elements against
+///   `skill_dir`, looks up env var names from the process environment.
 /// - Hooks: parses event strings into `HookEvent`, resolves relative command paths.
 /// - Discovery: renders a short 5-line skill card (PR-F) preceded by a
 ///   generic exploration preamble emitted once per call.
@@ -175,17 +175,35 @@ fn render_skill_card(
     card
 }
 
+/// Resolve a `./`/`../`-prefixed relative path against the skill dir;
+/// anything else (bare commands like "node", flags, absolute paths, plain
+/// arguments) passes through verbatim.
+fn resolve_skill_path(arg: &str, skill_dir: &Path) -> String {
+    let p = Path::new(arg);
+    if p.is_relative() && (arg.starts_with("./") || arg.starts_with("../")) {
+        skill_dir.join(p).to_string_lossy().into_owned()
+    } else {
+        arg.to_owned()
+    }
+}
+
 /// Convert a skill MCP server declaration into a runtime `McpServerConfig`.
 fn resolve_mcp_server(srv: &SkillMcpServer, skill_dir: &Path) -> McpServerConfig {
     // Resolve relative command paths against skill dir; bare commands (e.g. "node") left for PATH.
-    let command = srv.command.as_ref().map(|cmd| {
-        let p = Path::new(cmd);
-        if p.is_relative() && (cmd.starts_with("./") || cmd.starts_with("../")) {
-            skill_dir.join(p).to_string_lossy().into_owned()
-        } else {
-            cmd.clone()
-        }
-    });
+    let command = srv
+        .command
+        .as_ref()
+        .map(|cmd| resolve_skill_path(cmd, skill_dir));
+
+    // `connect_stdio` sets no `current_dir`, so the server process runs with
+    // the daemon's cwd — never the skill dir. Every `./`/`../` arg element
+    // must resolve here too; resolving only `command` leaves a script path
+    // like `["node", "./server.js"]` pointing at the wrong root.
+    let args = srv
+        .args
+        .iter()
+        .map(|arg| resolve_skill_path(arg, skill_dir))
+        .collect();
 
     // Resolve env var NAMES to actual values from the process environment.
     let mut env = HashMap::new();
@@ -197,7 +215,7 @@ fn resolve_mcp_server(srv: &SkillMcpServer, skill_dir: &Path) -> McpServerConfig
 
     McpServerConfig {
         command,
-        args: srv.args.clone(),
+        args,
         env,
         url: srv.url.clone(),
         headers: srv.headers.clone(),
@@ -298,6 +316,50 @@ mod tests {
             cmd == "/skills/my-skill/./bin/server" || cmd == "/skills/my-skill\\./bin/server",
             "unexpected resolved command: {cmd}"
         );
+    }
+
+    #[test]
+    fn test_resolve_mcp_relative_args() {
+        // `connect_stdio` sets no `current_dir`, so the server process runs
+        // with the daemon's cwd — never the skill dir. Every `./`/`../` arg
+        // element must resolve against the skill dir, otherwise
+        // `["./server.js"]` fails to find the script (issue #2255).
+        let srv = SkillMcpServer {
+            command: Some("node".into()),
+            args: vec![
+                "./server.js".into(),
+                "../shared/lib.js".into(),
+                "--port".into(),
+                "--config=./other.cfg".into(),
+                "..".into(),
+                "/abs/path.cfg".into(),
+                "plain-arg".into(),
+            ],
+            env: vec![],
+            url: None,
+            headers: HashMap::new(),
+        };
+        let config = resolve_mcp_server(&srv, Path::new("/skills/my-skill"));
+        assert!(
+            config.args[0] == "/skills/my-skill/./server.js"
+                || config.args[0] == "/skills/my-skill\\./server.js",
+            "unexpected resolved arg: {}",
+            config.args[0]
+        );
+        assert!(
+            config.args[1] == "/skills/my-skill/../shared/lib.js"
+                || config.args[1] == "/skills/my-skill\\../shared/lib.js",
+            "unexpected resolved arg: {}",
+            config.args[1]
+        );
+        // Flags, absolute paths, and plain arguments stay untouched.
+        assert_eq!(config.args[2], "--port");
+        // An embedded `./` after a flag value is not a leading path prefix.
+        assert_eq!(config.args[3], "--config=./other.cfg");
+        // A bare `..` (no trailing separator) matches neither prefix.
+        assert_eq!(config.args[4], "..");
+        assert_eq!(config.args[5], "/abs/path.cfg");
+        assert_eq!(config.args[6], "plain-arg");
     }
 
     #[test]
