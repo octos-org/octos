@@ -1349,6 +1349,21 @@ class OctosError:  # type: ignore
         def __repr__(self):
             return "OctosError.NoEmbedder({})".format(str(self))
     _UniffiTempOctosError.NoEmbedder = NoEmbedder # type: ignore
+    class Incomplete(_UniffiTempOctosError):
+        """
+        Provider output was truncated. This remains a failure; partial output
+        and consumed usage are available separately from the short diagnostic.
+        """
+
+        def __init__(self, partial):
+            super().__init__(", ".join([
+                "partial={!r}".format(partial),
+            ]))
+            self.partial = partial
+
+        def __repr__(self):
+            return "OctosError.Incomplete({})".format(str(self))
+    _UniffiTempOctosError.Incomplete = Incomplete # type: ignore
 
 OctosError = _UniffiTempOctosError # type: ignore
 del _UniffiTempOctosError
@@ -1377,6 +1392,10 @@ class _UniffiConverterTypeOctosError(_UniffiConverterRustBuffer):
         if variant == 5:
             return OctosError.NoEmbedder(
             )
+        if variant == 6:
+            return OctosError.Incomplete(
+                _UniffiConverterTypeTaskResult.read(buf),
+            )
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1395,6 +1414,9 @@ class _UniffiConverterTypeOctosError(_UniffiConverterRustBuffer):
             return
         if isinstance(value, OctosError.NoEmbedder):
             return
+        if isinstance(value, OctosError.Incomplete):
+            _UniffiConverterTypeTaskResult.check_lower(value.partial)
+            return
 
     @staticmethod
     def write(value, buf):
@@ -1412,6 +1434,9 @@ class _UniffiConverterTypeOctosError(_UniffiConverterRustBuffer):
             _UniffiConverterString.write(value.msg, buf)
         if isinstance(value, OctosError.NoEmbedder):
             buf.write_i32(5)
+        if isinstance(value, OctosError.Incomplete):
+            buf.write_i32(6)
+            _UniffiConverterTypeTaskResult.write(value.partial, buf)
 
 
 

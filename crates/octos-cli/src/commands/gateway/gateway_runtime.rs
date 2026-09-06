@@ -40,6 +40,7 @@ use crate::persona_service::PersonaService;
 use crate::profiles::UserProfile;
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::runtime::ProfileRuntime;
+use crate::runtime::session::UNATTENDED_MAX_ITERATIONS_FALLBACK;
 use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
@@ -1262,7 +1263,8 @@ impl GatewayRuntime {
         let system_prompt = Arc::new(std::sync::RwLock::new(system_prompt));
 
         // Build agent config (shared by all per-session agents)
-        let max_iterations = cmd.max_iterations.or(config.max_iterations).unwrap_or(50);
+        let max_iterations =
+            resolve_gateway_max_iterations(cmd.max_iterations, config.max_iterations);
         let session_timeout_secs = gw_config
             .session_timeout_secs
             .unwrap_or(octos_agent::DEFAULT_SESSION_TIMEOUT_SECS);
@@ -2267,9 +2269,47 @@ impl GatewayRuntime {
     }
 }
 
+/// Resolve the gateway agent iteration budget: the CLI flag, then
+/// `gateway.max_iterations`, then [`UNATTENDED_MAX_ITERATIONS_FALLBACK`].
+///
+/// The gateway is an unattended lane, so an unset budget must never inherit
+/// the unlimited interactive `AgentConfig` default (see the constant's docs).
+fn resolve_gateway_max_iterations(cli: Option<u32>, configured: Option<u32>) -> u32 {
+    cli.or(configured)
+        .unwrap_or(UNATTENDED_MAX_ITERATIONS_FALLBACK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_fall_back_to_finite_unattended_cap_when_gateway_max_iterations_unset() {
+        assert_eq!(
+            resolve_gateway_max_iterations(Some(7), Some(120)),
+            7,
+            "the CLI flag wins over config"
+        );
+        assert_eq!(resolve_gateway_max_iterations(None, Some(120)), 120);
+        assert_eq!(
+            resolve_gateway_max_iterations(None, Some(0)),
+            0,
+            "an explicit 0 keeps its documented unlimited meaning"
+        );
+        // The gateway is an UNATTENDED lane: no operator can interrupt a loop
+        // that keeps emitting progress, so unset must resolve to a concrete
+        // finite backstop rather than inherit the unlimited interactive
+        // `AgentConfig` default.
+        assert_eq!(resolve_gateway_max_iterations(None, None), 50);
+        assert_eq!(
+            resolve_gateway_max_iterations(None, None),
+            UNATTENDED_MAX_ITERATIONS_FALLBACK
+        );
+        assert_ne!(
+            resolve_gateway_max_iterations(None, None),
+            AgentConfig::default().max_iterations
+        );
+    }
 
     #[test]
     fn should_resolve_forwarded_host_asr_default_for_profile_gateway() {

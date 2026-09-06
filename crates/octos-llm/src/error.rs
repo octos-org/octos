@@ -64,6 +64,10 @@ pub struct LlmError {
     /// Operator-visible provider/model label (e.g. "anthropic",
     /// "MiniMax-M2.5-highspeed"). Empty when not provided.
     pub provider: String,
+    /// Wire protocol of the lane, rendered in `Display` as `api_style=…` so
+    /// status-code errors name the concrete lane the same way transport and
+    /// operational errors do. `provider` itself is unchanged for consumers.
+    pub api_style: Option<crate::provider::ApiStyle>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -73,6 +77,7 @@ impl LlmError {
             kind,
             message: message.into(),
             provider: String::new(),
+            api_style: None,
             source: None,
         }
     }
@@ -80,6 +85,12 @@ impl LlmError {
     /// Builder: attach the operator-visible provider/model label.
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
+        self
+    }
+
+    /// Builder: attach the lane's wire protocol (`api_style=…` in `Display`).
+    pub fn with_api_style(mut self, api_style: crate::provider::ApiStyle) -> Self {
+        self.api_style = Some(api_style);
         self
     }
 
@@ -248,6 +259,7 @@ impl LlmError {
             kind,
             message,
             provider,
+            api_style: None,
             source: None,
         }
     }
@@ -258,10 +270,11 @@ impl fmt::Display for LlmError {
     /// so the operator sees which lane failed (e.g.
     /// "API error (MiniMax-M2.5-highspeed): provider quota exhausted — HTTP 403 - ...").
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = if self.provider.is_empty() {
-            "API error".to_string()
-        } else {
-            format!("API error ({})", self.provider)
+        let prefix = match (self.provider.is_empty(), self.api_style) {
+            (true, None) => "API error".to_string(),
+            (true, Some(style)) => format!("API error (api_style={style})"),
+            (false, None) => format!("API error ({})", self.provider),
+            (false, Some(style)) => format!("API error ({}, api_style={style})", self.provider),
         };
         let summary = match &self.kind {
             LlmErrorKind::Authentication => "authentication failed",
@@ -790,5 +803,33 @@ mod tests {
         // After bridging, the source should still resolve to the original
         // StreamError so downstream logs preserve the typed context.
         assert!(llm.source().is_some());
+    }
+}
+
+#[cfg(test)]
+mod api_style_display_tests {
+    use super::{LlmError, LlmErrorKind};
+    use crate::provider::ApiStyle;
+
+    #[test]
+    fn should_render_api_style_in_display_only_when_set() {
+        let plain = LlmError::new(LlmErrorKind::ServerError { status: 503 }, "x")
+            .with_provider("zai-coding/glm-5.3");
+        assert_eq!(
+            plain.to_string(),
+            "API error (zai-coding/glm-5.3): provider server error — x"
+        );
+        let styled = LlmError::new(LlmErrorKind::ServerError { status: 503 }, "x")
+            .with_provider("zai-coding/glm-5.3")
+            .with_api_style(ApiStyle::AnthropicMessages);
+        assert_eq!(
+            styled.to_string(),
+            "API error (zai-coding/glm-5.3, api_style=anthropic_messages): provider server error — x"
+        );
+        assert_eq!(
+            styled.provider, "zai-coding/glm-5.3",
+            "label unchanged for consumers"
+        );
+        assert_eq!(styled.kind, LlmErrorKind::ServerError { status: 503 });
     }
 }

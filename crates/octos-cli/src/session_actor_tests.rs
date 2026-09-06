@@ -2264,6 +2264,7 @@ fn conversation_response_with_usage(
         files_modified: vec![],
         files_to_send: vec![],
         streamed: false,
+        assistant_segments: Default::default(),
         messages: vec![],
         tool_results: vec![],
         synthesized_from_spawn_only: false,
@@ -2509,9 +2510,17 @@ async fn master_continuation_tick_reenters_actor_loop() {
         "periodic actor tick must drain queued child completion into process_inbound"
     );
 
-    for _ in 0..10 {
-        tokio::time::advance(Duration::from_millis(250)).await;
-        tokio::task::yield_now().await;
+    // `process_inbound` persists through the real spawn-blocking JSONL path.
+    // This test uses a paused Tokio clock, so advancing virtual time alone
+    // cannot guarantee that the blocking-pool completion has been observed.
+    // Poll in bounded real-time slices, matching the goal-continuation test
+    // below, instead of racing the durable append.
+    for _ in 0..500 {
+        tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(2));
+        })
+        .await
+        .unwrap();
         let session_handle = SessionHandle::open(dir.path(), &session_id);
         if session_handle.session().messages.iter().any(|message| {
             message.role == MessageRole::Assistant
@@ -5174,6 +5183,551 @@ async fn test_agent_error_persists_to_history() {
 
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+#[cfg(feature = "api")]
+struct PartialReasoningProvider(Arc<DelayedMockProvider>);
+
+#[cfg(feature = "api")]
+#[async_trait]
+impl LlmProvider for PartialReasoningProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        self.0.chat(messages, tools, config).await
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatStream> {
+        // The trait's compatibility default does not emit reasoning deltas.
+        // Model a real reasoning-capable stream so the carrier is exercised.
+        let response = self.chat(messages, tools, config).await?;
+        let mut events = Vec::new();
+        if let Some(reasoning) = response.reasoning_content {
+            events.push(octos_llm::StreamEvent::ReasoningDelta(reasoning));
+        }
+        if let Some(text) = response.content {
+            events.push(octos_llm::StreamEvent::TextDelta(text));
+        }
+        for (index, call) in response.tool_calls.into_iter().enumerate() {
+            events.push(octos_llm::StreamEvent::ToolCallDelta {
+                index,
+                id: Some(call.id),
+                name: Some(call.name),
+                arguments_delta: call.arguments.to_string(),
+            });
+        }
+        events.push(octos_llm::StreamEvent::Usage(response.usage));
+        events.push(octos_llm::StreamEvent::Done(response.stop_reason));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+    fn model_id(&self) -> &str {
+        "partial-reasoning"
+    }
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+}
+
+async fn assert_incomplete_gateway_turn_preserves_partial(mode: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    let artifact = dir.path().join("partial-artifact.txt");
+    std::fs::write(&artifact, "actual partial artifact").unwrap();
+    let mut tool_response = make_response("partial preamble");
+    tool_response.stop_reason = StopReason::ToolUse;
+    tool_response.tool_calls = vec![octos_core::ToolCall {
+        id: "partial-read-call".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": artifact}),
+        metadata: None,
+    }];
+    let mut partial_response = make_response("actual unfinished assistant text");
+    partial_response.stop_reason = StopReason::MaxTokens;
+    partial_response.reasoning_content = Some("actual partial reasoning".into());
+    partial_response.usage.cache_read_tokens = 17;
+    partial_response.usage.cache_write_tokens = 19;
+    let provider = Arc::new(DelayedMockProvider::new(
+        "partial-provider",
+        vec![
+            (Duration::ZERO, tool_response),
+            (Duration::ZERO, partial_response),
+        ],
+    ));
+    let memory = Arc::new(
+        EpisodeStore::open(dir.path().join("partial-memory"))
+            .await
+            .unwrap(),
+    );
+    let gateway_provider: Arc<dyn LlmProvider> = {
+        #[cfg(feature = "api")]
+        {
+            Arc::new(PartialReasoningProvider(provider.clone()))
+        }
+        #[cfg(not(feature = "api"))]
+        {
+            provider.clone()
+        }
+    };
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("partial-gateway"),
+            gateway_provider,
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    // API metadata must retain a machine-readable incomplete outcome, while
+    // the visible content still contains the actual partial answer.
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("keep this user input") else {
+        unreachable!()
+    };
+    message.channel = "api".into();
+    message.metadata = serde_json::json!({"client_message_id": "partial-gateway-turn"});
+    match mode {
+        "serial" => actor.process_inbound(message, vec![], vec![], None).await,
+        "primary" => {
+            actor
+                .process_inbound_speculative(message, vec![], vec![], None)
+                .await
+        }
+        "overflow" => {
+            actor.serve_overflow(&message, &[]);
+            tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+                while actor.active_overflow_tasks.load(Ordering::Acquire) > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("overflow settles");
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "actual partial artifact"
+    );
+    let persisted = SessionHandle::open(dir.path(), &actor.session_key);
+    let rows = &persisted.session().messages;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.role == MessageRole::Assistant
+                && row.content == "actual unfinished assistant text")
+            .count(),
+        1,
+        "{mode}: the actual partial final must be persisted exactly once"
+    );
+    #[cfg(feature = "api")]
+    let partial_row = rows
+        .iter()
+        .find(|row| {
+            row.role == MessageRole::Assistant && row.content == "actual unfinished assistant text"
+        })
+        .unwrap();
+    #[cfg(feature = "api")]
+    assert_eq!(
+        partial_row.reasoning_content.as_deref(),
+        Some("actual partial reasoning")
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.role == MessageRole::User && row.content == "keep this user input")
+            .count(),
+        1
+    );
+    if mode != "overflow" {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::Assistant
+                    && row.content == "partial preamble"
+                    && row
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| calls[0].id == "partial-read-call"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::Tool
+                    && row.tool_call_id.as_deref() == Some("partial-read-call"))
+                .count(),
+            1
+        );
+        let tool_row = rows
+            .iter()
+            .find(|row| {
+                row.role == MessageRole::Tool
+                    && row.tool_call_id.as_deref() == Some("partial-read-call")
+            })
+            .unwrap();
+        assert!(
+            tool_row.content.contains("actual partial artifact"),
+            "actual tool output retained: {}",
+            tool_row.content
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row.role, MessageRole::Assistant | MessageRole::Tool))
+                .all(|row| row.thread_id.as_deref() == Some("partial-gateway-turn"))
+        );
+    } else {
+        assert!(
+            rows.iter()
+                .all(|row| row.role != MessageRole::Tool && row.tool_calls.is_none()),
+            "overflow retains its final-only concurrency policy"
+        );
+    }
+    let usage = actor.session_usage.snapshot();
+    assert_eq!(
+        usage.input_tokens, 100,
+        "{mode}: partial usage is still billed"
+    );
+    assert_eq!(usage.output_tokens, 20);
+    if mode == "serial" {
+        assert_eq!(actor.last_turn_total_tokens, 156);
+    }
+    let mut outbound = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        outbound.push(message);
+    }
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("actual unfinished assistant text")),
+        "{mode}: the caller must receive the partial text"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.metadata["truncated"] == true
+                && message.metadata["outcome"] == "incomplete"),
+        "{mode}: an actual partial response must never be reported as successful completion: {outbound:?}"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("incomplete")),
+        "{mode}: visible error notice is retained alongside the partial text"
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_serial_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("serial").await;
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_primary_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("primary").await;
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_overflow_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("overflow").await;
+}
+
+#[derive(Default)]
+struct PartialStreamChannel {
+    finishes: std::sync::Mutex<Vec<String>>,
+    starts: std::sync::atomic::AtomicUsize,
+}
+
+/// Fail only the final session append, after serve_overflow durably writes
+/// its user row and before the provider returns its streamed partial answer.
+struct PersistFailureStreamProvider {
+    inner: StreamingMockProvider,
+    sessions_dir: std::path::PathBuf,
+    preserved_dir: std::path::PathBuf,
+}
+
+#[async_trait]
+impl LlmProvider for PersistFailureStreamProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        std::fs::rename(&self.sessions_dir, &self.preserved_dir)?;
+        std::fs::write(&self.sessions_dir, "fixture final-append blocker")?;
+        self.inner.chat(messages, tools, config).await
+    }
+
+    fn model_id(&self) -> &str {
+        "partial-persist-failure"
+    }
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+}
+
+#[async_trait]
+impl octos_bus::Channel for PartialStreamChannel {
+    fn name(&self) -> &str {
+        "api"
+    }
+    async fn start(&self, _: mpsc::Sender<InboundMessage>) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn send(&self, _: &OutboundMessage) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn send_with_id(&self, _: &OutboundMessage) -> eyre::Result<Option<String>> {
+        self.starts.fetch_add(1, Ordering::Relaxed);
+        Ok(Some("partial-stream".into()))
+    }
+    async fn edit_message(&self, _: &str, _: &str, _: &str) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn finish_stream(&self, _: &str, _: &str, text: &str) -> eyre::Result<()> {
+        self.finishes.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+    fn supports_edit(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_streamed_overflow_without_second_bubble() {
+    streamed_incomplete_overflow_case(false).await;
+}
+
+#[tokio::test]
+async fn should_not_send_empty_overflow_notification_when_partial_persistence_fails() {
+    streamed_incomplete_overflow_case(true).await;
+}
+
+async fn streamed_incomplete_overflow_case(fail_final_persistence: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    let sessions_dir = actor
+        .session_handle
+        .lock()
+        .await
+        .task_state_path()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let preserved_dir = dir.path().join("preserved-overflow-user-session");
+    let mut response = make_response("streamed unfinished content");
+    response.stop_reason = StopReason::MaxTokens;
+    let provider = StreamingMockProvider::new(
+        "partial-stream",
+        vec![(
+            Duration::from_millis(250),
+            "streamed unfinished content".into(),
+            response,
+        )],
+    );
+    let provider: Arc<dyn LlmProvider> = if fail_final_persistence {
+        Arc::new(PersistFailureStreamProvider {
+            inner: provider,
+            sessions_dir: sessions_dir.clone(),
+            preserved_dir: preserved_dir.clone(),
+        })
+    } else {
+        Arc::new(provider)
+    };
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("partial-stream"),
+            provider,
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            Arc::new(
+                EpisodeStore::open(dir.path().join("stream-memory"))
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    let stream = Arc::new(PartialStreamChannel::default());
+    actor.status_indicator = Some(Arc::new(StatusComposer::new(
+        stream.clone(),
+        vec!["Thinking".into()],
+    )));
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("stream this") else {
+        unreachable!()
+    };
+    message.channel = "api".into();
+    message.metadata = serde_json::json!({"client_message_id": "overflow-partial-stream"});
+    actor.serve_overflow(&message, &[]);
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while actor.active_overflow_tasks.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        stream.starts.load(Ordering::Relaxed) > 0,
+        "actual streaming branch exercised"
+    );
+    {
+        let finishes = stream.finishes.lock().unwrap();
+        let final_edit = finishes.last().expect("the existing bubble is finalized");
+        assert_eq!(final_edit.matches("streamed unfinished content").count(), 1);
+        assert!(final_edit.contains("incomplete"));
+    }
+    let mut replies = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        replies.push(message);
+    }
+    assert!(
+        replies
+            .iter()
+            .all(|message| !message.content.contains("streamed unfinished content")),
+        "no second visible bubble after streaming"
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|message| message.metadata.get("_completion").is_none()),
+        "an overflow error must not close the primary stream"
+    );
+    let results: Vec<_> = replies
+        .iter()
+        .filter_map(|message| message.metadata.get("_session_result"))
+        .filter(|result| result["role"] == "assistant")
+        .collect();
+    if fail_final_persistence {
+        assert!(
+            sessions_dir.is_file() && preserved_dir.is_dir(),
+            "actual I/O fault exercised"
+        );
+        let rows = actor.session_handle.lock().await.session().messages.clone();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::User && row.content == "stream this")
+                .count(),
+            1,
+            "the user committed before the injected final-append failure"
+        );
+        assert!(
+            rows.iter().all(|row| row.role != MessageRole::Assistant),
+            "failed final append cannot claim persistence"
+        );
+        assert!(
+            results.is_empty(),
+            "no invented committed result after an I/O error"
+        );
+        assert!(
+            replies.iter().all(|message| !message.content.is_empty()
+                || message.metadata.get("_session_result").is_some()),
+            "no empty notification without durable identity after the existing bubble was finalized: {replies:?}"
+        );
+        return;
+    }
+    assert_eq!(
+        results.len(),
+        1,
+        "one authoritative durable fanout survives a closed primary"
+    );
+    assert_eq!(results[0]["outcome"], "incomplete");
+    assert_eq!(results[0]["tokens_in"], 50);
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("streamed unfinished content")
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_silent_serial_failure_without_fake_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    // Literal empty / thinking-only responses are retried before MaxTokens.
+    // The silence marker is a real nonempty response, but must not suppress
+    // the incomplete outcome or fabricate a success answer in a cron turn.
+    let raw_partial = "[SILENT]";
+    let mut response = make_response(raw_partial);
+    response.stop_reason = StopReason::MaxTokens;
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("empty-partial"),
+            Arc::new(DelayedMockProvider::new(
+                "empty-partial",
+                vec![(Duration::ZERO, response)],
+            )),
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            Arc::new(
+                EpisodeStore::open(dir.path().join("empty-memory"))
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        }),
+    );
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("silent partial") else {
+        unreachable!()
+    };
+    message.channel = "system".into();
+    message.sender_id = "cron".into();
+    actor.process_inbound(message, vec![], vec![], None).await;
+    let mut replies = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        replies.push(message);
+    }
+    assert!(
+        replies
+            .iter()
+            .any(|message| message.content.contains("incomplete"))
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|message| !message.content.contains("Session Summary")
+                && !message.content.contains("empty response"))
+    );
+    let persisted = SessionHandle::open(dir.path(), &actor.session_key);
+    let assistant_rows: Vec<_> = persisted
+        .session()
+        .messages
+        .iter()
+        .filter(|row| row.role == MessageRole::Assistant)
+        .collect();
+    assert_eq!(assistant_rows.len(), 1);
+    assert_eq!(
+        assistant_rows[0].content, raw_partial,
+        "no invented final row"
+    );
+    let terminal = replies
+        .iter()
+        .find(|message| message.metadata.get("_completion").is_some())
+        .unwrap();
+    assert_eq!(terminal.metadata["outcome"], "incomplete");
+    assert_eq!(terminal.metadata["tokens_in"], 50);
 }
 
 #[tokio::test]
