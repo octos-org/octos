@@ -1005,6 +1005,7 @@ printf 'done\n'
     #[tokio::test]
     async fn workspace_r6_non_utf8_native_cli_mcp_share_one_purge_without_lossy_neighbor() {
         use super::super::agent_orchestrator::NativeSpecialistLaunchRequest;
+        use super::super::supervisor_store::ContinuationStatus;
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -1171,10 +1172,9 @@ printf 'done\n'
         let raw_scope_key = WorkspaceScope::from_path(&raw_root).unwrap();
         let neighbor_scope_key = WorkspaceScope::from_path(&lossy_neighbor).unwrap();
         assert_ne!(raw_scope_key, neighbor_scope_key);
-        let snapshot =
-            super::super::supervisor_store::SupervisorStore::new(dir.path().join("supervisor"))
-                .load_state()
-                .unwrap();
+        let store =
+            super::super::supervisor_store::SupervisorStore::new(dir.path().join("supervisor"));
+        let snapshot = store.load_state().unwrap();
         let scatter_cohort = |scope: &WorkspaceScope| {
             let mut rows = snapshot
                 .continuations
@@ -1233,6 +1233,108 @@ printf 'done\n'
         );
         assert_ne!(raw_scatter[0].2, neighbor_scatter[0].2);
 
+        fn terminal_rows(
+            state: &super::super::supervisor_store::SupervisorState,
+            scope: &WorkspaceScope,
+        ) -> std::collections::HashMap<String, ContinuationStatus> {
+            state
+                .continuations
+                .values()
+                .filter(|record| {
+                    record
+                        .metadata
+                        .get("payload:workspace_scope")
+                        .and_then(Value::as_str)
+                        == Some(scope.key())
+                })
+                .filter(|record| {
+                    matches!(
+                        record.metadata.get("reason").and_then(Value::as_str),
+                        Some("child_completed" | "scatter_join_complete")
+                    )
+                })
+                .map(|record| (record.continuation_id.clone(), record.status.clone()))
+                .collect()
+        }
+        let raw_rows = terminal_rows(&snapshot, &raw_scope_key);
+        let neighbor_rows = terminal_rows(&snapshot, &neighbor_scope_key);
+        assert!(
+            !raw_rows.is_empty(),
+            "raw scope terminal cohort must be nonempty"
+        );
+        assert!(
+            !neighbor_rows.is_empty(),
+            "lossy-neighbor terminal cohort must be nonempty"
+        );
+        assert_eq!(
+            raw_rows.len(),
+            7,
+            "raw cohort must contain six pending rows and one seed"
+        );
+        assert_eq!(
+            neighbor_rows.len(),
+            3,
+            "lossy-neighbor cohort must contain two pending rows and one seed"
+        );
+        let raw_pending_ids = raw_rows
+            .iter()
+            .filter(|(_, status)| **status == ContinuationStatus::Queued)
+            .map(|(continuation_id, _)| continuation_id.clone())
+            .collect::<HashSet<_>>();
+        let neighbor_pending_ids = neighbor_rows
+            .iter()
+            .filter(|(_, status)| **status == ContinuationStatus::Queued)
+            .map(|(continuation_id, _)| continuation_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            raw_pending_ids.len(),
+            6,
+            "raw scope must expose exactly the six pending purge IDs"
+        );
+        assert_eq!(
+            neighbor_pending_ids.len(),
+            2,
+            "lossy-neighbor scope must expose exactly the two pending purge IDs"
+        );
+        let seed_ids_for_scope = |scope: &WorkspaceScope| {
+            snapshot
+                .continuations
+                .values()
+                .filter(|record| {
+                    record
+                        .metadata
+                        .get("payload:workspace_scope")
+                        .and_then(Value::as_str)
+                        == Some(scope.key())
+                })
+                .filter(|record| {
+                    record.status == ContinuationStatus::Completed
+                        && record.metadata.get("reason").and_then(Value::as_str)
+                            == Some("child_completed")
+                })
+                .map(|record| record.continuation_id.clone())
+                .collect::<HashSet<_>>()
+        };
+        let raw_seed_ids = seed_ids_for_scope(&raw_scope_key);
+        let neighbor_seed_ids = seed_ids_for_scope(&neighbor_scope_key);
+        assert_eq!(
+            raw_seed_ids.len(),
+            1,
+            "raw scope must retain its completed seed"
+        );
+        assert_eq!(
+            neighbor_seed_ids.len(),
+            1,
+            "lossy-neighbor scope must retain its completed seed"
+        );
+        let completed_rows = |rows: &std::collections::HashMap<String, ContinuationStatus>| {
+            rows.keys()
+                .map(|continuation_id| (continuation_id.clone(), ContinuationStatus::Completed))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let raw_completed_rows = completed_rows(&raw_rows);
+        let neighbor_completed_rows = completed_rows(&neighbor_rows);
+
         let raw_scope = crate::peers::workspace_scope_encode(&raw_root).unwrap();
         assert_eq!(
             orchestrator.clear_pending_terminal_continuations_for_session(
@@ -1244,6 +1346,32 @@ printf 'done\n'
             6,
             "one /stop must purge native, CLI, and MCP continuations in the raw-byte cohort"
         );
+        let after_raw_purge = store.load_state().unwrap();
+        let raw_rows_after_first_purge = terminal_rows(&after_raw_purge, &raw_scope_key);
+        assert_eq!(
+            raw_rows_after_first_purge, raw_completed_rows,
+            "fresh durable raw cohort load must preserve every row as Completed tombstones"
+        );
+        assert!(
+            raw_rows_after_first_purge
+                .values()
+                .all(|status| *status == ContinuationStatus::Completed),
+            "raw pending IDs must all be Completed after the first purge"
+        );
+        let neighbor_rows_after_first_purge = terminal_rows(&after_raw_purge, &neighbor_scope_key);
+        assert_eq!(
+            neighbor_rows_after_first_purge, neighbor_rows,
+            "the first purge must preserve both queued neighbor IDs and its completed seed"
+        );
+        let neighbor_pending_ids_after_first_purge = neighbor_rows_after_first_purge
+            .iter()
+            .filter(|(_, status)| **status == ContinuationStatus::Queued)
+            .map(|(continuation_id, _)| continuation_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            neighbor_pending_ids_after_first_purge, neighbor_pending_ids,
+            "the first purge must leave exactly the two previously queued neighbor IDs"
+        );
         let neighbor_scope = crate::peers::workspace_scope_encode(&lossy_neighbor).unwrap();
         assert_eq!(
             orchestrator.clear_pending_terminal_continuations_for_session(
@@ -1254,6 +1382,24 @@ printf 'done\n'
             ),
             2,
             "the real U+FFFD neighbor must remain after purging the raw-byte cohort"
+        );
+        let after_neighbor_purge = store.load_state().unwrap();
+        let raw_rows_after_second_purge = terminal_rows(&after_neighbor_purge, &raw_scope_key);
+        assert_eq!(
+            raw_rows_after_second_purge, raw_completed_rows,
+            "fresh durable raw cohort load must remain Completed after the neighbor purge"
+        );
+        let neighbor_rows_after_second_purge =
+            terminal_rows(&after_neighbor_purge, &neighbor_scope_key);
+        assert_eq!(
+            neighbor_rows_after_second_purge, neighbor_completed_rows,
+            "fresh durable neighbor cohort load must preserve every row as Completed tombstones"
+        );
+        assert!(
+            neighbor_rows_after_second_purge
+                .values()
+                .all(|status| *status == ContinuationStatus::Completed),
+            "neighbor pending IDs must all be Completed after the second purge"
         );
     }
 
