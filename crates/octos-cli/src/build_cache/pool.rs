@@ -178,7 +178,14 @@ pub struct Slot {
 #[derive(Debug)]
 pub enum BuildCacheError {
     /// Space gate refused the allocation (§5): `available_gb < min_gb`.
-    FreeSpaceLow { available_gb: f64, min_gb: u64 },
+    /// `available_bytes` is the raw measured count — `gate --json` (#5)
+    /// reports it directly instead of re-deriving precision from the
+    /// rounded `available_gb` (D5).
+    FreeSpaceLow {
+        available_bytes: u64,
+        available_gb: f64,
+        min_gb: u64,
+    },
     /// `fs2::available_space` failed (statvfs unavailable). Fail-closed:
     /// the whole point of this line is preventing full-disk incidents, so
     /// a failed measurement never lets an allocation through. Operators
@@ -198,11 +205,12 @@ impl fmt::Display for BuildCacheError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FreeSpaceLow {
+                available_bytes,
                 available_gb,
                 min_gb,
             } => write!(
                 f,
-                "free space {available_gb:.2} GB is below the {min_gb} GB gate — refusing to allocate a build-cache slot; run `octos cache gc --apply` or free disk space"
+                "free space {available_gb:.2} GB ({available_bytes} bytes) is below the {min_gb} GB gate — refusing to allocate a build-cache slot; run `octos cache gc --apply` or free disk space"
             ),
             Self::FreeSpaceUnknown { source } => write!(
                 f,
@@ -332,6 +340,12 @@ pub enum ReclaimOutcome {
     /// Unheld and past the stale window: `target/` removed (never
     /// `.lock`).
     Reclaimed,
+    /// Unheld and past the stale window, but nothing was deleted — a
+    /// report-only walk (`apply: false`) or a slot with no `target/` left
+    /// to reclaim. Carries the size `--apply` would free in
+    /// [`ReclaimReport::would_free_bytes`] so a report can say WHAT would
+    /// go, not merely that something would (D1).
+    Stale,
     /// Unheld but inside the stale window.
     Fresh,
     /// The slot dir exists but its `.lock` file does not — structurally
@@ -347,6 +361,7 @@ impl ReclaimOutcome {
             Self::Locked => "locked",
             Self::HolderCleared => "holder_cleared",
             Self::Reclaimed => "reclaimed",
+            Self::Stale => "stale",
             Self::Fresh => "fresh",
             Self::NoLock => "no_lock",
         }
@@ -361,6 +376,12 @@ pub struct ReclaimReport {
     /// Bytes freed for `Reclaimed` rows (directory size before removal),
     /// `0` otherwise.
     pub freed_bytes: u64,
+    /// Bytes `--apply` WOULD free now: the size of `target/` for `Stale`
+    /// rows (report mode), and of any tree that existed at decision time
+    /// for `Reclaimed`. `0` for every other outcome (D1: a report-only gc
+    /// must be able to say what it would reclaim, not just "fresh").
+    #[serde(default)]
+    pub would_free_bytes: u64,
 }
 
 /// Unix seconds now (0 on a pre-epoch clock — treated as maximally stale).
@@ -481,6 +502,7 @@ fn space_gate(pool_root: &Path, min_free_gb: u64) -> Result<(), BuildCacheError>
     let min_bytes = min_free_gb.saturating_mul(GIB);
     if available < min_bytes {
         return Err(BuildCacheError::FreeSpaceLow {
+            available_bytes: available,
             available_gb: available as f64 / GIB as f64,
             min_gb: min_free_gb,
         });
@@ -734,6 +756,7 @@ pub fn reclaim_stale(
                     slot_path: dir,
                     outcome: outcome.0,
                     freed_bytes: outcome.1,
+                    would_free_bytes: outcome.2,
                 });
             }
         }
@@ -741,12 +764,15 @@ pub fn reclaim_stale(
     Ok(reports)
 }
 
-/// Reclaim one slot dir, returning `(outcome, freed_bytes)`.
+/// Reclaim one slot dir, returning `(outcome, freed_bytes,
+/// would_free_bytes)`. `would_free_bytes` is only ever non-zero where the
+/// slot actually reached the reclaim arm — the bytes `--apply` would free
+/// right now (identical to `freed_bytes` for `Reclaimed`).
 fn reclaim_one(
     dir: &Path,
     _kind: SlotKind,
     policy: &GcPolicy,
-) -> Result<(ReclaimOutcome, u64), BuildCacheError> {
+) -> Result<(ReclaimOutcome, u64, u64), BuildCacheError> {
     let lock_path = dir.join(LOCK_LEAF);
     let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(f) => f,
@@ -755,7 +781,7 @@ fn reclaim_one(
             // unlocked-but-suspicious and skip — we never create it here,
             // because doing so could hand a racing creator's mutex to a
             // reclaimer. Reported as its own outcome (D6), not "fresh".
-            return Ok((ReclaimOutcome::NoLock, 0));
+            return Ok((ReclaimOutcome::NoLock, 0, 0));
         }
         Err(e) => {
             return Err(BuildCacheError::io(
@@ -765,7 +791,7 @@ fn reclaim_one(
         }
     };
     if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
-        return Ok((ReclaimOutcome::Locked, 0)); // live holder
+        return Ok((ReclaimOutcome::Locked, 0, 0)); // live holder
     }
     // Lock held for the duration of this check.
     let holder_path = dir.join(HOLDER_LEAF);
@@ -783,7 +809,7 @@ fn reclaim_one(
             Err(_) => false,
         };
         if !stale_holder {
-            return Ok((ReclaimOutcome::Locked, 0)); // holder alive
+            return Ok((ReclaimOutcome::Locked, 0, 0)); // holder alive
         }
         let _ = fs::remove_file(&holder_path); // dead holder: clear metadata
         holder_cleared = true;
@@ -801,19 +827,23 @@ fn reclaim_one(
     let age_secs = now_secs().saturating_sub(last_used);
     if age_secs <= policy.stale_hours * 3600 {
         return Ok(if holder_cleared {
-            (ReclaimOutcome::HolderCleared, 0)
+            (ReclaimOutcome::HolderCleared, 0, 0)
         } else {
-            (ReclaimOutcome::Fresh, 0)
+            (ReclaimOutcome::Fresh, 0, 0)
         });
     }
     let target = dir.join(TARGET_LEAF);
     if !policy.apply || !target.exists() {
-        return Ok((ReclaimOutcome::Fresh, 0));
+        // D1: report-only (or nothing left to delete) must still name the
+        // slot as stale and carry the bytes --apply would free, so `octos
+        // cache gc` output (and the outer loop consuming it in #6) can see
+        // exactly what a subsequent --apply would reclaim.
+        return Ok((ReclaimOutcome::Stale, 0, dir_size(&target)));
     }
     let freed = dir_size(&target);
     fs::remove_dir_all(&target)
         .map_err(|e| BuildCacheError::io(format!("failed to remove {}", target.display()), e))?;
-    Ok((ReclaimOutcome::Reclaimed, freed))
+    Ok((ReclaimOutcome::Reclaimed, freed, freed))
 }
 
 /// Byte size of a directory tree (best-effort; symlink targets not
@@ -1239,6 +1269,9 @@ mod tests {
             &HolderInfo::default(),
         )
         .unwrap();
+        // Put real bytes in target/ so the report can carry a non-zero
+        // would-free size (an empty dir measures 0).
+        fs::write(slot.target_dir.join("stale.bin"), vec![0u8; 4096]).unwrap();
         let dir = slot.path.clone();
         drop(slot);
         // Crash-simulation with the pid gone: clear the holder so the §6
@@ -1256,7 +1289,11 @@ mod tests {
         )
         .unwrap();
         let row = report.iter().find(|r| r.slot_path == dir).unwrap();
-        assert_eq!(row.outcome, ReclaimOutcome::Fresh); // not applied
+        // Past the window, apply=false → Stale carrying the would-free bytes
+        // (D1), never Reclaimed, and the tree survives.
+        assert_eq!(row.outcome, ReclaimOutcome::Stale);
+        assert!(row.would_free_bytes > 0, "would-free size must be carried");
+        assert_eq!(row.freed_bytes, 0);
         assert!(dir.join(TARGET_LEAF).is_dir());
     }
 
