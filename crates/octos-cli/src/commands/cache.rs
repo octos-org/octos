@@ -23,8 +23,8 @@ use eyre::{Result, WrapErr};
 
 use super::Executable;
 use crate::build_cache::pool::{
-    self, BuildCacheConfig, BuildCacheError, GcPolicy, HolderMeta, ReclaimOutcome, ReclaimReport,
-    SlotKind,
+    self, BuildCacheConfig, BuildCacheError, GcPolicy, HolderInfo, HolderMeta, ReclaimOutcome,
+    ReclaimReport, SlotKind, SlotOutcome,
 };
 
 /// `octos cache` — inspect and reclaim the build-cache pool.
@@ -71,6 +71,46 @@ enum CacheAction {
         #[arg(long, value_name = "N")]
         min_free_gb: Option<u64>,
     },
+    /// Acquire an outer-loop verification slot and print it in a
+    /// script-parseable form (see `octoloop` / OLP_OUTER_BOOT).
+    Acquire {
+        /// Emit machine-readable JSON instead of the SLOT/TARGET/RELEASE
+        /// lines.
+        #[arg(long)]
+        json: bool,
+        /// The MAIN repository the verification will build (repo-key
+        /// derivation input — the pool is shared per repository).
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+        /// Slot namespace. Only `verify` is exposed on the CLI today:
+        /// peer slots are acquired internally by serve and must not be
+        /// taken by hand (§1.3 namespaces).
+        #[arg(long, default_value = "verify")]
+        purpose: CacheAcquirePurpose,
+        /// Free-form label recorded in `holder.json` (shown by
+        /// `octos cache status`).
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// The pid whose lifetime the slot must span (#6 truth model:
+        /// `holder.json` + pid liveness is what keeps a CLI-acquired slot
+        /// held between processes). Defaults to the PARENT of this CLI
+        /// process, i.e. the shell/loop invoking `octos cache acquire`.
+        #[arg(long, value_name = "PID")]
+        pid: Option<u32>,
+    },
+    /// Release a verification slot acquired by `octos cache acquire`.
+    Release {
+        /// The slot directory exactly as printed by `acquire`.
+        #[arg(long, value_name = "DIR")]
+        slot: PathBuf,
+    },
+}
+
+/// The one purpose the CLI may acquire (`octos cache acquire` is the
+/// outer-loop entry, §1.3); keeps clap from accepting `--purpose peer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum CacheAcquirePurpose {
+    Verify,
 }
 
 impl Executable for CacheCommand {
@@ -83,6 +123,14 @@ impl Executable for CacheCommand {
                 apply,
             }) => self.run_gc(json, stale_hours, apply),
             Some(CacheAction::Gate { json, min_free_gb }) => self.run_gate(json, min_free_gb),
+            Some(CacheAction::Acquire {
+                json,
+                ref repo,
+                ref note,
+                ref pid,
+                ..
+            }) => self.run_acquire(json, repo, note.clone(), *pid),
+            Some(CacheAction::Release { ref slot }) => self.run_release(slot),
             // Bare `octos cache`: same "no wizard" posture as `octos config`
             // — print a read-only overview pointing at the subcommands.
             None => {
@@ -105,7 +153,11 @@ impl CacheCommand {
         match &self.action {
             Some(CacheAction::Status { json })
             | Some(CacheAction::Gc { json, .. })
-            | Some(CacheAction::Gate { json, .. }) => *json,
+            | Some(CacheAction::Gate { json, .. })
+            | Some(CacheAction::Acquire { json, .. }) => *json,
+            // `release` prints exactly one human line; parseable text, not
+            // JSON, is its contract.
+            Some(CacheAction::Release { .. }) => false,
             None => false,
         }
     }
@@ -334,6 +386,119 @@ impl CacheCommand {
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // acquire / release (#6, outer-loop entry)
+    // ------------------------------------------------------------------
+
+    /// `octos cache acquire --purpose verify --repo <dir>`
+    ///
+    /// Output contract (STABLE, script-parsed by OLP_OUTER_BOOT): the
+    /// first three stdout lines are exactly
+    ///
+    /// ```text
+    /// SLOT <slot dir>
+    /// TARGET <slot dir>/target
+    /// RELEASE octos cache release --slot <slot dir>
+    /// ```
+    ///
+    /// with `--json` carrying the same three fields under those names.
+    /// Anything else (human hints) goes to stderr or below the marker
+    /// lines, never before or between them.
+    fn run_acquire(
+        &self,
+        json: bool,
+        repo: &Path,
+        note: Option<String>,
+        pid: Option<u32>,
+    ) -> Result<()> {
+        let config = self.build_cache_config()?;
+        let pool_root = self.pool_root()?;
+        let repo_key = crate::build_cache::repo_key_for_path(repo).ok_or_else(|| {
+            eyre::eyre!(
+                "cannot derive a build-cache repo key from {} (canonicalization failed — does \
+                 the directory exist?)",
+                repo.display()
+            )
+        })?;
+
+        // Truth model (#6, docs/build-cache-pool.md §3.5 arm 2): the slot
+        // must stay held between THIS process's exit and a later
+        // `octos cache release`, so the pid recorded in holder.json is the
+        // one whose lifetime the verification spans. Default to the
+        // parent: the invoking shell / outer-loop driver outlives this
+        // one-shot CLI. (rustix `getppid` — std has no getppid; `None`
+        // means the parent already exited, in which case the slot would
+        // be immediately reap-able, so fall back to OUR pid and say so.)
+        let pid = pid
+            .or_else(|| {
+                rustix::process::getppid()
+                    .and_then(|p| u32::try_from(p.as_raw_nonzero().get()).ok())
+            })
+            .unwrap_or_else(std::process::id);
+
+        let holder = HolderInfo {
+            purpose_note: Some(note.unwrap_or_else(|| "verify".to_owned())),
+            pid_override: Some(pid),
+            ..HolderInfo::default()
+        };
+        let slot = pool::acquire_detached(&pool_root, &repo_key, &config, &holder)
+            .wrap_err("acquire: could not allocate a verify slot")?;
+
+        let release_cmd = format!("octos cache release --slot {}", shell_quoted(&slot.path));
+        if json {
+            let payload = AcquireJson {
+                slot: &slot.path,
+                target: &slot.target_dir,
+                release: release_cmd.as_str(),
+                pid,
+            };
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("SLOT {}", slot.path.display());
+            println!("TARGET {}", slot.target_dir.display());
+            println!("RELEASE {release_cmd}");
+            eprintln!(
+                "{} export CARGO_TARGET_DIR={} && export CARGO_INCREMENTAL=0",
+                "next".dimmed(),
+                slot.target_dir.display()
+            );
+            eprintln!(
+                "{} the slot is held in this pool until pid {pid} exits or the RELEASE command \
+                 runs (whichever first); gc skips live holders",
+                "note".dimmed()
+            );
+        }
+        Ok(())
+    }
+
+    /// `octos cache release --slot <dir>` — idempotent (outcome
+    /// `Completed`), refuses paths outside the pool root or missing the
+    /// slot's `.lock` (see `pool::release_detached`).
+    fn run_release(&self, slot: &Path) -> Result<()> {
+        let pool_root = self.pool_root()?;
+        match pool::release_detached(pool_root.as_path(), slot, SlotOutcome::Completed) {
+            Ok(()) => {
+                println!("released {}", slot.display());
+                Ok(())
+            }
+            Err(BuildCacheError::SlotNotFound { .. }) => {
+                // An idempotent double release is a no-op success; a path
+                // that never was a slot is surfaced distinctly but still
+                // exits non-zero — scripts must not mistake it for done.
+                eprintln!("{}", "release: no such slot".red().bold());
+                eprintln!("  {}", slot.display());
+                eprintln!(
+                    "  {}",
+                    "the pool never created this slot (missing .lock); check `octos cache status`"
+                        .dimmed()
+                );
+                std::process::exit(3);
+            }
+            Err(err) => Err(eyre::eyre!(err))
+                .wrap_err_with(|| format!("release: could not release {}", slot.display())),
+        }
+    }
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -463,6 +628,31 @@ impl<'a> GcJson<'a> {
                 .collect(),
         }
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AcquireJson<'a> {
+    slot: &'a Path,
+    target: &'a Path,
+    release: &'a str,
+    /// The pid recorded in `holder.json` — whose liveness keeps the slot
+    /// held (#6 truth model). Mirrored here so scripts can assert the
+    /// holder they expect.
+    pid: u32,
+}
+
+/// Shell-quote a path for the RELEASE line so paths with spaces stay one
+/// argument. POSIX-single-quote style: everything is literal between the
+/// quotes, an embedded quote closes/reopens with an escape.
+fn shell_quoted(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '~'))
+    {
+        return text.into_owned();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1037,6 +1227,266 @@ mod tests {
         assert!(pool_root_status_empty(&pool_root));
     }
 
+    /// Script-side parser for the acquire output (#6's contract): three
+    /// lines `SLOT <p>` / `TARGET <p>` / `RELEASE <cmd>`, in that order,
+    /// nothing before them. Returns None on any deviation — a loop script
+    /// would rather fail loudly than cargo into the wrong directory.
+    fn parse_acquire_output(stdout: &str) -> Option<(PathBuf, PathBuf, String)> {
+        let mut lines = stdout.lines();
+        let slot = lines.next()?.strip_prefix("SLOT ")?;
+        let target = lines.next()?.strip_prefix("TARGET ")?;
+        let release = lines.next()?.strip_prefix("RELEASE ")?;
+        if slot.is_empty() || target.is_empty() || release.is_empty() {
+            return None;
+        }
+        Some((
+            PathBuf::from(slot),
+            PathBuf::from(target),
+            release.to_owned(),
+        ))
+    }
+
+    #[test]
+    fn acquire_output_parses_with_the_script_parser() {
+        let fx = fixture();
+        let pool_root = fx.pool_root;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let key = repo_key_for_path(repo_dir.path()).unwrap();
+        // gate off, as everywhere in this module (arbitrary test disks)
+        let holder = HolderInfo {
+            purpose_note: Some("outer-loop verify".to_owned()),
+            pid_override: Some(std::process::id()),
+            ..HolderInfo::default()
+        };
+        let slot = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
+
+        // Render exactly what run_acquire prints (same fns, no colors on
+        // the three contract lines).
+        let stdout = format!(
+            "SLOT {}\nTARGET {}\nRELEASE octos cache release --slot {}\n",
+            slot.path.display(),
+            slot.target_dir.display(),
+            shell_quoted(&slot.path)
+        );
+        let (slot_out, target_out, release_out) =
+            parse_acquire_output(&stdout).expect("the three contract lines must parse in order");
+        assert_eq!(slot_out, slot.path);
+        assert_eq!(target_out, slot.path.join("target"));
+        assert_eq!(
+            release_out,
+            format!("octos cache release --slot {}", shell_quoted(&slot.path))
+        );
+        // Degenerate output must not half-parse.
+        assert!(parse_acquire_output("SLOT /a\nTARGET /b\n").is_none());
+        assert!(parse_acquire_output("").is_none());
+        assert!(parse_acquire_output("note\nSLOT /a\nTARGET /b\nRELEASE octos x\n").is_none());
+    }
+
+    #[test]
+    fn acquire_release_roundtrip_frees_the_verify_slot_for_reacquire() {
+        let pool_root = fixture().pool_root;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let key = repo_key_for_path(repo_dir.path()).unwrap();
+        let holder = HolderInfo {
+            pid_override: Some(std::process::id()),
+            ..HolderInfo::default()
+        };
+
+        // Acquire (CLI semantics: flock intentionally leaked away at
+        // process-exit, so from HERE on the slot is held by metadata only).
+        let first = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
+        // Held between processes: status must see it with purpose=verify.
+        let meta = pool::read_holder(&first.path).expect("holder.json written");
+        assert_eq!(meta.kind, SlotKind::Verify);
+        assert_eq!(meta.pid, std::process::id());
+        // A second detached acquire does NOT get PoolExhausted: detached
+        // slots hold no flock, so the pool cannot see the first claim at
+        // the mutex layer — it takes the same slot and OVERWRITES
+        // holder.json (last claimant wins). That is the honest semantics
+        // of the metadata-only truth model; what protects the outer loop
+        // is verify_slots sizing plus the pid liveness check, not the
+        // flock. Assert the overwrite, not exhaustion.
+        let second = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
+        assert_eq!(
+            second.path, first.path,
+            "same slot re-claimed (no flock to refuse it)"
+        );
+        let meta2 = pool::read_holder(&first.path).expect("holder.json overwritten");
+        assert_eq!(meta2.pid, std::process::id());
+
+        // Release from the "other process" (path-only API), then re-acquire
+        // must get the same slot back and reuse its target dir.
+        pool::release_detached(&pool_root, &second.path, SlotOutcome::Completed).unwrap();
+        assert!(pool::read_holder(&first.path).is_none(), "holder cleared");
+        let second = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
+        assert_eq!(second.path, first.path, "released slot is reusable");
+        assert_eq!(second.target_dir, first.target_dir);
+        // target contents survive release (I2 — the whole point of the pool)
+        assert!(second.target_dir.is_dir());
+    }
+
+    #[test]
+    fn release_is_idempotent() {
+        let pool_root = fixture().pool_root;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let key = repo_key_for_path(repo_dir.path()).unwrap();
+        let holder = HolderInfo {
+            pid_override: Some(std::process::id()),
+            ..HolderInfo::default()
+        };
+        let slot = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
+        pool::release_detached(&pool_root, &slot.path, SlotOutcome::Completed).unwrap();
+        // Second release: no holder.json left ⇒ no-op Ok, never an error —
+        // the outer loop may run its cleanup unconditionally.
+        pool::release_detached(&pool_root, &slot.path, SlotOutcome::Completed)
+            .expect("double release is a no-op");
+        // And a third after the last_used stamp: still fine.
+        pool::release_detached(&pool_root, &slot.path, SlotOutcome::Completed).unwrap();
+    }
+
+    #[test]
+    fn release_rejects_unknown_and_outside_paths_cleanly() {
+        let fx = fixture();
+        let pool_root = fx.pool_root;
+
+        // Not a slot: exists, under the pool root, but never had a .lock.
+        let not_a_slot = pool_root.join("0123456789ab/verify-7");
+        std::fs::create_dir_all(&not_a_slot).unwrap();
+        assert!(matches!(
+            pool::release_detached(&pool_root, &not_a_slot, SlotOutcome::Completed),
+            Err(BuildCacheError::SlotNotFound { .. })
+        ));
+
+        // Outside the pool root entirely (including via a plausible path).
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            pool::release_detached(&pool_root, &elsewhere.path(), SlotOutcome::Completed),
+            Err(BuildCacheError::SlotOutsidePool { .. })
+        ));
+
+        // Nonexistent path: canonicalize fails FIRST (the dir doesn't
+        // exist), which is reported as SlotNotFound — same script-facing
+        // meaning ("this is not a slot"), just detected one step earlier.
+        let ghost = pool_root.join("0123456789ab/verify-99");
+        assert!(matches!(
+            pool::release_detached(&pool_root, &ghost, SlotOutcome::Completed),
+            Err(BuildCacheError::SlotNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn detached_slot_is_held_for_status_between_processes() {
+        // The #6 truth model, end to end: acquire in "process A" (flock
+        // leaked away = A has exited), then the pool's OWN gc walk — the
+        // thing that would reclaim the slot — must treat it as held while
+        // the recorded pid is alive, and must reclaim it once that pid dies.
+        let pool_root = fixture().pool_root;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let key = repo_key_for_path(repo_dir.path()).unwrap();
+        let dead_pid = {
+            // Reap a freshly-exited child so test_kill_process(ESRCH)s.
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let live_holder = HolderInfo {
+            pid_override: Some(std::process::id()),
+            ..HolderInfo::default()
+        };
+        let slot = pool::acquire_detached(&pool_root, &key, &config(), &live_holder).unwrap();
+        std::fs::write(slot.target_dir.join("dep.bin"), vec![0u8; 2048]).unwrap();
+        // Backdate so staleness alone would reclaim it if it were unheld.
+        std::fs::write(slot.path.join("last_used"), b"0\n").unwrap();
+
+        // Live pid: gc must not touch the slot (skip = held), even though
+        // the flock is long gone (the CLI exited).
+        let reports = pool::reclaim_stale(
+            &pool_root,
+            &GcPolicy {
+                stale_hours: 1,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        let row = reports
+            .iter()
+            .find(|r| r.slot_path == slot.path)
+            .expect("the verify slot is reported");
+        assert_eq!(
+            row.outcome,
+            ReclaimOutcome::Locked,
+            "live pid keeps the slot held"
+        );
+        assert!(
+            slot.target_dir.join("dep.bin").exists(),
+            "contents untouched"
+        );
+
+        // Dead pid: gc clears the metadata first (HolderCleared — the slot
+        // was just re-acquired so last_used is fresh, nothing to delete),
+        // and a SECOND backdated pass then reclaims the target. Two steps
+        // mirrors §3.5 exactly: dead holder ⇒ demote to ownerless, THEN
+        // staleness applies on its own clock.
+        let dead_holder = HolderInfo {
+            pid_override: Some(dead_pid),
+            ..HolderInfo::default()
+        };
+        let slot2 = pool::acquire_detached(&pool_root, &key, &config(), &dead_holder).unwrap();
+        assert_eq!(
+            slot2.path, slot.path,
+            "freed by the gc pass above, re-acquired"
+        );
+        let reports = pool::reclaim_stale(
+            &pool_root,
+            &GcPolicy {
+                stale_hours: 1,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        let row = reports
+            .iter()
+            .find(|r| r.slot_path == slot.path)
+            .expect("reported again");
+        assert_eq!(
+            row.outcome,
+            ReclaimOutcome::HolderCleared,
+            "dead holder ⇒ metadata cleared"
+        );
+        assert!(
+            slot.target_dir.join("dep.bin").exists(),
+            "fresh clock: target kept this pass"
+        );
+
+        // Backdate past the window and walk once more: now it reclaims.
+        std::fs::write(slot.path.join("last_used"), b"0\n").unwrap();
+        let reports = pool::reclaim_stale(
+            &pool_root,
+            &GcPolicy {
+                stale_hours: 1,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        let row = reports
+            .iter()
+            .find(|r| r.slot_path == slot.path)
+            .expect("reported a third time");
+        assert_eq!(
+            row.outcome,
+            ReclaimOutcome::Reclaimed,
+            "ownerless + stale ⇒ reclaimed"
+        );
+        assert!(
+            !slot.target_dir.join("dep.bin").exists(),
+            "target cleared by gc --apply"
+        );
+    }
+
     #[test]
     fn clap_subcommands_parse() {
         // Parse through the REAL `octos` Args (the way `octos cache …` is
@@ -1071,6 +1521,43 @@ mod tests {
             "--json",
         ])
         .expect("`octos cache gate --min-free-gb 10 --json` must parse");
+        // #6: the outer-loop acquire/release pair.
+        crate::commands::Args::try_parse_from([
+            "octos",
+            "cache",
+            "acquire",
+            "--purpose",
+            "verify",
+            "--repo",
+            "/repo/under/verify",
+            "--note",
+            "outer-loop recheck",
+            "--pid",
+            "4242",
+            "--json",
+        ])
+        .expect("`octos cache acquire --purpose verify …` must parse");
+        crate::commands::Args::try_parse_from([
+            "octos",
+            "cache",
+            "release",
+            "--slot",
+            "/pool/0123456789ab/verify-1",
+        ])
+        .expect("`octos cache release --slot …` must parse");
+        // Peer namespace is NOT acquireable by hand (§1.3 namespaces).
+        assert!(
+            crate::commands::Args::try_parse_from([
+                "octos",
+                "cache",
+                "acquire",
+                "--purpose",
+                "peer",
+                "--repo",
+                "."
+            ])
+            .is_err()
+        );
         // Bare `octos cache` still parses (overview).
         crate::commands::Args::try_parse_from(["octos", "cache"])
             .expect("bare `octos cache` must parse");

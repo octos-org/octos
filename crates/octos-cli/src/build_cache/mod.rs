@@ -43,6 +43,7 @@ pub mod repo_key;
 
 pub use pool::{
     BuildCacheConfig, BuildCacheError, GcPolicy, ReclaimOutcome, ReclaimReport, Slot, SlotKind,
-    SlotPurpose, acquire, reclaim_stale, release, touch,
+    SlotOutcome, SlotPurpose, acquire, acquire_detached, reclaim_stale, release, release_detached,
+    touch,
 };
 pub use repo_key::{RepoKeyParseError, repo_key, repo_key_for_path};

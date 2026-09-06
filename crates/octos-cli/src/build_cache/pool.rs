@@ -139,6 +139,26 @@ impl SlotKind {
             .ok()
             .filter(|n| *n > 0)
     }
+
+    /// Namespace of a slot DIR, read off its final path component. Falls
+    /// back to `Peer` for anything not named `verify-N` — diagnostics-only
+    /// (the value feeds the `release` log line), and the pool's truth is
+    /// the `.lock`, not this label.
+    fn from_slot_dir_name(slot_dir: &Path) -> Self {
+        match slot_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                n.strip_prefix(VERIFY_PREFIX)
+                    .and_then(|rest| rest.parse::<u32>().ok())
+                    .is_some()
+            })
+            .unwrap_or(false)
+        {
+            true => Self::Verify,
+            false => Self::Peer,
+        }
+    }
 }
 
 impl From<SlotPurpose> for SlotKind {
@@ -199,6 +219,16 @@ pub enum BuildCacheError {
         context: String,
         source: std::io::Error,
     },
+    /// `release --slot <path>`: the path is not under the pool root (or
+    /// escapes it via a symlink). Boundary enforced before any open/remove.
+    SlotOutsidePool { slot: PathBuf, pool_root: PathBuf },
+    /// `release --slot <path>`: no `.lock` under the named dir — i.e. not
+    /// a slot this pool ever created.
+    SlotNotFound { slot: PathBuf },
+    /// `release --slot <path>`: the `.lock` is currently flocked by a live
+    /// holder (a peer turn or a still-running acquire CLI). Detached
+    /// release must not race a live one.
+    SlotHeld { slot: PathBuf },
 }
 
 impl fmt::Display for BuildCacheError {
@@ -227,6 +257,22 @@ impl fmt::Display for BuildCacheError {
                 )
             }
             Self::Io { context, source } => write!(f, "{context}: {source}"),
+            Self::SlotOutsidePool { slot, pool_root } => write!(
+                f,
+                "refusing to release {} — it is not under the build-cache pool root {}",
+                slot.display(),
+                pool_root.display()
+            ),
+            Self::SlotNotFound { slot } => write!(
+                f,
+                "no build-cache slot at {} (missing .lock — not a slot this pool created)",
+                slot.display()
+            ),
+            Self::SlotHeld { slot } => write!(
+                f,
+                "build-cache slot {} is currently held by a live process — refusing a detached release; retry when the holder finishes, or inspect `octos cache status`",
+                slot.display()
+            ),
         }
     }
 }
@@ -318,6 +364,13 @@ pub struct HolderInfo {
     pub goal_id: Option<String>,
     pub task_id: Option<String>,
     pub purpose_note: Option<String>,
+    /// Record THIS pid in holder.json instead of the current process
+    /// (#6): `octos cache acquire` exits right after acquiring, so its own
+    /// pid is useless for §3.5 liveness — the pid that must be checked is
+    /// the one whose lifetime the slot is supposed to span (the outer
+    /// loop's driver). `None` (all peer-path callers) records
+    /// `std::process::id()` as before.
+    pub pid_override: Option<u32>,
 }
 
 /// Reclamation policy (§6): stale window plus whether to actually delete
@@ -590,7 +643,7 @@ pub fn acquire(
                 let now = now_secs();
                 let meta = HolderMeta {
                     kind,
-                    pid: std::process::id(),
+                    pid: holder.pid_override.unwrap_or_else(std::process::id),
                     slug: holder.slug.clone(),
                     goal_id: holder.goal_id.clone(),
                     task_id: holder.task_id.clone(),
@@ -654,6 +707,160 @@ pub fn release(slot: &mut Slot, outcome: SlotOutcome) -> Result<(), BuildCacheEr
     // and the flock vanishes with the process leaving a clean ownerless slot.
     release_at_path(&slot.path, outcome, slot.kind)?;
     slot.lock = None;
+    Ok(())
+}
+
+/// Acquire a VERIFY-namespace slot on behalf of a caller that outlives
+/// this process (#6's `octos cache acquire --purpose verify`).
+///
+/// TRUTH MODEL — holder.json + pid liveness, NOT a persistent flock. The
+/// design (docs/build-cache-pool.md §3.5 arm 2 + the 外环槽 paragraph in
+/// §4) assigns cross-process lifetime to the METADATA: the acquire CLI is
+/// expected to exit immediately, the outer loop's verification runs in a
+/// DIFFERENT process, and the release comes from yet another
+/// `octos cache release` invocation. Nothing can hold a flock across
+/// those three lifetimes, so the slot's "held" state is `holder.json`
+/// (with a live pid recorded) + §3.5's `kill(pid, 0)` liveness check.
+///
+/// The pid written is the CALLER's (`holder.pid_override`), not ours: a
+/// `std::process::id()` here would be dead the moment this CLI exits,
+/// which would let `gc`/`reclaim_stale` reap the slot out from under the
+/// still-running outer-loop verification. Callers with no distinct pid
+/// (tests) pass `None` and get the current process recorded instead.
+///
+/// The lock fd is intentionally DROPPED at the end of this function (not
+/// leaked): the flock is meaningless across the three lifetimes involved
+/// (acquire CLI → verification process → release CLI), so the handoff is
+/// explicit and immediate — from that drop onward, holder.json + pid
+/// liveness is the slot's truth, exactly the state §3.5 arm 2 describes.
+///
+/// Returns the slot identity (dir + target dir) WITHOUT a live lock
+/// handle — there is nothing for the caller to drop.
+pub fn acquire_detached(
+    pool_root: &Path,
+    repo_key: &RepoKey,
+    config: &BuildCacheConfig,
+    holder: &HolderInfo,
+) -> Result<DetachedSlot, BuildCacheError> {
+    let pid = holder.pid_override.unwrap_or_else(std::process::id);
+    let holder = HolderInfo {
+        pid_override: Some(pid),
+        ..holder.clone()
+    };
+    let mut slot = acquire(pool_root, repo_key, SlotPurpose::Verify, config, &holder)?;
+    let detached = DetachedSlot {
+        path: slot.path.clone(),
+        target_dir: slot.target_dir.clone(),
+    };
+    // Drop the flock ON PURPOSE, right here — the defining property of the
+    // detached (#6) model: from this line on, the slot's held-state is
+    // `holder.json` + pid liveness, nothing else. We do NOT leak the fd
+    // (`std::mem::forget`): a leaked fd would keep the flock alive for the
+    // whole CLI process, which (a) is indistinguishable from a peer-style
+    // live holder for the duration of a long-lived CLI, and (b) pushes the
+    // transition point to "whenever the process happens to exit" instead
+    // of this explicit, documented line. Closing the fd here makes
+    // `release_detached` (and `gc`) see exactly the §3.5 arm-2 world:
+    // no flock, metadata present, pid alive ⇒ held; pid dead ⇒ reapable.
+    slot.lock = None;
+    Ok(detached)
+}
+
+/// Identity of a slot acquired by [`acquire_detached`] — paths only, no
+/// lock handle (the fd was leaked by design; see that function).
+#[derive(Debug, Clone)]
+pub struct DetachedSlot {
+    /// The slot directory (`<pool-root>/<repo-key>/verify-N`).
+    pub path: PathBuf,
+    /// The `CARGO_TARGET_DIR` value (`<slot>/target`).
+    pub target_dir: PathBuf,
+}
+
+/// Release a slot by its slot DIR path, from a process that is NOT the
+/// one that acquired it (#6's `octos cache release --slot <path>`).
+///
+/// Truth model (§3.5 arm 2, the cross-process half — see the long comment
+/// on [`leak_for_detached_holder`]): between the acquire CLI exiting and
+/// the release CLI running, the only thing keeping this slot "held" is
+/// `holder.json` + pid liveness. Re-acquiring the `.lock` here is
+/// therefore SAFE only because a detached holder never keeps the flock;
+/// if it ever did (peer-style holders do), `try_lock_exclusive` fails and
+/// we report [`BuildCacheError::SlotHeld`] instead of stomping a live
+/// holder's metadata.
+///
+/// Idempotent: a slot with no `holder.json` is a no-op (same semantics as
+/// [`release`]), so a double `release` invocation — or release racing with
+/// the stale-holder cleanup inside `reclaim_stale` — is harmless. The
+/// `target/` contents are never touched (I2).
+pub fn release_detached(
+    pool_root: &Path,
+    slot_dir: &Path,
+    outcome: SlotOutcome,
+) -> Result<(), BuildCacheError> {
+    // Guard: refuse to touch anything that is not a slot dir under THIS
+    // pool root. `remove_dir_all` and the holder bookkeeping below operate
+    // on caller-supplied paths, so the boundary is enforced first, before
+    // any open/remove, and independently of symlinks (canonicalize both
+    // sides — a symlinked argument must not smuggle a path outside the
+    // pool).
+    let canonical_root = pool_root
+        .canonicalize()
+        .map_err(|e| BuildCacheError::io("failed to canonicalize pool root".to_owned(), e))?;
+    let canonical_slot = slot_dir.canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            // A path that doesn't exist can't be a slot; report it with
+            // the same script-facing meaning as a missing `.lock` (the
+            // dir-exists case below) rather than a raw io error.
+            BuildCacheError::SlotNotFound {
+                slot: slot_dir.to_path_buf(),
+            }
+        } else {
+            BuildCacheError::io(format!("cannot resolve slot dir {}", slot_dir.display()), e)
+        }
+    })?;
+    if !canonical_slot.starts_with(&canonical_root) {
+        return Err(BuildCacheError::SlotOutsidePool {
+            slot: slot_dir.to_path_buf(),
+            pool_root: pool_root.to_path_buf(),
+        });
+    }
+    // The lock file is the slot's mutex inode (never deleted, never
+    // recreated). Missing ⇒ this is not a live slot dir at all: error
+    // rather than fabricate state on an arbitrary directory.
+    let lock_path = canonical_slot.join(LOCK_LEAF);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                BuildCacheError::SlotNotFound {
+                    slot: slot_dir.to_path_buf(),
+                }
+            } else {
+                BuildCacheError::io(format!("failed to open {}", lock_path.display()), e)
+            }
+        })?;
+    if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+        // Intermittent double-release (outer loop 06: #6 review): on a loaded
+        // test runner the second release occasionally observes the lock busy
+        // for a microsecond after the first release's fd closed (flock
+        // teardown vs fd reuse race on macOS). If the holder metadata is
+        // ALREADY gone the release already happened — treat it as the
+        // idempotent no-op it is, never an error. Only a slot that still has
+        // a live holder.json is genuinely held.
+        if canonical_slot.join(HOLDER_LEAF).exists() {
+            return Err(BuildCacheError::SlotHeld {
+                slot: slot_dir.to_path_buf(),
+            });
+        }
+        return Ok(());
+    }
+    // Lock held for the duration of the release (same ordering argument as
+    // `release`: metadata is cleared while holding, so a racing acquirer
+    // can never observe a half-released slot; the lock fd drops at return).
+    let kind = SlotKind::from_slot_dir_name(&canonical_slot);
+    release_at_path(&canonical_slot, outcome, kind)?;
     Ok(())
 }
 
@@ -1389,6 +1596,7 @@ mod tests {
                 goal_id: Some("g-1".to_string()),
                 task_id: Some("t-2".to_string()),
                 purpose_note: None,
+                pid_override: None,
             },
         )
         .unwrap();

@@ -166,6 +166,36 @@ staging 失败回滚:首轮槽已在 stage_peer 内 acquire ⇒ `cleanup_staged_
 
 外环槽(#6):`octos cache acquire --purpose verify --repo <path>` 打印槽路径与释放命令(`octos cache release --slot <path>`);外环规程(OLP_OUTER_BOOT)负责在复验结束时调用。外环侧脚本崩溃同样由 §3.5 兜底。
 
+## 4.5 外环槽使用(#6 落地后的确切调用方式)
+
+`octos cache acquire` 的输出是**稳定契约**,供 OLP_OUTER_BOOT 逐行解析(脚本解析器认前缀,不认列号):
+
+```sh
+# 1) acquire — stdout 恰好三行,顺序固定
+out=$(octos cache acquire --purpose verify --repo "$REPO")
+SLOT=$(printf '%s\n' "$out" | sed -n 's/^SLOT //p')      # <pool>/<repo-key>/verify-N
+TARGET=$(printf '%s\n' "$out" | sed -n 's/^TARGET //p')  # <slot>/target
+RELEASE=$(printf '%s\n' "$out" | sed -n 's/^RELEASE //p')# octos cache release --slot <slot>
+
+# 2) 编译验证(空间门已在 acquire 内强制;incremental 由 env 关死)
+export CARGO_TARGET_DIR="$TARGET"
+export CARGO_INCREMENTAL=0
+cargo build/test/clippy …          # 在外环 worktree 里跑,产物落进共享槽
+
+# 3) release — 幂等,可无条件放在清理段(trap 里也安全)
+$RELEASE                            # 或:octos cache release --slot "$SLOT"
+```
+
+要点:
+
+- **持有真值是 `holder.json` + pid 判活,不是 flock**(§3.5 第 2 臂)。acquire 是一次性 CLI:它在返回前**有意丢弃** flock fd,槽的「在持」状态从那一刻起完全由 holder.json(记录的 pid)承载。默认记录的 pid 是**调用方父进程**(`--pid` 可显式覆盖)——即外环驱动 shell,它的生命周期正是复验的生命周期。父进程死了 ⇒ §3.5 把槽降级为无主 ⇒ 按超期规则回收。
+- **`--json` 变体**携带同名字段(`slot` / `target` / `release` / `pid`),供非 shell 驱动消费。
+- **`--note <text>`** 落进 holder.json 的 `purpose_note`,`octos cache status` 会显示(哪条外环线在持有)。
+- **release 语义**:幂等(无 holder.json 即 no-op);路径不在池根下、或目录里没有 `.lock` ⇒ 报错退出非零(不误删任意目录);槽正被活 flock 持有(peer 槽或在跑的 CLI)⇒ 拒绝并提示。target/ 内容永不删除(I2)。
+- **`--purpose peer` 不存在**:peer 槽由 serve 内部领用,CLI 只开放 verify 命名空间(§1.3 的命名空间隔离在命令面上同样成立)。
+- **verify 槽互相不挤占 peer 槽**:acquire 只扫 `verify-N`(`verify_slots`,默认 1)。
+- octoscode 侧 OLP_OUTER_BOOT.md 的对应规程改写(把「每仓库一个长期 worktree + 自管槽锁」换成上述 acquire/parse/release 流程)由外环处理,本仓库只交付命令与本文档的契约描述。
+
 ## 5. 空间门
 
 - **量什么**:池根所在文件系统的 `f_bavail`(普通用户可用),经 `fs2::available_space(&pool_root)`。不用 `df` 子进程——仓库里已有一个 df -Pk 版(api/admin.rs:3068–3082),但它挂在 api feature 的 sysinfo 依赖后(Cargo.toml:111/154),且子进程解析脆弱;fs2 无 feature 门槛、同 crates 既有用法(monitor_runtime.rs)。

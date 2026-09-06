@@ -975,6 +975,9 @@ pub(crate) mod build_cache_peer {
             goal_id: goal_id.filter(|s| !s.is_empty()).map(str::to_owned),
             task_id: task_id.filter(|s| !s.is_empty()).map(str::to_owned),
             purpose_note: None,
+            // Peer slots are held by THIS serve process; no override (#6's
+            // override exists only for the CLI's cross-process verify slot).
+            pid_override: None,
         };
         let slot = acquire(
             &pool_root(&data_dir),
