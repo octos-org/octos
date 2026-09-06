@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::vertex_auth::{ServiceAccount, TokenSource, VertexTokenProvider};
 use crate::vision;
 
+use crate::cache_manifest::{PromptCacheInputManifest, without_cache_markers};
 use crate::config::ChatConfig;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::types::{
@@ -185,6 +186,17 @@ impl GeminiProvider {
         self
     }
 
+    /// Lane-attributed wording for operational failures (see
+    /// [`crate::provider::operational_error_message`]).
+    fn operational_message(&self, stage: crate::provider::OperationalStage) -> String {
+        crate::provider::operational_error_message(
+            stage,
+            self.provider_name(),
+            &self.model,
+            crate::provider::ApiStyle::GeminiGenerateContent,
+        )
+    }
+
     /// Build the generateContent endpoint URL for the active auth mode.
     fn build_url(&self, streaming: bool) -> String {
         let action = if streaming {
@@ -214,6 +226,91 @@ impl GeminiProvider {
             }
         })
     }
+
+    fn build_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<GeminiRequest> {
+        let (contents, system_instruction) = build_gemini_contents_for_model(messages, &self.model);
+        Ok(GeminiRequest {
+            contents,
+            system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
+                parts: vec![GeminiPart::Text {
+                    text,
+                    thought: None,
+                }],
+            }),
+            tools: build_gemini_tools(tools),
+            generation_config: Some(build_gemini_generation_config(
+                config,
+                &format!("{}/{}", self.provider_name(), self.model),
+            )?),
+            // Explicit cached-content handles require create/refresh/delete
+            // lifecycle management. Until that exists, semantic context
+            // remains correctness-neutral and this field stays absent.
+            cached_content: None,
+            tool_config: config
+                .tool_choice
+                .gemini_function_calling_config(!tools.is_empty())
+                .map(|function_calling_config| {
+                    serde_json::json!({ "functionCallingConfig": function_calling_config })
+                }),
+        })
+    }
+
+    fn prompt_cache_input_manifest(
+        &self,
+        request: &GeminiRequest,
+        config: &ChatConfig,
+    ) -> PromptCacheInputManifest {
+        let normalized = without_cache_markers(
+            serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({})),
+        );
+        let mut stable = Vec::new();
+        if let Some(system) = normalized.get("system_instruction") {
+            stable.push(("system_instruction".to_owned(), system.clone()));
+        }
+        if let Some(tools) = normalized.get("tools").and_then(|value| value.as_array()) {
+            stable.extend(
+                tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| (format!("tool:{index}"), tool.clone())),
+            );
+        }
+        let conversation = normalized
+            .get("contents")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, content)| {
+                let role = content
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                (format!("content:{index}:{role}"), content.clone())
+            })
+            .collect();
+        PromptCacheInputManifest::from_normalized_segments(
+            self.provider_name(),
+            self.model.clone(),
+            config
+                .prompt_cache_context
+                .as_ref()
+                .map(|context| context.epoch_id.as_str()),
+            stable,
+            conversation,
+        )
+    }
+
+    fn trace_prompt_cache_input(&self, request: &GeminiRequest, config: &ChatConfig) {
+        if tracing::enabled!(target: "octos.prompt_cache", tracing::Level::TRACE) {
+            self.prompt_cache_input_manifest(request, config).trace();
+        }
+    }
 }
 
 #[async_trait]
@@ -224,25 +321,8 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let (contents, system_instruction) = build_gemini_contents_for_model(messages, &self.model);
-
-        let gemini_tools = build_gemini_tools(tools);
-
-        let request = GeminiRequest {
-            contents,
-            system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
-                parts: vec![GeminiPart::Text {
-                    text,
-                    thought: None,
-                }],
-            }),
-            tools: gemini_tools,
-            generation_config: Some(build_gemini_generation_config(
-                config,
-                &format!("gemini/{}", self.model),
-            )?),
-            cached_content: None,
-        };
+        let request = self.build_request(messages, tools, config)?;
+        self.trace_prompt_cache_input(&request, config);
 
         let url = self.build_url(false);
 
@@ -254,12 +334,14 @@ impl LlmProvider for GeminiProvider {
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
             ))
             .json(&request);
-        let response = self
-            .apply_auth(req)
-            .await?
-            .send()
-            .await
-            .wrap_err("failed to send request to Gemini")?;
+        let response = self.apply_auth(req).await?.send().await.wrap_err_with(|| {
+            crate::provider::transport_error_message(
+                false,
+                self.provider_name(),
+                &self.model,
+                crate::provider::ApiStyle::GeminiGenerateContent,
+            )
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -268,19 +350,21 @@ impl LlmProvider for GeminiProvider {
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                format!("gemini/{}", self.model),
+                format!("{}/{}", self.provider_name(), self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::GeminiGenerateContent)
             .into());
         }
 
-        let response_text = response
-            .text()
-            .await
-            .wrap_err("failed to read Gemini response body")?;
+        let response_text = response.text().await.wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::ReadResponseBody)
+        })?;
         let api_response: GeminiResponse =
-            serde_json::from_str(&response_text).wrap_err("failed to parse Gemini response")?;
+            serde_json::from_str(&response_text).wrap_err_with(|| {
+                self.operational_message(crate::provider::OperationalStage::ParseResponse)
+            })?;
 
-        gemini_response_to_chat_response(api_response)
+        gemini_response_to_chat_response(api_response, self.provider_name(), &self.model)
     }
 
     async fn chat_stream(
@@ -289,25 +373,8 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let (contents, system_instruction) = build_gemini_contents_for_model(messages, &self.model);
-
-        let gemini_tools = build_gemini_tools(tools);
-
-        let request = GeminiRequest {
-            contents,
-            system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
-                parts: vec![GeminiPart::Text {
-                    text,
-                    thought: None,
-                }],
-            }),
-            tools: gemini_tools,
-            generation_config: Some(build_gemini_generation_config(
-                config,
-                &format!("gemini/{}", self.model),
-            )?),
-            cached_content: None,
-        };
+        let request = self.build_request(messages, tools, config)?;
+        self.trace_prompt_cache_input(&request, config);
 
         let url = self.build_url(true);
 
@@ -319,12 +386,14 @@ impl LlmProvider for GeminiProvider {
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&request);
-        let response = self
-            .apply_auth(req)
-            .await?
-            .send()
-            .await
-            .wrap_err("failed to send streaming request to Gemini")?;
+        let response = self.apply_auth(req).await?.send().await.wrap_err_with(|| {
+            crate::provider::transport_error_message(
+                true,
+                self.provider_name(),
+                &self.model,
+                crate::provider::ApiStyle::GeminiGenerateContent,
+            )
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -333,8 +402,9 @@ impl LlmProvider for GeminiProvider {
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                format!("gemini/{}", self.model),
+                format!("{}/{}", self.provider_name(), self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::GeminiGenerateContent)
             .into());
         }
 
@@ -364,6 +434,10 @@ impl LlmProvider for GeminiProvider {
         }
     }
 
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        Some(crate::provider::ApiStyle::GeminiGenerateContent)
+    }
+
     fn provider_metadata(&self) -> ProviderMetadata {
         let endpoint = if self.base_url != "https://generativelanguage.googleapis.com/v1beta" {
             endpoint_label_from_base_url(&self.base_url)
@@ -388,6 +462,10 @@ struct GeminiRequest {
     generation_config: Option<GeminiGenerationConfig>,
     #[serde(rename = "cachedContent", skip_serializing_if = "Option::is_none")]
     cached_content: Option<String>,
+    /// `ChatConfig.tool_choice` as `toolConfig.functionCallingConfig`;
+    /// absent for the default `auto`.
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -484,6 +562,7 @@ fn build_gemini_generation_config(
                     message,
                 )
                 .with_provider(provider_label)
+                .with_api_style(crate::provider::ApiStyle::GeminiGenerateContent)
                 .into());
             }
             (Some("application/json".into()), Some(s))
@@ -933,16 +1012,24 @@ fn append_nonempty(target: &mut Option<String>, text: String) {
     }
 }
 
-fn gemini_response_to_chat_response(api_response: GeminiResponse) -> Result<ChatResponse> {
+fn gemini_response_to_chat_response(
+    api_response: GeminiResponse,
+    provider: &str,
+    model: &str,
+) -> Result<ChatResponse> {
     let GeminiResponse {
         candidates,
         usage_metadata,
     } = api_response;
 
-    let candidate = candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| eyre::eyre!("no candidates in Gemini response"))?;
+    let candidate = candidates.into_iter().next().ok_or_else(|| {
+        eyre::Report::msg(crate::provider::operational_error_message(
+            crate::provider::OperationalStage::NoCandidates,
+            provider,
+            model,
+            crate::provider::ApiStyle::GeminiGenerateContent,
+        ))
+    })?;
 
     let mut content = None;
     let mut reasoning_content = None;
@@ -1139,6 +1226,76 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn should_serialize_gemini_tool_config_only_when_tool_choice_is_explicit() {
+        let provider = GeminiProvider::new("test-key", "gemini-2.5-flash");
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let messages = vec![Message::user("hello")];
+        let auto = serde_json::to_value(
+            provider
+                .build_request(&messages, &tools, &ChatConfig::default())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(auto.get("toolConfig").is_none(), "{auto}");
+        let none = ChatConfig {
+            tool_choice: crate::ToolChoice::None,
+            ..Default::default()
+        };
+        let request =
+            serde_json::to_value(provider.build_request(&messages, &tools, &none).unwrap())
+                .unwrap();
+        assert_eq!(
+            request["toolConfig"]["functionCallingConfig"]["mode"],
+            "NONE"
+        );
+        let tool_less =
+            serde_json::to_value(provider.build_request(&messages, &[], &none).unwrap()).unwrap();
+        assert!(tool_less.get("toolConfig").is_none(), "{tool_less}");
+    }
+
+    #[test]
+    fn provider_normalized_manifest_proves_same_epoch_append_only_contents() {
+        let provider = GeminiProvider::new("test-key", "gemini-2.5-flash");
+        let config = ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "unused".to_owned(),
+                epoch_id: "epoch-one".to_owned(),
+                stable_prefix_hash: "agent-stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let first_messages = vec![Message::system("stable"), Message::user("first")];
+        let mut next_messages = first_messages.clone();
+        next_messages.push(Message::assistant("answer"));
+        next_messages.push(Message::user("next"));
+
+        let first_request = provider
+            .build_request(&first_messages, &tools, &config)
+            .unwrap();
+        let next_request = provider
+            .build_request(&next_messages, &tools, &config)
+            .unwrap();
+        let first = provider.prompt_cache_input_manifest(&first_request, &config);
+        let next = provider.prompt_cache_input_manifest(&next_request, &config);
+        let comparison = first.compare_prefix(&next);
+
+        assert_eq!(first.stable_prefix_hash, next.stable_prefix_hash);
+        assert_eq!(comparison.conversation_prefix_segments, 1);
+        assert_eq!(comparison.invalidation_reason, None);
+        assert!(comparison.reusable_normalized_bytes > 0);
     }
 
     // --- sanitize_schema_for_gemini tests ---
@@ -1857,7 +2014,7 @@ mod tests {
         }))
         .unwrap();
 
-        let response = gemini_response_to_chat_response(api_response).unwrap();
+        let response = gemini_response_to_chat_response(api_response, "gemini", "test").unwrap();
         assert_eq!(
             response.reasoning_content.as_deref(),
             Some("Inspect the constraints.")
@@ -2124,5 +2281,61 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, StreamEvent::Usage(u) if u.reasoning_tokens == 20 && u.cache_read_tokens == 30 && u.input_tokens == 70)
         ));
+    }
+}
+
+#[cfg(test)]
+mod lane_attributed_operational_errors {
+    use octos_core::Message;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::GeminiProvider;
+    use crate::config::ChatConfig;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::assert_error_names_lane;
+
+    const LANE: &str = "gemini/gemini-test";
+    const STYLE: &str = "api_style=gemini_generate_content";
+    const FORBIDDEN: &[&str] = &["Gemini response", "Gemini request"];
+
+    async fn lane_returning(status: u16, body: &str) -> (MockServer, GeminiProvider) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body.to_owned()))
+            .mount(&server)
+            .await;
+        let provider = GeminiProvider::new("key", "gemini-test").with_base_url(server.uri());
+        (server, provider)
+    }
+
+    #[tokio::test]
+    async fn should_name_lane_and_api_style_when_response_body_is_malformed() {
+        let (_server, provider) = lane_returning(200, "not json{").await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn should_name_lane_and_api_style_when_candidates_are_empty() {
+        let (_server, provider) = lane_returning(200, r#"{"candidates":[]}"#).await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn should_name_lane_and_api_style_when_status_error_is_mapped() {
+        let (_server, provider) = lane_returning(500, "boom").await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
     }
 }

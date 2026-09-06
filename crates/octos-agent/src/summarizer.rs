@@ -304,6 +304,7 @@ rather than appending duplicates.\n\n",
             // summary + new turns) and is sent exactly once — opt out of the
             // 1.25x cache-write premium.
             cache_retention: octos_llm::CacheRetention::None,
+            prompt_cache_context: None,
         };
         let messages = vec![Message::user(prompt)];
         // Bridge the async LLM call to the synchronous Summarizer contract.

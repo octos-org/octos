@@ -767,6 +767,7 @@ mod tests {
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            session_store_root: None,
             config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             goal_verifier_llm: None,
@@ -780,6 +781,8 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            session_defaults: None,
+            agent_profile: None,
             format_after_edit: false,
             snapshots: None,
             tool_specs: Arc::new(base_tools),

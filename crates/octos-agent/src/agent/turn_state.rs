@@ -137,21 +137,22 @@ impl LoopTurnState {
     /// the turn total at the wrong model.
     pub(crate) fn record_usage(
         &mut self,
-        input_tokens: u32,
-        output_tokens: u32,
-        cache_read_tokens: u32,
-        cache_write_tokens: u32,
+        usage: &TokenUsage,
         tracker: Option<&TokenTracker>,
         estimated_cost_usd: Option<f64>,
     ) {
-        self.total_usage.input_tokens += input_tokens;
-        self.total_usage.output_tokens += output_tokens;
+        self.total_usage.input_tokens += usage.input_tokens;
+        self.total_usage.output_tokens += usage.output_tokens;
+        // Reasoning is a reported component of output, not extra billable
+        // volume. Retain it for diagnostics without adding it to output,
+        // pricing, active-token thresholds, or the existing tracker counters.
+        self.total_usage.reasoning_tokens += usage.reasoning_tokens;
         // Cache traffic is real processed prompt volume — Anthropic reports
         // it OUTSIDE input_tokens (disjoint accounting) — so accumulate it
         // too, keeping the turn totals and the token-budget gate at their
         // pre-caching meaning (everything the provider processed).
-        self.total_usage.cache_read_tokens += cache_read_tokens;
-        self.total_usage.cache_write_tokens += cache_write_tokens;
+        self.total_usage.cache_read_tokens += usage.cache_read_tokens;
+        self.total_usage.cache_write_tokens += usage.cache_write_tokens;
         if let Some(cost) = estimated_cost_usd {
             self.turn_spend_usd += cost;
             self.priced_usage = true;
@@ -166,6 +167,27 @@ impl LoopTurnState {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+    }
+
+    /// Adapt provider usage to the core's counter type in one place. The
+    /// provider-only semantic checkpoint report is not an additive counter.
+    pub(crate) fn record_llm_usage(
+        &mut self,
+        usage: &octos_llm::TokenUsage,
+        tracker: Option<&TokenTracker>,
+        estimated_cost_usd: Option<f64>,
+    ) {
+        self.record_usage(
+            &TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+            },
+            tracker,
+            estimated_cost_usd,
+        );
     }
 
     pub(crate) fn record_retry(&mut self, reason: LoopRetryReason) {
@@ -328,9 +350,14 @@ mod tests {
         // Two responses priced at DIFFERENT models' rates plus one from
         // an unpriced model: tokens all count, spend sums only the known
         // costs — no re-pricing of earlier responses at the last model.
-        state.record_usage(1_000, 200, 0, 0, None, Some(0.015));
-        state.record_usage(2_000, 400, 0, 0, None, Some(0.002));
-        state.record_usage(500, 100, 0, 0, None, None);
+        let usage = |input_tokens, output_tokens| TokenUsage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        };
+        state.record_usage(&usage(1_000, 200), None, Some(0.015));
+        state.record_usage(&usage(2_000, 400), None, Some(0.002));
+        state.record_usage(&usage(500, 100), None, None);
 
         assert_eq!(state.total_usage().input_tokens, 3_500);
         assert_eq!(state.total_usage().output_tokens, 700);
@@ -344,9 +371,20 @@ mod tests {
         // turn total must carry them so the token budget and downstream
         // ledgers see the full processed volume.
         let mut state = LoopTurnState::new(Instant::now());
-        state.record_usage(100, 50, 4_000, 850, None, None);
+        state.record_usage(
+            &TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                reasoning_tokens: 30,
+                cache_read_tokens: 4_000,
+                cache_write_tokens: 850,
+            },
+            None,
+            None,
+        );
         assert_eq!(state.total_usage().input_tokens, 100);
         assert_eq!(state.total_usage().output_tokens, 50);
+        assert_eq!(state.total_usage().reasoning_tokens, 30);
         assert_eq!(state.total_usage().cache_read_tokens, 4_000);
         assert_eq!(state.total_usage().cache_write_tokens, 850);
     }

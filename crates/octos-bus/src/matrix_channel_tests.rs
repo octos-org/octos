@@ -3879,7 +3879,7 @@ async fn test_slash_command_createbot() {
 async fn test_slash_command_createbot_defaults_private() {
     let (tx, _rx) = mpsc::channel(1);
     let mut state = make_test_state(tx);
-    state.bot_manager = Some(Arc::new(RecordingBotManager::default()));
+    state.bot_manager = Some(Arc::new(RecordingBotManager));
 
     let result = handle_slash_command(
         &state,
@@ -3904,7 +3904,7 @@ async fn test_slash_command_createbot_defaults_private() {
 async fn test_slash_command_createbot_with_public_visibility() {
     let (tx, _rx) = mpsc::channel(1);
     let mut state = make_test_state(tx);
-    state.bot_manager = Some(Arc::new(RecordingBotManager::default()));
+    state.bot_manager = Some(Arc::new(RecordingBotManager));
 
     let result = handle_slash_command(
         &state,

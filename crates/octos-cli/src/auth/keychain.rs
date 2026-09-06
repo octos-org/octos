@@ -16,6 +16,10 @@
 use std::collections::HashMap;
 
 use eyre::Result;
+// #2258 — `wrap_err` is only used by the macOS-gated helpers below; keep the
+// trait import gated too so Linux clippy (unused_imports) and macOS rustc agree.
+#[cfg(target_os = "macos")]
+use eyre::WrapErr;
 
 /// Sentinel prefix stored in profile `env_vars` to indicate that the real
 /// secret lives in the macOS Keychain.
