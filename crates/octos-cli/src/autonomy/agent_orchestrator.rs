@@ -44223,7 +44223,7 @@ mod tests {
         }
         {
             let mut state = orch.state();
-            for (_, carrier) in carriers.iter() {
+            for carrier in carriers.values() {
                 assert!(
                     matches!(
                         state.continuations.reinsert(carrier.clone()),
