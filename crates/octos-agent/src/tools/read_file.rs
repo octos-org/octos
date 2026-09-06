@@ -361,8 +361,9 @@ impl ReadFileTool {
             },
         };
 
-        // Reject files larger than 10MB to prevent OOM (output is capped to 100KB
-        // anyway, and reading a multi-GB file just to slice a few lines is wasteful).
+        // Reject files larger than 10MB to prevent OOM (output is capped under
+        // the tool-output limit anyway, and reading a multi-GB file just to
+        // slice a few lines is wasteful).
         const MAX_FILE_BYTES: u64 = 10_000_000;
         let (current_mtime, file_size) = match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.len() > MAX_FILE_BYTES => {
@@ -633,6 +634,25 @@ impl ReadFileTool {
             output.push_str(&formatted);
         }
 
+        // #2197: the UNARMED cut budget — the loop's per-tool output cap
+        // MINUS a footer reserve, never above it. Anything past
+        // `tool_output_limit` is head/tail-cut by the execution loop's
+        // backstop (#2124), which elides the MIDDLE of the page: the range
+        // recorded in the cache below would then claim lines the model never
+        // saw (the same lie class as #2197, one level down), and the blind
+        // cut would sandwich the advising footer behind an omission marker.
+        // The armed window is sized the same way (`WINDOW_MAX_BYTES +
+        // FOOTER_RESERVE <= tool_output_limit`, pinned by read_window's
+        // tripwire). The reserve is a flat 400 bytes though the footer is
+        // ~120, so a formatted output landing in the 400-byte band under the
+        // cap is paged rather than served whole — a deliberate trade for one
+        // simple, provably-safe budget. Decided before the "(showing lines)"
+        // footer below — when the cut fires, that footer would name lines
+        // the cut drops, so the advising footer replaces it.
+        let output_limit = octos_core::tool_output_limit("read_file");
+        let cut_budget = output_limit - super::read_window::FOOTER_RESERVE;
+        let unarmed_cut = !window_armed && output.len() > cut_budget;
+
         match clamp {
             Some(kind) => {
                 // The advising footer: which limit fired, the range actually
@@ -657,8 +677,9 @@ impl ReadFileTool {
                 output = clamp_armed_return(output);
             }
             None => {
-                // Add file info
-                if start > 0 || end < total_lines {
+                // Add file info — except when the unarmed cut fires: this
+                // footer would name lines the cut drops.
+                if !unarmed_cut && (start > 0 || end < total_lines) {
                     output.push_str(&format!(
                         "\n(showing lines {}-{} of {})",
                         start + 1,
@@ -670,13 +691,62 @@ impl ReadFileTool {
         }
 
         // Truncate if too long. UNARMED ONLY: the armed path's advising
-        // window above bounds output to WINDOW_MAX_BYTES + a footer — under
-        // both this blind cut and the execution loop's 50,000-byte backstop
-        // (#2124), which must never fire on an armed read (a blind head/tail
-        // cut would mangle the very footer that names the continuation).
-        if !window_armed {
-            const MAX_OUTPUT: usize = 100000;
-            octos_core::truncate_utf8(&mut output, MAX_OUTPUT, "\n... (content truncated)");
+        // window above bounds output to WINDOW_MAX_BYTES + a footer, under
+        // the execution loop's backstop (#2124), which must never fire on an
+        // armed read (a blind head/tail cut would mangle the very footer
+        // that names the continuation).
+        //
+        // #2197: this cut used to be blind, and the M8.4 cache put below
+        // recorded the REQUESTED range (`user_range` — `None`, "complete
+        // file", for an unbounded read) with the full content hash. The next
+        // unchanged-mtime read then short-circuited to `[FILE_UNCHANGED]
+        // (full file cached)`, pointing the model at a previous result that
+        // was truncated. Cut at a whole-line boundary instead, name the
+        // range actually returned and the exact next call, and record THAT
+        // range in the cache. The budget keeps the emitted page under the
+        // loop's per-tool cap, so what is recorded is what the model
+        // actually receives.
+        //
+        // `cut_shown_to` is the last line actually emitted (1-indexed) when
+        // the advising cut fired; `None` when the output was returned whole.
+        let mut cut_shown_to: Option<usize> = None;
+        // A single formatted line larger than the whole budget cannot be
+        // paged by line range (byte mode is armed-only): keep the blind head
+        // cut there — the model at least sees the head — but the view is
+        // partial with no honest line range, so it must not be cached.
+        let mut skip_cache_put = false;
+        if unarmed_cut {
+            // Every formatted content line ends in '\n' and content lines
+            // never contain one, so the last newline inside the budget is a
+            // whole-line boundary.
+            let mut budget = cut_budget;
+            while budget > 0 && !output.is_char_boundary(budget) {
+                budget -= 1;
+            }
+            match output[..budget].rfind('\n') {
+                Some(nl) => {
+                    output.truncate(nl + 1);
+                    let lines_kept = output.bytes().filter(|b| *b == b'\n').count();
+                    let shown_to = start + lines_kept;
+                    output.push_str(&format!(
+                        "\n[read_file truncated: showing lines {}-{shown_to} of {total_lines} — \
+                         {cut_budget}-byte output limit hit. Continue with offset: {}.]",
+                        start + 1,
+                        shown_to + 1
+                    ));
+                    // The footer is fixed text plus a handful of small
+                    // integers — bounded by construction well under
+                    // FOOTER_RESERVE — so this never cuts; it is the enforced
+                    // guarantee that the loop's blind backstop never fires on
+                    // an unarmed read either.
+                    octos_core::truncate_utf8(&mut output, output_limit, "");
+                    cut_shown_to = Some(shown_to);
+                }
+                None => {
+                    octos_core::truncate_utf8(&mut output, cut_budget, "\n... (content truncated)");
+                    skip_cache_put = true;
+                }
+            }
         }
 
         // M8.4: record this read in the file-state cache so a later read can
@@ -688,12 +758,22 @@ impl ReadFileTool {
         // request can never hit a windowed entry and claim
         // `[FILE_UNCHANGED] (full file cached)` against content the model
         // was never shown.
+        //
+        // #2197: same rule unarmed — when the cut fired, record the EMITTED
+        // range, never the requested one (an unbounded request would
+        // otherwise record `None`, "complete file", for a truncated view).
+        // The cut budget sits under the loop's output cap, so the recorded
+        // range is what the model actually receives, end to end.
         let recorded_range = if clamp.is_some() {
             Some(((start + 1) as u64, included_end as u64))
+        } else if let Some(shown_to) = cut_shown_to {
+            Some(((start + 1) as u64, shown_to as u64))
         } else {
             user_range(start_line, end_line)
         };
-        if let (Some(cache), Some(mtime)) = (ctx.file_state_cache.as_ref(), current_mtime) {
+        if !skip_cache_put
+            && let (Some(cache), Some(mtime)) = (ctx.file_state_cache.as_ref(), current_mtime)
+        {
             let can_cache = !FileStateCache::has_binary_extension(&path)
                 && FileStateCache::is_text_cacheable(content.as_bytes());
             if can_cache {
@@ -2026,19 +2106,29 @@ mod tests {
                 305,
                 0x1fb1_380c_4950_1cb6,
             ),
-            // The internal blind 100KB cut stays on the unarmed path.
+            // #2197: the internal cut on the unarmed path is now an ADVISING
+            // whole-line cut (names the emitted range and the next call),
+            // not the old blind mid-line cut, and its budget sits under the
+            // loop's 50,000-byte cap so the backstop never middle-elides a
+            // page the cache later claims was seen whole. 49-byte formatted
+            // lines (4-digit gutter + "│ " + 40 + '\n'): 1012 lines fit the
+            // 49,600-byte budget (49,588 bytes), then the advising footer.
             (
                 serde_json::json!({"path": "golden_cut.txt", "start_line": 1, "end_line": 3000}),
                 true,
-                100_024,
-                0xfd5e_1b93_81ff_e0b0,
+                49_701,
+                0x1e93_e37e_c905_c486,
             ),
-            // >2000 lines unbounded stays a FULL read when unarmed.
+            // #2197: >2000 lines unbounded no longer stays a FULL read when
+            // unarmed — the formatted 52,893 bytes exceed the 49,600-byte cut
+            // budget, so this is now an advising first page (lines 1-2817,
+            // continuation offset 2818) instead of a whole-file body the
+            // loop's backstop would have middle-elided anyway.
             (
                 serde_json::json!({"path": "golden_manylines.txt"}),
                 true,
-                52_893,
-                0x88cc_44e4_d1e6_85a3,
+                49_712,
+                0xa75f_0c5c_9b53_c64e,
             ),
         ];
         for (args, success, len, fnv) in cases {
@@ -2327,6 +2417,214 @@ mod tests {
         assert!(
             second.output.contains("showing lines 1-450 of 1500"),
             "the honest answer is the same first page again: {}",
+            second.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_cache_an_unarmed_blind_cut_read_as_complete() {
+        // #2197: unarmed, the internal output cut fires AFTER formatting, and
+        // the M8.4 cache put used to record the REQUESTED range — `None`,
+        // "complete file", for an unbounded read — with the full content
+        // hash. The next unchanged-mtime read then short-circuited to
+        // `[FILE_UNCHANGED] (full file cached)`, pointing the model at a
+        // previous result that was truncated. The cut must now be advising
+        // (naming the range actually returned and the exact next call) and
+        // the cache must record the EMITTED range, so an unbounded re-read
+        // re-pages instead of lying.
+        let dir = tempfile::tempdir().unwrap();
+        // 32,000 raw bytes — under the #2131 unbounded-read refusal budget —
+        // whose formatted form (11 bytes/line) exceeds the cut budget: the
+        // exact reachability the issue names.
+        std::fs::write(dir.path().join("many_tiny.txt"), "x\n".repeat(16_000)).unwrap();
+        let tool = ReadFileTool::new(dir.path()); // unarmed
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let first = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "many_tiny.txt"}))
+            .await
+            .unwrap();
+        assert!(first.success, "{}", first.output);
+        assert!(
+            !first.output.contains("... (content truncated)"),
+            "the cut must no longer be a blind mid-line cut: {}",
+            first.output
+        );
+        // 4509 x 11 = 49,599 fits the budget (50,000 - FOOTER_RESERVE); line
+        // 4510 would cross it.
+        assert!(
+            first.output.contains("showing lines 1-4509 of 16000")
+                && first.output.contains("Continue with offset: 4510"),
+            "the advising footer names the emitted range, the true total, and \
+             the exact next call: {}",
+            first.output
+        );
+        assert!(
+            first.output.len() <= octos_core::tool_output_limit("read_file"),
+            "the advising cut keeps the page under the loop's cap, so its blind \
+             backstop never fires and the recorded range is honest end-to-end: \
+             {} bytes",
+            first.output.len()
+        );
+
+        // The poison: an unchanged-mtime re-read must NOT be served
+        // [FILE_UNCHANGED] against a view the model only partially saw.
+        let second = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "many_tiny.txt"}))
+            .await
+            .unwrap();
+        assert!(second.success, "{}", second.output);
+        assert!(
+            !second.output.contains("[FILE_UNCHANGED]"),
+            "a truncated view must never satisfy an unbounded read as \
+             unchanged-complete: {}",
+            second.output
+        );
+        assert_eq!(
+            second.output, first.output,
+            "the honest answer is the same advised first page again"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_record_the_emitted_range_when_the_unarmed_cut_fires_on_a_bounded_read() {
+        // #2197, bounded variant: an explicit range over a wide-line file
+        // crosses the cut budget (the #2131 refusal only guards UNBOUNDED
+        // reads). The cache must record the EMITTED (1, 455) range — an
+        // identical re-read re-pages (no [FILE_UNCHANGED] lie), while a
+        // re-read of exactly the emitted range may still hit: the page fits
+        // the loop's output cap, so the model really saw those lines in full.
+        let dir = tempfile::tempdir().unwrap();
+        wide_rows_file(&dir, "bounded.txt"); // 1500 rows, 109 formatted bytes/line
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let args = serde_json::json!({"path": "bounded.txt", "start_line": 1, "end_line": 1500});
+        let first = tool.execute_with_context(&ctx, &args).await.unwrap();
+        assert!(first.success, "{}", first.output);
+        // 455 x 109 = 49,595 <= 49,600; line 456 would cross the budget.
+        assert!(
+            first.output.contains("showing lines 1-455 of 1500")
+                && first.output.contains("Continue with offset: 456"),
+            "the advising footer names the emitted range and the next call: {}",
+            first.output
+        );
+        assert!(
+            first.output.contains("row 000455") && !first.output.contains("row 000456"),
+            "the cut is at a whole-line boundary: {}",
+            first.output
+        );
+
+        let second = tool.execute_with_context(&ctx, &args).await.unwrap();
+        assert!(second.success, "{}", second.output);
+        assert!(
+            !second.output.contains("[FILE_UNCHANGED]"),
+            "the emitted (1, 455) view cannot satisfy the requested (1, 1500): {}",
+            second.output
+        );
+        assert!(second.output.contains("showing lines 1-455 of 1500"));
+
+        // A re-read of exactly the emitted range MAY hit — the model did
+        // see those lines in full.
+        let third = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "bounded.txt", "start_line": 1, "end_line": 455}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            third.output.contains("[FILE_UNCHANGED]"),
+            "the exactly-emitted range is an honest cache hit: {}",
+            third.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_advise_and_record_the_emitted_range_for_a_mid_file_bounded_read() {
+        // #2197: same as above, but the range starts MID-FILE — the emitted
+        // range is (start + lines_kept), the off-by-one-prone path.
+        let dir = tempfile::tempdir().unwrap();
+        wide_rows_file(&dir, "midfile.txt"); // 1500 rows, 109 formatted bytes/line
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let args = serde_json::json!({"path": "midfile.txt", "offset": 400, "end_line": 1500});
+        let first = tool.execute_with_context(&ctx, &args).await.unwrap();
+        assert!(first.success, "{}", first.output);
+        // 455 lines from line 400: 400 + 455 - 1 = 854.
+        assert!(
+            first.output.contains("showing lines 400-854 of 1500")
+                && first.output.contains("Continue with offset: 855"),
+            "the footer names the emitted mid-file range and the next call: {}",
+            first.output
+        );
+        assert!(
+            first.output.contains("row 000400") && !first.output.contains("row 000399"),
+            "the page starts at the requested line: {}",
+            first.output
+        );
+
+        // The full requested range is not satisfied by the cut entry...
+        let second = tool.execute_with_context(&ctx, &args).await.unwrap();
+        assert!(
+            !second.output.contains("[FILE_UNCHANGED]"),
+            "the emitted (400, 854) view cannot satisfy the requested (400, 1500): {}",
+            second.output
+        );
+        // ...but exactly the emitted range is an honest hit.
+        let third = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "midfile.txt", "start_line": 400, "end_line": 854}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            third.output.contains("[FILE_UNCHANGED]"),
+            "the exactly-emitted mid-file range is an honest cache hit: {}",
+            third.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_never_cache_a_giant_single_line_blind_cut_when_unarmed() {
+        // #2197 edge: ONE line larger than the whole cut budget cannot be
+        // paged by line range unarmed (byte mode is armed-only), so the
+        // blind head cut still serves the head — but the view is partial
+        // with no honest line range, so it must not be cached at all.
+        // (Bounded args bypass the #2131 unbounded-read refusal.)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("giant_unarmed.txt"),
+            format!("{}\n", "G".repeat(150_000)),
+        )
+        .unwrap();
+        let tool = ReadFileTool::new(dir.path());
+        let cache = Arc::new(FileStateCache::new());
+        let ctx = ctx_with_cache(cache.clone());
+
+        let args = serde_json::json!({"path": "giant_unarmed.txt", "start_line": 1, "end_line": 1});
+        let first = tool.execute_with_context(&ctx, &args).await.unwrap();
+        assert!(first.success, "{}", first.output);
+        assert!(
+            first.output.contains("... (content truncated)"),
+            "the head is still served when no whole line fits: {}",
+            first.output
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "a blind-cut partial view must never be cached"
+        );
+
+        let second = tool.execute_with_context(&ctx, &args).await.unwrap();
+        assert!(
+            !second.output.contains("[FILE_UNCHANGED]"),
+            "no cache entry, no lie: {}",
             second.output
         );
     }
