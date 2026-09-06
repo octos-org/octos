@@ -32807,7 +32807,12 @@ async fn router_failover_subscriber_receives_events_with_session_id() {
             }),
         ],
         &[],
-        octos_llm::AdaptiveConfig::default(),
+        octos_llm::AdaptiveConfig {
+            // This assertion exercises the primary-to-fallback event, not
+            // the default 10% probe that can legitimately start on p2.
+            probe_probability: 0.0,
+            ..Default::default()
+        },
     ));
     let mut rx = router.subscribe_failover();
 
