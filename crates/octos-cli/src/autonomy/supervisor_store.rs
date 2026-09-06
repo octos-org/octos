@@ -2379,7 +2379,8 @@ impl SupervisorStore {
                         target: "octos::supervisor",
                         path = %self.events_path.display(),
                         replay_offset = offset,
-                        line = idx + 1,
+                        // `replay_line` is relative to `replay_offset`.
+                        replay_line = idx + 1,
                         error = %err,
                         "skipping malformed supervisor event row (#26a tolerant replay)"
                     );
