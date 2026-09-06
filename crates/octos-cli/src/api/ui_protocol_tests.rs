@@ -635,8 +635,9 @@ fn profile_for_runtime_message(id: &str) -> crate::profiles::UserProfile {
 // Regression coverage for the "No ProfileRuntime registered... Set up the
 // profile with an API key in the dashboard" message, which used to fire
 // verbatim for every Ok(None) from `ensure_session_profile_runtime` —
-// including a merely-disabled profile, a sub-account, or an unknown id,
-// none of which an API key would fix.
+// including a sub-account or an unknown id, neither of which an API key would
+// fix. A profile with gateway auto-start disabled is still eligible for an
+// authenticated, on-demand AppUI runtime.
 #[test]
 fn should_report_no_profile_store_when_profile_runtime_unavailable_and_store_missing() {
     let state = AppState {
@@ -669,20 +670,29 @@ fn should_report_unknown_profile_when_profile_runtime_unavailable_and_profile_mi
     );
 }
 
-#[test]
-fn should_report_disabled_when_profile_runtime_unavailable_and_profile_disabled() {
+#[tokio::test]
+async fn should_bootstrap_appui_runtime_when_gateway_autostart_is_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state(dir.path());
     let mut profile = profile_for_runtime_message("disabled-one");
     profile.enabled = false;
-    // Fully configured (a real key) — the only thing wrong is `enabled`.
+    // `enabled` controls gateway auto-start, not authenticated AppUI access.
     profile.config.llm = Some(crate::profiles::LlmProfileConfig {
         primary: Some(crate::profiles::LlmModelSelectionConfig {
-            family_id: Some("zai".to_string()),
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_APPUI_DISABLED_PROFILE_KEY".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         fallbacks: Vec::new(),
     });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_APPUI_DISABLED_PROFILE_KEY".to_string(),
+        "test-key".to_string(),
+    );
     state
         .profile_store
         .as_ref()
@@ -690,15 +700,11 @@ fn should_report_disabled_when_profile_runtime_unavailable_and_profile_disabled(
         .save(&profile)
         .unwrap();
 
-    let message = profile_runtime_unavailable_message(&state, "disabled-one");
-    assert!(
-        message.contains("disabled"),
-        "expected a disabled-profile explanation, got: {message}"
-    );
-    assert!(
-        !message.contains("API key"),
-        "a disabled-but-configured profile must not be told to add an API key: {message}"
-    );
+    let runtime = ensure_session_profile_runtime(&state, Some("disabled-one"))
+        .await
+        .expect("runtime bootstrap")
+        .expect("on-demand AppUI runtime");
+    assert_eq!(runtime.primary_model_id, "gpt-4o-mini");
 }
 
 #[test]
