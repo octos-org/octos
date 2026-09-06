@@ -109,7 +109,15 @@ impl Agent {
         if self.shutdown.load(Ordering::Acquire) {
             return Some(BudgetStop::Shutdown);
         }
-        if iteration >= self.config.max_iterations {
+        // `0` is the Codex-style interactive mode (`octos chat`, `octos acp`):
+        // no arbitrary turn cap while a human is attached. Unattended lanes
+        // never inherit it: `octos gateway` / `octos serve` session actors
+        // fall back to `UNATTENDED_MAX_ITERATIONS_FALLBACK` (octos-cli
+        // `runtime/session.rs`) and spawned sub-agents to
+        // `DEFAULT_SPAWN_MAX_ITERATIONS` (`tools/spawn.rs`) when nothing is
+        // configured. Cancellation, idle detection and per-call timeouts
+        // remain live in both modes.
+        if self.config.max_iterations > 0 && iteration >= self.config.max_iterations {
             return Some(BudgetStop::MaxIterations {
                 limit: self.config.max_iterations,
             });
@@ -212,7 +220,7 @@ mod tests {
     #[test]
     fn agent_config_default_values() {
         let cfg = AgentConfig::default();
-        assert_eq!(cfg.max_iterations, 50);
+        assert_eq!(cfg.max_iterations, 0);
         assert_eq!(cfg.max_tokens, None);
         assert_eq!(cfg.max_timeout, Some(Duration::from_secs(1800)));
         assert!(cfg.save_episodes);
@@ -408,6 +416,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_iteration_limit_is_unlimited_but_other_guards_stay_live() {
+        let agent = test_agent(Some(Duration::from_secs(30))).await;
+        assert_eq!(agent.config.max_iterations, 0);
+        let activity = super::super::activity::LoopActivityState::new(Instant::now());
+
+        let stop = agent.check_budget(
+            50_000,
+            Instant::now() - Duration::from_secs(3600),
+            &TokenUsage::default(),
+            &activity,
+        );
+        assert!(
+            stop.is_none(),
+            "active turns with max_iterations=0 must not hit an iteration cap"
+        );
+
+        activity.set_last_activity_at(Instant::now() - Duration::from_secs(301));
+        let stop = agent.check_budget(50_001, Instant::now(), &TokenUsage::default(), &activity);
+        assert!(matches!(stop, Some(BudgetStop::IdleProgressTimeout { .. })));
+    }
+
+    #[tokio::test]
     async fn stale_progress_trips_activity_timeout_before_idle_timeout() {
         let agent = test_agent(Some(Duration::from_secs(30))).await;
         let activity = super::super::activity::LoopActivityState::new(Instant::now());
@@ -462,6 +492,7 @@ mod tests {
             files_to_send: vec![],
             streamed: false,
             messages: vec![],
+            assistant_segments: Default::default(),
             tool_results: vec![],
             synthesized_from_spawn_only: false,
             pending_approval: None,

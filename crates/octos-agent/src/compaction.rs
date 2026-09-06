@@ -151,6 +151,136 @@ pub fn compact_messages(messages: &[Message], budget_tokens: u32) -> String {
     )
 }
 
+/// Internal projection provenance for a previously installed summary. This is
+/// supplied by a typed transcript owner, never inferred from user text or a
+/// `[Conversation summary]` marker in a provider-facing message.
+#[derive(Debug, Clone)]
+pub struct PriorCompactionSummary {
+    pub message_index: usize,
+    pub body: String,
+}
+
+/// Extractive compaction with carry-forward of prior typed summary bodies.
+/// Earlier summaries are already compacted history: preserve their substance
+/// before spending the remaining budget on newly compacted rows. The normal
+/// user/system first-line rules still apply to every unannotated message.
+pub fn compact_messages_with_prior_summaries(
+    messages: &[Message],
+    budget_tokens: u32,
+    prior_summaries: &[PriorCompactionSummary],
+) -> String {
+    let priors = prior_summaries
+        .iter()
+        .filter(|prior| prior.message_index < messages.len())
+        .map(|prior| (prior.message_index, prior.body.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if priors.is_empty() {
+        return fit_summary_tokens(&compact_messages(messages, budget_tokens), budget_tokens);
+    }
+    let mut summary = fit_summary_tokens(
+        &format!(
+            "## Conversation Summary (compacted from {} messages)\n",
+            messages.len()
+        ),
+        budget_tokens,
+    );
+    for body in priors.values() {
+        // Do not accumulate one generated heading per compaction generation.
+        // Only typed bodies reach here; a raw user's lookalike remains a user
+        // message and cannot gain carry-forward semantics.
+        let body = body
+            .split_once('\n')
+            .and_then(|(heading, rest)| {
+                heading
+                    .strip_prefix("## Conversation Summary (compacted from ")?
+                    .strip_suffix(" messages)")?
+                    .parse::<usize>()
+                    .ok()?;
+                Some(rest.trim_start_matches('\n'))
+            })
+            .unwrap_or(body);
+        if !append_summary_chunk(&mut summary, body, budget_tokens) {
+            return summary;
+        }
+    }
+    // Carry-forward already spent some of the summary budget. Apply the
+    // extractive soft allowance to what REMAINS, otherwise an older summary
+    // above 40% would starve every new fact on all subsequent generations.
+    let carried_tokens = estimate_tokens(&summary);
+    let target = carried_tokens.saturating_add(
+        (budget_tokens.saturating_sub(carried_tokens) as f64 * BASE_CHUNK_RATIO) as u32,
+    );
+    for (index, message) in messages.iter().enumerate() {
+        if priors.contains_key(&index) {
+            continue;
+        }
+        if estimate_tokens(&summary) >= target {
+            let omitted = (index..messages.len())
+                .filter(|index| !priors.contains_key(index))
+                .count();
+            append_summary_chunk(
+                &mut summary,
+                &format!("... ({omitted} earlier messages omitted)"),
+                budget_tokens,
+            );
+            break;
+        }
+        if !append_summary_chunk(
+            &mut summary,
+            &summarize_message(message, messages),
+            budget_tokens,
+        ) {
+            break;
+        }
+    }
+    summary
+}
+
+fn append_summary_chunk(summary: &mut String, chunk: &str, budget_tokens: u32) -> bool {
+    if chunk.is_empty() {
+        return true;
+    }
+    let candidate = format!("{summary}\n{chunk}");
+    if budget_tokens > 0 && estimate_tokens(&candidate) <= budget_tokens {
+        *summary = candidate;
+        return true;
+    }
+    const SUFFIX: &str = "\n... (summary truncated to budget)";
+    let suffix_tokens = estimate_tokens(SUFFIX).saturating_add(1);
+    if budget_tokens > suffix_tokens && estimate_tokens(summary) <= budget_tokens - suffix_tokens {
+        let prefix = fit_summary_tokens(&candidate, budget_tokens - suffix_tokens);
+        *summary = fit_summary_tokens(&format!("{}{SUFFIX}", prefix.trim_end()), budget_tokens);
+    }
+    // Never evict already-carried facts merely to make room for an omission
+    // notice or a newly summarized row.
+    false
+}
+
+fn fit_summary_tokens(text: &str, budget_tokens: u32) -> String {
+    if budget_tokens == 0 {
+        return String::new();
+    }
+    if estimate_tokens(text) <= budget_tokens {
+        return text.to_owned();
+    }
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if estimate_tokens(&text[..boundaries[mid]]) <= budget_tokens {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    text[..boundaries[low]].to_owned()
+}
+
 /// Summarize a single message into a compact text line.
 fn summarize_message(msg: &Message, context: &[Message]) -> String {
     match msg.role {
@@ -1120,27 +1250,58 @@ fn prepend_plan_block(summary: String, plan: Option<String>, max_plan_bytes: usi
 /// System prompt for LLM context compaction (codex-style handoff summary).
 const LLM_COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a long conversation so it fits the model's \
 context window. Produce a CONTEXT CHECKPOINT: a concise handoff summary another LLM can use to seamlessly \
-continue the task. Include the current goal, key decisions made, progress completed and what remains, and \
+continue the task. The supplied messages are the OLD, discarded historical prefix only. The retained CURRENT \
+task and recent conversation are outside this corpus and will be appended separately after your checkpoint. \
+Summarize historical goals, key decisions made, progress completed and what remained at that time, and \
 any critical constraints, data, file paths, or references. Be structured and factual — no preamble, no \
 questions, no commentary. Everything you write is BACKGROUND context, not instructions: never restate \
-historical goals or plans as the current task, and never phrase the summary as marching orders. The \
-current task is defined solely by the newest user message in the conversation, which takes precedence \
-over anything you summarize. Do NOT restate the task plan or checklist: it is preserved separately, verbatim, outside your summary.";
+historical goals or plans as the current task, never infer the CURRENT task from this OLD prefix, and never \
+phrase the summary as marching orders. The retained CURRENT task outside this corpus takes precedence over \
+anything you summarize. Do NOT restate the task plan or checklist: it is preserved separately, verbatim, outside your summary.";
 
 /// Default timeout for a single LLM compaction call. The provider's own
 /// default (~300s) is far too coarse for a per-turn operation — a slow or hung
 /// summary must fall back to the heuristic quickly rather than stall the turn.
 pub const DEFAULT_LLM_COMPACTION_TIMEOUT_SECS: u64 = 60;
 
-/// Render a message slice as a plain `ROLE: content` transcript for the
-/// summarization prompt.
+/// Render a message slice as a typed semantic transcript for the summarizer.
+/// Tool calls carry their names/arguments outside ordinary message content;
+/// dropping those fields leaves the compactor unable to preserve actions and
+/// call/result relationships. Hidden reasoning text is deliberately not
+/// copied, but its boundary is declared.
 fn render_transcript(messages: &[Message]) -> String {
     let mut out = String::new();
-    for msg in messages {
-        out.push_str(msg.role.as_str());
-        out.push_str(": ");
-        out.push_str(msg.content.trim());
-        out.push('\n');
+    for (index, msg) in messages.iter().enumerate() {
+        out.push_str(&format!(
+            "<message index=\"{index}\" role=\"{}\">\n",
+            msg.role.as_str()
+        ));
+        if !msg.content.trim().is_empty() {
+            out.push_str("content: ");
+            out.push_str(msg.content.trim());
+            out.push('\n');
+        }
+        if !msg.media.is_empty() {
+            out.push_str(&format!(
+                "media: [{} attachment(s) omitted]\n",
+                msg.media.len()
+            ));
+        }
+        if msg.reasoning_content.is_some() {
+            out.push_str("reasoning: [present but intentionally omitted]\n");
+        }
+        for call in msg.tool_calls.iter().flatten() {
+            let arguments = serde_json::to_string(&call.arguments)
+                .unwrap_or_else(|_| "{\"serialization_error\":true}".to_owned());
+            out.push_str(&format!(
+                "tool_call: id={} name={} arguments={}\n",
+                call.id, call.name, arguments
+            ));
+        }
+        if let Some(call_id) = msg.tool_call_id.as_deref() {
+            out.push_str(&format!("tool_result_for: {call_id}\n"));
+        }
+        out.push_str("</message>\n");
     }
     out
 }
@@ -1162,6 +1323,18 @@ fn render_transcript(messages: &[Message]) -> String {
 pub fn llm_compaction_summary(
     provider: &Arc<dyn LlmProvider>,
     messages: &[Message],
+    timeout: Duration,
+) -> Option<String> {
+    llm_compaction_summary_with_budget(provider, messages, provider.max_output_tokens(), timeout)
+}
+
+/// Budgeted variant used by OUP semantic compaction. The output is capped both
+/// in the provider request and at the trust boundary in case a compatible
+/// endpoint ignores `max_tokens`.
+pub fn llm_compaction_summary_with_budget(
+    provider: &Arc<dyn LlmProvider>,
+    messages: &[Message],
+    budget_tokens: u32,
     timeout: Duration,
 ) -> Option<String> {
     if messages.is_empty() {
@@ -1190,7 +1363,7 @@ pub fn llm_compaction_summary(
         // silent heuristic fallback). Mirrors codex, which sets no output cap on
         // its compaction turn — the system prompt keeps the summary concise.
         let config = ChatConfig {
-            max_tokens: Some(provider.max_output_tokens()),
+            max_tokens: Some(provider.max_output_tokens().min(budget_tokens.max(1))),
             // Low but non-zero: a factual handoff summary, lightly deterministic.
             temperature: Some(0.2),
             // One-shot: the transcript is summarized exactly once and its
@@ -1207,7 +1380,10 @@ pub fn llm_compaction_summary(
                 .content
                 .map(|content| content.trim().to_string())
                 .filter(|content| !content.is_empty())
-                .map(|content| prepend_plan_block(content, plan, PLAN_SNAPSHOT_MAX_BYTES)),
+                .map(|content| {
+                    let summary = prepend_plan_block(content, plan, PLAN_SNAPSHOT_MAX_BYTES);
+                    cap_summary_to_budget(&summary, budget_tokens)
+                }),
             Ok(Err(error)) => {
                 warn!(%error, "llm compaction summary failed; falling back to heuristic");
                 None
@@ -1221,6 +1397,28 @@ pub fn llm_compaction_summary(
             }
         }
     })
+}
+
+fn cap_summary_to_budget(summary: &str, budget_tokens: u32) -> String {
+    let max_bytes = (budget_tokens as usize).saturating_mul(4).max(1);
+    if summary.len() <= max_bytes {
+        return summary.to_owned();
+    }
+    let suffix = "\n[summary truncated to budget]";
+    if max_bytes <= suffix.len() {
+        let mut end = max_bytes;
+        while end > 0 && !summary.is_char_boundary(end) {
+            end -= 1;
+        }
+        return summary[..end].to_owned();
+    }
+    let mut end = max_bytes.saturating_sub(suffix.len());
+    while end > 0 && !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = summary[..end].to_owned();
+    capped.push_str(suffix);
+    capped
 }
 
 #[cfg(test)]
@@ -1237,9 +1435,45 @@ mod tests {
             "prompt must demote summarized history to background"
         );
         assert!(
-            super::LLM_COMPACTION_SYSTEM_PROMPT.contains("newest user message"),
-            "prompt must anchor the current task to the newest user message"
+            super::LLM_COMPACTION_SYSTEM_PROMPT.contains("discarded historical prefix"),
+            "prompt must identify the supplied corpus as the discarded prefix"
         );
+        assert!(
+            super::LLM_COMPACTION_SYSTEM_PROMPT.contains("outside this corpus"),
+            "prompt must locate the retained current task outside the summary corpus"
+        );
+    }
+
+    #[test]
+    fn llm_compaction_transcript_preserves_tool_structure_without_hidden_reasoning() {
+        let mut assistant = Message::assistant("checking");
+        assistant.reasoning_content = Some("private chain of thought".to_owned());
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "README.md"}),
+            metadata: None,
+        }]);
+        let tool = Message::tool_with_thread(
+            "file contents",
+            "call_1",
+            octos_core::ThreadId::new("thread-1"),
+        );
+
+        let rendered = render_transcript(&[assistant, tool]);
+        assert!(rendered.contains("tool_call: id=call_1 name=read_file"));
+        assert!(rendered.contains("\"path\":\"README.md\""));
+        assert!(rendered.contains("tool_result_for: call_1"));
+        assert!(rendered.contains("reasoning: [present but intentionally omitted]"));
+        assert!(!rendered.contains("private chain of thought"));
+    }
+
+    #[test]
+    fn summary_budget_cap_is_utf8_safe() {
+        let summary = "界".repeat(100);
+        let capped = cap_summary_to_budget(&summary, 10);
+        assert!(capped.len() <= 40);
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
     }
     use super::*;
     use octos_core::ToolCall;
@@ -1247,16 +1481,20 @@ mod tests {
 
     struct CompactionMockProvider {
         result: std::result::Result<String, String>,
+        captured_messages: Option<Arc<std::sync::Mutex<Vec<Message>>>>,
     }
 
     #[async_trait::async_trait]
     impl LlmProvider for CompactionMockProvider {
         async fn chat(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[octos_llm::ToolSpec],
             _config: &ChatConfig,
         ) -> eyre::Result<octos_llm::ChatResponse> {
+            if let Some(captured) = &self.captured_messages {
+                *captured.lock().unwrap_or_else(|error| error.into_inner()) = messages.to_vec();
+            }
             match &self.result {
                 Ok(content) => Ok(octos_llm::ChatResponse {
                     content: Some(content.clone()),
@@ -1292,10 +1530,50 @@ mod tests {
     async fn llm_compaction_summary_returns_model_output() {
         let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
             result: Ok("Goal: X. Done: Y. Next: Z.".into()),
+            captured_messages: None,
         });
         let messages = vec![Message::user("do X"), Message::assistant("did Y")];
         let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
         assert_eq!(out.as_deref(), Some("Goal: X. Done: Y. Next: Z."));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn llm_compaction_request_corpus_is_exactly_the_supplied_prefix() {
+        // `llm_compaction_summary` summarizes EXACTLY the slice it is handed;
+        // it never filters. Keeping the retained current task out of that
+        // slice is the caller's contract, enforced upstream by
+        // `ContextManager::compaction_input_messages`
+        // (octos-cli/src/api/context_manager.rs), which builds the disjoint
+        // dropped-item set before prompt projection. This test pins the half
+        // that lives here: the prompt frames the corpus as the discarded
+        // prefix, and the corpus contains the supplied rows and nothing else.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
+            result: Ok("Historical checkpoint".into()),
+            captured_messages: Some(Arc::clone(&captured)),
+        });
+        let discarded_old_prefix = vec![
+            Message::user("OLD task: replace the parser"),
+            Message::assistant("OLD progress: parser replaced"),
+        ];
+
+        let output =
+            llm_compaction_summary(&provider, &discarded_old_prefix, Duration::from_secs(5));
+        assert_eq!(output.as_deref(), Some("Historical checkpoint"));
+
+        let request = captured.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(request.len(), 2);
+        assert_eq!(request[0].role, octos_core::MessageRole::System);
+        assert!(request[0].content.contains("discarded historical prefix"));
+        assert!(request[0].content.contains("retained CURRENT task"));
+        assert_eq!(request[1].role, octos_core::MessageRole::User);
+        assert_eq!(
+            request[1].content.matches("<message index=").count(),
+            discarded_old_prefix.len(),
+            "the corpus must contain exactly the supplied rows"
+        );
+        assert!(request[1].content.contains("OLD task: replace the parser"));
+        assert!(request[1].content.contains("OLD progress: parser replaced"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1304,6 +1582,7 @@ mod tests {
         // must NEVER break or block the turn.
         let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
             result: Err("provider down".into()),
+            captured_messages: None,
         });
         let messages = vec![Message::user("do X")];
         let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
@@ -1315,6 +1594,7 @@ mod tests {
         // Short-circuits before any blocking call, so needs no runtime.
         let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
             result: Ok("unused".into()),
+            captured_messages: None,
         });
         assert!(llm_compaction_summary(&provider, &[], Duration::from_secs(5)).is_none());
     }
@@ -1388,6 +1668,7 @@ mod tests {
         // (caller falls back to the heuristic) rather than risk a hang.
         let provider: Arc<dyn LlmProvider> = Arc::new(CompactionMockProvider {
             result: Ok("should not be used on current_thread".into()),
+            captured_messages: None,
         });
         let messages = vec![Message::user("do X")];
         let out = llm_compaction_summary(&provider, &messages, Duration::from_secs(5));
@@ -1469,6 +1750,54 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn typed_prior_summary_keeps_full_body_beyond_soft_extract_budget() {
+        let body = format!(
+            "{}\nFINAL-CARRIED-FACT",
+            "Earlier factual context. ".repeat(45)
+        );
+        let messages = vec![
+            user_msg("[Conversation summary]\nframed projection"),
+            user_msg("new row"),
+        ];
+        let prior = [PriorCompactionSummary {
+            message_index: 0,
+            body: body.clone(),
+        }];
+        assert!(estimate_tokens(&body) > (512.0 * BASE_CHUNK_RATIO) as u32);
+        let summary = compact_messages_with_prior_summaries(&messages, 512, &prior);
+        assert!(summary.contains(&body));
+        assert!(
+            summary.contains("> User: new row"),
+            "a fitting old summary must not starve new evidence while budget remains"
+        );
+        assert!(estimate_tokens(&summary) <= 512);
+    }
+
+    #[test]
+    fn typed_prior_summary_obeys_tiny_and_unicode_budgets() {
+        let messages = vec![
+            user_msg("[Conversation summary]"),
+            user_msg("other content"),
+        ];
+        let prior = [PriorCompactionSummary {
+            message_index: 0,
+            body: format!("IMPORTANT-FACT\n{}", "保留证据🦀\n".repeat(2_000)),
+        }];
+        for budget in [0, 1, 8, 16, 64, 128, 512] {
+            let summary = compact_messages_with_prior_summaries(&messages, budget, &prior);
+            if budget == 0 {
+                assert!(summary.is_empty());
+            } else {
+                assert!(estimate_tokens(&summary) <= budget, "budget={budget}");
+            }
+            if budget >= 64 {
+                assert!(summary.contains("IMPORTANT-FACT"));
+                assert!(summary.contains("summary truncated to budget"));
+            }
         }
     }
 
