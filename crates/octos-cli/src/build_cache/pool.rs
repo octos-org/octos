@@ -635,6 +635,13 @@ pub fn acquire(
         };
         match fs2::FileExt::try_lock_exclusive(&lock) {
             Ok(()) => {
+                // Detached claims drop their flock but retain ownership while
+                // their recorded process is alive. Inspect under this lock.
+                if let Some(meta) = read_holder(&dir)
+                    && pid_alive(meta.pid).is_some()
+                {
+                    continue;
+                }
                 let target_dir = dir.join(TARGET_LEAF);
                 if let Err(e) = fs::create_dir_all(&target_dir) {
                     last_err = Some(e);
@@ -1227,6 +1234,30 @@ mod tests {
         // Scan order is deterministic: the freed lowest-numbered slot is
         // re-taken first.
         assert_eq!(again.path, first);
+    }
+
+    #[test]
+    fn detached_live_claims_use_distinct_slots_then_exhaust() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let cfg = BuildCacheConfig {
+            verify_slots: 2,
+            ..config()
+        };
+        let first = acquire_detached(&root, &key(&tmp), &cfg, &HolderInfo::default()).unwrap();
+        let second = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Verify,
+            &cfg,
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        assert_ne!(first.path, second.path);
+        assert!(matches!(
+            acquire_detached(&root, &key(&tmp), &cfg, &HolderInfo::default()),
+            Err(BuildCacheError::PoolExhausted { .. })
+        ));
     }
 
     #[test]

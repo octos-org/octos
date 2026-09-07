@@ -1308,24 +1308,12 @@ mod tests {
         let meta = pool::read_holder(&first.path).expect("holder.json written");
         assert_eq!(meta.kind, SlotKind::Verify);
         assert_eq!(meta.pid, std::process::id());
-        // A second detached acquire does NOT get PoolExhausted: detached
-        // slots hold no flock, so the pool cannot see the first claim at
-        // the mutex layer — it takes the same slot and OVERWRITES
-        // holder.json (last claimant wins). That is the honest semantics
-        // of the metadata-only truth model; what protects the outer loop
-        // is verify_slots sizing plus the pid liveness check, not the
-        // flock. Assert the overwrite, not exhaustion.
-        let second = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
-        assert_eq!(
-            second.path, first.path,
-            "same slot re-claimed (no flock to refuse it)"
-        );
-        let meta2 = pool::read_holder(&first.path).expect("holder.json overwritten");
-        assert_eq!(meta2.pid, std::process::id());
-
-        // Release from the "other process" (path-only API), then re-acquire
-        // must get the same slot back and reuse its target dir.
-        pool::release_detached(&pool_root, &second.path, SlotOutcome::Completed).unwrap();
+        // Live detached claims remain exclusive after their flock is dropped.
+        assert!(matches!(
+            pool::acquire_detached(&pool_root, &key, &config(), &holder),
+            Err(BuildCacheError::PoolExhausted { .. })
+        ));
+        pool::release_detached(&pool_root, &first.path, SlotOutcome::Completed).unwrap();
         assert!(pool::read_holder(&first.path).is_none(), "holder cleared");
         let second = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
         assert_eq!(second.path, first.path, "released slot is reusable");
