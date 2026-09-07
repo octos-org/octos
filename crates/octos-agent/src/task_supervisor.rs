@@ -107,6 +107,17 @@ pub enum RegisterTaskError {
         parent_tool_call_id: String,
         parent_status: TaskStatus,
     },
+    /// #21 (round-4, codex #17 B3) — the registration's FIRST durable
+    /// task-ledger write failed, so the task row (which must already carry
+    /// the workspace stamp: the crash window between a `workspace_root=None`
+    /// insert and a later `set_workspace_root` second write is exactly the
+    /// gap this variant exists to close) was ROLLED BACK: the in-memory
+    /// insert is removed and no half-bound task exists. The caller must
+    /// treat the bind as failed (no registry binding, no task id).
+    WorkspacePersistFailed {
+        tool_call_id: String,
+        source: String,
+    },
 }
 
 impl std::fmt::Display for RegisterTaskError {
@@ -127,6 +138,14 @@ impl std::fmt::Display for RegisterTaskError {
                 f,
                 "parent task (tool_call_id='{parent_tool_call_id}') is already {} — refusing child registration",
                 parent_status.as_str(),
+            ),
+            Self::WorkspacePersistFailed {
+                tool_call_id,
+                source,
+            } => write!(
+                f,
+                "task (tool_call_id='{tool_call_id}') registration rollback: the first durable \
+                 task-ledger write (including the workspace stamp) failed: {source}"
             ),
         }
     }
@@ -357,6 +376,25 @@ pub struct BackgroundTask {
     /// domain-specific views from the canonical task lifecycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_metadata: Option<Value>,
+    /// #1707 round 5 codex round 2 (board item #13 round 2) — the MASTER
+    /// session's workspace root, captured at registration time.
+    ///
+    /// The background-task agent mirror derives its `cwd` stamp from this
+    /// value (falling back to the legacy `output_files[0]` parent-dir
+    /// derivation when absent), so the continuation queue's workspace stamps
+    /// — which the `/stop` terminal purge matches against the interrupted
+    /// turn's `session_runtime.workspace_root` — share ONE source with the
+    /// purge argument instead of depending on how the task completed
+    /// (`retire_peer_supervised_task` completes with EMPTY output files →
+    /// `cwd=None`; orphan adoption completes with `<profile-data>/peers/
+    /// <slug>/result.md` → `cwd=<…>/peers/<slug>` — NEITHER equalled the
+    /// master's workspace root, so the `/stop` purge matched ZERO
+    /// `peer_handoff` items in production).
+    ///
+    /// `#[serde(default)]` so pre-existing persisted snapshots deserialize
+    /// unchanged; `None` preserves the legacy derivation bit-for-bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 impl BackgroundTask {
@@ -750,6 +788,23 @@ struct PersistedTaskRecord {
     #[serde(default = "default_task_ledger_schema")]
     schema_version: u32,
     task: BackgroundTask,
+}
+
+// Wall-clock order remains authoritative across supervisors. On an exact
+// tie, accept only lifecycle progress supported by the live transition rules.
+fn task_snapshot_advances(candidate: &BackgroundTask, existing: &BackgroundTask) -> bool {
+    match candidate.updated_at.cmp(&existing.updated_at) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            (candidate.status.is_terminal() && !existing.status.is_terminal())
+                || (existing.status == TaskStatus::Failed
+                    && existing.failed_by_observer
+                    && (candidate.status == TaskStatus::Completed
+                        || (candidate.status == TaskStatus::Failed
+                            && !candidate.failed_by_observer)))
+        }
+    }
 }
 
 fn default_task_ledger_schema() -> u32 {
@@ -1486,7 +1541,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             for (task_id, task) in restored {
                 match tasks.get(&task_id) {
-                    Some(existing) if existing.updated_at >= task.updated_at => {}
+                    Some(existing) if !task_snapshot_advances(&task, existing) => {}
                     _ => {
                         restored_won.insert(task_id.clone());
                         tasks.insert(task_id, task);
@@ -2312,6 +2367,48 @@ impl TaskSupervisor {
         )
     }
 
+    /// #21 (round-4, codex #17 B3) — STRICT peer-task registration whose
+    /// FIRST durable ledger row already carries the workspace stamp.
+    ///
+    /// The pre-#21 shape (`register` + `set_workspace_root`) persisted the
+    /// task row with `workspace_root: None` first and stamped the workspace
+    /// in a SECOND snapshot append; a crash between the two (or a failed
+    /// second write — which was only warned) left the restored task
+    /// unstamped, and the `/stop` purge / continuation workspace scoping
+    /// fell back to the never-matching `output_files` derivation.
+    ///
+    /// This entry point closes the window structurally: the task is built
+    /// WITH the workspace stamp, and the registration only completes if the
+    /// first `persist_snapshot` write SUCCEEDS. On failure the task is never
+    /// inserted or published to registration observers, and
+    /// [`RegisterTaskError::WorkspacePersistFailed`] is returned. When the
+    /// supervisor has NO persistence path configured the write is trivially
+    /// "successful" (in-memory supervision only) and the registration
+    /// proceeds — the same no-store contract as every other register path.
+    ///
+    /// The stamp accepts a lossless-encoded workspace scope (see
+    /// `peers::workspace_scope_encode`); an empty string is normalized to
+    /// `None` (unstamped, legacy shape).
+    pub fn try_register_peer_with_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        workspace_scope: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            None,
+            None,
+            None,
+            None,
+            workspace_scope,
+            true,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn register_full(
         &self,
@@ -2322,6 +2419,32 @@ impl TaskSupervisor {
         tool_input: Option<Value>,
         originating_client_message_id: Option<String>,
         parent_terminal_check_tool_call_id: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            task_ledger_path,
+            tool_input,
+            originating_client_message_id,
+            parent_terminal_check_tool_call_id,
+            None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_full_with_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+        tool_input: Option<Value>,
+        originating_client_message_id: Option<String>,
+        parent_terminal_check_tool_call_id: Option<&str>,
+        workspace_scope: Option<&str>,
+        require_persistence: bool,
     ) -> Result<String, RegisterTaskError> {
         // Codex P2 follow-up: early terminal-parent check, BEFORE the
         // fan-out cap path. The cap path has side effects (poisoning
@@ -2560,7 +2683,17 @@ impl TaskSupervisor {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: workspace_scope
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
         };
+        // Read configuration before locking the task table: enable_persistence
+        // may consult the task table while holding the configuration lock.
+        let persistence_path = self
+            .persistence_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         // Codex P2 atomicity: when this is a child-task registration
         // that requested the parent-terminal guard, recheck parent
@@ -2594,9 +2727,22 @@ impl TaskSupervisor {
                 parent_status: status,
             });
         }
+        // Publish the task only after its first, already-stamped row has
+        // been accepted. Holding the task lock also prevents readers from
+        // observing an uncommitted registration.
+        if require_persistence {
+            Self::persist_snapshot_strict(persistence_path.as_ref(), &task).map_err(|error| {
+                RegisterTaskError::WorkspacePersistFailed {
+                    tool_call_id: tool_call_id.to_string(),
+                    source: error.to_string(),
+                }
+            })?;
+        }
         tasks.insert(id.clone(), task);
         drop(tasks);
-        self.persist_snapshot_by_id(&id);
+        if !require_persistence {
+            self.persist_snapshot_by_id(&id);
+        }
         record_child_session_lifecycle(
             "tracked",
             if session_key.is_some() {
@@ -2667,6 +2813,35 @@ impl TaskSupervisor {
             // Stamp updated_at so reconnect hydration / dashboards see
             // the projection update even when no lifecycle transition
             // fires.
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
+        self.emit_progress_for_state(&snapshot);
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13 round 2) — stamp the
+    /// MASTER session's workspace root onto an already-registered task.
+    /// Same post-registration shape as [`Self::set_m13b_projection`]:
+    /// keeps every `register_*` signature unchanged (octos-agent stays
+    /// additive) while letting the registration site record the purge-side
+    /// workspace value the background-task mirror derives `cwd` from. A
+    /// `None` / empty value is ignored — the task keeps any existing stamp
+    /// (and the legacy `output_files` derivation stays the fallback).
+    pub fn set_workspace_root(&self, task_id: &str, workspace_root: Option<&str>) {
+        let Some(workspace_root) = workspace_root.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            if task.workspace_root.as_deref() == Some(workspace_root) {
+                return;
+            }
+            task.workspace_root = Some(workspace_root.to_string());
             task.updated_at = Utc::now();
             task.clone()
         };
@@ -3531,6 +3706,27 @@ impl TaskSupervisor {
         }
     }
 
+    /// #21 (round-4, codex #17 B3) — CHECKED variant of
+    /// [`Self::persist_snapshot`]: returns the write error instead of
+    /// warning it away, so the strict registration entry point can roll the
+    /// in-memory insert back and surface the failure. `Ok(())` when no
+    /// persistence path is configured (in-memory supervision contract).
+    fn persist_snapshot_strict(
+        path: Option<&PathBuf>,
+        task: &BackgroundTask,
+    ) -> std::io::Result<()> {
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let record = PersistedTaskRecord {
+            schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+            task: task.clone(),
+        };
+        let json = serde_json::to_string(&record)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Self::append_persisted_task(path, &json)
+    }
+
     fn persist_snapshot(&self, task: &BackgroundTask) {
         let Some(path) = self
             .persistence_path
@@ -3607,7 +3803,7 @@ impl TaskSupervisor {
             // append to the SAME per-session ledger, so rows can interleave
             // such that an older snapshot lands after a newer one. (codex P2.)
             match restored.get(&record.task.id) {
-                Some(existing) if existing.updated_at >= record.task.updated_at => {}
+                Some(existing) if !task_snapshot_advances(&record.task, existing) => {}
                 _ => {
                     restored.insert(record.task.id.clone(), record.task);
                 }
@@ -3617,7 +3813,8 @@ impl TaskSupervisor {
     }
 
     /// Re-read the persistence ledger and merge any snapshot newer (by
-    /// `updated_at`) than the in-memory copy into `self.tasks`. Unlike
+    /// `updated_at`, with lifecycle progress breaking exact ties) than the
+    /// in-memory copy into `self.tasks`. Unlike
     /// [`Self::enable_persistence`] this does NOT run the orphan sweep, persist
     /// snapshots, or fire callbacks — it only freshens stale in-memory rows.
     ///
@@ -3649,7 +3846,7 @@ impl TaskSupervisor {
             // `cancel_task`/`relaunch_task` (oldest-first) would then fire the
             // wrong supervisor's token while the real worker runs on (codex P1).
             if let Some(existing) = tasks.get(&task_id) {
-                if task.updated_at > existing.updated_at {
+                if task_snapshot_advances(&task, existing) {
                     tasks.insert(task_id, task);
                     refreshed += 1;
                 }
@@ -3680,7 +3877,7 @@ impl TaskSupervisor {
                 // Update only if this supervisor already owns the task — never
                 // import an absent row (codex P1; see `refresh_from_persistence`).
                 if let Some(existing) = tasks.get(task_id) {
-                    if task.updated_at > existing.updated_at {
+                    if task_snapshot_advances(task, existing) {
                         tasks.insert(task_id.to_string(), task.clone());
                     }
                 }

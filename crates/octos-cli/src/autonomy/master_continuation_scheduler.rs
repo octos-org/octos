@@ -353,6 +353,25 @@ pub(crate) struct QueuedMasterContinuation {
     /// the item (pop→reinsert→pop preserves it) and dies when the item is
     /// consumed or re-homed to a fresh continuation.
     pub(crate) redelivery_attempts: u32,
+    /// #26 (round-4, #18 B4) — the DURABLE revision (`attempt`) this queued
+    /// item's payload was persisted at, so the delivery path can stamp
+    /// Started/Completed with the revision it actually resolved. 0 = not
+    /// (yet) durable / legacy shape (the lifecycle event then applies
+    /// unconditionally, matching pre-#26 behavior). Set by the persist
+    /// helpers and by restart restore (the record's own `attempt`); NOT
+    /// part of dedupe identity.
+    pub(crate) persisted_attempt: u32,
+}
+
+/// Canonical workspace identity, with legacy `workspace` fallback for old
+/// callers. Producer/restore boundaries normalize known peer wire spellings.
+/// Empty strings remain absent so an unstamped item keeps the None scope.
+pub(crate) fn item_workspace(item: &QueuedMasterContinuation) -> Option<&str> {
+    item.metadata
+        .get("workspace_scope")
+        .or_else(|| item.metadata.get("workspace"))
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 impl QueuedMasterContinuation {
@@ -592,6 +611,7 @@ impl MasterContinuationScheduler {
             created_at: request.created_at,
             enqueued_at,
             redelivery_attempts: 0,
+            persisted_attempt: 0,
         };
 
         self.heap.push(HeapEntry {
@@ -608,6 +628,23 @@ impl MasterContinuationScheduler {
         dedupe_key: &MasterContinuationDedupeKey,
     ) -> Option<QueuedMasterContinuation> {
         self.pending_by_key.remove(dedupe_key)
+    }
+
+    /// #26 (round-4, #18 B4) — stamp the durable revision onto the still-
+    /// pending item so any later drain of it carries the attempt its
+    /// payload was persisted at (the delivery path's Started/Completed
+    /// resolve that revision). A no-op when the key is no longer pending
+    /// (already drained/cancelled — nothing left to stamp). Never lowers an
+    /// existing stamp: a retry's re-persist of the same payload at a higher
+    /// allocator attempt only lifts it.
+    pub(crate) fn stamp_persisted_attempt(
+        &mut self,
+        dedupe_key: &MasterContinuationDedupeKey,
+        attempt: u32,
+    ) {
+        if let Some(item) = self.pending_by_key.get_mut(dedupe_key) {
+            item.persisted_attempt = item.persisted_attempt.max(attempt);
+        }
     }
 
     /// #436 P1 #2/#4 — RE-INSERT a continuation that was popped (claimed) but
@@ -651,6 +688,56 @@ impl MasterContinuationScheduler {
         });
         self.pending_by_key.insert(item.dedupe_key.clone(), item);
         ReinsertOutcome::Requeued
+    }
+
+    /// #1707 (codex Blocker 1) — put back an item REMOVED by
+    /// [`Self::take_pending_terminal_for_scope`] when its fold aborts (the
+    /// carrier's durable persist failed, so nothing was tombstoned and the
+    /// batch must deliver as-is). Unlike [`Self::reinsert`], this is a
+    /// crash-safe RESTORE, not a delivery attempt: it clears the claim guard
+    /// and restores the item to pending + heap with a FRESH sequence (back of
+    /// the FIFO) WITHOUT counting a redelivery attempt — the fold abort is a
+    /// durability failure, not a failed delivery. Idempotent: a key already
+    /// pending is left untouched.
+    pub(crate) fn requeue_taken(&mut self, mut item: QueuedMasterContinuation) {
+        self.recently_claimed_external.remove(&item.dedupe_key);
+        if self.pending_by_key.contains_key(&item.dedupe_key) {
+            return;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        item.sequence = sequence;
+        self.heap.push(HeapEntry {
+            priority: item.priority,
+            sequence,
+            dedupe_key: item.dedupe_key.clone(),
+        });
+        self.pending_by_key.insert(item.dedupe_key.clone(), item);
+    }
+
+    /// #1707 round 3 (codex Blocker 3) — STATUS-CORRECTION enqueue: a
+    /// terminal re-forward whose STATUS differs from the pending/drained one
+    /// (a `failed` → `completed` correction on the same identity dedupe key)
+    /// must REPLACE any still-pending older payload instead of collapsing as
+    /// a `Duplicate`, and must bypass the reclaim window when the older item
+    /// was claimed moments ago (`CHILD_SCATTER_RECLAIM_WINDOW` —
+    /// the correction is a DIFFERENT occurrence of the same key, not the
+    /// double-enqueue the guard exists to collapse).
+    ///
+    /// Mechanics mirror [`Self::requeue_taken`] but from a request: remove
+    /// any pending item with the same dedupe key (its heap entry goes stale
+    /// and is skipped by `entry_matches_pending`), clear the key's
+    /// recently-claimed guard entry, then enqueue the fresh request with a
+    /// fresh sequence and NO redelivery counting. Returns the outcome like
+    /// [`Self::enqueue_at`].
+    pub(crate) fn replace_pending_payload(
+        &mut self,
+        request: MasterContinuationRequest,
+    ) -> MasterContinuationEnqueueOutcome {
+        let dedupe_key = request.stable_dedupe_key();
+        self.pending_by_key.remove(&dedupe_key);
+        self.recently_claimed_external.remove(&dedupe_key);
+        self.enqueue_at(request, SystemTime::now())
     }
 
     pub(crate) fn peek_ready(
@@ -703,12 +790,24 @@ impl MasterContinuationScheduler {
         drained
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_ready_for_session(
         &mut self,
         runtime_state: MasterContinuationRuntimeState,
         max_items: usize,
         session_id: &str,
         profile_id: &str,
+    ) -> Vec<QueuedMasterContinuation> {
+        self.drain_ready_for_session_if(runtime_state, max_items, session_id, profile_id, |_| true)
+    }
+
+    pub(crate) fn drain_ready_for_session_if(
+        &mut self,
+        runtime_state: MasterContinuationRuntimeState,
+        max_items: usize,
+        session_id: &str,
+        profile_id: &str,
+        mut eligible: impl FnMut(&QueuedMasterContinuation) -> bool,
     ) -> Vec<QueuedMasterContinuation> {
         if max_items == 0 || !runtime_state.is_idle_eligible() {
             return Vec::new();
@@ -727,7 +826,9 @@ impl MasterContinuationScheduler {
                 .pending_by_key
                 .get(&entry.dedupe_key)
                 .is_some_and(|item| {
-                    item.session_id.as_str() == session_id && item.profile_id.as_str() == profile_id
+                    item.session_id.as_str() == session_id
+                        && item.profile_id.as_str() == profile_id
+                        && eligible(item)
                 });
             if matches_session {
                 if let Some(item) = self.pending_by_key.remove(&entry.dedupe_key) {
@@ -742,6 +843,73 @@ impl MasterContinuationScheduler {
             self.heap.push(entry);
         }
         drained
+    }
+
+    /// Number of pending `ChildCompleted` items for `session_id` +
+    /// `profile_id` scoped to one continuation group and workspace (#1707).
+    /// `workspace` is matched against the item's `workspace` metadata with an
+    /// empty string treated as absent (`None == None` matches).
+    pub(crate) fn pending_child_completed_count_for_scope(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+        group_id: &str,
+        workspace: Option<&str>,
+    ) -> usize {
+        self.pending_by_key
+            .values()
+            .filter(|item| {
+                item.session_id.as_str() == session_id
+                    && item.profile_id.as_str() == profile_id
+                    && item.reason == MasterContinuationReason::ChildCompleted
+                    && item.group_id.as_str() == group_id
+                    && item_workspace(item) == workspace
+            })
+            .count()
+    }
+
+    /// Remove every pending `ChildCompleted` / `ScatterJoinComplete` item for
+    /// `session_id` + `profile_id` + `group_id` + `workspace` (#1707:
+    /// terminal coalescing is scope-batched so a burst from another group or
+    /// another workspace is never tombstoned into a carrier whose prompt only
+    /// describes the carrier's own group). Heap entries for the removed keys
+    /// go stale and are skipped by `entry_matches_pending`; claims are
+    /// recorded so a same-key re-enqueue inside the reclaim window collapses.
+    /// Returned oldest-first.
+    pub(crate) fn take_pending_terminal_for_scope(
+        &mut self,
+        session_id: &str,
+        profile_id: &str,
+        group_id: &str,
+        workspace: Option<&str>,
+        mut eligible: impl FnMut(&QueuedMasterContinuation) -> bool,
+    ) -> Vec<QueuedMasterContinuation> {
+        let keys = self
+            .pending_by_key
+            .values()
+            .filter(|item| {
+                item.session_id.as_str() == session_id
+                    && item.profile_id.as_str() == profile_id
+                    && matches!(
+                        item.reason,
+                        MasterContinuationReason::ChildCompleted
+                            | MasterContinuationReason::ScatterJoinComplete
+                    )
+                    && item.group_id.as_str() == group_id
+                    && item_workspace(item) == workspace
+                    && eligible(item)
+            })
+            .map(|item| item.dedupe_key.clone())
+            .collect::<Vec<_>>();
+        let mut taken = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(item) = self.pending_by_key.remove(&key) {
+                self.record_external_claim(&item);
+                taken.push(item);
+            }
+        }
+        taken.sort_by_key(|item| item.sequence);
+        taken
     }
 
     #[cfg(test)]
@@ -775,6 +943,13 @@ impl MasterContinuationScheduler {
     /// goal/loop has since been paused, cleared, or deleted.
     pub(crate) fn pending_items(&self) -> impl Iterator<Item = &QueuedMasterContinuation> + '_ {
         self.pending_by_key.values()
+    }
+
+    pub(crate) fn pending_item(
+        &self,
+        key: &MasterContinuationDedupeKey,
+    ) -> Option<&QueuedMasterContinuation> {
+        self.pending_by_key.get(key)
     }
 
     fn discard_stale_heap_entries(&mut self) {
