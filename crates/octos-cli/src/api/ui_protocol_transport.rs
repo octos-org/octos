@@ -15378,7 +15378,6 @@ fn write_peer_result_if_peer_session(
     // RateLimited → Failed (an INTERRUPTED turn never reaches this writer
     // — it releases at the interrupted terminal instead).
     let slot_key = build_cache_slot_registry_key(&runtime.data_dir.join("peers"), slug);
-    if let Some(mut slot) = build_cache_slot_registry().take(&slot_key) {
         let outcome = match outcome {
             TurnTerminalOutcome::Completed => crate::build_cache::pool::SlotOutcome::Completed,
             TurnTerminalOutcome::Errored | TurnTerminalOutcome::RateLimited => {
@@ -15386,8 +15385,7 @@ fn write_peer_result_if_peer_session(
             }
             TurnTerminalOutcome::Interrupted => crate::build_cache::pool::SlotOutcome::Cancelled,
         };
-        crate::peers::build_cache_peer::release_slot(&mut slot, outcome);
-    }
+        build_cache_slot_registry().release(&slot_key, outcome);
 
     // Peer-agent-based goal: if this peer was staged under a goal context
     // (the `goal` file the master wrote at handoff), persist this turn's
@@ -34404,7 +34402,8 @@ async fn run_standalone_turn(
             // itself only carries the PATH (for env injection); the fd stays
             // here, where the terminal path can reach it.
             if let Some(slot) = held_slot {
-                build_cache_slot_registry().park(slot_key.clone(), slot);
+                let usage = build_cache_slot_registry().park_with_usage(slot_key.clone(), slot);
+                request_agent = request_agent.with_build_cache_usage(usage);
             }
         }
     }

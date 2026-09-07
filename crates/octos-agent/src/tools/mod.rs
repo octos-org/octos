@@ -29,6 +29,9 @@
 //! migrated the task-local becomes redundant and can be retired, but that
 //! clean-up is out of scope for M8.1.
 
+mod build_cache_usage;
+pub use build_cache_usage::{BuildCacheUsage, BuildCacheUseGuard};
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -356,6 +359,8 @@ pub struct ToolContext {
     /// `None` for non-peer sessions and a peer turn that failed to acquire
     /// a slot (it still runs, just with cargo's default target dir).
     pub build_cache_slot: Option<std::path::PathBuf>,
+    /// Shared child lifetime accounting for this cache claim.
+    pub build_cache_usage: Option<BuildCacheUsage>,
     /// Post-edit formatting (issue #1774): when true, a successful
     /// `edit_file` / `write_file` / `diff_edit` runs the language formatter
     /// for the file (rustfmt / prettier / black / gofmt — see
@@ -414,6 +419,7 @@ impl ToolContext {
             task_id: None,
             originator_session: None,
             build_cache_slot: None,
+            build_cache_usage: None,
             format_after_edit: false,
         }
     }

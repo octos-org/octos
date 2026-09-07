@@ -191,6 +191,16 @@ impl ShellTool {
         // `strip_trailing_ampersand`).
         let command = strip_trailing_ampersand(raw_command);
 
+        let usage_guard = match begin_build_cache_use(ctx) {
+            Ok(guard) => guard,
+            Err(message) => {
+                return ToolResult {
+                    output: message.to_owned(),
+                    success: false,
+                    ..Default::default()
+                };
+            }
+        };
         let slot = resolve_build_cache_slot(ctx);
         let mut cmd = self.sandbox.wrap_command_with_build_cache_slot(
             &command,
@@ -264,6 +274,7 @@ impl ShellTool {
                 let watch_id = id.clone();
                 let watch_label = label.clone();
                 tokio::spawn(async move {
+                    let _usage_guard = usage_guard;
                     let mut child = child;
                     match child.wait().await {
                         Ok(status) if status.success() => sup.mark_completed(&watch_id, vec![]),
@@ -295,6 +306,7 @@ impl ShellTool {
             // still run detached, but reap the child so it doesn't zombie.
             _ => {
                 tokio::spawn(async move {
+                    let _usage_guard = usage_guard;
                     let mut child = child;
                     let _ = child.wait().await;
                 });
@@ -806,6 +818,26 @@ fn resolve_build_cache_slot(ctx: &ToolContext) -> Option<PathBuf> {
     })
 }
 
+fn begin_build_cache_use(
+    ctx: &ToolContext,
+) -> Result<Option<super::BuildCacheUseGuard>, &'static str> {
+    let usage = if ctx.build_cache_slot.is_some() || ctx.build_cache_usage.is_some() {
+        ctx.build_cache_usage.clone()
+    } else {
+        TOOL_CTX
+            .try_with(|inner| inner.build_cache_usage.clone())
+            .ok()
+            .flatten()
+    };
+    match usage {
+        Some(usage) => usage
+            .begin()
+            .map(Some)
+            .ok_or("Build-cache claim is closing; shell command was not started"),
+        None => Ok(None),
+    }
+}
+
 /// Use the SAME resolved option as the sandbox wrapper for this call.
 fn apply_build_cache_env(cmd: &mut tokio::process::Command, slot: Option<&Path>) {
     let Some(slot) = slot else {
@@ -1145,6 +1177,16 @@ impl Tool for ShellTool {
         // Spawn the child, grab its PID, then timeout on wait_with_output().
         // If timeout fires, kill by PID to prevent orphaned processes.
         // (wait_with_output() takes ownership of child, so we save the PID first.)
+        let usage_guard = match begin_build_cache_use(ctx) {
+            Ok(guard) => guard,
+            Err(message) => {
+                return Ok(ToolResult {
+                    output: message.to_owned(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
         let slot = resolve_build_cache_slot(ctx);
         let mut cmd = self.sandbox.wrap_command_with_build_cache_slot(
             &input.command,
@@ -1171,7 +1213,16 @@ impl Tool for ShellTool {
         };
         let child_pid = child.id();
 
-        let result = timeout(timeout_duration, child.wait_with_output()).await;
+        // The waiter owns both the child and the claim usage. Dropping the
+        // caller's future detaches this waiter, so release still waits for exit.
+        let waiter = tokio::spawn(async move {
+            let _usage_guard = usage_guard;
+            child.wait_with_output().await
+        });
+        let result = timeout(timeout_duration, async {
+            waiter.await.map_err(std::io::Error::other)?
+        })
+        .await;
 
         match result {
             Ok(Ok(output)) => {
@@ -3030,5 +3081,73 @@ mod build_cache_sandbox_handoff_tests {
             .unwrap();
         assert!(!revoked.success, "subsequent None must revoke the old slot");
         assert!(!own.join("target/revoked").exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod build_cache_usage_tests {
+    use super::*;
+    use crate::tools::BuildCacheUsage;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    async fn child_holds_claim(background: bool, cancel: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = ToolContext::zero();
+        let usage = BuildCacheUsage::default();
+        ctx.build_cache_usage = Some(usage.clone());
+        let cwd = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            ShellTool::new(&cwd)
+                .execute_with_context(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf started > started; sleep 1; printf done > done",
+                        "background": background
+                    }),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tmp.path().join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel {
+            task.abort();
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        usage.close_and_when_idle(move || flag.store(true, Ordering::SeqCst));
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "running child must retain claim"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !released.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tmp.path().join("done").exists());
+        if !cancel {
+            assert!(task.await.unwrap().success);
+        }
+    }
+
+    #[tokio::test]
+    async fn background_child_retains_build_cache_claim() {
+        child_holds_claim(true, false).await;
+    }
+    #[tokio::test]
+    async fn foreground_child_retains_build_cache_claim() {
+        child_holds_claim(false, false).await;
+    }
+    #[tokio::test]
+    async fn cancelled_foreground_retains_build_cache_claim_until_child_exit() {
+        child_holds_claim(false, true).await;
     }
 }

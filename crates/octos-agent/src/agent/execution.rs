@@ -513,6 +513,7 @@ impl Agent {
             // holds so the shell tool injects CARGO_TARGET_DIR per call
             // (§7.4) — never a process env var (peers share the process).
             build_cache_slot: self.build_cache_slot.clone(),
+            build_cache_usage: self.build_cache_usage.clone(),
             // #1774: approval-gated edits still honor the post-edit
             // formatting opt-in.
             format_after_edit: self.config.format_after_edit,
@@ -616,6 +617,7 @@ impl Agent {
         let ctx_task_id = self.task_id.clone();
         let ctx_originator_session = self.originator_session.clone();
         let ctx_build_cache_slot = self.build_cache_slot.clone();
+        let ctx_build_cache_usage = self.build_cache_usage.clone();
         let reporter = self.reporter();
         let hooks = self.hooks.clone();
         let hook_ctx = self.hook_ctx();
@@ -2158,6 +2160,7 @@ impl Agent {
                 // held build-cache slot for per-call CARGO_TARGET_DIR
                 // injection in the shell tool (docs/build-cache-pool.md §7.4).
                 build_cache_slot: ctx_build_cache_slot.clone(),
+                build_cache_usage: ctx_build_cache_usage.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools

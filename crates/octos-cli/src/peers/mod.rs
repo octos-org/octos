@@ -1111,7 +1111,21 @@ pub(crate) mod build_cache_peer {
 /// lifetime discipline as `peer_wire_registry` / `peer_task_registry`: a peer
 /// is staged on one path and released on another.
 pub(crate) struct BuildCacheSlotRegistry {
-    by_key: std::sync::Mutex<HashMap<String, Slot>>,
+    by_key: std::sync::Mutex<HashMap<String, BuildCacheSlotEntry>>,
+}
+
+struct BuildCacheSlotEntry {
+    slot: Slot,
+    usage: octos_agent::tools::BuildCacheUsage,
+}
+
+impl BuildCacheSlotEntry {
+    fn release(self, outcome: SlotOutcome) {
+        let mut slot = self.slot;
+        self.usage.close_and_when_idle(move || {
+            build_cache_peer::release_slot(&mut slot, outcome);
+        });
+    }
 }
 
 /// Registry key for one peer's held slot: `"<peers_root>\u{1f}<slug>"`. The
@@ -1172,34 +1186,36 @@ pub(crate) fn build_cache_config_for(peers_root: &Path) -> Option<BuildCacheConf
 }
 
 impl BuildCacheSlotRegistry {
-    /// Park a held slot under its peer key. Latest-wins, mirroring the wire
-    /// registry: a re-staged peer's new slot supersedes any stale entry (the
-    /// old entry's `Slot` drop keeps its flock only until process exit — the
-    /// stale slot is then recovered by §3.5 crash rules).
+    /// Park a claimed slot with its per-child usage tracker.
     pub(crate) fn park(&self, key: String, slot: Slot) {
-        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = map.insert(key, slot) {
-            tracing::warn!(
-                "build-cache: superseded an unreleased slot entry (crash recovery applies)"
-            );
-            let _ = old;
+        self.park_with_usage(key, slot);
+    }
+
+    pub(crate) fn park_with_usage(&self, key: String, slot: Slot) -> octos_agent::tools::BuildCacheUsage {
+        let usage = octos_agent::tools::BuildCacheUsage::default();
+        let old = self.by_key.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key, BuildCacheSlotEntry { slot, usage: usage.clone() },
+        );
+        if let Some(old) = old {
+            old.release(SlotOutcome::Cancelled);
         }
+        usage
     }
 
-    /// Take the parked slot for `key`, removing it. `None` when this peer
-    /// holds no slot in THIS process (never acquired, already released, or
-    /// staged by a previous serve generation — the residual `holder.json`
-    /// with our dead pid is then reclaimed by §3.5).
     pub(crate) fn take(&self, key: &str) -> Option<Slot> {
-        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
-        map.remove(key)
+        self.by_key.lock().unwrap_or_else(|e| e.into_inner()).remove(key).map(|entry| entry.slot)
     }
 
-    /// Release-and-drop in one step for the safety-net call sites (close /
-    /// eviction / solo return), which have no use for the handle afterwards.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn usage(&self, key: &str) -> Option<octos_agent::tools::BuildCacheUsage> {
+        self.by_key.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|entry| entry.usage.clone())
+    }
+
+    /// Close admission before returning the claim; live children retain its lock.
     pub(crate) fn release(&self, key: &str, outcome: SlotOutcome) {
-        if let Some(mut slot) = self.take(key) {
-            build_cache_peer::release_slot(&mut slot, outcome);
+        let entry = self.by_key.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+        if let Some(entry) = entry {
+            entry.release(outcome);
         }
     }
 
@@ -1225,10 +1241,10 @@ impl BuildCacheSlotRegistry {
             .filter(|key| key.ends_with(&suffix))
             .cloned()
             .collect();
-        for key in hits {
-            if let Some(mut slot) = map.remove(&key) {
-                build_cache_peer::release_slot(&mut slot, outcome);
-            }
+        let entries: Vec<_> = hits.into_iter().filter_map(|key| map.remove(&key)).collect();
+        drop(map);
+        for entry in entries {
+            entry.release(outcome);
         }
     }
 }
@@ -1240,6 +1256,28 @@ impl BuildCacheSlotRegistry {
 #[cfg(test)]
 mod build_cache_peer_tests {
     use super::*;
+
+    #[test]
+    fn bc9_b5_registry_keeps_claim_until_last_child_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("peers");
+        let config = BuildCacheConfig { peer_slots: 1, min_free_gb: 0, ..Default::default() };
+        let slot = build_cache_peer::acquire_for_staging(&root, tmp.path(), "usage", None, None, &config).unwrap();
+        let path = slot.path.clone();
+        let registry = BuildCacheSlotRegistry::default();
+        registry.park("usage".into(), slot);
+        let usage = registry.usage("usage").unwrap();
+        let child = usage.begin().unwrap();
+        registry.release("usage", SlotOutcome::Completed);
+        assert!(path.join("holder.json").exists());
+        assert!(usage.begin().is_none());
+        assert!(build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config).is_err());
+        drop(child);
+        assert!(!path.join("holder.json").exists());
+        let mut next = build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config).unwrap();
+        assert_eq!(next.path, path);
+        build_cache_peer::release_slot(&mut next, SlotOutcome::Completed);
+    }
 
     #[test]
     fn bc9_n6_registry_key_has_one_separator_and_no_newline() {
@@ -2270,9 +2308,7 @@ pub(crate) fn stage_peer(
     // not keep a slot either. Registry take+release is idempotent.
     let slot_key = build_cache_slot_registry_key(peers_root, &slug);
     let rollback_staged = || {
-        if let Some(mut slot) = build_cache_slot_registry().take(&slot_key) {
-            build_cache_peer::release_slot(&mut slot, SlotOutcome::Cancelled);
-        }
+        build_cache_slot_registry().release(&slot_key, SlotOutcome::Cancelled);
     };
     let brief_path = peer_dir.join("brief.md");
     if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "brief.md", brief) {
@@ -3956,6 +3992,7 @@ mod issue_2236_build_cache_tests {
             .unwrap()
             .get(&key)
             .unwrap()
+            .slot
             .path
             .clone();
         let mut first = build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug)

@@ -552,6 +552,7 @@ pub struct Agent {
     /// path shares one process across peers and the master, so this MUST
     /// ride the tool context, never the process environment.
     pub(super) build_cache_slot: Option<std::path::PathBuf>,
+    pub(super) build_cache_usage: Option<crate::tools::BuildCacheUsage>,
     /// Optional inference-time verifier plus structured TurnLedger. Absent
     /// by default so legacy agent loops do not spend verifier calls or write
     /// verifier sidecars unless a caller opts in explicitly.
@@ -664,6 +665,7 @@ impl Agent {
             task_id: None,
             originator_session: None,
             build_cache_slot: None,
+            build_cache_usage: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -749,6 +751,7 @@ impl Agent {
             task_id: None,
             originator_session: None,
             build_cache_slot: None,
+            build_cache_usage: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -1148,6 +1151,12 @@ impl Agent {
     /// inject `CARGO_TARGET_DIR` per tool call (never a process env var).
     pub fn with_build_cache_slot(mut self, slot: std::path::PathBuf) -> Self {
         self.build_cache_slot = Some(slot);
+        self
+    }
+
+    /// Share the registry claim's child lifetime tracker with tool execution.
+    pub fn with_build_cache_usage(mut self, usage: crate::tools::BuildCacheUsage) -> Self {
+        self.build_cache_usage = Some(usage);
         self
     }
 
