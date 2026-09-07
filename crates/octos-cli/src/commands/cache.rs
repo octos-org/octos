@@ -1479,6 +1479,16 @@ mod tests {
             "contents untouched"
         );
 
+        // The live GC pass preserves ownership. Release that claim before
+        // exercising the separate dead-holder lifecycle below.
+        pool::release_detached(
+            &pool_root,
+            &slot.path,
+            &slot.claim_token,
+            SlotOutcome::Completed,
+        )
+        .unwrap();
+
         // Dead pid: gc clears the metadata first (HolderCleared — the slot
         // was just re-acquired so last_used is fresh, nothing to delete),
         // and a SECOND backdated pass then reclaims the target. Two steps
@@ -1491,7 +1501,7 @@ mod tests {
         let slot2 = pool::acquire_detached(&pool_root, &key, &config(), &dead_holder).unwrap();
         assert_eq!(
             slot2.path, slot.path,
-            "freed by the gc pass above, re-acquired"
+            "explicitly released live claim is reusable"
         );
         let reports = pool::reclaim_stale(
             &pool_root,
