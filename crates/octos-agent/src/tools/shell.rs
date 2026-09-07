@@ -2934,7 +2934,10 @@ mod build_cache_sandbox_handoff_tests {
             let profile = profiles.lock().unwrap().last().unwrap().clone();
             for slot in &slots {
                 let canonical = std::fs::canonicalize(slot).unwrap();
-                let grant = format!("(allow file-write* (subpath \"{}\"))", canonical.display());
+                let grant = format!(
+                    "(allow file-write* (subpath \"{}/target\"))",
+                    canonical.display()
+                );
                 assert_eq!(
                     profile.contains(&grant),
                     expected_slot == Some(slot),
@@ -2949,7 +2952,7 @@ mod build_cache_sandbox_handoff_tests {
         shared.wrap_command("true", &cwd);
         let stale = std::fs::canonicalize(&slots[2]).unwrap();
         assert!(profiles.lock().unwrap().last().unwrap().contains(&format!(
-            "(allow file-write* (subpath \"{}\"))",
+            "(allow file-write* (subpath \"{}/target\"))",
             stale.display()
         )));
     }
@@ -2992,6 +2995,25 @@ mod build_cache_sandbox_handoff_tests {
             std::fs::read_to_string(own.join("target/probe")).unwrap(),
             "pooled"
         );
+        for control in [".lock", "holder.json", "last_used"] {
+            let path = own.join(control);
+            std::fs::write(&path, "control").unwrap();
+            let quoted = path.to_string_lossy().replace('\'', "'\\''");
+            let result = tool
+                .execute_with_context(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": format!("printf changed > '{quoted}'")
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !result.success,
+                "control file {control} must remain unwritable"
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "control");
+        }
         let sibling_result = tool.execute_with_context(&ctx, &serde_json::json!({"command": "printf denied > \"$CARGO_TARGET_DIR/../../slot-2/target/probe\""})).await.unwrap();
         assert!(!sibling_result.success);
         assert!(!sibling.join("target/probe").exists());

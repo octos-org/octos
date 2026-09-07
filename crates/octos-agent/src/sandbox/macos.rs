@@ -496,7 +496,7 @@ impl Sandbox for MacosSandbox {
                 } else {
                     format!(
                         "(allow file-read* (subpath \"{real_slot}\"))\n\
-                         (allow file-write* (subpath \"{real_slot}\"))\n"
+                         (allow file-write* (subpath \"{real_slot}/target\"))\n"
                     )
                 }
             }
@@ -1889,8 +1889,8 @@ mod tests {
             "own slot must be readable, profile: {profile}"
         );
         assert!(
-            profile.contains(&format!("(allow file-write* (subpath \"{own}\"))")),
-            "own slot must be writable, profile: {profile}"
+            profile.contains(&format!("(allow file-write* (subpath \"{own}/target\"))")),
+            "own target must be writable, profile: {profile}"
         );
         assert!(
             !profile.contains(other),
@@ -1957,7 +1957,7 @@ mod tests {
             .find(|a| a.contains("deny default"))
             .expect("should have SBPL profile");
         assert!(
-            profile.contains(&format!("(allow file-write* (subpath \"{own}\"))")),
+            profile.contains(&format!("(allow file-write* (subpath \"{own}/target\"))")),
             "the slot grant is independent of the fence, profile: {profile}"
         );
     }
