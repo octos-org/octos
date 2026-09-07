@@ -1119,11 +1119,7 @@ pub(crate) struct BuildCacheSlotRegistry {
 /// peers of different profiles (or a slug that happens to contain the other's
 /// root as a prefix) can never collide.
 pub(crate) fn build_cache_slot_registry_key(peers_root: &Path, slug: &str) -> String {
-    format!(
-        "{}
-\u{1f}{slug}",
-        peers_root.to_string_lossy()
-    )
+    format!("{}\u{1f}{slug}", peers_root.to_string_lossy())
 }
 
 impl Default for BuildCacheSlotRegistry {
@@ -1244,6 +1240,12 @@ impl BuildCacheSlotRegistry {
 #[cfg(test)]
 mod build_cache_peer_tests {
     use super::*;
+
+    #[test]
+    fn bc9_n6_registry_key_has_one_separator_and_no_newline() {
+        let root = Path::new("/tmp/profile/peers");
+        assert_eq!(build_cache_slot_registry_key(root, "worker"), "/tmp/profile/peers\u{1f}worker");
+    }
 
     #[test]
     fn two_staged_peers_acquire_distinct_slots_and_release_on_terminal() {
