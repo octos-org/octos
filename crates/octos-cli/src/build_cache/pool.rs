@@ -14,7 +14,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,10 @@ const TARGET_LEAF: &str = "target";
 /// outer loop never share slots.
 const SLOT_PREFIX: &str = "slot-";
 const VERIFY_PREFIX: &str = "verify-";
+/// Bound transient fork-inherited flock contention per candidate slot.
+const LOCK_RETRY_WINDOW: Duration = Duration::from_millis(200);
+/// Back off between non-blocking probes; never queue behind a live claim.
+const LOCK_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Default per-repository peer-slot cap (§2).
 pub const DEFAULT_PEER_SLOTS: u32 = 2;
@@ -220,7 +224,7 @@ pub enum BuildCacheError {
     /// who need the gate off set `min_free_gb = 0`.
     FreeSpaceUnknown { source: std::io::Error },
     /// Every slot in the requested namespace is held (§3.2 step 5).
-    /// Fail-fast: never queue, never wait — let the caller re-plan.
+    /// Live claims fail fast; transient inherited locks get a bounded retry.
     PoolExhausted { repo_key: String, kind: SlotKind },
     /// Wrapped filesystem/serialization failure with context.
     Io {
@@ -591,6 +595,38 @@ fn slot_dir(repo_dir: &Path, kind: SlotKind, n: u32) -> PathBuf {
     repo_dir.join(format!("{}{n}", kind.prefix()))
 }
 
+/// A close-on-exec lock fd can still be inherited by another thread's
+/// fork until its child execs. After the owner drops its fd, that shared
+/// open-file description briefly keeps the flock alive. Retry only this
+/// plausible transient case, never bypass the flock or hide other errors.
+/// A detached release with the matching nonempty token may also wait for
+/// its own fd's inherited copies even while its recorded pid stays alive.
+fn try_lock_slot(lock: &File, dir: &Path, release_token: Option<&str>) -> std::io::Result<()> {
+    let start = Instant::now();
+    loop {
+        let error = match fs2::FileExt::try_lock_exclusive(lock) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => error,
+            Err(error) => return Err(error),
+        };
+        // Read again on every contention: a newly published live owner must
+        // stop retries. Missing, dead, and unknown metadata are distinct.
+        let retry = match fs::read_to_string(dir.join(HOLDER_LEAF)) {
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            Ok(text) => serde_json::from_str::<HolderMeta>(&text).is_ok_and(|meta| {
+                pid_alive(meta.pid).is_none()
+                    || release_token
+                        .is_some_and(|token| !token.is_empty() && token == meta.claim_token)
+            }),
+        };
+        let remaining = LOCK_RETRY_WINDOW.saturating_sub(start.elapsed());
+        if !retry || remaining.is_zero() {
+            return Err(error);
+        }
+        std::thread::sleep(LOCK_RETRY_BACKOFF.min(remaining));
+    }
+}
+
 /// Acquire a slot (§3.2). Space-gate first, then scan the namespace's
 /// candidates in order; first slot whose `.lock` can be flocked
 /// exclusively and non-blockingly wins. The lock fd is held by the
@@ -650,7 +686,7 @@ pub fn acquire(
                 continue;
             }
         };
-        match fs2::FileExt::try_lock_exclusive(&lock) {
+        match try_lock_slot(&lock, &dir, None) {
             Ok(()) => {
                 // Detached claims drop their flock but retain ownership while
                 // their recorded process is alive. Inspect under this lock.
@@ -698,7 +734,8 @@ pub fn acquire(
                     claim_token: meta.claim_token,
                 });
             }
-            Err(_) => continue, // held by someone else: next candidate
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => last_err = Some(e),
         }
     }
     if let Some(e) = last_err {
@@ -827,9 +864,10 @@ pub struct DetachedSlot {
 /// the release CLI running, the only thing keeping this slot "held" is
 /// `holder.json` + pid liveness. Re-acquiring the `.lock` here is
 /// therefore SAFE only because a detached holder never keeps the flock;
-/// if it ever did (peer-style holders do), `try_lock_exclusive` fails and
-/// we report [`BuildCacheError::SlotHeld`] instead of stomping a live
-/// holder's metadata.
+/// if it ever did (peer-style holders do), the bounded lock retry expires
+/// and we report [`BuildCacheError::SlotHeld`]. A matching token permits
+/// waiting for inherited copies; identity is checked again under the flock
+/// before any metadata is changed.
 ///
 /// Idempotent: a slot with no `holder.json` is a no-op (same semantics as
 /// [`release`]), so a double `release` invocation — or release racing with
@@ -885,20 +923,14 @@ pub fn release_detached(
                 BuildCacheError::io(format!("failed to open {}", lock_path.display()), e)
             }
         })?;
-    if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
-        // Intermittent double-release (outer loop 06: #6 review): on a loaded
-        // test runner the second release occasionally observes the lock busy
-        // for a microsecond after the first release's fd closed (flock
-        // teardown vs fd reuse race on macOS). If the holder metadata is
-        // ALREADY gone the release already happened — treat it as the
-        // idempotent no-op it is, never an error. Only a slot that still has
-        // a live holder.json is genuinely held.
-        if canonical_slot.join(HOLDER_LEAF).exists() {
-            return Err(BuildCacheError::SlotHeld {
+    if let Err(error) = try_lock_slot(&lock, &canonical_slot, Some(claim_token)) {
+        return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
+            BuildCacheError::SlotHeld {
                 slot: slot_dir.to_path_buf(),
-            });
-        }
-        return Ok(ReleaseDisposition::AlreadyReleased);
+            }
+        } else {
+            BuildCacheError::io(format!("failed to lock {}", lock_path.display()), error)
+        });
     }
     // Lock held for the duration of the release (same ordering argument as
     // `release`: metadata is cleared while holding, so a racing acquirer
@@ -996,7 +1028,8 @@ pub fn stale_window_secs(hours: u64) -> Result<u64, BuildCacheError> {
 /// Walk every repo pool under `pool_root` and reclaim stale slots (§3.5 +
 /// §6). For each slot:
 ///
-/// 1. try `flock(EX|NB)` — unavailable means a live holder, skip;
+/// 1. try `flock(EX|NB)` with bounded retries for absent/dead metadata;
+///    unavailable after the window, or a live/unknown holder, means skip;
 /// 2. `holder.json` present → check pid liveness; dead → clear metadata
 ///    only when applying (then staleness applies), alive → skip;
 /// 3. no holder → compare `now - last_used` against the stale window
@@ -1119,8 +1152,14 @@ fn reclaim_one(
             ));
         }
     };
-    if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
-        return Ok((ReclaimOutcome::Locked, 0, 0)); // live holder
+    if let Err(error) = try_lock_slot(&lock, dir, None) {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok((ReclaimOutcome::Locked, 0, 0));
+        }
+        return Err(BuildCacheError::io(
+            format!("failed to lock {}", lock_path.display()),
+            error,
+        ));
     }
     // Lock held for the duration of this check.
     let holder_path = dir.join(HOLDER_LEAF);
@@ -1306,6 +1345,291 @@ mod tests {
 
     fn key(tmp: &tempfile::TempDir) -> RepoKey {
         repo_key_for_path(tmp.path()).unwrap()
+    }
+
+    #[cfg(unix)]
+    mod transient_flock {
+        use super::*;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        /// Keep the same open-file description in a child spawned by another
+        /// thread. Mapping a duplicate to stdout deliberately keeps it across
+        /// exec, making the brief fork-to-exec inheritance race reproducible
+        /// without unsafe pre_exec. The child never writes to the lock file.
+        struct InheritedLockChild(Child);
+
+        impl InheritedLockChild {
+            fn spawn(lock: &File) -> Self {
+                let inherited = lock.try_clone().unwrap();
+                Self(
+                    std::thread::spawn(move || {
+                        Command::new("/bin/sh")
+                            .args(["-c", "read -r start; exec /bin/sleep 0.05"])
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::from(inherited))
+                            .spawn()
+                            .unwrap()
+                    })
+                    .join()
+                    .unwrap(),
+                )
+            }
+
+            fn assert_contended(&self, dir: &Path) {
+                let probe = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(LOCK_LEAF))
+                    .unwrap();
+                assert_eq!(
+                    fs2::FileExt::try_lock_exclusive(&probe).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "the child must retain the parent's flock after its fd closes"
+                );
+            }
+
+            fn finish_shortly(&mut self) {
+                self.0.stdin.take().unwrap().write_all(b"start\n").unwrap();
+            }
+        }
+
+        impl Drop for InheritedLockChild {
+            fn drop(&mut self) {
+                // Also runs on assertion panic, so a failed regression cannot
+                // strand a child waiting for input or retain the pool lock.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn held_slot(tmp: &tempfile::TempDir, holder: HolderInfo) -> Slot {
+            acquire(
+                &tmp.path().join("pool"),
+                &key(tmp),
+                SlotPurpose::Peer,
+                &config(),
+                &holder,
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn inherited_flock_released_slot_reacquires_first_slot() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut slot = held_slot(&tmp, HolderInfo::default());
+            let dir = slot.path.clone();
+            let mut child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            release(&mut slot, SlotOutcome::Completed).unwrap();
+            child.assert_contended(&dir);
+            child.finish_shortly();
+            let replacement = held_slot(&tmp, HolderInfo::default());
+            assert_eq!(
+                replacement.path, dir,
+                "transient inheritance must not skip slot-1"
+            );
+        }
+
+        #[test]
+        fn inherited_flock_dead_holder_reacquires_first_slot() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dead = spawn_dead_pid();
+            assert_eq!(pid_alive(dead), None);
+            let slot = held_slot(
+                &tmp,
+                HolderInfo {
+                    pid_override: Some(dead),
+                    ..HolderInfo::default()
+                },
+            );
+            let dir = slot.path.clone();
+            let mut child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            drop(slot);
+            child.assert_contended(&dir);
+            child.finish_shortly();
+            let replacement = held_slot(&tmp, HolderInfo::default());
+            assert_eq!(
+                replacement.path, dir,
+                "dead holder with inherited flock must reuse slot-1"
+            );
+        }
+
+        #[test]
+        fn inherited_flock_matching_token_detached_release_retries() {
+            let tmp = tempfile::tempdir().unwrap();
+            let slot = held_slot(&tmp, HolderInfo::default());
+            let dir = slot.path.clone();
+            let token = slot.claim_token.clone();
+            let mut child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            drop(slot); // Same fd-drop handoff as acquire_detached; pid stays live.
+            child.assert_contended(&dir);
+            child.finish_shortly();
+            assert_eq!(
+                release_detached(
+                    &tmp.path().join("pool"),
+                    &dir,
+                    &token,
+                    SlotOutcome::Completed
+                )
+                .unwrap(),
+                ReleaseDisposition::Released
+            );
+            assert!(!dir.join(HOLDER_LEAF).exists());
+        }
+
+        #[test]
+        fn inherited_flock_gc_retries_before_reclaiming() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut slot = held_slot(&tmp, HolderInfo::default());
+            let dir = slot.path.clone();
+            let mut child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            release(&mut slot, SlotOutcome::Completed).unwrap();
+            write_last_used(&dir, 0).unwrap();
+            child.assert_contended(&dir);
+            child.finish_shortly();
+            let report = reclaim_stale(
+                &tmp.path().join("pool"),
+                &GcPolicy {
+                    stale_hours: 1,
+                    apply: true,
+                },
+                &config(),
+            )
+            .unwrap();
+            assert_eq!(
+                report.iter().find(|r| r.slot_path == dir).unwrap().outcome,
+                ReclaimOutcome::Reclaimed
+            );
+            assert!(!dir.join(TARGET_LEAF).exists());
+            assert!(dir.join(LOCK_LEAF).exists());
+        }
+
+        #[test]
+        fn inherited_flock_retry_expires_without_bypassing_lock() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut slot = held_slot(&tmp, HolderInfo::default());
+            let dir = slot.path.clone();
+            let child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            release(&mut slot, SlotOutcome::Completed).unwrap();
+            child.assert_contended(&dir);
+            let before = fs::read(dir.join(LAST_USED_LEAF)).unwrap();
+            let start = Instant::now();
+            let result = acquire(
+                &tmp.path().join("pool"),
+                &key(&tmp),
+                SlotPurpose::Peer,
+                &BuildCacheConfig {
+                    peer_slots: 1,
+                    ..config()
+                },
+                &HolderInfo::default(),
+            );
+            assert!(matches!(result, Err(BuildCacheError::PoolExhausted { .. })));
+            assert!(
+                start.elapsed() >= Duration::from_millis(180),
+                "ownerless contention needs a bounded retry window"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "retry must expire"
+            );
+            assert_eq!(fs::read(dir.join(LAST_USED_LEAF)).unwrap(), before);
+            assert!(!dir.join(HOLDER_LEAF).exists());
+            child.assert_contended(&dir);
+        }
+
+        #[test]
+        fn inherited_flock_matching_token_release_expires_without_writes() {
+            let tmp = tempfile::tempdir().unwrap();
+            let slot = held_slot(&tmp, HolderInfo::default());
+            let dir = slot.path.clone();
+            let token = slot.claim_token.clone();
+            let child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            drop(slot);
+            child.assert_contended(&dir);
+            let holder = fs::read(dir.join(HOLDER_LEAF)).unwrap();
+            let last_used = fs::read(dir.join(LAST_USED_LEAF)).unwrap();
+            let start = Instant::now();
+            assert!(matches!(
+                release_detached(&tmp.path().join("pool"), &dir, &token, SlotOutcome::Failed),
+                Err(BuildCacheError::SlotHeld { .. })
+            ));
+            assert!(start.elapsed() >= Duration::from_millis(180));
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert_eq!(fs::read(dir.join(HOLDER_LEAF)).unwrap(), holder);
+            assert_eq!(fs::read(dir.join(LAST_USED_LEAF)).unwrap(), last_used);
+            child.assert_contended(&dir);
+        }
+
+        #[test]
+        fn inherited_flock_unknown_metadata_does_not_retry() {
+            let tmp = tempfile::tempdir().unwrap();
+            let slot = held_slot(&tmp, HolderInfo::default());
+            let dir = slot.path.clone();
+            let child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            drop(slot);
+            child.assert_contended(&dir);
+            fs::write(dir.join(HOLDER_LEAF), b"invalid json").unwrap();
+            let probe = File::open(dir.join(LOCK_LEAF)).unwrap();
+            for unreadable in [false, true] {
+                if unreadable {
+                    fs::remove_file(dir.join(HOLDER_LEAF)).unwrap();
+                    fs::create_dir(dir.join(HOLDER_LEAF)).unwrap();
+                }
+                let start = Instant::now();
+                assert_eq!(
+                    try_lock_slot(&probe, &dir, None).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert!(
+                    start.elapsed() < Duration::from_millis(180),
+                    "unknown metadata must stop retries"
+                );
+            }
+        }
+
+        #[test]
+        fn inherited_flock_live_holder_and_wrong_token_remain_excluded() {
+            let tmp = tempfile::tempdir().unwrap();
+            let slot = held_slot(&tmp, HolderInfo::default());
+            let dir = slot.path.clone();
+            let child = InheritedLockChild::spawn(slot.lock.as_ref().unwrap());
+            drop(slot);
+            child.assert_contended(&dir);
+            let holder = fs::read(dir.join(HOLDER_LEAF)).unwrap();
+            let last_used = fs::read(dir.join(LAST_USED_LEAF)).unwrap();
+            let start = Instant::now();
+            let replacement = held_slot(&tmp, HolderInfo::default());
+            assert_ne!(replacement.path, dir);
+            assert!(matches!(
+                release_detached(
+                    &tmp.path().join("pool"),
+                    &dir,
+                    "wrong-token",
+                    SlotOutcome::Failed
+                ),
+                Err(BuildCacheError::SlotHeld { .. })
+            ));
+            let report = reclaim_stale(
+                &tmp.path().join("pool"),
+                &GcPolicy {
+                    stale_hours: 0,
+                    apply: true,
+                },
+                &config(),
+            )
+            .unwrap();
+            assert_eq!(
+                report.iter().find(|r| r.slot_path == dir).unwrap().outcome,
+                ReclaimOutcome::Locked
+            );
+            assert!(
+                start.elapsed() < Duration::from_millis(180),
+                "live unrelated ownership must not wait through the retry window"
+            );
+            assert_eq!(fs::read(dir.join(HOLDER_LEAF)).unwrap(), holder);
+            assert_eq!(fs::read(dir.join(LAST_USED_LEAF)).unwrap(), last_used);
+        }
     }
 
     #[test]

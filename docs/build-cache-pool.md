@@ -102,9 +102,17 @@ stale_hours  = 168    # GC:无持有者且 last_used 超过该小时数才可清
 
 1. **空间门**(I3):`fs2::available_space(pool_root)`(fs2 已是 octos-cli 依赖,Cargo.toml:59;fs2-0.4.3 底层即 statvfs/fstatvfs,`available_space` 见 fs2-0.4.3/src/lib.rs:180)。pool-root 不存在先 `create_dir_all` 再量。`available < min_free_gb * 1024^3` ⇒ 返回 `FreeSpaceLow { available_gb, min_gb }`;测量失败(无法 statvfs)⇒ 返回 `FreeSpaceUnknown`(fail-closed:这条线的全部意义就是防磁盘满,不因测量失败而放行;确需关闭门用 `min_free_gb = 0`)。
 2. 依 purpose 选命名空间(peer → `slot-1..slot-peer_slots`,verify → `verify-1..verify-verify_slots`)。
-3. 对每个候选槽:打开/创建 `<槽>/.lock`,`flock(EX | NB)`(fs2::FileExt,仓库既有用法见 autonomy/monitor_runtime.rs:410–437,MSRV 注释也照抄:std 的 flock 是 1.89+,保持 fs2 限定调用)。拿不到(EWOULDBLOCK)⇒ 下一个。
+3. 对每个候选槽:打开/创建 `<槽>/.lock`,`flock(EX | NB)`(fs2::FileExt,仓库既有用法见 autonomy/monitor_runtime.rs:410–437,MSRV 注释也照抄:std 的 flock 是 1.89+,保持 fs2 限定调用)。遇到 EWOULDBLOCK 时按下述有界窗口处理瞬时争用;活 holder 仍立即跳过。
 4. 拿到锁后:若 `target/` 不存在则建;写 `holder.json`;`last_used = now`;返回 `Slot { path, target_dir, lock_fd }`。**锁 fd 由持有方进程内存持有到 release**,这是 I1 的真值。
-5. 全部槽被占 ⇒ `PoolExhausted { repo_key, kind }`,错误文案面向模型:「peer 池已满(2/2):每个 peer 的编译槽在其当前 turn 结束时释放,无需等 peer 关闭;稍后重试,或 `octos cache status` 查看持有者」。分配失败绝不等待、绝不排队(fail-fast,让 master 重新规划,而不是挂死一个 turn)。
+5. 全部槽被占 ⇒ `PoolExhausted { repo_key, kind }`,错误文案面向模型:「peer 池已满(2/2):每个 peer 的编译槽在其当前 turn 结束时释放,无需等 peer 关闭;稍后重试,或 `octos cache status` 查看持有者」。不等待活 holder 完成、不排队;仅对疑似继承描述符引起的瞬时争用执行有界重试。
+
+#### flock 瞬时争用窗口(#11)
+
+`CLOEXEC` 在 exec 时关闭描述符,不会阻止同进程另一线程 fork 出的子进程暂时继承它。父进程已释放槽并关闭自己的 fd 后,子进程持有的同一 open file description 仍可能让 `flock(EX | NB)` 短暂返回 `WouldBlock`。
+
+池核心共享 `LOCK_RETRY_WINDOW = 200ms` 与 `LOCK_RETRY_BACKOFF = 5ms`。acquire 和 GC 只在 holder.json 不存在、或其 PID 可确认已死时重试;活 holder、不可读取或无法解析的元数据立即保守跳过。每次争用都重读元数据,拿到锁后再执行原有持有者检查。只有 `WouldBlock` 进入重试,其他锁错误按 I/O 错误报告。窗口按单槽计算,一次扫描最多累积候选槽数 × 200ms 的等待预算(另加系统调用和调度耗时),超时后仍跳过或报告 Locked。
+
+`release_detached` 使用同一窗口,并允许持有正确非空 claim token 的调用方等待自己这一 claim 的锁释放,即使 holder PID 仍存活;不匹配的活 claim 立即拒绝等待。成功拿锁后再次核对 token,才可修改 holder.json 和 last_used。普通 `release(&mut Slot)` 本来就持有 flock,无需重新抢锁;它关闭父进程 fd 后的继承窗口由后续 acquire/GC/release_detached 处理。重试不改变槽互斥和 claim 身份约束。
 
 ### 3.3 touch(slot) 与 last_used 规则
 
@@ -125,7 +133,7 @@ stale_hours  = 168    # GC:无持有者且 last_used 超过该小时数才可清
 
 进程死亡 ⇒ 内核释放 flock,但 `holder.json` 残留。回收(reclaim)规则,在 (a) serve/cli 启动期对全部池跑一遍,(b) `octos cache gc` 时跑:
 
-1. 先 `flock(EX|NB)` 试 `.lock`:拿不到 ⇒ 有活持有者,跳过(锁是第一真值,元数据缺失也救得回来)。
+1. 先 `flock(EX|NB)` 试 `.lock`:活 holder 立即跳过;无 holder 或 PID 已死时按 §3.2 的窗口重试,仍拿不到则报告 Locked 并跳过(锁仍是第一真值)。
 2. 拿到锁后读 `holder.json`:不存在 ⇒ 无主,进入 §6 陈旧判定;存在则查 pid 存活——`kill(pid, 0)`:`ESRCH` = 死 ⇒ 删 holder.json(降级为无主,再走 §6);`EPERM` = 活着但不属于我们 ⇒ 视为持有,跳过;`0` = 本进程或同 uid 活进程 ⇒ 视为持有,跳过。
 3. 残余风险(pid 复用把死持有者认成活)记录在案:holder.json 带 `acquired_at`,可人工核对;不做进程启动时间比对(macOS 无 /proc,Linux-only 方案不值当)。
 
@@ -208,7 +216,7 @@ $RELEASE                            # 必须保留 acquire 返回的 --token 参
 
 对每个 `<repo-key>/` 下每个槽:
 
-1. `flock(EX|NB)` 拿 `.lock`:拿不到 ⇒ 活持有,跳过。
+1. `flock(EX|NB)` 拿 `.lock`:按 §3.2 的相同窗口处理瞬时争用;活 holder 或窗口耗尽 ⇒ Locked,跳过。
 2. `holder.json` 存在 ⇒ §3.5 的 pid 存活检查;活 ⇒ 跳过;死 ⇒ 删 holder.json 后继续。
 3. 无主 ⇒ 读 `last_used`(缺失按 0 处理,即最陈旧):`now - last_used <= stale_hours` ⇒ 跳过。
 4. 超期 ⇒ `remove_dir_all(target)`(保留 `.lock`;`holder.json`/`last_used` 此时本就不存在或已删),报告一条「reclaimed <槽> <GB>」。
