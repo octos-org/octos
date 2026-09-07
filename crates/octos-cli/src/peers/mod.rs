@@ -1018,36 +1018,68 @@ pub(crate) mod build_cache_peer {
         Ok(slot)
     }
 
-    /// Recheck eligibility before adopting or reacquiring on EVERY turn.
-    /// Cargo env wins over repository config, so RepoConfig/None must also
-    /// release any first-turn handle staged before the configuration changed.
+    /// Atomically retain the claim and its tracker for the exact turn owner.
     #[cfg_attr(not(feature = "api"), allow(dead_code))]
-    pub(crate) fn slot_for_turn(
+    pub(crate) fn slot_for_owned_turn(
         peers_root: &Path,
         workspace_root: &Path,
         slug: &str,
-    ) -> Result<Option<Slot>, RpcError> {
+        owner: &super::BuildCacheTurnOwner,
+    ) -> Result<Option<super::BuildCacheSlotView>, RpcError> {
         let peer_dir = peers_root.join(slug);
         let clone = peer_dir.join("wt");
         let key = super::build_cache_slot_registry_key(peers_root, slug);
+        let registry = super::build_cache_slot_registry();
+        let mut map = registry.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get(&key)
+            && let super::BuildCacheSlotState::Active(current) = &entry.state
+            && current != owner
+        {
+            return Err(super::build_cache_owned_error());
+        }
+        // Ownership is checked before eligibility: a rejected session cannot
+        // retire another turn's claim after a repository/config change.
         let config = super::build_cache_config_for(peers_root);
         if !clone.is_dir()
             || super::wire_fenced_peer_build_cache(&clone, workspace_root)
                 != super::PeerBuildCache::Shared
             || config.is_none()
         {
-            super::build_cache_slot_registry().release(&key, SlotOutcome::Cancelled);
+            let entry = map.remove(&key);
+            drop(map);
+            if let Some(entry) = entry {
+                entry.release(SlotOutcome::Cancelled);
+            }
             return Ok(None);
         }
-        if let Some(slot) = super::build_cache_slot_registry().take(&key) {
-            return Ok(Some(slot));
+        if let Some(entry) = map.get_mut(&key) {
+            entry.state = super::BuildCacheSlotState::Active(owner.clone());
+            return Ok(Some(entry.view()));
         }
+        let slot = acquire_for_turn(peers_root, &peer_dir, &clone, slug, &config.unwrap())?;
+        let entry = super::BuildCacheSlotEntry {
+            slot,
+            usage: Default::default(),
+            state: super::BuildCacheSlotState::Active(owner.clone()),
+        };
+        let view = entry.view();
+        map.insert(key, entry);
+        Ok(Some(view))
+    }
+
+    fn acquire_for_turn(
+        peers_root: &Path,
+        peer_dir: &Path,
+        clone: &Path,
+        slug: &str,
+        config: &BuildCacheConfig,
+    ) -> Result<Slot, RpcError> {
         // The session workspace is the clone. As in collect_peer_branch,
         // origin identifies the SOURCE repository: hashing the clone here
         // would split the bounded source pool on the second turn.
         let origin = std::process::Command::new("git")
             .arg("-C")
-            .arg(&clone)
+            .arg(clone)
             .args(["config", "--get", "remote.origin.url"])
             .output()
             .ok()
@@ -1060,7 +1092,7 @@ pub(crate) mod build_cache_peer {
                 ))
             })?;
         let goal = super::peer_io::read_peer_file(
-            &peer_dir,
+            peer_dir,
             "goal",
             super::peer_io::PEER_FILE_READ_CAP_SMALL,
         );
@@ -1073,9 +1105,32 @@ pub(crate) mod build_cache_peer {
             slug,
             goal_id,
             task_id,
-            &config.expect("checked above"),
+            config,
         )
-        .map(Some)
+    }
+
+    // Legacy fixture helper: exercise the production ownership/eligibility path,
+    // then extract its handle so existing pool-focused tests can release it.
+    #[cfg(test)]
+    pub(crate) fn slot_for_turn(
+        peers_root: &Path,
+        workspace_root: &Path,
+        slug: &str,
+    ) -> Result<Option<Slot>, RpcError> {
+        let owner = super::BuildCacheTurnOwner {
+            generation: 0,
+            session: octos_core::SessionKey("fixture".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        let view = slot_for_owned_turn(peers_root, workspace_root, slug, &owner)?;
+        Ok(view.and_then(|_| {
+            super::build_cache_slot_registry()
+                .by_key
+                .lock()
+                .unwrap()
+                .remove(&super::build_cache_slot_registry_key(peers_root, slug))
+                .map(|entry| entry.slot)
+        }))
     }
 
     /// Persist the held slot to `peers/<slug>/build-cache` (§7.4). The file
@@ -1114,12 +1169,48 @@ pub(crate) struct BuildCacheSlotRegistry {
     by_key: std::sync::Mutex<HashMap<String, BuildCacheSlotEntry>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BuildCacheTurnOwner {
+    pub session: SessionKey,
+    pub turn: octos_core::ui_protocol::TurnId,
+    /// Server dispatch identity; transport pins its state allocation while referenced.
+    pub generation: usize,
+}
+
+pub(crate) struct BuildCacheSlotView {
+    pub path: PathBuf,
+    pub usage: octos_agent::tools::BuildCacheUsage,
+}
+
+enum BuildCacheSlotState {
+    Staged,
+    Active(BuildCacheTurnOwner),
+}
+
+fn build_cache_owned_error() -> RpcError {
+    RpcError::invalid_request(
+        "build_cache_unavailable: another turn owns this peer's build-cache slot",
+    )
+    .with_data(serde_json::json!({"code": "build_cache_unavailable"}))
+}
+
 struct BuildCacheSlotEntry {
+    state: BuildCacheSlotState,
     slot: Slot,
     usage: octos_agent::tools::BuildCacheUsage,
 }
 
 impl BuildCacheSlotEntry {
+    fn owned_by(&self, owner: &BuildCacheTurnOwner) -> bool {
+        matches!(&self.state, BuildCacheSlotState::Active(current) if current == owner)
+    }
+    fn view(&self) -> BuildCacheSlotView {
+        BuildCacheSlotView {
+            path: self.slot.path.clone(),
+            usage: self.usage.clone(),
+        }
+    }
+
     fn release(self, outcome: SlotOutcome) {
         let mut slot = self.slot;
         self.usage.close_and_when_idle(move || {
@@ -1186,64 +1277,134 @@ pub(crate) fn build_cache_config_for(peers_root: &Path) -> Option<BuildCacheConf
 }
 
 impl BuildCacheSlotRegistry {
+    /// Bind a staged claim at dispatch, before the turn task can fail or be aborted.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn reserve_staged(
+        &self,
+        key: &str,
+        owner: &BuildCacheTurnOwner,
+    ) -> Result<(), RpcError> {
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(key) {
+            if matches!(entry.state, BuildCacheSlotState::Active(_)) {
+                return Err(build_cache_owned_error());
+            }
+            entry.state = BuildCacheSlotState::Active(owner.clone());
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn release_owned(
+        &self,
+        key: &str,
+        owner: &BuildCacheTurnOwner,
+        outcome: SlotOutcome,
+    ) {
+        self.release_matching(
+            |candidate, entry| candidate == key && entry.owned_by(owner),
+            outcome,
+        );
+    }
+
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn release_for_slug(
+        &self,
+        slug: &str,
+        owner: &BuildCacheTurnOwner,
+        outcome: SlotOutcome,
+    ) {
+        let suffix = format!("\u{1f}{slug}");
+        self.release_matching(
+            |key, entry| key.ends_with(&suffix) && entry.owned_by(owner),
+            outcome,
+        );
+    }
+
+    fn release_matching(
+        &self,
+        matches: impl Fn(&str, &BuildCacheSlotEntry) -> bool,
+        outcome: SlotOutcome,
+    ) {
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<_> = map
+            .iter()
+            .filter(|(key, entry)| matches(key, entry))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let entries: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| map.remove(&key))
+            .collect();
+        drop(map);
+        for entry in entries {
+            entry.release(outcome);
+        }
+    }
+
     /// Park a claimed slot with its per-child usage tracker.
     pub(crate) fn park(&self, key: String, slot: Slot) {
         self.park_with_usage(key, slot);
     }
 
-    pub(crate) fn park_with_usage(&self, key: String, slot: Slot) -> octos_agent::tools::BuildCacheUsage {
+    pub(crate) fn park_with_usage(
+        &self,
+        key: String,
+        slot: Slot,
+    ) -> octos_agent::tools::BuildCacheUsage {
         let usage = octos_agent::tools::BuildCacheUsage::default();
-        let old = self.by_key.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            key, BuildCacheSlotEntry { slot, usage: usage.clone() },
-        );
-        if let Some(old) = old {
-            old.release(SlotOutcome::Cancelled);
+        let incoming = BuildCacheSlotEntry {
+            slot,
+            usage: usage.clone(),
+            state: BuildCacheSlotState::Staged,
+        };
+        let displaced = {
+            let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+            if map
+                .get(&key)
+                .is_some_and(|entry| matches!(entry.state, BuildCacheSlotState::Active(_)))
+            {
+                Some(incoming)
+            } else {
+                map.insert(key, incoming)
+            }
+        };
+        if let Some(entry) = displaced {
+            entry.release(SlotOutcome::Cancelled);
         }
         usage
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&self, key: &str) -> Option<Slot> {
-        self.by_key.lock().unwrap_or_else(|e| e.into_inner()).remove(key).map(|entry| entry.slot)
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(key)
+            .is_some_and(|entry| matches!(entry.state, BuildCacheSlotState::Staged))
+        {
+            map.remove(key).map(|entry| entry.slot)
+        } else {
+            None
+        }
     }
 
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn usage(&self, key: &str) -> Option<octos_agent::tools::BuildCacheUsage> {
-        self.by_key.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|entry| entry.usage.clone())
+        self.by_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|entry| entry.usage.clone())
     }
 
     /// Close admission before returning the claim; live children retain its lock.
     pub(crate) fn release(&self, key: &str, outcome: SlotOutcome) {
-        let entry = self.by_key.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+        let entry = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
         if let Some(entry) = entry {
-            entry.release(outcome);
-        }
-    }
-
-    /// Eviction safety net (§4.2): release every slot held for `slug` when
-    /// the caller cannot know the peers root (connection-close eviction has
-    /// only the session key). Scoped by the key's `\u{1f}<slug>` SUFFIX, so a
-    /// slug can never match another slug's key. Only one entry can exist per
-    /// slug in this process (acquire is serialized per peer turn), and the
-    /// primary per-turn release has usually already emptied it.
-    /// Outer-loop #4 (§4.2): release-by-slug for peers whose registry key
-    /// is not reconstructible at the call site. The feature-gated
-    /// (`#[cfg(feature = "api")]`) release sites in api/ui_protocol_transport.rs
-    /// and commands/serve.rs are compiled in the api builds where they are
-    /// exercised; under a default (no-api) build this method — like the sites
-    /// — is dead by design, so silence the lint rather than delete the
-    /// integration.
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
-    pub(crate) fn release_for_slug(&self, slug: &str, outcome: SlotOutcome) {
-        let suffix = format!("\u{1f}{slug}");
-        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
-        let hits: Vec<String> = map
-            .keys()
-            .filter(|key| key.ends_with(&suffix))
-            .cloned()
-            .collect();
-        let entries: Vec<_> = hits.into_iter().filter_map(|key| map.remove(&key)).collect();
-        drop(map);
-        for entry in entries {
             entry.release(outcome);
         }
     }
@@ -1258,11 +1419,55 @@ mod build_cache_peer_tests {
     use super::*;
 
     #[test]
+    fn bc9_b6_park_preserves_active_and_releases_rejected_incoming_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("peers");
+        let config = BuildCacheConfig {
+            peer_slots: 2,
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        let first =
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "first", None, None, &config)
+                .unwrap();
+        let path = first.path.clone();
+        let registry = BuildCacheSlotRegistry::default();
+        registry.park("claim".into(), first);
+        let owner = BuildCacheTurnOwner {
+            generation: 0,
+            session: SessionKey("owner".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        registry.reserve_staged("claim", &owner).unwrap();
+        let incoming = build_cache_peer::acquire_for_staging(
+            &root,
+            tmp.path(),
+            "incoming",
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+        let rejected = incoming.path.clone();
+        registry.park("claim".into(), incoming);
+        assert!(path.join("holder.json").exists());
+        assert!(!rejected.join("holder.json").exists());
+        assert!(registry.take("claim").is_none());
+        registry.release_owned("claim", &owner, SlotOutcome::Completed);
+    }
+
+    #[test]
     fn bc9_b5_registry_keeps_claim_until_last_child_finishes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("peers");
-        let config = BuildCacheConfig { peer_slots: 1, min_free_gb: 0, ..Default::default() };
-        let slot = build_cache_peer::acquire_for_staging(&root, tmp.path(), "usage", None, None, &config).unwrap();
+        let config = BuildCacheConfig {
+            peer_slots: 1,
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        let slot =
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "usage", None, None, &config)
+                .unwrap();
         let path = slot.path.clone();
         let registry = BuildCacheSlotRegistry::default();
         registry.park("usage".into(), slot);
@@ -1271,10 +1476,15 @@ mod build_cache_peer_tests {
         registry.release("usage", SlotOutcome::Completed);
         assert!(path.join("holder.json").exists());
         assert!(usage.begin().is_none());
-        assert!(build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config).is_err());
+        assert!(
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config)
+                .is_err()
+        );
         drop(child);
         assert!(!path.join("holder.json").exists());
-        let mut next = build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config).unwrap();
+        let mut next =
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config)
+                .unwrap();
         assert_eq!(next.path, path);
         build_cache_peer::release_slot(&mut next, SlotOutcome::Completed);
     }
@@ -1282,7 +1492,10 @@ mod build_cache_peer_tests {
     #[test]
     fn bc9_n6_registry_key_has_one_separator_and_no_newline() {
         let root = Path::new("/tmp/profile/peers");
-        assert_eq!(build_cache_slot_registry_key(root, "worker"), "/tmp/profile/peers\u{1f}worker");
+        assert_eq!(
+            build_cache_slot_registry_key(root, "worker"),
+            "/tmp/profile/peers\u{1f}worker"
+        );
     }
 
     #[test]
@@ -3933,6 +4146,48 @@ mod issue_2236_build_cache_tests {
         )
         .unwrap();
         (tmp, ws, peers_root, staged)
+    }
+
+    #[test]
+    fn bc9_b6_second_session_cannot_adopt_active_slot() {
+        let (_tmp, _ws, root, staged) = staged_cargo_peer("owned-active");
+        let owner = BuildCacheTurnOwner {
+            generation: 0,
+            session: SessionKey("first".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        let first = build_cache_peer::slot_for_owned_turn(&root, &staged.cwd, &staged.slug, &owner)
+            .unwrap()
+            .unwrap();
+        let child = first.usage.begin().unwrap();
+        let second = BuildCacheTurnOwner {
+            generation: 0,
+            session: SessionKey("second".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        assert!(
+            build_cache_peer::slot_for_owned_turn(&root, &staged.cwd, &staged.slug, &second)
+                .is_err(),
+            "active slot must not be adopted by another session"
+        );
+        set_build_cache_config(&root, None);
+        assert!(
+            build_cache_peer::slot_for_owned_turn(&root, &staged.cwd, &staged.slug, &second)
+                .is_err(),
+            "eligibility changes cannot clear another owner"
+        );
+        let key = build_cache_slot_registry_key(&root, &staged.slug);
+        assert!(
+            build_cache_slot_registry().take(&key).is_none(),
+            "active handles cannot be taken"
+        );
+        build_cache_slot_registry().release_owned(&key, &second, SlotOutcome::Failed);
+        assert!(first.path.join("holder.json").exists());
+        assert!(first.usage.begin().is_some());
+        build_cache_slot_registry().release_owned(&key, &owner, SlotOutcome::Completed);
+        assert!(first.path.join("holder.json").exists());
+        drop(child);
+        assert!(!first.path.join("holder.json").exists());
     }
 
     #[test]

@@ -236,11 +236,6 @@ impl ScopePolicy {
     pub(crate) fn evict_session(&self, session_id: &SessionKey) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions.remove(session_id);
-        if let Some(slug) = session_id.topic().and_then(|topic| topic.strip_prefix("peer-")) {
-            crate::peers::build_cache_slot_registry().release_for_slug(
-                slug, crate::build_cache::pool::SlotOutcome::Cancelled,
-            );
-        }
     }
 
     /// Drops every `ApproveForTurn` entry for `(session_id, turn_id)`. Other

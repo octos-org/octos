@@ -3480,10 +3480,10 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
             abort,
         },
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(session.clone(), turn_id);
+    connection_turns.lock().await.insert(
+        session.clone(),
+        test_connection_turn(&active_turns, &session, &turn_id).await,
+    );
     let remover = active_turns.clone();
     let session_for_removal = session.clone();
     tokio::spawn(async move {
@@ -3546,7 +3546,10 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
             abort,
         },
     );
-    connection_turns.lock().await.insert(session, turn_id);
+    connection_turns.lock().await.insert(
+        session.clone(),
+        test_connection_turn(&active_turns, &session, &turn_id).await,
+    );
 
     let drained = drain_connection_turns_for_shutdown(
         &active_turns,
@@ -3615,10 +3618,10 @@ async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
         session_id.clone(),
         test_active_turn(turn_id.clone(), turn_task.abort_handle()),
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        test_connection_turn(&active_turns, &session_id, &turn_id).await,
+    );
 
     let (forwarder_started_tx, forwarder_started_rx) = oneshot::channel();
     let (forwarder_drop_tx, forwarder_drop_rx) = oneshot::channel();
@@ -16006,6 +16009,23 @@ fn state_with_sessions(data_dir: &std::path::Path) -> Arc<AppState> {
 
 /// Build an `ActiveTurn` with default `Active` state for tests that drive
 /// the registry directly without going through `handle_turn_start`.
+async fn test_connection_turn(
+    active: &SharedActiveTurns,
+    session: &SessionKey,
+    turn_id: &TurnId,
+) -> ConnectionTurn {
+    let map = active.lock().await;
+    let state = map
+        .get(session)
+        .filter(|entry| entry.turn_id == *turn_id)
+        .map(|entry| entry.state.clone())
+        .unwrap_or_else(|| Arc::new(TokioMutex::new(TurnState::Active)));
+    ConnectionTurn {
+        turn_id: turn_id.clone(),
+        state,
+    }
+}
+
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
@@ -20615,14 +20635,14 @@ async fn abort_connection_turns_removes_only_matching_active_turns() {
         stale_session_id.clone(),
         test_active_turn(newer_turn_id.clone(), newer_handle.abort_handle()),
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(owned_session_id.clone(), owned_turn_id);
-    connection_turns
-        .lock()
-        .await
-        .insert(stale_session_id.clone(), stale_connection_turn_id);
+    connection_turns.lock().await.insert(
+        owned_session_id.clone(),
+        test_connection_turn(&active_turns, &owned_session_id, &owned_turn_id).await,
+    );
+    connection_turns.lock().await.insert(
+        stale_session_id.clone(),
+        test_connection_turn(&active_turns, &stale_session_id, &stale_connection_turn_id).await,
+    );
 
     let scopes = ScopePolicy::default();
     let ledger = UiProtocolLedger::new(16);
@@ -40468,10 +40488,10 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
     let mut entry = test_active_turn(turn_id.clone(), handle.abort_handle());
     entry.steer = Some(buffer.clone());
     active_turns.lock().await.insert(session_id.clone(), entry);
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        test_connection_turn(&active_turns, &session_id, &turn_id).await,
+    );
 
     let scopes = ScopePolicy::default();
     let ledger = UiProtocolLedger::new(16);
@@ -42150,14 +42170,18 @@ async fn issue_2236_build_cache_early_terminal_releases_slot() {
         let ws = WsConnection::new(tx);
         let ledger = UiProtocolLedger::new(32);
         let session = SessionKey::with_profile_topic("cache", "api", "tab", "peer-cache-terminal");
-        let state = TokioMutex::new(TurnState::Active);
+        let turn = TurnId::new();
+        let state = Arc::new(TokioMutex::new(TurnState::Active));
+        build_cache_slot_registry()
+            .reserve_staged(&key, &build_cache_turn_owner(&session, &turn, &state))
+            .unwrap();
         try_emit_terminal(
             &state,
             reason,
             &ws,
             &ledger,
             &session,
-            &TurnId::new(),
+            &turn,
             Some(("peer_lifetime_unavailable", "failed before dispatch")),
             None,
             None,
@@ -42178,41 +42202,362 @@ async fn bc9_sf1_disconnect_releases_build_cache_slot() {
     let peers_root = tmp.path().join("peers");
     let slug = "bc9-disconnect";
     let slot = build_cache_peer::acquire_for_staging(
-        &peers_root, tmp.path(), slug, None, None,
-        &crate::build_cache::BuildCacheConfig { min_free_gb: 0, ..Default::default() },
-    ).unwrap();
+        &peers_root,
+        tmp.path(),
+        slug,
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let path = slot.path.clone();
     build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
     let session = SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
     let turn = TurnId::new();
+    let state = Arc::new(TokioMutex::new(TurnState::Active));
+    build_cache_slot_registry()
+        .reserve_staged(
+            &build_cache_slot_registry_key(&peers_root, slug),
+            &build_cache_turn_owner(&session, &turn, &state),
+        )
+        .unwrap();
     let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
     let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
     let handle = tokio::spawn(std::future::pending::<()>());
-    active.lock().await.insert(session.clone(), test_active_turn(turn.clone(), handle.abort_handle()));
-    connection.lock().await.insert(session, turn);
-    abort_connection_turns(&active, &connection, &ScopePolicy::default(), &UiProtocolLedger::new(16),
-        &PendingApprovalStore::default(), &PendingQuestionStore::default()).await;
-    assert!(!path.join("holder.json").exists(), "disconnect must return the held cache slot");
+    let mut entry = test_active_turn(turn.clone(), handle.abort_handle());
+    entry.state = state.clone();
+    active.lock().await.insert(session.clone(), entry);
+    connection.lock().await.insert(
+        session,
+        ConnectionTurn {
+            turn_id: turn,
+            state,
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        !path.join("holder.json").exists(),
+        "disconnect must return the held cache slot"
+    );
     assert!(handle.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]
 async fn bc9_sf2_shortcut_and_early_error_release_build_cache_slot() {
-    for (reason, known_root) in [(TerminalReason::Completed, true), (TerminalReason::Completed, false), (TerminalReason::Errored, false)] {
+    for (reason, known_root) in [
+        (TerminalReason::Completed, true),
+        (TerminalReason::Completed, false),
+        (TerminalReason::Errored, false),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let peers_root = tmp.path().join("peers");
         let slug = "bc9-shortcut";
         let slot = build_cache_peer::acquire_for_staging(
-            &peers_root, tmp.path(), slug, None, None,
-            &crate::build_cache::BuildCacheConfig { min_free_gb: 0, ..Default::default() },
-        ).unwrap();
+            &peers_root,
+            tmp.path(),
+            slug,
+            None,
+            None,
+            &crate::build_cache::BuildCacheConfig {
+                min_free_gb: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let path = slot.path.clone();
         build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
         let (tx, _rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
         let ws = WsConnection::new(tx);
-        let session = SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
-        try_emit_terminal(&TokioMutex::new(TurnState::Active), reason, &ws, &UiProtocolLedger::new(32),
-            &session, &TurnId::new(), None, None, None, known_root.then_some(peers_root.as_path())).await;
-        assert!(!path.join("holder.json").exists(), "{reason:?}, known_root={known_root} must return the slot");
+        let session =
+            SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
+        let turn = TurnId::new();
+        let state = Arc::new(TokioMutex::new(TurnState::Active));
+        build_cache_slot_registry()
+            .reserve_staged(
+                &build_cache_slot_registry_key(&peers_root, slug),
+                &build_cache_turn_owner(&session, &turn, &state),
+            )
+            .unwrap();
+        try_emit_terminal(
+            &state,
+            reason,
+            &ws,
+            &UiProtocolLedger::new(32),
+            &session,
+            &turn,
+            None,
+            None,
+            None,
+            known_root.then_some(peers_root.as_path()),
+        )
+        .await;
+        assert!(
+            !path.join("holder.json").exists(),
+            "{reason:?}, known_root={known_root} must return the slot"
+        );
     }
+}
+
+fn bc9_b6_claim(
+    slug: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    BuildCacheTurnOwner,
+    Arc<TokioMutex<TurnState>>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("peers");
+    let slot = build_cache_peer::acquire_for_staging(
+        &root,
+        tmp.path(),
+        slug,
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    let key = build_cache_slot_registry_key(&root, slug);
+    build_cache_slot_registry().park(key.clone(), slot);
+    let state = Arc::new(TokioMutex::new(TurnState::Active));
+    let owner = build_cache_turn_owner(
+        &SessionKey::with_profile_topic("cache", "api", "first", &format!("peer-{slug}")),
+        &TurnId::new(),
+        &state,
+    );
+    build_cache_slot_registry()
+        .reserve_staged(&key, &owner)
+        .unwrap();
+    (tmp, root, path, owner, state)
+}
+
+#[tokio::test]
+async fn bc9_b6_rejected_second_terminal_preserves_first_claim() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("rejected-terminal");
+    let second = SessionKey::with_profile_topic("cache", "api", "second", "peer-rejected-terminal");
+    let (tx, _rx) = mpsc::channel(8);
+    try_emit_terminal(
+        &TokioMutex::new(TurnState::Active),
+        TerminalReason::Errored,
+        &WsConnection::new(tx),
+        &UiProtocolLedger::new(32),
+        &second,
+        &TurnId::new(),
+        Some(("build_cache_unavailable", "another turn owns the slot")),
+        None,
+        None,
+        Some(&root),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "rejected turn cannot release first turn"
+    );
+    build_cache_slot_registry().release_for_slug(
+        "rejected-terminal",
+        &owner,
+        crate::build_cache::pool::SlotOutcome::Completed,
+    );
+}
+
+#[tokio::test]
+async fn bc9_b6_stale_terminal_cannot_release_new_turn_or_staged_claim() {
+    for staged in [false, true] {
+        let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("stale-terminal");
+        let key = build_cache_slot_registry_key(&root, "stale-terminal");
+        if staged {
+            build_cache_slot_registry()
+                .release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+            let slot = build_cache_peer::acquire_for_staging(
+                &root,
+                _tmp.path(),
+                "stale-terminal",
+                None,
+                None,
+                &crate::build_cache::BuildCacheConfig {
+                    min_free_gb: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            build_cache_slot_registry().park(key.clone(), slot);
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        try_emit_terminal(
+            &TokioMutex::new(TurnState::Active),
+            TerminalReason::Completed,
+            &WsConnection::new(tx),
+            &UiProtocolLedger::new(32),
+            &owner.session,
+            &TurnId::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            path.join("holder.json").exists(),
+            "old terminal must preserve newer or staged claim"
+        );
+        build_cache_slot_registry().release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+    }
+}
+
+#[tokio::test]
+async fn bc9_b6_stale_connection_cannot_release_new_turn() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("stale-disconnect");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(owner.turn.clone(), handle.abort_handle());
+    entry.state = _claim_state.clone();
+    active.lock().await.insert(owner.session.clone(), entry);
+    connection.lock().await.insert(
+        owner.session.clone(),
+        ConnectionTurn {
+            turn_id: TurnId::new(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old connection must not release newer turn of same session"
+    );
+    assert!(!handle.is_finished());
+    handle.abort();
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(&root, "stale-disconnect"),
+        crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
+}
+
+#[tokio::test]
+async fn bc9_b6_abort_before_task_start_releases_dispatch_reservation() {
+    let (_tmp, _root, path, owner, _claim_state) = bc9_b6_claim("prestart-abort");
+    let reservation = BuildCacheTurnReservation(owner, _claim_state);
+    let task = tokio::spawn(async move {
+        let _reservation = reservation;
+        std::future::pending::<()>().await;
+    });
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!path.join("holder.json").exists());
+}
+
+#[tokio::test]
+async fn bc9_b6_reused_id_stale_guard_preserves_new_claim() {
+    let (tmp, root, _path, owner, _claim_state) = bc9_b6_claim("reuse-guard");
+    let key = build_cache_slot_registry_key(&root, "reuse-guard");
+    let stale_guard = BuildCacheTurnReservation(owner.clone(), _claim_state.clone());
+    build_cache_slot_registry().release_owned(
+        &key,
+        &owner,
+        crate::build_cache::pool::SlotOutcome::Completed,
+    );
+    let slot = build_cache_peer::acquire_for_staging(
+        &root,
+        tmp.path(),
+        "reuse-guard",
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    build_cache_slot_registry().park(key.clone(), slot);
+    let new_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let new_owner = build_cache_turn_owner(&owner.session, &owner.turn, &new_state);
+    build_cache_slot_registry()
+        .reserve_staged(&key, &new_owner)
+        .unwrap();
+    drop(stale_guard);
+    assert!(
+        path.join("holder.json").exists(),
+        "old dispatch guard must not release a reused wire turn id"
+    );
+    let (tx, _rx) = mpsc::channel(8);
+    try_emit_terminal(
+        &_claim_state,
+        TerminalReason::Completed,
+        &WsConnection::new(tx),
+        &UiProtocolLedger::new(16),
+        &owner.session,
+        &owner.turn,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old terminal must preserve reused ID's new dispatch"
+    );
+    build_cache_slot_registry().release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+}
+
+#[tokio::test]
+async fn bc9_b6_reused_id_stale_connection_preserves_new_claim() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("reuse-connection");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(owner.turn.clone(), handle.abort_handle());
+    entry.state = _claim_state.clone();
+    active.lock().await.insert(owner.session.clone(), entry);
+    connection.lock().await.insert(
+        owner.session.clone(),
+        ConnectionTurn {
+            turn_id: owner.turn.clone(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old connection must not abort or release a reused wire turn id"
+    );
+    assert!(!handle.is_finished());
+    handle.abort();
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(&root, "reuse-connection"),
+        crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
 }

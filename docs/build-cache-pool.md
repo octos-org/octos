@@ -135,20 +135,17 @@ stale_hours  = 168    # GC:无持有者且 last_used 超过该小时数才可清
 
 为什么不能把主释放挂在 close 上:peer 会话是**持久会话**(#438)——close 回调 `build_peer_close_callback`(api/ui_protocol_transport.rs:15138)只由 originator 显式 `peer_close` 触发,而 peer wire 会话按 slug 注册、断线可重连(`register_peer_wire_session` :2822 起,:2830 的 #436 防复活闸只拦已写 `closed` 标记者),一个跑完 turn 的 peer 通常**永远不会被 close**。若 release 只挂 close 回调,该 peer 会握着 flock 直到 serve 退出 ⇒ peer_slots=2 时第三个 peer 的 turn 将一直 `PoolExhausted`(死锁,不是排队)。仓库里已有同一形态的教训:成果分支收集最初也只挂 close,未 close 的 peer 成果滞留在 clone 里,后来改为 per-turn 收集(`collect_peer_branch` 调用点 :14406 的注释记录了这次 live soak)。本设计从第一版就把释放对齐到 per-turn 终态。
 
-### 4.1 主释放点:per-turn 终态写 result.md 处
+### 4.1 主释放点:统一的 per-turn 终态转换
 
-serve 路径上每个 peer turn 都收口于 `write_peer_result_if_peer_session`(api/ui_protocol_transport.rs:14279):Completed 在 :34277 调用,Errored/RateLimited 在 :34383 调用;同函数内紧跟 per-turn 的 `collect_peer_branch`(:14406)——「成果已落 result.md、分支已 collect」正是该 turn 的终态语义。release 挂这里:
+serve 的 `transition_to_terminal_settling_steers` 是普通完成、错误、中断、快捷路径和早期失败的共同释放入口。Completed 映射为 `Completed`，Errored/RateLimited 映射为 `Failed`，Interrupted 映射为 `Cancelled`。释放必须同时匹配 `session_id`、`turn_id` 和服务端 dispatch generation；未持有槽的第二轮失败不会释放第一轮的槽。`write_peer_result_if_peer_session` 只负责成果落盘与分支收集，不再执行缺少 turn 身份的释放。
 
-- turn Completed(:34277)⇒ `release(slot, Completed)`;
-- turn Errored / RateLimited(:34383)⇒ `release(slot, Failed)`。
-
-对应地 **acquire 也 per-turn**:serve 侧在该 turn 的 boot 段(ui_protocol_transport.rs:32616–32652,重建 agent、重水化 goal/originator 的同一处);首轮槽由 stage_peer 的 staging 段先行领用(失败回滚见下)。**boot 段每个 turn 都会跑,包括首轮**,故首轮不是再 acquire,而是认领(adopt):
-
-- **adopt 规则(首轮槽交接)**:boot 段读 `peers/<slug>/build-cache`(stage_peer 已持久化的槽路径,§7.4)。若其命名的槽 `holder.json` 的 slug 与本 peer slug 一致 ⇒ **认领既有槽**:接手其锁 fd、改写 holder.json(仍写本 slug,acquired_at 刷新),不再新 acquire。只有「无记录槽」或「记录槽 holder.json 属他人」才走 §3.2 全新 acquire。理由:首轮槽的 flock 已由同进程(stage_peer)持有,flock 锁随 open file description 走,同进程第二个 fd 的 `EX|NB` 必然 EWOULDBLOCK ⇒ 裸 acquire 会抢走另一槽(2 槽池被同一 peer 双持);且 boot 段若覆写 build-cache 文件,staging 槽就以活 pid 之名漏到 serve 退出——两处事故 adopt 一并消除。
+acquire 同样按 turn 进行。首轮槽由 `stage_peer` 先行领用，dispatch 在启动任务前把 Staged 条目绑定到本轮；boot 的 `slot_for_owned_turn` 在 registry 锁内检查所有权和资格，采用已有句柄或分配新槽，返回路径和共享使用计数。槽句柄始终留在 registry，既不重新解析 `build-cache` 文件决定所有权，也不在 adopt 时重写 holder。Active 条目只允许其原有 owner 再次取得视图。
 
 solo 路径尚未接入构建缓存池，池功能保持关闭；`run_chat_peer` 不领取或释放池槽。当前按 turn 领取与释放的接线用于 serve 中启用池配置的 peer。
 
 staging 失败回滚:首轮槽已在 stage_peer 内 acquire ⇒ `cleanup_staged_peer`(peers/mod.rs:1912–1924)同函数内 release(见 #4 的失败回滚注意)。
+
+registry 条目分为 `Staged` 和 `Active(session_id, turn_id, dispatch_generation)`。dispatch 在启动异步任务前将已暂存的槽绑定到本轮；工具启动时原子采用或分配槽，句柄与同一个使用计数仍留在 registry。另一 session/turn 不能采用 Active 槽，会得到 `build_cache_unavailable`。客户端可重用 turn ID，因此连接登记与取消 guard 同时保留该次 dispatch 的身份。普通终态、断连与任务取消只释放精确匹配本次 dispatch 的 Active 条目，旧终态不清理新轮或尚未绑定的 Staged 条目；显式关闭 peer 仍可回收它的当前条目。
 
 当前进程记录的前台、后台 shell 子进程共享槽使用计数。终态释放先关闭新子进程准入，等待已登记子进程结束后再归还槽；前台调用被取消时，独立等待任务继续持有使用计数直至子进程退出。命令自行启动并脱离登记 shell 生命周期的 detached 子进程不在此保证范围内；需要缓存槽的工作应在登记 shell 完成前结束。此保证依赖当前服务进程仍在运行，不覆盖服务进程被强制终止的情况。
 
@@ -159,9 +156,9 @@ staging 失败回滚:首轮槽已在 stage_peer 内 acquire ⇒ `cleanup_staged_
 | 事件 | 现有落点 | 动作 |
 | --- | --- | --- |
 | peer_close 取消 / 中断在飞 turn | close 回调 `build_peer_close_callback`(api/ui_protocol_transport.rs:15138;写 `closed` 标记 :15182、close 侧 `collect_peer_branch` :15192、取消注入队列 :15197–15198)与 turn 中断(:1729–1739) | `release(slot, Cancelled)`(幂等) |
-| 中断终态路径(client 侧 turn/interrupt 命中 peer 会话时) | `try_emit_terminal`(api/ui_protocol_transport.rs:34717,发 `turn/error code=interrupted`;中断源枚举 InterruptOrigin :1729–1739 含 **Client** 与 PeerClose 两源)。注意:中断 turn **不经** :14279 主释放——该函数 doc comment(:14273–14277)明写 INTERRUPTED threads 0、never reaches this writer,与 :34383 的 error 臂是两条路 | 中断终态路径必须**同样调用幂等 release**(`release(slot, Cancelled)`)。否则一次 client 中断即漏一个槽:serve 存活 ⇒ §3.5 的 pid 判活跳过,无自愈,peer_slots=2 时累计两次即 PoolExhausted 到 serve 重启 |
+| 中断终态路径(client 侧 turn/interrupt 命中 peer 会话时) | `try_emit_terminal` 经统一终态转换 | 按精确 owner 关闭使用准入并安排 `Cancelled` 释放 |
 | parked → retired(close 写 `closed` 后 peer 不再复活) | :2830 的 #436 防复活闸 | 同 close 路径,`release(slot, Retired)`(幂等,主释放已生效则 no-op) |
-| 会话驱逐(FIX-06:连接断开即会话终) | `evict_session`(api/ui_protocol_transport.rs:36776) | 兜底 `release`(幂等);peer 重连后下一 turn 走 4.1 重新 acquire |
+| 连接断开 | `abort_connection_turns` 的已登记 session+turn；通用 `evict_session` 不管理缓存槽 | 仅释放断连所对应的 owner；旧连接不能释放同 session 的更新 turn |
 | 进程崩溃 | flock 自动释放 + §3.5 启动期回收 | 无即时动作 |
 
 监督任务的退役(`retire_peer_supervised_task`,peers/mod.rs:264–275)不动槽:它只在 close 路径触发且 take-一次,槽释放以 4.1 的 turn 终态为准,避免双写。
@@ -264,7 +261,7 @@ peer 的 cwd 是它自己的 clone `peers/<slug>/wt`(peers/mod.rs:1597–1622),�
 
 依据(按实际分层,非偏好):
 
-1. **谁是写入方**:池的全部状态改写都发生在 octos-cli——peer staging(peers/mod.rs 的 stage_peer 及其 serve 调用 ui_protocol_transport.rs:13284)、turn 终态释放(write_peer_result_if_peer_session :14279,调用点 :34277/:34383;solo 侧 run_chat_peer chat.rs:828)、兜底释放(close 回调 :15138、会话驱逐 :36776)、`octos cache status|gc|gate|acquire|release` 命令(#5/#6,commands/ 下)。外环接入(#6)更是天生 CLI。
+1. **谁是写入方**:池的全部状态改写都发生在 octos-cli——peer staging(peers/mod.rs 的 stage_peer 及其 serve 调用 ui_protocol_transport.rs:13284)、turn 终态释放(transition_to_terminal_settling_steers，按 session+turn 所有权)、兜底释放(close 回调 :15138、会话驱逐 :36776)、`octos cache status|gc|gate|acquire|release` 命令(#5/#6,commands/ 下)。外环接入(#6)更是天生 CLI。
 2. **依赖方向**:octos-cli 依赖 octos-agent(Cargo.toml:24),反向不存在。池若放 octos-agent,octos-cli 的一切调用都要穿过一层与 agent 语义无关的 API;而 agent 侧真实需要的只有「我的槽路径」这一个数据(进 SandboxConfig 与 ToolContext),不是池逻辑。
 3. **依赖就近**:fs2(Cargo.toml:59,锁 + statvfs)、sha2(:58,repo-key)都已在 octos-cli;放 octos-agent 得新加依赖。
 4. **共享代码现状**:cli 与 agent 今天共享的东西(锁习惯用法 monitor_runtime.rs:410–437、原子写 peer_io、沙箱构造 create_sandbox sandbox/mod.rs:1005)全部是「cli 调 agent / cli 自持」形态,没有「agent 反过来调 cli 设施」的先例;本设计维持该方向。
@@ -275,7 +272,7 @@ peer 的 cwd 是它自己的 clone `peers/<slug>/wt`(peers/mod.rs:1597–1622),�
 ## 9. 与后续条目的映射
 
 - #3 池核心:§1/§3/§5/§6 的 `acquire/release/touch/reclaim_stale` + `BuildCacheError`;测试 = 并发 acquire 不超池大小、释放后可复用、持有者死亡可回收、空间门返回错误不 panic(临时目录池)。
-- #4 peer 接入:§4.1 主释放(turn 终态 :14279/:34277/:34383 + per-turn acquire)+ §4.2 四条兜底 + §7.4 的 env 注入 + §7.2 的沙箱授权;测试 = peer 环境含正确变量、两 peer 拿不同槽、turn 终态释放(不依赖 close)、close/evict 兜底幂等、白名单仅含自己的槽(单测 profile 字符串)。
+- #4 peer 接入:§4.1 主释放(统一终态转换 + per-turn acquire)+ §4.2 四条兜底 + §7.4 的 env 注入 + §7.2 的沙箱授权;测试 = peer 环境含正确变量、两 peer 拿不同槽、turn 终态释放(不依赖 close)、close/evict 兜底幂等、白名单仅含自己的槽(单测 profile 字符串)。
 - #5 命令:`octos cache status|gc|gate`,阈值默认 §2;测试 = 命令级单测(临时目录池)。
 - #6 外环:§4 末段的 acquire/release 命令对,输出可被 shell 解析。
 - #7 收尾:全量 test/clippy/fmt,本文件随 #2 提交后不再回改(修订走新条目)。
@@ -283,7 +280,7 @@ peer 的 cwd 是它自己的 clone `peers/<slug>/wt`(peers/mod.rs:1597–1622),�
 ## 10. 锚点速查(实测行号,feat/build-cache-pool @ 9c157101)
 
 - peer staging 核心:crates/octos-cli/src/peers/mod.rs:1563(stage_peer 签名);:1592–1595 slug 预留;:1597–1599 cwd=peers/<slug>/wt;:1615–1628 为何是 clone 不是 worktree;:1637–1652 `git clone --quiet --no-hardlinks`;:1654–1668 建分支;:1726–1733 goal 文件两行格式;:1738 brief.md;:1760–1767 StagedPeer 返回。
-- peer 终态/清理:peers/mod.rs:264–275 retire_peer_supervised_task;:1912–1924 cleanup_staged_peer;api/ui_protocol_transport.rs:14279 write_peer_result_if_peer_session(turn 终态主释放点,Completed 调用 :34277、Errored/RateLimited 调用 :34383);:14406 per-turn collect_peer_branch;:15138 build_peer_close_callback(兜底);:15177–15186 closed 标记;:15192 close 侧 collect_peer_branch;:15197–15198 取消注入;:1729–1739 peer_close 中断 turn;:2830 防复活闸(#438 持久会话);:36776 evict_session(FIX-06,兜底);:32616–32652 serve 侧 peer boot(goal/originator 重水化,per-turn acquire 段)。
+- peer 终态/清理:peers/mod.rs:264–275 retire_peer_supervised_task;:1912–1924 cleanup_staged_peer;api/ui_protocol_transport.rs:14279 write_peer_result_if_peer_session(成果写入；缓存主释放已移至 transition_to_terminal_settling_steers);:14406 per-turn collect_peer_branch;:15138 build_peer_close_callback(兜底);:15177–15186 closed 标记;:15192 close 侧 collect_peer_branch;:15197–15198 取消注入;:1729–1739 peer_close 中断 turn;:2830 防复活闸(#438 持久会话);:36776 evict_session(FIX-06,权限清理；缓存由 abort_connection_turns 按 owner 清理);:32616–32652 serve 侧 peer boot(goal/originator 重水化,per-turn acquire 段)。
 - 沙箱:crates/octos-agent/src/sandbox/mod.rs:37 SandboxConfig;:149 allow_toolchains;:92 repo_git_write;:183–187 ToolchainWriteGrants;:209–247 toolchain_write_grants;:254–265 push_cargo_grants;:269–275 configured_toolchain_grants(deny-wins 抑制点);:1005 create_sandbox;:1075–1085 build_backend(MacosSandbox 装配);sandbox/macos.rs:307 cwd 写规则;:315–332 toolchain 授权发射;:333–378 workspace 三臂;:358–369 repo_git_write 规则(canonicalize 模式);:417–443 外部 scratch 独立授权(本设计 §7.2 的同构范本);:448–461 profile 拼装与 `(deny default)`;:464–469 TMPDIR 注入;:498 起 tests(规则字符串断言范本)。
 - 环境注入:crates/octos-cli/src/commands/chat.rs:797–812 进程内 peer 驱动;:828 run_chat_peer;:854 create_sandbox;:875–882 Agent 装配;:886 goal 重水化。crates/octos-agent/src/tools/shell.rs:194 wrap_command;:201–204 与 :1104–1107 环境注入点;:327–332 apply_frontend_tool_env(范本);:754 apply_git_tool_env;:449–462 MAIN_TREE_SOVEREIGNTY_PROVIDER(host 装配范本)。crates/octos-agent/src/subprocess_env.rs:159–171 should_forward_env_name;:90–94 + :113–127 strict 变体保留 OCTOS_*。crates/octos-agent/src/tools/mod.rs:261 ToolContext;:341–348 goal/task/originator 字段(§7.4 传递层范本);agent/execution.rs:508–511 逐调用下发。
 - 路径与数据根:api/ui_protocol_transport.rs:13212 `runtime.data_dir.join("peers")`;:11525 同;crates/octos-cli/src/profiles.rs:164–166 data_dir 覆盖;:1894 resolve_data_dir;:1939 octos_home_dir;crates/octos-cli/src/config.rs:26 Config;:123/127 既有可选段形态;runtime/profile.rs:991–996 read_allow_paths 追加 home。

@@ -445,7 +445,20 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
 ];
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
-type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>>;
+#[derive(Clone)]
+struct ConnectionTurn {
+    turn_id: TurnId,
+    // Pin the original dispatch even after ActiveTurns advances to a reused ID.
+    state: Arc<TokioMutex<TurnState>>,
+}
+
+impl ConnectionTurn {
+    fn matches(&self, active: &ActiveTurn) -> bool {
+        self.turn_id == active.turn_id && Arc::ptr_eq(&self.state, &active.state)
+    }
+}
+
+type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ConnectionTurn>>>;
 type DynamicProfileRuntimeMap =
     std::sync::RwLock<HashMap<String, Arc<crate::runtime::ProfileRuntime>>>;
 
@@ -7422,11 +7435,11 @@ async fn drain_connection_turns_for_shutdown(
         let mut live: Vec<SessionKey> = Vec::new();
         {
             let active = active_turns.lock().await;
-            for (session_id, turn_id) in &owned {
+            for (session_id, registered) in &owned {
                 let Some(turn) = active.get(session_id) else {
                     continue;
                 };
-                if &turn.turn_id != turn_id {
+                if !registered.matches(turn) {
                     continue;
                 }
                 // Terminal entries stay registered until cleanup — the turn
@@ -15142,6 +15155,81 @@ mod peer_awaiting_wake_tests {
     }
 }
 
+fn build_cache_turn_owner(
+    session: &SessionKey,
+    turn: &TurnId,
+    state: &TokioMutex<TurnState>,
+) -> BuildCacheTurnOwner {
+    BuildCacheTurnOwner {
+        session: session.clone(),
+        turn: turn.clone(),
+        generation: std::ptr::from_ref(state) as usize,
+    }
+}
+
+/// Exact turn ownership also applies when a terminal has no resolved peers root.
+fn release_peer_build_cache_slot(
+    peers_root: Option<&std::path::Path>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    turn_state: &TokioMutex<TurnState>,
+    outcome: crate::build_cache::pool::SlotOutcome,
+) {
+    let Some(slug) = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+    else {
+        return;
+    };
+    let owner = build_cache_turn_owner(session_id, turn_id, turn_state);
+    if let Some(root) = peers_root {
+        build_cache_slot_registry().release_owned(
+            &build_cache_slot_registry_key(root, slug),
+            &owner,
+            outcome,
+        );
+    } else {
+        build_cache_slot_registry().release_for_slug(slug, &owner, outcome);
+    }
+}
+
+/// Captured before the task is spawned, so an abort before its first poll also
+/// releases the dispatch reservation. The strong state reference pins the
+/// generation address until this guard drops; a stale guard cannot close a
+/// replacement even when its client-supplied session and turn IDs are reused.
+struct BuildCacheTurnReservation(BuildCacheTurnOwner, Arc<TokioMutex<TurnState>>);
+impl Drop for BuildCacheTurnReservation {
+    fn drop(&mut self) {
+        release_peer_build_cache_slot(
+            None,
+            &self.0.session,
+            &self.0.turn,
+            &self.1,
+            crate::build_cache::pool::SlotOutcome::Cancelled,
+        );
+    }
+}
+
+fn reserve_peer_build_cache_turn(
+    state: &AppState,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    turn_state: &Arc<TokioMutex<TurnState>>,
+    routed_profile: Option<&str>,
+) -> Result<BuildCacheTurnReservation, RpcError> {
+    let owner = build_cache_turn_owner(session_id, turn_id, turn_state);
+    if let Some(slug) = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+        && let Some(runtime) =
+            resolve_session_profile_runtime(state, session_id.profile_id().or(routed_profile))
+    {
+        let key = build_cache_slot_registry_key(&runtime.data_dir.join("peers"), slug);
+        build_cache_slot_registry().reserve_staged(&key, &owner)?;
+    }
+    Ok(BuildCacheTurnReservation(owner, turn_state.clone()))
+}
+
 /// #1801 v2: peer sessions leave a durable result on the blackboard — a
 /// `result.md` beside the brief, overwritten on every turn terminal (latest
 /// state). Files, not connection state: `/gather`, the future mailbox, and
@@ -15167,47 +15255,6 @@ mod peer_awaiting_wake_tests {
 /// aborts the agent task before it can report usage (and this path has no
 /// shared token tracker to read post-abort), so it still threads 0 and never
 /// reaches this writer — tracked as a follow-up.
-/// Outer-loop #4 (docs/build-cache-pool.md §4.2): safety-net release of a
-/// peer's held build-cache slot from the paths a turn does NOT end at the
-/// normal terminal — client interrupt (`try_emit_terminal` Interrupted arm),
-/// `peer_close` retiring a peer with a turn in flight, and connection-close
-/// session eviction. All are idempotent: the registry `take` returns `None`
-/// once the turn terminal (the primary, §4.1) has already released.
-/// `outcome` differs per site (Cancelled / Retired) purely for the release
-/// log; release behavior is identical (§3.4).
-fn release_peer_build_cache_slot(
-    peers_root: Option<&std::path::Path>,
-    session_id: &SessionKey,
-    outcome: crate::build_cache::pool::SlotOutcome,
-) {
-    let Some(slug) = session_id
-        .topic()
-        .and_then(|topic| topic.strip_prefix("peer-"))
-    else {
-        return;
-    };
-    if let Some(peers_root) = peers_root {
-        let key = build_cache_slot_registry_key(peers_root, slug);
-        build_cache_slot_registry().release(&key, outcome);
-    } else {
-        build_cache_slot_registry().release_for_slug(slug, outcome);
-    }
-}
-
-/// Interrupted-terminal variant (§4.2 row 2): both interrupt origins —
-/// `turn/interrupt` from the client and the `peer_close` abort — land in the
-/// same `TerminalReason::Interrupted` arm, so one hook covers both.
-fn release_peer_build_cache_slot_interrupted(
-    peers_root: Option<&std::path::Path>,
-    session_id: &SessionKey,
-) {
-    release_peer_build_cache_slot(
-        peers_root,
-        session_id,
-        crate::build_cache::pool::SlotOutcome::Cancelled,
-    );
-}
-
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
@@ -15366,26 +15413,6 @@ fn write_peer_result_if_peer_session(
     // it committed exists. Best-effort and idempotent: the fetch is a forced
     // refspec, so re-running it per turn simply fast-forwards.
     collect_peer_branch(&peer_dir, slug);
-
-    // Outer-loop #4 (docs/build-cache-pool.md §4.1): THE primary slot
-    // release. "result.md written + branch collected" is this turn's
-    // terminal semantics, so the slot's ONE-TURN lifecycle ends here —
-    // NOT on peer close (a finished peer is typically never closed; with
-    // peer_slots=2 a close-only release deadlocks the third peer).
-    // Release is idempotent (`pool::release` no-ops without holder.json),
-    // so the close/interrupt/evict safety nets may fire afterwards.
-    // Outcome mapping per §4.1: Completed → Completed; Errored /
-    // RateLimited → Failed (an INTERRUPTED turn never reaches this writer
-    // — it releases at the interrupted terminal instead).
-    let slot_key = build_cache_slot_registry_key(&runtime.data_dir.join("peers"), slug);
-        let outcome = match outcome {
-            TurnTerminalOutcome::Completed => crate::build_cache::pool::SlotOutcome::Completed,
-            TurnTerminalOutcome::Errored | TurnTerminalOutcome::RateLimited => {
-                crate::build_cache::pool::SlotOutcome::Failed
-            }
-            TurnTerminalOutcome::Interrupted => crate::build_cache::pool::SlotOutcome::Cancelled,
-        };
-        build_cache_slot_registry().release(&slot_key, outcome);
 
     // Peer-agent-based goal: if this peer was staged under a goal context
     // (the `goal` file the master wrote at handoff), persist this turn's
@@ -21695,7 +21722,7 @@ async fn handle_review_start(
                 ActiveTurn {
                     turn_id: turn_id.clone(),
                     profile_id: profile_for_stamp.clone(),
-                    state: turn_state,
+                    state: turn_state.clone(),
                     interrupt_tx,
                     // Review turns are non-steerable (codex
                     // `ActiveTurnNotSteerable` for the Review turn kind).
@@ -21716,10 +21743,13 @@ async fn handle_review_start(
         return;
     }
 
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        ConnectionTurn {
+            turn_id: turn_id.clone(),
+            state: turn_state.clone(),
+        },
+    );
     if send_rpc_result(
         ws,
         id,
@@ -22280,7 +22310,21 @@ async fn handle_turn_start_with_accept(
                     .active_goal_id(&session_id, &goal_profile)
                     .map(|goal_id| (goal_profile, goal_id))
             });
+    let cache_reservation = match reserve_peer_build_cache_turn(
+        state,
+        &session_id,
+        &turn_id,
+        &turn_state,
+        resolved_profile_id.as_deref(),
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return false;
+        }
+    };
     let handle = tokio::spawn(async move {
+        let _cache_reservation = cache_reservation;
         if start_rx.await.is_err() {
             return;
         }
@@ -22376,10 +22420,13 @@ async fn handle_turn_start_with_accept(
         return false;
     }
 
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        ConnectionTurn {
+            turn_id: turn_id.clone(),
+            state: turn_state.clone(),
+        },
+    );
     // Lifecycle reply: if the client cannot receive the accept, abort the
     // freshly-inserted turn — running an unaccepted turn would be a leak.
     if send_rpc_result(ws, id, accept_result).is_err() {
@@ -22387,16 +22434,15 @@ async fn handle_turn_start_with_accept(
         let mut active = active_turns.lock().await;
         if active
             .get(&session_id)
-            .is_some_and(|entry| entry.turn_id == turn_id)
+            .is_some_and(|entry| entry.turn_id == turn_id && Arc::ptr_eq(&entry.state, &turn_state))
         {
             active.remove(&session_id);
         }
         drop(active);
         let mut connection = connection_turns.lock().await;
-        if connection
-            .get(&session_id)
-            .is_some_and(|registered| *registered == turn_id)
-        {
+        if connection.get(&session_id).is_some_and(|registered| {
+            registered.turn_id == turn_id && Arc::ptr_eq(&registered.state, &turn_state)
+        }) {
             connection.remove(&session_id);
         }
         return false;
@@ -22888,7 +22934,21 @@ async fn maybe_spawn_appui_master_continuation_runner(
             if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
                 || kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
     );
+    let cache_reservation = match reserve_peer_build_cache_turn(
+        state,
+        &session_id,
+        &turn_id,
+        &turn_state,
+        routed_profile_id.as_deref(),
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            tracing::warn!(%error.message, "build-cache continuation admission refused");
+            return false;
+        }
+    };
     let handle = tokio::spawn(async move {
+        let _cache_reservation = cache_reservation;
         if start_rx.await.is_err() {
             return;
         }
@@ -23042,7 +23102,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         ActiveTurn {
             turn_id: turn_id.clone(),
             profile_id: profile_id.clone(),
-            state: turn_state,
+            state: turn_state.clone(),
             interrupt_tx,
             steer: Some(steer_buffer),
             abort: handle.abort_handle(),
@@ -23050,10 +23110,13 @@ async fn maybe_spawn_appui_master_continuation_runner(
     );
     drop(active);
 
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id, turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id,
+        ConnectionTurn {
+            turn_id: turn_id.clone(),
+            state: turn_state.clone(),
+        },
+    );
     let _ = start_tx.send(());
     true
 }
@@ -23523,9 +23586,9 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                 if !conns.is_empty() {
                     let mut active = active_turns.lock().await;
                     let mut finished: Vec<SessionKey> = Vec::new();
-                    for (session, turn_id) in conns.iter() {
+                    for (session, registered) in conns.iter() {
                         match active.get(session) {
-                            Some(existing) if existing.turn_id == *turn_id => {
+                            Some(existing) if registered.matches(existing) => {
                                 if matches!(&*existing.state.lock().await, TurnState::Terminal(_)) {
                                     finished.push(session.clone());
                                 }
@@ -23537,7 +23600,10 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
                     }
                     for session in finished {
                         if let Some(existing) = active.get(&session) {
-                            if conns.get(&session) == Some(&existing.turn_id) {
+                            if conns
+                                .get(&session)
+                                .is_some_and(|registered| registered.matches(existing))
+                            {
                                 active.remove(&session);
                             }
                         }
@@ -34360,19 +34426,14 @@ async fn run_standalone_turn(
             // (or ADOPT) this turn's build-cache slot. Slot lifecycle is ONE
             // TURN: boot acquires, the turn terminal releases.
             //
-            // ADOPT rule (§4.1/D2): on the FIRST turn the slot was already
-            // acquired by `stage_peer` IN THIS PROCESS, and an flock belongs
-            // to the open file description — a fresh `acquire` here would
-            // EWOULDBLOCK against ourselves and grab a SECOND slot (a 2-slot
-            // pool double-held by one peer). So when the registry holds a
-            // slot for this peer we take it over as-is; only when it does
-            // NOT (turn 2+, or a cross-process staging edge) do we acquire
-            // fresh, overwriting the `peers/<slug>/build-cache` record.
-            let slot_key = build_cache_slot_registry_key(&peers_root, slug);
-            let held_slot = match build_cache_peer::slot_for_turn(
+            // The registry keeps the original lock and usage tracker during
+            // adoption. An Active claim owned by another session/turn is
+            // rejected before eligibility cleanup or any new allocation.
+            let held_slot = match build_cache_peer::slot_for_owned_turn(
                 &peers_root,
                 &session_runtime.workspace_root,
                 slug,
+                &build_cache_turn_owner(&session_id, &turn_id, &turn_state),
             ) {
                 Ok(slot) => slot,
                 Err(error) => {
@@ -34395,15 +34456,10 @@ async fn run_standalone_turn(
                     return;
                 }
             };
-            if let Some(slot) = held_slot.as_ref() {
-                request_agent = request_agent.with_build_cache_slot(slot.path.clone());
-            }
-            // Re-park the handle for the turn terminal to release: the agent
-            // itself only carries the PATH (for env injection); the fd stays
-            // here, where the terminal path can reach it.
             if let Some(slot) = held_slot {
-                let usage = build_cache_slot_registry().park_with_usage(slot_key.clone(), slot);
-                request_agent = request_agent.with_build_cache_usage(usage);
+                request_agent = request_agent
+                    .with_build_cache_slot(slot.path)
+                    .with_build_cache_usage(slot.usage);
             }
         }
     }
@@ -37644,6 +37700,8 @@ async fn try_emit_terminal(
             release_peer_build_cache_slot(
                 peers_root,
                 session_id,
+                turn_id,
+                turn_state,
                 crate::build_cache::pool::SlotOutcome::Failed,
             );
             let (code, message) = error_payload.unwrap_or(("runtime_error", "turn failed"));
@@ -37667,7 +37725,13 @@ async fn try_emit_terminal(
             // restart — with peer_slots=2, two interrupts pool-exhaust the
             // fleet. Idempotent: a turn that already released at its terminal
             // finds no registry entry.
-            release_peer_build_cache_slot_interrupted(peers_root, session_id);
+            release_peer_build_cache_slot(
+                peers_root,
+                session_id,
+                turn_id,
+                turn_state,
+                crate::build_cache::pool::SlotOutcome::Cancelled,
+            );
         }
     }
 
@@ -38632,12 +38696,20 @@ async fn abort_connection_turns(
     }
 
     let mut active = active_turns.lock().await;
-    for (session_id, turn_id) in turns {
+    for (session_id, registered) in turns {
+        let turn_id = registered.turn_id.clone();
+        // Reused client IDs do not confer ownership of a newer dispatch.
+        if active
+            .get(&session_id)
+            .is_some_and(|current| !registered.matches(current))
+        {
+            continue;
+        }
         let mut aborted_state: Option<Arc<TokioMutex<TurnState>>> = None;
         let mut aborted_steer: Option<octos_agent::SharedSteerBuffer> = None;
         let should_abort = active
             .get(&session_id)
-            .is_some_and(|active| active.turn_id == turn_id);
+            .is_some_and(|active| registered.matches(active));
         if should_abort {
             if let Some(active) = active.remove(&session_id) {
                 aborted_state = Some(active.state.clone());
@@ -38645,6 +38717,13 @@ async fn abort_connection_turns(
                 active.abort.abort();
             }
         }
+        release_peer_build_cache_slot(
+            None,
+            &session_id,
+            &turn_id,
+            &registered.state,
+            crate::build_cache::pool::SlotOutcome::Cancelled,
+        );
         // #920.1: append a durable terminal event so reconnect-replay
         // sees this turn end. Without this the in-flight turn vanishes
         // from the live registry but no `turn/error` lands, so clients
@@ -40153,7 +40232,7 @@ async fn transition_to_terminal_settling_steers(
         TerminalReason::Errored => crate::build_cache::pool::SlotOutcome::Failed,
         TerminalReason::Interrupted => crate::build_cache::pool::SlotOutcome::Cancelled,
     };
-    release_peer_build_cache_slot(None, session_id, outcome);
+    release_peer_build_cache_slot(None, session_id, turn_id, turn_state, outcome);
     if let Some(buffer) = steer_buffer {
         settle_leftover_steers(
             buffer,
