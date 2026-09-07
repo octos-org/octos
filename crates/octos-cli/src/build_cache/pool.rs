@@ -111,6 +111,9 @@ pub struct HolderMeta {
     /// Unix seconds at acquire; lets a human audit a suspected pid-reuse
     /// resurrection (§3.5 residual risk).
     pub acquired_at: u64,
+    /// Fresh identity for this acquisition, including repeated claims by one pid.
+    #[serde(default)]
+    pub claim_token: String,
 }
 
 /// Namespace tag mirrored into holder metadata.
@@ -183,6 +186,7 @@ pub struct Slot {
     pub target_dir: PathBuf,
     /// Which namespace this slot belongs to.
     pub kind: SlotKind,
+    pub claim_token: String,
     /// The held lock file, wrapped so [`release`] can drop it explicitly
     /// while the `Slot` handle stays with the caller (the close-path
     /// safety net may call `release` again). Held for the lifetime of
@@ -656,6 +660,7 @@ pub fn acquire(
                     task_id: holder.task_id.clone(),
                     purpose_note: holder.purpose_note.clone(),
                     acquired_at: now,
+                    claim_token: uuid::Uuid::new_v4().to_string(),
                 };
                 let json = serde_json::to_string(&meta).map_err(|e| {
                     BuildCacheError::io("failed to serialize holder.json", e.into())
@@ -677,6 +682,7 @@ pub fn acquire(
                     target_dir,
                     kind,
                     lock: Some(lock),
+                    claim_token: meta.claim_token,
                 });
             }
             Err(_) => continue, // held by someone else: next candidate
@@ -698,13 +704,27 @@ pub fn acquire(
     }
 }
 
+/// Result of an identity-checked release; no-op cases preserve all metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseDisposition {
+    Released,
+    AlreadyReleased,
+    ClaimMismatch,
+}
+
 /// Release a slot (§3.4): remove `holder.json`, stamp `last_used = now`,
 /// drop the lock fd (the kernel releases the flock). Idempotent — a slot
 /// already missing `holder.json` is a no-op, because the turn-terminal
 /// main release and the close/evict safety-net release may both fire.
 /// The `target/` contents are NEVER deleted (I2: the whole point of the
 /// pool is that the next peer of this repository reuses them).
-pub fn release(slot: &mut Slot, outcome: SlotOutcome) -> Result<(), BuildCacheError> {
+pub fn release(
+    slot: &mut Slot,
+    outcome: SlotOutcome,
+) -> Result<ReleaseDisposition, BuildCacheError> {
+    if slot.lock.is_none() {
+        return Ok(ReleaseDisposition::AlreadyReleased);
+    }
     // §3.4 order: remove holder.json and stamp last_used WHILE still holding
     // the flock, and drop the lock fd last. Doing it the other way round
     // opens a window where another process acquires this slot and writes its
@@ -712,9 +732,9 @@ pub fn release(slot: &mut Slot, outcome: SlotOutcome) -> Result<(), BuildCacheEr
     // the new holder. Holding the lock across both writes closes that race:
     // die before them and §3.5 clears the dead-pid metadata; die after them
     // and the flock vanishes with the process leaving a clean ownerless slot.
-    release_at_path(&slot.path, outcome, slot.kind)?;
+    let disposition = release_claim(&slot.path, &slot.claim_token, outcome, slot.kind)?;
     slot.lock = None;
-    Ok(())
+    Ok(disposition)
 }
 
 /// Acquire a VERIFY-namespace slot on behalf of a caller that outlives
@@ -758,6 +778,7 @@ pub fn acquire_detached(
     let detached = DetachedSlot {
         path: slot.path.clone(),
         target_dir: slot.target_dir.clone(),
+        claim_token: slot.claim_token.clone(),
     };
     // Drop the flock ON PURPOSE, right here — the defining property of the
     // detached (#6) model: from this line on, the slot's held-state is
@@ -781,10 +802,12 @@ pub struct DetachedSlot {
     pub path: PathBuf,
     /// The `CARGO_TARGET_DIR` value (`<slot>/target`).
     pub target_dir: PathBuf,
+    /// Pass this exact identity to `release_detached` or `--token`.
+    pub claim_token: String,
 }
 
 /// Release a slot by its slot DIR path, from a process that is NOT the
-/// one that acquired it (#6's `octos cache release --slot <path>`).
+/// one that acquired it (`octos cache release --slot <path> --token <token>`).
 ///
 /// Truth model (§3.5 arm 2, the cross-process half — see the long comment
 /// on [`leak_for_detached_holder`]): between the acquire CLI exiting and
@@ -802,8 +825,9 @@ pub struct DetachedSlot {
 pub fn release_detached(
     pool_root: &Path,
     slot_dir: &Path,
+    claim_token: &str,
     outcome: SlotOutcome,
-) -> Result<(), BuildCacheError> {
+) -> Result<ReleaseDisposition, BuildCacheError> {
     // Guard: refuse to touch anything that is not a slot dir under THIS
     // pool root. `remove_dir_all` and the holder bookkeeping below operate
     // on caller-supplied paths, so the boundary is enforced first, before
@@ -861,14 +885,32 @@ pub fn release_detached(
                 slot: slot_dir.to_path_buf(),
             });
         }
-        return Ok(());
+        return Ok(ReleaseDisposition::AlreadyReleased);
     }
     // Lock held for the duration of the release (same ordering argument as
     // `release`: metadata is cleared while holding, so a racing acquirer
     // can never observe a half-released slot; the lock fd drops at return).
     let kind = SlotKind::from_slot_dir_name(&canonical_slot);
-    release_at_path(&canonical_slot, outcome, kind)?;
-    Ok(())
+    release_claim(&canonical_slot, claim_token, outcome, kind)
+}
+
+/// Compare identity under the caller's flock before changing metadata.
+fn release_claim(
+    slot_dir: &Path,
+    claim_token: &str,
+    outcome: SlotOutcome,
+    kind: SlotKind,
+) -> Result<ReleaseDisposition, BuildCacheError> {
+    if !slot_dir.join(HOLDER_LEAF).exists() {
+        return Ok(ReleaseDisposition::AlreadyReleased);
+    }
+    if claim_token.is_empty()
+        || read_holder(slot_dir).is_none_or(|meta| meta.claim_token != claim_token)
+    {
+        return Ok(ReleaseDisposition::ClaimMismatch);
+    }
+    release_at_path(slot_dir, outcome, kind)?;
+    Ok(ReleaseDisposition::Released)
 }
 
 /// Path-level release used by both [`release`] and `reclaim_stale`'s
@@ -908,6 +950,11 @@ fn release_at_path(
 /// the design allows — a holder that wants to explicitly mark activity
 /// (e.g. a long-lived verify slot ahead of a GC run).
 pub fn touch(slot: &Slot) -> Result<(), BuildCacheError> {
+    if slot.lock.is_none()
+        || read_holder(&slot.path).is_none_or(|meta| meta.claim_token != slot.claim_token)
+    {
+        return Ok(());
+    }
     write_last_used(&slot.path, now_secs()).map_err(|e| {
         BuildCacheError::io(
             format!(
@@ -1261,6 +1308,59 @@ mod tests {
     }
 
     #[test]
+    fn old_slot_release_preserves_new_claim_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let mut old = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        release(&mut old, SlotOutcome::Completed).unwrap();
+        let new = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        assert_eq!(old.path, new.path);
+        write_last_used(&new.path, 123).unwrap();
+        let metadata = fs::read(new.path.join(HOLDER_LEAF)).unwrap();
+        assert_eq!(
+            release(&mut old, SlotOutcome::Completed).unwrap(),
+            ReleaseDisposition::AlreadyReleased
+        );
+        assert_eq!(fs::read(new.path.join(HOLDER_LEAF)).unwrap(), metadata);
+        assert_eq!(read_last_used(&new.path), 123);
+        touch(&old).unwrap();
+        assert_eq!(read_last_used(&new.path), 123);
+    }
+
+    #[test]
+    fn old_detached_release_preserves_new_claim_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let old = acquire_detached(&root, &key(&tmp), &config(), &HolderInfo::default()).unwrap();
+        release_detached(&root, &old.path, &old.claim_token, SlotOutcome::Completed).unwrap();
+        let new = acquire_detached(&root, &key(&tmp), &config(), &HolderInfo::default()).unwrap();
+        assert_eq!(old.path, new.path);
+        write_last_used(&new.path, 123).unwrap();
+        let metadata = fs::read(new.path.join(HOLDER_LEAF)).unwrap();
+        assert_ne!(old.claim_token, new.claim_token);
+        assert_eq!(
+            release_detached(&root, &old.path, &old.claim_token, SlotOutcome::Completed).unwrap(),
+            ReleaseDisposition::ClaimMismatch
+        );
+        assert_eq!(fs::read(new.path.join(HOLDER_LEAF)).unwrap(), metadata);
+        assert_eq!(read_last_used(&new.path), 123);
+    }
+
+    #[test]
     fn namespaces_do_not_share_slots() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("pool");
@@ -1403,6 +1503,7 @@ mod tests {
             task_id: None,
             purpose_note: None,
             acquired_at: 1,
+            claim_token: String::new(),
         };
         write_file_atomic(&dir, HOLDER_LEAF, &serde_json::to_string(&meta).unwrap()).unwrap();
         // Age it past the window by backdating last_used.
@@ -1711,6 +1812,7 @@ mod tests {
             task_id: None,
             purpose_note: None,
             acquired_at: 1,
+            claim_token: String::new(),
         };
         write_file_atomic(&dir, HOLDER_LEAF, &serde_json::to_string(&meta).unwrap()).unwrap();
         write_last_used(&dir, 0).unwrap(); // maximally stale
@@ -1838,6 +1940,7 @@ mod tests {
             task_id: None,
             purpose_note: None,
             acquired_at: 1,
+            claim_token: String::new(),
         };
         write_file_atomic(&dir, HOLDER_LEAF, &serde_json::to_string(&meta).unwrap()).unwrap();
         // chmod 000: unreadable to everyone (root sees through it; the

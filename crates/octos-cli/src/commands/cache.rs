@@ -103,6 +103,9 @@ enum CacheAction {
         /// The slot directory exactly as printed by `acquire`.
         #[arg(long, value_name = "DIR")]
         slot: PathBuf,
+        /// Acquisition identity printed in the RELEASE command.
+        #[arg(long, value_name = "TOKEN")]
+        token: String,
     },
 }
 
@@ -130,7 +133,10 @@ impl Executable for CacheCommand {
                 ref pid,
                 ..
             }) => self.run_acquire(json, repo, note.clone(), *pid),
-            Some(CacheAction::Release { ref slot }) => self.run_release(slot),
+            Some(CacheAction::Release {
+                ref slot,
+                ref token,
+            }) => self.run_release(slot, token),
             // Bare `octos cache`: same "no wizard" posture as `octos config`
             // — print a read-only overview pointing at the subcommands.
             None => {
@@ -399,7 +405,7 @@ impl CacheCommand {
     /// ```text
     /// SLOT <slot dir>
     /// TARGET <slot dir>/target
-    /// RELEASE octos cache release --slot <slot dir>
+    /// RELEASE octos cache release --slot <slot dir> --token <claim token>
     /// ```
     ///
     /// with `--json` carrying the same three fields under those names.
@@ -440,7 +446,7 @@ impl CacheCommand {
         let slot = pool::acquire_detached(&pool_root, &repo_key, &config, &holder)
             .wrap_err("acquire: could not allocate a verify slot")?;
 
-        let release_cmd = format!("octos cache release --slot {}", shell_quoted(&slot.path));
+        let release_cmd = release_command(&slot);
         if json {
             let payload = AcquireJson {
                 slot: &slot.path,
@@ -470,11 +476,16 @@ impl CacheCommand {
     /// `octos cache release --slot <dir>` — idempotent (outcome
     /// `Completed`), refuses paths outside the pool root or missing the
     /// slot's `.lock` (see `pool::release_detached`).
-    fn run_release(&self, slot: &Path) -> Result<()> {
+    fn run_release(&self, slot: &Path, token: &str) -> Result<()> {
         let pool_root = self.pool_root()?;
-        match pool::release_detached(pool_root.as_path(), slot, SlotOutcome::Completed) {
-            Ok(()) => {
-                println!("released {}", slot.display());
+        match pool::release_detached(pool_root.as_path(), slot, token, SlotOutcome::Completed) {
+            Ok(disposition) => {
+                let label = match disposition {
+                    pool::ReleaseDisposition::Released => "released",
+                    pool::ReleaseDisposition::AlreadyReleased => "already released",
+                    pool::ReleaseDisposition::ClaimMismatch => "claim mismatch; unchanged",
+                };
+                println!("{label} {}", slot.display());
                 Ok(())
             }
             Err(BuildCacheError::SlotNotFound { .. }) => {
@@ -494,6 +505,14 @@ impl CacheCommand {
                 .wrap_err_with(|| format!("release: could not release {}", slot.display())),
         }
     }
+}
+
+fn release_command(slot: &pool::DetachedSlot) -> String {
+    format!(
+        "octos cache release --slot {} --token {}",
+        shell_quoted(&slot.path),
+        slot.claim_token
+    )
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -1206,6 +1225,7 @@ mod tests {
             task_id: None,
             purpose_note: None,
             acquired_at: 1,
+            claim_token: String::new(),
         };
         assert_eq!(render_holder(&meta), "peer-a (pid 42, goal goal_1)");
         let verify = HolderMeta {
@@ -1272,10 +1292,10 @@ mod tests {
         // Render exactly what run_acquire prints (same fns, no colors on
         // the three contract lines).
         let stdout = format!(
-            "SLOT {}\nTARGET {}\nRELEASE octos cache release --slot {}\n",
+            "SLOT {}\nTARGET {}\nRELEASE {}\n",
             slot.path.display(),
             slot.target_dir.display(),
-            shell_quoted(&slot.path)
+            release_command(&slot)
         );
         let (slot_out, target_out, release_out) =
             parse_acquire_output(&stdout).expect("the three contract lines must parse in order");
@@ -1283,7 +1303,11 @@ mod tests {
         assert_eq!(target_out, slot.path.join("target"));
         assert_eq!(
             release_out,
-            format!("octos cache release --slot {}", shell_quoted(&slot.path))
+            format!(
+                "octos cache release --slot {} --token {}",
+                shell_quoted(&slot.path),
+                slot.claim_token
+            )
         );
         // Degenerate output must not half-parse.
         assert!(parse_acquire_output("SLOT /a\nTARGET /b\n").is_none());
@@ -1313,7 +1337,13 @@ mod tests {
             pool::acquire_detached(&pool_root, &key, &config(), &holder),
             Err(BuildCacheError::PoolExhausted { .. })
         ));
-        pool::release_detached(&pool_root, &first.path, SlotOutcome::Completed).unwrap();
+        pool::release_detached(
+            &pool_root,
+            &first.path,
+            &first.claim_token,
+            SlotOutcome::Completed,
+        )
+        .unwrap();
         assert!(pool::read_holder(&first.path).is_none(), "holder cleared");
         let second = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
         assert_eq!(second.path, first.path, "released slot is reusable");
@@ -1332,13 +1362,30 @@ mod tests {
             ..HolderInfo::default()
         };
         let slot = pool::acquire_detached(&pool_root, &key, &config(), &holder).unwrap();
-        pool::release_detached(&pool_root, &slot.path, SlotOutcome::Completed).unwrap();
+        pool::release_detached(
+            &pool_root,
+            &slot.path,
+            &slot.claim_token,
+            SlotOutcome::Completed,
+        )
+        .unwrap();
         // Second release: no holder.json left ⇒ no-op Ok, never an error —
         // the outer loop may run its cleanup unconditionally.
-        pool::release_detached(&pool_root, &slot.path, SlotOutcome::Completed)
-            .expect("double release is a no-op");
+        pool::release_detached(
+            &pool_root,
+            &slot.path,
+            &slot.claim_token,
+            SlotOutcome::Completed,
+        )
+        .expect("double release is a no-op");
         // And a third after the last_used stamp: still fine.
-        pool::release_detached(&pool_root, &slot.path, SlotOutcome::Completed).unwrap();
+        pool::release_detached(
+            &pool_root,
+            &slot.path,
+            &slot.claim_token,
+            SlotOutcome::Completed,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1350,14 +1397,24 @@ mod tests {
         let not_a_slot = pool_root.join("0123456789ab/verify-7");
         std::fs::create_dir_all(&not_a_slot).unwrap();
         assert!(matches!(
-            pool::release_detached(&pool_root, &not_a_slot, SlotOutcome::Completed),
+            pool::release_detached(
+                &pool_root,
+                &not_a_slot,
+                "unused-token",
+                SlotOutcome::Completed
+            ),
             Err(BuildCacheError::SlotNotFound { .. })
         ));
 
         // Outside the pool root entirely (including via a plausible path).
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(matches!(
-            pool::release_detached(&pool_root, elsewhere.path(), SlotOutcome::Completed),
+            pool::release_detached(
+                &pool_root,
+                elsewhere.path(),
+                "unused-token",
+                SlotOutcome::Completed
+            ),
             Err(BuildCacheError::SlotOutsidePool { .. })
         ));
 
@@ -1366,7 +1423,7 @@ mod tests {
         // meaning ("this is not a slot"), just detected one step earlier.
         let ghost = pool_root.join("0123456789ab/verify-99");
         assert!(matches!(
-            pool::release_detached(&pool_root, &ghost, SlotOutcome::Completed),
+            pool::release_detached(&pool_root, &ghost, "unused-token", SlotOutcome::Completed),
             Err(BuildCacheError::SlotNotFound { .. })
         ));
     }
@@ -1540,8 +1597,21 @@ mod tests {
             "release",
             "--slot",
             "/pool/0123456789ab/verify-1",
+            "--token",
+            "claim-identity",
         ])
-        .expect("`octos cache release --slot …` must parse");
+        .expect("`octos cache release --slot … --token …` must parse");
+        assert!(
+            crate::commands::Args::try_parse_from([
+                "octos",
+                "cache",
+                "release",
+                "--slot",
+                "/pool/0123456789ab/verify-1"
+            ])
+            .is_err(),
+            "release requires acquisition identity"
+        );
         // Peer namespace is NOT acquireable by hand (§1.3 namespaces).
         assert!(
             crate::commands::Args::try_parse_from([
