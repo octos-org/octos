@@ -999,8 +999,8 @@ pub fn stale_window_secs(hours: u64) -> Result<u64, BuildCacheError> {
 /// §6). For each slot:
 ///
 /// 1. try `flock(EX|NB)` — unavailable means a live holder, skip;
-/// 2. `holder.json` present → check pid liveness; dead → clear the
-///    metadata (then staleness applies), alive → skip;
+/// 2. `holder.json` present → check pid liveness; dead → clear metadata
+///    only when applying (then staleness applies), alive → skip;
 /// 3. no holder → compare `now - last_used` against the stale window
 ///    (missing `last_used` reads as 0, maximally stale);
 /// 4. past the window → `remove_dir_all(target)` when `policy.apply`.
@@ -1142,8 +1142,12 @@ fn reclaim_one(
         if !stale_holder {
             return Ok((ReclaimOutcome::Locked, 0, 0)); // holder alive
         }
-        let _ = fs::remove_file(&holder_path); // dead holder: clear metadata
-        holder_cleared = true;
+        if policy.apply {
+            fs::remove_file(&holder_path).map_err(|e| {
+                BuildCacheError::io(format!("failed to remove {}", holder_path.display()), e)
+            })?;
+            holder_cleared = true;
+        }
         // §3.5: a dead holder demotes the slot to ownerless, which then
         // goes through the SAME §6 staleness check below — it is not
         // automatically reclaimable (the cache contents may still be
@@ -1590,6 +1594,61 @@ mod tests {
     fn numeric_oversized_pid_is_conservatively_alive() {
         assert_eq!(pid_alive(u32::MAX), Some(false));
         assert_eq!(pid_alive(i32::MAX as u32 + 1), Some(false));
+    }
+
+    #[test]
+    fn report_only_preserves_dead_holder_and_all_slot_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let slot = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo {
+                pid_override: Some(spawn_dead_pid()),
+                ..HolderInfo::default()
+            },
+        )
+        .unwrap();
+        let dir = slot.path.clone();
+        fs::write(slot.target_dir.join("artifact"), b"cache").unwrap();
+        drop(slot);
+        for last_used in [0, now_secs()] {
+            write_last_used(&dir, last_used).unwrap();
+            let paths = [
+                dir.join(HOLDER_LEAF),
+                dir.join(LOCK_LEAF),
+                dir.join(LAST_USED_LEAF),
+                dir.join(TARGET_LEAF).join("artifact"),
+            ];
+            let before: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+            let reports = reclaim_stale(
+                &root,
+                &GcPolicy {
+                    stale_hours: 1,
+                    apply: false,
+                },
+                &config(),
+            )
+            .unwrap();
+            let after: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+            assert_eq!(before, after, "report-only preserves slot files");
+            let report = reports
+                .iter()
+                .find(|report| report.slot_path == dir)
+                .unwrap();
+            if last_used == 0 {
+                assert_eq!(report.outcome, ReclaimOutcome::Stale);
+                assert_eq!(report.would_free_bytes, 5);
+            } else {
+                assert_eq!(report.outcome, ReclaimOutcome::Fresh);
+            }
+            assert!(
+                reports.iter().all(|report| report.freed_bytes == 0
+                    && report.outcome != ReclaimOutcome::HolderCleared)
+            );
+        }
     }
 
     #[test]
