@@ -522,14 +522,18 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// floor the config layer enforces (D4) — a 0 window under `--apply` would
 /// reclaim every slot last touched, so it is rejected, not silently run.
 fn resolve_stale_hours(flag: Option<u64>, config_hours: u64) -> Result<u64> {
-    match flag {
-        Some(0) => Err(eyre::eyre!(
-            "`--stale-hours 0` is not allowed — the stale window must be at least 1 hour \
+    let hours = match flag {
+        Some(0) => {
+            return Err(eyre::eyre!(
+                "`--stale-hours 0` is not allowed — the stale window must be at least 1 hour \
              (same floor as `[build_cache] stale_hours`)"
-        )),
-        Some(hours) => Ok(hours),
-        None => Ok(config_hours.max(1)),
-    }
+            ));
+        }
+        Some(hours) => hours,
+        None => config_hours.max(1),
+    };
+    pool::stale_window_secs(hours)?;
+    Ok(hours)
 }
 
 /// `fs2::available_space` on the pool root, creating it first when missing
@@ -1214,6 +1218,14 @@ mod tests {
         assert_eq!(resolve_stale_hours(Some(24), 168).unwrap(), 24);
         assert_eq!(resolve_stale_hours(None, 168).unwrap(), 168);
         assert_eq!(resolve_stale_hours(None, 0).unwrap(), 1);
+        assert_eq!(
+            resolve_stale_hours(Some(pool::MAX_STALE_HOURS), 168).unwrap(),
+            pool::MAX_STALE_HOURS
+        );
+        for hours in [pool::MAX_STALE_HOURS + 1, u64::MAX] {
+            assert!(resolve_stale_hours(Some(hours), 168).is_err());
+            assert!(resolve_stale_hours(None, hours).is_err());
+        }
     }
 
     #[test]

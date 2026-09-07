@@ -55,6 +55,8 @@ pub const DEFAULT_MIN_FREE_GB: u64 = 50;
 /// 7 days matches cargo-gc.sh v1's staleness signal and keeps weekday-hot
 /// caches out of weekly maintenance).
 pub const DEFAULT_STALE_HOURS: u64 = 168;
+/// Maximum GC retention window: ten 365-day years.
+pub const MAX_STALE_HOURS: u64 = 10 * 365 * 24;
 
 /// Why a slot is being held. Chooses the namespace (§1.3): `Peer` takes
 /// `slot-1..=slot-peer_slots`, `Verify` takes `verify-1..=verify-verify_slots`.
@@ -201,6 +203,8 @@ pub struct Slot {
 /// instead of string-matching.
 #[derive(Debug)]
 pub enum BuildCacheError {
+    /// Invalid pool configuration or GC override.
+    InvalidConfig(String),
     /// Space gate refused the allocation (§5): `available_gb < min_gb`.
     /// `available_bytes` is the raw measured count — `gate --json` (#5)
     /// reports it directly instead of re-deriving precision from the
@@ -261,6 +265,9 @@ impl fmt::Display for BuildCacheError {
                 )
             }
             Self::Io { context, source } => write!(f, "{context}: {source}"),
+            Self::InvalidConfig(message) => {
+                write!(f, "invalid build-cache configuration: {message}")
+            }
             Self::SlotOutsidePool { slot, pool_root } => write!(
                 f,
                 "refusing to release {} — it is not under the build-cache pool root {}",
@@ -347,6 +354,9 @@ impl BuildCacheConfig {
         }
         if self.stale_hours < 1 {
             warnings.push("build_cache.stale_hours must be >= 1".to_string());
+        }
+        if let Err(error) = stale_window_secs(self.stale_hours) {
+            warnings.push(error.to_string());
         }
         warnings
     }
@@ -476,9 +486,11 @@ fn now_secs() -> u64 {
 fn pid_alive(pid: u32) -> Option<bool> {
     use rustix::io::Errno;
     use rustix::process::{Pid, test_kill_process};
-    let Some(pid) = Pid::from_raw(pid as i64 as i32) else {
-        // pid 0 or one that does not fit an i32 was not written by a live
-        // holder on this host; the kernel would reject it with EINVAL.
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        // Invalid metadata must never become a negative process/group id.
+        return Some(false);
+    };
+    let Some(pid) = Pid::from_raw(raw_pid) else {
         return None;
     };
     match test_kill_process(pid) {
@@ -969,6 +981,20 @@ pub fn touch(slot: &Slot) -> Result<(), BuildCacheError> {
     })
 }
 
+/// Validate the upper bound and convert hours without arithmetic overflow.
+/// A zero policy is retained for internal immediate-GC callers; the CLI
+/// independently enforces its one-hour minimum.
+pub fn stale_window_secs(hours: u64) -> Result<u64, BuildCacheError> {
+    hours
+        .checked_mul(3600)
+        .filter(|_| hours <= MAX_STALE_HOURS)
+        .ok_or_else(|| {
+            BuildCacheError::InvalidConfig(format!(
+                "stale_hours must be <= {MAX_STALE_HOURS} (ten years)"
+            ))
+        })
+}
+
 /// Walk every repo pool under `pool_root` and reclaim stale slots (§3.5 +
 /// §6). For each slot:
 ///
@@ -989,6 +1015,7 @@ pub fn reclaim_stale(
     policy: &GcPolicy,
     config: &BuildCacheConfig,
 ) -> Result<Vec<ReclaimReport>, BuildCacheError> {
+    stale_window_secs(policy.stale_hours)?;
     let mut reports = Vec::new();
     if is_symlink(pool_root) {
         return Ok(vec![skipped_report(pool_root.to_path_buf())]);
@@ -1129,7 +1156,7 @@ fn reclaim_one(
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
     let age_secs = now_secs().saturating_sub(last_used);
-    if age_secs <= policy.stale_hours * 3600 {
+    if age_secs <= stale_window_secs(policy.stale_hours)? {
         return Ok(if holder_cleared {
             (ReclaimOutcome::HolderCleared, 0, 0)
         } else {
@@ -1514,6 +1541,55 @@ mod tests {
     #[cfg(unix)]
     fn gc_skips_target_symlink_fixture() {
         gc_link_fixture("target");
+    }
+
+    #[test]
+    fn numeric_excessive_stale_window_is_a_configuration_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let mut slot = acquire(
+            &root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        release(&mut slot, SlotOutcome::Completed).unwrap();
+        for hours in [10 * 366 * 24 + 1, u64::MAX] {
+            let result = reclaim_stale(
+                &root,
+                &GcPolicy {
+                    stale_hours: hours,
+                    apply: false,
+                },
+                &config(),
+            );
+            assert!(
+                result.is_err(),
+                "invalid stale window {hours} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_excessive_stale_config_is_reported() {
+        let cfg = BuildCacheConfig {
+            stale_hours: u64::MAX,
+            ..config()
+        };
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|warning| warning.contains("stale_hours"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn numeric_oversized_pid_is_conservatively_alive() {
+        assert_eq!(pid_alive(u32::MAX), Some(false));
+        assert_eq!(pid_alive(i32::MAX as u32 + 1), Some(false));
     }
 
     #[test]
