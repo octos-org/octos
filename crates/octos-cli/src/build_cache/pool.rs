@@ -490,9 +490,7 @@ fn pid_alive(pid: u32) -> Option<bool> {
         // Invalid metadata must never become a negative process/group id.
         return Some(false);
     };
-    let Some(pid) = Pid::from_raw(raw_pid) else {
-        return None;
-    };
+    let pid = Pid::from_raw(raw_pid)?;
     match test_kill_process(pid) {
         Ok(()) => Some(true),
         Err(Errno::SRCH) => None,
