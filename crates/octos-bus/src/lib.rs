@@ -65,7 +65,7 @@ pub use resume_policy::{
 pub use session::{
     ActiveSessionStore, AnalysisFile, AnalysisSession, MessageCommitObserver, Session,
     SessionHandle, SessionListEntry, SessionManager, persist_message_through_canonical_path,
-    set_message_commit_observer, validate_topic_name,
+    set_message_commit_observer, set_scoped_message_commit_observer, validate_topic_name,
 };
 
 #[cfg(feature = "api")]

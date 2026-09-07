@@ -36,6 +36,7 @@ use crate::skills_scope::{
 /// Immutable inputs needed to rebuild only a profile's plugin-derived layer.
 /// Long-lived stores, providers, schedulers, and profile services are reused
 /// from the existing [`ProfileRuntime`].
+#[derive(Clone)]
 pub struct ProfilePluginReloadConfig {
     base_tools: Arc<ToolRegistry>,
     plugin_dirs: Vec<PathBuf>,
@@ -275,6 +276,12 @@ pub struct ProfileRuntime {
     /// session-scope bootstrap code don't have to re-derive it.
     pub data_dir: PathBuf,
 
+    /// Optional local-frontend transcript root. Ephemeral chat keeps profile
+    /// memory/tools rooted at `data_dir`, while session JSONL and context/task
+    /// sidecars use this temporary directory even with per-cwd storage enabled.
+    /// Ordinary Serve/Gateway/ACP runtimes leave this unset.
+    pub session_store_root: Option<PathBuf>,
+
     /// The profile's resolved [`crate::config::Config`] (as produced by
     /// `config_from_profile` at bootstrap, with host memory/plugins merged).
     /// Most runtime state is pre-extracted into the typed fields below; this
@@ -360,6 +367,12 @@ pub struct ProfileRuntime {
     /// honors the configured value instead of a hardcoded cap (which silently
     /// starved spawned sub-agents doing multi-step work).
     pub max_iterations: Option<u32>,
+
+    /// Local frontend overrides applied by the canonical session bootstrap.
+    /// OUP still owns per-turn intent, context, persistence and cancellation.
+    pub session_defaults: Option<octos_agent::AgentConfig>,
+    /// Optional operator-selected coding tool/agent profile (chat and ACP).
+    pub agent_profile: Option<Arc<octos_agent::profile::ProfileDefinition>>,
 
     /// Post-edit formatting opt-in (`config.format_after_edit`, issue
     /// #1774) that per-session agents inherit. When true, successful
@@ -655,6 +668,43 @@ async fn build_profile_plugin_layer(
 }
 
 impl ProfileRuntime {
+    /// Bind project plugins at session scope. Local adapters may open multiple
+    /// cwds on one profile; none may inherit another project's executables.
+    pub(crate) async fn for_workspace(self: &Arc<Self>, workspace: &Path) -> Result<Arc<Self>> {
+        if self.session_defaults.is_none() {
+            return Ok(self.clone());
+        }
+        let Some(reload) = &self.plugin_reload else {
+            return Ok(self.clone());
+        };
+        let mut dirs = Config::plugin_dirs_from_project(&workspace.join(".octos"));
+        if dirs.is_empty() {
+            return Ok(self.clone());
+        }
+        for dir in &reload.plugin_dirs {
+            if !dirs.contains(dir) {
+                dirs.push(dir.clone());
+            }
+        }
+        let mut reload = (**reload).clone();
+        reload.plugin_dirs = dirs;
+        self.rebuild_plugin_layer_using(&Arc::new(reload)).await
+    }
+
+    /// Reapply the effective envelope after cwd rebinding or dynamic tool
+    /// registration. A cloned registry must never resurrect excluded tools.
+    pub(crate) fn apply_tool_envelope(&self, tools: &mut ToolRegistry) {
+        if let Some(policy) = &self.tool_policy {
+            tools.apply_policy(policy);
+        }
+        if let Some(profile) = &self.agent_profile {
+            tools.filter_by_profile(&profile.tools);
+            if !profile.tools.allows("run_pipeline") {
+                tools.retain(|name| name != "run_pipeline");
+            }
+        }
+    }
+
     /// Rebuild plugin-derived tools, trusted actions, prompt fragments, and
     /// hooks while sharing all long-lived profile resources with `self`.
     pub async fn rebuild_plugin_layer(self: &Arc<Self>) -> Result<Arc<Self>> {
@@ -664,8 +714,20 @@ impl ProfileRuntime {
                 self.profile_id
             )
         })?;
+        self.rebuild_plugin_layer_using(reload).await
+    }
+
+    async fn rebuild_plugin_layer_using(
+        self: &Arc<Self>,
+        reload: &Arc<ProfilePluginReloadConfig>,
+    ) -> Result<Arc<Self>> {
         let (mut tools, plugin_result) =
             build_profile_plugin_layer(&self.profile_id, reload, true).await?;
+        let pipeline_factory = self.pipeline_factory.as_ref().map(|factory| {
+            factory
+                .with_plugin_dirs(reload.plugin_dirs.clone())
+                .unwrap_or_else(|| factory.clone())
+        });
 
         tools.register(octos_agent::RecallMemoryTool::new(
             self.memory_store.clone(),
@@ -677,7 +739,7 @@ impl ProfileRuntime {
         if self.memory_refresh_enabled {
             tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
         }
-        if let Some(ref factory) = self.pipeline_factory {
+        if let Some(ref factory) = pipeline_factory {
             tools.register_arc(factory.create(&self.default_sandbox));
             tools.mark_spawn_only(
                 "run_pipeline",
@@ -694,6 +756,7 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
 
+        self.apply_tool_envelope(&mut tools);
         let skills_loader = build_account_skills_loader(&self.data_dir)
             .with_skill_filter(reload.skill_filter.clone());
         let mut prompt_parts = build_system_prompt(
@@ -707,6 +770,13 @@ impl ProfileRuntime {
         for fragment in &plugin_result.prompt_fragments {
             prompt_parts.post_memory.push_str("\n\n");
             prompt_parts.post_memory.push_str(fragment);
+        }
+        if let Some(profile) = &self.agent_profile
+            && let Some(template) = &profile.system_prompt_template
+            && let Some(template) =
+                crate::commands::load_profile_prompt_template(&profile.name, template)
+        {
+            prompt_parts.pre_memory = template;
         }
         let system_prompt = prompt_parts.joined();
 
@@ -753,6 +823,7 @@ impl ProfileRuntime {
         Ok(Arc::new(Self {
             profile_id: self.profile_id.clone(),
             data_dir: self.data_dir.clone(),
+            session_store_root: self.session_store_root.clone(),
             config: self.config.clone(),
             llm: self.llm.clone(),
             goal_verifier_llm: self.goal_verifier_llm.clone(),
@@ -768,12 +839,14 @@ impl ProfileRuntime {
             tool_policy: self.tool_policy.clone(),
             default_sandbox: self.default_sandbox.clone(),
             max_iterations: self.max_iterations,
+            session_defaults: self.session_defaults.clone(),
+            agent_profile: self.agent_profile.clone(),
             format_after_edit: self.format_after_edit,
             snapshots: self.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
-            plugin_reload: self.plugin_reload.clone(),
+            plugin_reload: Some(reload.clone()),
             plugin_dirs: reload.plugin_dirs.clone(),
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
@@ -790,7 +863,7 @@ impl ProfileRuntime {
             tool_config: self.tool_config.clone(),
             cron_service: self.cron_service.clone(),
             runtime_lifecycle: self.runtime_lifecycle.clone(),
-            pipeline_factory: self.pipeline_factory.clone(),
+            pipeline_factory,
             hook_executor,
             lane_routing: self.lane_routing.clone(),
             voice: self.voice.clone(),
@@ -876,6 +949,27 @@ impl ProfileRuntime {
         // inherit the host budget.
         crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
+        Self::bootstrap_resolved(
+            profile, data_dir, octos_home, role, config, host_voice, false, None,
+        )
+        .await
+    }
+
+    /// Local OUP adapters use the same assembler with their already-resolved
+    /// CLI config. Do not round-trip this through ProfileConfig: doing so loses
+    /// custom endpoints, API styles and explicit CLI policy overrides.
+    /// A supplied provider is an embedding seam, not a second runtime path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bootstrap_resolved(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        config: Config,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        no_retry: bool,
+        provider_override: Option<Arc<dyn LlmProvider>>,
+    ) -> Result<Arc<Self>> {
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
         // else falls back to `detect_provider(model)`.
@@ -895,16 +989,18 @@ impl ProfileRuntime {
             })?;
 
         // Step 3: build the LLM provider chain.
-        let base_provider = chat::create_provider(&provider_name, &config, model, base_url)
-            .wrap_err_with(|| {
-                format!("failed to create LLM provider for profile '{}'", profile.id)
-            })?;
+        let base_provider = match provider_override {
+            Some(provider) => provider,
+            None => chat::create_provider(&provider_name, &config, model, base_url).wrap_err_with(
+                || format!("failed to create LLM provider for profile '{}'", profile.id),
+            )?,
+        };
         let primary_model_id = base_provider.model_id().to_string();
         let bundle = build_adaptive_provider_chain(
             base_provider,
             &config,
             data_dir,
-            false,
+            no_retry,
             ExporterMode::Spawn,
         );
         let llm = bundle.llm.clone();
@@ -1053,7 +1149,7 @@ impl ProfileRuntime {
         // one-shot migration warning on first detection.
         let plugin_work_dir = data_dir.join("skill-output");
         let _ = std::fs::create_dir_all(&plugin_work_dir);
-        let mut plugin_dirs: Vec<PathBuf> = Config::plugin_dirs_from_project(&effective_octos_home);
+        let mut plugin_dirs = Config::plugin_dirs_from_project(&effective_octos_home);
         let platform_dir = effective_octos_home.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
         if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
             plugin_dirs.push(platform_dir);
@@ -1179,6 +1275,7 @@ impl ProfileRuntime {
         let pipeline_factory: Option<
             Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
         > = {
+            #[derive(Clone)]
             struct AppUiPipelineToolFactory {
                 llm: Arc<dyn LlmProvider>,
                 memory: Arc<EpisodeStore>,
@@ -1201,6 +1298,16 @@ impl ProfileRuntime {
             }
 
             impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
+                fn with_plugin_dirs(
+                    &self,
+                    plugin_dirs: Vec<PathBuf>,
+                ) -> Option<Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>>
+                {
+                    let mut factory = self.clone();
+                    factory.plugin_dirs = plugin_dirs;
+                    Some(Arc::new(factory))
+                }
+
                 fn create(&self, sandbox: &SandboxConfig) -> Arc<dyn octos_agent::tools::Tool> {
                     let mut pt = octos_pipeline::RunPipelineTool::new(
                         self.llm.clone(),
@@ -1514,6 +1621,7 @@ impl ProfileRuntime {
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
+            session_store_root: None,
             // Retained whole for lazy per-lane provider resolution (e.g. a
             // peer running on a named `sub_provider` model lane); the typed
             // fields below carry the pre-extracted hot-path state.
@@ -1530,6 +1638,8 @@ impl ProfileRuntime {
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
             max_iterations: config.max_iterations,
+            session_defaults: None,
+            agent_profile: None,
             format_after_edit: config.format_after_edit,
             snapshots: config.snapshots.clone(),
             tool_specs: Arc::new(tools),

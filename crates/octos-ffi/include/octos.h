@@ -6,7 +6,8 @@
  *    Never use a handle after octos_runtime_free(); never free it twice or
  *    concurrently with any other call on the same handle. Free it from a plain
  *    (non-async) thread.
- *  - Strings returned by octos_run_task()/octos_embed() are owned by YOU and
+ *  - Strings returned by octos_run_task()/octos_embed() or
+ *    octos_take_last_partial_result() are owned by YOU and
  *    must be freed, UNMODIFIED, with octos_string_free() -- never free(3),
  *    never twice, and do not alter the bytes or NUL terminator before freeing.
  *  - const char* from octos_last_error()/octos_version() must NOT be freed.
@@ -61,6 +62,8 @@ void octos_runtime_free(OctosRuntime *runtime);
 // Run a one-shot task. `brief_json` is `{"prompt": "...", "max_iterations"?:
 // N}`. Returns owned JSON `{"output", "iterations", "tokens"}` that the caller
 // must free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
+// On an incomplete response, NULL still means failure; retrieve the partial
+// output separately with [`octos_take_last_partial_result`] on this thread.
 char *octos_run_task(OctosRuntime *runtime, const char *brief_json);
 
 // Embed `text`. Returns owned JSON `{"embedding": [f32, ...]}` that the caller
@@ -69,8 +72,8 @@ char *octos_run_task(OctosRuntime *runtime, const char *brief_json);
 // config.
 char *octos_embed(OctosRuntime *runtime, const char *text);
 
-// Free a string returned by [`octos_run_task`] / [`octos_embed`]. NULL is a
-// no-op.
+// Free a string returned by [`octos_run_task`], [`octos_embed`], or
+// [`octos_take_last_partial_result`]. NULL is a no-op.
 //
 // The string is owned by the caller and MUST be freed here, UNMODIFIED — do
 // not alter its bytes or NUL terminator before freeing. (This reclaims via
@@ -82,6 +85,18 @@ void octos_string_free(char *s);
 // Return the thread-local last-error string, or NULL if none. Do NOT free it;
 // valid only until the next FFI call on this thread.
 const char *octos_last_error(void);
+
+// Take this thread's last incomplete task result as owned JSON with the same
+// shape as [`octos_run_task`]. Returns NULL if absent or already taken. This
+// does not change the error diagnostic and does NOT turn the task into success.
+//
+// Consume once on the SAME thread, before another `octos_runtime_new`,
+// `octos_run_task`, or `octos_embed` call (success or failure clears it).
+// Any new error, including a caught panic, also clears it. Error/version
+// inspection and successful free calls leave it available. The caller must
+// free the returned allocation, UNMODIFIED, with [`octos_string_free`].
+// The payload is lossless model output, not a sanitized/600-byte diagnostic.
+char *octos_take_last_partial_result(void);
 
 // Return the crate version as a static NUL-terminated string (never freed).
 const char *octos_version(void);

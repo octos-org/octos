@@ -1441,6 +1441,21 @@ impl TaskSupervisor {
     /// supervisor itself stays alive) are NOT addressed here — that needs
     /// a heartbeat-based reaper, which is a follow-up if observed.
     pub fn enable_persistence(&self, path: impl Into<PathBuf>) -> std::io::Result<usize> {
+        self.enable_persistence_with_recovery(path, |_, _| {})
+    }
+
+    /// Restore host-owned logical lifetimes before the dead-worker sweep.
+    ///
+    /// The callback runs once, after replay/persistence are installed and with
+    /// no supervisor locks held. Hosts may reinstate a proven external
+    /// lifetime's liveness lease or settle an already-closed lifetime. Ordinary
+    /// workers and unproved lifetimes still pass through the normal orphan
+    /// transition; the post-sweep restore observers retain their ordering.
+    pub fn enable_persistence_with_recovery(
+        &self,
+        path: impl Into<PathBuf>,
+        recover: impl FnOnce(&Self, &[BackgroundTask]),
+    ) -> std::io::Result<usize> {
         let path = path.into();
         // Idempotence guard (#1906): already persisting to THIS ledger —
         // nothing new to restore and nothing stale to re-append.
@@ -1503,6 +1518,8 @@ impl TaskSupervisor {
         for task in snapshots {
             self.persist_snapshot(&task);
         }
+
+        recover(self, &self.get_all_tasks());
 
         // Sweep orphans: any task whose runtime_state is non-terminal at
         // this point has no live worker behind it (we are still in startup,

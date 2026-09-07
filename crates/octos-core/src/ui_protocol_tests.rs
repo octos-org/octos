@@ -532,7 +532,9 @@ fn session_open_result_includes_capabilities_field() {
         .as_array()
         .expect("supported_features array");
     for feature in UI_PROTOCOL_KNOWN_FEATURES {
-        if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2 {
+        if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
+            || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
+        {
             continue;
         }
         assert!(
@@ -548,6 +550,12 @@ fn session_open_result_includes_capabilities_field() {
             .any(|advertised| advertised == &json!(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)),
         "strictly opt-in v2 must not change the no-header SessionOpened wire"
     );
+    assert!(
+        !supported_features
+            .iter()
+            .any(|advertised| advertised == &json!(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)),
+        "strictly opt-in semantic cache diagnostics must not change the no-header SessionOpened wire"
+    );
 
     // Older payloads (e.g. ledger replays from before the field
     // existed) decode successfully because the field carries
@@ -561,6 +569,44 @@ fn session_open_result_includes_capabilities_field() {
         decoded.capabilities,
         UiProtocolCapabilities::first_server_slice()
     );
+}
+
+#[test]
+fn should_not_claim_semantic_cache_when_session_opened_carries_no_negotiated_capabilities() {
+    // UPCR-2026-029: `context.semantic_cache.v1` is advertised only after a
+    // client explicitly REQUESTS it. The no-header baseline
+    // (`first_server_slice`) doubles as the serde default for legacy
+    // `SessionOpened` payloads, so both must stay silent about it exactly
+    // like the opt-in `projection.envelope.v2`.
+    let baseline = UiProtocolCapabilities::first_server_slice();
+    assert!(
+        !baseline.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+        "the no-header baseline must not advertise the opt-in semantic cache diagnostics"
+    );
+    assert!(
+        baseline.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
+        "the parent lifecycle capability stays in the baseline"
+    );
+
+    let legacy = json!({ "session_id": "local:demo" });
+    let decoded: SessionOpened =
+        serde_json::from_value(legacy).expect("legacy SessionOpened decode");
+    assert!(
+        !decoded
+            .capabilities
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+        "a legacy payload without capabilities must not decode into a semantic-cache claim"
+    );
+
+    // The feature stays in the known registry and is still advertised once a
+    // client asks for it.
+    assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    let negotiated = UiProtocolCapabilities::for_negotiated_features([
+        UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+        UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+    ]);
+    assert!(negotiated.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    assert!(negotiated.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1));
 }
 
 #[test]
@@ -733,6 +779,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
     assert_eq!(
         UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
         "context.lifecycle.v1"
+    );
+    assert_eq!(
+        UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+        "context.semantic_cache.v1"
     );
     assert_eq!(
         UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
@@ -6762,6 +6812,7 @@ fn file_attached_topic_method_reads_explicit_field_then_session_suffix() {
         turn_id: TurnId::new(),
         path: "/tmp/deck.pptx".into(),
         tool_call_id: Some("tc-slides".into()),
+        attachment_owner: None,
         mime: None,
     });
     assert_eq!(with_field.topic(), Some("slides"));
@@ -6772,6 +6823,7 @@ fn file_attached_topic_method_reads_explicit_field_then_session_suffix() {
         turn_id: TurnId::new(),
         path: "/tmp/deck.pptx".into(),
         tool_call_id: None,
+        attachment_owner: None,
         mime: None,
     });
     assert_eq!(fallback.topic(), Some("slides"));
@@ -6887,6 +6939,7 @@ fn stamp_topic_from_session_populates_new_topic_class_events() {
         turn_id: TurnId::new(),
         path: "/tmp/deck.pptx".into(),
         tool_call_id: None,
+        attachment_owner: None,
         mime: None,
     });
     event.stamp_topic_from_session();
@@ -7305,4 +7358,38 @@ fn turn_steer_dropped_topic_routing_matches_other_turn_events() {
         .into_rpc_notification()
         .expect("serialize with explicit topic");
     assert_eq!(rpc.params["topic"], json!("explicit"));
+}
+
+#[test]
+fn context_state_semantic_cache_diagnostics_are_optional_and_backward_compatible() {
+    let legacy = json!({
+        "session_id": "local:demo",
+        "generation": 2,
+        "transcript_hash": "sha256:history",
+        "item_count": 3,
+        "token_estimate": 42,
+        "recovery_state": "exact"
+    });
+    let legacy_state: UiContextState = serde_json::from_value(legacy).unwrap();
+    assert!(legacy_state.cache_epoch_id.is_none());
+    assert!(legacy_state.semantic_head_id.is_none());
+
+    let current = UiContextState {
+        session_id: SessionKey("local:demo".into()),
+        thread_id: None,
+        generation: 3,
+        transcript_hash: "sha256:history".into(),
+        item_count: 4,
+        token_estimate: 64,
+        recovery_state: "exact".into(),
+        last_checkpoint_id: None,
+        last_compaction_id: None,
+        cache_epoch_id: Some("sha256:epoch".into()),
+        last_cache_invalidation_reason: Some("tool_schema_changed".into()),
+        semantic_head_id: Some("semblk_000004".into()),
+        semantic_head_kind: Some("tool_interaction".into()),
+    };
+    let encoded = serde_json::to_value(current).unwrap();
+    assert_eq!(encoded["cache_epoch_id"], "sha256:epoch");
+    assert_eq!(encoded["semantic_head_kind"], "tool_interaction");
 }

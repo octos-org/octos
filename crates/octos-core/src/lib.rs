@@ -14,6 +14,7 @@ mod error;
 pub mod gateway;
 pub mod git_worktree;
 mod message;
+pub mod secret_redaction;
 pub mod session_scope;
 mod task;
 mod types;

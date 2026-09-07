@@ -158,6 +158,9 @@ pub enum OctosError {
     /// No embedder is available (no model path configured, or built without the
     /// `embed-llama` feature).
     NoEmbedder,
+    /// Provider output was truncated. This remains a failure; partial output
+    /// and consumed usage are available separately from the short diagnostic.
+    Incomplete { partial: TaskResult },
 }
 
 impl std::fmt::Display for OctosError {
@@ -168,6 +171,7 @@ impl std::fmt::Display for OctosError {
             | OctosError::Run { msg }
             | OctosError::Embed { msg } => f.write_str(msg),
             OctosError::NoEmbedder => f.write_str("no embedder configured"),
+            OctosError::Incomplete { .. } => f.write_str(octos_ffi::INCOMPLETE_RESPONSE_MESSAGE),
         }
     }
 }
@@ -190,6 +194,9 @@ impl From<octos_ffi::CoreError> for OctosError {
             CoreError::Run(msg) => OctosError::Run { msg: redact(&msg) },
             CoreError::Embed(msg) => OctosError::Embed { msg: redact(&msg) },
             CoreError::NoEmbedder => OctosError::NoEmbedder,
+            CoreError::Incomplete { partial } => OctosError::Incomplete {
+                partial: partial.into(),
+            },
         }
     }
 }
@@ -373,6 +380,35 @@ mod tests {
         assert_eq!(mapped.tokens.reasoning, 3);
         assert_eq!(mapped.tokens.cache_read, 4);
         assert_eq!(mapped.tokens.cache_write, 5);
+    }
+
+    #[test]
+    fn incomplete_error_preserves_payload_without_sanitizing_it_as_a_diagnostic() {
+        let output = format!("  模型 partial\n{}", "actual output ".repeat(100));
+        let error = OctosError::from(octos_ffi::CoreError::Incomplete {
+            partial: octos_ffi::TaskResult {
+                output: output.clone(),
+                iterations: 2,
+                tokens: octos_ffi::TokenUsage {
+                    input: 18,
+                    output: 8,
+                    reasoning: 6,
+                    cache_read: 7,
+                    cache_write: 5,
+                },
+            },
+        });
+        assert!(!error.to_string().contains("模型"));
+        let OctosError::Incomplete { partial } = error else {
+            panic!("incomplete output must remain a structured error");
+        };
+        assert_eq!(partial.output, output);
+        assert_eq!(partial.iterations, 2);
+        assert_eq!(partial.tokens.input, 18);
+        assert_eq!(partial.tokens.output, 8);
+        assert_eq!(partial.tokens.reasoning, 6);
+        assert_eq!(partial.tokens.cache_read, 7);
+        assert_eq!(partial.tokens.cache_write, 5);
     }
 
     #[test]

@@ -1526,8 +1526,8 @@ impl Tool for GoalCreateTool {
         "Create a persistent goal for this session — ONLY when the user or system/developer \
          instructions explicitly ask for a goal; do NOT infer one from an ordinary task. Starts \
          a new active goal when none exists, or replaces the current goal only when it is \
-         already complete. Fails if an unfinished goal exists (complete or clear it first). Set \
-         token_budget only when an explicit token budget is requested."
+         terminal (already complete or archived). Fails if an unfinished goal exists (complete \
+         or clear it first). Set token_budget only when an explicit token budget is requested."
     }
 
     fn input_schema(&self) -> Value {

@@ -13,12 +13,15 @@ use tracing::{Instrument, info, info_span, warn};
 
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
 use super::budget::BudgetStop;
+use super::convergence::{
+    CheckpointReason, ConvergenceController, active_tokens, is_checkpoint_context,
+};
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState, attach_partial_usage};
 use super::verifier::{TurnLedger, ledger_entry_from_tool_result};
-use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
+use super::{Agent, AssistantSegmentProvenance, ConversationResponse, TASK_REPORTER, TokenTracker};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::write_event_to_sink;
 use crate::hooks::{HookEvent, HookPayload, HookResult};
@@ -44,6 +47,37 @@ const MAX_TOKENS_EMPTY_RECOVERY_PROMPT: &str = "Your previous response reached t
 /// instead of an empty success so the turn never silently dead-ends (#2174).
 const MAX_TOKENS_EMPTY_EXHAUSTED_MESSAGE: &str = "[The model repeatedly reached the output token limit without producing any text or tool call — a degenerate or looping generation. Try a stronger model, reduce the context size, or configure an anti-repetition sampler (a non-zero temperature or a repeat penalty).]";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
+
+/// Keep projection provenance beside the immutable output log, not in prompt
+/// messages: compaction, voice rewrites and skipped user rows cannot shift it.
+struct TurnOutputLog {
+    messages: Vec<Message>,
+    provenance: AssistantSegmentProvenance,
+}
+
+impl TurnOutputLog {
+    fn new(user: Message) -> Self {
+        Self {
+            messages: vec![user],
+            provenance: AssistantSegmentProvenance::default(),
+        }
+    }
+
+    fn push(&mut self, message: Message) {
+        if message.role == MessageRole::Assistant {
+            self.provenance
+                .message_iterations
+                .push((self.messages.len(), self.provenance.final_iteration));
+        }
+        self.messages.push(message);
+    }
+
+    fn extend(&mut self, messages: impl IntoIterator<Item = Message>) {
+        for message in messages {
+            self.push(message);
+        }
+    }
+}
 
 /// Prepended to the user content on a live video-call turn so the model treats
 /// the attached image as the user's real-time camera view rather than a file
@@ -765,19 +799,21 @@ impl Agent {
     /// (`record_user_prompt_and_emit_turn_item`). FIFO order is the
     /// buffer's append order (`split_off(0)` semantics).
     ///
-    /// Persistence ownership: when a drained-callback is registered the
-    /// HOST persists each steer row (and emits its standard persisted
-    /// user-message event) at drain time, so the rows stay OUT of
-    /// `turn_output_log` — otherwise the end-of-turn persist pass would
-    /// write them a second time. Without a callback (chat/gateway paths)
-    /// the rows ride the normal end-of-turn persistence via the log.
+    /// Persistence ownership: drained steer rows ALWAYS ride the
+    /// chronological `turn_output_log`, so the end-of-turn persist pass
+    /// writes them at their model-visible position (after every row the
+    /// model had already seen). The optional drained-callback is a live
+    /// observation hook for the host; it never owns persistence — a host
+    /// that persisted at drain time gave the steer a lower durable sequence
+    /// than the turn's own rows and corrupted the chronology of any context
+    /// ledger rebuilt from session history.
     ///
     /// No-op without a configured buffer — pre-steer loops are
     /// byte-identical.
     async fn drain_pending_steer_input(
         &self,
         messages: &mut Vec<Message>,
-        turn_output_log: &mut Vec<Message>,
+        turn_output_log: &mut TurnOutputLog,
     ) {
         let Some(buffer) = self.steer_buffer.as_ref() else {
             return;
@@ -793,9 +829,15 @@ impl Agent {
         for text in &drained {
             let message = Message::user(text.clone());
             messages.push(message.clone());
-            if self.steer_drained_callback.is_none() {
-                turn_output_log.push(message);
-            }
+            // The steer is appended to the durable turn log at its
+            // chronological position — after every row the model has already
+            // seen — so session history persists in model-visible order and a
+            // rebuild of the context ledger from that history reproduces the
+            // same chronology (answer, then the injected steer). A host that
+            // persisted the steer at drain time instead put it BEFORE the
+            // turn's prompt/answer rows in the durable sequence, which
+            // silently reordered the prompt after any snapshot rebuild.
+            turn_output_log.push(message);
         }
         if let Some(callback) = self.steer_drained_callback.as_ref() {
             callback(drained).await;
@@ -1018,7 +1060,7 @@ impl Agent {
                 // row a return site adds). The log is never read back from
                 // — only pushed to — so no mutation pass can shift OLD rows
                 // into it.
-                let mut turn_output_log: Vec<Message> = vec![current_user];
+                let mut turn_output_log = TurnOutputLog::new(current_user);
 
                 let config = self.chat_config();
                 let mut files_modified = Vec::new();
@@ -1029,7 +1071,17 @@ impl Agent {
                 // built below so the session actor can plumb it into the SSE
                 // `done` event for the W1.G4 cost panel.
                 let mut tool_structured_metadata: Vec<(String, serde_json::Value)> = Vec::new();
-                let mut turn = LoopTurnState::new(Instant::now());
+                let turn_started_at = Instant::now();
+                let mut turn = LoopTurnState::new(turn_started_at);
+                let mut convergence = match self.convergence_intervals {
+                    Some((llm_calls, active_tokens, elapsed)) => ConvergenceController::new(
+                        turn_started_at,
+                        llm_calls,
+                        active_tokens,
+                        elapsed,
+                    ),
+                    None => ConvergenceController::from_env(turn_started_at),
+                };
                 // M6.2: per-turn retry-bucket state machine. Lives alongside
                 // `LoopTurnState` rather than inside it so the file boundary
                 // from issue #489 stays exact.
@@ -1112,7 +1164,8 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed: false,
-                                messages: turn_output_log.clone(),
+                                assistant_segments: turn_output_log.provenance.clone(),
+                                messages: turn_output_log.messages.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                                 pending_approval: None,
@@ -1168,6 +1221,20 @@ impl Agent {
                     // results are recorded.
                     self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
                         .await;
+                    // The previous checkpoint summary is transient working
+                    // memory, not durable conversation history. Remove it
+                    // before prompt repair/compaction and re-inject only the
+                    // controller's latest summary below.
+                    messages.retain(|message| {
+                        !(message.role == MessageRole::User
+                            && is_checkpoint_context(&message.content))
+                    });
+                    // #1691 grace: when the budget stop is converted into one
+                    // FINAL action call, that call must be the model's, not a
+                    // convergence reflection (which would `continue` straight
+                    // back into the exhausted budget and end the turn without
+                    // the deliverable the grace exists for).
+                    let mut grace_iteration = false;
                     if let Some(stop) = turn.check_budget(self, activity.as_ref()) {
                         let stop_iteration = turn.iteration();
                         if !self.try_budget_grace_call(
@@ -1186,7 +1253,8 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed: false,
-                                messages: turn_output_log.clone(),
+                                assistant_segments: turn_output_log.provenance.clone(),
+                                messages: turn_output_log.messages.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                                 pending_approval: None,
@@ -1202,9 +1270,11 @@ impl Agent {
                              deliverable (write_file / edit_file) or give your final answer \
                              in THIS response.",
                         ));
+                        grace_iteration = true;
                     }
 
                     let iteration = turn.advance_iteration();
+                    turn_output_log.provenance.final_iteration = iteration;
                     // #1691 (codex gap G6): as the run approaches its iteration
                     // cap, warn the model in-band ONCE (~80%) so a long task
                     // converges on a written deliverable instead of silently
@@ -1290,7 +1360,142 @@ impl Agent {
                         },
                         iteration,
                     );
+                    // Typed User-role tail (ADR "Stable versus volatile prompt
+                    // content"): a System row here would rewrite the stable
+                    // prefix at every checkpoint (Anthropic hoists all System
+                    // rows into `system`; exact-prefix caches key on it).
+                    if let Some(context) = convergence.context_message() {
+                        messages.push(Message::user(context));
+                    }
                     let total_usage = turn.total_usage().clone();
+
+                    // Item 8: project a single compact status line through the
+                    // existing UI protocol. This is deliberately token/time
+                    // telemetry, not a fee budget or cost-enforcement rail.
+                    let tokens = active_tokens(&total_usage);
+                    self.reporter().report(ProgressEvent::AgentProgress {
+                        iteration,
+                        active_tokens: tokens,
+                        elapsed: turn_started_at.elapsed(),
+                        checkpoints: convergence.checkpoints(),
+                        reflecting: false,
+                    });
+
+                    // M8.5 tier 2: optionally decorate the outgoing ChatConfig
+                    // with the Anthropic `context_management` payload so the
+                    // server can clear old tool uses on its side. Non-Anthropic
+                    // providers ignore `context_management` via
+                    // `skip_serializing_if`. Built BEFORE the checkpoint so the
+                    // reflection request derives from the exact action config.
+                    let call_config = with_tier2_context_management(&config, self);
+
+                    // A convergence threshold is a soft checkpoint, never a
+                    // terminal budget. Run one private, tools-disabled LLM
+                    // round, store its synthesis as transient working memory,
+                    // then continue the same user turn with normal tools. A
+                    // budget-grace iteration is exempt: its single remaining
+                    // call belongs to the model's deliverable.
+                    let checkpoint_due = if grace_iteration {
+                        None
+                    } else {
+                        convergence.due(&total_usage)
+                    };
+                    if let Some(reason) = checkpoint_due {
+                        self.reporter().report(ProgressEvent::AgentProgress {
+                            iteration,
+                            active_tokens: tokens,
+                            elapsed: turn_started_at.elapsed(),
+                            checkpoints: convergence.checkpoints(),
+                            reflecting: true,
+                        });
+                        // The instruction is the final User row and the call
+                        // carries the SAME tool slice as the action call, so
+                        // the checkpoint request is the action request plus
+                        // appended rows: byte-identical stable prefix, same
+                        // epoch, a cache hit instead of a full re-prefill.
+                        // `tool_choice = None` still forbids tool use; a
+                        // provider that ignores it contributes only its text
+                        // (tool calls on the reflection are dropped below).
+                        let mut checkpoint_messages = messages.clone();
+                        checkpoint_messages.push(Message::user(ConvergenceController::prompt(
+                            &reason,
+                        )));
+                        // Derived from `call_config`, not the bare `config`:
+                        // the `context_management` payload is a stable cache
+                        // segment on Anthropic, so the checkpoint must carry
+                        // it exactly like the action call. The output cap
+                        // bounds reflection spend only when no reasoning
+                        // effort is configured — Anthropic derives the
+                        // `thinking` budget from `max_tokens`, and a changed
+                        // thinking config invalidates the message cache.
+                        let mut checkpoint_config = call_config.clone();
+                        checkpoint_config.tool_choice = octos_llm::ToolChoice::None;
+                        if checkpoint_config.reasoning_effort.is_none() {
+                            checkpoint_config.max_tokens = Some(
+                                checkpoint_config
+                                    .max_tokens
+                                    .unwrap_or(1_024)
+                                    .min(1_024),
+                            );
+                        }
+                        match self
+                            .call_llm_with_hooks_silent(
+                                &checkpoint_messages,
+                                &tools_spec,
+                                &checkpoint_config,
+                                iteration,
+                                &total_usage,
+                                &mut turn,
+                            )
+                            .await
+                        {
+                            Ok((reflection, _streamed, attributed_cost)) => {
+                                turn.record_llm_usage(
+                                    &reflection.usage,
+                                    tracker,
+                                    attributed_cost,
+                                );
+                                let content = reflection.content.unwrap_or_else(|| {
+                                    "Checkpoint returned no text; continue with one bounded next action."
+                                        .to_string()
+                                });
+                                let usage_after_checkpoint = turn.total_usage().clone();
+                                // The reflection's own usage is real spend for
+                                // the turn (recorded above) but is excluded
+                                // from the convergence thresholds.
+                                let reflection_usage = TokenUsage {
+                                    input_tokens: reflection.usage.input_tokens,
+                                    output_tokens: reflection.usage.output_tokens,
+                                    cache_read_tokens: reflection.usage.cache_read_tokens,
+                                    cache_write_tokens: reflection.usage.cache_write_tokens,
+                                    ..Default::default()
+                                };
+                                convergence.complete(
+                                    &usage_after_checkpoint,
+                                    Some(&reflection_usage),
+                                    content,
+                                );
+                                tracing::info!(
+                                    iteration,
+                                    checkpoint = convergence.checkpoints(),
+                                    "convergence checkpoint completed; continuing user turn"
+                                );
+                                continue 'agent_loop;
+                            }
+                            Err(error) => {
+                                // Reflection is a guardrail, not a new failure
+                                // mode. Rearm it and proceed with the normal
+                                // call when the checkpoint provider fails.
+                                warn!(%error, iteration, "convergence checkpoint failed open");
+                                convergence.complete(
+                                    turn.total_usage(),
+                                    None,
+                                    "Checkpoint failed; continue with one bounded, evidence-driven action."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
 
                     if iteration == 1 && tools_spec.len() > 25 {
                         tracing::warn!(
@@ -1306,12 +1511,6 @@ impl Agent {
                         message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
                         "calling LLM"
                     );
-                    // M8.5 tier 2: optionally decorate the outgoing ChatConfig
-                    // with the Anthropic `context_management` payload so the
-                    // server can clear old tool uses on its side. Non-Anthropic
-                    // providers ignore `context_management` via
-                    // `skip_serializing_if`.
-                    let call_config = with_tier2_context_management(&config, self);
                     // #27d (R4) — malformed tool-call FEEDBACK buffer. A
                     // `StreamError::MalformedArgs` (the model emitted a tool
                     // call whose JSON arguments failed to parse) stays
@@ -1501,11 +1700,8 @@ impl Agent {
                             "LLM response received"
                         );
                     }
-                    turn.record_usage(
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                        response.usage.cache_read_tokens,
-                        response.usage.cache_write_tokens,
+                    turn.record_llm_usage(
+                        &response.usage,
                         tracker,
                         // Attributed inside `call_llm_with_hooks`: each
                         // attempt (discarded retries included) priced at the
@@ -1514,6 +1710,10 @@ impl Agent {
                         // misprice cross-provider retries.
                         attributed_cost,
                     );
+                    // One COMPLETED action call. The convergence call
+                    // threshold counts these, never the pre-call iteration
+                    // index and never the checkpoint's own reflection call.
+                    convergence.record_action_call();
 
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
@@ -1567,7 +1767,8 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: turn_output_log.clone(),
+                                assistant_segments: turn_output_log.provenance.clone(),
+                                messages: turn_output_log.messages,
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                                 pending_approval: None,
@@ -1591,7 +1792,8 @@ impl Agent {
                                         files_modified,
                                         files_to_send,
                                         streamed,
-                                        messages: turn_output_log.clone(),
+                                        assistant_segments: turn_output_log.provenance.clone(),
+                                        messages: turn_output_log.messages.clone(),
                                         tool_results: tool_structured_metadata.clone(),
                                         synthesized_from_spawn_only: false,
                                         pending_approval: None,
@@ -1717,7 +1919,8 @@ impl Agent {
                                             files_modified,
                                             files_to_send,
                                             streamed,
-                                            messages: turn_output_log.clone(),
+                                            assistant_segments: turn_output_log.provenance.clone(),
+                                            messages: turn_output_log.messages.clone(),
                                             tool_results: tool_structured_metadata.clone(),
                                             synthesized_from_spawn_only: false,
                                 pending_approval: None,
@@ -1750,7 +1953,8 @@ impl Agent {
                                             files_modified,
                                             files_to_send,
                                             streamed,
-                                            messages: turn_output_log.clone(),
+                                            assistant_segments: turn_output_log.provenance.clone(),
+                                            messages: turn_output_log.messages.clone(),
                                             tool_results: tool_structured_metadata.clone(),
                                             synthesized_from_spawn_only: false,
                                             pending_approval: None,
@@ -1818,7 +2022,8 @@ impl Agent {
                                                 files_modified,
                                                 files_to_send,
                                                 streamed,
-                                                messages: turn_output_log.clone(),
+                                                assistant_segments: turn_output_log.provenance.clone(),
+                                                messages: turn_output_log.messages.clone(),
                                                 tool_results: tool_structured_metadata.clone(),
                                                 synthesized_from_spawn_only: false,
                                 pending_approval: None,
@@ -1881,6 +2086,38 @@ impl Agent {
                                 }
                             };
 
+                            if let Some(tool_name) = loop_detector.take_peer_polling_signal() {
+                                convergence.force(CheckpointReason::PeerPolling { tool_name });
+                            }
+
+                            if let Some(churn) = loop_detector.take_file_churn_signal() {
+                                if churn.escalation {
+                                    // Existing adaptive/fallback providers
+                                    // interpret this as a late failure and may
+                                    // choose a stronger/healthier slot next.
+                                    // A single-provider setup safely no-ops.
+                                    self.llm.report_late_failure();
+                                }
+                                self.reporter().report(ProgressEvent::LlmStatus {
+                                    message: format!(
+                                        "File churn: {} edits to {}{}; synthesizing before continuing",
+                                        churn.edits,
+                                        churn.path,
+                                        if churn.escalation {
+                                            " · model escalation requested"
+                                        } else {
+                                            ""
+                                        },
+                                    ),
+                                    iteration,
+                                });
+                                convergence.force(CheckpointReason::FileChurn {
+                                    path: churn.path,
+                                    edits: churn.edits,
+                                    escalation: churn.escalation,
+                                });
+                            }
+
                             // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md):
                             // a tool call matched a human-approval rule —
                             // suspend the turn. The host (session actor)
@@ -1903,7 +2140,8 @@ impl Agent {
                                     files_modified,
                                     files_to_send,
                                     streamed,
-                                    messages: turn_output_log.clone(),
+                                    assistant_segments: turn_output_log.provenance.clone(),
+                                    messages: turn_output_log.messages.clone(),
                                     tool_results: tool_structured_metadata.clone(),
                                     synthesized_from_spawn_only: false,
                                     pending_approval: Some(draft),
@@ -1994,7 +2232,8 @@ impl Agent {
                                     files_modified,
                                     files_to_send,
                                     streamed,
-                                    messages: turn_output_log.clone(),
+                                    assistant_segments: turn_output_log.provenance.clone(),
+                                    messages: turn_output_log.messages.clone(),
                                     tool_results: tool_structured_metadata.clone(),
                                     synthesized_from_spawn_only: false,
                                 pending_approval: None,
@@ -2168,7 +2407,8 @@ impl Agent {
                                         files_modified,
                                         files_to_send,
                                         streamed,
-                                        messages: turn_output_log.clone(),
+                                        assistant_segments: turn_output_log.provenance.clone(),
+                                        messages: turn_output_log.messages.clone(),
                                         tool_results: tool_structured_metadata.clone(),
                                         // dspfac "two bubbles per turn" fix: this
                                         // branch synthesises `content` as the
@@ -2223,7 +2463,8 @@ impl Agent {
                             } else {
                                 response.content.clone().unwrap_or_default()
                             };
-                            return Ok(ConversationResponse {
+                            // Preserve partial output while retaining the provider truncation status.
+                            let partial = ConversationResponse {
                                 content,
                                 reasoning_content: response.reasoning_content.clone(),
                                 provider_metadata: Some(
@@ -2234,11 +2475,16 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: turn_output_log.clone(),
+                                assistant_segments: turn_output_log.provenance.clone(),
+                                messages: turn_output_log.messages,
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                                 pending_approval: None,
-                            });
+                            };
+                            return Err(attach_partial_usage(
+                                super::IncompleteResponseError { partial }.into(),
+                                turn.total_usage().clone(),
+                            ));
                         }
                         StopReason::ContentFiltered => {
                             // After retries in call_llm_with_hooks, content is still filtered.
@@ -2260,7 +2506,8 @@ impl Agent {
                                 files_modified,
                                 files_to_send,
                                 streamed,
-                                messages: turn_output_log.clone(),
+                                assistant_segments: turn_output_log.provenance.clone(),
+                                messages: turn_output_log.messages.clone(),
                                 tool_results: tool_structured_metadata.clone(),
                                 synthesized_from_spawn_only: false,
                                 pending_approval: None,
@@ -2443,11 +2690,8 @@ impl Agent {
                     }
                 };
                 Self::normalize_inline_invokes(&mut response);
-                turn.record_usage(
-                    response.usage.input_tokens,
-                    response.usage.output_tokens,
-                    response.usage.cache_read_tokens,
-                    response.usage.cache_write_tokens,
+                turn.record_llm_usage(
+                    &response.usage,
                     tracker,
                     // Attributed per attempt inside `call_llm_with_hooks`
                     // (cross-provider retries priced at their own slot).
@@ -2830,7 +3074,7 @@ impl Agent {
         // appended here. The task loop passes `None` (it returns
         // `TaskResult`, not `ConversationResponse`, so no log is
         // needed there).
-        turn_output_log: Option<&mut Vec<Message>>,
+        turn_output_log: Option<&mut TurnOutputLog>,
         // PR #1363 (this PR): the outer-scope LoopDetector. Hard cycle
         // detection runs in the caller BEFORE this is invoked (so the
         // turn can be terminated cleanly); the soft "no progress" hint
@@ -3129,6 +3373,13 @@ impl Agent {
                 } else {
                     false
                 };
+                if let Some(hint) = loop_detector.record_file_mutation(
+                    name,
+                    args,
+                    success_by_id.get(id).copied().unwrap_or(false),
+                ) {
+                    message.content.push_str(&hint);
+                }
                 if let Some(ledger) = turn_ledger.as_deref_mut() {
                     ledger.push_entry(ledger_entry_from_tool_result(
                         turn.iteration(),
@@ -3171,10 +3422,7 @@ impl Agent {
             files_to_send.extend(tool_send_files);
         }
         turn.record_usage(
-            tool_tokens.input_tokens,
-            tool_tokens.output_tokens,
-            tool_tokens.cache_read_tokens,
-            tool_tokens.cache_write_tokens,
+            &tool_tokens,
             tracker,
             // Tool-reported usage has no per-response provider attribution;
             // price it at the active slot as the closest estimate.
@@ -3777,7 +4025,7 @@ fn inject_loop_detected_synthetic_results_with_log(
     response: &ChatResponse,
     warning: &str,
     agent: &Agent,
-    turn_output_log: Option<&mut Vec<Message>>,
+    turn_output_log: Option<&mut TurnOutputLog>,
 ) {
     let synthesis_hint = "\n\nTry a different approach — synthesise from prior tool results already in this conversation, call a different tool, or finish the turn with the partial information you have.";
     let primary_body = format!("{warning}{synthesis_hint}");

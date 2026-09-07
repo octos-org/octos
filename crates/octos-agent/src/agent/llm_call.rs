@@ -5,10 +5,14 @@ use std::time::{Duration, Instant};
 use eyre::Result;
 use octos_core::Message;
 use octos_core::TokenUsage;
-use octos_llm::{ChatConfig, ChatResponse, LlmCallPolicy, StopReason, ToolSpec};
-use tracing::{info, warn};
+use octos_llm::{
+    ChatConfig, ChatResponse, LlmCallPolicy, StopReason, ToolSpec, record_prompt_cache_usage,
+    with_prompt_cache_observation_context,
+};
+use tracing::{debug, info, trace, warn};
 
 use super::Agent;
+use super::prompt_cache::{build_prompt_cache_context, fingerprint_prompt};
 use super::turn_state::{LoopRetryReason, LoopTurnState};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
@@ -27,6 +31,53 @@ impl Agent {
         iteration: u32,
         total_usage: &TokenUsage,
         turn: &mut LoopTurnState,
+    ) -> Result<(ChatResponse, bool, Option<f64>)> {
+        self.call_llm_with_hooks_mode(
+            messages,
+            tools_spec,
+            config,
+            iteration,
+            total_usage,
+            turn,
+            true,
+        )
+        .await
+    }
+
+    /// Internal checkpoint call: retain hooks, retries, usage attribution and
+    /// provider failover, but do not stream private reflection into the user's
+    /// transcript.
+    pub(super) async fn call_llm_with_hooks_silent(
+        &self,
+        messages: &[Message],
+        tools_spec: &[ToolSpec],
+        config: &ChatConfig,
+        iteration: u32,
+        total_usage: &TokenUsage,
+        turn: &mut LoopTurnState,
+    ) -> Result<(ChatResponse, bool, Option<f64>)> {
+        self.call_llm_with_hooks_mode(
+            messages,
+            tools_spec,
+            config,
+            iteration,
+            total_usage,
+            turn,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_llm_with_hooks_mode(
+        &self,
+        messages: &[Message],
+        tools_spec: &[ToolSpec],
+        config: &ChatConfig,
+        iteration: u32,
+        total_usage: &TokenUsage,
+        turn: &mut LoopTurnState,
+        emit_progress: bool,
         // Returns `(response, streamed, attributed_cost_usd)`. The response's
         // `usage` MERGES discarded retry attempts into the final attempt, and
         // those attempts can come from DIFFERENT provider slots (an empty
@@ -78,6 +129,50 @@ impl Agent {
             }
         }
 
+        // Phase 0 of the OUP semantic-cache plan: capture the final agent-side
+        // prompt shape immediately before provider dispatch. The normal DEBUG
+        // row contains aggregate hashes/counts only; TRACE adds per-boundary
+        // hashes so an offline soak analyzer can measure the longest common
+        // prefix across turns. Neither level contains prompt/tool-schema text.
+        let prompt_fingerprint = fingerprint_prompt(messages, tools_spec);
+        debug!(
+            session = ?self.parent_session_key(),
+            provider = self.llm.provider_name(),
+            model = self.llm.model_id(),
+            iteration,
+            input_hash = %prompt_fingerprint.input_hash,
+            stable_prefix_hash = %prompt_fingerprint.stable_prefix_hash,
+            conversation_hash = %prompt_fingerprint.conversation_hash,
+            messages = prompt_fingerprint.message_count(),
+            tools = prompt_fingerprint.tool_count(),
+            estimated_tokens = prompt_fingerprint.estimated_tokens,
+            "model prompt cache fingerprint"
+        );
+        trace!(
+            session = ?self.parent_session_key(),
+            provider = self.llm.provider_name(),
+            model = self.llm.model_id(),
+            iteration,
+            manifest = %prompt_fingerprint.redacted_manifest(),
+            "model prompt cache fingerprint manifest"
+        );
+        let mut provider_config = config.clone();
+        let prompt_cache_epoch_id = self
+            .prompt_context_manager
+            .as_ref()
+            .and_then(|manager| manager.prompt_cache_epoch_id())
+            .or_else(|| self.prompt_cache_epoch_id.clone());
+        // Session identity only: `self.llm` may be an AdaptiveRouter whose
+        // `provider_name()`/`model_id()` re-run selection per call, and cache
+        // affinity must not flap with it (route is logged above instead).
+        provider_config.prompt_cache_context = Some(build_prompt_cache_context(
+            &prompt_fingerprint,
+            messages,
+            self.parent_session_key(),
+            prompt_cache_epoch_id.as_deref(),
+            self.llm.supports_semantic_checkpoint_hints(),
+        ));
+
         let mut last_error: Option<eyre::Report> = None;
         // Track token usage from retried (discarded) attempts so cost reporting
         // reflects actual consumption, not just the final successful call.
@@ -96,6 +191,10 @@ impl Agent {
         // the happy path never clones the config.
         let mut bumped_config: Option<ChatConfig> = None;
 
+        // All unsuccessful exits settle the rejected responses exactly once.
+        // Keep success settlement with the caller: successful responses below
+        // already carry the merged retry usage and attributed spend.
+        let result = async {
         for attempt in 0..=retry_max {
             let call_start = Instant::now();
             // Try the full LLM call (stream creation + consumption)
@@ -104,15 +203,30 @@ impl Agent {
             let input_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
             let input_estimate = (input_bytes / 3) as u32;
 
-            let attempt_config: &ChatConfig = bumped_config.as_ref().unwrap_or(config);
-            let build_and_consume = async {
-                let stream = self
-                    .llm
-                    .chat_stream(messages, tools_spec, attempt_config)
-                    .await?;
-                self.consume_stream_with_input_estimate(stream, iteration, input_estimate)
-                    .await
-            };
+            let attempt_config: &ChatConfig = bumped_config.as_ref().unwrap_or(&provider_config);
+            let build_and_consume = with_prompt_cache_observation_context(
+                attempt_config.prompt_cache_context.as_ref(),
+                iteration,
+                attempt,
+                async {
+                    let stream = self
+                        .llm
+                        .chat_stream(messages, tools_spec, attempt_config)
+                        .await?;
+                    if emit_progress {
+                        self.consume_stream_with_input_estimate(stream, iteration, input_estimate)
+                            .await
+                    } else {
+                        self.consume_stream_with_input_estimate_mode(
+                            stream,
+                            iteration,
+                            input_estimate,
+                            false,
+                        )
+                        .await
+                    }
+                },
+            );
             // Voice fail-fast: bound the WHOLE {build + consume} future with the
             // voice overall deadline. The per-chunk `StreamTimeouts` only start
             // inside `consume_stream`, so a provider that hangs while returning
@@ -135,6 +249,7 @@ impl Agent {
 
             match call_result {
                 Ok((response, streamed)) => {
+                    self.record_prompt_cache_usage(&response, attempt_config, iteration, attempt);
                     if !Self::is_retriable_response(&response) {
                         // Genuine success -- merge retry usage into response.
                         // Price the FINAL attempt at its own slot BEFORE the
@@ -153,8 +268,11 @@ impl Agent {
                         let mut response = response;
                         response.usage.input_tokens += retry_usage.input_tokens;
                         response.usage.output_tokens += retry_usage.output_tokens;
+                        response.usage.reasoning_tokens += retry_usage.reasoning_tokens;
                         response.usage.cache_read_tokens += retry_usage.cache_read_tokens;
                         response.usage.cache_write_tokens += retry_usage.cache_write_tokens;
+                        self.observe_semantic_checkpoint_report(&response, &provider_config);
+                        self.observe_effective_provider_route(&response);
 
                         if let Some(ref hooks) = self.hooks {
                             let latency_ms = call_start.elapsed().as_millis() as u64;
@@ -194,6 +312,23 @@ impl Agent {
                         return Ok((response, streamed, attributed_cost));
                     }
 
+                    // Every rejected response consumed usage, including the
+                    // last streaming attempt and FailFast's single attempt.
+                    if let Some(cost) = self.response_usage_cost(
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                        response.usage.cache_read_tokens,
+                        response.usage.cache_write_tokens,
+                        response.provider_index,
+                    ) {
+                        retry_spend = Some(retry_spend.unwrap_or(0.0) + cost);
+                    }
+                    retry_usage.input_tokens += response.usage.input_tokens;
+                    retry_usage.output_tokens += response.usage.output_tokens;
+                    retry_usage.reasoning_tokens += response.usage.reasoning_tokens;
+                    retry_usage.cache_read_tokens += response.usage.cache_read_tokens;
+                    retry_usage.cache_write_tokens += response.usage.cache_write_tokens;
+
                     if attempt == retry_max {
                         // All streaming retries exhausted.
                         let reason = if response.stop_reason == StopReason::ContentFiltered {
@@ -224,8 +359,21 @@ impl Agent {
                         );
 
                         // Non-streaming call triggers FallbackProvider's full fallback chain
-                        match self.llm.chat(messages, tools_spec, config).await {
+                        match with_prompt_cache_observation_context(
+                            provider_config.prompt_cache_context.as_ref(),
+                            iteration,
+                            attempt + 1,
+                            self.llm.chat(messages, tools_spec, &provider_config),
+                        )
+                        .await
+                        {
                             Ok(fallback_resp) if !Self::is_retriable_response(&fallback_resp) => {
+                                self.record_prompt_cache_usage(
+                                    &fallback_resp,
+                                    &provider_config,
+                                    iteration,
+                                    attempt + 1,
+                                );
                                 info!("non-streaming fallback succeeded");
                                 let final_cost = self.response_usage_cost(
                                     fallback_resp.usage.input_tokens,
@@ -241,13 +389,41 @@ impl Agent {
                                 let mut fallback_resp = fallback_resp;
                                 fallback_resp.usage.input_tokens += retry_usage.input_tokens;
                                 fallback_resp.usage.output_tokens += retry_usage.output_tokens;
+                                fallback_resp.usage.reasoning_tokens += retry_usage.reasoning_tokens;
                                 fallback_resp.usage.cache_read_tokens +=
                                     retry_usage.cache_read_tokens;
                                 fallback_resp.usage.cache_write_tokens +=
                                     retry_usage.cache_write_tokens;
+                                self.observe_semantic_checkpoint_report(
+                                    &fallback_resp,
+                                    &provider_config,
+                                );
+                                self.observe_effective_provider_route(&fallback_resp);
                                 return Ok((fallback_resp, false, attributed_cost));
                             }
-                            Ok(_) => {
+                            Ok(fallback_resp) => {
+                                self.record_prompt_cache_usage(
+                                    &fallback_resp,
+                                    &provider_config,
+                                    iteration,
+                                    attempt + 1,
+                                );
+                                if let Some(cost) = self.response_usage_cost(
+                                    fallback_resp.usage.input_tokens,
+                                    fallback_resp.usage.output_tokens,
+                                    fallback_resp.usage.cache_read_tokens,
+                                    fallback_resp.usage.cache_write_tokens,
+                                    fallback_resp.provider_index,
+                                ) {
+                                    retry_spend = Some(retry_spend.unwrap_or(0.0) + cost);
+                                }
+                                retry_usage.input_tokens += fallback_resp.usage.input_tokens;
+                                retry_usage.output_tokens += fallback_resp.usage.output_tokens;
+                                retry_usage.reasoning_tokens += fallback_resp.usage.reasoning_tokens;
+                                retry_usage.cache_read_tokens +=
+                                    fallback_resp.usage.cache_read_tokens;
+                                retry_usage.cache_write_tokens +=
+                                    fallback_resp.usage.cache_write_tokens;
                                 warn!("non-streaming fallback also returned empty response");
                             }
                             Err(e) => {
@@ -262,24 +438,7 @@ impl Agent {
                         ));
                     }
 
-                    // Empty or abnormal response -- accumulate usage and retry.
-                    // Price THIS attempt at the slot that produced it now;
-                    // by the time a later attempt wins, the winning slot's
-                    // rate would misprice these tokens.
-                    if let Some(cost) = self.response_usage_cost(
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                        response.usage.cache_read_tokens,
-                        response.usage.cache_write_tokens,
-                        response.provider_index,
-                    ) {
-                        retry_spend = Some(retry_spend.unwrap_or(0.0) + cost);
-                    }
-                    retry_usage.input_tokens += response.usage.input_tokens;
-                    retry_usage.output_tokens += response.usage.output_tokens;
-                    retry_usage.cache_read_tokens += response.usage.cache_read_tokens;
-                    retry_usage.cache_write_tokens += response.usage.cache_write_tokens;
-
+                    // Retry after accounting for this rejected response above.
                     let delay = Duration::from_secs(1 << attempt);
                     let reason = if response.stop_reason == StopReason::ContentFiltered {
                         "content filtered by safety/moderation"
@@ -301,17 +460,19 @@ impl Agent {
                     );
                     // Clear stream forwarder buffer before retry so partial
                     // text from this attempt isn't concatenated with the next.
-                    self.reporter()
-                        .report(ProgressEvent::StreamRetry { iteration });
-                    self.reporter().report(ProgressEvent::LlmStatus {
-                        message: format!(
-                            "Retrying ({}/{})... {}",
-                            attempt + 1,
-                            retry_max + 1,
-                            reason,
-                        ),
-                        iteration,
-                    });
+                    if emit_progress {
+                        self.reporter()
+                            .report(ProgressEvent::StreamRetry { iteration });
+                        self.reporter().report(ProgressEvent::LlmStatus {
+                            message: format!(
+                                "Retrying ({}/{})... {}",
+                                attempt + 1,
+                                retry_max + 1,
+                                reason,
+                            ),
+                            iteration,
+                        });
+                    }
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
@@ -323,9 +484,9 @@ impl Agent {
                         // attempt can complete the call. Only bump upward.
                         if Self::is_truncated_tool_call_error(&e) {
                             let model_max = self.llm.max_output_tokens();
-                            let current = config.max_tokens.unwrap_or(0);
+                            let current = provider_config.max_tokens.unwrap_or(0);
                             if model_max > current {
-                                let mut c = config.clone();
+                                let mut c = provider_config.clone();
                                 c.max_tokens = Some(model_max);
                                 warn!(
                                     from = current,
@@ -350,16 +511,18 @@ impl Agent {
                         );
                         // Clear stream forwarder buffer before retry so partial
                         // text from this attempt isn't concatenated with the next.
-                        self.reporter()
-                            .report(ProgressEvent::StreamRetry { iteration });
-                        self.reporter().report(ProgressEvent::LlmStatus {
-                            message: format!(
-                                "Retrying ({}/{})... stream error",
-                                attempt + 1,
-                                retry_max + 1,
-                            ),
-                            iteration,
-                        });
+                        if emit_progress {
+                            self.reporter()
+                                .report(ProgressEvent::StreamRetry { iteration });
+                            self.reporter().report(ProgressEvent::LlmStatus {
+                                message: format!(
+                                    "Retrying ({}/{})... stream error",
+                                    attempt + 1,
+                                    retry_max + 1,
+                                ),
+                                iteration,
+                            });
+                        }
                         last_error = Some(e);
                         tokio::time::sleep(delay).await;
                     } else if attempt == retry_max {
@@ -379,8 +542,21 @@ impl Agent {
                             error = %e,
                             "stream retries exhausted, trying non-streaming fallback"
                         );
-                        match self.llm.chat(messages, tools_spec, config).await {
+                        match with_prompt_cache_observation_context(
+                            provider_config.prompt_cache_context.as_ref(),
+                            iteration,
+                            attempt + 1,
+                            self.llm.chat(messages, tools_spec, &provider_config),
+                        )
+                        .await
+                        {
                             Ok(resp) if !Self::is_retriable_response(&resp) => {
+                                self.record_prompt_cache_usage(
+                                    &resp,
+                                    &provider_config,
+                                    iteration,
+                                    attempt + 1,
+                                );
                                 info!("non-streaming fallback succeeded after stream failures");
                                 // Codex #1632 r2 P2: merge the accumulated
                                 // retry usage here like the empty-response
@@ -404,11 +580,34 @@ impl Agent {
                                 let mut resp = resp;
                                 resp.usage.input_tokens += retry_usage.input_tokens;
                                 resp.usage.output_tokens += retry_usage.output_tokens;
+                                resp.usage.reasoning_tokens += retry_usage.reasoning_tokens;
                                 resp.usage.cache_read_tokens += retry_usage.cache_read_tokens;
                                 resp.usage.cache_write_tokens += retry_usage.cache_write_tokens;
+                                self.observe_semantic_checkpoint_report(&resp, &provider_config);
+                                self.observe_effective_provider_route(&resp);
                                 return Ok((resp, false, attributed_cost));
                             }
-                            Ok(_) => {
+                            Ok(resp) => {
+                                self.record_prompt_cache_usage(
+                                    &resp,
+                                    &provider_config,
+                                    iteration,
+                                    attempt + 1,
+                                );
+                                if let Some(cost) = self.response_usage_cost(
+                                    resp.usage.input_tokens,
+                                    resp.usage.output_tokens,
+                                    resp.usage.cache_read_tokens,
+                                    resp.usage.cache_write_tokens,
+                                    resp.provider_index,
+                                ) {
+                                    retry_spend = Some(retry_spend.unwrap_or(0.0) + cost);
+                                }
+                                retry_usage.input_tokens += resp.usage.input_tokens;
+                                retry_usage.output_tokens += resp.usage.output_tokens;
+                                retry_usage.reasoning_tokens += resp.usage.reasoning_tokens;
+                                retry_usage.cache_read_tokens += resp.usage.cache_read_tokens;
+                                retry_usage.cache_write_tokens += resp.usage.cache_write_tokens;
                                 warn!("non-streaming fallback also returned empty");
                             }
                             Err(fb_err) => {
@@ -426,13 +625,83 @@ impl Agent {
 
         // All retries exhausted with errors
         Err(last_error.unwrap_or_else(|| eyre::eyre!("LLM call failed after retries")))
+        }
+        .await;
+        if result.is_err() {
+            turn.record_usage(&retry_usage, None, retry_spend);
+        }
+        result
+    }
+
+    fn record_prompt_cache_usage(
+        &self,
+        response: &ChatResponse,
+        config: &ChatConfig,
+        agent_iteration: u32,
+        attempt: u32,
+    ) {
+        let route = self
+            .llm
+            .provider_metadata_for_index(response.provider_index);
+        record_prompt_cache_usage(
+            config.prompt_cache_context.as_ref(),
+            &route.provider,
+            &route.model,
+            agent_iteration,
+            attempt,
+            &response.usage,
+        );
+    }
+
+    fn observe_semantic_checkpoint_report(&self, response: &ChatResponse, config: &ChatConfig) {
+        let Some(report) = response.usage.semantic_checkpoint.as_ref() else {
+            return;
+        };
+        let offered = report
+            .restored_boundary_id
+            .as_deref()
+            .is_none_or(|restored| {
+                config.prompt_cache_context.as_ref().is_some_and(|context| {
+                    context
+                        .semantic_boundaries
+                        .iter()
+                        .any(|hint| hint.boundary_id == restored)
+                })
+            });
+        if offered {
+            debug!(
+                provider = self.llm.provider_name(),
+                model = self.llm.model_id(),
+                restored_boundary_id = ?report.restored_boundary_id,
+                restored_prefix_tokens = report.restored_prefix_tokens,
+                re_prefill_tokens = report.re_prefill_tokens,
+                "semantic checkpoint restore report"
+            );
+        } else {
+            warn!(
+                provider = self.llm.provider_name(),
+                model = self.llm.model_id(),
+                restored_boundary_id = ?report.restored_boundary_id,
+                "provider reported a semantic checkpoint that was not offered for this exact prefix"
+            );
+        }
+    }
+
+    fn observe_effective_provider_route(&self, response: &ChatResponse) {
+        let Some(manager) = self.prompt_context_manager.as_ref() else {
+            return;
+        };
+        let route = self
+            .llm
+            .provider_metadata_for_index(response.provider_index);
+        manager.observe_effective_provider_route(&route.provider, &route.model);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::super::AgentConfig;
@@ -441,13 +710,15 @@ mod tests {
     use futures::stream;
     use octos_core::{AgentId, Message};
     use octos_llm::{
-        ChatConfig, ChatResponse, ChatStream, LlmCallPolicy, LlmProvider, StopReason, StreamEvent,
+        ChatConfig, ChatResponse, ChatStream, LlmCallPolicy, LlmError, LlmErrorKind, LlmProvider,
+        PromptCacheContext, ProviderChain, SemanticCheckpointReport, StopReason, StreamEvent,
         TokenUsage as LlmTokenUsage, ToolSpec, with_llm_call_policy,
     };
     use octos_memory::EpisodeStore;
 
     use super::super::Agent;
     use super::super::turn_state::LoopTurnState;
+    use crate::prompt_context::{PromptContextManager, PromptContextReport, PromptContextRequest};
     use crate::tools::ToolRegistry;
 
     // ── Shared call counters ──────────────────────────────────────────────────
@@ -587,6 +858,136 @@ mod tests {
     struct TruncateThenSucceedProvider {
         counters: Arc<CallCounters>,
         seen_max_tokens: Arc<std::sync::Mutex<Vec<Option<u32>>>>,
+    }
+
+    /// Models a local runtime which accepts semantic boundary hints and
+    /// reports the deepest checkpoint it actually restored.
+    struct SemanticCheckpointProvider {
+        seen_contexts: Arc<Mutex<Vec<PromptCacheContext>>>,
+        previous_context: Mutex<Option<PromptCacheContext>>,
+    }
+
+    struct NamedRouteProvider {
+        provider: &'static str,
+        model: &'static str,
+        fail: bool,
+    }
+
+    #[derive(Default)]
+    struct EffectiveRouteObserver {
+        routes: Mutex<Vec<(String, String)>>,
+    }
+
+    impl PromptContextManager for EffectiveRouteObserver {
+        fn prepare_prompt(
+            &self,
+            _request: PromptContextRequest,
+            _messages: &mut Vec<Message>,
+        ) -> std::result::Result<PromptContextReport, String> {
+            Ok(PromptContextReport::default())
+        }
+
+        fn observe_effective_provider_route(&self, provider_name: &str, model_id: &str) {
+            self.routes
+                .lock()
+                .unwrap()
+                .push((provider_name.to_owned(), model_id.to_owned()));
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for NamedRouteProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            if self.fail {
+                return Err(LlmError::new(
+                    LlmErrorKind::ServerError { status: 503 },
+                    "forced primary failure",
+                )
+                .into());
+            }
+            Ok(ChatResponse {
+                content: Some("fallback response".to_owned()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            self.model
+        }
+
+        fn provider_name(&self) -> &str {
+            self.provider
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SemanticCheckpointProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            eyre::bail!("streaming path should succeed in this test")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            let context = config
+                .prompt_cache_context
+                .clone()
+                .expect("agent must attach provider-neutral cache context");
+            let restored = {
+                let mut previous = self.previous_context.lock().unwrap();
+                let restored = previous
+                    .as_ref()
+                    .and_then(|old| old.deepest_shared_checkpoint(&context))
+                    .cloned()
+                    .or_else(|| context.semantic_boundaries.last().cloned())
+                    .expect("local provider must receive safe semantic boundaries");
+                *previous = Some(context.clone());
+                restored
+            };
+            self.seen_contexts.lock().unwrap().push(context);
+            let events = vec![
+                StreamEvent::TextDelta("restored".to_string()),
+                StreamEvent::Usage(LlmTokenUsage {
+                    semantic_checkpoint: Some(SemanticCheckpointReport {
+                        restored_boundary_id: Some(restored.boundary_id),
+                        restored_prefix_tokens: restored.prefix_token_estimate as u32,
+                        re_prefill_tokens: restored.estimated_recompute_tokens as u32,
+                    }),
+                    ..Default::default()
+                }),
+                StreamEvent::Done(StopReason::EndTurn),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+
+        fn model_id(&self) -> &str {
+            "local-semantic-test"
+        }
+
+        fn provider_name(&self) -> &str {
+            "local-test"
+        }
+
+        fn supports_semantic_checkpoint_hints(&self) -> bool {
+            true
+        }
     }
 
     #[async_trait]
@@ -748,7 +1149,15 @@ mod tests {
         // the hook's cumulative cost must be built from this attribution,
         // never from repricing the cumulative tokens at the current model.
         let mut turn = turn();
-        turn.record_usage(5_000, 1_000, 0, 0, None, Some(0.005));
+        turn.record_usage(
+            &octos_core::TokenUsage {
+                input_tokens: 5_000,
+                output_tokens: 1_000,
+                ..Default::default()
+            },
+            None,
+            Some(0.005),
+        );
         let total_usage = turn.total_usage().clone();
 
         let (_response, _streamed, attributed) = agent
@@ -785,6 +1194,158 @@ mod tests {
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn provider_chain_reports_the_concrete_route_that_won_failover() {
+        let chain: Arc<dyn LlmProvider> = Arc::new(ProviderChain::new(vec![
+            Arc::new(NamedRouteProvider {
+                provider: "primary",
+                model: "model-a",
+                fail: true,
+            }),
+            Arc::new(NamedRouteProvider {
+                provider: "fallback",
+                model: "model-b",
+                fail: false,
+            }),
+        ]));
+        let observer = Arc::new(EffectiveRouteObserver::default());
+        let (agent, _dir) = build_agent(chain).await;
+        let agent = agent.with_prompt_context_manager(observer.clone());
+
+        let (response, streamed, _cost) = agent
+            .call_llm_with_hooks(
+                &msgs(),
+                &[],
+                &ChatConfig::default(),
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await
+            .expect("fallback lane should complete the request");
+
+        assert!(streamed);
+        assert_eq!(response.content.as_deref(), Some("fallback response"));
+        assert_eq!(response.provider_index, Some(1));
+        assert_eq!(
+            *observer.routes.lock().unwrap(),
+            vec![("fallback".to_owned(), "model-b".to_owned())],
+            "the durable context hook must see the winner once, not the failed primary"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_provider_receives_safe_boundaries_and_reports_exact_restore() {
+        let seen_contexts = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(SemanticCheckpointProvider {
+            seen_contexts: seen_contexts.clone(),
+            previous_context: Mutex::new(None),
+        });
+        let (agent, _dir) = build_agent(provider).await;
+        let agent = agent
+            .with_parent_session_key("semantic-session")
+            .with_prompt_cache_epoch_id("epoch-after-compaction");
+        let mut tool_request = Message::assistant("");
+        tool_request.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call-read".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path": "README.md"}),
+            metadata: None,
+        }]);
+        let messages_before_edit = vec![
+            Message::user("inspect the repository"),
+            tool_request.clone(),
+            Message::tool_with_thread(
+                "old README contents",
+                "call-read",
+                octos_core::ThreadId::new("thread-semantic"),
+            ),
+            Message::assistant("inspection complete"),
+        ];
+
+        let (_first_response, first_streamed, _cost) = agent
+            .call_llm_with_hooks(
+                &messages_before_edit,
+                &[],
+                &ChatConfig::default(),
+                1,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await
+            .expect("semantic-aware local provider call should succeed");
+        assert!(first_streamed);
+
+        // Editing a completed tool output invalidates that interaction and
+        // every later checkpoint, while preserving the preceding user-turn
+        // checkpoint. The local runtime must report that surviving boundary,
+        // not blindly restore the deepest checkpoint from the old request.
+        let messages_after_edit = vec![
+            Message::user("inspect the repository"),
+            tool_request,
+            Message::tool_with_thread(
+                "new README contents",
+                "call-read",
+                octos_core::ThreadId::new("thread-semantic"),
+            ),
+            Message::assistant("inspection complete"),
+        ];
+        let (response, streamed, _cost) = agent
+            .call_llm_with_hooks(
+                &messages_after_edit,
+                &[],
+                &ChatConfig::default(),
+                2,
+                &octos_core::TokenUsage::default(),
+                &mut turn(),
+            )
+            .await
+            .expect("edited suffix should fall back to its deepest surviving checkpoint");
+
+        assert!(streamed);
+        assert_eq!(response.content.as_deref(), Some("restored"));
+        let contexts = seen_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 2);
+        let before = &contexts[0];
+        let after = &contexts[1];
+        assert_eq!(before.epoch_id, "epoch-after-compaction");
+        assert_eq!(after.epoch_id, "epoch-after-compaction");
+        assert_eq!(
+            before
+                .semantic_boundaries
+                .iter()
+                .map(|boundary| boundary.boundary_kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user_turn", "tool_interaction", "assistant_final"]
+        );
+        assert_eq!(
+            before.semantic_boundaries[0].prefix_hash, after.semantic_boundaries[0].prefix_hash,
+            "the pre-edit user boundary survives"
+        );
+        assert_ne!(
+            before.semantic_boundaries[1].prefix_hash, after.semantic_boundaries[1].prefix_hash,
+            "the edited tool interaction must invalidate its checkpoint"
+        );
+        let deepest = &before.semantic_boundaries[0];
+        let report = response
+            .usage
+            .semantic_checkpoint
+            .as_ref()
+            .expect("provider restore report must survive stream accumulation");
+        assert_eq!(
+            report.restored_boundary_id.as_deref(),
+            Some(deepest.boundary_id.as_str())
+        );
+        assert_eq!(
+            report.restored_prefix_tokens,
+            deepest.prefix_token_estimate as u32
+        );
+        assert_eq!(
+            report.re_prefill_tokens,
+            deepest.estimated_recompute_tokens as u32
+        );
+    }
 
     /// Under FailFast, a provider whose stream always errors (retryable 503):
     ///   - chat_stream called exactly once (no retries)

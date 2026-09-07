@@ -23,6 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, PartialEq, Eq)]
 struct PrivateAsrConfig {
     grant_url: String,
+    readiness_url: String,
     service_token: String,
 }
 
@@ -31,6 +32,7 @@ impl fmt::Debug for PrivateAsrConfig {
         formatter
             .debug_struct("PrivateAsrConfig")
             .field("grant_url", &self.grant_url)
+            .field("readiness_url", &self.readiness_url)
             .field("service_token", &"[REDACTED]")
             .finish()
     }
@@ -69,9 +71,75 @@ impl PrivateAsrConfig {
         let base = control_url.trim_end_matches('/');
         Ok(Self {
             grant_url: format!("{base}/api/v1/browser-grants"),
+            readiness_url: format!("{base}/readyz"),
             service_token: service_token.to_owned(),
         })
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PrivateAsrReadiness {
+    pub ready: bool,
+    pub detail: String,
+}
+
+/// Probe the browser-facing private ASR route when it is configured.
+///
+/// `None` means that neither private-ASR setting is present, so callers should
+/// retain the normal local-development route (`ASR_API_URL` or OMiniX). Once an
+/// operator supplies either setting, an invalid pair is reported as not ready
+/// instead of silently falling back to an unrelated ASR implementation.
+pub(crate) async fn readiness(client: &reqwest::Client) -> Option<PrivateAsrReadiness> {
+    let control_url = std::env::var(CONTROL_URL_ENV).ok();
+    let service_token = std::env::var(SERVICE_TOKEN_ENV).ok();
+    readiness_from_values(client, control_url.as_deref(), service_token.as_deref()).await
+}
+
+async fn readiness_from_values(
+    client: &reqwest::Client,
+    control_url: Option<&str>,
+    service_token: Option<&str>,
+) -> Option<PrivateAsrReadiness> {
+    let configured = control_url.is_some_and(|value| !value.trim().is_empty())
+        || service_token.is_some_and(|value| !value.trim().is_empty());
+    if !configured {
+        return None;
+    }
+    let config = match PrivateAsrConfig::from_values(control_url, service_token) {
+        Ok(config) => config,
+        Err(_) => {
+            return Some(PrivateAsrReadiness {
+                ready: false,
+                detail: "Private ASR configuration is incomplete or invalid".into(),
+            });
+        }
+    };
+    let response = client
+        .get(&config.readiness_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await;
+    Some(match response {
+        Ok(response) if response.status().is_success() => PrivateAsrReadiness {
+            ready: true,
+            detail: "Private ASR ready".into(),
+        },
+        Ok(response) => PrivateAsrReadiness {
+            ready: false,
+            detail: format!(
+                "Private ASR readiness check returned HTTP {}",
+                response.status()
+            ),
+        },
+        Err(error) => PrivateAsrReadiness {
+            ready: false,
+            detail: if error.is_timeout() {
+                "Private ASR readiness check timed out".into()
+            } else {
+                "Private ASR is unreachable".into()
+            },
+        },
+    })
 }
 
 fn control_url_is_secure(url: &reqwest::Url) -> bool {
@@ -265,6 +333,7 @@ mod tests {
             config.grant_url,
             "https://asr.example.com/api/v1/browser-grants"
         );
+        assert_eq!(config.readiness_url, "https://asr.example.com/readyz");
         assert_eq!(config.service_token, TOKEN);
     }
 
@@ -357,5 +426,67 @@ mod tests {
             .expect("exchange succeeds");
         assert_eq!(grant.grant, "one-time-grant");
         assert_eq!(grant.expires_at_ms, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn readiness_is_absent_when_private_asr_is_not_configured() {
+        assert_eq!(
+            readiness_from_values(&reqwest::Client::new(), None, None).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_an_incomplete_private_asr_configuration() {
+        assert_eq!(
+            readiness_from_values(
+                &reqwest::Client::new(),
+                Some("https://asr.example.com"),
+                None,
+            )
+            .await,
+            Some(PrivateAsrReadiness {
+                ready: false,
+                detail: "Private ASR configuration is incomplete or invalid".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_probes_the_private_asr_ready_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/readyz"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            readiness_from_values(&reqwest::Client::new(), Some(&server.uri()), Some(TOKEN)).await,
+            Some(PrivateAsrReadiness {
+                ready: true,
+                detail: "Private ASR ready".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_when_the_private_asr_is_not_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/readyz"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            readiness_from_values(&reqwest::Client::new(), Some(&server.uri()), Some(TOKEN)).await,
+            Some(PrivateAsrReadiness {
+                ready: false,
+                detail: "Private ASR readiness check returned HTTP 503 Service Unavailable".into(),
+            })
+        );
     }
 }

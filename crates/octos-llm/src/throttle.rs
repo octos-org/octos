@@ -102,6 +102,14 @@ impl LlmProvider for SemaphoreThrottledProvider {
         self.inner.provider_metadata_for_index(provider_index)
     }
 
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.inner.api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.inner.supports_semantic_checkpoint_hints()
+    }
+
     fn export_metrics(&self) -> Option<serde_json::Value> {
         self.inner.export_metrics()
     }

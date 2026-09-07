@@ -1,35 +1,24 @@
 #!/usr/bin/env bash
 # Register voice clones with ominix-api on each fleet host.
 #
-# OminiX-API's voice registry is in-memory at startup (loaded from
-# ~/.OminiX/models/voices.json). Voice .wav files saved by mofa-fm
-# under ~/.octos/profiles/<profile>/data/voice_profiles/ are NOT
-# auto-discovered by ominix-api; if voices.json is missing those
-# names, every clone request hits mofa-fm's pre-validation and fails
-# with "voice 'X' is not registered on ominix-api".
+# Fleet addresses and passwords are intentionally not stored in this repository.
+# Set OCTOS_MINI<N>_HOST (for example user@host) and, only when key auth is not
+# available, OCTOS_MINI<N>_PASSWORD in the invoking environment or secret store.
 #
-# This script writes voices.json on the remote host so /v1/voices
-# enumerates every saved voice profile, then nudges the daemon to
-# pick up the change. It's idempotent: existing entries are kept
-# (operators can hand-tune ref_text/aliases without losing them).
-#
-# Run as part of post-deploy by invoking ./scripts/deploy.sh, or
-# directly when fixing a single host:
-#
-#   ./scripts/register-fleet-voices.sh           # all minis (skips mini5)
-#   ./scripts/register-fleet-voices.sh 1         # mini1 only
+# Usage:
+#   ./scripts/register-fleet-voices.sh
+#   ./scripts/register-fleet-voices.sh 1
 #   ./scripts/register-fleet-voices.sh user@host --password <pw>
 #
-# Mini5 is reserved for coding-green local testing — the script
-# refuses to touch it unless --force-mini5 is set.
+# Mini5 is reserved for coding-green local testing. The script refuses to touch
+# it unless --force-mini5 is supplied.
 set -euo pipefail
 
-# --- Built-in targets (mirror deploy.sh) ---
-HOST_1="cloud@69.194.3.128"; PW_1="zjsgf128"
-HOST_2="cloud@69.194.3.129"; PW_2="vbasx129"
-HOST_3="cloud@69.194.3.203"; PW_3="b_KPfpN7Ge2ggxF-"
-HOST_4="cloud@69.194.3.66";  PW_4=""        # key auth
-HOST_5="cloud@69.194.3.19";  PW_5="zjsgf19"
+HOST_1="${OCTOS_MINI1_HOST:-}"; PW_1="${OCTOS_MINI1_PASSWORD:-}"
+HOST_2="${OCTOS_MINI2_HOST:-}"; PW_2="${OCTOS_MINI2_PASSWORD:-}"
+HOST_3="${OCTOS_MINI3_HOST:-}"; PW_3="${OCTOS_MINI3_PASSWORD:-}"
+HOST_4="${OCTOS_MINI4_HOST:-}"; PW_4="${OCTOS_MINI4_PASSWORD:-}"
+HOST_5="${OCTOS_MINI5_HOST:-}"; PW_5="${OCTOS_MINI5_PASSWORD:-}"
 
 FORCE_MINI5=false
 TARGETS=()
@@ -57,7 +46,6 @@ while [[ $# -gt 0 ]]; do
             awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
             exit 0 ;;
         *)
-            # Treat as user@host
             TARGETS+=("custom:$1")
             shift ;;
     esac
@@ -67,8 +55,6 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
     TARGETS=("1" "2" "3" "4")
 fi
 
-# Remote script: scans voice_profiles dirs and merges into voices.json.
-# Idempotent — does not overwrite existing entries.
 REMOTE_SCRIPT='
 set -e
 mkdir -p ~/.OminiX/models
@@ -91,7 +77,6 @@ added = []
 for wav in sorted(glob.glob(os.path.join(home, ".octos/profiles/*/data/voice_profiles/*.wav"))):
     name = os.path.splitext(os.path.basename(wav))[0]
     if name in voices:
-        # keep operator-tuned entries
         continue
     voices[name] = {
         "ref_audio": wav,
@@ -109,9 +94,6 @@ shown = added if added else "(none)"
 print(f"voices.json: {len(voices)} custom entries; added this run: {shown}")
 PYEOF
 
-# Nudge ominix-api so /v1/voices reflects the new file.
-# voices.json is loaded once at startup, so we need to bounce the
-# daemon. Kickstart -k restarts under launchd if the agent is loaded.
 if launchctl print "gui/$(id -u)/io.ominix.ominix-api" >/dev/null 2>&1; then
     launchctl kickstart -k "gui/$(id -u)/io.ominix.ominix-api" 2>/dev/null || true
 elif launchctl list | grep -q io.ominix.ominix-api; then
@@ -120,7 +102,6 @@ elif launchctl list | grep -q io.ominix.ominix-api; then
     launchctl load ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null || true
 fi
 
-# Wait for /v1/voices to come back (max 20s).
 for i in $(seq 1 20); do
     sleep 1
     body=$(curl -sf --max-time 2 http://localhost:8080/v1/voices 2>/dev/null || true)
@@ -136,6 +117,10 @@ exit 1
 
 run_one() {
     local label="$1" host="$2" pw="$3"
+    if [[ -z "$host" ]]; then
+        echo "ERROR: $label host is unset; configure the matching OCTOS_MINI<N>_HOST variable" >&2
+        return 2
+    fi
     echo
     echo "=== $label ($host) ==="
     if [[ -n "$pw" ]]; then

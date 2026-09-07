@@ -5,20 +5,22 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "0 10 * * *"
 
 # Cancel a PR's in-flight run when it is superseded by a new push. Without this
-# every amend queues another full matrix behind the old one, and the
-# self-hosted/large runners (ARM, RISC-V) are the ones that back up. Never
-# cancels `main`: those runs gate the release artifacts.
+# every amend queues another full matrix behind the old one. A newer run on the
+# same ref contains every earlier commit, so it supersedes the older run.
+# Release artifacts are built by release.yml, not this workflow.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.97.1"
   FEATURES: "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
   SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home -p skill-evolve"
 
@@ -247,6 +249,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
@@ -376,6 +379,9 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -418,6 +424,9 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -533,11 +542,17 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: matrix-feature
+
+      # Workspace/all-target builds can unify the api or cfg(test) gates and
+      # hide missing symbols in FFI consumers of the minimal production lib.
+      - name: Clippy minimal octos-cli production library
+        run: cargo clippy -p octos-cli --lib --no-default-features -- -D warnings
 
       - name: Clippy octos-cli with matrix feature
         run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
@@ -546,9 +561,10 @@ jobs:
     # Deliberately NOT on PRs, unlike check-windows: the workspace has ZERO
     # `cfg(target_arch)` sites, so there is no arch-specific code for this to
     # catch that the x86 jobs do not already compile — and it costs ~67 min.
-    # It stays on `main` (and the nightly schedule) to catch toolchain- or
-    # dependency-level ARM breakage, which is the real risk here.
-    if: github.event_name != 'pull_request'
+    # The full ARM lane moved to nightly.yml. Keep this manual escape hatch for
+    # focused diagnosis without putting every main push behind the scarce ARM
+    # runner or duplicating the nightly workload.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     env:
       CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
@@ -556,6 +572,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -588,39 +607,6 @@ jobs:
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
-      # NOTE — these two steps are where check-arm dies, and it is NOT our code.
-      #
-      # check-arm fails on roughly half of `main` pushes, always the same way:
-      # GitHub kills the runner ("The hosted runner lost communication with the
-      # server ... starves it for CPU/Memory") partway through
-      # `Test octos-agent (lib)`, after steps 1-15 pass. A killed runner uploads
-      # no logs, so every failure destroys its own evidence.
-      #
-      # MEASURED on an aarch64 Ubuntu box matched to the runner (4 CPU, 15.7GB),
-      # running THIS ENTIRE JOB's step sequence in order — all-features build,
-      # test-binary build, all nine crate test steps, then these two:
-      #
-      #   step 16 `octos-agent --lib`   29.3s, 2462 passed, exit 0
-      #   step 17 `octos-agent --tests`  9 passed, exit 0
-      #   memory available               never dipped below ~14.7GB
-      #
-      # 29 seconds locally vs 46 minutes and a dead runner in CI, on the same
-      # architecture running the same sequence with memory to spare. So the
-      # workload is not the cause, and these were all tried and disproven:
-      #
-      #   - RUST_TEST_THREADS=1 (#1890): serialising changed the time-to-death by
-      #     0.7 min (46.0 -> 46.7). Contention is not it.
-      #   - timeout-minutes (#1891): never fired. Step timeouts are enforced BY
-      #     the runner agent, which is itself dying — so it cannot preserve logs.
-      #   - a hanging test: it completes in 29s.
-      #   - accumulated RAM from earlier steps: fully replicated above; memory
-      #     never moved. A lib/integration matrix split (what test-octos-agent
-      #     does for a "fresh 16GB allocation") therefore would NOT help either.
-      #
-      # Both mitigations are removed as unnecessary. If this job is still red and
-      # you are reaching for a workflow tweak: the evidence says the fix is a
-      # RUNNER change (self-hosted arm64, or retry-on-infra-failure), not config.
-      # Please do not re-litigate the four theories above without new data.
       - name: Test octos-agent (lib)
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
@@ -651,18 +637,8 @@ jobs:
     # Note this is a QUEUE limit, so `timeout-minutes` does NOT bound it —
     # that only starts counting once a runner picks the job up.
     #
-    # While queued it holds the whole run in-progress, and `cancel-in-progress`
-    # is false for `push` and `schedule`, so that one run owns the
-    # `ci-CI-refs/heads/main` concurrency slot for a full day. Every push behind
-    # it is cancelled while still pending — 22 of the last 50 `main` runs were
-    # cancelled having dispatched zero jobs.
-    #
-    # `schedule` is deliberately excluded too: the nightly cron runs on `main`
-    # and lands in the SAME concurrency group, so a schedule-only riscv job
-    # would re-wedge the slot for 24 h once a day.
-    #
-    # Restore `github.event_name != 'pull_request'` once a riscv64 runner is
-    # actually registered for this repo.
+    # While queued it holds a manual run open for a full day. Move it into the
+    # nightly matrix only after a riscv64 runner is actually registered.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-riscv
     env:
@@ -671,6 +647,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -748,10 +727,14 @@ jobs:
     # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
     # tells you nothing.
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -763,10 +746,20 @@ jobs:
       # code of its LAST line and silently swallows every failure before it.
       # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
       # two blocks were the only multi-command steps in this job.
-      - name: Build (workspace)
+      - name: Check workspace (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo check --workspace
+
+      - name: Check octos-cli + all features (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo check -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Build workspace (main/manual)
+        if: github.event_name != 'pull_request'
         run: cargo build --workspace
 
-      - name: Build (octos-cli + all features)
+      - name: Build octos-cli + all features (main/manual)
+        if: github.event_name != 'pull_request'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
 
       # Sharded per-crate tests — same rationale as the `check` job.
@@ -782,62 +775,62 @@ jobs:
       # step still fails the job, so this weakens no gate — it only makes one
       # run report the whole truth.
       - name: Test octos-core
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-core
       - name: Test octos-memory
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-memory
       - name: Test octos-llm (lib)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-llm --tests
       - name: Test octos-bus
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-bus
       - name: Test octos-pipeline
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-plugin
       - name: Test octos-sandbox
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-cli --lib
       - name: Test octos-cli (integration)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-cli --tests
       - name: Test harness starter generic
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-generic
 
       - name: Test harness starter report
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-report
 
       - name: Test harness starter audio
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-audio
 
       - name: Test harness starter coding
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-coding
 
       - name: Doc tests
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test --workspace --doc
 
   # ── Release artifact builds (main only) ──────────────────────────
@@ -848,6 +841,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
@@ -886,6 +881,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
@@ -918,12 +915,14 @@ jobs:
           retention-days: 7
 
   build-linux-arm:
-    if: github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch'
     needs: check-arm
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: arm64-release
@@ -964,6 +963,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release
@@ -1004,7 +1005,6 @@ jobs:
   # executed in any of the last 14 CI runs (#2015).
   e2e-changes:
     runs-on: ubuntu-latest
-    if: github.event_name != 'schedule'
     outputs:
       run: ${{ steps.changes.outputs.run }}
     steps:
@@ -1042,11 +1042,13 @@ jobs:
     # Run on pushes to main and on every PR whose diff touches the paths in
     # `e2e-changes`. PR-title keyword matching used to gate this job, so a PR
     # that changed tools without saying so in the title skipped e2e entirely.
-    if: github.event_name != 'schedule' && needs.e2e-changes.outputs.run == 'true'
+    if: needs.e2e-changes.outputs.run == 'true'
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -1160,8 +1162,8 @@ jobs:
       # reported SUCCESS by simply not running.
       #
       # Required checks stay deterministic. The model-dependent specs run in
-      # `e2e-live-nightly` below, where a flake costs a notification instead of
-      # a merge.
+      # Model-dependent coverage lives in nightly.yml, where it reports a
+      # regression without making model phrasing a merge gate.
       - name: Run e2e tool regression tests
         working-directory: e2e
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/tool-use-regression.spec.ts
@@ -1179,90 +1181,11 @@ jobs:
       # without a configured profile. The rest of the m9 tree (turn/start,
       # tool events, interrupt, most of fault-injection) needs a `_main`
       # profile with a provider and answers `-32602 profile '_main' is not
-      # configured` without one; those stay in `e2e-live-nightly` until CI
-      # grows a profile fixture.
+      # configured` without one; the deterministic profile fixture lives in
+      # nightly.yml.
       - name: Run m9 protocol conformance (model-independent)
         working-directory: e2e
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts
-
-      - name: Stop octos serve
-        if: always()
-        run: pkill -f "octos serve" || true
-
-  # #1923 — the model-dependent half of the e2e tree, nightly and NON-BLOCKING.
-  #
-  # These specs ask a live model to produce particular words and then assert on
-  # them exactly (`toContain('OK')`, `toContain('ALPHA')`, CJK output, event
-  # counts). They catch real regressions, but they can also fail because a model
-  # phrased an answer differently or because no provider credential is present —
-  # neither of which is a reason to block a merge.
-  #
-  # `continue-on-error` keeps a red run visible without gating anything. If these
-  # are ever promoted back to required, the assertions need to be semantic rather
-  # than exact-match first.
-  e2e-live-nightly:
-    runs-on: macos-14
-    if: github.event_name == 'schedule'
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: e2e/package-lock.json
-
-      - name: Build dashboard bundle (embedded at compile time)
-        run: ./scripts/build-dashboard.sh
-
-      - name: Build octos with all features
-        run: cargo build --release -p octos-cli --features "$FEATURES"
-
-      - name: Install Homebrew ffmpeg (macOS)
-        run: brew install ffmpeg
-
-      # Same `allow_admin_shell` config as the required job (#2031) — this job
-      # runs the full tree, which includes the admin-shell specs.
-      - name: Write CI serve config (enables the admin shell endpoint)
-        run: |
-          echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
-
-      - name: Start octos serve
-        run: |
-          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
-            --config /tmp/octos-ci-serve.json &
-          # `/api/status` is a 404; `/health` is the endpoint that answers 200.
-          # See the identical note in `e2e-tool-regression` above.
-          ready=""
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
-              echo "Server ready after ${i}s"
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ -z "$ready" ]; then
-            echo "::error::octos serve never answered /health on port 3000 after 30s."
-            exit 1
-          fi
-
-      - name: Install e2e deps
-        working-directory: e2e
-        run: npm ci
-
-      - name: Install Playwright browsers
-        working-directory: e2e
-        run: npx playwright install chromium
-
-      - name: Run model-dependent e2e specs
-        working-directory: e2e
-        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line
 
       - name: Stop octos serve
         if: always()
@@ -1274,7 +1197,6 @@ jobs:
     # Run on pushes and on every PR — the file-level detection below is the
     # only filter (title keyword matching used to let security-relevant PRs
     # slip through when the title didn't say "security"/"sandbox").
-    if: github.event_name != 'schedule'
     steps:
       # fetch-depth: 0 is load-bearing: with the old depth-2 checkout the PR
       # base sha was absent, the masked git-diff failure produced FILES="",
@@ -1284,6 +1206,8 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -1311,3 +1235,52 @@ jobs:
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
           cargo test -p octos-agent --test security_sandbox -- --nocapture
+
+  # One stable status for branch protection. Individual jobs can be renamed or
+  # conditionally skipped without requiring a repository-ruleset edit, while a
+  # real failure or cancellation still makes this gate red.
+  ci-required:
+    name: CI required
+    if: always()
+    needs:
+      - dashboard
+      - swarm-app
+      - typos
+      - ux-gate-report
+      - windows-deploy-script
+      - web-app-base-url-windows
+      - check
+      - test-octos-agent
+      - test-octos-cli
+      - check-matrix
+      - check-windows
+      - e2e-changes
+      - e2e-tool-regression
+      - security
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every mandatory job and reject failed optional jobs
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq .
+
+          for job in dashboard swarm-app typos ux-gate-report \
+            windows-deploy-script web-app-base-url-windows check \
+            test-octos-agent test-octos-cli check-matrix check-windows \
+            e2e-changes security; do
+            result=$(echo "$RESULTS" | jq -r --arg job "$job" '.[$job].result')
+            if [ "$result" != success ]; then
+              echo "::error::required job $job finished with $result"
+              exit 1
+            fi
+          done
+
+          optional=$(echo "$RESULTS" | jq -r \
+            '[."e2e-tool-regression".result] | map(select(. != "success" and . != "skipped")) | join(",")')
+          if [ -n "$optional" ]; then
+            echo "::error::conditional E2E job finished with $optional"
+            exit 1
+          fi

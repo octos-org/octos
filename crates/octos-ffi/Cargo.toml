@@ -34,6 +34,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
 
+[dev-dependencies]
+async-trait = { workspace = true }
+eyre = { workspace = true }
+
 [features]
 default = []
 # Compile the GGUF embedding backend into `octos_embed`. Without it,
