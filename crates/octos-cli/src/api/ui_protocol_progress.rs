@@ -1432,6 +1432,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
 
         let event = background_task_to_progress_json(&task);
@@ -1480,6 +1481,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
 
         let notification = replay_task_updated_notification(&session_id, &task)
@@ -1543,6 +1545,7 @@ mod tests {
             artifact_count: Some(2),
             runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
             projection_metadata: None,
+            workspace_root: None,
         };
 
         let event = background_task_to_progress_json(&task);
@@ -1588,6 +1591,7 @@ mod tests {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: None,
         };
 
         let bare_event = background_task_to_progress_json(&bare);
