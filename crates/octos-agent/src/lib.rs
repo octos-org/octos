@@ -190,10 +190,10 @@ pub use swarm::{
     MailboxMessage, MailboxRecovery,
 };
 pub use task_supervisor::{
-    BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
-    TaskCancelToken, TaskLifecycleState, TaskLivenessLease, TaskRelaunchError, TaskRuntimeState,
-    TaskStatus, TaskSupervisor, TaskTerminalGuard, TerminalEvent, TerminalOutcome,
-    parse_alternatives, task_is_live,
+    BackgroundTask, RegisterTaskError, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal,
+    TaskCancelError, TaskCancelToken, TaskLifecycleState, TaskLivenessLease, TaskRelaunchError,
+    TaskRuntimeState, TaskStatus, TaskSupervisor, TaskTerminalGuard, TerminalEvent,
+    TerminalOutcome, parse_alternatives, task_is_live,
 };
 pub use tools::{
     AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,

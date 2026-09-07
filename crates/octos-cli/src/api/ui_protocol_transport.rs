@@ -5431,7 +5431,14 @@ fn forward_task_progress_to_channel(
     };
     forward_task_progress_json_to_channel(tx, progress_dropped, task, "task_progress", json);
 
-    if let Some((session_id, agent)) = upsert_background_task_agent(task, runtime_profile_id) {
+    let mirrored = match upsert_background_task_agent(task, runtime_profile_id) {
+        Ok(mirrored) => mirrored,
+        Err(error) => {
+            tracing::warn!(task_id = %task.id, error = %error.message, "task progress mirror admission failed");
+            return;
+        }
+    };
+    if let Some((session_id, agent)) = mirrored {
         let event = json!({
             "type": "agent_updated",
             "session_id": session_id,
@@ -5481,9 +5488,13 @@ fn forward_terminal_agent_update_durable(
     if !task.status.is_terminal() {
         return;
     }
-    let Some((session_id, agent_value)) = upsert_background_task_agent(task, runtime_profile_id)
-    else {
-        return;
+    let (session_id, agent_value) = match upsert_background_task_agent(task, runtime_profile_id) {
+        Ok(Some(mirrored)) => mirrored,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(task_id = %task.id, error = %error.message, "durable terminal mirror admission failed");
+            return;
+        }
     };
     let Ok(agent) = serde_json::from_value::<octos_core::ui_protocol::UiAgentRecord>(agent_value)
     else {
@@ -12011,7 +12022,11 @@ fn wire_goal_task_row_observers_for_cached_supervisor(
 ) {
     // Round 3 — thin adapter over the SHARED installer so this site cannot
     // drift from the per-turn / gateway wiring or from the effect tests.
-    crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+    // #8 — the COMPOSED variant: a cached WS supervisor can restore
+    // `peer_handoff` rows, so its restore must also adopt parked orphans whose
+    // `result.md` already sits on the blackboard (one shared `on_restore`
+    // callback; goal resolvers unchanged).
+    crate::autonomy::agent_orchestrator::install_peer_restore_observers_resolving_at_callback(
         supervisor,
         session_id,
         profile_id,
@@ -31298,7 +31313,7 @@ async fn run_m15_live_subagent_fixture_turn(
 
     for spec in specs {
         let artifact_path = artifact_dir.join(spec.artifact_file);
-        let agent = default_agent_orchestrator().upsert_agent(AgentUpsert {
+        let agent = match default_agent_orchestrator().upsert_agent(AgentUpsert {
             agent_id: spec.agent_id.to_owned(),
             parent_agent_id: Some("master".to_owned()),
             session_id: session_id.clone(),
@@ -31311,7 +31326,17 @@ async fn run_m15_live_subagent_fixture_turn(
             last_task: Some("Running live code review check".to_owned()),
             cwd: Some(workdir.to_string_lossy().into_owned()),
             profile_id: profile_id.clone(),
-        });
+        }) {
+            Ok(agent) => agent,
+            Err(error) => {
+                joins.abort_all();
+                while joins.join_next().await.is_some() {}
+                return M9FixtureOutcome::Errored {
+                    code: "m15_subagent_admission_failed",
+                    message: error.message,
+                };
+            }
+        };
         let _ = send_raw_notification_ephemeral(
             ws,
             octos_core::ui_protocol::methods::AGENT_UPDATED,
@@ -31678,8 +31703,13 @@ async fn seed_m9_task_output_fixture(
         ))
         .map_err(|error| format!("failed to enable task persistence: {error}"))?;
     supervisor.set_on_change(move |task| {
-        let Some((event_session_id, agent_value)) = upsert_background_task_agent(task, None) else {
-            return;
+        let (event_session_id, agent_value) = match upsert_background_task_agent(task, None) {
+            Ok(Some(mirrored)) => mirrored,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(task_id = %task.id, error = %error.message, "fixture mirror admission failed");
+                return;
+            }
         };
         let Ok(agent) = serde_json::from_value::<UiAgentRecord>(agent_value) else {
             return;
@@ -32988,15 +33018,22 @@ async fn run_standalone_turn(
                     .clone()
                     .map(|goal_id| (goal_id, goal_charge_profile.clone()))
             });
-        // #2056 round 2 (H2b) — the RECONCILE binding is resolved separately
-        // and WITHOUT the active-only filter above. Registration is right to
-        // refuse a non-active goal (no new work should be recorded against
-        // one); reconciliation is not — a paused or budget-limited goal keeps
-        // its ledger, and its stranded rows are still wrong. Resolved at
-        // callback time, on the same keys, so a goal that leaves `active`
-        // mid-turn is still reconciled at the next restore. The profile falls
-        // back exactly like `terminal_profile_id` below, because
-        // `goal_charge_profile` degrades to `_main` on a goal-less turn.
+        // #14 (codex round 2, item A) — the per-turn WS supervisor's restore
+        // observer is now the COMPOSED variant (goal resolvers + parked-peer
+        // adoption), identical to the gateway actor's
+        // `session_actor.rs` wiring. This is the supervisor `peer_handoff`
+        // ACTUALLY registers against: `emit_staged` below binds the peer task
+        // via `tool_registry.supervisor()` — i.e. THIS fresh per-turn
+        // supervisor from `snapshot_excluding` — so the goal-only install
+        // here previously left the WS restart-recovery path parking peer
+        // rows without ever adopting them. The extra restore consumer in
+        // `install_peer_restore_observers_composed` REPLACES the single
+        // `on_restore` slot, so the turn-scoped reconcile resolver below
+        // would be silently dropped if we installed it first — hence the
+        // hand-built restore callback that adopts first, then reconciles
+        // through this turn's resolver chain (goal-context key preferred,
+        // wire-key fallback — the #2056 round-2 H2b semantics preserved
+        // verbatim), both halves over the POST-adoption table.
         let restore_goal_key = goal_context.as_ref().map(|goal_ctx| {
             (
                 goal_ctx.goal_session_key.clone(),
@@ -33008,28 +33045,48 @@ async fn run_standalone_turn(
             .clone()
             .or_else(|| routed_profile_id.clone())
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
-        // Round 3 — the SHARED installer wires both halves (recorder +
-        // change-feed settle listener), with THIS turn's dispatch-time
-        // binding snapshot as the resolver. The settle rides the change
-        // feed as a NAMED listener (not the `on_terminal` sink below):
-        // `cancel` emits only `notify_change`, and the sink's once-per-task
-        // dedupe would swallow the owner's failed→complete correction.
-        // Inherited by nested child supervisors.
-        crate::autonomy::agent_orchestrator::install_goal_task_row_observers(
+        let peer_adopt_profile = session_runtime.profile.profile_id.clone();
+        let peer_adopt_data_dir = session_runtime.profile.data_dir.clone();
+        let peer_adopt_supervisor = task_supervisor.clone();
+        let peer_adopt_master = session_id.to_string();
+        let reconcile_supervisor = task_supervisor.clone();
+        crate::autonomy::agent_orchestrator::install_peer_restore_observers_composed(
             &task_supervisor,
             &session_runtime.profile.data_dir,
             move || register_goal_binding.clone(),
-            move || {
+            move |_restored| {
+                // B — adopt FIRST (its `mark_completed` re-stashes the
+                // task→goal binding from the staged dir's `goal` file), then
+                // reconcile the POST-adoption table so the adopted row's
+                // terminal verdict reaches the goal ledger.
+                crate::peers::adopt_parked_peer_tasks_with_results(
+                    &peer_adopt_supervisor,
+                    &peer_adopt_profile,
+                    &peer_adopt_master,
+                    &peer_adopt_data_dir,
+                    &peer_adopt_supervisor.get_all_tasks(),
+                );
                 let orchestrator = default_agent_orchestrator();
-                if let Some((goal_key, profile)) = restore_goal_key.as_ref()
-                    && let Some(goal_id) =
-                        orchestrator.bound_goal_id_under_goal_key(goal_key, profile)
-                {
-                    return Some((goal_id, profile.clone()));
+                let binding = if let Some((goal_key, profile)) = restore_goal_key.as_ref() {
+                    orchestrator
+                        .bound_goal_id_under_goal_key(goal_key, profile)
+                        .map(|goal_id| (goal_id, profile.clone()))
+                } else {
+                    None
                 }
-                orchestrator
-                    .bound_goal_id(&restore_wire_key, &restore_wire_profile)
-                    .map(|goal_id| (goal_id, restore_wire_profile.clone()))
+                .or_else(|| {
+                    orchestrator
+                        .bound_goal_id(&restore_wire_key, &restore_wire_profile)
+                        .map(|goal_id| (goal_id, restore_wire_profile.clone()))
+                });
+                if let Some((goal_id, profile)) = binding {
+                    orchestrator.reconcile_goal_task_rows_after_restore(
+                        &peer_adopt_data_dir,
+                        &profile,
+                        &goal_id,
+                        &reconcile_supervisor.get_all_tasks(),
+                    );
+                }
             },
         );
         // Gap-1 unification: the single terminal sink. Routes BOTH success
@@ -33565,43 +33622,76 @@ async fn run_standalone_turn(
             // runs many turns and would otherwise retire after its first.
             let peer_supervisor = tool_registry.supervisor();
             let peer_task_profile = session_runtime.profile.profile_id.clone();
-            let peer_task_root = session_runtime.profile.data_dir.join("peers");
+            // #1707 round 5 codex round 2 (board item #13 round 2) — stamp
+            // the registered peer task with THIS turn's workspace root, from
+            // the SAME `SessionRuntime.workspace_root` instance the
+            // interrupt-time `/stop` purge reads (`purge_workspace` below).
+            // Both sides then compare ONE value; the pre-#13r2 derivation
+            // from `output_files[0]` never matched it in production (close
+            // path: empty output files → `cwd=None`; orphan adoption:
+            // `cwd=<profile-data>/peers/<slug>`).
+            // #21 (round-4, codex #17 B3) — LOSSLESS scope encoding: hex of
+            // the path's raw OsStr bytes (never `to_str()`, which collapses
+            // every non-UTF-8 root to None and desynced the stamp from the
+            // purge argument). The decode side (`/stop` purge) encodes its
+            // own `workspace_root` with the SAME helper, so both endpoints
+            // compare one representation.
+            let peer_task_scope =
+                crate::peers::workspace_scope_encode(&session_runtime.workspace_root);
+            // #14 (codex round 2, item C) — the peers root for the
+            // registration-time task-id binding the restore-time adoption
+            // sweep exact-matches against (see
+            // `peers::persist_peer_task_id_binding`).
+            let peer_binding_peers_root = session_runtime.profile.data_dir.join("peers");
             let emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync> = Arc::new(
                 move |event: PeerStagedEvent| {
                     let registry_key = peer_wire_key(&peer_task_profile, &event.slug);
-                    // `register` returns an EMPTY-STRING sentinel when the
-                    // supervisor refuses. Binding that would make the close path
-                    // try to retire a task that never existed. See
-                    // `bind_peer_supervised_task` for the binding contract.
-                    if let Some(task_id) = bind_peer_supervised_task(
+                    // #22: the staged identity gate and the strict workspace
+                    // registration share one helper, also exercised by tests.
+                    match crate::peers::bind_staged_peer_supervised_task(
                         &peer_supervisor,
                         registry_key,
                         &event.session_id.0,
+                        peer_task_scope.as_deref(),
+                        &peer_binding_peers_root,
+                        &event.slug,
                     ) {
-                        if let Err(error) = record_peer_lifetime_binding(
-                            &peer_task_root,
-                            &peer_task_profile,
-                            &event.slug,
-                            &event.session_id.0,
-                            &task_id,
-                        ) {
-                            peer_task_registry().take_if_task(
-                                &peer_wire_key(&peer_task_profile, &event.slug),
+                        Ok(Some(task_id)) => {
+                            if let Err(error) = record_peer_lifetime_binding(
+                                &peer_binding_peers_root,
+                                &peer_task_profile,
+                                &event.slug,
+                                &event.session_id.0,
                                 &task_id,
-                            );
-                            peer_supervisor.mark_failed(
-                                &task_id,
-                                format!("failed to persist peer lifetime: {error}"),
-                            );
-                            tracing::warn!(%error, slug = %event.slug, "peer lifetime persistence failed");
+                            ) {
+                                peer_task_registry().take_if_task(
+                                    &peer_wire_key(&peer_task_profile, &event.slug),
+                                    &task_id,
+                                );
+                                peer_supervisor.mark_failed(
+                                    &task_id,
+                                    format!("failed to persist peer lifetime: {error}"),
+                                );
+                                tracing::warn!(%error, slug = %event.slug, "peer lifetime persistence failed");
+                            }
                         }
-                    } else {
-                        tracing::warn!(
-                            slug = %event.slug,
-                            master = %event.session_id,
-                            "peer task registration refused by the supervisor; \
-                             peer runs UNSUPERVISED (no task row, no cancel token)"
-                        );
+                        Ok(None) => {
+                            tracing::warn!(
+                                slug = %event.slug,
+                                master = %event.session_id,
+                                "peer task registration refused by the supervisor; \
+                                 peer runs UNSUPERVISED (no task row, no cancel token)"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                slug = %event.slug,
+                                master = %event.session_id,
+                                error = %err,
+                                "peer task binding failed (identity gate or workspace \
+                                 persistence); peer runs UNSUPERVISED"
+                            );
+                        }
                     }
                     let _ = send_notification_durable(
                         &peer_ws,
@@ -36368,6 +36458,53 @@ async fn run_standalone_turn(
         // LLM / web_search future at its next poll. Idempotent: already-
         // terminal tasks return `AlreadyTerminal` and are skipped.
         cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
+        // #1707 round 5 (board item #7): a terminal mirror that lands AFTER
+        // this interrupt (task-status re-forward, restart replay into a
+        // fresh runtime) must not re-enter the session as a
+        // ChildCompleted / ScatterJoinComplete continuation — the user just
+        // asked for everything to stop. Purge the session's pending
+        // terminal continuations under one state lock, tombstone them
+        // durably (single batched `record_continuations_coalesced`), and
+        // stamp the delivered marks so a same-process re-forward collapses.
+        // Scoped to the terminal pair only: GoalContinue/GoalWrapUp/LoopFire/
+        // External own their lifecycle (goal pause, loop delete, fleet
+        // outbox). Idempotent: a replayed interrupt finds nothing pending
+        // and returns 0.
+        //
+        // #1707 round 5 codex round 2 (board item #13) — the purge is scoped
+        // to the full `(session, profile, workspace)` triple, not the bare
+        // session id: a same-named session under another profile, or the same
+        // profile+session rebound to a different project folder
+        // (`sessions_in_cwd`), keeps its own pending terminal items. The
+        // profile is THIS turn's resolved runtime profile
+        // (`session_runtime.profile.profile_id`) — the same id every agent
+        // the turn spawned was registered with. The workspace is THIS turn's
+        // effective tool workspace (`session_runtime.workspace_root`), the
+        // same root the tool registry was bound to and the canonical cwd the
+        // children inherited (the continuations' `payload:workspace` stamps
+        // come from `agent.cwd`). An empty root string normalizes to `None`,
+        // matching unstamped items only.
+        //
+        // #21 (round-4, codex #17 B3) — BOTH endpoints now encode the root
+        // with `workspace_scope_encode` (hex of the raw OsStr bytes): the
+        // stamp side (peer task registration) and this purge side share one
+        // lossless representation, so a non-UTF-8 root stamps and purges as
+        // the SAME scope instead of one side collapsing to `None` via
+        // `to_str()` and silently widening the match.
+        let purge_workspace = crate::peers::workspace_scope_encode(&session_runtime.workspace_root);
+        let purged = default_agent_orchestrator().clear_pending_terminal_continuations_for_session(
+            &session_id,
+            &session_runtime.profile.profile_id,
+            purge_workspace.as_deref(),
+            "session_interrupt_stop",
+        );
+        if purged > 0 {
+            tracing::info!(
+                session = %session_id,
+                purged,
+                "interrupt purged pending terminal continuations for the stopped session"
+            );
+        }
         // FIX-04: also flush any accumulated drops before the lifecycle
         // terminal so the client knows the cursor is incomplete.
         flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);

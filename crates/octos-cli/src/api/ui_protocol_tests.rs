@@ -13449,20 +13449,22 @@ fn appui_task_artifacts_resolve_agent_task_artifacts() {
     let session_id = SessionKey::with_profile(profile_id, "api", "agent-artifacts");
     let task_id = TaskId::new();
     let orchestrator = InProcessAgentOrchestrator::default();
-    orchestrator.upsert_agent(AgentUpsert {
-        agent_id: "agent-1".into(),
-        parent_agent_id: Some("master".into()),
-        session_id: session_id.clone(),
-        task_id: Some(task_id.clone()),
-        path: "master/agent-1".into(),
-        role: "worker".into(),
-        nickname: "Worker".into(),
-        backend_kind: "native".into(),
-        status: "completed".into(),
-        last_task: Some("summarize".into()),
-        cwd: None,
-        profile_id: profile_id.into(),
-    });
+    orchestrator
+        .upsert_agent(AgentUpsert {
+            agent_id: "agent-1".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.clone()),
+            path: "master/agent-1".into(),
+            role: "worker".into(),
+            nickname: "Worker".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("summarize".into()),
+            cwd: None,
+            profile_id: profile_id.into(),
+        })
+        .unwrap();
     orchestrator
         .set_agent_artifacts(
             "agent-1",
@@ -23074,6 +23076,7 @@ fn make_background_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -23355,6 +23358,7 @@ async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentr
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     };
 
     // The production `set_on_change` callback, threading the resolved
@@ -23468,6 +23472,7 @@ fn unified_terminal_test_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -34696,7 +34701,8 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
         crate::autonomy::agent_orchestrator::upsert_background_task_agent(
             task,
             Some("peer-close-no-wake"),
-        );
+        )
+        .unwrap();
     });
     supervisor.set_on_terminal(|event| {
         crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
