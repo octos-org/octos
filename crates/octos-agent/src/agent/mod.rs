@@ -1143,7 +1143,7 @@ impl Agent {
     /// Builder: set the build-cache pool slot this peer's current turn holds
     /// (outer-loop #4, docs/build-cache-pool.md §4/§7.4). Called by the peer
     /// turn boot — serve adopts the staging slot on the first turn and
-    /// acquires fresh on later ones; solo acquires at `run_chat_peer` entry.
+    /// acquires fresh on later ones. The solo chat path does not allocate pool slots.
     /// Threaded into `ToolContext.build_cache_slot` so the shell tool can
     /// inject `CARGO_TARGET_DIR` per tool call (never a process env var).
     pub fn with_build_cache_slot(mut self, slot: std::path::PathBuf) -> Self {

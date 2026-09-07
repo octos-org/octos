@@ -146,7 +146,7 @@ serve 路径上每个 peer turn 都收口于 `write_peer_result_if_peer_session`
 
 - **adopt 规则(首轮槽交接)**:boot 段读 `peers/<slug>/build-cache`(stage_peer 已持久化的槽路径,§7.4)。若其命名的槽 `holder.json` 的 slug 与本 peer slug 一致 ⇒ **认领既有槽**:接手其锁 fd、改写 holder.json(仍写本 slug,acquired_at 刷新),不再新 acquire。只有「无记录槽」或「记录槽 holder.json 属他人」才走 §3.2 全新 acquire。理由:首轮槽的 flock 已由同进程(stage_peer)持有,flock 锁随 open file description 走,同进程第二个 fd 的 `EX|NB` 必然 EWOULDBLOCK ⇒ 裸 acquire 会抢走另一槽(2 槽池被同一 peer 双持);且 boot 段若覆写 build-cache 文件,staging 槽就以活 pid 之名漏到 serve 退出——两处事故 adopt 一并消除。
 
-solo 侧 `run_chat_peer`(commands/chat.rs:828)是单 turn 驱动(`process_message(brief)` 一次、写完 result.md 即返回),其收尾/`Err` 分支(chat.rs:806 附近的 eprintln)本身就是该 turn 的终态:`release(slot, Completed/Failed)` 挂在返回前。同一 peer 的下一个 turn 重新 acquire,可能拿到不同槽——无妨:槽内容本就跨 peer 复用(I2),持有只是互斥权,不承诺粘性。
+solo 路径尚未接入构建缓存池，池功能保持关闭；`run_chat_peer` 不领取或释放池槽。当前按 turn 领取与释放的接线用于 serve 中启用池配置的 peer。
 
 staging 失败回滚:首轮槽已在 stage_peer 内 acquire ⇒ `cleanup_staged_peer`(peers/mod.rs:1912–1924)同函数内 release(见 #4 的失败回滚注意)。
 
