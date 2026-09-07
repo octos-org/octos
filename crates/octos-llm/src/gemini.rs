@@ -475,6 +475,11 @@ struct GeminiSystemInstruction {
 
 #[derive(Serialize, Deserialize)]
 struct GeminiContent {
+    // Gemini normally returns `role: "model"`, but the API is allowed to
+    // omit it (for example on a short/MAX_TOKENS response).  The role is only
+    // needed while constructing request history; response decoding consumes
+    // the parts and must not reject an otherwise valid provider response.
+    #[serde(default)]
     role: String,
     #[serde(default)]
     parts: Vec<GeminiPart>,
@@ -2019,6 +2024,24 @@ mod tests {
             Some("Return the concise answer.")
         );
         assert_eq!(response.usage.reasoning_tokens, 7);
+    }
+
+    #[test]
+    fn test_gemini_response_accepts_content_without_role() {
+        let api_response: GeminiResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{ "text": "OK" }]
+                    },
+                    "finishReason": "STOP"
+                }
+            ]
+        }))
+        .expect("Gemini response role is optional");
+
+        let response = gemini_response_to_chat_response(api_response, "gemini", "test").unwrap();
+        assert_eq!(response.content.as_deref(), Some("OK"));
     }
 
     // --- Provider metadata tests ---
