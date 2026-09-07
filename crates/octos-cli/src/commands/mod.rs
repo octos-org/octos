@@ -4,6 +4,7 @@ mod account;
 pub mod acp;
 mod admin;
 mod auth;
+mod cache;
 mod channels;
 pub mod chat;
 mod clean;
@@ -58,6 +59,7 @@ pub use acp::AcpCommand;
 pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
+pub use cache::CacheCommand;
 pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
 pub use clean::CleanCommand;
@@ -133,6 +135,8 @@ pub enum Command {
     Channels(ChannelsCommand),
     /// Interactive multi-turn chat with an agent.
     Chat(ChatCommand),
+    /// Inspect and reclaim the build-cache pool (`status` / `gc` / `gate`).
+    Cache(CacheCommand),
     /// Inspect the saved startup config (`show` / `path`); read-only.
     Config(ConfigCommand),
     /// Manage scheduled cron jobs.
@@ -202,6 +206,11 @@ pub fn reserve_stdout(command: &Command) -> bool {
         // `inbox path` is a machine-readable single path.
         Command::Inbox(_) => true,
         Command::Doctor(cmd) => cmd.json,
+        // `octos cache <sub> --json` emits a machine-readable object meant
+        // for scripting / the outer loop's gate check — same rule as
+        // `doctor --json`. Without `--json` the human table stays on the
+        // historical stdout routing.
+        Command::Cache(cmd) => cmd.emits_json(),
         _ => false,
     }
 }
@@ -393,6 +402,7 @@ impl Executable for Command {
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
+            Self::Cache(cmd) => cmd.execute(),
             Self::Config(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
             Self::Doctor(cmd) => cmd.execute(),

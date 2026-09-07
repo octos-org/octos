@@ -45,6 +45,7 @@ use octos_core::ui_protocol::{
 use tracing::warn;
 
 use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
+use crate::build_cache::pool::{BuildCacheConfig, Slot, SlotOutcome};
 use crate::contracts::UiProtocolContractStores;
 
 mod recovery;
@@ -914,6 +915,740 @@ pub(crate) mod peer_io {
     }
 }
 
+/// Build-cache pool integration for peers (outer-loop #4,
+/// docs/build-cache-pool.md §4/§7.4).
+///
+/// The slot lifecycle is ONE PEER TURN, not the peer session: staging
+/// acquires the FIRST turn's slot and records it in
+/// `peers/<slug>/build-cache`; the serve boot ADOPTS that slot on turn 1
+/// (§4.1 adopt rule — the staging flock is held by the SAME process, so a
+/// fresh `acquire` would EWOULDBLOCK and grab a second slot) and acquires
+/// fresh on later turns; the turn terminal releases (primary), with close /
+/// interrupt / eviction / rollback as idempotent safety nets (§4.2).
+pub(crate) mod build_cache_peer {
+    use std::path::{Path, PathBuf};
+
+    use super::RpcError;
+    use crate::build_cache::pool::{
+        BuildCacheConfig, HolderInfo, Slot, SlotOutcome, SlotPurpose, acquire, release,
+    };
+    use crate::build_cache::repo_key_for_path;
+
+    /// The per-peer read-back leaf (`peers/<slug>/build-cache`): one line,
+    /// the slot dir path held by the peer's CURRENT turn (§7.4). Written by
+    /// whichever side acquired (staging on turn 1, boot on later turns);
+    /// boot turn 1 reads it back and ADOPTS instead of double-acquiring.
+    pub(crate) const LEAF: &str = "build-cache";
+
+    /// The pool root for a profile data dir (§1.1): beside `peers/`, so slot
+    /// and peer metadata share a lifecycle root and (by default, with the
+    /// pool inside the octos home) peer sandboxes can read it without an
+    /// extra read grant.
+    pub(crate) fn pool_root(data_dir: &Path) -> PathBuf {
+        data_dir.join("build-cache")
+    }
+
+    fn err_text(slug: &str, err: crate::build_cache::BuildCacheError) -> String {
+        format!("build-cache slot for peer '{slug}': {err}")
+    }
+
+    /// Acquire the peer's FIRST-turn slot during staging and record it in
+    /// `peers/<slug>/build-cache` (§7.4). Called from `stage_peer` AFTER the
+    /// dir is reserved but BEFORE `brief.md` (the visibility gate): a peer
+    /// that boots can always read its slot back. Space-gate / pool-exhausted
+    /// failures roll the staging back (the caller passes the error through
+    /// as an `RpcError`, fail-fast per §3.2 step 5 — never queue).
+    pub(crate) fn acquire_for_staging(
+        peers_root: &Path,
+        workspace_root: &Path,
+        slug: &str,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
+        config: &BuildCacheConfig,
+    ) -> Result<Slot, RpcError> {
+        let data_dir = peers_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| peers_root.to_path_buf());
+        let repo_key = repo_key_for_path(workspace_root).ok_or_else(|| {
+            RpcError::internal_error(format!(
+                "build-cache slot for peer '{slug}': cannot canonicalize workspace root {} \
+                 (repo-key derivation failed)",
+                workspace_root.display()
+            ))
+        })?;
+        let holder = HolderInfo {
+            slug: Some(slug.to_owned()),
+            goal_id: goal_id.filter(|s| !s.is_empty()).map(str::to_owned),
+            task_id: task_id.filter(|s| !s.is_empty()).map(str::to_owned),
+            purpose_note: None,
+            // Peer slots are held by THIS serve process; no override (#6's
+            // override exists only for the CLI's cross-process verify slot).
+            pid_override: None,
+        };
+        let slot = acquire(
+            &pool_root(&data_dir),
+            &repo_key,
+            SlotPurpose::Peer,
+            config,
+            &holder,
+        )
+        .map_err(|e| RpcError::internal_error(err_text(slug, e)))?;
+        Ok(slot)
+    }
+
+    /// Acquire and record as one operation, releasing on a failed write.
+    /// Both staging and turn boot must leave no live-pid holder on failure.
+    pub(crate) fn acquire_recorded(
+        peers_root: &Path,
+        workspace_root: &Path,
+        slug: &str,
+        goal_id: Option<&str>,
+        task_id: Option<&str>,
+        config: &BuildCacheConfig,
+    ) -> Result<Slot, RpcError> {
+        let mut slot =
+            acquire_for_staging(peers_root, workspace_root, slug, goal_id, task_id, config)?;
+        if let Err(err) = record_slot(&peers_root.join(slug), &slot) {
+            release_slot(&mut slot, SlotOutcome::Cancelled);
+            return Err(RpcError::internal_error(format!(
+                "failed to record build-cache slot for peer '{slug}': {err}"
+            )));
+        }
+        Ok(slot)
+    }
+
+    /// Atomically retain the claim and its tracker for the exact turn owner.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn slot_for_owned_turn(
+        peers_root: &Path,
+        workspace_root: &Path,
+        slug: &str,
+        owner: &super::BuildCacheTurnOwner,
+    ) -> Result<Option<super::BuildCacheSlotView>, RpcError> {
+        let peer_dir = peers_root.join(slug);
+        let clone = peer_dir.join("wt");
+        let key = super::build_cache_slot_registry_key(peers_root, slug);
+        let registry = super::build_cache_slot_registry();
+        let mut map = registry.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get(&key)
+            && let super::BuildCacheSlotState::Active(current) = &entry.state
+            && current != owner
+        {
+            return Err(super::build_cache_owned_error());
+        }
+        // Ownership is checked before eligibility: a rejected session cannot
+        // retire another turn's claim after a repository/config change.
+        let config = super::build_cache_config_for(peers_root);
+        if !clone.is_dir()
+            || super::wire_fenced_peer_build_cache(&clone, workspace_root)
+                != super::PeerBuildCache::Shared
+            || config.is_none()
+        {
+            let entry = map.remove(&key);
+            drop(map);
+            if let Some(entry) = entry {
+                entry.release(SlotOutcome::Cancelled);
+            }
+            return Ok(None);
+        }
+        if let Some(entry) = map.get_mut(&key) {
+            entry.state = super::BuildCacheSlotState::Active(owner.clone());
+            return Ok(Some(entry.view()));
+        }
+        let slot = acquire_for_turn(peers_root, &peer_dir, &clone, slug, &config.unwrap())?;
+        let entry = super::BuildCacheSlotEntry {
+            slot,
+            usage: Default::default(),
+            state: super::BuildCacheSlotState::Active(owner.clone()),
+        };
+        let view = entry.view();
+        map.insert(key, entry);
+        Ok(Some(view))
+    }
+
+    fn acquire_for_turn(
+        peers_root: &Path,
+        peer_dir: &Path,
+        clone: &Path,
+        slug: &str,
+        config: &BuildCacheConfig,
+    ) -> Result<Slot, RpcError> {
+        // The session workspace is the clone. As in collect_peer_branch,
+        // origin identifies the SOURCE repository: hashing the clone here
+        // would split the bounded source pool on the second turn.
+        let origin = std::process::Command::new("git")
+            .arg("-C")
+            .arg(clone)
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .filter(|origin| !origin.is_empty())
+            .ok_or_else(|| {
+                RpcError::internal_error(format!(
+                    "build-cache slot for peer '{slug}': cannot resolve source repository"
+                ))
+            })?;
+        let goal = super::peer_io::read_peer_file(
+            peer_dir,
+            "goal",
+            super::peer_io::PEER_FILE_READ_CAP_SMALL,
+        );
+        let mut lines = goal.as_deref().unwrap_or_default().lines();
+        let goal_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+        let task_id = lines.next().map(str::trim).filter(|s| !s.is_empty());
+        acquire_recorded(
+            peers_root,
+            Path::new(&origin),
+            slug,
+            goal_id,
+            task_id,
+            config,
+        )
+    }
+
+    // Legacy fixture helper: exercise the production ownership/eligibility path,
+    // then extract its handle so existing pool-focused tests can release it.
+    #[cfg(test)]
+    pub(crate) fn slot_for_turn(
+        peers_root: &Path,
+        workspace_root: &Path,
+        slug: &str,
+    ) -> Result<Option<Slot>, RpcError> {
+        let owner = super::BuildCacheTurnOwner {
+            generation: 0,
+            session: octos_core::SessionKey("fixture".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        let view = slot_for_owned_turn(peers_root, workspace_root, slug, &owner)?;
+        Ok(view.and_then(|_| {
+            super::build_cache_slot_registry()
+                .by_key
+                .lock()
+                .unwrap()
+                .remove(&super::build_cache_slot_registry_key(peers_root, slug))
+                .map(|entry| entry.slot)
+        }))
+    }
+
+    /// Persist the held slot to `peers/<slug>/build-cache` (§7.4). The file
+    /// is a read-back channel, not the truth — the flock + `holder.json`
+    /// are. Production callers use acquire_recorded so write failures
+    /// surface and release the newly acquired slot at staging and turn boot.
+    pub(crate) fn record_slot(peer_dir: &Path, slot: &Slot) -> std::io::Result<()> {
+        super::peer_io::write_peer_file_atomic(peer_dir, LEAF, &slot.path.to_string_lossy())
+    }
+
+    /// Release a held slot, mapping the peer outcome onto the pool's
+    /// outcome enum (§3.4 — the outcome is diagnostics-only; release
+    /// behavior is identical for every arm). Idempotent by construction:
+    /// `pool::release` is a no-op once `holder.json` is gone, so the turn
+    /// terminal, the close callback, and eviction may all fire.
+    pub(crate) fn release_slot(slot: &mut Slot, outcome: SlotOutcome) {
+        if let Err(err) = release(slot, outcome) {
+            tracing::warn!(%err, outcome = ?outcome, "build-cache slot release failed (crash recovery applies)");
+        }
+    }
+}
+
+/// Process-global map of `"{profile}:peer:{slug}"` → the build-cache slot
+/// handle CURRENTLY held for that peer's turn (outer-loop #4).
+///
+/// WHY a registry at all: an flock belongs to the open file description, so
+/// `release` must run on the SAME `Slot` (with its lock fd) that `acquire`
+/// returned — re-opening `.lock` by path would mint a second description and
+/// `try_lock_exclusive` would EWOULDBLOCK against ourselves. The handle is
+/// therefore parked here between the acquire side (staging for turn 1, serve
+/// boot for later turns) and the release side (turn terminal primary; close /
+/// interrupt / eviction safety nets). Same key shape and process-global
+/// lifetime discipline as `peer_wire_registry` / `peer_task_registry`: a peer
+/// is staged on one path and released on another.
+pub(crate) struct BuildCacheSlotRegistry {
+    by_key: std::sync::Mutex<HashMap<String, BuildCacheSlotEntry>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BuildCacheTurnOwner {
+    pub session: SessionKey,
+    pub turn: octos_core::ui_protocol::TurnId,
+    /// Server dispatch identity; transport pins its state allocation while referenced.
+    pub generation: usize,
+}
+
+pub(crate) struct BuildCacheSlotView {
+    pub path: PathBuf,
+    pub usage: octos_agent::tools::BuildCacheUsage,
+}
+
+enum BuildCacheSlotState {
+    Staged,
+    Active(BuildCacheTurnOwner),
+}
+
+fn build_cache_owned_error() -> RpcError {
+    RpcError::invalid_request(
+        "build_cache_unavailable: another turn owns this peer's build-cache slot",
+    )
+    .with_data(serde_json::json!({"code": "build_cache_unavailable"}))
+}
+
+struct BuildCacheSlotEntry {
+    state: BuildCacheSlotState,
+    slot: Slot,
+    usage: octos_agent::tools::BuildCacheUsage,
+}
+
+impl BuildCacheSlotEntry {
+    fn owned_by(&self, owner: &BuildCacheTurnOwner) -> bool {
+        matches!(&self.state, BuildCacheSlotState::Active(current) if current == owner)
+    }
+    fn view(&self) -> BuildCacheSlotView {
+        BuildCacheSlotView {
+            path: self.slot.path.clone(),
+            usage: self.usage.clone(),
+        }
+    }
+
+    fn release(self, outcome: SlotOutcome) {
+        let mut slot = self.slot;
+        self.usage.close_and_when_idle(move || {
+            build_cache_peer::release_slot(&mut slot, outcome);
+        });
+    }
+}
+
+/// Registry key for one peer's held slot: `"<peers_root>\u{1f}<slug>"`. The
+/// separator is a control char no path component or slug may contain, so two
+/// peers of different profiles (or a slug that happens to contain the other's
+/// root as a prefix) can never collide.
+pub(crate) fn build_cache_slot_registry_key(peers_root: &Path, slug: &str) -> String {
+    format!("{}\u{1f}{slug}", peers_root.to_string_lossy())
+}
+
+impl Default for BuildCacheSlotRegistry {
+    fn default() -> Self {
+        Self {
+            by_key: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+pub(crate) fn build_cache_slot_registry() -> &'static BuildCacheSlotRegistry {
+    static REGISTRY: OnceLock<BuildCacheSlotRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(BuildCacheSlotRegistry::default)
+}
+
+/// Per-`peers_root` build-cache config, installed by the process that owns
+/// the peers (serve bootstrap / chat `--peers` host) so `stage_peer` can
+/// acquire a first-turn slot WITHOUT growing its already-10-argument
+/// signature through ~20 call sites. Absent = the pool is OFF for that root:
+/// staging then behaves exactly as before #4 (no slot, no `build-cache`
+/// file). This mirrors how `peer_wire_registry` / `peer_task_registry` make
+/// process-global state reachable from staging and close alike.
+static BUILD_CACHE_CONFIGS: OnceLock<std::sync::Mutex<HashMap<String, BuildCacheConfig>>> =
+    OnceLock::new();
+
+/// Install (or replace) the build-cache config for one peers root. Called at
+/// bootstrap; a `None` value REMOVES the entry (used by tests to isolate).
+/// The bootstrap call site lives in commands/serve.rs behind
+/// `#[cfg(feature = "api")]` — under a default (no-api) build this setter is
+/// dead by design, so the lint is silenced instead of deleting the wiring.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) fn set_build_cache_config(peers_root: &Path, config: Option<BuildCacheConfig>) {
+    let table = BUILD_CACHE_CONFIGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = table.lock().unwrap_or_else(|e| e.into_inner());
+    match config {
+        Some(cfg) => {
+            map.insert(peers_root.to_string_lossy().into_owned(), cfg);
+        }
+        None => {
+            map.remove(&peers_root.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// The build-cache config in force for one peers root (`None` = pool off).
+pub(crate) fn build_cache_config_for(peers_root: &Path) -> Option<BuildCacheConfig> {
+    let table = BUILD_CACHE_CONFIGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let map = table.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&peers_root.to_string_lossy().into_owned()).cloned()
+}
+
+impl BuildCacheSlotRegistry {
+    /// Bind a staged claim at dispatch, before the turn task can fail or be aborted.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn reserve_staged(
+        &self,
+        key: &str,
+        owner: &BuildCacheTurnOwner,
+    ) -> Result<(), RpcError> {
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(key) {
+            if matches!(entry.state, BuildCacheSlotState::Active(_)) {
+                return Err(build_cache_owned_error());
+            }
+            entry.state = BuildCacheSlotState::Active(owner.clone());
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn release_owned(
+        &self,
+        key: &str,
+        owner: &BuildCacheTurnOwner,
+        outcome: SlotOutcome,
+    ) {
+        self.release_matching(
+            |candidate, entry| candidate == key && entry.owned_by(owner),
+            outcome,
+        );
+    }
+
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn release_for_slug(
+        &self,
+        slug: &str,
+        owner: &BuildCacheTurnOwner,
+        outcome: SlotOutcome,
+    ) {
+        let suffix = format!("\u{1f}{slug}");
+        self.release_matching(
+            |key, entry| key.ends_with(&suffix) && entry.owned_by(owner),
+            outcome,
+        );
+    }
+
+    fn release_matching(
+        &self,
+        matches: impl Fn(&str, &BuildCacheSlotEntry) -> bool,
+        outcome: SlotOutcome,
+    ) {
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<_> = map
+            .iter()
+            .filter(|(key, entry)| matches(key, entry))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let entries: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| map.remove(&key))
+            .collect();
+        drop(map);
+        for entry in entries {
+            entry.release(outcome);
+        }
+    }
+
+    /// Park a claimed slot with its per-child usage tracker.
+    pub(crate) fn park(&self, key: String, slot: Slot) {
+        self.park_with_usage(key, slot);
+    }
+
+    pub(crate) fn park_with_usage(
+        &self,
+        key: String,
+        slot: Slot,
+    ) -> octos_agent::tools::BuildCacheUsage {
+        let usage = octos_agent::tools::BuildCacheUsage::default();
+        let incoming = BuildCacheSlotEntry {
+            slot,
+            usage: usage.clone(),
+            state: BuildCacheSlotState::Staged,
+        };
+        let displaced = {
+            let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+            if map
+                .get(&key)
+                .is_some_and(|entry| matches!(entry.state, BuildCacheSlotState::Active(_)))
+            {
+                Some(incoming)
+            } else {
+                map.insert(key, incoming)
+            }
+        };
+        if let Some(entry) = displaced {
+            entry.release(SlotOutcome::Cancelled);
+        }
+        usage
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take(&self, key: &str) -> Option<Slot> {
+        let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(key)
+            .is_some_and(|entry| matches!(entry.state, BuildCacheSlotState::Staged))
+        {
+            map.remove(key).map(|entry| entry.slot)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn usage(&self, key: &str) -> Option<octos_agent::tools::BuildCacheUsage> {
+        self.by_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|entry| entry.usage.clone())
+    }
+
+    /// Close admission before returning the claim; live children retain its lock.
+    pub(crate) fn release(&self, key: &str, outcome: SlotOutcome) {
+        let entry = self
+            .by_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+        if let Some(entry) = entry {
+            entry.release(outcome);
+        }
+    }
+}
+
+// Outer-loop #4 — peer↔pool integration tests. Unit-level per the board: no
+// seatbelt exec, no live serve; they pin the contract the wiring relies on
+// (env vars, distinct slots per peer, terminal release, adopt-not-double-hold,
+// sandbox grant shape).
+#[cfg(test)]
+mod build_cache_peer_tests {
+    use super::*;
+
+    #[test]
+    fn bc9_b6_park_preserves_active_and_releases_rejected_incoming_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("peers");
+        let config = BuildCacheConfig {
+            peer_slots: 2,
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        let first =
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "first", None, None, &config)
+                .unwrap();
+        let path = first.path.clone();
+        let registry = BuildCacheSlotRegistry::default();
+        registry.park("claim".into(), first);
+        let owner = BuildCacheTurnOwner {
+            generation: 0,
+            session: SessionKey("owner".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        registry.reserve_staged("claim", &owner).unwrap();
+        let incoming = build_cache_peer::acquire_for_staging(
+            &root,
+            tmp.path(),
+            "incoming",
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+        let rejected = incoming.path.clone();
+        registry.park("claim".into(), incoming);
+        assert!(path.join("holder.json").exists());
+        assert!(!rejected.join("holder.json").exists());
+        assert!(registry.take("claim").is_none());
+        registry.release_owned("claim", &owner, SlotOutcome::Completed);
+    }
+
+    #[test]
+    fn bc9_b5_registry_keeps_claim_until_last_child_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("peers");
+        let config = BuildCacheConfig {
+            peer_slots: 1,
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        let slot =
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "usage", None, None, &config)
+                .unwrap();
+        let path = slot.path.clone();
+        let registry = BuildCacheSlotRegistry::default();
+        registry.park("usage".into(), slot);
+        let usage = registry.usage("usage").unwrap();
+        let child = usage.begin().unwrap();
+        registry.release("usage", SlotOutcome::Completed);
+        assert!(path.join("holder.json").exists());
+        assert!(usage.begin().is_none());
+        assert!(
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config)
+                .is_err()
+        );
+        drop(child);
+        assert!(!path.join("holder.json").exists());
+        let mut next =
+            build_cache_peer::acquire_for_staging(&root, tmp.path(), "next", None, None, &config)
+                .unwrap();
+        assert_eq!(next.path, path);
+        build_cache_peer::release_slot(&mut next, SlotOutcome::Completed);
+    }
+
+    #[test]
+    fn bc9_n6_registry_key_has_one_separator_and_no_newline() {
+        let root = Path::new("/tmp/profile/peers");
+        assert_eq!(
+            build_cache_slot_registry_key(root, "worker"),
+            "/tmp/profile/peers\u{1f}worker"
+        );
+    }
+
+    #[test]
+    fn two_staged_peers_acquire_distinct_slots_and_release_on_terminal() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        set_build_cache_config(
+            &peers_root,
+            Some(crate::build_cache::BuildCacheConfig::default()),
+        );
+        // Two DIFFERENT repo keys so each pool has capacity; the assertion is
+        // per-pool namespace semantics + distinct paths for distinct peers.
+        let repo_a = data.path().join("repo-a");
+        let repo_b = data.path().join("repo-b");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        let slot_a = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo_a,
+            "slug-a",
+            Some("goal-1"),
+            Some("t1"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .expect("peer A acquires");
+        let slot_b = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo_b,
+            "slug-b",
+            Some("goal-1"),
+            Some("t2"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .expect("peer B acquires");
+        assert_ne!(
+            slot_a.path, slot_b.path,
+            "two peers must never share a slot"
+        );
+        let target_a = slot_a.target_dir.clone();
+        let mut sa = Some(slot_a);
+        if let Some(s) = sa.as_mut() {
+            build_cache_peer::release_slot(s, SlotOutcome::Completed);
+        }
+        assert!(target_a.exists(), "release keeps target/");
+        drop(sa);
+        // The freed slot is immediately reusable for a third peer (terminal
+        // release, per §4.1 — not close).
+        let slot_c = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo_a,
+            "slug-a",
+            Some("goal-1"),
+            Some("t3"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .expect("freed slot reusable by next turn");
+        drop(slot_c);
+    }
+
+    #[test]
+    fn adopt_rule_first_boot_does_not_double_acquire() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        set_build_cache_config(
+            &peers_root,
+            Some(crate::build_cache::BuildCacheConfig::default()),
+        );
+        let repo = data.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Staging acquired slot-1 (peer_slots default 2 → slot-2 free). The
+        // recorded slot must be re-takable by the SAME slug without the pool
+        // reporting exhaustion — i.e. the recorded slot is adopted, not
+        // double-held: a second acquire with the recorded slot still HELD
+        // (not yet released) lands on slot-2, and after releasing BOTH the
+        // next acquire succeeds again.
+        let slot1 = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo,
+            "slug-x",
+            Some("g"),
+            Some("t1"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(peers_root.join("slug-x")).unwrap();
+        build_cache_peer::record_slot(&peers_root.join("slug-x"), &slot1).unwrap();
+        let slot2 = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo,
+            "slug-x",
+            Some("g"),
+            Some("t2"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            slot1.path, slot2.path,
+            "held slot-1 forces slot-2 (no aliasing)"
+        );
+        let mut s2 = Some(slot2);
+        if let Some(s) = s2.as_mut() {
+            build_cache_peer::release_slot(s, SlotOutcome::Completed);
+        }
+        drop(s2);
+        let leaf = peers_root.join("slug-x").join(build_cache_peer::LEAF);
+        assert!(
+            std::fs::read_to_string(&leaf).is_ok(),
+            "peers/<slug>/build-cache read-back file exists (§7.4)"
+        );
+        let mut s1 = Some(slot1);
+        if let Some(s) = s1.as_mut() {
+            build_cache_peer::release_slot(s, SlotOutcome::Completed);
+        }
+        drop(s1);
+    }
+
+    #[test]
+    fn registry_release_is_idempotent_across_terminal_and_close() {
+        let data = tempfile::tempdir().unwrap();
+        let peers_root = data.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        set_build_cache_config(
+            &peers_root,
+            Some(crate::build_cache::BuildCacheConfig::default()),
+        );
+        let repo = data.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let slot = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &repo,
+            "slug-i",
+            Some("g"),
+            Some("t1"),
+            &crate::build_cache::BuildCacheConfig::default(),
+        )
+        .unwrap();
+        let key = build_cache_slot_registry_key(&peers_root, "slug-i");
+        build_cache_slot_registry().park(key.clone(), slot);
+        // Terminal release (take) then close-path release (take again) — the
+        // second must find nothing and not panic (idempotent, §4.2).
+        if let Some(mut s) = build_cache_slot_registry().take(&key) {
+            build_cache_peer::release_slot(&mut s, SlotOutcome::Completed);
+        }
+        assert!(
+            build_cache_slot_registry().take(&key).is_none(),
+            "close after terminal finds nothing"
+        );
+        release_staged_peer_build_cache_slot(&peers_root, "slug-i"); // no-op, no panic
+    }
+}
+
 #[cfg(all(test, unix))]
 mod peer_io_tests {
     use std::sync::mpsc;
@@ -1603,7 +2338,7 @@ pub(crate) fn stage_peer(
         None => reserve_peer_dir(peers_root, seed)?,
     };
     // The fence: a worktree on branch `peer/<slug>` under the peer dir.
-    let (cwd, build_cache) = if worktree {
+    let (cwd, mut build_cache) = if worktree {
         let worktree_path = peer_dir.join("wt");
         let branch = format!("peer/{slug}");
         // Best-effort re-validation immediately before handing the path to git:
@@ -1698,9 +2433,8 @@ pub(crate) fn stage_peer(
                 .args(["config", key, &value])
                 .output();
         }
-        // #2236 — wire the clone at the workspace's hot build cache BEFORE
-        // returning the path; the decision rides back to the caller for
-        // model_note + the peer_staged event detail.
+        // Classify the clone first. Shared is published only after the pool
+        // allocation below succeeds; no Cargo config is generated.
         let cache = wire_fenced_peer_build_cache(&worktree_path, workspace_root);
         (worktree_path, cache)
     } else {
@@ -1747,8 +2481,51 @@ pub(crate) fn stage_peer(
         }
     }
 
+    // Outer-loop #4 (§4.1/§7.4): acquire the FIRST-turn build-cache slot and
+    // record it BEFORE `brief.md` (the visibility gate) — the same ordering
+    // discipline as `goal` above: a peer that becomes bootable must already
+    // carry its slot record, or boot turn 1 would re-acquire and double-hold
+    // two slots of a 2-slot pool. A pool failure (space gate / exhaustion)
+    // fails the staging fast (§3.2 step 5) and rolls back.
+    //
+    // The HANDLE is parked in the process-global registry IMMEDIATELY, so
+    // every later staging-failure rollback below (brief / name / record) can
+    // release it through the same key as the turn terminal — one shape of
+    // release, no per-site `Slot` juggling.
+    //
+    // Outer-loop #4: config comes from the process side-table (see
+    // `set_build_cache_config`) — `None` there keeps the pre-pool behaviour.
+    if build_cache == PeerBuildCache::Shared
+        && let Some(config) = build_cache_config_for(peers_root)
+    {
+        match build_cache_peer::acquire_recorded(
+            peers_root,
+            workspace_root,
+            &slug,
+            goal_id,
+            task_id,
+            &config,
+        ) {
+            Ok(slot) => build_cache_slot_registry()
+                .park(build_cache_slot_registry_key(peers_root, &slug), slot),
+            Err(err) => {
+                cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+                return Err(err);
+            }
+        }
+    } else if build_cache == PeerBuildCache::Shared {
+        build_cache = PeerBuildCache::None;
+    }
+    // §4.1 staging-failure rollback: brief.md is the visibility gate and the
+    // peer dir is about to be deleted — a peer that never became visible must
+    // not keep a slot either. Registry take+release is idempotent.
+    let slot_key = build_cache_slot_registry_key(peers_root, &slug);
+    let rollback_staged = || {
+        build_cache_slot_registry().release(&slot_key, SlotOutcome::Cancelled);
+    };
     let brief_path = peer_dir.join("brief.md");
     if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "brief.md", brief) {
+        rollback_staged();
         cleanup_staged_peer(workspace_root, &slug, &peer_dir);
         return Err(RpcError::internal_error(format!(
             "failed to write brief: {err}"
@@ -1763,6 +2540,7 @@ pub(crate) fn stage_peer(
     // (`read_peer_blackboard` / `resolve_peer_name_to_slug`) can surface it.
     if let Some(name) = name {
         if let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "name", name) {
+            rollback_staged();
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to write peer name: {err}"
@@ -1770,6 +2548,10 @@ pub(crate) fn stage_peer(
         }
     }
 
+    // NOTE: the slot HANDLE stays parked in the registry from the acquire
+    // block above. The serve boot's FIRST turn ADOPTS it out of the registry
+    // per §4.1 — same process on the serve path, so the handoff is a map
+    // move.
     Ok(StagedPeer {
         topic: format!("peer-{slug}"),
         worktree_branch: worktree.then(|| format!("peer/{slug}")),
@@ -1917,6 +2699,24 @@ pub(crate) fn collect_peer_branch(peer_dir: &Path, slug: &str) {
         ),
         Err(error) => tracing::warn!(slug, %error, "failed to run git to collect the peer branch"),
     }
+}
+
+/// Outer-loop #4 (§4.2 fleet rollback): release the first-turn slot a staged
+/// peer is still holding, WITHOUT touching the staged dir. Called by the
+/// multi-member rollback in the API layer after a sibling member failed — the
+/// surviving members' handles sit in the process-global registry from
+/// `stage_peer`'s acquire, and dropping the peer dir without this would leak
+/// the flock until serve exit (a 2-slot pool is exhausted by the second leak).
+/// Idempotent (registry take → None when nothing is held) and a no-op when the
+/// pool is off for this root. Call sites are `#[cfg(feature = "api")]`
+/// (ui_protocol_transport.rs fleet rollback + close callback); silenced for
+/// no-api builds where they do not exist.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
+pub(crate) fn release_staged_peer_build_cache_slot(peers_root: &Path, slug: &str) {
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(peers_root, slug),
+        SlotOutcome::Cancelled,
+    );
 }
 
 /// Roll back ONE half-staged peer: unregister its OWN worktree, remove its
@@ -2233,24 +3033,23 @@ pub(crate) fn read_peer_model_lane(peers_root: &Path, slug: &str) -> Option<Stri
 /// `peer_staged` event detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerBuildCache {
-    /// `wt/.cargo/config.toml` written pointing at the workspace `target/`.
+    /// A slot is held in the source repository's pool; tools receive its env.
     Shared,
-    /// Workspace root has no `Cargo.toml`: nothing written, no note.
+    /// Unfenced, non-Cargo, or unregistered pool: no cache override or note.
     None,
-    /// The repo's own `.cargo/config.toml` was cloned in: left untouched.
+    /// The repo's `.cargo/config.toml` or legacy `.cargo/config`: respected.
     RepoConfig,
 }
 
 impl PeerBuildCache {
     /// The `model_note` line for this decision (None = no note line).
-    pub(crate) fn note_line(&self, workspace_root: &Path) -> Option<String> {
+    pub(crate) fn note_line(&self, _workspace_root: &Path) -> Option<String> {
         match self {
-            PeerBuildCache::Shared => Some(format!(
-                "build cache: target-dir -> {}/target",
-                workspace_root.display()
-            )),
+            PeerBuildCache::Shared => {
+                Some("build cache: slot pool (CARGO_TARGET_DIR injected per tool call)".to_string())
+            }
             PeerBuildCache::RepoConfig => {
-                Some("build cache: repo has its own .cargo/config.toml, left untouched".to_string())
+                Some("build cache: repo has its own Cargo config, left untouched".to_string())
             }
             PeerBuildCache::None => None,
         }
@@ -2266,14 +3065,10 @@ impl PeerBuildCache {
     }
 }
 
-/// #2236 — after the fenced clone lands, point cargo at the WORKSPACE's hot
-/// `target/` (a fresh clone compiles from zero: 147s–500s per cargo run ate
-/// the #45 peer's entire 50-iteration budget). Writes `wt/.cargo/config.toml`
-/// with an absolute `build.target-dir`, and excludes the file via
-/// `wt/.git/info/exclude` so the fence's `git status` stays clean and no
-/// `git add` can pick it up. A repo-provided `.cargo/config.toml` is never
-/// overwritten (RepoConfig); a non-Cargo workspace writes nothing (None).
-/// No env vars: the peer's tool-process environment is not the stage's to own.
+/// Classify a fenced Cargo peer without changing repository files.
+/// Shared is an allocation candidate; staging only publishes it after a
+/// configured pool actually provides a slot. RepoConfig always wins over
+/// our env injection, which would otherwise override Cargo's config file.
 pub(crate) fn wire_fenced_peer_build_cache(
     worktree_path: &Path,
     workspace_root: &Path,
@@ -2281,39 +3076,11 @@ pub(crate) fn wire_fenced_peer_build_cache(
     if !workspace_root.join("Cargo.toml").is_file() {
         return PeerBuildCache::None;
     }
-    let cargo_dir = worktree_path.join(".cargo");
-    let config_path = cargo_dir.join("config.toml");
-    if config_path.exists() {
+    if worktree_path.join(".cargo/config.toml").exists()
+        || worktree_path.join(".cargo/config").exists()
+    {
         return PeerBuildCache::RepoConfig;
     }
-    let body = format!(
-        "[build]\ntarget-dir = \"{}/target\"\n",
-        workspace_root.display()
-    );
-    let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&cargo_dir)?;
-        std::fs::write(&config_path, body)
-    };
-    if write().is_err() {
-        return PeerBuildCache::None;
-    }
-    // Keep the fence's git view clean: exclude via .git/info/exclude (local,
-    // never committed, never pushed).
-    let exclude_path = worktree_path.join(".git").join("info").join("exclude");
-    let _ = (|| -> std::io::Result<()> {
-        if let Some(parent) = exclude_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-        if !existing.lines().any(|l| l.trim() == ".cargo/config.toml") {
-            if !existing.ends_with('\n') && !existing.is_empty() {
-                existing.push('\n');
-            }
-            existing.push_str(".cargo/config.toml\n");
-            std::fs::write(&exclude_path, existing)?;
-        }
-        Ok(())
-    })();
     PeerBuildCache::Shared
 }
 
@@ -3050,7 +3817,7 @@ pub(crate) fn build_peer_list_callback(
 
 #[cfg(test)]
 mod issue_2236_build_cache_tests {
-    use super::stage_peer;
+    use super::*;
 
     /// Real temp git repo fixture (per the contract: real repos, no cargo run).
     fn cargo_ws_repo(
@@ -3082,7 +3849,7 @@ mod issue_2236_build_cache_tests {
                     .success()
             );
         }
-        if with_repo_config {
+        {
             assert!(
                 std::process::Command::new("git")
                     .arg("-C")
@@ -3097,13 +3864,20 @@ mod issue_2236_build_cache_tests {
                 std::process::Command::new("git")
                     .arg("-C")
                     .arg(&ws)
-                    .args(["commit", "--quiet", "-m", "seed"])
+                    .args(["commit", "--quiet", "--allow-empty", "-m", "seed"])
                     .output()
                     .unwrap()
                     .status
                     .success()
             );
         }
+        set_build_cache_config(
+            &tmp.path().join("peers"),
+            Some(BuildCacheConfig {
+                min_free_gb: 0,
+                ..Default::default()
+            }),
+        );
         (tmp, ws)
     }
 
@@ -3128,27 +3902,27 @@ mod issue_2236_build_cache_tests {
         )
         .unwrap();
         let wt = peers_root.join(&staged.slug).join("wt");
-        let cfg = wt.join(".cargo").join("config.toml");
-        let body = std::fs::read_to_string(&cfg).unwrap();
-        // #2236-r2 — the config is EXACTLY two lines: [build] + target-dir.
-        // Nothing else (CARGO_HOME, registry keys, …) may ride along.
-        assert_eq!(
-            body,
-            format!("[build]\ntarget-dir = \"{}/target\"\n", ws.display()),
-            "config must be exactly the two contract lines"
-        );
-        assert!(!body.contains("CARGO_HOME"), "no CARGO_HOME key");
-        assert!(!body.contains("registry"), "no registry key");
-        let exclude =
-            std::fs::read_to_string(wt.join(".git").join("info").join("exclude")).unwrap();
         assert!(
-            exclude.lines().any(|l| l.trim() == ".cargo/config.toml"),
-            "{exclude}"
+            !wt.join(".cargo/config.toml").exists(),
+            "pool uses env, no generated config"
         );
-        // model_note rides on the StagedPeer decision; the tool-level note is
-        // asserted via the decision enum: Shared => note contains the line.
+        let slot_path = peer_io::read_peer_file(
+            &peers_root.join(&staged.slug),
+            build_cache_peer::LEAF,
+            peer_io::PEER_FILE_READ_CAP_SMALL,
+        )
+        .unwrap();
+        let expected = tmp
+            .path()
+            .join("build-cache")
+            .join(crate::build_cache::repo_key_for_path(&ws).unwrap().as_str())
+            .join("slot-1");
+        assert_eq!(Path::new(slot_path.trim()), expected);
+        assert!(expected.join("holder.json").is_file());
+        assert_eq!(staged.build_cache, PeerBuildCache::Shared);
         let note = staged.build_cache.note_line(&ws).unwrap();
-        assert!(note.contains("build cache: target-dir ->"), "{note}");
+        assert!(note.contains("slot pool"), "{note}");
+        release_staged_peer_build_cache_slot(&peers_root, &staged.slug);
     }
 
     #[test]
@@ -3173,6 +3947,18 @@ mod issue_2236_build_cache_tests {
         assert!(
             staged.build_cache.note_line(&ws).is_none(),
             "no build-cache note"
+        );
+        assert!(
+            !peers_root
+                .join(&staged.slug)
+                .join(build_cache_peer::LEAF)
+                .exists(),
+            "no pooled env override for RepoConfig/None"
+        );
+        assert!(
+            build_cache_slot_registry()
+                .take(&build_cache_slot_registry_key(&peers_root, &staged.slug))
+                .is_none()
         );
     }
 
@@ -3212,6 +3998,18 @@ mod issue_2236_build_cache_tests {
         assert_eq!(ours, repo, "repo config untouched (CRLF-normalized)");
         let note = staged.build_cache.note_line(&ws).unwrap();
         assert!(note.contains("left untouched"), "{note}");
+        assert!(
+            !peers_root
+                .join(&staged.slug)
+                .join(build_cache_peer::LEAF)
+                .exists(),
+            "no pooled env override for RepoConfig/None"
+        );
+        assert!(
+            build_cache_slot_registry()
+                .take(&build_cache_slot_registry_key(&peers_root, &staged.slug))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3236,6 +4034,18 @@ mod issue_2236_build_cache_tests {
             "workspace untouched"
         );
         assert_eq!(staged.build_cache.detail_suffix(), "", "no suffix unfenced");
+        assert!(
+            !peers_root
+                .join(&staged.slug)
+                .join(build_cache_peer::LEAF)
+                .exists(),
+            "no pooled env override for RepoConfig/None"
+        );
+        assert!(
+            build_cache_slot_registry()
+                .take(&build_cache_slot_registry_key(&peers_root, &staged.slug))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3258,6 +4068,7 @@ mod issue_2236_build_cache_tests {
         // The detail is derived from the same decision the event carries.
         let detail = format!("peer staged{}", staged.build_cache.detail_suffix());
         assert_eq!(detail, "peer staged (build cache: shared)");
+        release_staged_peer_build_cache_slot(&peers_root, &staged.slug);
     }
 
     #[test]
@@ -3290,6 +4101,296 @@ mod issue_2236_build_cache_tests {
             status.trim().is_empty(),
             "git status must be clean: {status}"
         );
+        release_staged_peer_build_cache_slot(&peers_root, &staged.slug);
+    }
+
+    #[test]
+    fn unregistered_pool_does_not_claim_shared_or_write_config() {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let peers_root = tmp.path().join("peers");
+        set_build_cache_config(&peers_root, None);
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("off"),
+            None,
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(staged.build_cache, PeerBuildCache::None);
+        assert!(!staged.cwd.join(".cargo/config.toml").exists());
+        assert!(
+            !peers_root
+                .join(&staged.slug)
+                .join(build_cache_peer::LEAF)
+                .exists()
+        );
+    }
+    fn staged_cargo_peer(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf, StagedPeer) {
+        let (tmp, ws) = cargo_ws_repo(true, false);
+        let peers_root = tmp.path().join("peers");
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some(name),
+            None,
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        (tmp, ws, peers_root, staged)
+    }
+
+    #[test]
+    fn bc9_b6_second_session_cannot_adopt_active_slot() {
+        let (_tmp, _ws, root, staged) = staged_cargo_peer("owned-active");
+        let owner = BuildCacheTurnOwner {
+            generation: 0,
+            session: SessionKey("first".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        let first = build_cache_peer::slot_for_owned_turn(&root, &staged.cwd, &staged.slug, &owner)
+            .unwrap()
+            .unwrap();
+        let child = first.usage.begin().unwrap();
+        let second = BuildCacheTurnOwner {
+            generation: 0,
+            session: SessionKey("second".into()),
+            turn: octos_core::ui_protocol::TurnId::new(),
+        };
+        assert!(
+            build_cache_peer::slot_for_owned_turn(&root, &staged.cwd, &staged.slug, &second)
+                .is_err(),
+            "active slot must not be adopted by another session"
+        );
+        set_build_cache_config(&root, None);
+        assert!(
+            build_cache_peer::slot_for_owned_turn(&root, &staged.cwd, &staged.slug, &second)
+                .is_err(),
+            "eligibility changes cannot clear another owner"
+        );
+        let key = build_cache_slot_registry_key(&root, &staged.slug);
+        assert!(
+            build_cache_slot_registry().take(&key).is_none(),
+            "active handles cannot be taken"
+        );
+        build_cache_slot_registry().release_owned(&key, &second, SlotOutcome::Failed);
+        assert!(first.path.join("holder.json").exists());
+        assert!(first.usage.begin().is_some());
+        build_cache_slot_registry().release_owned(&key, &owner, SlotOutcome::Completed);
+        assert!(first.path.join("holder.json").exists());
+        drop(child);
+        assert!(!first.path.join("holder.json").exists());
+    }
+
+    #[test]
+    fn turn_rechecks_repo_config_before_adopting_staging_slot() {
+        let (_tmp, _ws, peers_root, staged) = staged_cargo_peer("config-later");
+        let key = build_cache_slot_registry_key(&peers_root, &staged.slug);
+        let first = build_cache_slot_registry().take(&key).unwrap();
+        let path = first.path.clone();
+        build_cache_slot_registry().park(key.clone(), first);
+        std::fs::create_dir_all(staged.cwd.join(".cargo")).unwrap();
+        std::fs::write(
+            staged.cwd.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = 'repo-target'\n",
+        )
+        .unwrap();
+        let slot = build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug).unwrap();
+        assert!(
+            slot.is_none(),
+            "RepoConfig must suppress pooled env even with an existing holder"
+        );
+        assert!(
+            !path.join("holder.json").exists(),
+            "displaced staging slot released"
+        );
+        assert!(build_cache_slot_registry().take(&key).is_none());
+        assert!(
+            build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug)
+                .unwrap()
+                .is_none(),
+            "later turns must not reacquire over repo config"
+        );
+    }
+
+    #[test]
+    fn turn_rechecks_unregistered_pool_before_adopting_slot() {
+        let (_tmp, _ws, peers_root, staged) = staged_cargo_peer("disabled-later");
+        let key = build_cache_slot_registry_key(&peers_root, &staged.slug);
+        let first = build_cache_slot_registry().take(&key).unwrap();
+        let path = first.path.clone();
+        build_cache_slot_registry().park(key, first);
+        set_build_cache_config(&peers_root, None);
+        assert!(
+            build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.join("holder.json").exists());
+    }
+
+    #[test]
+    fn turn_two_reuses_source_pool_after_first_turn_adoption_and_release() {
+        let (_tmp, ws, peers_root, staged) = staged_cargo_peer("two-turns");
+        let key = build_cache_slot_registry_key(&peers_root, &staged.slug);
+        let path = build_cache_slot_registry()
+            .by_key
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .slot
+            .path
+            .clone();
+        let mut first = build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.path, path, "first turn adopts without double acquire");
+        assert_eq!(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            crate::build_cache::repo_key_for_path(&ws).unwrap().as_str()
+        );
+        build_cache_peer::release_slot(&mut first, SlotOutcome::Completed);
+        let mut second = build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.path, path,
+            "later turns stay in the source repository's bounded pool"
+        );
+        build_cache_peer::release_slot(&mut second, SlotOutcome::Completed);
+    }
+
+    #[test]
+    fn turn_pool_exhaustion_is_an_error_without_unbounded_fallback() {
+        let (_tmp, ws, peers_root, staged) = staged_cargo_peer("exhausted");
+        release_staged_peer_build_cache_slot(&peers_root, &staged.slug);
+        let config = BuildCacheConfig {
+            peer_slots: 1,
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        set_build_cache_config(&peers_root, Some(config.clone()));
+        let mut blocker =
+            build_cache_peer::acquire_for_staging(&peers_root, &ws, "blocker", None, None, &config)
+                .unwrap();
+        let result = build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug);
+        build_cache_peer::release_slot(&mut blocker, SlotOutcome::Completed);
+        assert!(
+            result.is_err(),
+            "an eligible turn cannot fall back outside the bounded pool"
+        );
+    }
+
+    #[test]
+    fn turn_record_failure_releases_new_slot() {
+        let (_tmp, ws, peers_root, staged) = staged_cargo_peer("record-failure");
+        release_staged_peer_build_cache_slot(&peers_root, &staged.slug);
+        let leaf = peers_root.join(&staged.slug).join(build_cache_peer::LEAF);
+        std::fs::remove_file(&leaf).unwrap();
+        std::fs::create_dir(&leaf).unwrap();
+        let result = build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug);
+        assert!(result.is_err(), "record failure must surface");
+        let config = build_cache_config_for(&peers_root).unwrap();
+        let mut replacement = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            &ws,
+            "replacement",
+            None,
+            None,
+            &config,
+        )
+        .unwrap();
+        assert!(
+            replacement.path.ends_with("slot-1"),
+            "failed write must release metadata as well as lock"
+        );
+        build_cache_peer::release_slot(&mut replacement, SlotOutcome::Completed);
+    }
+
+    #[test]
+    fn fenced_peer_keeps_legacy_cargo_config_without_env_override() {
+        let (tmp, ws) = cargo_ws_repo(true, true);
+        for args in [
+            vec!["mv", ".cargo/config.toml", ".cargo/config"],
+            vec!["commit", "--quiet", "-m", "legacy config"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&ws)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let peers_root = tmp.path().join("peers");
+        let staged = stage_peer(
+            &peers_root,
+            &ws,
+            "s",
+            Some("legacy"),
+            None,
+            "B.",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(staged.build_cache, PeerBuildCache::RepoConfig);
+        assert_eq!(
+            std::fs::read_to_string(staged.cwd.join(".cargo/config"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "# repo's own\n"
+        );
+        assert!(!staged.cwd.join(".cargo/config.toml").exists());
+        assert!(
+            build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn turn_none_regions_do_not_acquire() {
+        for (cargo, fenced) in [(false, true), (true, false)] {
+            let (tmp, ws) = cargo_ws_repo(cargo, false);
+            let peers_root = tmp.path().join("peers");
+            let staged = stage_peer(
+                &peers_root,
+                &ws,
+                "s",
+                Some("none"),
+                None,
+                "B.",
+                fenced,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(staged.build_cache, PeerBuildCache::None);
+            assert!(
+                build_cache_peer::slot_for_turn(&peers_root, &staged.cwd, &staged.slug)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!tmp.path().join("build-cache").exists());
+        }
     }
 }
 

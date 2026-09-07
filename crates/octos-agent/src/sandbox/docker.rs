@@ -39,6 +39,21 @@ impl Sandbox for DockerSandbox {
     }
 
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+        self.wrap_with_slot(shell_command, cwd, None)
+    }
+
+    fn wrap_command_with_build_cache_slot(
+        &self,
+        shell_command: &str,
+        cwd: &Path,
+        slot: Option<&Path>,
+    ) -> Command {
+        self.wrap_with_slot(shell_command, cwd, slot)
+    }
+}
+
+impl DockerSandbox {
+    fn wrap_with_slot(&self, shell_command: &str, cwd: &Path, slot: Option<&Path>) -> Command {
         let mut cmd = Command::new("docker");
         cmd.arg("run").arg("--rm");
 
@@ -121,15 +136,79 @@ impl Sandbox for DockerSandbox {
             cmd.arg("-v").arg(bind);
         }
 
+        if let Some(slot) = slot {
+            let target = std::fs::canonicalize(slot.join("target"));
+            let target = match target {
+                Ok(target) if target.is_dir() => target,
+                _ => return cache_mount_refusal(),
+            };
+            let source = target.to_string_lossy();
+            if source.contains([':', '\0', '\n', '\r']) || is_blocked_bind_source(&source) {
+                return cache_mount_refusal();
+            }
+            // Only artifacts are writable; the claim's control files stay on the host.
+            cmd.arg("-v")
+                .arg(format!("{source}:/octos-build-cache/target"));
+            cmd.arg("--env")
+                .arg("CARGO_TARGET_DIR=/octos-build-cache/target");
+            cmd.arg("--env").arg("CARGO_INCREMENTAL=0");
+        }
+
         cmd.arg(&self.config.image);
         cmd.arg("sh").arg("-c").arg(shell_command);
         cmd
     }
 }
 
+fn cache_mount_refusal() -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg("echo 'sandbox error: build-cache target cannot be mounted' >&2; exit 1");
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_cache_target_is_mounted_and_env_reaches_container() {
+        let sb = DockerSandbox {
+            config: DockerConfig::default(),
+            allow_network: false,
+        };
+        let slot = tempfile::tempdir().unwrap();
+        std::fs::create_dir(slot.path().join("target")).unwrap();
+        let cmd = sb.wrap_command_with_build_cache_slot(
+            "cargo build",
+            Path::new("/tmp/work"),
+            Some(slot.path()),
+        );
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|a| a == ["--env", "CARGO_TARGET_DIR=/octos-build-cache/target"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|a| a == ["--env", "CARGO_INCREMENTAL=0"])
+        );
+        let target = std::fs::canonicalize(slot.path().join("target")).unwrap();
+        assert!(args.windows(2).any(|a| a
+            == [
+                "-v",
+                &format!("{}:/octos-build-cache/target", target.display())
+            ]));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == &format!("{}:/octos-build-cache", slot.path().display()))
+        );
+    }
 
     #[test]
     fn test_docker_sandbox_command() {

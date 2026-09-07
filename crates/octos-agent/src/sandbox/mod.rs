@@ -91,6 +91,26 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub repo_git_write: Option<PathBuf>,
 
+    /// Build-cache pool slot this session's shell may WRITE, beyond the cwd
+    /// (default: `None`). Outer-loop #4 (docs/build-cache-pool.md §7.2):
+    /// a peer's `CARGO_TARGET_DIR` lives in the pool
+    /// (`<data_dir>/build-cache/<repo-key>/slot-N/target`), which is OUTSIDE
+    /// the peer's clone cwd — without this grant `(deny default)` denies
+    /// every cargo write. The grant is INDEPENDENT of `workspace_write`,
+    /// `write_allow_globs`, and the toolchain grants on purpose: those
+    /// express "what may change inside the workspace" and are suppressed by
+    /// deny-wins fences, while the slot is harness-allocated infrastructure
+    /// OUTSIDE the workspace (the same reasoning as the external tmp write
+    /// rule). Only the peer's OWN slot is ever granted (I4: other slots and
+    /// other repositories' pools stay default-denied).
+    ///
+    /// Backend cover: macOS emits `(allow file-read*|file-write* (subpath
+    /// "<slot>"))`. bwrap/docker/landlock cannot add a writable bind for an
+    /// arbitrary out-of-workspace dir in this cut — known degradation (a
+    /// slot-pointing build fails there until a bind follow-up lands).
+    #[serde(default)]
+    pub build_cache_slot: Option<PathBuf>,
+
     /// Docker-specific settings (used when mode = "docker").
     #[serde(default)]
     pub docker: DockerConfig,
@@ -344,6 +364,7 @@ impl Default for SandboxConfig {
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
+            build_cache_slot: None,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             write_allow_globs: None,
@@ -443,6 +464,19 @@ pub enum SandboxMode {
 pub trait Sandbox: Send + Sync {
     /// Wrap a shell command string into a sandboxed `Command`.
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command;
+
+    /// Wrap a shell call with its current harness-held build-cache slot.
+    /// Backends without a contextual slot grant keep their existing behavior.
+    /// A supporting backend treats this option as authoritative, including
+    /// None, without changing the shared sandbox or legacy wrap_command config.
+    fn wrap_command_with_build_cache_slot(
+        &self,
+        shell_command: &str,
+        cwd: &Path,
+        _slot: Option<&Path>,
+    ) -> Command {
+        self.wrap_command(shell_command, cwd)
+    }
 
     /// Whether this sandbox provides no confinement (runs commands directly).
     /// Lets callers that require confinement (e.g. the `mcp-serve` server path)
@@ -1079,6 +1113,10 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
             read_allow_paths: config.read_allow_paths.clone(),
             workspace_write: config.workspace_write,
             repo_git_write: config.repo_git_write.clone(),
+            // Outer-loop #4 (docs/build-cache-pool.md §7.2): the build-cache
+            // slot rides its OWN grant on macOS, independent of the
+            // workspace/fence/toolchain arms.
+            build_cache_slot: config.build_cache_slot.clone(),
             // #1976: macOS EXPRESSES the fence (per-glob SBPL regex rules).
             write_allow_globs: config.write_allow_globs.clone(),
             toolchain_write_grants: configured_toolchain_grants(config),
@@ -1087,10 +1125,15 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
             allow_network: config.allow_network,
             workspace_write: fence_degraded_workspace_write(config, "bwrap"),
             repo_git_write: config.repo_git_write.clone(),
+            // TODO(outer-loop #4 §7.2, known degradation): bwrap cannot yet
+            // add a writable bind for an out-of-workspace slot dir, so
+            // `build_cache_slot` is IGNORED here — a slot-pointing cargo
+            // build fails under bwrap until a bind follow-up lands.
         }),
         SandboxBackendChoice::Docker => Box::new(DockerSandbox {
             config: fence_degraded_docker(config),
             allow_network: config.allow_network,
+            // Per-call cache target mounts are supplied by the shell tool.
         }),
         SandboxBackendChoice::Landlock => {
             #[cfg(target_os = "linux")]
@@ -1100,6 +1143,10 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
                     read_allow_paths: config.read_allow_paths.clone(),
                     profile_name: config.profile_name.clone(),
                     workspace_write: fence_degraded_workspace_write(config, "landlock"),
+                    // TODO(outer-loop #4 §7.2, known degradation):
+                    // `build_cache_slot` is IGNORED here until the Landlock
+                    // ruleset gains a per-path writable-access entry for the
+                    // slot dir; a slot-pointing cargo build fails meanwhile.
                 })
             }
             #[cfg(not(target_os = "linux"))]
@@ -1399,6 +1446,7 @@ mod tests {
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
+            build_cache_slot: None,
             docker: DockerConfig::default(),
             read_allow_paths: Vec::new(),
             write_allow_globs: None,

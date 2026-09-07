@@ -307,6 +307,11 @@ pub struct ProfileConfig {
     /// (`snapshots.enabled` + `keep_last`). Default OFF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots: Option<octos_agent::SnapshotConfig>,
+    /// Build-cache pool configuration (outer-loop #3; design
+    /// docs/build-cache-pool.md §2). Projected into
+    /// `Config.build_cache`. Absent = defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<crate::build_cache::BuildCacheConfig>,
     /// Sandbox configuration for tool isolation.
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
@@ -2855,6 +2860,7 @@ pub(crate) fn config_from_profile(
         // #1768: thread the profile's snapshot opt-in so serve sessions
         // honor it (parity with format_after_edit).
         snapshots: profile.config.snapshots.clone(),
+        build_cache: profile.config.build_cache.clone(),
         // #2168: carry the profile's tool policy so a serve / UserProfile
         // session can slim its roster (the serve path already applies this).
         tool_policy: profile.config.tool_policy.clone(),
