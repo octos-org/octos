@@ -40150,6 +40150,11 @@ async fn transition_to_terminal_settling_steers(
     turn_id: &TurnId,
 ) -> Option<TerminalTransition> {
     let transition = transition_to_terminal(turn_state, expected_reason).await?;
+    if matches!(transition.reason, TerminalReason::Interrupted)
+        && let Some(slug) = session_id.topic().and_then(|topic| topic.strip_prefix("peer-"))
+    {
+        build_cache_slot_registry().release_for_slug(slug, crate::build_cache::pool::SlotOutcome::Cancelled);
+    }
     if let Some(buffer) = steer_buffer {
         settle_leftover_steers(
             buffer,

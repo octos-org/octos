@@ -42171,3 +42171,27 @@ async fn issue_2236_build_cache_early_terminal_releases_slot() {
         assert!(build_cache_slot_registry().take(&key).is_none());
     }
 }
+
+#[tokio::test]
+async fn bc9_sf1_disconnect_releases_build_cache_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "bc9-disconnect";
+    let slot = build_cache_peer::acquire_for_staging(
+        &peers_root, tmp.path(), slug, None, None,
+        &crate::build_cache::BuildCacheConfig { min_free_gb: 0, ..Default::default() },
+    ).unwrap();
+    let path = slot.path.clone();
+    build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
+    let session = SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
+    let turn = TurnId::new();
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    active.lock().await.insert(session.clone(), test_active_turn(turn.clone(), handle.abort_handle()));
+    connection.lock().await.insert(session, turn);
+    abort_connection_turns(&active, &connection, &ScopePolicy::default(), &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(), &PendingQuestionStore::default()).await;
+    assert!(!path.join("holder.json").exists(), "disconnect must return the held cache slot");
+    assert!(handle.await.unwrap_err().is_cancelled());
+}

@@ -1221,7 +1221,6 @@ impl BuildCacheSlotRegistry {
     /// — is dead by design, so silence the lint rather than delete the
     /// integration.
     #[cfg_attr(not(feature = "api"), allow(dead_code))]
-    #[allow(dead_code)] // api 构建下暂无调用点:reserved for eviction path (#4 follow-up)
     pub(crate) fn release_for_slug(&self, slug: &str, outcome: SlotOutcome) {
         let suffix = format!("\u{1f}{slug}");
         let mut map = self.by_key.lock().unwrap_or_else(|e| e.into_inner());
