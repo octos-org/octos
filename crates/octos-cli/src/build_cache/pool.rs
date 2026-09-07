@@ -1722,47 +1722,70 @@ mod tests {
         let root = Arc::new(tmp.path().join("pool"));
         let cfg = Arc::new(config());
         let key = Arc::new(key(&tmp));
-        let holders: Arc<std::sync::Mutex<Vec<PathBuf>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let holders = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let acquired = Arc::new(std::sync::Barrier::new(9));
+        let checked = Arc::new(std::sync::Barrier::new(9));
         let exhausted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut joins = Vec::new();
         for _ in 0..8 {
-            let (root, cfg, key, holders, exhausted) = (
+            let (root, cfg, key, holders, acquired, checked, exhausted) = (
                 Arc::clone(&root),
                 Arc::clone(&cfg),
                 Arc::clone(&key),
                 Arc::clone(&holders),
+                Arc::clone(&acquired),
+                Arc::clone(&checked),
                 Arc::clone(&exhausted),
             );
             joins.push(std::thread::spawn(move || {
-                for _ in 0..4 {
-                    match acquire(&root, &key, SlotPurpose::Peer, &cfg, &HolderInfo::default()) {
-                        Ok(slot) => holders.lock().unwrap().push(slot.path.clone()),
-                        Err(BuildCacheError::PoolExhausted { .. }) => {
-                            exhausted.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(other) => panic!("unexpected error: {other}"),
+                let result = acquire(&root, &key, SlotPurpose::Peer, &cfg, &HolderInfo::default());
+                if let Ok(slot) = &result {
+                    holders.lock().unwrap().push(slot.path.clone());
+                } else if matches!(&result, Err(BuildCacheError::PoolExhausted { .. })) {
+                    exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+                // Keep every successful Slot alive across both barriers.
+                acquired.wait();
+                checked.wait();
+                match result {
+                    Ok(mut slot) => {
+                        release(&mut slot, SlotOutcome::Completed).unwrap();
                     }
+                    Err(BuildCacheError::PoolExhausted { .. }) => {}
+                    Err(other) => panic!("unexpected acquire error: {other}"),
                 }
             }));
         }
-        for j in joins {
-            j.join().unwrap();
+        acquired.wait();
+        let held = holders.lock().unwrap().clone();
+        // Capture lock ownership while all worker handles are still alive.
+        let all_locked = held.iter().all(|path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join(LOCK_LEAF))
+                .is_ok_and(|lock| fs2::FileExt::try_lock_exclusive(&lock).is_err())
+        });
+        // Always unblock workers before assertions, including on failures.
+        checked.wait();
+        for join in joins {
+            join.join().unwrap();
         }
-        let held = holders.lock().unwrap();
-        // I1: at most `peer_slots` DISTINCT slot dirs were handed out, even
-        // though every thread tried to acquire repeatedly.
-        let mut distinct: Vec<&PathBuf> = held.iter().collect();
+        let mut distinct = held.clone();
         distinct.sort();
         distinct.dedup();
         assert!(
-            distinct.len() <= cfg.peer_slots as usize,
-            "handed out {} distinct slots, pool size {}",
-            distinct.len(),
-            cfg.peer_slots
+            all_locked,
+            "successful workers must retain flock through the overlap interval"
         );
-        // And the exhaustion was reported, not silently swallowed.
-        assert!(exhausted.load(Ordering::Relaxed) > 0);
+        assert_eq!(held.len(), cfg.peer_slots as usize);
+        assert_eq!(
+            distinct.len(),
+            held.len(),
+            "simultaneous holders must use different paths"
+        );
+        assert!(held.len() <= cfg.peer_slots as usize);
+        assert_eq!(exhausted.load(Ordering::Relaxed), 8 - held.len());
     }
 
     #[test]
