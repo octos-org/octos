@@ -103,7 +103,7 @@ stale_hours  = 168    # GC:无持有者且 last_used 超过该小时数才可清
 1. **空间门**(I3):`fs2::available_space(pool_root)`(fs2 已是 octos-cli 依赖,Cargo.toml:59;fs2-0.4.3 底层即 statvfs/fstatvfs,`available_space` 见 fs2-0.4.3/src/lib.rs:180)。pool-root 不存在先 `create_dir_all` 再量。`available < min_free_gb * 1024^3` ⇒ 返回 `FreeSpaceLow { available_gb, min_gb }`;测量失败(无法 statvfs)⇒ 返回 `FreeSpaceUnknown`(fail-closed:这条线的全部意义就是防磁盘满,不因测量失败而放行;确需关闭门用 `min_free_gb = 0`)。
 2. 依 purpose 选命名空间(peer → `slot-1..slot-peer_slots`,verify → `verify-1..verify-verify_slots`)。
 3. 对每个候选槽:打开/创建 `<槽>/.lock`,`flock(EX | NB)`(fs2::FileExt,仓库既有用法见 autonomy/monitor_runtime.rs:410–437,MSRV 注释也照抄:std 的 flock 是 1.89+,保持 fs2 限定调用)。遇到 EWOULDBLOCK 时按下述有界窗口处理瞬时争用;活 holder 仍立即跳过。
-4. 拿到锁后:若 `target/` 不存在则建;写 `holder.json`;`last_used = now`;返回 `Slot { path, target_dir, lock_fd }`。**锁 fd 由持有方进程内存持有到 release**,这是 I1 的真值。
+4. 拿到锁后:若 `target/` 不存在则建;先写 `last_used = now`,最后原子写入 `holder.json`,随后直接返回 `Slot { path, target_dir, lock_fd }`。发布持有者后不再执行可能失败的 I/O,避免领取报错却留下当前进程的占用记录。**锁 fd 由持有方进程内存持有到 release**,这是 I1 的真值。
 5. 全部槽被占 ⇒ `PoolExhausted { repo_key, kind }`,错误文案面向模型:「peer 池已满(2/2):每个 peer 的编译槽在其当前 turn 结束时释放,无需等 peer 关闭;稍后重试,或 `octos cache status` 查看持有者」。不等待活 holder 完成、不排队;仅对疑似继承描述符引起的瞬时争用执行有界重试。
 
 #### flock 瞬时争用窗口(#11)
