@@ -15180,20 +15180,18 @@ fn release_peer_build_cache_slot(
     session_id: &SessionKey,
     outcome: crate::build_cache::pool::SlotOutcome,
 ) {
-    // `None` = this terminal path has no peer context (a master session):
-    // slot holders are keyed by (peers_root, slug), so there is nothing to
-    // find and the release is a no-op.
-    let Some(peers_root) = peers_root else {
-        return;
-    };
     let Some(slug) = session_id
         .topic()
         .and_then(|topic| topic.strip_prefix("peer-"))
     else {
         return;
     };
-    let key = build_cache_slot_registry_key(peers_root, slug);
-    build_cache_slot_registry().release(&key, outcome);
+    if let Some(peers_root) = peers_root {
+        let key = build_cache_slot_registry_key(peers_root, slug);
+        build_cache_slot_registry().release(&key, outcome);
+    } else {
+        build_cache_slot_registry().release_for_slug(slug, outcome);
+    }
 }
 
 /// Interrupted-terminal variant (§4.2 row 2): both interrupt origins —
@@ -40150,11 +40148,13 @@ async fn transition_to_terminal_settling_steers(
     turn_id: &TurnId,
 ) -> Option<TerminalTransition> {
     let transition = transition_to_terminal(turn_state, expected_reason).await?;
-    if matches!(transition.reason, TerminalReason::Interrupted)
-        && let Some(slug) = session_id.topic().and_then(|topic| topic.strip_prefix("peer-"))
-    {
-        build_cache_slot_registry().release_for_slug(slug, crate::build_cache::pool::SlotOutcome::Cancelled);
-    }
+    // Every terminal path, including shortcuts and boot failures, returns its claim.
+    let outcome = match transition.reason {
+        TerminalReason::Completed => crate::build_cache::pool::SlotOutcome::Completed,
+        TerminalReason::Errored => crate::build_cache::pool::SlotOutcome::Failed,
+        TerminalReason::Interrupted => crate::build_cache::pool::SlotOutcome::Cancelled,
+    };
+    release_peer_build_cache_slot(None, session_id, outcome);
     if let Some(buffer) = steer_buffer {
         settle_leftover_steers(
             buffer,

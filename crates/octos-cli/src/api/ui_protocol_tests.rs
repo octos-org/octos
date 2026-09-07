@@ -42195,3 +42195,24 @@ async fn bc9_sf1_disconnect_releases_build_cache_slot() {
     assert!(!path.join("holder.json").exists(), "disconnect must return the held cache slot");
     assert!(handle.await.unwrap_err().is_cancelled());
 }
+
+#[tokio::test]
+async fn bc9_sf2_shortcut_and_early_error_release_build_cache_slot() {
+    for (reason, known_root) in [(TerminalReason::Completed, true), (TerminalReason::Completed, false), (TerminalReason::Errored, false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        let slug = "bc9-shortcut";
+        let slot = build_cache_peer::acquire_for_staging(
+            &peers_root, tmp.path(), slug, None, None,
+            &crate::build_cache::BuildCacheConfig { min_free_gb: 0, ..Default::default() },
+        ).unwrap();
+        let path = slot.path.clone();
+        build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let session = SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
+        try_emit_terminal(&TokioMutex::new(TurnState::Active), reason, &ws, &UiProtocolLedger::new(32),
+            &session, &TurnId::new(), None, None, None, known_root.then_some(peers_root.as_path())).await;
+        assert!(!path.join("holder.json").exists(), "{reason:?}, known_root={known_root} must return the slot");
+    }
+}
