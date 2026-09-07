@@ -714,15 +714,18 @@ pub fn acquire(
                 let json = serde_json::to_string(&meta).map_err(|e| {
                     BuildCacheError::io("failed to serialize holder.json", e.into())
                 })?;
-                write_file_atomic(&dir, HOLDER_LEAF, &json).map_err(|e| {
-                    BuildCacheError::io(
-                        format!("failed to write {}", dir.join(HOLDER_LEAF).display()),
-                        e,
-                    )
-                })?;
+                // Publish the live claim only after all other fallible writes.
+                // Once holder.json is renamed into place, return its Slot
+                // without another I/O step that could strand the claim.
                 write_last_used(&dir, now).map_err(|e| {
                     BuildCacheError::io(
                         format!("failed to write {}", dir.join(LAST_USED_LEAF).display()),
+                        e,
+                    )
+                })?;
+                write_file_atomic(&dir, HOLDER_LEAF, &json).map_err(|e| {
+                    BuildCacheError::io(
+                        format!("failed to write {}", dir.join(HOLDER_LEAF).display()),
                         e,
                     )
                 })?;
@@ -1674,6 +1677,57 @@ mod tests {
         // I2: contents survive release for the next peer of this repo.
         assert!(path.join(TARGET_LEAF).join("artifact.bin").exists());
         assert!(path.join(LOCK_LEAF).exists());
+    }
+
+    fn assert_failed_acquire_is_recoverable(purpose: SlotPurpose, failed_leaf: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pool");
+        let repo_key = key(&tmp);
+        let cfg = BuildCacheConfig {
+            peer_slots: 1,
+            verify_slots: 1,
+            ..config()
+        };
+        let dir = slot_dir(&root.join(repo_key.as_str()), SlotKind::from(purpose), 1);
+        let blocked = dir.join(failed_leaf);
+        // A directory at the destination deterministically fails the atomic
+        // rename without requiring a full disk or permission-sensitive tests.
+        fs::create_dir_all(&blocked).unwrap();
+        let target = dir.join(TARGET_LEAF);
+        fs::create_dir_all(&target).unwrap();
+        let artifact = target.join("artifact.bin");
+        fs::write(&artifact, b"cached").unwrap();
+
+        let result = acquire(&root, &repo_key, purpose, &cfg, &HolderInfo::default());
+        assert!(matches!(result, Err(BuildCacheError::Io { .. })));
+        assert!(
+            read_holder(&dir).is_none(),
+            "failed acquisition must not publish a live claim without a Slot"
+        );
+        assert!(dir.join(LOCK_LEAF).is_file());
+        assert_eq!(fs::read(&artifact).unwrap(), b"cached");
+
+        fs::remove_dir(&blocked).unwrap();
+        let mut slot = acquire(&root, &repo_key, purpose, &cfg, &HolderInfo::default())
+            .expect("the same process must reacquire the only slot after the I/O failure is fixed");
+        assert_eq!(slot.path, dir);
+        assert_eq!(read_holder(&dir).unwrap().claim_token, slot.claim_token);
+        release(&mut slot, SlotOutcome::Completed).unwrap();
+        assert_eq!(fs::read(&artifact).unwrap(), b"cached");
+    }
+
+    #[test]
+    fn failed_last_used_write_does_not_leak_acquisition() {
+        for purpose in [SlotPurpose::Peer, SlotPurpose::Verify] {
+            assert_failed_acquire_is_recoverable(purpose, LAST_USED_LEAF);
+        }
+    }
+
+    #[test]
+    fn failed_holder_write_does_not_leak_acquisition() {
+        for purpose in [SlotPurpose::Peer, SlotPurpose::Verify] {
+            assert_failed_acquire_is_recoverable(purpose, HOLDER_LEAF);
+        }
     }
 
     #[test]
