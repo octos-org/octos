@@ -1133,8 +1133,7 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
         SandboxBackendChoice::Docker => Box::new(DockerSandbox {
             config: fence_degraded_docker(config),
             allow_network: config.allow_network,
-            // TODO(outer-loop #4 §7.2, known degradation): same as bwrap —
-            // no writable extra mount for the slot in this cut.
+            // Per-call cache target mounts are supplied by the shell tool.
         }),
         SandboxBackendChoice::Landlock => {
             #[cfg(target_os = "linux")]

@@ -240,7 +240,7 @@ peer 的 cwd 是它自己的 clone `peers/<slug>/wt`(peers/mod.rs:1597–1622),�
   `(allow file-write* (subpath "<real_slot>/target"))` + `(allow file-read* (subpath "<real_slot>"))`
   写权限只覆盖 `target/`；`.lock`、`holder.json`、`last_used` 不在该授权范围内。
   ——路径先 canonicalize、再过 `path_has_sbpl_metachars` 校验(与 macos.rs:318/325 同款),不安全即跳过该条(fail-closed:编译失败可见,profile 不可注入)。**独立于 fence/toolchain 开关**的理由:槽在 workspace 之外,是 harness 分配的基础设施目录,与 macos.rs 外部 tmp 的处理完全同构;fence 约束的是「workspace 内写什么」,不该顺带杀掉 workspace 外的编译产物目录。
-- 其他后端(bwrap :1086、docker :1091、Landlock :1095)首版处理:bwrap/docker 无法动态加挂一个 workspace 外目录的可写 bind ⇒ 记为已知降级(槽目录不可写 ⇒ CARGO_TARGET_DIR 指向槽时构建会失败),文档明示 macOS 优先;后续条目再补 bind 方案。NoSandbox 本就不拦。
+- Docker 在每次 shell 调用时仅挂载本槽 `target/` 到容器内 `/octos-build-cache/target`，并通过 `--env` 传入该容器路径的 `CARGO_TARGET_DIR` 与 `CARGO_INCREMENTAL=0`。目标目录不可用或无法表示为挂载参数时拒绝执行。bwrap 与 Landlock 仍未提供池目标目录的可写授权，构建可能失败；NoSandbox 本就不拦。
 - 单元测试面(#4 要求的「白名单仅含自己的槽」,不必真跑 seatbelt):直接断言生成的 profile 字符串含且仅含本槽 subpath(模式同 macos.rs 既有 tests,:498 起)。
 
 ### 7.3 读侧
