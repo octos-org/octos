@@ -305,6 +305,7 @@ impl CacheCommand {
                 ReclaimOutcome::HolderCleared => "holder_cleared".yellow(),
                 ReclaimOutcome::Fresh => "fresh".dimmed(),
                 ReclaimOutcome::NoLock => "no_lock".yellow(),
+                ReclaimOutcome::Skipped => "skipped".yellow(),
             };
             let rel = pool_root
                 .join(&row.slot_path)

@@ -409,6 +409,8 @@ pub enum ReclaimOutcome {
     /// broken (we never create or delete `.lock`). Skipped, never deleted,
     /// and reported distinctly from `fresh` so a human can see it (D6).
     NoLock,
+    /// Symbolic link or unresolved filesystem boundary; left untouched.
+    Skipped,
 }
 
 impl ReclaimOutcome {
@@ -421,6 +423,7 @@ impl ReclaimOutcome {
             Self::Stale => "stale",
             Self::Fresh => "fresh",
             Self::NoLock => "no_lock",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -987,6 +990,9 @@ pub fn reclaim_stale(
     config: &BuildCacheConfig,
 ) -> Result<Vec<ReclaimReport>, BuildCacheError> {
     let mut reports = Vec::new();
+    if is_symlink(pool_root) {
+        return Ok(vec![skipped_report(pool_root.to_path_buf())]);
+    }
     let entries = match fs::read_dir(pool_root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(reports),
@@ -997,14 +1003,24 @@ pub fn reclaim_stale(
             ));
         }
     };
+    let canonical_root = pool_root
+        .canonicalize()
+        .map_err(|e| BuildCacheError::io("failed to resolve GC pool root", e))?;
     for entry in entries.flatten() {
         let repo_dir = entry.path();
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
         // Only directories named like a pool repo dir (12-hex repo key);
         // unrelated content under the root is never touched.
         if super::repo_key::RepoKey::parse(&entry.file_name().to_string_lossy()).is_err() {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&repo_dir) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            reports.push(skipped_report(repo_dir));
+            continue;
+        }
+        if !metadata.is_dir() {
             continue;
         }
         // D3: enumerate the slot dirs that ACTUALLY exist (read_dir), not
@@ -1012,7 +1028,7 @@ pub fn reclaim_stale(
         // make historical high-numbered slots invisible to GC forever.
         for kind in [SlotKind::Peer, SlotKind::Verify] {
             for dir in existing_slot_dirs(&repo_dir, kind, config) {
-                let outcome = reclaim_one(&dir, kind, policy)?;
+                let outcome = reclaim_one(&canonical_root, &dir, kind, policy)?;
                 reports.push(ReclaimReport {
                     slot_path: dir,
                     outcome: outcome.0,
@@ -1025,15 +1041,42 @@ pub fn reclaim_stale(
     Ok(reports)
 }
 
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+fn skipped_report(slot_path: PathBuf) -> ReclaimReport {
+    ReclaimReport {
+        slot_path,
+        outcome: ReclaimOutcome::Skipped,
+        freed_bytes: 0,
+        would_free_bytes: 0,
+    }
+}
+
 /// Reclaim one slot dir, returning `(outcome, freed_bytes,
 /// would_free_bytes)`. `would_free_bytes` is only ever non-zero where the
 /// slot actually reached the reclaim arm — the bytes `--apply` would free
 /// right now (identical to `freed_bytes` for `Reclaimed`).
 fn reclaim_one(
+    canonical_root: &Path,
     dir: &Path,
     _kind: SlotKind,
     policy: &GcPolicy,
 ) -> Result<(ReclaimOutcome, u64, u64), BuildCacheError> {
+    // Check directory and bookkeeping entries without following links before
+    // reading metadata or taking a lock through any of these paths.
+    if is_symlink(dir)
+        || [LOCK_LEAF, HOLDER_LEAF, LAST_USED_LEAF, TARGET_LEAF]
+            .iter()
+            .any(|leaf| is_symlink(&dir.join(leaf)))
+    {
+        return Ok((ReclaimOutcome::Skipped, 0, 0));
+    }
+    let canonical_dir = match dir.canonicalize() {
+        Ok(path) if path.starts_with(canonical_root) && path != canonical_root => path,
+        _ => return Ok((ReclaimOutcome::Skipped, 0, 0)),
+    };
     let lock_path = dir.join(LOCK_LEAF);
     let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(f) => f,
@@ -1101,8 +1144,23 @@ fn reclaim_one(
         // exactly what a subsequent --apply would reclaim.
         return Ok((ReclaimOutcome::Stale, 0, dir_size(&target)));
     }
-    let freed = dir_size(&target);
-    fs::remove_dir_all(&target)
+    // Recheck immediately before removal and delete only a resolved target
+    // still belonging to this slot and pool.
+    if is_symlink(dir) || is_symlink(&target) {
+        return Ok((ReclaimOutcome::Skipped, 0, 0));
+    }
+    let canonical_target = match target.canonicalize() {
+        Ok(path)
+            if path.starts_with(canonical_root)
+                && path.starts_with(&canonical_dir)
+                && path != canonical_dir =>
+        {
+            path
+        }
+        _ => return Ok((ReclaimOutcome::Skipped, 0, 0)),
+    };
+    let freed = dir_size(&canonical_target);
+    fs::remove_dir_all(&canonical_target)
         .map_err(|e| BuildCacheError::io(format!("failed to remove {}", target.display()), e))?;
     Ok((ReclaimOutcome::Reclaimed, freed, freed))
 }
@@ -1113,6 +1171,9 @@ fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
+        if !fs::symlink_metadata(&p).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
         let entries = match fs::read_dir(&p) {
             Ok(e) => e,
             Err(_) => continue,
@@ -1162,7 +1223,10 @@ fn existing_slot_dirs(repo_dir: &Path, kind: SlotKind, config: &BuildCacheConfig
             let Some(n) = kind.strip_prefix_of(name) else {
                 continue;
             };
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) && !ns.contains(&n) {
+            if fs::symlink_metadata(entry.path())
+                .is_ok_and(|metadata| metadata.is_dir() || metadata.file_type().is_symlink())
+                && !ns.contains(&n)
+            {
                 ns.push(n);
             }
         }
@@ -1170,7 +1234,10 @@ fn existing_slot_dirs(repo_dir: &Path, kind: SlotKind, config: &BuildCacheConfig
     // Fallback when read_dir itself failed: probe the configured range, so a
     // permissions hiccup degrades to the old behavior instead of blindness.
     for n in 1..=config.slot_count(kind) {
-        if slot_dir(repo_dir, kind, n).is_dir() && !ns.contains(&n) {
+        if fs::symlink_metadata(slot_dir(repo_dir, kind, n))
+            .is_ok_and(|metadata| metadata.is_dir() || metadata.file_type().is_symlink())
+            && !ns.contains(&n)
+        {
             ns.push(n);
         }
     }
@@ -1358,6 +1425,95 @@ mod tests {
         );
         assert_eq!(fs::read(new.path.join(HOLDER_LEAF)).unwrap(), metadata);
         assert_eq!(read_last_used(&new.path), 123);
+    }
+
+    #[cfg(unix)]
+    fn gc_link_fixture(component: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_root = tmp.path().join("source-pool");
+        let mut source = acquire(
+            &source_root,
+            &key(&tmp),
+            SlotPurpose::Peer,
+            &config(),
+            &HolderInfo::default(),
+        )
+        .unwrap();
+        release(&mut source, SlotOutcome::Completed).unwrap();
+        write_last_used(&source.path, 0).unwrap();
+        let artifact = source.target_dir.join("artifact");
+        fs::write(&artifact, b"cached content").unwrap();
+        let pool_root = tmp.path().join("pool");
+        let repo = pool_root.join(key(&tmp).as_str());
+        fs::create_dir_all(&pool_root).unwrap();
+        let link = match component {
+            "repo" => {
+                std::os::unix::fs::symlink(source.path.parent().unwrap(), &repo).unwrap();
+                repo
+            }
+            "slot" => {
+                fs::create_dir_all(&repo).unwrap();
+                let link = repo.join("slot-1");
+                std::os::unix::fs::symlink(&source.path, &link).unwrap();
+                link
+            }
+            "target" => {
+                let mut slot = acquire(
+                    &pool_root,
+                    &key(&tmp),
+                    SlotPurpose::Peer,
+                    &config(),
+                    &HolderInfo::default(),
+                )
+                .unwrap();
+                release(&mut slot, SlotOutcome::Completed).unwrap();
+                write_last_used(&slot.path, 0).unwrap();
+                fs::remove_dir(&slot.target_dir).unwrap();
+                std::os::unix::fs::symlink(&source.target_dir, &slot.target_dir).unwrap();
+                slot.target_dir
+            }
+            _ => unreachable!(),
+        };
+        let reports = reclaim_stale(
+            &pool_root,
+            &GcPolicy {
+                stale_hours: 1,
+                apply: true,
+            },
+            &config(),
+        )
+        .unwrap();
+        assert!(artifact.is_file(), "original fixture content must remain");
+        assert!(link.is_symlink(), "GC must leave symbolic links untouched");
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.outcome.as_str() == "skipped"),
+            "symbolic links must be reported as skipped: {reports:?}"
+        );
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.freed_bytes == 0 && report.would_free_bytes == 0)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_skips_repo_symlink_fixture() {
+        gc_link_fixture("repo");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_skips_slot_symlink_fixture() {
+        gc_link_fixture("slot");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_skips_target_symlink_fixture() {
+        gc_link_fixture("target");
     }
 
     #[test]
