@@ -1125,7 +1125,15 @@ pub async fn test_provider(
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,
     // so 16 tokens is too small — they return empty content.  Use 128 for
     // Gemini and keep 16 for everyone else (fast, cheap connectivity check).
-    let max_tokens = if req.provider == "gemini" || req.provider == "vertex" {
+    // Resolve aliases through the registry: the web settings UI historically
+    // sends `google`, which is the registered alias for `gemini`. Treating the
+    // alias as an unrelated provider left the connectivity probe with only 16
+    // output tokens and caused thinking-capable Gemini models to return a
+    // truncated/empty candidate that was then reported as a connection error.
+    let canonical_provider = octos_llm::registry::lookup(&req.provider)
+        .map(|entry| entry.name)
+        .unwrap_or(req.provider.as_str());
+    let max_tokens = if canonical_provider == "gemini" || canonical_provider == "vertex" {
         128
     } else {
         16
