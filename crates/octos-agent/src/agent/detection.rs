@@ -50,7 +50,7 @@ static PARAM_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
 impl Agent {
     /// Check if an LLM response is empty or abnormal and should be retried.
     /// Catches:
-    /// - Empty content with no tool calls and no reasoning (including output_tokens > 0 bug)
+    /// - No answer or tool calls, even if reasoning/output tokens are present
     /// - Content filtered by safety/moderation
     /// - Repetitive output suppressed by the stream consumer (#1507): the
     ///   placeholder message stands in for degenerate output, so the retry /
@@ -58,13 +58,14 @@ impl Agent {
     ///   real content — only when that ladder is disabled or exhausted does
     ///   the placeholder reach the user (instead of the old blank bubble).
     pub(super) fn is_retriable_response(response: &ChatResponse) -> bool {
-        let has_reasoning = response
-            .reasoning_content
+        // Reasoning is not a deliverable. Treat reasoning-only and whitespace
+        // responses like other empty results so the bounded recovery ladder
+        // gets a chance to obtain a real answer (or emits an error).
+        let is_empty = response
+            .content
             .as_ref()
-            .is_some_and(|r| !r.is_empty());
-        let is_empty = response.content.as_ref().is_none_or(|c| c.is_empty())
-            && response.tool_calls.is_empty()
-            && !has_reasoning;
+            .is_none_or(|c| c.trim().is_empty())
+            && response.tool_calls.is_empty();
         let is_abnormal_tool_use =
             response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty();
         let is_filtered = response.stop_reason == StopReason::ContentFiltered;
@@ -632,6 +633,21 @@ mod tests {
     }
 
     // ---------- Agent::is_retriable_response ----------
+
+    #[test]
+    fn terminal_integrity_reasoning_is_not_a_final_answer() {
+        for stop in [
+            StopReason::EndTurn,
+            StopReason::StopSequence,
+            StopReason::MaxTokens,
+        ] {
+            for content in [None, Some(""), Some(" \n\t")] {
+                let mut response = make_response_with_stop(content, vec![], 100, stop);
+                response.reasoning_content = Some("Need to inspect the image.".into());
+                assert!(Agent::is_retriable_response(&response), "{response:?}");
+            }
+        }
+    }
 
     #[test]
     fn should_retry_when_all_empty() {

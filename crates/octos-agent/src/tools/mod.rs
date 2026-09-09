@@ -29,6 +29,9 @@
 //! migrated the task-local becomes redundant and can be retired, but that
 //! clean-up is out of scope for M8.1.
 
+mod build_cache_usage;
+pub use build_cache_usage::{BuildCacheUsage, BuildCacheUseGuard};
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -346,6 +349,18 @@ pub struct ToolContext {
     /// can enforce the goal-binding check WITHOUT re-reading the originator
     /// file on every call. `None` for non-peer sessions.
     pub originator_session: Option<String>,
+    /// Build-cache pool slot this peer's CURRENT turn holds (outer-loop #4,
+    /// design docs/build-cache-pool.md §7.4). Populated from
+    /// `Agent::build_cache_slot` at tool dispatch, exactly like
+    /// `goal_id`/`task_id` above. Read by the shell tool to inject
+    /// `CARGO_TARGET_DIR=<slot>/target` + `CARGO_INCREMENTAL=0` PER TOOL
+    /// CALL — never via `std::env::set_var`, because on the serve path a
+    /// peer shares the process with the master and every other peer.
+    /// `None` for non-peer sessions and a peer turn that failed to acquire
+    /// a slot (it still runs, just with cargo's default target dir).
+    pub build_cache_slot: Option<std::path::PathBuf>,
+    /// Shared child lifetime accounting for this cache claim.
+    pub build_cache_usage: Option<BuildCacheUsage>,
     /// Post-edit formatting (issue #1774): when true, a successful
     /// `edit_file` / `write_file` / `diff_edit` runs the language formatter
     /// for the file (rustfmt / prettier / black / gofmt — see
@@ -403,6 +418,8 @@ impl ToolContext {
             goal_id: None,
             task_id: None,
             originator_session: None,
+            build_cache_slot: None,
+            build_cache_usage: None,
             format_after_edit: false,
         }
     }

@@ -183,7 +183,13 @@ pub(crate) fn load_skill_action_jobs(
         profile_id,
         data_dir,
     );
-    supervisor.enable_persistence(task_state_path(data_dir, session_id))?;
+    crate::peers::enable_peer_task_persistence(
+        &supervisor,
+        task_state_path(data_dir, session_id),
+        &data_dir.join("peers"),
+        profile_id,
+        &session_id.0,
+    )?;
     Ok(project_skill_action_jobs(
         supervisor.get_tasks_for_session(&session_id.0),
     ))
@@ -282,6 +288,52 @@ mod tests {
         assert_eq!(succeeded.status, SkillActionJobStatus::Succeeded);
         assert_eq!(succeeded.output.as_deref(), Some("source imported"));
         assert_eq!(succeeded.result, Some(json!({"success": true})));
+    }
+
+    #[test]
+    fn should_restore_completed_peer_when_job_inspection_precedes_first_master_turn() {
+        use crate::peers::*;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = format!("peer-inspection-{}", uuid::Uuid::now_v7());
+        let master = SessionKey::with_profile(&profile, "local", "master");
+        let peer = SessionKey::with_profile_topic(&profile, "local", "peer", "peer-auditor");
+        let peers_root = dir.path().join("peers");
+        let peer_dir = peers_root.join("auditor");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        peer_io::write_peer_file_atomic(&peer_dir, "brief.md", "review").unwrap();
+        peer_io::write_peer_file_atomic(&peer_dir, "originator", &master.0).unwrap();
+        let ledger = task_state_path(dir.path(), &master);
+        let staging = TaskSupervisor::new();
+        staging.enable_persistence(&ledger).unwrap();
+        let key = peer_wire_key(&profile, "auditor");
+        let task_id = bind_peer_supervised_task(&staging, key.clone(), &master.0).unwrap();
+        record_peer_lifetime_binding(&peers_root, &profile, "auditor", &master.0, &task_id)
+            .unwrap();
+        let token = begin_peer_lifetime_turn(&peers_root, &peer, "completed-turn")
+            .unwrap()
+            .unwrap();
+        peer_io::write_peer_file_atomic(&peer_dir, "result.md", "completed").unwrap();
+        finish_peer_lifetime_turn(&token, "completed", true, false).unwrap();
+        peer_task_registry().take(&key);
+        drop(staging);
+        // The real status/inspect fallback is the first path to enable this
+        // ledger after boot. It must not append a false Failed before the
+        // ordinary foreground factory gets a chance to restore the lifetime.
+        assert!(
+            load_skill_action_jobs(dir.path(), &profile, &master)
+                .unwrap()
+                .is_empty()
+        );
+        let foreground = TaskSupervisor::new();
+        enable_peer_task_persistence(&foreground, &ledger, &peers_root, &profile, &master.0)
+            .unwrap();
+        let row = foreground.get_task(&task_id).unwrap();
+        assert!(row.status.is_active());
+        assert!(row.error.is_none());
+        assert_eq!(
+            retire_peer_supervised_task(&foreground, &profile, "auditor"),
+            Some(task_id)
+        );
     }
 
     #[test]

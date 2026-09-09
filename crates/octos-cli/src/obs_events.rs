@@ -9,7 +9,10 @@
 //!
 //! `kind` coverage required by the contract: `peer_staged`,
 //! `finding_recorded`, `escalation`, `goal_transition`, `steer_consumed`,
-//! `turn_error`.
+//! `turn_error`; stage 2 (#48) adds `fallback_switch` (model-lane failover,
+//! gateway + serve/UI forwarder paths) and `malformed_exhausted` (malformed
+//! tool-call self-correction budget exhausted, replaces that terminal's
+//! turn_error row).
 
 use std::path::{Path, PathBuf};
 

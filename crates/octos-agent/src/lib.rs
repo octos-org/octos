@@ -67,6 +67,12 @@ pub mod validators;
 pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
+/// #48b — stable prefix marking that a turn terminated because the
+/// malformed tool-call self-correction budget was exhausted. The CLI's
+/// terminal-error path `starts_with` this marker to emit the
+/// `malformed_exhausted` OLP event INSTEAD of a generic turn_error row.
+pub const MALFORMED_TOOLCALL_EXHAUSTED_MARKER: &str =
+    "malformed tool-call feedback budget exhausted";
 
 pub use abi_schema::{
     COMPACTION_POLICY_SCHEMA_VERSION, COST_ATTRIBUTION_SCHEMA_VERSION,
@@ -79,9 +85,10 @@ pub use abi_schema::{
     check_supported, default_credential_pool_config_schema_version,
 };
 pub use agent::{
-    Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
-    DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT, MAX_TOOL_TIMEOUT_SECS, PartialTurnUsage,
-    PromptSegmentProvider, RealtimeController, TASK_REPORTER, TokenTracker,
+    Agent, AgentConfig, AssistantSegmentProvenance, ConversationResponse,
+    DEFAULT_SESSION_TIMEOUT_SECS, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_WORKER_PROMPT,
+    IncompleteResponseError, MAX_TOOL_TIMEOUT_SECS, PartialTurnUsage, PromptSegmentProvider,
+    RealtimeController, TASK_REPORTER, TokenTracker,
     loop_state::{
         LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
         SHELL_SPIRAL_VARIANT,
@@ -142,6 +149,7 @@ pub use hooks::{
 pub use mcp::{McpClient, McpServerConfig};
 pub use memory_segment::{
     MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
+    stable_memory_instructions, volatile_memory_content,
 };
 pub use permissions::{InvalidSafetyTier, SafetyTier};
 pub use plugins::{
@@ -188,10 +196,10 @@ pub use swarm::{
     MailboxMessage, MailboxRecovery,
 };
 pub use task_supervisor::{
-    BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal, TaskCancelError,
-    TaskCancelToken, TaskLifecycleState, TaskLivenessLease, TaskRelaunchError, TaskRuntimeState,
-    TaskStatus, TaskSupervisor, TaskTerminalGuard, TerminalEvent, TerminalOutcome,
-    parse_alternatives, task_is_live,
+    BackgroundTask, RegisterTaskError, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal,
+    TaskCancelError, TaskCancelToken, TaskLifecycleState, TaskLivenessLease, TaskRelaunchError,
+    TaskRuntimeState, TaskStatus, TaskSupervisor, TaskTerminalGuard, TerminalEvent,
+    TerminalOutcome, parse_alternatives, task_is_live,
 };
 pub use tools::{
     AskUserQuestionTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,

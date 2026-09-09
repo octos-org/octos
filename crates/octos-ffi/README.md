@@ -39,8 +39,9 @@ cbindgen --config crates/octos-ffi/cbindgen.toml \
 | `void octos_runtime_free(OctosRuntime*)` | Free the runtime (NULL-safe). |
 | `char* octos_run_task(OctosRuntime*, const char* brief_json)` | Run one task; returns owned JSON, NULL on error. |
 | `char* octos_embed(OctosRuntime*, const char* text)` | Embed text (needs `embed-llama` + a model path); NULL on error. |
-| `void octos_string_free(char*)` | Free a string returned by `octos_run_task`/`octos_embed`. |
+| `void octos_string_free(char*)` | Free a string returned by `octos_run_task`/`octos_embed`/`octos_take_last_partial_result`. |
 | `const char* octos_last_error(void)` | Thread-local last error; do NOT free; valid until the next FFI call on this thread. |
+| `char* octos_take_last_partial_result(void)` | Take the last incomplete task's owned JSON once, on the same thread; NULL if absent. Free with `octos_string_free`. |
 | `const char* octos_version(void)` | Static version string. |
 
 `config_json`:
@@ -61,6 +62,29 @@ cbindgen --config crates/octos-ffi/cbindgen.toml \
 `brief_json`: `{"prompt": "...", "max_iterations"?: N}`.
 Task result: `{"output": "...", "iterations": N, "tokens": {"input", "output", ...}}`.
 
+### Incomplete responses are failures with recoverable output
+
+A provider `max_tokens` stop still makes `octos_run_task` return **NULL**.
+`octos_last_error` holds a short, sanitized diagnostic; it never contains the
+partial model body. Call `octos_take_last_partial_result` on the **same thread**
+to take the actual partial `TaskResult` JSON, including accumulated token usage
+and iterations. This is not a successful final answer.
+
+The accessor transfers ownership once and returns NULL on subsequent reads.
+Free its allocation, unmodified, with `octos_string_free`. Reading last-error
+or version, taking the result, and successful free calls do not reset the
+diagnostic. A new `octos_runtime_new`, `octos_run_task`, or `octos_embed` call
+clears any untaken partial at entry, whether it later succeeds or fails. Any
+new error (including a caught panic) also clears it. Untaken data is released
+at thread exit; no data is shared across threads.
+
+Partial output is the Agent's task payload: its Unicode, whitespace, and full
+length are preserved by the FFI, just like successful output (normal Agent
+response normalization still applies). It is **not** sanitized or shortened
+by the 600-byte diagnostic cap. Hosts should not log it as error text. Native
+Rust callers receive `CoreError::Incomplete { partial: TaskResult }` directly;
+other error kinds retain their existing behavior.
+
 ### Safety contract
 
 - **Handle thread-safety & lifetime.** An `OctosRuntime*` is NOT thread-safe.
@@ -75,7 +99,7 @@ Task result: `{"output": "...", "iterations": N, "tokens": {"input", "output", .
   block internally). The panic firewall contains such misuse (returns
   null/no-op) but the runtime cannot then clean up fully.
 - **Returned strings are immutable + caller-owned.** Strings from
-  `octos_run_task`/`octos_embed` MUST be freed, UNMODIFIED, with
+  `octos_run_task`/`octos_embed`/`octos_take_last_partial_result` MUST be freed, UNMODIFIED, with
   `octos_string_free` — never `free(3)`, never twice, and do not alter the bytes
   or the NUL terminator before freeing (freeing rescans for the NUL; a mutated
   terminator corrupts the allocator).

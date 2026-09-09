@@ -558,6 +558,7 @@ async fn fetch_summary(
         // [`LastTickSummary`]), so an identical prompt is never re-sent and
         // a cache write would be pure 1.25x premium.
         cache_retention: octos_llm::CacheRetention::None,
+        prompt_cache_context: None,
     };
     let messages = vec![Message::user(prompt)];
     let fut = async move { provider.chat(&messages, &[], &config).await };

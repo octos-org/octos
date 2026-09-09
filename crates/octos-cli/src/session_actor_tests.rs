@@ -2264,6 +2264,7 @@ fn conversation_response_with_usage(
         files_modified: vec![],
         files_to_send: vec![],
         streamed: false,
+        assistant_segments: Default::default(),
         messages: vec![],
         tool_results: vec![],
         synthesized_from_spawn_only: false,
@@ -2480,8 +2481,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
-    crate::autonomy::agent_orchestrator::default_agent_orchestrator().upsert_agent(
-        crate::autonomy::agent_orchestrator::AgentUpsert {
+    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+        .upsert_agent(crate::autonomy::agent_orchestrator::AgentUpsert {
             agent_id: agent_id.clone(),
             parent_agent_id: Some("master".into()),
             session_id: session_id.clone(),
@@ -2494,8 +2495,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
             last_task: Some("review finished".into()),
             cwd: None,
             profile_id: MAIN_PROFILE_ID.into(),
-        },
-    );
+        })
+        .unwrap();
 
     for _ in 0..10 {
         tokio::time::advance(Duration::from_millis(250)).await;
@@ -2509,9 +2510,17 @@ async fn master_continuation_tick_reenters_actor_loop() {
         "periodic actor tick must drain queued child completion into process_inbound"
     );
 
-    for _ in 0..10 {
-        tokio::time::advance(Duration::from_millis(250)).await;
-        tokio::task::yield_now().await;
+    // `process_inbound` persists through the real spawn-blocking JSONL path.
+    // This test uses a paused Tokio clock, so advancing virtual time alone
+    // cannot guarantee that the blocking-pool completion has been observed.
+    // Poll in bounded real-time slices, matching the goal-continuation test
+    // below, instead of racing the durable append.
+    for _ in 0..500 {
+        tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(2));
+        })
+        .await
+        .unwrap();
         let session_handle = SessionHandle::open(dir.path(), &session_id);
         if session_handle.session().messages.iter().any(|message| {
             message.role == MessageRole::Assistant
@@ -5176,6 +5185,551 @@ async fn test_agent_error_persists_to_history() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
 
+#[cfg(feature = "api")]
+struct PartialReasoningProvider(Arc<DelayedMockProvider>);
+
+#[cfg(feature = "api")]
+#[async_trait]
+impl LlmProvider for PartialReasoningProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        self.0.chat(messages, tools, config).await
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatStream> {
+        // The trait's compatibility default does not emit reasoning deltas.
+        // Model a real reasoning-capable stream so the carrier is exercised.
+        let response = self.chat(messages, tools, config).await?;
+        let mut events = Vec::new();
+        if let Some(reasoning) = response.reasoning_content {
+            events.push(octos_llm::StreamEvent::ReasoningDelta(reasoning));
+        }
+        if let Some(text) = response.content {
+            events.push(octos_llm::StreamEvent::TextDelta(text));
+        }
+        for (index, call) in response.tool_calls.into_iter().enumerate() {
+            events.push(octos_llm::StreamEvent::ToolCallDelta {
+                index,
+                id: Some(call.id),
+                name: Some(call.name),
+                arguments_delta: call.arguments.to_string(),
+            });
+        }
+        events.push(octos_llm::StreamEvent::Usage(response.usage));
+        events.push(octos_llm::StreamEvent::Done(response.stop_reason));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+    fn model_id(&self) -> &str {
+        "partial-reasoning"
+    }
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+}
+
+async fn assert_incomplete_gateway_turn_preserves_partial(mode: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    let artifact = dir.path().join("partial-artifact.txt");
+    std::fs::write(&artifact, "actual partial artifact").unwrap();
+    let mut tool_response = make_response("partial preamble");
+    tool_response.stop_reason = StopReason::ToolUse;
+    tool_response.tool_calls = vec![octos_core::ToolCall {
+        id: "partial-read-call".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": artifact}),
+        metadata: None,
+    }];
+    let mut partial_response = make_response("actual unfinished assistant text");
+    partial_response.stop_reason = StopReason::MaxTokens;
+    partial_response.reasoning_content = Some("actual partial reasoning".into());
+    partial_response.usage.cache_read_tokens = 17;
+    partial_response.usage.cache_write_tokens = 19;
+    let provider = Arc::new(DelayedMockProvider::new(
+        "partial-provider",
+        vec![
+            (Duration::ZERO, tool_response),
+            (Duration::ZERO, partial_response),
+        ],
+    ));
+    let memory = Arc::new(
+        EpisodeStore::open(dir.path().join("partial-memory"))
+            .await
+            .unwrap(),
+    );
+    let gateway_provider: Arc<dyn LlmProvider> = {
+        #[cfg(feature = "api")]
+        {
+            Arc::new(PartialReasoningProvider(provider.clone()))
+        }
+        #[cfg(not(feature = "api"))]
+        {
+            provider.clone()
+        }
+    };
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("partial-gateway"),
+            gateway_provider,
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    // API metadata must retain a machine-readable incomplete outcome, while
+    // the visible content still contains the actual partial answer.
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("keep this user input") else {
+        unreachable!()
+    };
+    message.channel = "api".into();
+    message.metadata = serde_json::json!({"client_message_id": "partial-gateway-turn"});
+    match mode {
+        "serial" => actor.process_inbound(message, vec![], vec![], None).await,
+        "primary" => {
+            actor
+                .process_inbound_speculative(message, vec![], vec![], None)
+                .await
+        }
+        "overflow" => {
+            actor.serve_overflow(&message, &[]);
+            tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+                while actor.active_overflow_tasks.load(Ordering::Acquire) > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("overflow settles");
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "actual partial artifact"
+    );
+    let persisted = SessionHandle::open(dir.path(), &actor.session_key);
+    let rows = &persisted.session().messages;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.role == MessageRole::Assistant
+                && row.content == "actual unfinished assistant text")
+            .count(),
+        1,
+        "{mode}: the actual partial final must be persisted exactly once"
+    );
+    #[cfg(feature = "api")]
+    let partial_row = rows
+        .iter()
+        .find(|row| {
+            row.role == MessageRole::Assistant && row.content == "actual unfinished assistant text"
+        })
+        .unwrap();
+    #[cfg(feature = "api")]
+    assert_eq!(
+        partial_row.reasoning_content.as_deref(),
+        Some("actual partial reasoning")
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.role == MessageRole::User && row.content == "keep this user input")
+            .count(),
+        1
+    );
+    if mode != "overflow" {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::Assistant
+                    && row.content == "partial preamble"
+                    && row
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| calls[0].id == "partial-read-call"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::Tool
+                    && row.tool_call_id.as_deref() == Some("partial-read-call"))
+                .count(),
+            1
+        );
+        let tool_row = rows
+            .iter()
+            .find(|row| {
+                row.role == MessageRole::Tool
+                    && row.tool_call_id.as_deref() == Some("partial-read-call")
+            })
+            .unwrap();
+        assert!(
+            tool_row.content.contains("actual partial artifact"),
+            "actual tool output retained: {}",
+            tool_row.content
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row.role, MessageRole::Assistant | MessageRole::Tool))
+                .all(|row| row.thread_id.as_deref() == Some("partial-gateway-turn"))
+        );
+    } else {
+        assert!(
+            rows.iter()
+                .all(|row| row.role != MessageRole::Tool && row.tool_calls.is_none()),
+            "overflow retains its final-only concurrency policy"
+        );
+    }
+    let usage = actor.session_usage.snapshot();
+    assert_eq!(
+        usage.input_tokens, 100,
+        "{mode}: partial usage is still billed"
+    );
+    assert_eq!(usage.output_tokens, 20);
+    if mode == "serial" {
+        assert_eq!(actor.last_turn_total_tokens, 156);
+    }
+    let mut outbound = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        outbound.push(message);
+    }
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("actual unfinished assistant text")),
+        "{mode}: the caller must receive the partial text"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.metadata["truncated"] == true
+                && message.metadata["outcome"] == "incomplete"),
+        "{mode}: an actual partial response must never be reported as successful completion: {outbound:?}"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("incomplete")),
+        "{mode}: visible error notice is retained alongside the partial text"
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_serial_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("serial").await;
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_primary_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("primary").await;
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_overflow_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("overflow").await;
+}
+
+#[derive(Default)]
+struct PartialStreamChannel {
+    finishes: std::sync::Mutex<Vec<String>>,
+    starts: std::sync::atomic::AtomicUsize,
+}
+
+/// Fail only the final session append, after serve_overflow durably writes
+/// its user row and before the provider returns its streamed partial answer.
+struct PersistFailureStreamProvider {
+    inner: StreamingMockProvider,
+    sessions_dir: std::path::PathBuf,
+    preserved_dir: std::path::PathBuf,
+}
+
+#[async_trait]
+impl LlmProvider for PersistFailureStreamProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        std::fs::rename(&self.sessions_dir, &self.preserved_dir)?;
+        std::fs::write(&self.sessions_dir, "fixture final-append blocker")?;
+        self.inner.chat(messages, tools, config).await
+    }
+
+    fn model_id(&self) -> &str {
+        "partial-persist-failure"
+    }
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+}
+
+#[async_trait]
+impl octos_bus::Channel for PartialStreamChannel {
+    fn name(&self) -> &str {
+        "api"
+    }
+    async fn start(&self, _: mpsc::Sender<InboundMessage>) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn send(&self, _: &OutboundMessage) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn send_with_id(&self, _: &OutboundMessage) -> eyre::Result<Option<String>> {
+        self.starts.fetch_add(1, Ordering::Relaxed);
+        Ok(Some("partial-stream".into()))
+    }
+    async fn edit_message(&self, _: &str, _: &str, _: &str) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn finish_stream(&self, _: &str, _: &str, text: &str) -> eyre::Result<()> {
+        self.finishes.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+    fn supports_edit(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_streamed_overflow_without_second_bubble() {
+    streamed_incomplete_overflow_case(false).await;
+}
+
+#[tokio::test]
+async fn should_not_send_empty_overflow_notification_when_partial_persistence_fails() {
+    streamed_incomplete_overflow_case(true).await;
+}
+
+async fn streamed_incomplete_overflow_case(fail_final_persistence: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    let sessions_dir = actor
+        .session_handle
+        .lock()
+        .await
+        .task_state_path()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let preserved_dir = dir.path().join("preserved-overflow-user-session");
+    let mut response = make_response("streamed unfinished content");
+    response.stop_reason = StopReason::MaxTokens;
+    let provider = StreamingMockProvider::new(
+        "partial-stream",
+        vec![(
+            Duration::from_millis(250),
+            "streamed unfinished content".into(),
+            response,
+        )],
+    );
+    let provider: Arc<dyn LlmProvider> = if fail_final_persistence {
+        Arc::new(PersistFailureStreamProvider {
+            inner: provider,
+            sessions_dir: sessions_dir.clone(),
+            preserved_dir: preserved_dir.clone(),
+        })
+    } else {
+        Arc::new(provider)
+    };
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("partial-stream"),
+            provider,
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            Arc::new(
+                EpisodeStore::open(dir.path().join("stream-memory"))
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    let stream = Arc::new(PartialStreamChannel::default());
+    actor.status_indicator = Some(Arc::new(StatusComposer::new(
+        stream.clone(),
+        vec!["Thinking".into()],
+    )));
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("stream this") else {
+        unreachable!()
+    };
+    message.channel = "api".into();
+    message.metadata = serde_json::json!({"client_message_id": "overflow-partial-stream"});
+    actor.serve_overflow(&message, &[]);
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while actor.active_overflow_tasks.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        stream.starts.load(Ordering::Relaxed) > 0,
+        "actual streaming branch exercised"
+    );
+    {
+        let finishes = stream.finishes.lock().unwrap();
+        let final_edit = finishes.last().expect("the existing bubble is finalized");
+        assert_eq!(final_edit.matches("streamed unfinished content").count(), 1);
+        assert!(final_edit.contains("incomplete"));
+    }
+    let mut replies = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        replies.push(message);
+    }
+    assert!(
+        replies
+            .iter()
+            .all(|message| !message.content.contains("streamed unfinished content")),
+        "no second visible bubble after streaming"
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|message| message.metadata.get("_completion").is_none()),
+        "an overflow error must not close the primary stream"
+    );
+    let results: Vec<_> = replies
+        .iter()
+        .filter_map(|message| message.metadata.get("_session_result"))
+        .filter(|result| result["role"] == "assistant")
+        .collect();
+    if fail_final_persistence {
+        assert!(
+            sessions_dir.is_file() && preserved_dir.is_dir(),
+            "actual I/O fault exercised"
+        );
+        let rows = actor.session_handle.lock().await.session().messages.clone();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::User && row.content == "stream this")
+                .count(),
+            1,
+            "the user committed before the injected final-append failure"
+        );
+        assert!(
+            rows.iter().all(|row| row.role != MessageRole::Assistant),
+            "failed final append cannot claim persistence"
+        );
+        assert!(
+            results.is_empty(),
+            "no invented committed result after an I/O error"
+        );
+        assert!(
+            replies.iter().all(|message| !message.content.is_empty()
+                || message.metadata.get("_session_result").is_some()),
+            "no empty notification without durable identity after the existing bubble was finalized: {replies:?}"
+        );
+        return;
+    }
+    assert_eq!(
+        results.len(),
+        1,
+        "one authoritative durable fanout survives a closed primary"
+    );
+    assert_eq!(results[0]["outcome"], "incomplete");
+    assert_eq!(results[0]["tokens_in"], 50);
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("streamed unfinished content")
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_silent_serial_failure_without_fake_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    // Literal empty / thinking-only responses are retried before MaxTokens.
+    // The silence marker is a real nonempty response, but must not suppress
+    // the incomplete outcome or fabricate a success answer in a cron turn.
+    let raw_partial = "[SILENT]";
+    let mut response = make_response(raw_partial);
+    response.stop_reason = StopReason::MaxTokens;
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("empty-partial"),
+            Arc::new(DelayedMockProvider::new(
+                "empty-partial",
+                vec![(Duration::ZERO, response)],
+            )),
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            Arc::new(
+                EpisodeStore::open(dir.path().join("empty-memory"))
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        }),
+    );
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("silent partial") else {
+        unreachable!()
+    };
+    message.channel = "system".into();
+    message.sender_id = "cron".into();
+    actor.process_inbound(message, vec![], vec![], None).await;
+    let mut replies = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        replies.push(message);
+    }
+    assert!(
+        replies
+            .iter()
+            .any(|message| message.content.contains("incomplete"))
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|message| !message.content.contains("Session Summary")
+                && !message.content.contains("empty response"))
+    );
+    let persisted = SessionHandle::open(dir.path(), &actor.session_key);
+    let assistant_rows: Vec<_> = persisted
+        .session()
+        .messages
+        .iter()
+        .filter(|row| row.role == MessageRole::Assistant)
+        .collect();
+    assert_eq!(assistant_rows.len(), 1);
+    assert_eq!(
+        assistant_rows[0].content, raw_partial,
+        "no invented final row"
+    );
+    let terminal = replies
+        .iter()
+        .find(|message| message.metadata.get("_completion").is_some())
+        .unwrap();
+    assert_eq!(terminal.metadata["outcome"], "incomplete");
+    assert_eq!(terminal.metadata["tokens_in"], 50);
+}
+
 #[tokio::test]
 async fn test_attachment_hints_do_not_persist_in_session_history() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -7371,6 +7925,7 @@ fn make_supervisor_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -7390,7 +7945,12 @@ async fn terminal_task_status_survives_actor_inbox_backpressure() {
         octos_agent::TaskStatus::Completed,
         octos_agent::TaskRuntimeState::Completed,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain the filler so the spawned awaited send can proceed.
     let _ = rx.recv().await.expect("filler");
@@ -7426,7 +7986,12 @@ async fn non_terminal_task_status_drops_under_inbox_backpressure() {
         octos_agent::TaskStatus::Running,
         octos_agent::TaskRuntimeState::ExecutingTool,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain filler. There must be no durable retry queued behind it.
     let _ = rx.recv().await.expect("filler");
@@ -9741,4 +10306,371 @@ async fn should_wire_goal_task_row_observers_when_gateway_actor_is_spawned() {
 
     drop(tx);
     handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// #48a — OLP observability: `fallback_switch` event rows from the failover
+// forwarder. Best-effort, per-session, written on every REAL lane switch
+// regardless of the client-notice debounce.
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_48a {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    async fn spawn_forwarder(
+        data_dir: &std::path::Path,
+    ) -> (
+        tokio::sync::broadcast::Sender<octos_llm::adaptive::FailoverEvent>,
+        mpsc::Receiver<OutboundMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let (out_tx, out_rx) = mpsc::channel(4);
+        let session_key = test_session_key(data_dir);
+        let handle = tokio::spawn(crate::session_actor::forward_router_failovers_for_test(
+            crate::session_actor::FailoverForwarderParams {
+                rx,
+                out_tx,
+                session_id: session_key.to_string(),
+                session_key,
+                channel: "telegram".to_string(),
+                chat_id: "c1".to_string(),
+                profile_data_dir: data_dir.to_path_buf(),
+            },
+        ));
+        (tx, out_rx, handle)
+    }
+
+    fn own_event(session: &str) -> octos_llm::adaptive::FailoverEvent {
+        octos_llm::adaptive::FailoverEvent {
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            reason: "quota".into(),
+            elapsed_ms: 120,
+            originating_session_id: Some(session.to_string()),
+            originating_turn_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_writes_own_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one fallback_switch row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            rows[0].get("model_lane").and_then(|s| s.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            rows[0].get("detail").and_then(|s| s.as_str()),
+            Some("router failover: a -> b (quota, 120ms)")
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_other_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let other = own_event("some-other-session");
+        tx.send(other).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "other-session failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_none_originator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let mut none_event = own_event("unused");
+        none_event.originating_session_id = None;
+        tx.send(none_event).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "None-originator failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_write_failure_does_not_block_notice() {
+        // data_dir points at a path that cannot host events.jsonl (a FILE
+        // where a directory is needed): the write fails, the notice still
+        // goes out, and the forwarder task stays alive.
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not-a-dir").unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(&blocker).await;
+        // The forwarder's session identity derives from the blocker path
+        // (its "data dir"); the event's originator must match THAT session.
+        let sid = test_session_key(&blocker).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        let push = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("notice must still be sent when the obs write fails")
+            .expect("channel open");
+        assert!(
+            push.content.starts_with("↺ Router failover:"),
+            "{}",
+            push.content
+        );
+        // The forwarder did NOT exit (still joinable, not finished).
+        assert!(
+            !handle.is_finished(),
+            "write failure must not kill the forwarder"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_written_even_when_notice_debounced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        // Two rapid events — inside the debounce window.
+        tx.send(own_event(&sid)).unwrap();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 2, "both real switches write rows: {events:?}");
+        // Client notice: exactly ONE (the second was debounced).
+        let mut notices = 0;
+        while out_rx.try_recv().is_ok() {
+            notices += 1;
+        }
+        assert_eq!(notices, 1, "debounce still collapses the client push");
+    }
+}
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_delivers_one_profiled_carrier() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    use crate::autonomy::supervisor_store::SupervisorStore;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let profile = "gateway-dual-sink";
+    let session = SessionKey::with_profile(profile, "matrix", "completion");
+    assert_eq!(session.profile_id(), Some(profile));
+    let ids: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|call| {
+            let id = supervisor.register("shell", call, Some(&session.0));
+            supervisor.mark_running(&id);
+            id
+        })
+        .collect();
+    for id in &ids {
+        supervisor.mark_completed(id, vec![]);
+    }
+    let mut terminal_ids = std::collections::HashSet::new();
+    while let Ok(message) = rx.try_recv() {
+        if let ActorMessage::TaskStatusChanged { task_json } = message {
+            let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+            if row["lifecycle_state"] == "ready" {
+                terminal_ids.insert(row["id"].as_str().unwrap().to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        terminal_ids,
+        ids.into_iter().collect(),
+        "actual on_change inbox delivery"
+    );
+    assert_eq!(
+        runtime.pending_continuation_count_for_session_for_test(&session, profile),
+        3,
+        "two child verdicts and one final scatter; both real sinks share dedupe"
+    );
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                MAIN_PROFILE_ID,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let durable = SupervisorStore::new(dir.path()).load_state().unwrap();
+    assert_eq!(durable.children.len(), 2);
+    let drained = runtime.drain_ready_continuations_for_session(
+        &session,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(drained.len(), 1);
+    let carrier = &drained[0];
+    assert_eq!(
+        carrier.reason,
+        MasterContinuationReason::ScatterJoinComplete
+    );
+    assert_eq!(
+        carrier.metadata.get("coalesced_count").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        carrier
+            .metadata
+            .get("terminal_children")
+            .map(String::as_str),
+        Some("2")
+    );
+    for child in durable.children.values() {
+        assert!(carrier.metadata["coalesced_child_ids"].contains(&child.child_id));
+    }
+    runtime.mark_continuation_completed(carrier, None);
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let restarted = InProcessAgentOrchestrator::default();
+    restarted.configure_supervisor_store(dir.path()).unwrap();
+    assert_eq!(
+        restarted.pending_continuation_count_for_session_for_test(&session, profile),
+        0
+    );
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_filters_failure_recovery() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    for acked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        let supervisor = TaskSupervisor::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        install_gateway_task_status_sinks(
+            &supervisor,
+            tx,
+            dir.path().to_path_buf(),
+            runtime.clone(),
+        );
+        let profile = "gateway-failure-sink";
+        let session = SessionKey::with_profile(profile, "matrix", &format!("failure-{acked}"));
+        assert_eq!(session.profile_id(), Some(profile));
+        let id = supervisor.register("shell", "failure-call", Some(&session.0));
+        supervisor.mark_running(&id);
+        if acked {
+            supervisor.mark_synth_ack_emitted("failure-call");
+        }
+        supervisor.mark_failed(&id, "owner failed".into());
+        let mut saw_failed = false;
+        while let Ok(message) = rx.try_recv() {
+            if let ActorMessage::TaskStatusChanged { task_json } = message {
+                let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+                saw_failed |= row["id"] == id && row["status"] == "failed";
+            }
+        }
+        assert!(
+            saw_failed,
+            "on_change must project failures with or without ack"
+        );
+        assert!(
+            runtime
+                .drain_ready_continuations_for_session(
+                    &session,
+                    MAIN_PROFILE_ID,
+                    MasterContinuationRuntimeState::idle(),
+                    20
+                )
+                .is_empty()
+        );
+        let drained = runtime.drain_ready_continuations_for_session(
+            &session,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            20,
+        );
+        let recoveries = drained
+            .iter()
+            .filter(|item| {
+                matches!(&item.reason,
+            MasterContinuationReason::External(kind) if kind == "spawn_only_failure")
+            })
+            .count();
+        assert_eq!(
+            recoveries,
+            usize::from(acked),
+            "only the actual terminal sink can enqueue acked recovery"
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "on_change still mirrors unacked Failed child verdicts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_ignores_sessionless_reentry() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let completed = supervisor.register("shell", "sessionless-complete", None);
+    supervisor.mark_completed(&completed, vec![]);
+    let failed = supervisor.register("shell", "sessionless-fail", None);
+    supervisor.mark_synth_ack_emitted("sessionless-fail");
+    supervisor.mark_failed(&failed, "failed".into());
+    let mut delivered = 0;
+    while let Ok(message) = rx.try_recv() {
+        if matches!(message, ActorMessage::TaskStatusChanged { .. }) {
+            delivered += 1;
+        }
+    }
+    assert_eq!(
+        delivered, 2,
+        "truthful status delivery still reaches the actor"
+    );
+    assert_eq!(runtime.pending_continuation_count_for_test(), 0);
 }

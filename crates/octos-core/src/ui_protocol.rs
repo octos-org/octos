@@ -223,6 +223,14 @@ pub const UI_PROTOCOL_FEATURE_REVIEW_START_V1: &str = "review.start.v1";
 /// compaction lifecycle inspection.
 pub const UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 
+/// Optional semantic-context and provider-cache diagnostics carried by the
+/// context lifecycle records (UPCR-2026-029). This feature does not move any
+/// context policy into clients: it only declares that the optional cache
+/// epoch, invalidation reason, and semantic-head fields on [`UiContextState`]
+/// are meaningful. Clients that do not negotiate it must continue to treat
+/// those additive fields as opaque/absent.
+pub const UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1: &str = "context.semantic_cache.v1";
+
 /// #965 / UPCR-2026-019 — spec-canonical feature name for the
 /// supervised-task inspection surface (`task/list`, `task/updated`,
 /// `task/output/read`, `agent/list`, `agent/status/read`, `agent/output/read`,
@@ -319,6 +327,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_REVIEW_START_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
@@ -1621,6 +1630,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
@@ -1636,12 +1646,17 @@ impl UiProtocolCapabilities {
         // is known to the server (and is advertised after explicit
         // negotiation) but must not appear here: doing so would alter the
         // byte-level `session/open` response for legacy clients that never
-        // requested it.
+        // requested it. `context.semantic_cache.v1` (UPCR-2026-029) follows
+        // the same rule: it is a strictly opt-in diagnostics surface, and
+        // this slice is also the serde default for legacy `SessionOpened`
+        // payloads, so advertising it here would claim the feature for
+        // clients that never requested it.
         .with_supported_features(
             UI_PROTOCOL_KNOWN_FEATURES
                 .iter()
                 .copied()
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -6213,6 +6228,16 @@ pub struct UiContextState {
     pub last_checkpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_id: Option<String>,
+    /// Optional OUP semantic/cache diagnostics. Older clients ignore these;
+    /// they are emitted only inside the already-negotiated context lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_epoch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cache_invalidation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_head_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_head_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6338,6 +6363,20 @@ pub struct TurnErrorEvent {
     pub turn_id: TurnId,
     pub code: String,
     pub message: String,
+    /// Exact usage of this failed turn, when its producer has a typed total.
+    /// Absent on failures without usage; never a cumulative session estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<EnvelopeTokenUsage>,
+    /// Producer-authoritative partial identity; absence is legacy/unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_result: Option<TurnErrorPartialResult>,
+}
+
+/// A failed turn may have persisted an actual final fragment, or explicitly
+/// have no final answer. Neither case permits selecting an earlier preamble.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnErrorPartialResult {
+    pub session_result: Option<TurnSessionResult>,
 }
 
 /// task-return-unconsumed-steer-inputs: `turn/steer_dropped` payload. See
@@ -6385,6 +6424,10 @@ pub struct FileAttachedEvent {
     /// Originating tool call (if any).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Exact owner captured when the attachment is committed. Old records
+    /// omit it; new records do not recompute ownership during replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_owner: Option<AttachmentOwnerV2>,
     /// Optional MIME-type hint surfaced by the tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,

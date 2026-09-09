@@ -63,6 +63,16 @@ pub enum ProgressEvent {
     /// Agent is thinking (calling LLM).
     Thinking { iteration: u32 },
 
+    /// Live telemetry for an unbounded interactive turn. This is deliberately
+    /// usage/time visibility, not a fee budget or a terminal limit.
+    AgentProgress {
+        iteration: u32,
+        active_tokens: u64,
+        elapsed: Duration,
+        checkpoints: u32,
+        reflecting: bool,
+    },
+
     /// LLM responded with text.
     Response { content: String, iteration: u32 },
 
@@ -175,6 +185,33 @@ pub enum ProgressEvent {
         /// window instead of a hardcoded default.
         context_window: Option<u32>,
     },
+}
+
+/// Stable, compact status-line text shared by terminal and UI projections.
+pub fn agent_progress_message(
+    iteration: u32,
+    active_tokens: u64,
+    elapsed: Duration,
+    checkpoints: u32,
+    reflecting: bool,
+) -> String {
+    let seconds = elapsed.as_secs();
+    let elapsed = if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    };
+    if reflecting {
+        format!(
+            "Reflection checkpoint {} · Step {iteration} · {active_tokens} tokens · {elapsed}",
+            checkpoints.saturating_add(1),
+        )
+    } else {
+        format!(
+            "Step {iteration} · {active_tokens} tokens · {elapsed} · {checkpoints} reflection{}",
+            if checkpoints == 1 { "" } else { "s" },
+        )
+    }
 }
 
 /// Trait for receiving progress updates.
@@ -300,6 +337,27 @@ impl ProgressReporter for ConsoleReporter {
                     "\r{} {}",
                     self.yellow("⟳"),
                     self.dim(&format!("Thinking... (iteration {iteration})"))
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            ProgressEvent::AgentProgress {
+                iteration,
+                active_tokens,
+                elapsed,
+                checkpoints,
+                reflecting,
+            } => {
+                print!(
+                    "\r{} {}",
+                    self.yellow("⟳"),
+                    self.dim(&agent_progress_message(
+                        iteration,
+                        active_tokens,
+                        elapsed,
+                        checkpoints,
+                        reflecting,
+                    ))
                 );
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
