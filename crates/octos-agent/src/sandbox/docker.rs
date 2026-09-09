@@ -171,7 +171,11 @@ fn cache_mount_refusal() -> Command {
 mod tests {
     use super::*;
 
+    // Unix-only: on Windows `std::fs::canonicalize` returns a `\\?\C:`
+    // verbatim path whose drive colon trips the `-v` injection guard, and
+    // the Docker backend refuses drive-letter cwd mounts there anyway.
     #[test]
+    #[cfg(unix)]
     fn build_cache_target_is_mounted_and_env_reaches_container() {
         let sb = DockerSandbox {
             config: DockerConfig::default(),

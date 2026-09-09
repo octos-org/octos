@@ -1972,7 +1972,10 @@ mod tests {
         assert_eq!(pid_alive(i32::MAX as u32 + 1), Some(false));
     }
 
+    // Dead-holder reclamation hinges on `pid_alive`'s kill(pid, 0)
+    // semantics, which only exist on Unix; `spawn_dead_pid` is cfg(unix).
     #[test]
+    #[cfg(unix)]
     fn report_only_preserves_dead_holder_and_all_slot_files() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("pool");
@@ -2165,6 +2168,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn dead_holder_slot_is_reclaimable() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("pool");
@@ -2605,7 +2609,9 @@ mod tests {
         assert!(dir.join(TARGET_LEAF).is_dir(), "no_lock never deletes");
     }
 
+    // chmod-based EACCES plus the dead-pid seam are both Unix-only.
     #[test]
+    #[cfg(unix)]
     fn unreadable_holder_json_is_skipped_not_stale() {
         // D4: an EACCES on holder.json means the slot is probably someone
         // else's — conservative skip, not "stale holder".
