@@ -3688,7 +3688,11 @@ mod tests {
         }
 
         let actual = std::fs::read_to_string(&sink).unwrap();
-        assert_eq!(actual, fixture);
+        // #2267 (Windows): autocrlf checkouts give include_str! a CRLF fixture
+        // while the sink writes LF — compare normalized, the byte content of
+        // each event is what the fixture pins.
+        let norm = |s: &str| s.replace("\r\n", "\n");
+        assert_eq!(norm(&actual), norm(fixture));
         let _ = std::fs::remove_file(&sink);
     }
 
@@ -3913,7 +3917,10 @@ A second paragraph elaborates on alternatives [2]."
         // Trailer with report path stays for v1 host compatibility,
         // but now references the topic-named filename (issue #261).
         assert!(
-            report.contains("Report saved to: /tmp/research/topic/topic_report.md"),
+            report.contains(&format!(
+                "Report saved to: {}",
+                dir.join("topic_report.md").display()
+            )),
             "expected topic-named report path in trailer: {report}"
         );
         // Belt-and-suspenders: the legacy literal must NOT leak back in.
@@ -3958,7 +3965,10 @@ A second paragraph elaborates on alternatives [2]."
         assert!(!report.contains("## Synthesis"));
         // Trailer must reference the topic-named file.
         assert!(
-            report.contains("Report saved to: /tmp/research/topic/topic_report.md"),
+            report.contains(&format!(
+                "Report saved to: {}",
+                dir.join("topic_report.md").display()
+            )),
             "expected topic-named trailer: {report}"
         );
     }
