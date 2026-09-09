@@ -943,7 +943,7 @@ mod tests {
             }
         });
         let resp: ApiResponse = serde_json::from_value(json).unwrap();
-        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        let chat = openrouter_response_to_chat_response(resp, "test-model").unwrap();
         assert_eq!(chat.usage.input_tokens, 25);
         assert_eq!(chat.usage.cache_read_tokens, 75);
     }
@@ -964,7 +964,7 @@ mod tests {
             }
         });
         let resp: ApiResponse = serde_json::from_value(json).unwrap();
-        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        let chat = openrouter_response_to_chat_response(resp, "test-model").unwrap();
         assert_eq!(chat.usage.input_tokens, 10);
         assert_eq!(chat.usage.cache_read_tokens, 0);
     }
@@ -988,7 +988,7 @@ mod tests {
             }
         });
         let resp: ApiResponse = serde_json::from_value(json).unwrap();
-        let chat = openrouter_response_to_chat_response(resp).unwrap();
+        let chat = openrouter_response_to_chat_response(resp, "test-model").unwrap();
         assert_eq!(chat.usage.input_tokens, 0);
         assert_eq!(chat.usage.cache_read_tokens, 100);
     }
