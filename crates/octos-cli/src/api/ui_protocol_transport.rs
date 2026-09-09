@@ -15906,32 +15906,44 @@ fn raw_peer_gather(
         )));
     };
     let peers_root = runtime.data_dir.join("peers");
-    let peers: Vec<Value> = read_peer_blackboard(&peers_root, params.slugs.as_deref())
-        .into_iter()
-        .map(|row| {
-            json!({
-                "slug": row.slug,
-                "name": row.name,
-                "topic": format!("peer-{}", row.slug),
-                "brief": row.brief,
-                "brief_truncated": row.brief_truncated,
-                "result": row.result,
-                "result_truncated": row.result_truncated,
-                "result_updated_unix": row.result_updated_unix,
-                "has_worktree": row.has_worktree,
-                "closed": row.closed,
-                "turn_history": row.turn_history.as_ref().map(|history| {
-                    history.iter().map(|(count, outcome, ts)| {
-                        json!({
-                            "turn": count,
-                            "outcome": outcome,
-                            "updated_unix": ts,
-                        })
-                    }).collect::<Vec<_>>()
-                }),
+    let peers: Vec<Value> =
+        read_peer_blackboard_with_profile(&peers_root, params.slugs.as_deref(), &profile_id)
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "slug": row.slug,
+                    "name": row.name,
+                    "topic": format!("peer-{}", row.slug),
+                    "brief": row.brief,
+                    "brief_truncated": row.brief_truncated,
+                    "result": row.result,
+                    "result_truncated": row.result_truncated,
+                    "result_updated_unix": row.result_updated_unix,
+                    "has_worktree": row.has_worktree,
+                    "closed": row.closed,
+                    "turn_history": row.turn_history.as_ref().map(|history| {
+                        history.iter().map(|(count, outcome, ts)| {
+                            json!({
+                                "turn": count,
+                                "outcome": outcome,
+                                "updated_unix": ts,
+                            })
+                        }).collect::<Vec<_>>()
+                    }),
+                    // task-evo-peer-turn-status — the execution facet fields
+                    // (same derivation as the CLI rows; see
+                    // docs/peer-status-interface.json).
+                    "execution": row.execution_facet.execution,
+                    "last_outcome": row.execution_facet.last_outcome,
+                    "round": row.execution_facet.round,
+                    "rounds_delivered": row.execution_facet.rounds_delivered,
+                    "master_session_id": row.execution_facet.master_session_id,
+                    "task_id": row.execution_facet.task_id,
+                    "generation": row.execution_facet.generation,
+                    "turn_id": row.execution_facet.turn_id,
+                })
             })
-        })
-        .collect();
+            .collect();
     Ok(json!({ "profile_id": profile_id, "peers": peers }))
 }
 
@@ -16177,13 +16189,17 @@ fn commit_gathered_peer_results(
 }
 
 #[cfg(test)]
-fn build_peer_gather_callback(peers_root: PathBuf) -> octos_agent::PeerGatherCallback {
-    build_peer_gather_callback_for_turn(peers_root, None)
+fn build_peer_gather_callback(
+    peers_root: PathBuf,
+    profile_id: String,
+) -> octos_agent::PeerGatherCallback {
+    build_peer_gather_callback_for_turn(peers_root, None, profile_id)
 }
 
 fn build_peer_gather_callback_for_turn(
     peers_root: PathBuf,
     consumption: Option<(SessionKey, GatheredPeerResults)>,
+    profile_id: String,
 ) -> octos_agent::PeerGatherCallback {
     Arc::new(move |idents: Option<Vec<String>>| {
         // The model may pass peer NAMES or slugs; resolve each to a slug for
@@ -16194,7 +16210,10 @@ fn build_peer_gather_callback_for_turn(
                 .filter_map(|ident| resolve_peer_name_to_slug(&peers_root, ident))
                 .collect::<Vec<_>>()
         });
-        let rows = read_peer_blackboard(&peers_root, slugs.as_deref());
+        // task-evo-peer-turn-status — the gather tool reads under the
+        // CALLER'S profile so non-default profiles' valid lifetimes are not
+        // demoted to unknown by an "octos" default (outer-loop review).
+        let rows = read_peer_blackboard_with_profile(&peers_root, slugs.as_deref(), &profile_id);
         let (output, output_truncated) = compose_peer_gather_text_with_truncation(&rows);
         // A budget-capped gather is not proof the model saw every result.
         if !output_truncated
@@ -33907,6 +33926,7 @@ async fn run_standalone_turn(
             let gather = build_peer_gather_callback_for_turn(
                 session_runtime.profile.data_dir.join("peers"),
                 Some((session_id.clone(), gathered_peer_results.clone())),
+                session_runtime.profile.profile_id.clone(),
             );
             tool_registry.register(octos_agent::PeerGatherTool::new(gather));
         }
