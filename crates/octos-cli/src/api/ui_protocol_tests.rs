@@ -3486,10 +3486,10 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
             abort,
         },
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(session.clone(), turn_id);
+    connection_turns.lock().await.insert(
+        session.clone(),
+        test_connection_turn(&active_turns, &session, &turn_id).await,
+    );
     let remover = active_turns.clone();
     let session_for_removal = session.clone();
     tokio::spawn(async move {
@@ -3552,7 +3552,10 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
             abort,
         },
     );
-    connection_turns.lock().await.insert(session, turn_id);
+    connection_turns.lock().await.insert(
+        session.clone(),
+        test_connection_turn(&active_turns, &session, &turn_id).await,
+    );
 
     let drained = drain_connection_turns_for_shutdown(
         &active_turns,
@@ -3621,10 +3624,10 @@ async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
         session_id.clone(),
         test_active_turn(turn_id.clone(), turn_task.abort_handle()),
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        test_connection_turn(&active_turns, &session_id, &turn_id).await,
+    );
 
     let (forwarder_started_tx, forwarder_started_rx) = oneshot::channel();
     let (forwarder_drop_tx, forwarder_drop_rx) = oneshot::channel();
@@ -10139,6 +10142,7 @@ async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() 
         None,
         Some(details.clone()),
         None,
+        None,
     )
     .await;
 
@@ -10199,6 +10203,7 @@ async fn try_emit_terminal_with_no_details_omits_token_fields() {
         &ledger,
         &session_id,
         &turn_id,
+        None,
         None,
         None,
         None,
@@ -13449,20 +13454,22 @@ fn appui_task_artifacts_resolve_agent_task_artifacts() {
     let session_id = SessionKey::with_profile(profile_id, "api", "agent-artifacts");
     let task_id = TaskId::new();
     let orchestrator = InProcessAgentOrchestrator::default();
-    orchestrator.upsert_agent(AgentUpsert {
-        agent_id: "agent-1".into(),
-        parent_agent_id: Some("master".into()),
-        session_id: session_id.clone(),
-        task_id: Some(task_id.clone()),
-        path: "master/agent-1".into(),
-        role: "worker".into(),
-        nickname: "Worker".into(),
-        backend_kind: "native".into(),
-        status: "completed".into(),
-        last_task: Some("summarize".into()),
-        cwd: None,
-        profile_id: profile_id.into(),
-    });
+    orchestrator
+        .upsert_agent(AgentUpsert {
+            agent_id: "agent-1".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.clone()),
+            path: "master/agent-1".into(),
+            role: "worker".into(),
+            nickname: "Worker".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("summarize".into()),
+            cwd: None,
+            profile_id: profile_id.into(),
+        })
+        .unwrap();
     orchestrator
         .set_agent_artifacts(
             "agent-1",
@@ -16010,6 +16017,23 @@ fn state_with_sessions(data_dir: &std::path::Path) -> Arc<AppState> {
 
 /// Build an `ActiveTurn` with default `Active` state for tests that drive
 /// the registry directly without going through `handle_turn_start`.
+async fn test_connection_turn(
+    active: &SharedActiveTurns,
+    session: &SessionKey,
+    turn_id: &TurnId,
+) -> ConnectionTurn {
+    let map = active.lock().await;
+    let state = map
+        .get(session)
+        .filter(|entry| entry.turn_id == *turn_id)
+        .map(|entry| entry.state.clone())
+        .unwrap_or_else(|| Arc::new(TokioMutex::new(TurnState::Active)));
+    ConnectionTurn {
+        turn_id: turn_id.clone(),
+        state,
+    }
+}
+
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
@@ -20619,14 +20643,14 @@ async fn abort_connection_turns_removes_only_matching_active_turns() {
         stale_session_id.clone(),
         test_active_turn(newer_turn_id.clone(), newer_handle.abort_handle()),
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(owned_session_id.clone(), owned_turn_id);
-    connection_turns
-        .lock()
-        .await
-        .insert(stale_session_id.clone(), stale_connection_turn_id);
+    connection_turns.lock().await.insert(
+        owned_session_id.clone(),
+        test_connection_turn(&active_turns, &owned_session_id, &owned_turn_id).await,
+    );
+    connection_turns.lock().await.insert(
+        stale_session_id.clone(),
+        test_connection_turn(&active_turns, &stale_session_id, &stale_connection_turn_id).await,
+    );
 
     let scopes = ScopePolicy::default();
     let ledger = UiProtocolLedger::new(16);
@@ -23074,6 +23098,7 @@ fn make_background_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -23355,6 +23380,7 @@ async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentr
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     };
 
     // The production `set_on_change` callback, threading the resolved
@@ -23468,6 +23494,7 @@ fn unified_terminal_test_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -27948,6 +27975,7 @@ async fn should_not_overwrite_terminal_usage_or_fabricate_it_for_ordinary_failur
                     token_usage: usage,
                     ..Default::default()
                 }),
+                None,
                 None,
             )
             .await;
@@ -34696,7 +34724,8 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
         crate::autonomy::agent_orchestrator::upsert_background_task_agent(
             task,
             Some("peer-close-no-wake"),
-        );
+        )
+        .unwrap();
     });
     supervisor.set_on_terminal(|event| {
         crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
@@ -35203,6 +35232,7 @@ async fn peer_consumption_should_not_consume_when_interrupt_wins_the_actual_term
             session_result: build_turn_session_result_from_done(&done),
             ..Default::default()
         }),
+        None,
         None,
     )
     .await;
@@ -40349,6 +40379,7 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(("interrupted", "turn interrupted by client")),
         None,
         Some(&buffer),
+        None,
     )
     .await;
 
@@ -40393,6 +40424,7 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(("interrupted", "turn interrupted by client")),
         None,
         Some(&buffer),
+        None,
     )
     .await;
     assert!(
@@ -40468,10 +40500,10 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
     let mut entry = test_active_turn(turn_id.clone(), handle.abort_handle());
     entry.steer = Some(buffer.clone());
     active_turns.lock().await.insert(session_id.clone(), entry);
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        test_connection_turn(&active_turns, &session_id, &turn_id).await,
+    );
 
     let scopes = ScopePolicy::default();
     let ledger = UiProtocolLedger::new(16);
@@ -41069,6 +41101,371 @@ fn result_owner_contract_27h_r1() {
         std::any::type_name_of_val(&judge),
         std::any::type_name_of_val(&octos_agent::result_md_owner_content_is_peer),
     );
+}
+
+// ---------------------------------------------------------------------------
+// #48b — serve/UI forwarder path: `fallback_switch` rows from
+// `spawn_router_failover_forwarder` (same shape as the gateway path).
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_ui_48b {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn stub_router() -> Arc<octos_llm::AdaptiveRouter> {
+        Arc::new(octos_llm::AdaptiveRouter::new(
+            vec![Arc::new(Wave4AStubProvider {
+                name: "a",
+                model: "m1",
+            })],
+            &[],
+            octos_llm::AdaptiveConfig::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-own".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some(session_id.0.clone()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let events = read_events(data_dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "ui path writes one row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-other".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder =
+            spawn_router_failover_forwarder_for_test(ws, ledger, session_id, Some(router.clone()));
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some("some-other-session".to_string()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "other-session failover must not write rows on the ui path"
+        );
+    }
+
+    /// #48c-r1 — None originator: no `events.jsonl` row, but the client
+    /// NOTICE still passes through (the Codex P1 notice filter is
+    /// verbatim-untouched for None; only the event write is stricter).
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-none".to_owned());
+        let router = stub_router();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        // No RouterContext => originating_session_id is None.
+        router.publish_failover_for_subscribers("a", "b", "quota", 120);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "None-originator failover must not write rows on the ui path (#48c strict event gate)"
+        );
+        // The notice still passes through, verbatim pre-#48c behavior.
+        // The wire carries serialized WS text frames; decode the envelope to
+        // confirm the RouterFailover notice survived the None gate.
+        let noticed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(axum::extract::ws::Message::Text(text)) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if v.get("method").and_then(|t| t.as_str()) == Some("router/failover")
+                                || v.get("type").and_then(|t| t.as_str()) == Some("router/failover")
+                            {
+                                return v;
+                            }
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("notification channel closed without a RouterFailover notice"),
+                }
+            }
+        })
+        .await
+        .expect("None-originator failover notice still forwarded");
+        let params = noticed.get("params").cloned().unwrap_or_default();
+        assert_eq!(
+            params.get("session_id").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str()),
+            "notice targets THIS session: {noticed}"
+        );
+        assert_eq!(
+            params.get("from_provider").and_then(|s| s.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            params.get("to_provider").and_then(|s| s.as_str()),
+            Some("b")
+        );
+    }
+}
+
+/// #48b — doc pin: the obs_events header lists both new kinds.
+#[test]
+fn obs_events_doc_lists_new_kinds() {
+    let src = include_str!("../obs_events.rs");
+    assert!(src.contains("fallback_switch"), "doc lists fallback_switch");
+    assert!(
+        src.contains("malformed_exhausted"),
+        "doc lists malformed_exhausted"
+    );
+}
+
+/// #48b — marker-prefixed terminal message produces exactly the
+/// malformed_exhausted decision (and the CLI appends ONLY that row).
+mod obs_malformed_exhausted_48b {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn count_turn_error_rows(data_dir: &std::path::Path) -> usize {
+        read_events(data_dir)
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("turn_error"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+        // #48c — REAL agent error → terminal path → events.jsonl, no
+        // hand-built message: a provider that always returns MalformedArgs
+        // drives the loop_runner to exhaustion, the REAL error is classified
+        // through `classify_runtime_error_message`, and the Errored terminal
+        // appends exactly one malformed_exhausted row to a temp ledger dir.
+        struct AlwaysMalformedProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for AlwaysMalformedProvider {
+            fn provider_name(&self) -> &str {
+                "always-malformed"
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Err(eyre::Report::new(octos_llm::StreamError::MalformedArgs {
+                    tool_id: "call_bad".to_string(),
+                    tool_name: "shell".to_string(),
+                    error: "expected `,` or `}` at line 1 column 4123".to_string(),
+                }))
+            }
+            fn model_id(&self) -> &str {
+                "always-malformed"
+            }
+        }
+        let provider: std::sync::Arc<dyn octos_llm::LlmProvider> =
+            std::sync::Arc::new(AlwaysMalformedProvider);
+        let tools = octos_agent::ToolRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+        let memory = std::sync::Arc::new(
+            octos_memory::EpisodeStore::open(dir.path().join("memory"))
+                .await
+                .unwrap(),
+        );
+        let agent = octos_agent::Agent::new(
+            octos_core::AgentId::new("mfe-real"),
+            provider,
+            tools,
+            memory,
+        );
+        // The REAL exhausted error (marker prefix comes from the loop_runner
+        // return, NOT from this test's format!).
+        let error = agent
+            .process_message("never produces valid JSON", &[], vec![])
+            .await
+            .expect_err("exhausted malformed budget terminates the turn");
+        let message = classify_runtime_error_message(&error);
+        assert!(
+            message.starts_with(octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER),
+            "real classified error carries the marker: {message}"
+        );
+
+        // Terminal path with a temp ledger data_dir.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let session_id = SessionKey("tenant-a:api:mfe-real".to_owned());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+        let turn_error_before = count_turn_error_rows(data_dir.path());
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("runtime_error", message.as_str())),
+            None,
+            None,
+            None,
+        )
+        .await;
+        // Drain the ws notifications so the runtime doesn't complain.
+        while rx.try_recv().is_ok() {}
+
+        let rows = read_events(data_dir.path());
+        // The pair of helpers are pinned to a REAL use: total row count and
+        // the turn_error count (unchanged) come from the same read.
+        assert!(
+            !rows.is_empty(),
+            "terminal wrote at least the malformed_exhausted row"
+        );
+        let mfe: Vec<_> = rows
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("malformed_exhausted"))
+            .collect();
+        assert_eq!(
+            mfe.len(),
+            1,
+            "exactly one malformed_exhausted row: {rows:?}"
+        );
+        assert_eq!(
+            mfe[0].get("detail").and_then(|d| d.as_str()),
+            Some("feedback_limit=3 observed_malformed=4"),
+            "detail verbatim from the real error"
+        );
+        assert_eq!(
+            mfe[0].get("session").and_then(|s| s.as_str()),
+            Some("tenant-a:api:mfe-real")
+        );
+        assert_eq!(
+            count_turn_error_rows(data_dir.path()),
+            turn_error_before,
+            "no turn_error row added for this terminal"
+        );
+    }
+
+    /// #48c — the critical test above must use the REAL agent error path
+    /// (no hand-built marker message). This pins the SOURCE — scoped to
+    /// ONLY the target function body (contract v3.1), not the whole file:
+    /// from `fn obs_malformed_exhausted_event_on_errored_terminal` to the
+    /// next `#[` or `fn ` after it.
+    #[test]
+    fn obs_malformed_exhausted_terminal_test_uses_real_agent_error() {
+        let src = include_str!("ui_protocol_tests.rs");
+        let start = src
+            .find("fn obs_malformed_exhausted_event_on_errored_terminal")
+            .expect("target fn exists");
+        let rest = &src[start + 1..];
+        // Scope: the target function body ends at the NEXT attribute or fn.
+        let end_rel = rest
+            .find("\n    #[")
+            .or_else(|| rest.find("\n    fn "))
+            .or_else(|| rest.find("\n}"))
+            .expect("target fn body ends somewhere");
+        let body = &src[start..start + 1 + end_rel];
+        // It drives the real loop_runner.
+        assert!(
+            body.contains("process_message"),
+            "the critical test must drive the real agent loop: {body}"
+        );
+        // It reads the real events file.
+        assert!(
+            body.contains("events.jsonl"),
+            "the critical test must read events.jsonl"
+        );
+        // No hand-built marker message feeding the terminal.
+        assert!(
+            !body.contains("format!(\"{} feedback_limit"),
+            "the critical test must not hand-build the marker message"
+        );
+    }
+
+    #[test]
+    fn obs_no_malformed_exhausted_when_marker_not_prefix() {
+        let message = format!(
+            "ordinary error mentioning {} mid-text",
+            octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER
+        );
+        assert!(
+            malformed_exhausted_detail_for_terminal(&message).is_none(),
+            "marker buried mid-text must not trigger"
+        );
+    }
 }
 #[test]
 fn semantic_context_rollout_mode_parser_is_explicit_and_defaults_on() {
@@ -42124,4 +42521,420 @@ async fn should_redact_tool_started_secrets_through_the_notification_path() {
         assert!(!serialized.contains(&credential_b));
         assert!(serialized.contains("src/main.rs") || serialized.contains("todo"));
     }
+}
+
+#[tokio::test]
+async fn issue_2236_build_cache_early_terminal_releases_slot() {
+    for reason in [TerminalReason::Interrupted, TerminalReason::Errored] {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        let slot = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            tmp.path(),
+            "cache-terminal",
+            None,
+            None,
+            &crate::build_cache::BuildCacheConfig {
+                min_free_gb: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = slot.path.clone();
+        let key = build_cache_slot_registry_key(&peers_root, "cache-terminal");
+        build_cache_slot_registry().park(key.clone(), slot);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let ledger = UiProtocolLedger::new(32);
+        let session = SessionKey::with_profile_topic("cache", "api", "tab", "peer-cache-terminal");
+        let turn = TurnId::new();
+        let state = Arc::new(TokioMutex::new(TurnState::Active));
+        build_cache_slot_registry()
+            .reserve_staged(&key, &build_cache_turn_owner(&session, &turn, &state))
+            .unwrap();
+        try_emit_terminal(
+            &state,
+            reason,
+            &ws,
+            &ledger,
+            &session,
+            &turn,
+            Some(("peer_lifetime_unavailable", "failed before dispatch")),
+            None,
+            None,
+            Some(&peers_root),
+        )
+        .await;
+        assert!(
+            !path.join("holder.json").exists(),
+            "early {reason:?} terminal must release the held slot"
+        );
+        assert!(build_cache_slot_registry().take(&key).is_none());
+    }
+}
+
+#[tokio::test]
+async fn bc9_sf1_disconnect_releases_build_cache_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "bc9-disconnect";
+    let slot = build_cache_peer::acquire_for_staging(
+        &peers_root,
+        tmp.path(),
+        slug,
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
+    let session = SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
+    let turn = TurnId::new();
+    let state = Arc::new(TokioMutex::new(TurnState::Active));
+    build_cache_slot_registry()
+        .reserve_staged(
+            &build_cache_slot_registry_key(&peers_root, slug),
+            &build_cache_turn_owner(&session, &turn, &state),
+        )
+        .unwrap();
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(turn.clone(), handle.abort_handle());
+    entry.state = state.clone();
+    active.lock().await.insert(session.clone(), entry);
+    connection.lock().await.insert(
+        session,
+        ConnectionTurn {
+            turn_id: turn,
+            state,
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        !path.join("holder.json").exists(),
+        "disconnect must return the held cache slot"
+    );
+    assert!(handle.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn bc9_sf2_shortcut_and_early_error_release_build_cache_slot() {
+    for (reason, known_root) in [
+        (TerminalReason::Completed, true),
+        (TerminalReason::Completed, false),
+        (TerminalReason::Errored, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        let slug = "bc9-shortcut";
+        let slot = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            tmp.path(),
+            slug,
+            None,
+            None,
+            &crate::build_cache::BuildCacheConfig {
+                min_free_gb: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = slot.path.clone();
+        build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let session =
+            SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
+        let turn = TurnId::new();
+        let state = Arc::new(TokioMutex::new(TurnState::Active));
+        build_cache_slot_registry()
+            .reserve_staged(
+                &build_cache_slot_registry_key(&peers_root, slug),
+                &build_cache_turn_owner(&session, &turn, &state),
+            )
+            .unwrap();
+        try_emit_terminal(
+            &state,
+            reason,
+            &ws,
+            &UiProtocolLedger::new(32),
+            &session,
+            &turn,
+            None,
+            None,
+            None,
+            known_root.then_some(peers_root.as_path()),
+        )
+        .await;
+        assert!(
+            !path.join("holder.json").exists(),
+            "{reason:?}, known_root={known_root} must return the slot"
+        );
+    }
+}
+
+fn bc9_b6_claim(
+    slug: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    BuildCacheTurnOwner,
+    Arc<TokioMutex<TurnState>>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("peers");
+    let slot = build_cache_peer::acquire_for_staging(
+        &root,
+        tmp.path(),
+        slug,
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    let key = build_cache_slot_registry_key(&root, slug);
+    build_cache_slot_registry().park(key.clone(), slot);
+    let state = Arc::new(TokioMutex::new(TurnState::Active));
+    let owner = build_cache_turn_owner(
+        &SessionKey::with_profile_topic("cache", "api", "first", &format!("peer-{slug}")),
+        &TurnId::new(),
+        &state,
+    );
+    build_cache_slot_registry()
+        .reserve_staged(&key, &owner)
+        .unwrap();
+    (tmp, root, path, owner, state)
+}
+
+#[tokio::test]
+async fn bc9_b6_rejected_second_terminal_preserves_first_claim() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("rejected-terminal");
+    let second = SessionKey::with_profile_topic("cache", "api", "second", "peer-rejected-terminal");
+    let (tx, _rx) = mpsc::channel(8);
+    try_emit_terminal(
+        &TokioMutex::new(TurnState::Active),
+        TerminalReason::Errored,
+        &WsConnection::new(tx),
+        &UiProtocolLedger::new(32),
+        &second,
+        &TurnId::new(),
+        Some(("build_cache_unavailable", "another turn owns the slot")),
+        None,
+        None,
+        Some(&root),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "rejected turn cannot release first turn"
+    );
+    build_cache_slot_registry().release_for_slug(
+        "rejected-terminal",
+        &owner,
+        crate::build_cache::pool::SlotOutcome::Completed,
+    );
+}
+
+#[tokio::test]
+async fn bc9_b6_stale_terminal_cannot_release_new_turn_or_staged_claim() {
+    for staged in [false, true] {
+        let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("stale-terminal");
+        let key = build_cache_slot_registry_key(&root, "stale-terminal");
+        if staged {
+            build_cache_slot_registry()
+                .release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+            let slot = build_cache_peer::acquire_for_staging(
+                &root,
+                _tmp.path(),
+                "stale-terminal",
+                None,
+                None,
+                &crate::build_cache::BuildCacheConfig {
+                    min_free_gb: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            build_cache_slot_registry().park(key.clone(), slot);
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        try_emit_terminal(
+            &TokioMutex::new(TurnState::Active),
+            TerminalReason::Completed,
+            &WsConnection::new(tx),
+            &UiProtocolLedger::new(32),
+            &owner.session,
+            &TurnId::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            path.join("holder.json").exists(),
+            "old terminal must preserve newer or staged claim"
+        );
+        build_cache_slot_registry().release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+    }
+}
+
+#[tokio::test]
+async fn bc9_b6_stale_connection_cannot_release_new_turn() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("stale-disconnect");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(owner.turn.clone(), handle.abort_handle());
+    entry.state = _claim_state.clone();
+    active.lock().await.insert(owner.session.clone(), entry);
+    connection.lock().await.insert(
+        owner.session.clone(),
+        ConnectionTurn {
+            turn_id: TurnId::new(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old connection must not release newer turn of same session"
+    );
+    assert!(!handle.is_finished());
+    handle.abort();
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(&root, "stale-disconnect"),
+        crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
+}
+
+#[tokio::test]
+async fn bc9_b6_abort_before_task_start_releases_dispatch_reservation() {
+    let (_tmp, _root, path, owner, _claim_state) = bc9_b6_claim("prestart-abort");
+    let reservation = BuildCacheTurnReservation(owner, _claim_state);
+    let task = tokio::spawn(async move {
+        let _reservation = reservation;
+        std::future::pending::<()>().await;
+    });
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!path.join("holder.json").exists());
+}
+
+#[tokio::test]
+async fn bc9_b6_reused_id_stale_guard_preserves_new_claim() {
+    let (tmp, root, _path, owner, _claim_state) = bc9_b6_claim("reuse-guard");
+    let key = build_cache_slot_registry_key(&root, "reuse-guard");
+    let stale_guard = BuildCacheTurnReservation(owner.clone(), _claim_state.clone());
+    build_cache_slot_registry().release_owned(
+        &key,
+        &owner,
+        crate::build_cache::pool::SlotOutcome::Completed,
+    );
+    let slot = build_cache_peer::acquire_for_staging(
+        &root,
+        tmp.path(),
+        "reuse-guard",
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    build_cache_slot_registry().park(key.clone(), slot);
+    let new_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let new_owner = build_cache_turn_owner(&owner.session, &owner.turn, &new_state);
+    build_cache_slot_registry()
+        .reserve_staged(&key, &new_owner)
+        .unwrap();
+    drop(stale_guard);
+    assert!(
+        path.join("holder.json").exists(),
+        "old dispatch guard must not release a reused wire turn id"
+    );
+    let (tx, _rx) = mpsc::channel(8);
+    try_emit_terminal(
+        &_claim_state,
+        TerminalReason::Completed,
+        &WsConnection::new(tx),
+        &UiProtocolLedger::new(16),
+        &owner.session,
+        &owner.turn,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old terminal must preserve reused ID's new dispatch"
+    );
+    build_cache_slot_registry().release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+}
+
+#[tokio::test]
+async fn bc9_b6_reused_id_stale_connection_preserves_new_claim() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("reuse-connection");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(owner.turn.clone(), handle.abort_handle());
+    entry.state = _claim_state.clone();
+    active.lock().await.insert(owner.session.clone(), entry);
+    connection.lock().await.insert(
+        owner.session.clone(),
+        ConnectionTurn {
+            turn_id: owner.turn.clone(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old connection must not abort or release a reused wire turn id"
+    );
+    assert!(!handle.is_finished());
+    handle.abort();
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(&root, "reuse-connection"),
+        crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
 }

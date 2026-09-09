@@ -2481,8 +2481,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
-    crate::autonomy::agent_orchestrator::default_agent_orchestrator().upsert_agent(
-        crate::autonomy::agent_orchestrator::AgentUpsert {
+    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+        .upsert_agent(crate::autonomy::agent_orchestrator::AgentUpsert {
             agent_id: agent_id.clone(),
             parent_agent_id: Some("master".into()),
             session_id: session_id.clone(),
@@ -2495,8 +2495,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
             last_task: Some("review finished".into()),
             cwd: None,
             profile_id: MAIN_PROFILE_ID.into(),
-        },
-    );
+        })
+        .unwrap();
 
     for _ in 0..10 {
         tokio::time::advance(Duration::from_millis(250)).await;
@@ -7925,6 +7925,7 @@ fn make_supervisor_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -7944,7 +7945,12 @@ async fn terminal_task_status_survives_actor_inbox_backpressure() {
         octos_agent::TaskStatus::Completed,
         octos_agent::TaskRuntimeState::Completed,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain the filler so the spawned awaited send can proceed.
     let _ = rx.recv().await.expect("filler");
@@ -7980,7 +7986,12 @@ async fn non_terminal_task_status_drops_under_inbox_backpressure() {
         octos_agent::TaskStatus::Running,
         octos_agent::TaskRuntimeState::ExecutingTool,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain filler. There must be no durable retry queued behind it.
     let _ = rx.recv().await.expect("filler");
@@ -10295,4 +10306,371 @@ async fn should_wire_goal_task_row_observers_when_gateway_actor_is_spawned() {
 
     drop(tx);
     handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// #48a — OLP observability: `fallback_switch` event rows from the failover
+// forwarder. Best-effort, per-session, written on every REAL lane switch
+// regardless of the client-notice debounce.
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_48a {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    async fn spawn_forwarder(
+        data_dir: &std::path::Path,
+    ) -> (
+        tokio::sync::broadcast::Sender<octos_llm::adaptive::FailoverEvent>,
+        mpsc::Receiver<OutboundMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let (out_tx, out_rx) = mpsc::channel(4);
+        let session_key = test_session_key(data_dir);
+        let handle = tokio::spawn(crate::session_actor::forward_router_failovers_for_test(
+            crate::session_actor::FailoverForwarderParams {
+                rx,
+                out_tx,
+                session_id: session_key.to_string(),
+                session_key,
+                channel: "telegram".to_string(),
+                chat_id: "c1".to_string(),
+                profile_data_dir: data_dir.to_path_buf(),
+            },
+        ));
+        (tx, out_rx, handle)
+    }
+
+    fn own_event(session: &str) -> octos_llm::adaptive::FailoverEvent {
+        octos_llm::adaptive::FailoverEvent {
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            reason: "quota".into(),
+            elapsed_ms: 120,
+            originating_session_id: Some(session.to_string()),
+            originating_turn_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_writes_own_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one fallback_switch row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            rows[0].get("model_lane").and_then(|s| s.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            rows[0].get("detail").and_then(|s| s.as_str()),
+            Some("router failover: a -> b (quota, 120ms)")
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_other_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let other = own_event("some-other-session");
+        tx.send(other).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "other-session failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_none_originator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let mut none_event = own_event("unused");
+        none_event.originating_session_id = None;
+        tx.send(none_event).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "None-originator failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_write_failure_does_not_block_notice() {
+        // data_dir points at a path that cannot host events.jsonl (a FILE
+        // where a directory is needed): the write fails, the notice still
+        // goes out, and the forwarder task stays alive.
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not-a-dir").unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(&blocker).await;
+        // The forwarder's session identity derives from the blocker path
+        // (its "data dir"); the event's originator must match THAT session.
+        let sid = test_session_key(&blocker).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        let push = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("notice must still be sent when the obs write fails")
+            .expect("channel open");
+        assert!(
+            push.content.starts_with("↺ Router failover:"),
+            "{}",
+            push.content
+        );
+        // The forwarder did NOT exit (still joinable, not finished).
+        assert!(
+            !handle.is_finished(),
+            "write failure must not kill the forwarder"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_written_even_when_notice_debounced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        // Two rapid events — inside the debounce window.
+        tx.send(own_event(&sid)).unwrap();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 2, "both real switches write rows: {events:?}");
+        // Client notice: exactly ONE (the second was debounced).
+        let mut notices = 0;
+        while out_rx.try_recv().is_ok() {
+            notices += 1;
+        }
+        assert_eq!(notices, 1, "debounce still collapses the client push");
+    }
+}
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_delivers_one_profiled_carrier() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    use crate::autonomy::supervisor_store::SupervisorStore;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let profile = "gateway-dual-sink";
+    let session = SessionKey::with_profile(profile, "matrix", "completion");
+    assert_eq!(session.profile_id(), Some(profile));
+    let ids: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|call| {
+            let id = supervisor.register("shell", call, Some(&session.0));
+            supervisor.mark_running(&id);
+            id
+        })
+        .collect();
+    for id in &ids {
+        supervisor.mark_completed(id, vec![]);
+    }
+    let mut terminal_ids = std::collections::HashSet::new();
+    while let Ok(message) = rx.try_recv() {
+        if let ActorMessage::TaskStatusChanged { task_json } = message {
+            let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+            if row["lifecycle_state"] == "ready" {
+                terminal_ids.insert(row["id"].as_str().unwrap().to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        terminal_ids,
+        ids.into_iter().collect(),
+        "actual on_change inbox delivery"
+    );
+    assert_eq!(
+        runtime.pending_continuation_count_for_session_for_test(&session, profile),
+        3,
+        "two child verdicts and one final scatter; both real sinks share dedupe"
+    );
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                MAIN_PROFILE_ID,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let durable = SupervisorStore::new(dir.path()).load_state().unwrap();
+    assert_eq!(durable.children.len(), 2);
+    let drained = runtime.drain_ready_continuations_for_session(
+        &session,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(drained.len(), 1);
+    let carrier = &drained[0];
+    assert_eq!(
+        carrier.reason,
+        MasterContinuationReason::ScatterJoinComplete
+    );
+    assert_eq!(
+        carrier.metadata.get("coalesced_count").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        carrier
+            .metadata
+            .get("terminal_children")
+            .map(String::as_str),
+        Some("2")
+    );
+    for child in durable.children.values() {
+        assert!(carrier.metadata["coalesced_child_ids"].contains(&child.child_id));
+    }
+    runtime.mark_continuation_completed(carrier, None);
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let restarted = InProcessAgentOrchestrator::default();
+    restarted.configure_supervisor_store(dir.path()).unwrap();
+    assert_eq!(
+        restarted.pending_continuation_count_for_session_for_test(&session, profile),
+        0
+    );
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_filters_failure_recovery() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    for acked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        let supervisor = TaskSupervisor::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        install_gateway_task_status_sinks(
+            &supervisor,
+            tx,
+            dir.path().to_path_buf(),
+            runtime.clone(),
+        );
+        let profile = "gateway-failure-sink";
+        let session = SessionKey::with_profile(profile, "matrix", &format!("failure-{acked}"));
+        assert_eq!(session.profile_id(), Some(profile));
+        let id = supervisor.register("shell", "failure-call", Some(&session.0));
+        supervisor.mark_running(&id);
+        if acked {
+            supervisor.mark_synth_ack_emitted("failure-call");
+        }
+        supervisor.mark_failed(&id, "owner failed".into());
+        let mut saw_failed = false;
+        while let Ok(message) = rx.try_recv() {
+            if let ActorMessage::TaskStatusChanged { task_json } = message {
+                let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+                saw_failed |= row["id"] == id && row["status"] == "failed";
+            }
+        }
+        assert!(
+            saw_failed,
+            "on_change must project failures with or without ack"
+        );
+        assert!(
+            runtime
+                .drain_ready_continuations_for_session(
+                    &session,
+                    MAIN_PROFILE_ID,
+                    MasterContinuationRuntimeState::idle(),
+                    20
+                )
+                .is_empty()
+        );
+        let drained = runtime.drain_ready_continuations_for_session(
+            &session,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            20,
+        );
+        let recoveries = drained
+            .iter()
+            .filter(|item| {
+                matches!(&item.reason,
+            MasterContinuationReason::External(kind) if kind == "spawn_only_failure")
+            })
+            .count();
+        assert_eq!(
+            recoveries,
+            usize::from(acked),
+            "only the actual terminal sink can enqueue acked recovery"
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "on_change still mirrors unacked Failed child verdicts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_ignores_sessionless_reentry() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let completed = supervisor.register("shell", "sessionless-complete", None);
+    supervisor.mark_completed(&completed, vec![]);
+    let failed = supervisor.register("shell", "sessionless-fail", None);
+    supervisor.mark_synth_ack_emitted("sessionless-fail");
+    supervisor.mark_failed(&failed, "failed".into());
+    let mut delivered = 0;
+    while let Ok(message) = rx.try_recv() {
+        if matches!(message, ActorMessage::TaskStatusChanged { .. }) {
+            delivered += 1;
+        }
+    }
+    assert_eq!(
+        delivered, 2,
+        "truthful status delivery still reaches the actor"
+    );
+    assert_eq!(runtime.pending_continuation_count_for_test(), 0);
 }

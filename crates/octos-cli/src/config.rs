@@ -122,6 +122,15 @@ pub struct Config {
     #[serde(default)]
     pub snapshots: Option<octos_agent::SnapshotConfig>,
 
+    /// Build-cache pool configuration (outer-loop #1–#3; design
+    /// docs/build-cache-pool.md §2). Optional like `snapshots`: absent
+    /// means defaults (2 peer slots + 1 verify slot per repository, a
+    /// 50 GB free-space gate, 168 h stale window). Peers and outer-loop
+    /// verification draw cargo target dirs from this pool instead of each
+    /// growing an unbounded `target/`.
+    #[serde(default)]
+    pub build_cache: Option<crate::build_cache::BuildCacheConfig>,
+
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
     pub tool_policy: Option<octos_agent::ToolPolicy>,
@@ -2149,6 +2158,15 @@ impl Config {
                     "max_history {} is out of range (1-1000)",
                     gw.max_history
                 ));
+            }
+        }
+
+        // Check build_cache section floors (peer/verify slot caps >= 1,
+        // stale window >= 1). Warnings, not errors: a bad value still gets
+        // a working (default-clamped) pool.
+        if let Some(ref bc) = self.build_cache {
+            for warning in bc.validate() {
+                warnings.push(warning);
             }
         }
 

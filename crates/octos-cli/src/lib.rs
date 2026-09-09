@@ -14,6 +14,12 @@ pub use octos_store::admin_token_store;
 pub mod api;
 pub use octos_store::approvals_audit;
 pub mod auth;
+// Build-cache pool (outer-loop #3, design docs/build-cache-pool.md):
+// per-repository reusable cargo target-dir slots with flock exclusivity,
+// holder metadata for crash recovery, and a fail-closed space gate.
+// Deliberately NOT `api`-gated: `octos cache …` commands (#5) and peer
+// staging (#4) both need it in unfeatured builds.
+pub mod build_cache;
 // Goal / autonomy state engine. Deliberately NOT `api`-gated: it touches no
 // axum / AppState / WebSocket type, and `goal_tool` + the SessionActor goal
 // glue need it in unfeatured builds (`octos chat`).

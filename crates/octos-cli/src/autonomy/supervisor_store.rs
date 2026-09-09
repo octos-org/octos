@@ -300,6 +300,21 @@ pub struct PendingContinuationRecord {
     pub metadata: SupervisorMetadata,
 }
 
+/// Outcome of a retry that must never supersede a completed continuation.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum ContinuationQueueOutcome {
+    Written(SupervisorEventLedgerRow),
+    AlreadyCompleted(PendingContinuationRecord),
+}
+
+/// Optional cohort epoch committed with a complete child admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CohortEpochAdmission {
+    pub cwd_hash: u64,
+    pub epoch: u64,
+}
+
 // Several variants carry their full record by value (group/child/artifact/
 // continuation) because events are persisted and replayed as self-contained
 // payloads; boxing would complicate serde round-trips for no hot-path win.
@@ -316,6 +331,14 @@ pub enum SupervisorEvent {
     },
     ChildStarted {
         child: ChildAgentRecord,
+    },
+    /// A checked admission or update. The complete child and its optional
+    /// cohort binding share one ledger row, including terminal-first mirrors.
+    AgentAdmitted {
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        #[serde(default)]
+        cohort: Option<CohortEpochAdmission>,
     },
     Heartbeat {
         ping: HeartbeatPing,
@@ -335,6 +358,13 @@ pub enum SupervisorEvent {
         group_id: String,
         continuation_id: String,
         started_at_ms: u64,
+        /// #26 (round-4, #18 B4) — the revision (persisted `attempt`) of the
+        /// queued payload THIS start belongs to. `#[serde(default)]` keeps
+        /// pre-#26 events readable: they deserialize at 0 and the apply-side
+        /// revision check treats a 0 as "no revision carried" (legacy
+        /// behavior — always applied).
+        #[serde(default)]
+        attempt: u32,
     },
     ContinuationCompleted {
         group_id: String,
@@ -342,7 +372,74 @@ pub enum SupervisorEvent {
         completed_at_ms: u64,
         #[serde(default)]
         result: Option<String>,
+        /// #26 (round-4, #18 B4) — same as `ContinuationStarted::attempt`:
+        /// the queued revision this completion resolves. A Completed for an
+        /// OLD attempt must never tombstone a NEWER revision that has not
+        /// executed yet (crash window: attempt-1 turn finishes after the
+        /// attempt-2 correction was already durably queued).
+        #[serde(default)]
+        attempt: u32,
     },
+    /// #15b — durable join-epoch bump marker. `upsert_agent` bumps a group's
+    /// join epoch IN MEMORY when a new agent is admitted into an
+    /// already-joined group; without this record a crash before the bumped
+    /// epoch's scatter persists would restart at the last persisted epoch and
+    /// the reconcile pass could never derive the lost epoch's join key.
+    /// `apply_event` upserts the group's cohort-scoped `join_epoch` metadata
+    /// (max wins).
+    ///
+    /// #19 (round-4 B1) — `cwd_hash` carries the admitted agent's workspace
+    /// cohort (the same `DefaultHasher`-over-`Option<String>` value the join
+    /// key embeds): a bump under one workspace must not lift another
+    /// workspace's join epoch. `#[serde(default)]` keeps pre-#19 events
+    /// readable — they deserialize with 0 and map onto the NONE-workspace
+    /// cohort; pre-#19 stores only ever persisted the None-cwd cohort in
+    /// practice (every existing test fixture upserts with `cwd: None`), so
+    /// this fallback is exact there and best-effort elsewhere.
+    GroupEpochBumped {
+        group_id: String,
+        new_epoch: u64,
+        observed_at_ms: u64,
+        #[serde(default)]
+        cwd_hash: u64,
+    },
+    /// #20 (round-4 B2) — ATOMIC cohort admission. One durable event binds
+    /// the cohort admission, the admitted child's identity, AND the bumped
+    /// join epoch, replacing the two-step "bump in memory, then best-effort
+    /// `GroupEpochBumped`, then insert + persist the child" sequence whose
+    /// crash windows could (a) lose a join (marker failed, child durable) or
+    /// (b) fabricate a phantom join (marker durable, child lost). The event
+    /// id embeds the child id, so replaying the SAME admission is idempotent.
+    ///
+    /// `apply_event` appends `child_id:new_epoch` to the group's
+    /// `admissions#{cwd_hash}` metadata (comma list, append-if-absent) and
+    /// max-upserts the cohort-scoped `join_epoch#{cwd_hash}` marker — so the
+    /// restore side reads ONE metadata surface. The seed pass only TRUSTS an
+    /// admission whose child exists in `children` (durable child record),
+    /// which closes the phantom-join window.
+    CohortAdmission {
+        group_id: String,
+        #[serde(default)]
+        cwd_hash: u64,
+        child_id: String,
+        new_epoch: u64,
+        observed_at_ms: u64,
+    },
+}
+
+/// One folded-extra tombstone in a coalesced terminal-continuation fold
+/// (#1707 round 4). `result` names the carrier the extra folded into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoalescedTombstoneEntry {
+    pub group_id: String,
+    pub continuation_id: String,
+    pub completed_at_ms: u64,
+    pub result: String,
+    /// #26 (round-4, #18 B4) — the revision the tombstone resolves. 0 keeps
+    /// the legacy event id / unconditional-apply shape (folded extras whose
+    /// durable attempt is unknown or 0); a positive value carries the same
+    /// revision-match rule as single-record completions.
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -379,11 +476,16 @@ pub struct SupervisorState {
 
 impl SupervisorState {
     pub fn apply_ledger_row(&mut self, row: &SupervisorEventLedgerRow) {
-        self.last_sequence = self.last_sequence.max(row.sequence);
-        if !row.event_id.is_empty() && !self.applied_event_ids.insert(row.event_id.clone()) {
-            return;
+        if self.accept_ledger_row(row) {
+            self.apply_event(&row.event, row.recorded_at_ms);
         }
-        self.apply_event(&row.event, row.recorded_at_ms);
+    }
+
+    // Both full replay and the continuation projection deduplicate ALL event
+    // kinds globally, after advancing the sequence even for a duplicate.
+    fn accept_ledger_row(&mut self, row: &SupervisorEventLedgerRow) -> bool {
+        self.last_sequence = self.last_sequence.max(row.sequence);
+        row.event_id.is_empty() || self.applied_event_ids.insert(row.event_id.clone())
     }
 
     pub fn apply_event(&mut self, event: &SupervisorEvent, recorded_at_ms: u64) {
@@ -398,6 +500,13 @@ impl SupervisorState {
                 }
             }
             SupervisorEvent::ChildStarted { child } => self.upsert_child(child.clone()),
+            SupervisorEvent::AgentAdmitted {
+                group,
+                child,
+                cohort,
+            } => {
+                self.apply_agent_admitted(group.clone(), child.clone(), cohort.as_ref());
+            }
             SupervisorEvent::Heartbeat { ping } => self.apply_heartbeat(ping.clone()),
             SupervisorEvent::ChildTerminal {
                 group_id,
@@ -412,19 +521,206 @@ impl SupervisorState {
                 group_id,
                 continuation_id,
                 started_at_ms,
-            } => self.apply_continuation_started(group_id, continuation_id, *started_at_ms),
+                attempt,
+            } => {
+                self.apply_continuation_started(group_id, continuation_id, *started_at_ms, *attempt)
+            }
             SupervisorEvent::ContinuationCompleted {
                 group_id,
                 continuation_id,
                 completed_at_ms,
                 result,
+                attempt,
             } => self.apply_continuation_completed(
                 group_id,
                 continuation_id,
                 *completed_at_ms,
                 result.clone(),
+                *attempt,
             ),
+            SupervisorEvent::GroupEpochBumped {
+                group_id,
+                new_epoch,
+                observed_at_ms,
+                cwd_hash,
+            } => {
+                // #15b — durable epoch bump: max-upsert the group's
+                // `join_epoch` metadata so a restart restores the HIGHEST
+                // admitted epoch, not just the highest PERSISTED scatter.
+                // #19 (round-4 B1) — the metadata key is cohort-scoped
+                // (`join_epoch#{cwd_hash}`): each workspace cohort restores
+                // its OWN highest admitted epoch. Pre-#19 events carry
+                // `cwd_hash: 0` via `#[serde(default)]` and keep landing on
+                // the NONE-workspace cohort key.
+                let group = self.ensure_group(group_id, *observed_at_ms);
+                let metadata_key = format!("join_epoch#{cwd_hash}");
+                let existing = group
+                    .metadata
+                    .get(&metadata_key)
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                if *new_epoch > existing {
+                    group
+                        .metadata
+                        .insert(metadata_key, serde_json::Value::from(*new_epoch));
+                }
+                group.updated_at_ms = group.updated_at_ms.max(*observed_at_ms);
+            }
+            SupervisorEvent::CohortAdmission {
+                group_id,
+                cwd_hash,
+                child_id,
+                new_epoch,
+                observed_at_ms,
+            } => {
+                // #20 (round-4 B2) — record the admission in the cohort's
+                // `admissions#{cwd_hash}` metadata as a `child_id:new_epoch`
+                // comma list (append-if-absent by CHILD, so a replayed
+                // admission is a no-op). This is deliberately the ONLY
+                // metadata the event writes: the seed pass derives the cohort
+                // epoch from this list under the child-exists gate (an
+                // admission whose child record is not durable does NOT lift
+                // the epoch), whereas the legacy `join_epoch#{cwd_hash}`
+                // marker — written by the pre-#20 `GroupEpochBumped` arm — is
+                // read ungated for backward compatibility. Writing both from
+                // THIS arm would re-open the phantom-join window.
+                let group = self.ensure_group(group_id, *observed_at_ms);
+                let admissions_key = format!("admissions#{cwd_hash}");
+                let entry = format!("{child_id}:{new_epoch}");
+                let mut list: Vec<String> = group
+                    .metadata
+                    .get(&admissions_key)
+                    .and_then(|value| value.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.split(',').map(str::to_owned).collect())
+                    .unwrap_or_default();
+                if !list
+                    .iter()
+                    .any(|e| e.split(':').next() == Some(child_id.as_str()))
+                {
+                    list.push(entry);
+                    group
+                        .metadata
+                        .insert(admissions_key, serde_json::Value::from(list.join(",")));
+                }
+                group.updated_at_ms = group.updated_at_ms.max(*observed_at_ms);
+            }
         }
+    }
+
+    fn apply_agent_admitted(
+        &mut self,
+        mut group: SupervisedGroupRecord,
+        mut child: ChildAgentRecord,
+        cohort: Option<&CohortEpochAdmission>,
+    ) {
+        let group_id = group.group_id.clone();
+        let observed_at_ms = group.updated_at_ms.max(child.updated_at_ms);
+        // Admission callers build a fresh group description. Preserve prior
+        // registration data and admission/epoch history when merging it.
+        // Remember supplied child ids after merging so a newly seen child
+        // still reopens an automatically completed group.
+        let declared_children = std::mem::take(&mut group.child_ids);
+        if let Some(existing) = self.groups.get(&group_id) {
+            group.created_at_ms = group.created_at_ms.min(existing.created_at_ms);
+            group.child_ids = existing.child_ids.clone();
+            group.supervisor_id = group
+                .supervisor_id
+                .or_else(|| existing.supervisor_id.clone());
+            group.parent_session_id = group
+                .parent_session_id
+                .or_else(|| existing.parent_session_id.clone());
+            group.parent_turn_id = group
+                .parent_turn_id
+                .or_else(|| existing.parent_turn_id.clone());
+            group.objective = group.objective.or_else(|| existing.objective.clone());
+            // Existing group metadata may include replay-derived state. A
+            // child update must not replace that with an older group view.
+            group.metadata.extend(existing.metadata.clone());
+            if group.terminal.is_none() {
+                group.terminal = existing.terminal.clone();
+                group.status = existing.status.clone();
+            }
+        }
+        self.upsert_group(group);
+        for child_id in declared_children {
+            self.remember_child(&group_id, &child_id, observed_at_ms);
+        }
+
+        if let Some(existing) = self.children.get(&child_key(&group_id, &child.child_id)) {
+            // A durable update can replace the last current observation of
+            // an older workspace. Retain only its small provenance record so
+            // restore can still interpret legacy cohort hashes exactly.
+            let scope_changed = child.metadata.get("workspace_scope").is_some_and(|scope| {
+                existing
+                    .metadata
+                    .get("workspace_scope")
+                    .unwrap_or(&serde_json::Value::Null)
+                    != scope
+            });
+            let workspace_changed =
+                existing.workspace_path != child.workspace_path || scope_changed;
+            let mut workspace_history = existing
+                .metadata
+                .get("workspace_history")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if workspace_changed {
+                let observation = serde_json::json!({
+                    "workspace_path": existing.workspace_path,
+                    "workspace_scope": existing.metadata.get("workspace_scope"),
+                    "backend_kind": existing.metadata.get("backend_kind"),
+                    "role": existing.metadata.get("role"),
+                    "nickname": existing.metadata.get("nickname"),
+                    "label": existing.label,
+                });
+                if !workspace_history.contains(&observation) {
+                    workspace_history.push(observation);
+                }
+            }
+            // Status/workspace and explicitly supplied metadata belong to
+            // the candidate. Observations accumulated by other events must
+            // survive a candidate that does not carry them.
+            child.started_at_ms = child.started_at_ms.min(existing.started_at_ms);
+            if child.last_heartbeat.is_none() {
+                child.last_heartbeat = existing.last_heartbeat.clone();
+            }
+            let mut supplied_metadata = std::mem::take(&mut child.metadata);
+            // History is derived from actual prior records, never replaced
+            // by the candidate's potentially incomplete view of the child.
+            supplied_metadata.remove("workspace_history");
+            child.metadata = existing.metadata.clone();
+            child.metadata.extend(supplied_metadata);
+            if workspace_changed {
+                child.metadata.insert(
+                    "workspace_history".into(),
+                    serde_json::Value::Array(workspace_history),
+                );
+            }
+        }
+        let child_id = child.child_id.clone();
+        self.upsert_child(child);
+        if let Some(cohort) = cohort {
+            let group = self.ensure_group(&group_id, observed_at_ms);
+            let key = format!("admissions#{}", cohort.cwd_hash);
+            let entry = format!("{child_id}:{}", cohort.epoch);
+            let mut admissions: Vec<String> = group
+                .metadata
+                .get(&key)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(|value| value.split(',').map(str::to_owned).collect())
+                .unwrap_or_default();
+            if !admissions.contains(&entry) {
+                admissions.push(entry);
+                group
+                    .metadata
+                    .insert(key, serde_json::Value::from(admissions.join(",")));
+            }
+            group.updated_at_ms = group.updated_at_ms.max(observed_at_ms);
+        }
+        self.recompute_group_terminal(&group_id);
     }
 
     fn upsert_group(&mut self, group: SupervisedGroupRecord) {
@@ -529,7 +825,22 @@ impl SupervisorState {
         let key = continuation_key(&continuation.group_id, &continuation.continuation_id);
         match self.continuations.get_mut(&key) {
             Some(existing) => {
-                if continuation_rank(&continuation.status) >= continuation_rank(&existing.status) {
+                // #1707 round 3 (codex Blocker 3): `attempt` is the REVISION
+                // of a queued payload for this continuation id. A status
+                // correction (`failed` → `completed` on the same identity
+                // dedupe key) persists a fresh `Queued` record with a
+                // strictly higher attempt — and the status-rank gate alone
+                // (`Queued 0 < Completed 2`) would silently DROP it behind a
+                // delivered item's tombstone, resurrecting the OLD payload on
+                // restart replay. So a strictly-higher attempt is
+                // rank-eligible regardless of status; a same-or-lower attempt
+                // can never downgrade a higher-rank record (an attempt-1
+                // re-persist behind the tombstone stays dropped).
+                let attempt_eligible = continuation.attempt > existing.attempt;
+                if attempt_eligible
+                    || continuation_rank(&continuation.status)
+                        >= continuation_rank(&existing.status)
+                {
                     *existing = merge_continuation(existing.clone(), continuation);
                 }
             }
@@ -539,14 +850,66 @@ impl SupervisorState {
         }
     }
 
+    /// #26 (round-4, #18 B4) — revision-matched terminal transitions. A
+    /// Started/Completed for an OLD attempt must not touch a record that
+    /// now holds a NEWER queued revision: the attempt-1 turn may finish
+    /// (and write its Completed) AFTER a status correction durably queued
+    /// attempt 2; applying that Completed would tombstone the not-yet-run
+    /// correction, and after a crash neither replay nor the seeded gate
+    /// would surface it again. Rule: an incoming lifecycle event carries
+    /// the attempt of the payload it resolved; it applies only when the
+    /// record's current attempt is EQUAL or LOWER (equal = the normal
+    /// same-revision path; lower = the record is an older legacy row the
+    /// event still describes). A STRICTLY HIGHER record attempt means a
+    /// newer revision superseded this event's payload — the event is
+    /// ignored (warn) so the newer revision stays Queued for redelivery.
+    /// `incoming == 0` is the legacy shape (pre-#26 events deserialize
+    /// without an attempt): applied unconditionally, preserving the
+    /// historical behavior of old ledgers.
+    fn continuation_lifecycle_attempt_matches(
+        &self,
+        key: &str,
+        incoming_attempt: u32,
+        event_kind: &str,
+        continuation_id: &str,
+    ) -> bool {
+        let Some(record) = self.continuations.get(key) else {
+            return true;
+        };
+        if incoming_attempt == 0 {
+            return true;
+        }
+        if record.attempt > incoming_attempt {
+            tracing::warn!(
+                event = event_kind,
+                continuation_id,
+                record_attempt = record.attempt,
+                event_attempt = incoming_attempt,
+                "ignoring lifecycle event for a superseded attempt; the newer \
+                 queued revision stays pending"
+            );
+            return false;
+        }
+        true
+    }
+
     fn apply_continuation_started(
         &mut self,
         group_id: &str,
         continuation_id: &str,
         started_at_ms: u64,
+        attempt: u32,
     ) {
         self.ensure_group(group_id, started_at_ms);
         let key = continuation_key(group_id, continuation_id);
+        if !self.continuation_lifecycle_attempt_matches(
+            &key,
+            attempt,
+            "continuation_started",
+            continuation_id,
+        ) {
+            return;
+        }
         let continuation =
             self.continuations
                 .entry(key)
@@ -579,9 +942,18 @@ impl SupervisorState {
         continuation_id: &str,
         completed_at_ms: u64,
         result: Option<String>,
+        attempt: u32,
     ) {
         self.ensure_group(group_id, completed_at_ms);
         let key = continuation_key(group_id, continuation_id);
+        if !self.continuation_lifecycle_attempt_matches(
+            &key,
+            attempt,
+            "continuation_completed",
+            continuation_id,
+        ) {
+            return;
+        }
         let continuation =
             self.continuations
                 .entry(key)
@@ -673,6 +1045,56 @@ impl SupervisorState {
     }
 }
 
+// This fingerprint follows normal atomic snapshot replacement. It is not a
+// content hash: arbitrary external edits preserving identity/length/timestamps
+// are outside the filesystem cache contract. Missing modification timestamps
+// disable reuse conservatively.
+#[derive(Debug, PartialEq, Eq)]
+struct SnapshotFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+#[derive(Debug)]
+struct ContinuationIndex {
+    // Only continuations, global event IDs and last_sequence are retained.
+    state: SupervisorState,
+    snapshot_cutoff: u64,
+    snapshot: Option<SnapshotFingerprint>,
+    offset: u64,
+    boundary_sequence: Option<u64>,
+    extendable: bool,
+}
+
+impl ContinuationIndex {
+    fn project(state: SupervisorState) -> SupervisorState {
+        SupervisorState {
+            continuations: state.continuations,
+            applied_event_ids: state.applied_event_ids,
+            last_sequence: state.last_sequence,
+            ..SupervisorState::default()
+        }
+    }
+
+    fn apply(&mut self, row: &SupervisorEventLedgerRow) {
+        // Keep the snapshot cutoff fixed, even for out-of-order raw rows.
+        if row.sequence <= self.snapshot_cutoff || !self.state.accept_ledger_row(row) {
+            return;
+        }
+        if matches!(
+            row.event,
+            SupervisorEvent::ContinuationQueued { .. }
+                | SupervisorEvent::ContinuationStarted { .. }
+                | SupervisorEvent::ContinuationCompleted { .. }
+        ) {
+            self.state.apply_event(&row.event, row.recorded_at_ms);
+            self.state.groups.clear();
+        }
+    }
+}
+
 /// In-memory cursor over the on-disk ledger, shared by every clone of a store
 /// (the orchestrator clones its store into drain loops and tasks). It is only
 /// read or written while the cross-process append file-lock is held; the
@@ -691,6 +1113,9 @@ struct SeqCache {
     ledger_rows: u64,
     /// Appends since the events file was last fsynced (batched-fsync mode).
     appends_since_fsync: u64,
+    /// Independent validity: refreshing this projection never changes the
+    /// sequence cursor or fsync debt, including AlreadyCompleted returns.
+    continuations: Option<ContinuationIndex>,
 }
 
 #[derive(Debug, Clone)]
@@ -702,10 +1127,12 @@ pub struct SupervisorStore {
     /// Live-ledger row count that triggers snapshot + compaction on append;
     /// `0` disables auto-compaction.
     snapshot_every_appends: u64,
-    /// `Some(n)`: fsync the events file every n-th `append_event`;
+    /// `Some(n)`: fsync after n sequenced rows (at a batch's end);
     /// `None` (default): appends are never fsynced (see `append_ledger_row`).
     append_fsync_every: Option<u64>,
     seq_cache: Arc<Mutex<SeqCache>>,
+    #[cfg(test)]
+    append_io: Arc<Mutex<tests::AppendIoProbe>>,
 }
 
 #[derive(Debug)]
@@ -729,6 +1156,8 @@ impl SupervisorStore {
             snapshot_every_appends: SNAPSHOT_EVERY_APPENDS,
             append_fsync_every: None,
             seq_cache: Arc::new(Mutex::new(SeqCache::default())),
+            #[cfg(test)]
+            append_io: Arc::new(Mutex::new(tests::AppendIoProbe::default())),
             root_dir,
         }
     }
@@ -740,10 +1169,11 @@ impl SupervisorStore {
         self
     }
 
-    /// Opt into batched append durability: fsync the events file every
-    /// `every`-th `append_event`. `0` keeps the default (no append fsync —
-    /// the documented trade-off on `append_ledger_row`). Snapshots are always
-    /// fsynced regardless of this setting.
+    /// Opt into batched append durability: fsync after `every` sequenced
+    /// rows. A multi-row append that crosses the threshold syncs its whole
+    /// batch once, leaving no unsynced remainder. `0` keeps the default (no
+    /// append fsync — the documented trade-off on `append_ledger_row`).
+    /// Snapshots are always fsynced regardless of this setting.
     pub fn with_append_fsync_every(mut self, every: u64) -> Self {
         self.append_fsync_every = (every > 0).then_some(every);
         self
@@ -778,6 +1208,14 @@ impl SupervisorStore {
     /// ledger-first, either the rows are still in the ledger we read, or the
     /// snapshot we read afterwards already contains them.
     pub fn load_state(&self) -> io::Result<SupervisorState> {
+        self.load_state_with_cutoff().map(|(state, _)| state)
+    }
+
+    fn load_state_with_cutoff(&self) -> io::Result<(SupervisorState, u64)> {
+        #[cfg(test)]
+        {
+            self.append_io.lock().unwrap().full_replays += 1;
+        }
         let rows = self.read_ledger_rows()?;
         let snapshot = self.load_snapshot()?;
         let snapshot_last_sequence = snapshot.as_ref().map_or(0, |s| s.last_sequence);
@@ -789,7 +1227,7 @@ impl SupervisorStore {
                 state.apply_ledger_row(&row);
             }
         }
-        Ok(state)
+        Ok((state, snapshot_last_sequence))
     }
 
     /// #26a — goal-scoped view of the stream, folded BY (session, goal) KEY.
@@ -879,6 +1317,10 @@ impl SupervisorStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        #[cfg(test)]
+        {
+            self.append_io.lock().unwrap().snapshot_reads += 1;
+        }
         let snapshot: SupervisorSnapshot = serde_json::from_str(&body).map_err(invalid_data)?;
         if snapshot.schema_version > SNAPSHOT_SCHEMA_VERSION {
             return Err(io::Error::new(
@@ -939,9 +1381,18 @@ impl SupervisorStore {
     ) -> io::Result<SupervisorEventLedgerRow> {
         let _lock = self.acquire_append_lock()?;
         let mut cache = self.lock_seq_cache();
-        self.refresh_seq_cache_locked(&mut cache)?;
+        self.append_event_locked(event_id.into(), event, &mut cache)
+    }
+
+    // Caller holds the append-file lock, then the sequence-cache guard.
+    fn append_event_locked(
+        &self,
+        mut event_id: String,
+        event: SupervisorEvent,
+        cache: &mut SeqCache,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        self.refresh_seq_cache_locked(cache)?;
         let sequence = cache.last_sequence.saturating_add(1);
-        let mut event_id = event_id.into();
         if event_id.is_empty() {
             event_id = format!("event:{sequence}");
         }
@@ -951,9 +1402,9 @@ impl SupervisorStore {
             recorded_at_ms: unix_time_millis(),
             event,
         };
-        self.append_row_locked(&row, &mut cache)?;
+        self.append_row_locked(&row, cache)?;
         if self.snapshot_every_appends > 0 && cache.ledger_rows >= self.snapshot_every_appends {
-            if let Err(err) = self.snapshot_and_compact_locked(&mut cache) {
+            if let Err(err) = self.snapshot_and_compact_locked(cache) {
                 tracing::warn!(
                     error = %err,
                     events_path = %self.events_path.display(),
@@ -996,6 +1447,7 @@ impl SupervisorStore {
     pub fn append_ledger_row(&self, row: &SupervisorEventLedgerRow) -> io::Result<()> {
         let _lock = self.acquire_append_lock()?;
         let mut cache = self.lock_seq_cache();
+        cache.continuations = None;
         self.write_row_sealed_locked(row)?;
         // Raw rows bypass sequence assignment; rather than guess at the
         // ledger's shape (this path must keep working even on a ledger whose
@@ -1011,6 +1463,65 @@ impl SupervisorStore {
     ) -> io::Result<SupervisorEventLedgerRow> {
         let event_id = format!("group_registered:{}", group.group_id);
         self.append_event(event_id, SupervisorEvent::GroupRegistered { group })
+    }
+
+    /// #15b — persist a join-epoch bump marker so a restart restores the
+    /// HIGHEST admitted epoch even when the bumped epoch's scatter record was
+    /// never persisted (crash between admission and the scatter write).
+    /// The event id is keyed on (group, cwd_hash, epoch): replay dedup makes a
+    /// retried or double-written bump for the same cohort+epoch idempotent.
+    /// #19 (round-4 B1) — `cwd_hash` scopes the marker to the admitted
+    /// agent's workspace cohort (same hashing the join key uses).
+    pub fn record_group_epoch_bump(
+        &self,
+        group_id: impl Into<String>,
+        cwd_hash: u64,
+        new_epoch: u64,
+        observed_at_ms: u64,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        let group_id = group_id.into();
+        let event_id = format!("group_epoch_bumped:{group_id}:{cwd_hash}:{new_epoch}");
+        self.append_event(
+            event_id,
+            SupervisorEvent::GroupEpochBumped {
+                group_id,
+                new_epoch,
+                observed_at_ms,
+                cwd_hash,
+            },
+        )
+    }
+
+    /// #20 (round-4 B2) — persist an ATOMIC cohort admission: one durable
+    /// event binds the admitted child's identity AND the bumped join epoch.
+    /// Unlike `record_group_epoch_bump` (fire-and-forget marker), this is the
+    /// CHECKED admission record: `upsert_agent` writes it BEFORE the in-memory
+    /// bump + child insert and treats an `Err` as an admission failure (no
+    /// bump, no insert). The event id embeds the child id, so replaying the
+    /// SAME admission is idempotent; the restore side only trusts an
+    /// admission whose child record is durable (see `apply_event` + the seed
+    /// pass), which closes the phantom-join crash window.
+    pub fn record_cohort_admission(
+        &self,
+        group_id: impl Into<String>,
+        cwd_hash: u64,
+        child_id: impl Into<String>,
+        new_epoch: u64,
+        observed_at_ms: u64,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        let group_id = group_id.into();
+        let child_id = child_id.into();
+        let event_id = format!("cohort_admission:{group_id}:{cwd_hash}:{child_id}:{new_epoch}");
+        self.append_event(
+            event_id,
+            SupervisorEvent::CohortAdmission {
+                group_id,
+                cwd_hash,
+                child_id,
+                new_epoch,
+                observed_at_ms,
+            },
+        )
     }
 
     pub fn record_group_terminal(
@@ -1035,6 +1546,34 @@ impl SupervisorStore {
     ) -> io::Result<SupervisorEventLedgerRow> {
         let event_id = format!("child_started:{}:{}", child.group_id, child.child_id);
         self.append_event(event_id, SupervisorEvent::ChildStarted { child })
+    }
+
+    /// Commit the complete child and optional cohort epoch in one row.
+    /// A post-write I/O error may leave this complete event durable, but
+    /// replay can never observe only one half of its child/epoch payload.
+    pub fn record_agent_admitted(
+        &self,
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        cohort: Option<CohortEpochAdmission>,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        if group.group_id != child.group_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent admission group does not match the child's group",
+            ));
+        }
+        // The locked sequence allocator supplies a fresh event id. Unlike
+        // ChildStarted's stable id, it allows later checked child updates,
+        // including multiple updates within the same millisecond.
+        self.append_event(
+            "",
+            SupervisorEvent::AgentAdmitted {
+                group,
+                child,
+                cohort,
+            },
+        )
     }
 
     pub fn record_heartbeat(&self, ping: HeartbeatPing) -> io::Result<SupervisorEventLedgerRow> {
@@ -1136,21 +1675,73 @@ impl SupervisorStore {
         )
     }
 
+    /// Check replayed state and append under the same cross-process lock.
+    /// Completed is final for retry callers, even for a higher offered attempt.
+    pub fn record_continuation_queued_if_not_completed(
+        &self,
+        continuation: PendingContinuationRecord,
+    ) -> io::Result<ContinuationQueueOutcome> {
+        if continuation.status != ContinuationStatus::Queued {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected Queued continuation",
+            ));
+        }
+        let _lock = self.acquire_append_lock()?;
+        let mut cache = self.lock_seq_cache();
+        self.refresh_continuations_locked(&mut cache)?;
+        let key = continuation_key(&continuation.group_id, &continuation.continuation_id);
+        if let Some(current) = cache
+            .continuations
+            .as_ref()
+            .and_then(|index| index.state.continuations.get(&key))
+            && current.status == ContinuationStatus::Completed
+        {
+            return Ok(ContinuationQueueOutcome::AlreadyCompleted(current.clone()));
+        }
+        #[cfg(test)]
+        {
+            let barrier = self
+                .append_io
+                .lock()
+                .unwrap()
+                .conditional_queue_barrier
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+                barrier.wait();
+            }
+        }
+        let event_id = format!(
+            "continuation_queued:{}:{}:{}",
+            continuation.group_id, continuation.continuation_id, continuation.attempt
+        );
+        self.append_event_locked(
+            event_id,
+            SupervisorEvent::ContinuationQueued { continuation },
+            &mut cache,
+        )
+        .map(ContinuationQueueOutcome::Written)
+    }
+
     pub fn record_continuation_started(
         &self,
         group_id: impl Into<String>,
         continuation_id: impl Into<String>,
         started_at_ms: u64,
+        attempt: u32,
     ) -> io::Result<SupervisorEventLedgerRow> {
         let group_id = group_id.into();
         let continuation_id = continuation_id.into();
-        let event_id = format!("continuation_started:{group_id}:{continuation_id}:{started_at_ms}");
+        let event_id =
+            format!("continuation_started:{group_id}:{continuation_id}:{started_at_ms}:{attempt}");
         self.append_event(
             event_id,
             SupervisorEvent::ContinuationStarted {
                 group_id,
                 continuation_id,
                 started_at_ms,
+                attempt,
             },
         )
     }
@@ -1161,11 +1752,13 @@ impl SupervisorStore {
         continuation_id: impl Into<String>,
         completed_at_ms: u64,
         result: Option<String>,
+        attempt: u32,
     ) -> io::Result<SupervisorEventLedgerRow> {
         let group_id = group_id.into();
         let continuation_id = continuation_id.into();
-        let event_id =
-            format!("continuation_completed:{group_id}:{continuation_id}:{completed_at_ms}");
+        let event_id = format!(
+            "continuation_completed:{group_id}:{continuation_id}:{completed_at_ms}:{attempt}"
+        );
         self.append_event(
             event_id,
             SupervisorEvent::ContinuationCompleted {
@@ -1173,11 +1766,80 @@ impl SupervisorStore {
                 continuation_id,
                 completed_at_ms,
                 result,
+                attempt,
             },
         )
     }
 
-    /// Whole-line append (append lock must be held — EVERY events-file write
+    /// One coalesced-fold tombstone (a folded extra, marked `Completed` with
+    /// `result` naming the carrier it folded into).
+    ///
+    /// #1707 round 4 (codex Should-fix 3): the terminal-coalesce fold used to
+    /// issue one `record_continuation_completed` per extra — N independent
+    /// append-lock acquisitions serialised inside the orchestrator state
+    /// lock. [`SupervisorStore::record_continuations_coalesced`] now appends
+    /// the whole batch under ONE append lock with one ledger open,
+    /// `write_all`, and flush (one lock wait, at most one snapshot compaction).
+    /// `/stop` tombstones use this same batch path.
+    pub fn record_continuations_coalesced(
+        &self,
+        entries: &[CoalescedTombstoneEntry],
+    ) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Single-append-lock batch: mirror `append_event`'s lock + seq-cache
+        // pattern, then assign consecutive sequences and write one payload.
+        // Every entry keeps its own STABLE event id (keyed on the
+        // continuation id + completed_at_ms) so replay's `applied_event_ids`
+        // dedup makes a partial batch + caller retry idempotent per entry.
+        let _lock = self.acquire_append_lock()?;
+        let mut cache = self.lock_seq_cache();
+        self.refresh_seq_cache_locked(&mut cache)?;
+        let mut sequence = cache.last_sequence;
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                sequence = sequence.saturating_add(1);
+                SupervisorEventLedgerRow {
+                    event_id: format!(
+                        "continuation_completed:{}:{}:{}",
+                        entry.group_id, entry.continuation_id, entry.completed_at_ms
+                    ),
+                    sequence,
+                    recorded_at_ms: unix_time_millis(),
+                    event: SupervisorEvent::ContinuationCompleted {
+                        group_id: entry.group_id.clone(),
+                        continuation_id: entry.continuation_id.clone(),
+                        completed_at_ms: entry.completed_at_ms,
+                        result: Some(entry.result.clone()),
+                        attempt: entry.attempt,
+                    },
+                }
+            })
+            .collect();
+        let result = self.append_rows_locked(&rows, &mut cache);
+        if self.snapshot_every_appends > 0 && cache.ledger_rows >= self.snapshot_every_appends {
+            if let Err(err) = self.snapshot_and_compact_locked(&mut cache) {
+                // Mirror `append_event`: a failed compaction never fails the
+                // already-durable appends; the threshold stays exceeded so a
+                // later append retries.
+                tracing::warn!(
+                    error = %err,
+                    events_path = %self.events_path.display(),
+                    "supervisor ledger auto-compaction failed; will retry on a later append"
+                );
+            }
+        }
+        result?;
+        Ok(())
+    }
+
+    fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
+        self.write_rows_sealed_locked(std::slice::from_ref(row))
+    }
+
+    /// Whole-line batch append (append lock must be held — EVERY events-file write
     /// goes through here under the lock; an unlocked write could land between
     /// a concurrent compaction's "snapshot rows" and "rotate ledger" steps
     /// and be rotated away unreplayed). Returns the handle so callers can
@@ -1186,7 +1848,7 @@ impl SupervisorStore {
     /// Two repairs happen inline:
     /// - Torn tail: if the file is non-empty and does not end in a newline
     ///   (a crash split an earlier append), a `\n` is written first so this
-    ///   row can never concatenate onto the torn content. The torn bytes are
+    ///   batch can never concatenate onto the torn content. The torn bytes are
     ///   preserved, never truncated — they may be a complete row that merely
     ///   lost its terminator.
     /// - Fresh file: when this write CREATES the ledger (fresh store, or the
@@ -1195,16 +1857,17 @@ impl SupervisorStore {
     ///   batched append-fsync bound would be void (power loss could keep the
     ///   snapshot but lose the new ledger's directory entry).
     ///
-    /// The row and its terminator go down in a single `write_all`, keeping
-    /// the torn-write exposure to one syscall.
-    fn write_row_sealed_locked(&self, row: &SupervisorEventLedgerRow) -> io::Result<File> {
+    /// All rows and their terminators share one `write_all`. A failed write
+    /// can still persist a prefix; replay tolerates a torn final row and
+    /// stable event IDs suppress already-written entries on caller retry.
+    fn write_rows_sealed_locked(&self, rows: &[SupervisorEventLedgerRow]) -> io::Result<File> {
         self.ensure_root_dir()?;
         let created = !self.events_path.exists();
         // #39 — the ledger append OPEN also sits on the compaction-adjacent
         // path (the file was just rotated; Windows reopens can hit the same
         // transient spectrum). Retry-wrapped on Windows, single-shot on unix.
         #[cfg(windows)]
-        let mut file = fs_retry(
+        let file = fs_retry(
             &RetryClock::default(),
             std::time::Duration::from_millis(fs_retry_total_ms()),
             || {
@@ -1221,7 +1884,7 @@ impl SupervisorStore {
             is_transient_windows_lock,
         )?;
         #[cfg(not(windows))]
-        let mut file = fs_ctx(
+        let file = fs_ctx(
             "events-append-open",
             &self.events_path,
             OpenOptions::new()
@@ -1230,6 +1893,10 @@ impl SupervisorStore {
                 .append(true)
                 .open(&self.events_path),
         )?;
+        #[cfg(test)]
+        let mut file = tests::ObservedAppendFile::new(file, Arc::clone(&self.append_io));
+        #[cfg(not(test))]
+        let mut file = file;
         #[cfg(windows)]
         let len = fs_retry(
             &RetryClock::default(),
@@ -1249,8 +1916,10 @@ impl SupervisorStore {
                 payload.push(b'\n');
             }
         }
-        serde_json::to_writer(&mut payload, row).map_err(invalid_data)?;
-        payload.push(b'\n');
+        for row in rows {
+            serde_json::to_writer(&mut payload, row).map_err(invalid_data)?;
+            payload.push(b'\n');
+        }
         // O_APPEND: the write lands at EOF regardless of the read seek above.
         fs_ctx(
             "events-row-write",
@@ -1265,34 +1934,60 @@ impl SupervisorStore {
                 fsync_dir(&self.root_dir),
             )?;
         }
+        #[cfg(test)]
+        let file = file.inner;
         Ok(file)
     }
 
-    /// Append a sequenced row while holding the append lock: write, apply
-    /// the batched fsync policy, and advance the in-memory cursor to the new
-    /// tail.
     fn append_row_locked(
         &self,
         row: &SupervisorEventLedgerRow,
         cache: &mut SeqCache,
     ) -> io::Result<()> {
-        let file = self.write_row_sealed_locked(row)?;
+        self.append_rows_locked(std::slice::from_ref(row), cache)
+    }
+
+    /// Write one sequenced batch, apply the fsync policy, and advance the
+    /// cursor only after the whole write succeeds. On any I/O error the next
+    /// append reseeds from disk, including a possibly persisted prefix.
+    fn append_rows_locked(
+        &self,
+        rows: &[SupervisorEventLedgerRow],
+        cache: &mut SeqCache,
+    ) -> io::Result<()> {
+        let Some(last) = rows.last() else {
+            return Ok(());
+        };
+        let row_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        // Move, never clone the growing index. Keep its old checkpoint after
+        // success so the next guard consumes local AND foreign suffix rows in
+        // order. Any uncertain write/sync/metadata failure leaves it invalid.
+        let continuations = cache.continuations.take();
+        cache.seeded = false;
+        // Count conservatively before I/O: even a failed write/flush may
+        // leave rows on disk. Keep their fsync debt until a successful sync
+        // so partial batches cannot silently extend the durability window.
+        if self.append_fsync_every.is_some() {
+            cache.appends_since_fsync = cache.appends_since_fsync.saturating_add(row_count);
+        }
+        let file = self.write_rows_sealed_locked(rows)?;
         if let Some(every) = self.append_fsync_every {
-            cache.appends_since_fsync = cache.appends_since_fsync.saturating_add(1);
             if cache.appends_since_fsync >= every {
+                #[cfg(test)]
+                {
+                    let mut probe = self.append_io.lock().unwrap();
+                    probe.syncs += 1;
+                    if std::mem::take(&mut probe.fail_sync) {
+                        return Err(io::Error::other("injected ledger fsync failure"));
+                    }
+                }
                 file.sync_data()?;
                 cache.appends_since_fsync = 0;
             }
         }
-        // #34f — release the events-file handle BEFORE the caller may
-        // compact: on Windows, renaming a file that still has an open handle
-        // fails, and `append_event`'s auto-compaction below renames exactly
-        // this file. POSIX tolerates the open handle, which is why the five
-        // snapshot tests were green on Linux and Os error 3 on Windows.
-        cache.last_sequence = cache.last_sequence.max(row.sequence);
         // Exact length of the file we just extended; nothing else can write
         // while we hold the lock.
-        cache.events_len = file.metadata()?.len();
+        let events_len = file.metadata()?.len();
         // #34f — release the events-file handle BEFORE the caller may
         // compact (metadata read above must come first): on Windows,
         // renaming a file that still has an open handle fails, and
@@ -1300,8 +1995,11 @@ impl SupervisorStore {
         // POSIX tolerates the open handle — the five snapshot tests were
         // green on Linux and Os error 3 on Windows for exactly this reason.
         drop(file);
-        cache.ledger_rows = cache.ledger_rows.saturating_add(1);
+        cache.last_sequence = cache.last_sequence.max(last.sequence);
+        cache.events_len = events_len;
+        cache.ledger_rows = cache.ledger_rows.saturating_add(row_count);
         cache.seeded = true;
+        cache.continuations = continuations;
         Ok(())
     }
 
@@ -1394,6 +2092,7 @@ impl SupervisorStore {
     /// failure the cursor is left stale, which the next append detects and
     /// repairs by reseeding from disk.
     fn snapshot_and_compact_locked(&self, cache: &mut SeqCache) -> io::Result<SupervisorSnapshot> {
+        cache.continuations = None;
         let snapshot = self.write_snapshot_locked()?;
         if self.events_path.exists() {
             // #34g — rename_replace handles the previous generation
@@ -1416,6 +2115,19 @@ impl SupervisorStore {
         cache.ledger_rows = 0;
         // The snapshot fsync covered everything the ledger held.
         cache.appends_since_fsync = 0;
+        cache.continuations = Some(ContinuationIndex {
+            state: SupervisorState {
+                continuations: snapshot.state.continuations.clone(),
+                applied_event_ids: snapshot.state.applied_event_ids.clone(),
+                last_sequence: snapshot.state.last_sequence,
+                ..SupervisorState::default()
+            },
+            snapshot_cutoff: snapshot.last_sequence,
+            snapshot: self.snapshot_fingerprint()?,
+            offset: 0,
+            boundary_sequence: None,
+            extendable: true,
+        });
         Ok(snapshot)
     }
 
@@ -1427,9 +2139,86 @@ impl SupervisorStore {
                 // half-updated cursor; force a reseed from disk on next use.
                 let mut guard = poisoned.into_inner();
                 guard.seeded = false;
+                guard.continuations = None;
                 guard
             }
         }
+    }
+
+    fn snapshot_fingerprint(&self) -> io::Result<Option<SnapshotFingerprint>> {
+        let metadata = match fs::metadata(&self.snapshot_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(SnapshotFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        }))
+    }
+
+    // The append lock is held throughout validation, catch-up, check and write.
+    // Take the index before fallible reads; never publish partial replay after
+    // an error and never clone the whole index on the ordinary warm path.
+    fn refresh_continuations_locked(&self, cache: &mut SeqCache) -> io::Result<()> {
+        let previous = cache.continuations.take();
+        let snapshot = self.snapshot_fingerprint()?;
+        let disk_len = match fs::metadata(&self.events_path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err),
+        };
+        let mut index = match previous {
+            Some(mut index)
+                if index.snapshot == snapshot
+                    && snapshot
+                        .as_ref()
+                        .is_none_or(|stamp| stamp.modified.is_some())
+                    && index.extendable
+                    && disk_len >= index.offset
+                    && (index.offset == 0
+                        || (index.boundary_sequence.is_some()
+                            && self.read_last_row_sequence(index.offset)?
+                                == index.boundary_sequence)) =>
+            {
+                if disk_len == index.offset {
+                    cache.continuations = Some(index);
+                    return Ok(());
+                }
+                for row in self.read_ledger_rows_from(index.offset)? {
+                    index.apply(&row);
+                }
+                index
+            }
+            _ => {
+                let (state, snapshot_cutoff) = self.load_state_with_cutoff()?;
+                ContinuationIndex {
+                    state: ContinuationIndex::project(state),
+                    snapshot_cutoff,
+                    snapshot,
+                    offset: 0,
+                    boundary_sequence: None,
+                    extendable: false,
+                }
+            }
+        };
+        index.offset = disk_len;
+        index.boundary_sequence = self.read_last_row_sequence(disk_len)?;
+        index.extendable = if disk_len == 0 {
+            true
+        } else {
+            let mut file = File::open(&self.events_path)?;
+            file.seek(SeekFrom::Start(disk_len - 1))?;
+            let mut byte = [0];
+            file.read_exact(&mut byte)?;
+            byte[0] == b'\n'
+        };
+        cache.continuations = Some(index);
+        Ok(())
     }
 
     /// Bring the in-memory cursor in line with the on-disk ledger. Must be
@@ -1541,6 +2330,10 @@ impl SupervisorStore {
     }
 
     fn read_ledger_rows(&self) -> io::Result<Vec<SupervisorEventLedgerRow>> {
+        self.read_ledger_rows_from(0)
+    }
+
+    fn read_ledger_rows_from(&self, offset: u64) -> io::Result<Vec<SupervisorEventLedgerRow>> {
         // Open-and-match instead of exists()-then-open: a concurrent
         // compaction may rotate the ledger away between the two, which must
         // read as "no rows", not an error.
@@ -1550,11 +2343,12 @@ impl SupervisorStore {
         // window. `load_snapshot` uses `fs::read_to_string`, whose handle
         // is opened-and-closed inside the call. Kept explicit so a future
         // refactor that hoists these handles shows up against this comment.
-        let file = match File::open(&self.events_path) {
+        let mut file = match File::open(&self.events_path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        file.seek(SeekFrom::Start(offset))?;
         let reader = BufReader::new(file);
         let mut rows = Vec::new();
         // #26a — tolerant replay: a SINGLE malformed line (a torn write from a
@@ -1572,13 +2366,21 @@ impl SupervisorStore {
                 continue;
             }
             match serde_json::from_str(&line) {
-                Ok(row) => rows.push(row),
+                Ok(row) => {
+                    #[cfg(test)]
+                    {
+                        self.append_io.lock().unwrap().decoded_rows += 1;
+                    }
+                    rows.push(row);
+                }
                 Err(err) => {
                     skipped += 1;
                     tracing::warn!(
                         target: "octos::supervisor",
                         path = %self.events_path.display(),
-                        line = idx + 1,
+                        replay_offset = offset,
+                        // `replay_line` is relative to `replay_offset`.
+                        replay_line = idx + 1,
                         error = %err,
                         "skipping malformed supervisor event row (#26a tolerant replay)"
                     );
@@ -1843,20 +2645,71 @@ pub(crate) fn replace_with(ops: &ReplaceOps, src: &Path, dst: &Path) -> io::Resu
     }
 }
 
+pub(super) const COALESCED_METADATA_KEYS: &[&str] = &[
+    "coalesced_child_ids",
+    "coalesced_children",
+    "coalesced_count",
+    "coalesced_count_kind",
+    "listed_child_count",
+    "omitted_child_count",
+    "coalesced_row_kinds",
+    "omitted_summary_count",
+    "coalesce_generation",
+    "coalesced_child_ids_truncated",
+    "coalesced_children_truncated",
+    "coalesced_correction_note",
+];
+
+/// Canonical scope is authoritative even when two workspaces share a display
+/// path. Without a canonical key, only exact legacy path evidence is safe here;
+/// peer-stamp decoding requires the roster evidence owned by WorkspaceCompat.
+fn continuation_workspace(record: &PendingContinuationRecord) -> Option<&serde_json::Value> {
+    record
+        .metadata
+        .get("payload:workspace_scope")
+        .or_else(|| record.metadata.get("payload:workspace"))
+}
+
 fn merge_continuation(
     existing: PendingContinuationRecord,
     mut next: PendingContinuationRecord,
 ) -> PendingContinuationRecord {
-    next.started_at_ms = match (existing.started_at_ms, next.started_at_ms) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
-    next.completed_at_ms = match (existing.completed_at_ms, next.completed_at_ms) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
+    // Completed carriers have delivered or retired their reports. Carrying
+    // those fields into a correction would replay already-resolved siblings.
+    if existing.status != ContinuationStatus::Completed
+        && existing.group_id == next.group_id
+        && existing.metadata.get("session_id") == next.metadata.get("session_id")
+        && existing.metadata.get("profile_id") == next.metadata.get("profile_id")
+        && continuation_workspace(&existing) == continuation_workspace(&next)
+    {
+        for key in COALESCED_METADATA_KEYS {
+            let key = format!("payload:{key}");
+            if let Some(value) = existing.metadata.get(&key) {
+                next.metadata.entry(key).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    // #1707 round 3 follow-up: when a strictly-higher-attempt CORRECTION
+    // resurrects the payload at a LOWER status rank (e.g. Queued replacing a
+    // Completed tombstone), the tombstone's lifecycle timestamps
+    // (started_at_ms / completed_at_ms) must NOT survive into the corrected
+    // record — a Queued record with completion timestamps is a lie.
+    let is_correction = continuation_rank(&next.status) < continuation_rank(&existing.status);
+    if is_correction {
+        next.started_at_ms = None;
+        next.completed_at_ms = None;
+    } else {
+        next.started_at_ms = match (existing.started_at_ms, next.started_at_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        next.completed_at_ms = match (existing.completed_at_ms, next.completed_at_ms) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+    }
     if next.result.is_none() {
         next.result = existing.result;
     }
@@ -1950,6 +2803,88 @@ fn invalid_data(err: serde_json::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Debug, Default)]
+    pub(super) struct AppendIoProbe {
+        opens: usize,
+        writes: usize,
+        flushes: usize,
+        pub(super) syncs: usize,
+        pub(super) full_replays: usize,
+        pub(super) snapshot_reads: usize,
+        pub(super) decoded_rows: usize,
+        fail_after_first_row: bool,
+        fail_flush: bool,
+        pub(super) fail_sync: bool,
+        fail_before_write: bool,
+        fail_write_after_bytes: Option<usize>,
+        pub(super) conditional_queue_barrier: Option<Arc<std::sync::Barrier>>,
+    }
+
+    /// Wrap the actual append handle, so counts follow real file operations
+    /// and the failure test leaves real bytes for a fresh store to replay.
+    pub(super) struct ObservedAppendFile {
+        pub(super) inner: File,
+        probe: Arc<Mutex<AppendIoProbe>>,
+    }
+
+    impl ObservedAppendFile {
+        pub(super) fn new(inner: File, probe: Arc<Mutex<AppendIoProbe>>) -> Self {
+            probe.lock().unwrap().opens += 1;
+            Self { inner, probe }
+        }
+    }
+
+    impl std::ops::Deref for ObservedAppendFile {
+        type Target = File;
+
+        fn deref(&self) -> &File {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for ObservedAppendFile {
+        fn deref_mut(&mut self) -> &mut File {
+            &mut self.inner
+        }
+    }
+
+    impl Write for ObservedAppendFile {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            let mut probe = self.probe.lock().unwrap();
+            probe.writes += 1;
+            if std::mem::take(&mut probe.fail_before_write) {
+                return Err(io::Error::other("injected failure before ledger write"));
+            }
+            if let Some(bytes) = probe.fail_write_after_bytes.take() {
+                self.inner.write_all(&buf[..bytes.min(buf.len())])?;
+                return Err(io::Error::other("injected torn ledger row"));
+            }
+            if std::mem::take(&mut probe.fail_after_first_row) {
+                let first_row_end = buf.iter().position(|&byte| byte == b'\n').unwrap() + 1;
+                self.inner
+                    .write_all(&buf[..(first_row_end + 17).min(buf.len())])?;
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "injected partial ledger write",
+                ));
+            }
+            self.inner.write_all(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut probe = self.probe.lock().unwrap();
+            probe.flushes += 1;
+            if std::mem::take(&mut probe.fail_flush) {
+                return Err(io::Error::other("injected ledger flush failure"));
+            }
+            self.inner.flush()
+        }
+    }
+
     /// ###27-B2 — rename_replace error-classification pins (unix arm).
     mod replace_ops_27b2 {
         #[cfg(windows)]
@@ -2415,10 +3350,10 @@ mod tests {
             })
             .unwrap();
         store
-            .record_continuation_started("group-1", "cont-1", 150)
+            .record_continuation_started("group-1", "cont-1", 150, 1)
             .unwrap();
         store
-            .record_continuation_completed("group-1", "cont-1", 160, Some("resumed".to_string()))
+            .record_continuation_completed("group-1", "cont-1", 160, Some("resumed".to_string()), 1)
             .unwrap();
         store
             .record_child_completed("group-1", "child-a", 170, Some("done".to_string()))
@@ -2530,6 +3465,210 @@ mod tests {
             "new.md"
         );
         assert_eq!(state.applied_event_ids.len(), 4);
+    }
+
+    #[test]
+    fn correction_merge_preserves_folded_metadata_only_within_scope() {
+        let keys = [
+            "coalesced_child_ids",
+            "coalesced_children",
+            "coalesced_count",
+            "coalesced_count_kind",
+            "listed_child_count",
+            "omitted_child_count",
+            "coalesced_row_kinds",
+            "omitted_summary_count",
+            "coalesce_generation",
+            "coalesced_child_ids_truncated",
+            "coalesced_children_truncated",
+            "coalesced_correction_note",
+        ];
+        for changed in [
+            None,
+            Some("session_id"),
+            Some("profile_id"),
+            Some("group"),
+            Some("payload:workspace_scope"),
+            Some("legacy_workspace"),
+            Some("completed"),
+        ] {
+            let mut old = PendingContinuationRecord {
+                group_id: "group".into(),
+                continuation_id: "same-child-id".into(),
+                child_id: Some("a".into()),
+                prompt: None,
+                status: ContinuationStatus::Started,
+                queued_at_ms: 1,
+                started_at_ms: Some(2),
+                completed_at_ms: None,
+                result: None,
+                attempt: 1,
+                metadata: SupervisorMetadata::from_iter([
+                    ("session_id".into(), serde_json::json!("session")),
+                    ("profile_id".into(), serde_json::json!("profile")),
+                    (
+                        "payload:workspace_scope".into(),
+                        serde_json::json!("/tmp/a"),
+                    ),
+                    (
+                        "payload:workspace".into(),
+                        serde_json::json!("same display"),
+                    ),
+                ]),
+            };
+            if changed == Some("legacy_workspace") {
+                old.metadata.remove("payload:workspace_scope");
+            }
+            if changed == Some("completed") {
+                old.status = ContinuationStatus::Completed;
+                old.completed_at_ms = Some(3);
+            }
+            let mut next = old.clone();
+            for key in keys {
+                old.metadata.insert(
+                    format!("payload:{key}"),
+                    serde_json::json!(format!("old-{key}")),
+                );
+            }
+            old.metadata
+                .insert("payload:unrelated".into(), serde_json::json!("not carried"));
+            next.status = ContinuationStatus::Queued;
+            next.attempt = 2;
+            next.metadata.insert(
+                "payload:coalesced_correction_note".into(),
+                serde_json::json!("explicit new note"),
+            );
+            if let Some(key) = changed.filter(|key| *key != "completed") {
+                if key == "group" {
+                    next.group_id = "other".into();
+                } else {
+                    next.metadata.insert(
+                        if key == "legacy_workspace" {
+                            "payload:workspace"
+                        } else {
+                            key
+                        }
+                        .into(),
+                        serde_json::json!("other"),
+                    );
+                }
+            }
+            let merged = merge_continuation(old, next);
+            assert_eq!(merged.started_at_ms, None);
+            assert_eq!(
+                merged.metadata["payload:coalesced_correction_note"],
+                "explicit new note"
+            );
+            assert!(!merged.metadata.contains_key("payload:unrelated"));
+            for key in keys
+                .into_iter()
+                .filter(|key| *key != "coalesced_correction_note")
+            {
+                assert_eq!(
+                    merged.metadata.get(&format!("payload:{key}")),
+                    changed
+                        .is_none()
+                        .then(|| serde_json::json!(format!("old-{key}")))
+                        .as_ref(),
+                    "field {key}, changed scope {changed:?}"
+                );
+            }
+        }
+    }
+
+    /// #1707 round 3 (codex Blocker 3): `attempt` is the REVISION of a queued
+    /// payload for one continuation id. A status correction persists a fresh
+    /// `Queued` record with a strictly higher attempt, which must be
+    /// rank-ELIGIBLE — it replaces an existing `Completed` record of the same
+    /// (group, continuation_id) even though `Queued` ranks below `Completed`.
+    /// A same-or-lower attempt must NOT downgrade the higher-rank record.
+    #[test]
+    fn continuation_upsert_higher_attempt_replaces_completed_tombstone() {
+        let dir = TestDir::new("attempt-rank");
+        let store = SupervisorStore::new(&dir.path);
+        let record = |attempt: u32, status_label: &str| PendingContinuationRecord {
+            group_id: "group-1".to_string(),
+            continuation_id: "child/group-1/sess/agent-1".to_string(),
+            child_id: Some("agent-1".to_string()),
+            prompt: None,
+            status: ContinuationStatus::Queued,
+            queued_at_ms: 100 + u64::from(attempt),
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: None,
+            attempt,
+            metadata: {
+                let mut metadata = SupervisorMetadata::new();
+                metadata.insert(
+                    "payload:status".into(),
+                    serde_json::Value::String(status_label.to_string()),
+                );
+                metadata
+            },
+        };
+
+        // Original delivery: Queued attempt=1, then the drain tombstones it
+        // Completed. The completed_at_ms stamp dedups the completed event id.
+        store
+            .record_continuation_queued(record(1, "failed"))
+            .unwrap();
+        store
+            .record_continuation_completed("group-1", "child/group-1/sess/agent-1", 200, None, 1)
+            .unwrap();
+        let key = continuation_key("group-1", "child/group-1/sess/agent-1");
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Completed
+        );
+
+        // Status correction: a Queued record at a strictly HIGHER attempt
+        // must replace the Completed tombstone (rank gate alone would drop
+        // it: Queued 0 < Completed 2).
+        store
+            .record_continuation_queued(record(2, "completed"))
+            .unwrap();
+        let state = store.load_state().unwrap();
+        let restored = &state.continuations[&key];
+        assert_eq!(
+            restored.status,
+            ContinuationStatus::Queued,
+            "a higher-attempt Queued record must replace the Completed tombstone"
+        );
+        assert_eq!(
+            restored
+                .metadata
+                .get("payload:status")
+                .and_then(|v| v.as_str()),
+            Some("completed"),
+            "the replacement carries the corrected payload"
+        );
+        assert_eq!(
+            restored.completed_at_ms, None,
+            "the corrected Queued record must NOT inherit the tombstone's completion timestamp"
+        );
+        assert_eq!(
+            restored.started_at_ms, None,
+            "the corrected Queued record must NOT inherit the tombstone's start timestamp"
+        );
+
+        // A same-or-lower attempt must NOT downgrade the higher-rank record:
+        // re-persisting attempt=1 behind the tombstone stays dropped.
+        let _ = store.record_continuation_queued(record(1, "failed"));
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Queued,
+            "attempt=1 behind attempt=2 must not downgrade the record"
+        );
+        assert_eq!(
+            state.continuations[&key]
+                .metadata
+                .get("payload:status")
+                .and_then(|v| v.as_str()),
+            Some("completed"),
+            "the older payload must not overwrite the corrected one"
+        );
     }
 
     // Not run on Windows for the same reason as
@@ -2997,6 +4136,646 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_and_stop_batches_write_once_and_reload() {
+        for result in ["coalesced_into:carrier", "purged_by_stop"] {
+            let dir = TestDir::new("coalesced-stop-batch-io");
+            let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+            let entries = queued_tombstone_batch(&store, result);
+            *store.append_io.lock().unwrap() = AppendIoProbe::default();
+
+            store.record_continuations_coalesced(&entries).unwrap();
+
+            assert_append_io(&store, 1, 1, 1);
+            let rows = live_ledger_rows(&store);
+            assert_eq!(
+                rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5, 6]
+            );
+            let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+            assert_eq!(restored.last_sequence, 6);
+            for entry in &entries {
+                let continuation =
+                    &restored.continuations[&continuation_key("g", &entry.continuation_id)];
+                assert_eq!(continuation.status, ContinuationStatus::Completed);
+                assert_eq!(continuation.result.as_deref(), Some(result));
+            }
+            assert_eq!(store.lock_seq_cache().ledger_rows, 6);
+            assert_eq!(
+                store.lock_seq_cache().events_len,
+                fs::metadata(store.events_path()).unwrap().len()
+            );
+        }
+    }
+
+    fn queued_tombstone_batch(
+        store: &SupervisorStore,
+        result: &str,
+    ) -> Vec<CoalescedTombstoneEntry> {
+        (0..3)
+            .map(|index| {
+                let continuation_id = format!("continuation-{index}");
+                store
+                    .record_continuation_queued(PendingContinuationRecord {
+                        group_id: "g".to_string(),
+                        continuation_id: continuation_id.clone(),
+                        child_id: Some(format!("child-{index}")),
+                        prompt: None,
+                        status: ContinuationStatus::Queued,
+                        queued_at_ms: 1,
+                        started_at_ms: None,
+                        completed_at_ms: None,
+                        result: None,
+                        attempt: 1,
+                        metadata: SupervisorMetadata::new(),
+                    })
+                    .unwrap();
+                CoalescedTombstoneEntry {
+                    group_id: "g".to_string(),
+                    continuation_id,
+                    completed_at_ms: 42,
+                    result: result.to_string(),
+                    attempt: 1,
+                }
+            })
+            .collect()
+    }
+
+    fn assert_append_io(store: &SupervisorStore, opens: usize, writes: usize, flushes: usize) {
+        let probe = store.append_io.lock().unwrap();
+        assert_eq!(
+            (probe.opens, probe.writes, probe.flushes),
+            (opens, writes, flushes),
+            "append handle opens, write_all calls, flush calls"
+        );
+    }
+
+    #[test]
+    fn coalesced_batch_partial_write_retry_deduplicates_after_reload_and_compaction() {
+        let dir = TestDir::new("coalesced-batch-partial-write");
+        let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+        let mut entries = queued_tombstone_batch(&store, "coalesced_into:carrier");
+        *store.append_io.lock().unwrap() = AppendIoProbe {
+            fail_after_first_row: true,
+            ..AppendIoProbe::default()
+        };
+
+        let err = store.record_continuations_coalesced(&entries).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_append_io(&store, 1, 1, 0);
+        let partial = fs::read(store.events_path()).unwrap();
+        assert_ne!(partial.last(), Some(&b'\n'), "second row must be torn");
+        let recovered = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(recovered.last_sequence, 4);
+        assert_eq!(
+            recovered
+                .continuations
+                .values()
+                .filter(|record| record.status == ContinuationStatus::Completed)
+                .count(),
+            1
+        );
+
+        // Deliberately change the replayed payload: the stable event ID must
+        // preserve the prefix that reached disk even though the batch failed.
+        entries[0].result = "duplicate must not overwrite".to_string();
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_append_io(&store, 2, 2, 1);
+        assert_eq!(
+            live_ledger_rows(&store)
+                .iter()
+                .map(|row| row.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.last_sequence, 7);
+        assert_eq!(restored.applied_event_ids.len(), 6);
+        assert!(
+            restored
+                .continuations
+                .values()
+                .all(|record| record.status == ContinuationStatus::Completed)
+        );
+        assert_eq!(
+            restored.continuations[&continuation_key("g", "continuation-0")]
+                .result
+                .as_deref(),
+            Some("coalesced_into:carrier")
+        );
+        let event_ids: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "continuation_completed:{}:{}:{}",
+                    entry.group_id, entry.continuation_id, entry.completed_at_ms
+                )
+            })
+            .collect();
+        assert!(
+            event_ids
+                .iter()
+                .all(|event_id| restored.applied_event_ids.contains(event_id))
+        );
+
+        store.snapshot_now().unwrap();
+        let restarted = SupervisorStore::new(&dir.path);
+        restarted.record_continuations_coalesced(&entries).unwrap();
+        let after_snapshot_retry = restarted.load_state().unwrap();
+        assert_eq!(after_snapshot_retry.last_sequence, 10);
+        assert_eq!(after_snapshot_retry.continuations, restored.continuations);
+        assert_eq!(
+            after_snapshot_retry.applied_event_ids,
+            restored.applied_event_ids
+        );
+    }
+
+    #[test]
+    fn coalesced_batch_flush_failure_retries_above_written_sequences() {
+        let dir = TestDir::new("coalesced-batch-flush-failure");
+        let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+        let entries = queued_tombstone_batch(&store, "purged_by_stop");
+        *store.append_io.lock().unwrap() = AppendIoProbe {
+            fail_flush: true,
+            ..AppendIoProbe::default()
+        };
+
+        assert!(store.record_continuations_coalesced(&entries).is_err());
+        assert_eq!(
+            SupervisorStore::new(&dir.path)
+                .load_state()
+                .unwrap()
+                .last_sequence,
+            6
+        );
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_append_io(&store, 2, 2, 2);
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.last_sequence, 9);
+        assert_eq!(restored.applied_event_ids.len(), 6);
+        assert_eq!(store.lock_seq_cache().ledger_rows, 9);
+    }
+
+    #[test]
+    fn coalesced_batch_fsync_threshold_covers_the_whole_batch() {
+        let dir = TestDir::new("coalesced-batch-fsync");
+        let store = SupervisorStore::new(&dir.path)
+            .with_snapshot_every_appends(0)
+            .with_append_fsync_every(4);
+        let entries = queued_tombstone_batch(&store, "coalesced_into:carrier");
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 3);
+        *store.append_io.lock().unwrap() = AppendIoProbe::default();
+
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_eq!(store.append_io.lock().unwrap().syncs, 1);
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 0);
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_eq!(store.append_io.lock().unwrap().syncs, 1);
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 3);
+        store.record_continuations_coalesced(&entries).unwrap();
+        assert_eq!(store.append_io.lock().unwrap().syncs, 2);
+        assert_eq!(store.lock_seq_cache().appends_since_fsync, 0);
+        assert_append_io(&store, 3, 3, 3);
+        assert_eq!(
+            SupervisorStore::new(&dir.path)
+                .load_state()
+                .unwrap()
+                .last_sequence,
+            12
+        );
+    }
+
+    #[test]
+    fn coalesced_batch_seals_missing_newline_with_one_write() {
+        let dir = TestDir::new("coalesced-batch-missing-newline");
+        let store = SupervisorStore::new(&dir.path).with_snapshot_every_appends(0);
+        let entries = queued_tombstone_batch(&store, "coalesced_into:carrier");
+        let mut content = fs::read(store.events_path()).unwrap();
+        assert_eq!(content.pop(), Some(b'\n'));
+        fs::write(store.events_path(), &content).unwrap();
+        *store.append_io.lock().unwrap() = AppendIoProbe::default();
+
+        store.record_continuations_coalesced(&entries).unwrap();
+
+        assert_append_io(&store, 1, 1, 1);
+        assert_eq!(live_ledger_rows(&store).len(), 6);
+        assert_eq!(
+            SupervisorStore::new(&dir.path)
+                .load_state()
+                .unwrap()
+                .last_sequence,
+            6
+        );
+    }
+
+    #[test]
+    fn cohort_admission_uses_one_event_write() {
+        let dir = TestDir::new("cohort-admission-single-write");
+        let store = SupervisorStore::new(&dir.path);
+
+        let row = store
+            .record_cohort_admission("g", 7, "child", 2, 42)
+            .unwrap();
+
+        assert_append_io(&store, 1, 1, 1);
+        assert_eq!(live_ledger_rows(&store), vec![row]);
+    }
+
+    fn agent_admission_event(
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        cohort: Option<(u64, u64)>,
+    ) -> SupervisorEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "agent_admitted",
+            "payload": {
+                "group": group,
+                "child": child,
+                "cohort": cohort.map(|(cwd_hash, epoch)| {
+                    serde_json::json!({ "cwd_hash": cwd_hash, "epoch": epoch })
+                }),
+            },
+        }))
+        .expect("atomic agent admission event must deserialize")
+    }
+
+    fn append_agent_admission(
+        store: &SupervisorStore,
+        group: SupervisedGroupRecord,
+        child: ChildAgentRecord,
+        cohort: Option<(u64, u64)>,
+    ) -> io::Result<SupervisorEventLedgerRow> {
+        let SupervisorEvent::AgentAdmitted {
+            group,
+            child,
+            cohort,
+        } = agent_admission_event(group, child, cohort)
+        else {
+            unreachable!("agent admission helper built a different event")
+        };
+        store.record_agent_admitted(group, child, cohort)
+    }
+
+    #[test]
+    fn agent_admission_one_event_restores_child_and_epoch() {
+        let dir = TestDir::new("atomic-agent-admission");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        child.workspace_path = Some("/workspace".to_owned());
+        child
+            .metadata
+            .insert("workspace_scope".into(), serde_json::json!("scope-v1"));
+        let row = append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            Some((7, 2)),
+        )
+        .unwrap();
+
+        assert_append_io(&store, 1, 1, 1);
+        assert_eq!(live_ledger_rows(&store), vec![row.clone()]);
+        assert_eq!(
+            serde_json::from_str::<SupervisorEventLedgerRow>(&serde_json::to_string(&row).unwrap())
+                .unwrap(),
+            row
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.children[&child_key("g", "child")], child);
+        assert_eq!(restored.groups["g"].metadata["admissions#7"], "child:2");
+        assert_eq!(restored.groups["g"].child_ids, vec!["child"]);
+    }
+
+    #[test]
+    fn agent_admission_rejects_mismatched_group_before_append() {
+        let dir = TestDir::new("admission-mismatched-group");
+        let store = SupervisorStore::new(&dir.path);
+        let error = store
+            .record_agent_admitted(
+                SupervisedGroupRecord::new("group-a", 10),
+                ChildAgentRecord::new("group-b", "child", 10),
+                Some(CohortEpochAdmission {
+                    cwd_hash: 7,
+                    epoch: 1,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_append_io(&store, 0, 0, 0);
+        assert!(!store.events_path().exists());
+        let restored = store.load_state().unwrap();
+        assert!(restored.groups.is_empty());
+        assert!(restored.children.is_empty());
+    }
+
+    #[test]
+    fn agent_admission_preserves_prior_group_metadata_and_children() {
+        let dir = TestDir::new("admission-preserves-group");
+        let store = SupervisorStore::new(&dir.path);
+        let mut old_group = SupervisedGroupRecord::new("g", 1);
+        old_group.parent_session_id = Some("session".to_owned());
+        old_group
+            .metadata
+            .insert("identity".into(), serde_json::json!("original"));
+        old_group
+            .metadata
+            .insert("join_epoch#8".into(), serde_json::json!(9));
+        store.record_group_registered(old_group).unwrap();
+        for (child_id, epoch) in [("child:a", 1), ("child:b", 2)] {
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", epoch + 10),
+                ChildAgentRecord::new("g", child_id, epoch + 10),
+                Some((7, epoch)),
+            )
+            .unwrap();
+        }
+        store.snapshot_now().unwrap();
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let group = &restored.groups["g"];
+        assert_eq!(group.created_at_ms, 1);
+        assert_eq!(group.parent_session_id.as_deref(), Some("session"));
+        assert_eq!(group.metadata["identity"], "original");
+        assert_eq!(group.metadata["join_epoch#8"], 9);
+        assert_eq!(group.metadata["admissions#7"], "child:a:1,child:b:2");
+        assert_eq!(group.child_ids, vec!["child:a", "child:b"]);
+        assert_eq!(restored.children.len(), 2);
+    }
+
+    #[test]
+    fn agent_admission_allows_updates_after_child_started_at_same_timestamp() {
+        let dir = TestDir::new("admission-update");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        store.record_child_started(child.clone()).unwrap();
+        child.task = Some("first update".to_owned());
+        let first = append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        child.task = Some("second update".to_owned());
+        let second = append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(first.event_id, second.event_id);
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.children[&child_key("g", "child")], child);
+        assert_eq!(restored.groups["g"].child_ids, vec!["child"]);
+    }
+
+    #[test]
+    fn agent_admission_update_preserves_heartbeat_and_independent_metadata() {
+        let dir = TestDir::new("admission-preserves-child-observations");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        child.workspace_path = Some("/old-workspace".to_owned());
+        child
+            .metadata
+            .insert("artifact_refs".into(), serde_json::json!(["artifact-a"]));
+        child
+            .metadata
+            .insert("workspace_scope".into(), serde_json::json!("old-scope"));
+        store.record_child_started(child).unwrap();
+        let ping = test_ping("g", "child", "ping", 20);
+        store.record_heartbeat(ping.clone()).unwrap();
+        let mut update = ChildAgentRecord::new("g", "child", 30);
+        update.status = ChildStatus::Starting;
+        update.task = Some("updated task".to_owned());
+        update
+            .metadata
+            .insert("workspace_scope".into(), serde_json::Value::Null);
+        append_agent_admission(&store, SupervisedGroupRecord::new("g", 30), update, None).unwrap();
+
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let child = &restored.children[&child_key("g", "child")];
+        assert_eq!(child.started_at_ms, 10);
+        assert_eq!(child.updated_at_ms, 30);
+        assert_eq!(child.last_heartbeat, Some(ping));
+        assert_eq!(
+            child.metadata["artifact_refs"],
+            serde_json::json!(["artifact-a"])
+        );
+        assert_eq!(child.metadata["workspace_scope"], serde_json::Value::Null);
+        assert_eq!(child.workspace_path, None);
+        assert_eq!(child.status, ChildStatus::Starting);
+        assert_eq!(child.task.as_deref(), Some("updated task"));
+    }
+
+    #[test]
+    fn agent_admission_workspace_history_survives_later_terminal_update() {
+        let dir = TestDir::new("admission-workspace-history");
+        let store = SupervisorStore::new(&dir.path);
+        let earlier = serde_json::json!({
+            "workspace_path": "/earlier", "workspace_scope": "earlier-scope",
+            "backend_kind": "native", "role": "worker", "nickname": "earlier", "label": "Earlier"
+        });
+        let prior = serde_json::json!({
+            "workspace_path": "2f746d702f7773", "workspace_scope": null,
+            "backend_kind": "background_task", "role": "peer", "nickname": "peer_handoff", "label": "Peer A"
+        });
+        let mut old = ChildAgentRecord::new("g", "child", 10);
+        old.workspace_path = Some("2f746d702f7773".to_owned());
+        old.label = Some("Peer A".to_owned());
+        old.metadata
+            .insert("backend_kind".into(), serde_json::json!("background_task"));
+        old.metadata
+            .insert("role".into(), serde_json::json!("peer"));
+        old.metadata
+            .insert("nickname".into(), serde_json::json!("peer_handoff"));
+        old.metadata.insert(
+            "workspace_history".into(),
+            serde_json::json!([earlier.clone()]),
+        );
+        store.record_child_started(old).unwrap();
+        for now in [20, 30] {
+            let mut current = ChildAgentRecord::new("g", "child", now);
+            current.workspace_path = Some("/current".to_owned());
+            current
+                .metadata
+                .insert("workspace_scope".into(), serde_json::json!("current-scope"));
+            current.metadata.insert(
+                "workspace_history".into(),
+                serde_json::json!(["unobserved override"]),
+            );
+            if now == 30 {
+                current.status = ChildStatus::Completed;
+                current.terminal = Some(TerminalState::completed(now, None));
+            }
+            append_agent_admission(&store, SupervisedGroupRecord::new("g", now), current, None)
+                .unwrap();
+        }
+        store.snapshot_now().unwrap();
+
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let child = &restored.children[&child_key("g", "child")];
+        assert_eq!(child.workspace_path.as_deref(), Some("/current"));
+        assert_eq!(child.metadata["workspace_scope"], "current-scope");
+        assert_eq!(child.status, ChildStatus::Completed);
+        assert_eq!(
+            child.metadata["workspace_history"],
+            serde_json::json!([earlier, prior])
+        );
+    }
+
+    #[test]
+    fn agent_admission_workspace_history_records_scope_changes_once() {
+        let dir = TestDir::new("admission-workspace-history-scope");
+        let store = SupervisorStore::new(&dir.path);
+        for (now, scope) in [
+            (10, Some("scope-a")),
+            (20, None),
+            (30, Some("scope-a")),
+            (40, None),
+        ] {
+            let mut child = ChildAgentRecord::new("g", "child", now);
+            child.workspace_path = Some("/same".to_owned());
+            child
+                .metadata
+                .insert("workspace_scope".into(), serde_json::json!(scope));
+            append_agent_admission(&store, SupervisedGroupRecord::new("g", now), child, None)
+                .unwrap();
+        }
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        let child = &restored.children[&child_key("g", "child")];
+        assert_eq!(child.metadata["workspace_scope"], serde_json::Value::Null);
+        let history = child.metadata["workspace_history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["workspace_scope"], "scope-a");
+        assert_eq!(history[1]["workspace_scope"], serde_json::Value::Null);
+        assert!(
+            history
+                .iter()
+                .all(|observation| observation["workspace_path"] == "/same")
+        );
+        assert!(
+            history
+                .iter()
+                .all(|observation| observation.as_object().unwrap().len() == 6)
+        );
+    }
+
+    #[test]
+    fn agent_admission_first_terminal_snapshot_stays_terminal() {
+        let dir = TestDir::new("terminal-agent-admission");
+        let store = SupervisorStore::new(&dir.path);
+        let mut child = ChildAgentRecord::new("g", "child", 10);
+        child.status = ChildStatus::Completed;
+        child.terminal = Some(TerminalState::completed(10, Some("done".to_owned())));
+        append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            child.clone(),
+            Some((7, 1)),
+        )
+        .unwrap();
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert_eq!(restored.children[&child_key("g", "child")], child);
+        assert_eq!(restored.groups["g"].status, GroupStatus::Completed);
+    }
+
+    #[test]
+    fn agent_admission_prewrite_failure_has_no_replay_state() {
+        let dir = TestDir::new("admission-prewrite-failure");
+        let store = SupervisorStore::new(&dir.path);
+        store.append_io.lock().unwrap().fail_before_write = true;
+        assert!(
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", 10),
+                ChildAgentRecord::new("g", "child", 10),
+                Some((7, 1)),
+            )
+            .is_err()
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(restored.children.is_empty());
+        assert!(restored.groups.is_empty());
+        assert!(fs::read(store.events_path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_admission_torn_write_never_replays_half_an_admission() {
+        let dir = TestDir::new("admission-torn-write");
+        let store = SupervisorStore::new(&dir.path);
+        store.append_io.lock().unwrap().fail_write_after_bytes = Some(40);
+        assert!(
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", 10),
+                ChildAgentRecord::new("g", "child", 10),
+                Some((7, 1)),
+            )
+            .is_err()
+        );
+        let partial = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(partial.children.is_empty());
+        assert!(partial.groups.is_empty());
+        append_agent_admission(
+            &store,
+            SupervisedGroupRecord::new("g", 10),
+            ChildAgentRecord::new("g", "child", 10),
+            Some((7, 1)),
+        )
+        .unwrap();
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(restored.children.contains_key(&child_key("g", "child")));
+        assert_eq!(restored.groups["g"].metadata["admissions#7"], "child:1");
+    }
+
+    #[test]
+    fn agent_admission_postwrite_error_still_replays_a_complete_event() {
+        let dir = TestDir::new("admission-postwrite-failure");
+        let store = SupervisorStore::new(&dir.path);
+        store.append_io.lock().unwrap().fail_flush = true;
+        assert!(
+            append_agent_admission(
+                &store,
+                SupervisedGroupRecord::new("g", 10),
+                ChildAgentRecord::new("g", "child", 10),
+                Some((7, 1)),
+            )
+            .is_err()
+        );
+        let restored = SupervisorStore::new(&dir.path).load_state().unwrap();
+        assert!(restored.children.contains_key(&child_key("g", "child")));
+        assert_eq!(restored.groups["g"].metadata["admissions#7"], "child:1");
+    }
+
+    #[test]
+    fn agent_admission_keeps_legacy_epoch_event_shapes_readable() {
+        let legacy = [
+            serde_json::json!({"type":"group_epoch_bumped", "payload":{
+                "group_id":"legacy", "new_epoch":2, "observed_at_ms":10
+            }}),
+            serde_json::json!({"type":"cohort_admission", "payload":{
+                "group_id":"legacy", "child_id":"old", "new_epoch":3, "observed_at_ms":11
+            }}),
+        ];
+        let mut state = SupervisorState::default();
+        for value in legacy {
+            let event: SupervisorEvent = serde_json::from_value(value).unwrap();
+            state.apply_event(&event, 11);
+        }
+        state.apply_event(
+            &agent_admission_event(
+                SupervisedGroupRecord::new("legacy", 12),
+                ChildAgentRecord::new("legacy", "new", 12),
+                None,
+            ),
+            12,
+        );
+        assert_eq!(state.groups["legacy"].metadata["join_epoch#0"], 2);
+        assert_eq!(state.groups["legacy"].metadata["admissions#0"], "old:3");
+        assert!(state.children.contains_key(&child_key("legacy", "new")));
+    }
+
+    #[test]
     fn batched_append_fsync_mode_appends_and_loads() {
         let dir = TestDir::new("batched-fsync");
         // fsync effects are not observable through the fs API; this pins the
@@ -3273,5 +5052,811 @@ mod tests {
         assert!(err.to_string().contains("schema_version"), "{err}");
         let err = store.load_state().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn lifecycle_event_for_superseded_attempt_is_ignored() {
+        // #26 (round-4, #18 B4): a Started/Completed carrying an attempt
+        // LOWER than the record's current revision is dropped (warn), the
+        // record stays Queued at the higher attempt; the LEGACY shape
+        // (attempt 0, pre-#26 events) still applies unconditionally.
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SupervisorStore::new(dir.path());
+        store
+            .record_continuation_queued(PendingContinuationRecord {
+                group_id: "group-1".to_owned(),
+                continuation_id: "child/group-1/sess/agent-1".to_owned(),
+                child_id: None,
+                prompt: None,
+                status: ContinuationStatus::Queued,
+                queued_at_ms: 100,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: None,
+                attempt: 2,
+                metadata: SupervisorMetadata::new(),
+            })
+            .unwrap();
+        // Old-attempt lifecycle events are ignored.
+        store
+            .record_continuation_started("group-1", "child/group-1/sess/agent-1", 120, 1)
+            .unwrap();
+        store
+            .record_continuation_completed("group-1", "child/group-1/sess/agent-1", 130, None, 1)
+            .unwrap();
+        let key = continuation_key("group-1", "child/group-1/sess/agent-1");
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Queued,
+            "an attempt-1 lifecycle event cannot touch the attempt-2 record"
+        );
+        assert!(
+            state.continuations[&key].started_at_ms.is_none(),
+            "the ignored Started left no timestamp"
+        );
+
+        // Same-attempt events apply normally.
+        store
+            .record_continuation_started("group-1", "child/group-1/sess/agent-1", 140, 2)
+            .unwrap();
+        store
+            .record_continuation_completed(
+                "group-1",
+                "child/group-1/sess/agent-1",
+                150,
+                Some("done".to_owned()),
+                2,
+            )
+            .unwrap();
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.continuations[&key].status,
+            ContinuationStatus::Completed
+        );
+        assert_eq!(state.continuations[&key].started_at_ms, Some(140));
+        assert_eq!(state.continuations[&key].result.as_deref(), Some("done"));
+
+        // Legacy (attempt 0) events still apply — pre-#26 ledger replay.
+        store
+            .record_continuation_queued(PendingContinuationRecord {
+                group_id: "group-1".to_owned(),
+                continuation_id: "child/group-1/sess/agent-2".to_owned(),
+                child_id: None,
+                prompt: None,
+                status: ContinuationStatus::Queued,
+                queued_at_ms: 160,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: None,
+                attempt: 3,
+                metadata: SupervisorMetadata::new(),
+            })
+            .unwrap();
+        store
+            .record_continuation_completed("group-1", "child/group-1/sess/agent-2", 170, None, 0)
+            .unwrap();
+        let state = store.load_state().unwrap();
+        let legacy_key = continuation_key("group-1", "child/group-1/sess/agent-2");
+        assert_eq!(
+            state.continuations[&legacy_key].status,
+            ContinuationStatus::Completed,
+            "legacy attempt-0 lifecycle events keep applying unconditionally"
+        );
+    }
+    fn conditional_queue_record(attempt: u32) -> PendingContinuationRecord {
+        PendingContinuationRecord {
+            group_id: "conditional-group".into(),
+            continuation_id: "scatter-key".into(),
+            child_id: None,
+            prompt: None,
+            status: ContinuationStatus::Queued,
+            queued_at_ms: 10,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: None,
+            attempt,
+            metadata: SupervisorMetadata::new(),
+        }
+    }
+
+    fn assert_continuation_index_matches_replay(store: &SupervisorStore) {
+        let expected = store.load_state().unwrap();
+        let _lock = store.acquire_append_lock().unwrap();
+        let mut cache = store.lock_seq_cache();
+        store.refresh_continuations_locked(&mut cache).unwrap();
+        let actual = &cache.continuations.as_ref().unwrap().state;
+        assert_eq!(actual.continuations, expected.continuations);
+        assert_eq!(actual.applied_event_ids, expected.applied_event_ids);
+        assert_eq!(actual.last_sequence, expected.last_sequence);
+        assert!(actual.groups.is_empty());
+        assert!(actual.children.is_empty());
+        assert!(actual.artifacts.is_empty());
+    }
+
+    #[test]
+    fn continuation_index_warm_completion_clone_foreign_compaction_and_regrowth() {
+        for mode in 0..6 {
+            let dir = tempfile::tempdir().unwrap();
+            let a = SupervisorStore::new(dir.path())
+                .with_snapshot_every_appends(0)
+                .with_append_fsync_every(100);
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .unwrap();
+            // Refresh through the queued boundary, so compaction/regrowth must
+            // validate the historical boundary of a nonempty warm index.
+            assert_continuation_index_matches_replay(&a);
+            let old_len = fs::metadata(a.events_path()).unwrap().len();
+            let b = if mode == 0 {
+                a.clone()
+            } else {
+                SupervisorStore::new(dir.path()).with_snapshot_every_appends(0)
+            };
+            b.record_continuation_started("conditional-group", "scatter-key", 15, 1)
+                .unwrap();
+            b.record_continuation_completed(
+                "conditional-group",
+                "scatter-key",
+                20,
+                Some("exact result".into()),
+                1,
+            )
+            .unwrap();
+            if (2..=4).contains(&mode) {
+                b.snapshot_now().unwrap();
+            }
+            if mode == 5 {
+                b.write_snapshot().unwrap();
+            }
+            if mode == 3 {
+                let mut filler = conditional_queue_record(1);
+                filler.continuation_id = "regrowth".into();
+                filler.prompt = Some("x".repeat(old_len as usize + 100));
+                b.record_continuation_queued(filler).unwrap();
+                assert!(fs::metadata(a.events_path()).unwrap().len() > old_len);
+            }
+            if mode == 4 {
+                // Observe the first empty generation, then compact another
+                // generation to empty before A gets another guard call.
+                assert_continuation_index_matches_replay(&a);
+                b.record_continuation_completed(
+                    "conditional-group",
+                    "scatter-key",
+                    30,
+                    Some("second empty generation".into()),
+                    1,
+                )
+                .unwrap();
+                b.snapshot_now().unwrap();
+            }
+            let expected = a.load_state().unwrap().continuations
+                [&continuation_key("conditional-group", "scatter-key")]
+                .clone();
+            let before_bytes = fs::read(a.events_path()).ok();
+            let (sequence, debt) = {
+                let cache = a.lock_seq_cache();
+                (cache.last_sequence, cache.appends_since_fsync)
+            };
+            *a.append_io.lock().unwrap() = AppendIoProbe::default();
+            for _ in 0..4 {
+                let ContinuationQueueOutcome::AlreadyCompleted(actual) = a
+                    .record_continuation_queued_if_not_completed(conditional_queue_record(99))
+                    .unwrap()
+                else {
+                    panic!("warm completion lost in mode {mode}");
+                };
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(fs::read(a.events_path()).ok(), before_bytes);
+            let cache = a.lock_seq_cache();
+            assert_eq!(
+                (cache.last_sequence, cache.appends_since_fsync),
+                (sequence, debt)
+            );
+            let probe = a.append_io.lock().unwrap();
+            assert_eq!(
+                (probe.opens, probe.writes, probe.flushes, probe.syncs),
+                (0, 0, 0, 0)
+            );
+            assert!(probe.full_replays <= usize::from(mode >= 2));
+        }
+    }
+
+    #[test]
+    fn continuation_index_reuses_local_compaction_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(2);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        a.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        assert!(!a.events_path().exists());
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        for _ in 0..8 {
+            assert!(matches!(
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                    .unwrap(),
+                ContinuationQueueOutcome::AlreadyCompleted(_)
+            ));
+        }
+        let probe = a.append_io.lock().unwrap();
+        assert_eq!(
+            (
+                probe.full_replays,
+                probe.snapshot_reads,
+                probe.decoded_rows,
+                probe.opens
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn continuation_index_matches_lifecycle_global_dedup_and_raw_sequence_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        let b = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        let completed = |attempt| SupervisorEvent::ContinuationCompleted {
+            group_id: "conditional-group".into(),
+            continuation_id: "scatter-key".into(),
+            completed_at_ms: 20,
+            result: Some(format!("attempt {attempt}")),
+            attempt,
+        };
+        let queued = |attempt| SupervisorEvent::ContinuationQueued {
+            continuation: conditional_queue_record(attempt),
+        };
+        let events = vec![
+            ("complete-one", completed(1)),
+            ("old-queued", queued(1)),
+            ("reopen", queued(2)),
+            ("stale-complete", completed(1)),
+            (
+                "stale-start",
+                SupervisorEvent::ContinuationStarted {
+                    group_id: "conditional-group".into(),
+                    continuation_id: "scatter-key".into(),
+                    started_at_ms: 21,
+                    attempt: 1,
+                },
+            ),
+            (
+                "cross-kind",
+                SupervisorEvent::Heartbeat {
+                    ping: test_ping("unrelated", "child", "ping", 30),
+                },
+            ),
+            ("cross-kind", completed(2)),
+            ("legacy-complete", completed(0)),
+            ("reopen-again", queued(3)),
+            (
+                "missing-queued",
+                SupervisorEvent::ContinuationCompleted {
+                    group_id: "other-group".into(),
+                    continuation_id: "scatter-key".into(),
+                    completed_at_ms: 31,
+                    result: None,
+                    attempt: 1,
+                },
+            ),
+        ];
+        for (event_id, event) in events {
+            b.append_event(event_id, event).unwrap();
+            assert_continuation_index_matches_replay(&a);
+        }
+        b.snapshot_now().unwrap();
+        assert_continuation_index_matches_replay(&a);
+        b.append_event("legacy-complete", completed(0)).unwrap(); // snapshot's dedup survives
+        assert_continuation_index_matches_replay(&a);
+        let base = b.load_state().unwrap().last_sequence;
+        for (sequence, event_id, event) in [
+            (base + 10, "high-sequence", queued(4)),
+            (base + 2, "lower-sequence-new-id", completed(0)),
+            (base + 20, "cross-kind", queued(5)),
+        ] {
+            b.append_ledger_row(&SupervisorEventLedgerRow {
+                event_id: event_id.into(),
+                sequence,
+                recorded_at_ms: 40,
+                event,
+            })
+            .unwrap();
+            assert_continuation_index_matches_replay(&a);
+        }
+        let ContinuationQueueOutcome::AlreadyCompleted(record) = a
+            .record_continuation_queued_if_not_completed(conditional_queue_record(99))
+            .unwrap()
+        else {
+            panic!("lower sequence above the fixed snapshot cutoff must apply");
+        };
+        assert_eq!(record.attempt, 4);
+    }
+
+    #[test]
+    fn continuation_index_tolerates_malformed_suffix_and_unterminated_rows() {
+        for valid_eof in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .unwrap();
+            assert_continuation_index_matches_replay(&a);
+            let row = SupervisorEventLedgerRow {
+                event_id: "raw-completed".into(),
+                sequence: 2,
+                recorded_at_ms: 20,
+                event: SupervisorEvent::ContinuationCompleted {
+                    group_id: "conditional-group".into(),
+                    continuation_id: "scatter-key".into(),
+                    completed_at_ms: 20,
+                    result: None,
+                    attempt: 1,
+                },
+            };
+            {
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(a.events_path())
+                    .unwrap();
+                file.write_all(b"malformed middle\n\n").unwrap();
+                if valid_eof {
+                    file.write_all(&serde_json::to_vec(&row).unwrap()).unwrap();
+                } else {
+                    file.write_all(b"{torn").unwrap();
+                }
+            }
+            assert_continuation_index_matches_replay(&a);
+            // Both the valid EOF record and an incomplete final row force
+            // conservative reseeding after the append API seals the tail.
+            a.record_continuation_completed("other", "sealed", 30, None, 0)
+                .unwrap();
+            assert_continuation_index_matches_replay(&a);
+            if !valid_eof {
+                let b = SupervisorStore::new(dir.path());
+                let mut row = row;
+                row.sequence = 4;
+                b.append_ledger_row(&row).unwrap();
+            }
+            assert!(matches!(
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                    .unwrap(),
+                ContinuationQueueOutcome::AlreadyCompleted(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn continuation_index_reseeds_same_length_changed_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        a.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        let before = fs::read_to_string(a.events_path()).unwrap();
+        let after = before.replace("\"sequence\":2", "\"sequence\":9");
+        assert_ne!(before, after);
+        assert_eq!(before.len(), after.len());
+        fs::write(a.events_path(), after).unwrap();
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(99))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        assert_eq!(a.append_io.lock().unwrap().full_replays, 1);
+        assert_continuation_index_matches_replay(&a);
+    }
+
+    #[test]
+    fn continuation_index_snapshot_replacement_errors_fail_closed_when_warm() {
+        for nonempty in [false, true] {
+            for corrupt in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                    .unwrap();
+                let mut snapshot = a.snapshot_now().unwrap();
+                if nonempty {
+                    a.record_continuation_completed("other", "tail", 20, None, 0)
+                        .unwrap();
+                }
+                assert_continuation_index_matches_replay(&a);
+                let old_bytes = fs::read(a.events_path()).ok();
+                let tmp = dir.path().join("replacement");
+                snapshot.schema_version += 1;
+                fs::write(
+                    &tmp,
+                    if corrupt {
+                        b"invalid snapshot".to_vec()
+                    } else {
+                        serde_json::to_vec(&snapshot).unwrap()
+                    },
+                )
+                .unwrap();
+                rename_replace(&tmp, a.snapshot_path()).unwrap();
+                *a.append_io.lock().unwrap() = AppendIoProbe::default();
+                assert!(
+                    a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                        .is_err()
+                );
+                assert_eq!(fs::read(a.events_path()).ok(), old_bytes);
+                assert_eq!(a.append_io.lock().unwrap().opens, 0);
+                assert!(a.lock_seq_cache().continuations.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_index_reconciles_failed_completion_writes_and_fsync_debt() {
+        // Ordinary and raw paths may report an error after bytes reached disk.
+        // Only persisted, complete rows may suppress the retry.
+        for raw in [false, true] {
+            for failure in 0..4 {
+                if raw && failure == 3 {
+                    continue;
+                } // raw API has no fsync policy
+                let dir = tempfile::tempdir().unwrap();
+                let a = SupervisorStore::new(dir.path())
+                    .with_snapshot_every_appends(0)
+                    .with_append_fsync_every(1);
+                a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                    .unwrap();
+                assert_continuation_index_matches_replay(&a);
+                {
+                    let mut probe = a.append_io.lock().unwrap();
+                    match failure {
+                        0 => probe.fail_before_write = true,
+                        1 => probe.fail_write_after_bytes = Some(17),
+                        2 => probe.fail_flush = true,
+                        3 => probe.fail_sync = true,
+                        _ => unreachable!(),
+                    }
+                }
+                let result = if raw {
+                    a.append_ledger_row(&SupervisorEventLedgerRow {
+                        event_id: "raw-failure".into(),
+                        sequence: 2,
+                        recorded_at_ms: 20,
+                        event: SupervisorEvent::ContinuationCompleted {
+                            group_id: "conditional-group".into(),
+                            continuation_id: "scatter-key".into(),
+                            completed_at_ms: 20,
+                            result: Some("persisted".into()),
+                            attempt: 1,
+                        },
+                    })
+                } else {
+                    a.clone()
+                        .record_continuation_completed(
+                            "conditional-group",
+                            "scatter-key",
+                            20,
+                            Some("persisted".into()),
+                            1,
+                        )
+                        .map(|_| ())
+                };
+                assert!(result.is_err());
+                assert!(a.lock_seq_cache().continuations.is_none());
+                assert_continuation_index_matches_replay(&a);
+                let debt = a.lock_seq_cache().appends_since_fsync;
+                *a.append_io.lock().unwrap() = AppendIoProbe::default();
+                let outcome = a
+                    .record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                    .unwrap();
+                if failure >= 2 {
+                    let ContinuationQueueOutcome::AlreadyCompleted(record) = outcome else {
+                        panic!("persisted completion lost");
+                    };
+                    assert_eq!(record.result.as_deref(), Some("persisted"));
+                    assert_eq!(a.append_io.lock().unwrap().opens, 0);
+                    assert_eq!(a.lock_seq_cache().appends_since_fsync, debt);
+                    if !raw {
+                        assert_eq!(debt, 1);
+                    }
+                } else {
+                    assert!(matches!(outcome, ContinuationQueueOutcome::Written(_)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_index_reconciles_partial_completed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        a.append_io.lock().unwrap().fail_after_first_row = true;
+        let entries: Vec<_> = ["scatter-key", "second-key"]
+            .into_iter()
+            .map(|id| CoalescedTombstoneEntry {
+                group_id: "conditional-group".into(),
+                continuation_id: id.into(),
+                completed_at_ms: 20,
+                result: "folded".into(),
+                attempt: 1,
+            })
+            .collect();
+        assert!(a.record_continuations_coalesced(&entries).is_err());
+        assert!(a.lock_seq_cache().continuations.is_none());
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        let mut second = conditional_queue_record(1);
+        second.continuation_id = "second-key".into();
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(second)
+                .unwrap(),
+            ContinuationQueueOutcome::Written(_)
+        ));
+        assert_continuation_index_matches_replay(&a);
+    }
+
+    #[test]
+    fn continuation_index_utf8_read_error_invalidates_partial_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        let b = SupervisorStore::new(dir.path());
+        b.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(a.events_path())
+            .unwrap()
+            .write_all(&[0xff, b'\n'])
+            .unwrap();
+        let bytes = fs::read(a.events_path()).unwrap();
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .is_err()
+        );
+        assert!(a.lock_seq_cache().continuations.is_none());
+        assert_eq!(a.append_io.lock().unwrap().opens, 0);
+        assert_eq!(fs::read(a.events_path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn continuation_index_recovers_after_compaction_rotation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap();
+        a.record_continuation_completed("conditional-group", "scatter-key", 20, None, 1)
+            .unwrap();
+        assert_continuation_index_matches_replay(&a);
+        fs::create_dir(a.rotated_events_path()).unwrap();
+        fs::write(a.rotated_events_path().join("obstacle"), "keep").unwrap();
+        assert!(a.snapshot_now().is_err());
+        assert!(a.lock_seq_cache().continuations.is_none());
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        assert_continuation_index_matches_replay(&a);
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_batch_replays_history_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        for idx in 0..64 {
+            let mut record = conditional_queue_record(1);
+            record.continuation_id = format!("snapshot-{idx}");
+            record.prompt = Some("substantial historical payload".repeat(128));
+            store.record_continuation_queued(record).unwrap();
+        }
+        store.snapshot_now().unwrap();
+        let store = SupervisorStore::new(dir.path()).with_snapshot_every_appends(0);
+        for idx in 0..16 {
+            store
+                .record_continuation_completed("history", format!("tail-{idx}"), 20, None, 0)
+                .unwrap();
+        }
+        *store.append_io.lock().unwrap() = AppendIoProbe::default();
+        for idx in 0..12 {
+            let mut record = conditional_queue_record(1);
+            record.continuation_id = format!("join-{idx}");
+            assert!(matches!(
+                store
+                    .clone()
+                    .record_continuation_queued_if_not_completed(record)
+                    .unwrap(),
+                ContinuationQueueOutcome::Written(_)
+            ));
+            store
+                .record_continuation_completed("history", format!("intervening-{idx}"), 30, None, 0)
+                .unwrap();
+        }
+        let probe = store.append_io.lock().unwrap();
+        assert_eq!(probe.full_replays, 1, "batch must seed exactly once");
+        assert_eq!(
+            probe.snapshot_reads, 1,
+            "large snapshot must be read exactly once"
+        );
+        assert!(
+            probe.decoded_rows <= 16 + 24,
+            "historical tail must be decoded once, got {} decoded rows",
+            probe.decoded_rows
+        );
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_foreign_writer_snapshot_and_no_io() {
+        for compact in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = SupervisorStore::new(dir.path());
+            a.record_continuation_queued(conditional_queue_record(1))
+                .unwrap();
+            let b = SupervisorStore::new(dir.path());
+            b.record_continuation_completed(
+                "conditional-group",
+                "scatter-key",
+                20,
+                Some("stopped".into()),
+                1,
+            )
+            .unwrap();
+            if compact {
+                b.snapshot_now().unwrap();
+            }
+            let bytes = std::fs::read(a.events_path()).ok();
+            let sequence = a.lock_seq_cache().last_sequence;
+            let debt = a.lock_seq_cache().appends_since_fsync;
+            *a.append_io.lock().unwrap() = AppendIoProbe::default();
+            let outcome = a
+                .record_continuation_queued_if_not_completed(conditional_queue_record(99))
+                .unwrap();
+            let ContinuationQueueOutcome::AlreadyCompleted(record) = outcome else {
+                panic!("foreign completion must be final");
+            };
+            assert_eq!(record.attempt, 1);
+            assert_eq!(record.result.as_deref(), Some("stopped"));
+            assert_eq!(std::fs::read(a.events_path()).ok(), bytes);
+            assert_eq!(a.lock_seq_cache().last_sequence, sequence);
+            assert_eq!(a.lock_seq_cache().appends_since_fsync, debt);
+            let io = a.append_io.lock().unwrap();
+            assert_eq!((io.opens, io.writes, io.flushes, io.syncs), (0, 0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_validates_scope_and_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path());
+        let mut invalid = conditional_queue_record(1);
+        invalid.status = ContinuationStatus::Started;
+        assert_eq!(
+            a.record_continuation_queued_if_not_completed(invalid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(!a.events_path().exists());
+        let b = SupervisorStore::new(dir.path());
+        b.record_continuation_completed("other-group", "scatter-key", 1, None, 0)
+            .unwrap();
+        std::fs::write(a.snapshot_path(), "invalid snapshot").unwrap();
+        let bytes = std::fs::read(a.events_path()).unwrap();
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(a.events_path()).unwrap(), bytes);
+        std::fs::remove_file(a.snapshot_path()).unwrap();
+        let ContinuationQueueOutcome::Written(row) = a
+            .record_continuation_queued_if_not_completed(conditional_queue_record(1))
+            .unwrap()
+        else {
+            panic!("different group is independent");
+        };
+        assert_eq!(row.sequence, 2);
+        assert_eq!(
+            row.event_id,
+            "continuation_queued:conditional-group:scatter-key:1"
+        );
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_holds_lock_across_check_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        a.append_io.lock().unwrap().conditional_queue_barrier = Some(barrier.clone());
+        let b = SupervisorStore::new(dir.path());
+        let writer = std::thread::spawn(move || {
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .unwrap()
+        });
+        barrier.wait(); // A checked absence and still owns the append lock.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let completer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let row = b
+                .record_continuation_completed("conditional-group", "scatter-key", 20, None, 0)
+                .unwrap();
+            done_tx.send(row.sequence).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early_completion = done_rx.recv_timeout(std::time::Duration::from_millis(50));
+        let blocked = matches!(
+            early_completion,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        barrier.wait();
+        let outcome = writer.join().unwrap();
+        let completed_sequence = early_completion.unwrap_or_else(|_| done_rx.recv().unwrap());
+        completer.join().unwrap();
+        assert!(
+            blocked,
+            "another writer cannot complete between the check and queue append"
+        );
+        let ContinuationQueueOutcome::Written(row) = outcome else {
+            panic!("A was first");
+        };
+        assert!(row.sequence < completed_sequence);
+        assert_eq!(
+            SupervisorStore::new(dir.path())
+                .load_state()
+                .unwrap()
+                .continuations[&continuation_key("conditional-group", "scatter-key")]
+                .status,
+            ContinuationStatus::Completed
+        );
+    }
+
+    #[test]
+    fn continuation_queued_if_not_completed_prewrite_and_postflush_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SupervisorStore::new(dir.path()).with_append_fsync_every(3);
+        a.append_io.lock().unwrap().fail_before_write = true;
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .is_err()
+        );
+        assert!(a.load_state().unwrap().continuations.is_empty());
+        *a.append_io.lock().unwrap() = AppendIoProbe {
+            fail_flush: true,
+            ..AppendIoProbe::default()
+        };
+        assert!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(1))
+                .is_err()
+        );
+        assert_eq!(
+            a.load_state().unwrap().continuations
+                [&continuation_key("conditional-group", "scatter-key")]
+                .status,
+            ContinuationStatus::Queued
+        );
+        assert_eq!(a.lock_seq_cache().appends_since_fsync, 2);
+        let b = SupervisorStore::new(dir.path());
+        b.record_continuation_completed("conditional-group", "scatter-key", 20, None, 0)
+            .unwrap();
+        *a.append_io.lock().unwrap() = AppendIoProbe::default();
+        assert!(matches!(
+            a.record_continuation_queued_if_not_completed(conditional_queue_record(2))
+                .unwrap(),
+            ContinuationQueueOutcome::AlreadyCompleted(_)
+        ));
+        assert_eq!(a.append_io.lock().unwrap().opens, 0);
+        assert_eq!(a.lock_seq_cache().appends_since_fsync, 2);
+        let mut next = conditional_queue_record(1);
+        next.continuation_id = "other-key".into();
+        a.record_continuation_queued_if_not_completed(next).unwrap();
+        assert_eq!(a.append_io.lock().unwrap().syncs, 1);
+        assert_eq!(a.lock_seq_cache().appends_since_fsync, 0);
     }
 }

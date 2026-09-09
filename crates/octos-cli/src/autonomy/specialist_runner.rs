@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::time::MissedTickBehavior;
 
 use super::agent_orchestrator::{AgentArtifactRecord, AgentUpsert, InProcessAgentOrchestrator};
+use super::workspace_scope::WorkspaceScope;
 use crate::cli_agent_adapter::{
     CliAgentCommandConfig, CliAgentProcess, CliAgentRunResult, CliAgentTermination,
 };
@@ -156,7 +157,17 @@ pub(crate) async fn run_supervised_cli_specialist(
                 .push(artifact.path.clone());
         }
     }
-    let initial_agent = orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None));
+    let workspace_scope = request
+        .spec
+        .cwd
+        .as_deref()
+        .and_then(WorkspaceScope::from_path);
+    let initial_agent = orchestrator
+        .upsert_agent_scoped(
+            upsert_for_spec(&request.spec, "running", None),
+            workspace_scope,
+        )
+        .map_err(|error| error.message)?;
     // #1021 / M17-C — CLI specialists are spawned as external subprocesses that never consume the Octos prompt context manager, so the dispatch contract is `external_context_unmanaged` with `risk: "medium"`. Stamping it here surfaces `context_mode` / `context_refs` on every subsequent `agent/updated` event so AppUI clients can audit context regime per child without polling the MCP path.
     let cli_contract = DispatchContextContract::external_unmanaged(
         "cli_specialist_does_not_consume_managed_payload",
@@ -243,7 +254,17 @@ pub(crate) async fn run_supervised_mcp_specialist(
         return Err("MCP specialist timeout must be greater than zero".to_owned());
     }
 
-    let initial_agent = orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None));
+    let workspace_scope = request
+        .spec
+        .cwd
+        .as_deref()
+        .and_then(WorkspaceScope::from_path);
+    let initial_agent = orchestrator
+        .upsert_agent_scoped(
+            upsert_for_spec(&request.spec, "running", None),
+            workspace_scope,
+        )
+        .map_err(|error| error.message)?;
     // #1021 / M17-C — MCP supervised specialists dispatch through an external transport that does not yet wire a managed context payload, so the contract is `external_context_unmanaged` with `risk: "medium"`. The same contract is forwarded into the dispatch request below so the remote side and the AppUI event ledger agree on context regime.
     let context_contract = DispatchContextContract::external_unmanaged(
         "supervised_mcp_specialist_context_payload_not_wired",
@@ -920,6 +941,41 @@ printf 'done\n'
         artifact: Mutex<Option<PathBuf>>,
     }
 
+    #[cfg(unix)]
+    struct OneTurnNativeProvider;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl octos_llm::LlmProvider for OneTurnNativeProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some("native done".to_owned()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "one-turn-native"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl McpAgentBackend for ScriptedMcpBackend {
         fn backend_label(&self) -> &'static str {
@@ -943,6 +999,474 @@ printf 'done\n'
                 context_contract: None,
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_r6_non_utf8_native_cli_mcp_share_one_purge_without_lossy_neighbor() {
+        use super::super::agent_orchestrator::NativeSpecialistLaunchRequest;
+        use super::super::supervisor_store::ContinuationStatus;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw_root = dir.path().join(OsStr::from_bytes(b"\xff-root"));
+        let lossy_neighbor = dir.path().join("\u{fffd}-root");
+        let raw_root_created = match std::fs::create_dir_all(&raw_root) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(92) => false,
+            Err(error) => panic!("create raw-byte workspace: {error}"),
+        };
+        std::fs::create_dir_all(&lossy_neighbor).unwrap();
+        assert_ne!(raw_root, lossy_neighbor);
+        assert_eq!(raw_root.to_string_lossy(), lossy_neighbor.to_string_lossy());
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(dir.path().join("supervisor"))
+            .unwrap();
+        let session = SessionKey::with_profile("tenant-a", "api", "specialist");
+        // #39: joins require at least two ordinary children. Retire one seed
+        // verdict in each scope before the real runners execute, preserving
+        // their 6/2 pending purge counts without synthetic singleton joins.
+        for (id, root) in [("seed-raw", &raw_root), ("seed-neighbor", &lossy_neighbor)] {
+            orchestrator
+                .upsert_agent_scoped(
+                    AgentUpsert {
+                        agent_id: id.into(),
+                        parent_agent_id: Some("master".into()),
+                        session_id: session.clone(),
+                        task_id: None,
+                        path: format!("master/{id}"),
+                        role: "worker".into(),
+                        nickname: id.into(),
+                        backend_kind: "native".into(),
+                        status: "completed".into(),
+                        last_task: Some("seed completed before the runner burst".into()),
+                        cwd: Some(root.to_string_lossy().into_owned()),
+                        profile_id: "tenant-a".into(),
+                    },
+                    WorkspaceScope::from_path(root),
+                )
+                .unwrap();
+            let seeds = orchestrator.drain_ready_continuations_for_session(
+                &session,
+                "tenant-a",
+                super::super::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            assert_eq!(seeds.len(), 1);
+            assert_eq!(
+                seeds[0].child_agent_id.as_ref().map(|id| id.as_str()),
+                Some(id)
+            );
+            orchestrator.mark_continuation_completed(&seeds[0], Some("seed consumed".into()));
+        }
+
+        orchestrator
+            .run_native_specialist(NativeSpecialistLaunchRequest {
+                agent_id: Some("native-raw".to_owned()),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: session.clone(),
+                profile_id: "tenant-a".to_owned(),
+                role: "reviewer".to_owned(),
+                nickname: "Native Raw".to_owned(),
+                task: "review raw workspace".to_owned(),
+                cwd: raw_root.clone(),
+                llm: Arc::new(OneTurnNativeProvider),
+                memory: Arc::new(
+                    octos_memory::EpisodeStore::open(dir.path().join("native-memory"))
+                        .await
+                        .unwrap(),
+                ),
+                tools: Arc::new(octos_agent::ToolRegistry::with_builtins(dir.path())),
+                system_prompt: None,
+                agent_config: None,
+                task_ledger_path: None,
+                event_tx: None,
+                dispatch_policy: None,
+            })
+            .await
+            .unwrap();
+
+        let script = write_executable(
+            &dir,
+            "scope-agent",
+            "#!/bin/sh\nprintf done > cli-marker\nprintf 'cli done\\n'\n",
+        );
+        let sink = RecordingSink::default();
+        let mut cli_spec = sample_spec(&dir, "cli-raw");
+        cli_spec.cwd = Some(raw_root.clone());
+        cli_spec.artifacts.clear();
+        let raw_cli_result = run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                cli_spec,
+                CliAgentCommandConfig::new(&script).cwd(&raw_root),
+            ),
+        )
+        .await;
+        if raw_root_created {
+            raw_cli_result.unwrap();
+        } else {
+            assert!(
+                raw_cli_result.is_err(),
+                "a platform that rejects the raw directory must fail after runner admission"
+            );
+        }
+
+        let backend = Arc::new(ScriptedMcpBackend::default());
+        *backend.artifact.lock().unwrap() = Some(dir.path().join("mcp-report.md"));
+        let mut mcp_spec = sample_spec(&dir, "mcp-raw");
+        mcp_spec.cwd = Some(raw_root.clone());
+        mcp_spec.backend_kind = "mcp_test".to_owned();
+        mcp_spec.artifacts.clear();
+        run_supervised_mcp_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedMcpSpecialist::new(
+                mcp_spec,
+                backend,
+                "agent/run",
+                json!({"prompt": "review raw workspace"}),
+            )
+            .timeout(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        let mut neighbor_spec = sample_spec(&dir, "cli-lossy-neighbor");
+        neighbor_spec.cwd = Some(lossy_neighbor.clone());
+        neighbor_spec.artifacts.clear();
+        run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                neighbor_spec,
+                CliAgentCommandConfig::new(script).cwd(&lossy_neighbor),
+            ),
+        )
+        .await
+        .unwrap();
+
+        if raw_root_created {
+            assert!(raw_root.join("cli-marker").is_file());
+        }
+        assert!(lossy_neighbor.join("cli-marker").is_file());
+        for agent_id in ["native-raw", "cli-raw", "mcp-raw", "cli-lossy-neighbor"] {
+            let status = orchestrator
+                .read_agent_status(AgentRequest {
+                    agent_id: agent_id.to_owned(),
+                    session_id: Some(session.clone()),
+                    profile_id: "tenant-a".to_owned(),
+                })
+                .unwrap();
+            assert_eq!(
+                status["agent"]["cwd"],
+                json!(lossy_neighbor.to_string_lossy()),
+                "display cwd changed for {agent_id}"
+            );
+        }
+
+        let raw_scope_key = WorkspaceScope::from_path(&raw_root).unwrap();
+        let neighbor_scope_key = WorkspaceScope::from_path(&lossy_neighbor).unwrap();
+        assert_ne!(raw_scope_key, neighbor_scope_key);
+        let store =
+            super::super::supervisor_store::SupervisorStore::new(dir.path().join("supervisor"));
+        let snapshot = store.load_state().unwrap();
+        let scatter_cohort = |scope: &WorkspaceScope| {
+            let mut rows = snapshot
+                .continuations
+                .values()
+                .filter(|record| record.continuation_id.starts_with("scatter_join/"))
+                .filter(|record| {
+                    record
+                        .metadata
+                        .get("payload:workspace_scope")
+                        .and_then(Value::as_str)
+                        == Some(scope.key())
+                })
+                .map(|record| {
+                    let mut segments = record.continuation_id.rsplit('/');
+                    let epoch = segments
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap();
+                    let cohort_hash = segments
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap();
+                    let terminal_children = record.metadata["payload:terminal_children"]
+                        .as_str()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap();
+                    (epoch, terminal_children, cohort_hash)
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+        let raw_scatter = scatter_cohort(&raw_scope_key);
+        assert_eq!(
+            raw_scatter
+                .iter()
+                .map(|(epoch, children, _)| (*epoch, *children))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (1, 3), (2, 4)],
+            "native, CLI, and MCP must advance one shared raw-byte cohort"
+        );
+        assert!(
+            raw_scatter
+                .iter()
+                .all(|(_, _, hash)| *hash == raw_scatter[0].2),
+            "all raw-byte scatter generations must use one cohort hash"
+        );
+        let neighbor_scatter = scatter_cohort(&neighbor_scope_key);
+        assert_eq!(
+            neighbor_scatter
+                .iter()
+                .map(|(epoch, children, _)| (*epoch, *children))
+                .collect::<Vec<_>>(),
+            vec![(0, 2)],
+            "the real U+FFFD directory must start an independent cohort"
+        );
+        assert_ne!(raw_scatter[0].2, neighbor_scatter[0].2);
+
+        fn terminal_rows(
+            state: &super::super::supervisor_store::SupervisorState,
+            scope: &WorkspaceScope,
+        ) -> std::collections::HashMap<String, ContinuationStatus> {
+            state
+                .continuations
+                .values()
+                .filter(|record| {
+                    record
+                        .metadata
+                        .get("payload:workspace_scope")
+                        .and_then(Value::as_str)
+                        == Some(scope.key())
+                })
+                .filter(|record| {
+                    matches!(
+                        record.metadata.get("reason").and_then(Value::as_str),
+                        Some("child_completed" | "scatter_join_complete")
+                    )
+                })
+                .map(|record| (record.continuation_id.clone(), record.status.clone()))
+                .collect()
+        }
+        let raw_rows = terminal_rows(&snapshot, &raw_scope_key);
+        let neighbor_rows = terminal_rows(&snapshot, &neighbor_scope_key);
+        assert!(
+            !raw_rows.is_empty(),
+            "raw scope terminal cohort must be nonempty"
+        );
+        assert!(
+            !neighbor_rows.is_empty(),
+            "lossy-neighbor terminal cohort must be nonempty"
+        );
+        assert_eq!(
+            raw_rows.len(),
+            7,
+            "raw cohort must contain six pending rows and one seed"
+        );
+        assert_eq!(
+            neighbor_rows.len(),
+            3,
+            "lossy-neighbor cohort must contain two pending rows and one seed"
+        );
+        let raw_pending_ids = raw_rows
+            .iter()
+            .filter(|(_, status)| **status == ContinuationStatus::Queued)
+            .map(|(continuation_id, _)| continuation_id.clone())
+            .collect::<HashSet<_>>();
+        let neighbor_pending_ids = neighbor_rows
+            .iter()
+            .filter(|(_, status)| **status == ContinuationStatus::Queued)
+            .map(|(continuation_id, _)| continuation_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            raw_pending_ids.len(),
+            6,
+            "raw scope must expose exactly the six pending purge IDs"
+        );
+        assert_eq!(
+            neighbor_pending_ids.len(),
+            2,
+            "lossy-neighbor scope must expose exactly the two pending purge IDs"
+        );
+        let seed_ids_for_scope = |scope: &WorkspaceScope| {
+            snapshot
+                .continuations
+                .values()
+                .filter(|record| {
+                    record
+                        .metadata
+                        .get("payload:workspace_scope")
+                        .and_then(Value::as_str)
+                        == Some(scope.key())
+                })
+                .filter(|record| {
+                    record.status == ContinuationStatus::Completed
+                        && record.metadata.get("reason").and_then(Value::as_str)
+                            == Some("child_completed")
+                })
+                .map(|record| record.continuation_id.clone())
+                .collect::<HashSet<_>>()
+        };
+        let raw_seed_ids = seed_ids_for_scope(&raw_scope_key);
+        let neighbor_seed_ids = seed_ids_for_scope(&neighbor_scope_key);
+        assert_eq!(
+            raw_seed_ids.len(),
+            1,
+            "raw scope must retain its completed seed"
+        );
+        assert_eq!(
+            neighbor_seed_ids.len(),
+            1,
+            "lossy-neighbor scope must retain its completed seed"
+        );
+        let completed_rows = |rows: &std::collections::HashMap<String, ContinuationStatus>| {
+            rows.keys()
+                .map(|continuation_id| (continuation_id.clone(), ContinuationStatus::Completed))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let raw_completed_rows = completed_rows(&raw_rows);
+        let neighbor_completed_rows = completed_rows(&neighbor_rows);
+
+        let raw_scope = crate::peers::workspace_scope_encode(&raw_root).unwrap();
+        assert_eq!(
+            orchestrator.clear_pending_terminal_continuations_for_session(
+                &session,
+                "tenant-a",
+                Some(&raw_scope),
+                "stop raw",
+            ),
+            6,
+            "one /stop must purge native, CLI, and MCP continuations in the raw-byte cohort"
+        );
+        let after_raw_purge = store.load_state().unwrap();
+        let raw_rows_after_first_purge = terminal_rows(&after_raw_purge, &raw_scope_key);
+        assert_eq!(
+            raw_rows_after_first_purge, raw_completed_rows,
+            "fresh durable raw cohort load must preserve every row as Completed tombstones"
+        );
+        assert!(
+            raw_rows_after_first_purge
+                .values()
+                .all(|status| *status == ContinuationStatus::Completed),
+            "raw pending IDs must all be Completed after the first purge"
+        );
+        let neighbor_rows_after_first_purge = terminal_rows(&after_raw_purge, &neighbor_scope_key);
+        assert_eq!(
+            neighbor_rows_after_first_purge, neighbor_rows,
+            "the first purge must preserve both queued neighbor IDs and its completed seed"
+        );
+        let neighbor_pending_ids_after_first_purge = neighbor_rows_after_first_purge
+            .iter()
+            .filter(|(_, status)| **status == ContinuationStatus::Queued)
+            .map(|(continuation_id, _)| continuation_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            neighbor_pending_ids_after_first_purge, neighbor_pending_ids,
+            "the first purge must leave exactly the two previously queued neighbor IDs"
+        );
+        let neighbor_scope = crate::peers::workspace_scope_encode(&lossy_neighbor).unwrap();
+        assert_eq!(
+            orchestrator.clear_pending_terminal_continuations_for_session(
+                &session,
+                "tenant-a",
+                Some(&neighbor_scope),
+                "stop neighbor",
+            ),
+            2,
+            "the real U+FFFD neighbor must remain after purging the raw-byte cohort"
+        );
+        let after_neighbor_purge = store.load_state().unwrap();
+        let raw_rows_after_second_purge = terminal_rows(&after_neighbor_purge, &raw_scope_key);
+        assert_eq!(
+            raw_rows_after_second_purge, raw_completed_rows,
+            "fresh durable raw cohort load must remain Completed after the neighbor purge"
+        );
+        let neighbor_rows_after_second_purge =
+            terminal_rows(&after_neighbor_purge, &neighbor_scope_key);
+        assert_eq!(
+            neighbor_rows_after_second_purge, neighbor_completed_rows,
+            "fresh durable neighbor cohort load must preserve every row as Completed tombstones"
+        );
+        assert!(
+            neighbor_rows_after_second_purge
+                .values()
+                .all(|status| *status == ContinuationStatus::Completed),
+            "neighbor pending IDs must all be Completed after the second purge"
+        );
+    }
+
+    fn obstruct_admission_store(orchestrator: &InProcessAgentOrchestrator, root: &Path) {
+        orchestrator.configure_supervisor_store(root).unwrap();
+        let store = crate::autonomy::supervisor_store::SupervisorStore::new(root);
+        std::fs::create_dir_all(store.events_path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admission_r5_cli_does_not_spawn_after_failed_child_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            &dir,
+            "rejected",
+            "#!/bin/sh\nprintf started > worker-started\n",
+        );
+        let orchestrator = InProcessAgentOrchestrator::default();
+        obstruct_admission_store(&orchestrator, &dir.path().join("supervisor"));
+        let sink = RecordingSink::default();
+        let result = run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                sample_spec(&dir, "rejected-cli"),
+                CliAgentCommandConfig::new(script).cwd(dir.path()),
+            ),
+        )
+        .await;
+        assert!(
+            !dir.path().join("worker-started").exists(),
+            "rejected admission launched a subprocess"
+        );
+        assert!(result.is_err());
+        assert!(
+            sink.events().is_empty(),
+            "rejected admission published agent events"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_r5_mcp_does_not_dispatch_after_failed_child_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedMcpBackend::default());
+        *backend.artifact.lock().unwrap() = Some(dir.path().join("mcp-report.md"));
+        let orchestrator = InProcessAgentOrchestrator::default();
+        obstruct_admission_store(&orchestrator, &dir.path().join("supervisor"));
+        let sink = RecordingSink::default();
+        let result = run_supervised_mcp_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedMcpSpecialist::new(
+                sample_spec(&dir, "rejected-mcp"),
+                backend.clone(),
+                "agent/run",
+                json!({"prompt": "review"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            backend.calls.load(Ordering::Relaxed),
+            0,
+            "rejected admission dispatched backend"
+        );
+        assert!(result.is_err());
+        assert!(sink.events().is_empty());
     }
 
     #[tokio::test]
