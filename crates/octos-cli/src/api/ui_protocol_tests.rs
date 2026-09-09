@@ -40100,7 +40100,10 @@ async fn interactive_sentinel_done_verdict_completes_scoped_goal() {
         None,
     )
     .await;
-    assert!(completed, "verified sentinel must complete the goal");
+    assert!(
+        completed.completed,
+        "verified sentinel must complete the goal"
+    );
     assert_eq!(
         orchestrator.goal_status_for_test(&pinned).as_deref(),
         Some("complete"),
@@ -40165,7 +40168,10 @@ async fn interactive_sentinel_notdone_verdict_leaves_goal_active() {
         None,
     )
     .await;
-    assert!(!completed, "NotDone verdict must refuse the completion");
+    assert!(
+        !completed.completed,
+        "NotDone verdict must refuse the completion"
+    );
     assert_eq!(
         orchestrator.goal_status_for_test(&wire).as_deref(),
         Some("active"),
@@ -40218,7 +40224,10 @@ async fn interactive_sentinel_refuses_stale_goal_binding() {
         None,
     )
     .await;
-    assert!(!completed, "stale binding must refuse the completion");
+    assert!(
+        !completed.completed,
+        "stale binding must refuse the completion"
+    );
     assert_eq!(
         orchestrator.goal_status_for_test(&wire).as_deref(),
         Some("active"),
@@ -40269,7 +40278,7 @@ async fn interactive_sentinel_skips_verifier_without_completion_claim() {
         None,
     )
     .await;
-    assert!(!completed);
+    assert!(!completed.completed);
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -43053,5 +43062,209 @@ async fn bc9_b6_reused_id_stale_connection_preserves_new_claim() {
     build_cache_slot_registry().release(
         &build_cache_slot_registry_key(&root, "reuse-connection"),
         crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// evo-goal-verifier GAP-8 (spec Filter: ui_transport_sentinels_report_
+// verifier_failure_kind): the interactive sentinel station must surface
+// the structured failure kind — REAL path through
+// run_interactive_sentinel_completion, not a wrapper-only call.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn ui_transport_sentinels_report_verifier_failure_kind() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    let key = octos_core::SessionKey("gap8-prof:api:gap8-sentinel".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "gap8-prof".to_owned(),
+            objective: "surface kind on refusal".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let snapshot = orchestrator
+        .goal_verification_snapshot(&key, "gap8-prof")
+        .expect("snapshot");
+
+    // Empty reply (reasoning-only) classifies empty_response; the wrapper
+    // retries once (transient) so attempt lands at 2/2.
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let outcome = run_interactive_sentinel_completion(
+        &orchestrator,
+        std::sync::Arc::new(EmptyReplyVerifier),
+        &key,
+        "gap8-prof",
+        &snapshot.goal_id,
+        // A real completion CLAIM so the sentinel path actually runs.
+        "All tasks are complete. <goal:complete>",
+        Some(temp.path()),
+    )
+    .await;
+
+    // The goal must NOT have completed (empty verifier replies).
+    assert!(!outcome.completed, "empty replies never complete the goal");
+    // The structured failure leaves the station: kind + canonical line.
+    let (kind, line) = outcome
+        .failure
+        .expect("interactive sentinel must surface the structured failure");
+    assert_eq!(kind, "empty_response");
+    assert!(
+        line.contains("verifier empty_response (attempt 2/2)"),
+        "canonical Display line with kind+attempts, got: {line}"
+    );
+    // And the goal stays active — sentinel refusals never flip state.
+    let still = orchestrator
+        .goal_verification_snapshot(&key, "gap8-prof")
+        .expect("snapshot still resolvable");
+    assert_eq!(still.goal_id, snapshot.goal_id);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// evo-goal-verifier GAP-8b (root follow-up #5): the AUTONOMOUS consumer's
+// wire shape — the shared `goal_verifier_warning_event` constructor the
+// goal-turn accountant emits at :37553, driven through the REAL
+// `send_notification_ephemeral`, with a REAL verifier outcome produced by
+// the bounded wrapper (empty replies → empty_response, attempt 2/2).
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn ui_transport_autonomous_consumer_emits_verifier_warning_wire_shape() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    let key = octos_core::SessionKey("gap8b-prof:api:gap8b-auto".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "gap8b-prof".to_owned(),
+            objective: "autonomous wire shape".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let snapshot = orchestrator
+        .goal_verification_snapshot(&key, "gap8b-prof")
+        .expect("snapshot");
+
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    // REAL outcome through the bounded wrapper — the same object the
+    // autonomous accountant holds at :37523-37530.
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let outcome = orchestrator
+        .verify_goal_completion_bounded(
+            &key,
+            "gap8b-prof",
+            &snapshot,
+            std::sync::Arc::new(EmptyReplyVerifier),
+            "All tasks are complete. <goal:complete>",
+            Some(temp.path()),
+        )
+        .await;
+    assert_eq!(outcome.kind.map(|k| k.as_str()), Some("empty_response"));
+    assert_eq!(outcome.attempts, 2);
+
+    // The shared constructor the autonomous station uses…
+    let notification = goal_verifier_warning_event(&key, &outcome);
+    // …through the REAL ephemeral send path, read back off the wire as a
+    // Text JSON frame (the same WsMessage shape a live client receives).
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(8);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = UiProtocolLedger::new(16);
+    send_notification_ephemeral(&ws, &ledger, notification).expect("ephemeral send succeeds");
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ws_rx.recv())
+        .await
+        .expect("wire frame arrives")
+        .expect("channel open");
+    let WsMessage::Text(text) = frame else {
+        panic!("expected a Text wire frame");
+    };
+    let json: serde_json::Value = serde_json::from_str(text.as_str()).expect("frame parses");
+    assert_eq!(json["method"], "warning");
+    assert_eq!(
+        json["params"]["code"], "goal_verifier_empty_response",
+        "params: {:?}",
+        json["params"]
+    );
+    let message = json["params"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("verifier empty_response (attempt 2/2)"),
+        "canonical Display line on the wire, got: {message}"
+    );
+
+    // And the goal stays ACTIVE — the sentinel refusal never flips state
+    // (the SessionGoalUpdated repaint the accountant sends next carries
+    // `active`, never `complete`).
+    let event_json = orchestrator.session_goal_updated_event_json(&key, "gap8b-prof");
+    let event = serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
+        event_json.expect("goal event json"),
+    )
+    .expect("goal event parses");
+    assert_ne!(
+        event.goal.status, "complete",
+        "an unverified claim never completes the goal"
     );
 }

@@ -6193,7 +6193,9 @@ mod peer_task_registry_tests {
     /// (never collapsing to None like `to_str()`), and two different roots
     /// encode to two different scopes so one root's `/stop` purge can never
     /// match the other's stamped items.
+    // Constructing a non-UTF-8 OsStr uses `OsStrExt::from_bytes` (Unix-only).
     #[test]
+    #[cfg(unix)]
     fn workspace_scope_encoding_is_lossless_and_distinct() {
         use std::os::unix::ffi::OsStrExt;
 
@@ -6517,7 +6519,9 @@ mod peer_turn_status_tests {
         assert_eq!(f.rounds_delivered, 1, "#2024 floor: bare result.md");
     }
 
+    // `std::os::unix::fs::symlink` is Unix-only.
     #[test]
+    #[cfg(unix)]
     fn peer_list_symlinked_turns_index_is_ignored() {
         let temp = tempfile::tempdir().unwrap();
         let dir = staged(temp.path(), "sl", None);
