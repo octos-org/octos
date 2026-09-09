@@ -27,6 +27,10 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     // them to `minimax` (international) and the China endpoint is opt-in.
     detect_patterns: &[],
     model_discovery: crate::discovery::OPENAI_MODELS,
+    // The Anthropic-protocol route (sk-cp- Coding-plan keys) is selected via
+    // the `api_type` override, not by model name — the family-wide
+    // declaration always rules.
+    model_discovery_for_model: None,
     create,
 };
 
