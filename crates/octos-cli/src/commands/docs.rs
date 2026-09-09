@@ -121,6 +121,12 @@ fn providers_list() -> Vec<(
             Some("https://api.minimax.io/v1"),
         ),
         (
+            "MiniMax-CN",
+            "MINIMAX_CN_API_KEY",
+            "MiniMax-M3",
+            Some("https://api.minimaxi.com/v1"),
+        ),
+        (
             "Zhipu",
             "ZHIPU_API_KEY",
             "glm-4-plus",
