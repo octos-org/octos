@@ -8,7 +8,7 @@ const LIFETIME_FILE: &str = "lifetime.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum LifetimePhase {
+pub(crate) enum LifetimePhase {
     Pending,
     Running,
     Idle,
@@ -53,6 +53,92 @@ fn read_lifetime(dir: &Path) -> Option<PeerLifetime> {
         && peer_io::read_peer_file(dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
             .is_some_and(|master| master.trim() == record.master))
     .then_some(record)
+}
+
+/// A validated (fail-closed) projection view of `lifetime.json` — the
+/// trusted fields the status derivation needs. Returned by
+/// [`trusted_lifetime_projection`]; private `PeerLifetime` internals stay in
+/// this module.
+pub(crate) struct TrustedLifetimeView {
+    pub(crate) phase: LifetimePhase,
+    pub(crate) generation: u64,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) master: String,
+    pub(crate) task_id: String,
+}
+
+/// task-evo-peer-turn-status — TRUSTED read-only projection of a peer's
+/// `lifetime.json` for status derivation, or `None` when ANY fail-closed
+/// check fails (⇒ the caller must report execution=unknown with all identity
+/// fields null).
+///
+/// Layered on the typed [`read_lifetime`] parse (strict enum + Option field
+/// types — a numeric `turn_id` or `result_digest` fails DESERIALIZATION
+/// here rather than being silently coerced), then adds the checks the status
+/// contract needs beyond recovery's own restore gate:
+///
+/// * `registry_key` must equal `peer_wire_key(profile_id, slug)` — a
+///   lifetime staged under another profile/runtime (same slug) is not this
+///   peer's current authority.
+/// * Writer-shape turn binding, per the REAL writers (outer-loop probe
+///   ../outer-peer-projection-probe.json, 0 passed / 2 failed against the
+///   first draft): `invalidate_peer_lifetime_for_input` deliberately KEEPS
+///   the previous `turn_id` when flipping to Pending (and
+///   `finish_peer_lifetime_turn(queued=true)` produces Pending+Some too), so
+///   **Pending accepts both None and a valid Some** — rejecting Some would
+///   demote every real round2-queued peer to unknown, the exact bug this
+///   task exists to fix. Running/Idle/Failed still REQUIRE a valid Some
+///   (begin sets it fresh; finish keeps it). Readers interpret a Pending
+///   record together with `generation`/`phase`, never from turn_id alone.
+/// * Idle additionally binds to the CURRENT durable result: the fd-anchored
+///   result.md bytes must SHA256 to the recorded `result_digest` (blank,
+///   wrong, or missing digest, or an overwritten result.md ⇒ untrusted).
+///   Digest comparison only — the body is never parsed for an outcome.
+pub(crate) fn trusted_lifetime_projection(
+    dir: &Path,
+    profile_id: &str,
+    slug: &str,
+) -> Option<TrustedLifetimeView> {
+    let record = read_lifetime(dir)?;
+    if record.registry_key != peer_wire_key(profile_id, slug) {
+        return None;
+    }
+    match (&record.phase, record.turn_id.as_deref()) {
+        // The real queue writers keep the PREVIOUS turn's id on Pending —
+        // both None (fresh binding) and a NON-EMPTY Some (after any
+        // completed turn) are legal production shapes.
+        (LifetimePhase::Pending, None) => {}
+        (LifetimePhase::Pending, Some(_)) => {}
+        (LifetimePhase::Running | LifetimePhase::Idle | LifetimePhase::Failed, Some(_)) => {}
+        _ => return None,
+    }
+    // An empty-string turn_id is never legal (the writers only ever write a
+    // real id): refuse it explicitly — the match arms above can't express
+    // "non-empty" without a guard.
+    if record.turn_id.as_deref().is_some_and(str::is_empty) {
+        return None;
+    }
+    // Empty identity strings are not valid authority even when the legacy
+    // restore reader tolerates them: a projection that vouches for an empty
+    // master/turn_id fences nothing (outer-loop review #4).
+    if record.master.trim().is_empty() || record.task_id.trim().is_empty() {
+        return None;
+    }
+    if record.phase == LifetimePhase::Idle {
+        let digest = record.result_digest.as_deref()?;
+        let body = peer_io::read_peer_file(dir, "result.md", peer_io::PEER_FILE_READ_CAP_LARGE)?;
+        let actual = format!("{:x}", Sha256::digest(body.as_bytes()));
+        if actual != digest {
+            return None;
+        }
+    }
+    Some(TrustedLifetimeView {
+        phase: record.phase,
+        generation: record.generation,
+        turn_id: record.turn_id,
+        master: record.master,
+        task_id: record.task_id,
+    })
 }
 
 fn write_lifetime(dir: &Path, record: &PeerLifetime) -> std::io::Result<()> {
@@ -376,6 +462,40 @@ mod tests {
         fn drop(&mut self) {
             peer_task_registry().take_if_task(&self.key, &self.task_id);
         }
+    }
+
+    // task-evo-peer-turn-status — REAL-writer regressions (ported verbatim
+    // from the outer loop's probe, ../outer-peer-projection-under-test.rs;
+    // receipt ../outer-peer-projection-probe.json). Both drive the PRODUCTION
+    // writers (Fixture::begin/complete/invalidate) and then require the
+    // read-side projection to keep trusting the record: the queue writers
+    // DELIBERATELY keep the previous turn_id on Pending, so Pending+Some is a
+    // legal, in-production shape — not a torn write.
+    #[test]
+    fn outer_peer_projection_accepts_real_followup_pending() {
+        let f = Fixture::new();
+        let first = f.begin("first-turn");
+        f.complete(&first, "completed result", false);
+        invalidate_peer_lifetime_for_input(&f.peers, "auditor").unwrap();
+        let raw = read_lifetime(&f.dir).unwrap();
+        assert_eq!(raw.phase, LifetimePhase::Pending);
+        assert_eq!(raw.turn_id.as_deref(), Some("first-turn"));
+        assert!(
+            trusted_lifetime_projection(&f.dir, &f.profile, "auditor").is_some(),
+            "real queue writer keeps previous turn_id: projection must retain queued authority"
+        );
+    }
+
+    #[test]
+    fn outer_peer_projection_accepts_finish_with_queued_input() {
+        let f = Fixture::new();
+        let first = f.begin("first-turn");
+        f.complete(&first, "completed result", true);
+        assert_eq!(read_lifetime(&f.dir).unwrap().phase, LifetimePhase::Pending);
+        assert!(
+            trusted_lifetime_projection(&f.dir, &f.profile, "auditor").is_some(),
+            "real finish with queued input produces Pending+Some(turn_id), not an invalid record"
+        );
     }
 
     #[test]

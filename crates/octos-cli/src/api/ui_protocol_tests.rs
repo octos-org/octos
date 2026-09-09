@@ -34517,7 +34517,7 @@ fn peer_gather_callback_composes_done_and_running_rows() {
     std::fs::write(gamma.join("result.md"), "partial result before close\n").unwrap();
     std::fs::write(gamma.join("closed"), "tenant-a:api:master\n1700000000\n").unwrap();
 
-    let callback = build_peer_gather_callback(peers_root.clone());
+    let callback = build_peer_gather_callback(peers_root.clone(), "octos".to_owned());
     let text = callback(None).expect("gather composes");
     assert!(text.contains("## peer alpha (done)"), "{text}");
     assert!(
@@ -34551,7 +34551,7 @@ fn peer_gather_callback_composes_done_and_running_rows() {
 #[test]
 fn peer_gather_callback_reports_empty_blackboard() {
     let tmp = tempfile::tempdir().unwrap();
-    let missing = build_peer_gather_callback(tmp.path().join("peers"));
+    let missing = build_peer_gather_callback(tmp.path().join("peers"), "octos".to_owned());
     assert_eq!(
         missing(None).expect("missing dir is not an error"),
         "No peers staged for this profile."
@@ -34559,8 +34559,88 @@ fn peer_gather_callback_reports_empty_blackboard() {
 
     let empty_root = tmp.path().join("peers2");
     std::fs::create_dir_all(&empty_root).unwrap();
-    let empty = build_peer_gather_callback(empty_root);
+    let empty = build_peer_gather_callback(empty_root, "octos".to_owned());
     assert_eq!(empty(None).unwrap(), "No peers staged for this profile.");
+}
+
+/// task-e...[credential-redacted] — serve ENTRY profile threading (outer-loop
+/// review): the `peer/gather` RPC (raw) and the `peer_gather` TOOL callback
+/// read the blackboard under the CALLER'S profile, so a valid lifetime under
+/// a NON-DEFAULT profile stays trusted instead of degrading to unknown. The
+/// raw entry's projection is directly observable in the JSON; the tool
+/// callback is exercised through the same custom profile (its composed rows
+/// come from the same profile-aware reader), and the peer_list tool text
+/// (which DOES render execution) pins the projection observably.
+#[tokio::test]
+async fn peer_gather_entries_thread_caller_profile_for_lifetime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(tmp.path(), "gatherx").await;
+    let peers_root = runtime.data_dir.join("peers");
+    let dir = peers_root.join("gx");
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "originator", "master-gx").unwrap();
+    // Round-1 terminal evidence (production frontmatter shape).
+    let terminal = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\n---\n\nbody\n";
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "result.md", terminal).unwrap();
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "result-1.md", terminal).unwrap();
+    crate::peers::peer_io::append_peer_line(&dir, "turns.txt", "1 completed 100\n").unwrap();
+    // A VALID lifetime under the custom profile: round 2 RUNNING.
+    let lifetime = serde_json::json!({
+        "version": 1,
+        "task_id": "task-gx",
+        "registry_key": crate::peers::peer_wire_key("gatherx", "gx"),
+        "master": "master-gx",
+        "generation": 1,
+        "phase": "running",
+        "turn_id": "t2",
+        "result_digest": null,
+    });
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "lifetime.json", &lifetime.to_string())
+        .unwrap();
+
+    // RAW entry under the caller's real profile: TRUSTED projection. (Under
+    // the pre-fix default-"octos" read this same disk degraded to unknown —
+    // the registry_key would not match — so this assertion discriminates.)
+    let gathered = raw_peer_gather(
+        &state,
+        &RpcRequest::new(
+            "gather-profiled".to_string(),
+            APPUI_METHOD_PEER_GATHER,
+            json!({ "profile_id": "gatherx" }),
+        ),
+        None,
+    )
+    .expect("raw gather");
+    let rows = gathered["peers"].as_array().expect("peers");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["execution"], "running", "trusted under gatherx");
+    assert_eq!(rows[0]["last_outcome"], "completed");
+    assert_eq!(rows[0]["round"], 2);
+    assert_eq!(rows[0]["master_session_id"], "master-gx");
+    assert_eq!(rows[0]["task_id"], "task-gx");
+    assert_eq!(rows[0]["generation"], 1);
+    assert_eq!(rows[0]["turn_id"], "t2");
+
+    // TOOL gather callback under the same custom profile composes the row
+    // through the real entry (same profile-aware blackboard read).
+    let tool = build_peer_gather_callback(peers_root.clone(), "gatherx".to_owned());
+    let text = tool(None).expect("tool gather composes");
+    assert!(text.contains("## peer gx (done)"), "{text}");
+
+    // The peer_list TOOL text renders execution — observable proof the
+    // serve-side callback threads the custom profile into the projection.
+    let list = build_peer_list_callback(
+        peers_root,
+        Vec::new(),
+        Arc::new(UiProtocolContractStores::default()),
+        "gatherx".to_owned(),
+    );
+    let text = list().expect("peer list composes");
+    assert!(
+        text.contains("· exec=running"),
+        "current execution visible: {text}"
+    );
 }
 
 /// #436 hardening — a peer slug is a single path component; reject anything
@@ -34735,7 +34815,9 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
     });
     let task_id =
         bind_peer_supervised_task(&supervisor, peer_wire_key(profile, slug), &master.0).unwrap();
-    let gathered = build_peer_gather_callback(root.clone())(Some(vec![slug.into()])).unwrap();
+    let gathered =
+        build_peer_gather_callback(root.clone(), "octos".to_owned())(Some(vec![slug.into()]))
+            .unwrap();
     assert!(gathered.contains("Actual peer result"));
     let close_supervisor = supervisor.clone();
     let close = build_peer_close_callback(
@@ -34766,7 +34848,7 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
         "closing an already-read peer must not schedule follow-up answers: {pending:?}"
     );
     assert!(
-        build_peer_gather_callback(root)(Some(vec![slug.into()]))
+        build_peer_gather_callback(root, "octos".to_owned())(Some(vec![slug.into()]))
             .unwrap()
             .contains("Actual peer result"),
         "closing keeps the actual result readable"
@@ -34785,8 +34867,11 @@ async fn peer_consumption_should_not_wake_when_foreground_gathers_and_completes(
     std::fs::write(dir.join("brief.md"), "Read README").unwrap();
     std::fs::write(dir.join("originator"), &master.0).unwrap();
     let gathered = GatheredPeerResults::default();
-    let gather =
-        build_peer_gather_callback_for_turn(root.clone(), Some((master.clone(), gathered.clone())));
+    let gather = build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    );
     assert!(gather(None).unwrap().contains("still running"));
     let body = "---\nslug: reader\noutcome: completed\nupdated_unix: 123\nturn: 1\n---\n\nACTUAL-README-RESULT\n";
     std::fs::write(dir.join("result.md"), body).unwrap();
@@ -34860,7 +34945,12 @@ async fn peer_consumption_should_preserve_wake_when_final_is_not_successfully_co
         let root = runtime.data_dir.join("peers");
         stage_peer_consumption_result(&root, &master, "reader", 1);
         let gathered = GatheredPeerResults::default();
-        build_peer_gather_callback_for_turn(root.clone(), Some((master.clone(), gathered.clone())))(None).unwrap();
+        build_peer_gather_callback_for_turn(
+            root.clone(),
+            Some((master.clone(), gathered.clone())),
+            "octos".to_owned(),
+        )(None)
+        .unwrap();
         assert_eq!(gathered.lock().unwrap().len(), 1);
         let mut done = peer_consumption_done();
         let terminal = match label {
@@ -34908,9 +34998,11 @@ async fn peer_consumption_should_keep_unseen_newer_round_when_version_index_lags
     std::fs::write(root.join("reader/result-1.md"), "previous result").unwrap();
     write_peer_fleet_synthesis_marks(&root, &master.0, &[("reader".into(), 1)]).unwrap();
     let gathered = GatheredPeerResults::default();
-    build_peer_gather_callback_for_turn(root.clone(), Some((master.clone(), gathered.clone())))(
-        None,
-    )
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
     .unwrap();
     assert_eq!(
         gathered.lock().unwrap()["reader"].round,
@@ -34962,6 +35054,7 @@ fn peer_consumption_should_not_acknowledge_nonowned_or_truncated_reads() {
         let output = build_peer_gather_callback_for_turn(
             root.to_owned(),
             Some((reader.clone(), gathered.clone())),
+            "octos".to_owned(),
         )(None)
         .unwrap();
         assert!(
@@ -34983,9 +35076,11 @@ fn peer_consumption_should_not_acknowledge_nonowned_or_truncated_reads() {
         + &"x".repeat(PEER_GATHER_RESULT_CAP);
     std::fs::write(root.join("reader/result.md"), body).unwrap();
     let gathered = GatheredPeerResults::default();
-    build_peer_gather_callback_for_turn(root.to_owned(), Some((master.clone(), gathered.clone())))(
-        None,
-    )
+    build_peer_gather_callback_for_turn(
+        root.to_owned(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
     .unwrap();
     assert!(
         gathered.lock().unwrap().is_empty(),
@@ -34996,8 +35091,12 @@ fn peer_consumption_should_not_acknowledge_nonowned_or_truncated_reads() {
         "legacy result without authoritative round",
     )
     .unwrap();
-    build_peer_gather_callback_for_turn(root.to_owned(), Some((master, gathered.clone())))(None)
-        .unwrap();
+    build_peer_gather_callback_for_turn(
+        root.to_owned(),
+        Some((master, gathered.clone())),
+        "octos".to_owned(),
+    )(None)
+    .unwrap();
     assert!(
         gathered.lock().unwrap().is_empty(),
         "do not guess legacy result identities"
@@ -35021,9 +35120,11 @@ async fn peer_consumption_should_retire_queued_synthesis_only_for_exact_consumed
         .clone();
     assert!(!peer_synthesis_was_consumed(&state, &queued, &HashMap::new()).await);
     let gathered = GatheredPeerResults::default();
-    build_peer_gather_callback_for_turn(root.clone(), Some((master.clone(), gathered.clone())))(
-        None,
-    )
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
     .unwrap();
     commit_gathered_peer_results(
         &root,
@@ -35083,7 +35184,12 @@ fn peer_consumption_should_merge_concurrent_receipts_without_losing_other_peers_
     for slug in ["first", "second"] {
         stage_peer_consumption_result(&root, &master, slug, 2);
         let gathered = GatheredPeerResults::default();
-        build_peer_gather_callback_for_turn(root.clone(), Some((master.clone(), gathered.clone())))(Some(vec![slug.into()])).unwrap();
+        build_peer_gather_callback_for_turn(
+            root.clone(),
+            Some((master.clone(), gathered.clone())),
+            "octos".to_owned(),
+        )(Some(vec![slug.into()]))
+        .unwrap();
         let root = root.clone();
         let master = master.clone();
         let barrier = barrier.clone();
@@ -35106,9 +35212,11 @@ fn peer_consumption_should_merge_concurrent_receipts_without_losing_other_peers_
     assert_eq!(read_peer_consumption(&root, &master).results.len(), 2);
     stage_peer_consumption_result(&root, &master, "first", 1);
     let old = GatheredPeerResults::default();
-    build_peer_gather_callback_for_turn(root.clone(), Some((master.clone(), old.clone())))(Some(
-        vec!["first".into()],
-    ))
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), old.clone())),
+        "octos".to_owned(),
+    )(Some(vec!["first".into()]))
     .unwrap();
     stage_peer_consumption_result(&root, &master, "first", 3);
     commit_gathered_peer_results(
@@ -35141,9 +35249,11 @@ async fn peer_consumption_should_retire_prequeued_synthesis_when_gathered_peer_c
         .unwrap()
         .clone();
     let gathered = GatheredPeerResults::default();
-    build_peer_gather_callback_for_turn(root.clone(), Some((master.clone(), gathered.clone())))(
-        None,
-    )
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
     .unwrap();
     build_peer_close_callback(
         root.clone(),
@@ -35184,6 +35294,7 @@ fn peer_consumption_should_accept_current_receipt_when_peer_slug_is_restaged_at_
         build_peer_gather_callback_for_turn(
             root.to_owned(),
             Some((master.clone(), gathered.clone())),
+            "octos".to_owned(),
         )(None)
         .unwrap();
         commit_gathered_peer_results(
@@ -35208,9 +35319,11 @@ async fn peer_consumption_should_not_consume_when_interrupt_wins_the_actual_term
     let master = SessionKey::with_profile("consumption-terminal-race", "api", "master");
     stage_peer_consumption_result(root, &master, "reader", 1);
     let gathered = GatheredPeerResults::default();
-    build_peer_gather_callback_for_turn(root.to_owned(), Some((master.clone(), gathered.clone())))(
-        None,
-    )
+    build_peer_gather_callback_for_turn(
+        root.to_owned(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
     .unwrap();
     let (ack, wait_ack) = tokio::sync::oneshot::channel();
     let state = TokioMutex::new(TurnState::Interrupting {
@@ -35580,7 +35693,7 @@ fn peer_list_and_gather_surface_display_name() {
     );
     assert!(list.contains("(edison)"), "list annotates the slug: {list}");
 
-    let gather_cb = build_peer_gather_callback(peers.clone());
+    let gather_cb = build_peer_gather_callback(peers.clone(), "seed".to_owned());
     let gather = gather_cb(None).unwrap();
     assert!(
         gather.contains("## peer Edison [edison]"),
@@ -36075,6 +36188,8 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
             closed: false,
             turn_history: None,
             model_lane: None,
+            // Synthetic disk-less row: no execution assertions.
+            execution_facet: unknown_peer_execution_facet(),
         }
     }
     let over = PEER_LIST_MAX_ROWS + 5;
@@ -36114,7 +36229,7 @@ fn peer_gather_callback_caps_total_output_evenly() {
         std::fs::write(dir.join("brief.md"), format!("Task {slug}.")).unwrap();
         std::fs::write(dir.join("result.md"), "r".repeat(30 * 1024)).unwrap();
     }
-    let callback = build_peer_gather_callback(peers_root);
+    let callback = build_peer_gather_callback(peers_root, "octos".to_owned());
     let text = callback(None).unwrap();
     assert!(
         text.len() <= PEER_GATHER_TOOL_OUTPUT_CAP,
@@ -36633,6 +36748,8 @@ fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
         closed: false,
         turn_history: None,
         model_lane: model_lane.map(str::to_owned),
+        // Synthetic disk-less row: no execution assertions.
+        execution_facet: unknown_peer_execution_facet(),
     }
 }
 

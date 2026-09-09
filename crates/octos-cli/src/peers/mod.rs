@@ -50,6 +50,9 @@ use crate::contracts::UiProtocolContractStores;
 
 mod recovery;
 pub(crate) use recovery::*;
+// task-evo-peer-turn-status — the typed lifetime projection lives in
+// `recovery` (next to its writers); the derivation below uses both.
+use recovery::{LifetimePhase, trusted_lifetime_projection};
 
 /// Cap a string at `cap` bytes on a char boundary; returns (text, truncated).
 ///
@@ -983,6 +986,30 @@ pub(crate) mod peer_io {
         imp::peer_dir_count_prefixed(peer_dir, prefix, cap)
     }
 
+    /// task-evo-peer-turn-status — LIST the regular-file leaf names under
+    /// `prefix` (fd-anchored, scan-capped, symlink/refuse semantics identical
+    /// to [`peer_dir_count_prefixed`], #1824), sorted by name. `None` only
+    /// when the dir cannot be opened or the scan errors mid-way (fail-closed:
+    /// a partial list must never pose as complete).
+    pub(crate) fn peer_dir_list_prefixed(
+        peer_dir: &Path,
+        prefix: &str,
+        cap: usize,
+    ) -> Option<Vec<String>> {
+        imp::peer_dir_list_prefixed(peer_dir, prefix, cap).ok()
+    }
+
+    /// Test seam over the raw scanner result (Err = truncated/unreadable),
+    /// so regressions can assert the truncation signal itself.
+    #[cfg(test)]
+    pub(crate) fn peer_dir_list_prefixed_raw(
+        peer_dir: &Path,
+        prefix: &str,
+        cap: usize,
+    ) -> std::io::Result<Vec<String>> {
+        imp::peer_dir_list_prefixed(peer_dir, prefix, cap)
+    }
+
     /// `true` when `peer_dir` exists as a REAL (non-symlink) directory, opened
     /// `O_NOFOLLOW|O_DIRECTORY` — a symlinked `<slug>` is refused. Anchored
     /// replacement for a path-following `is_dir()` gate on a per-slug peer dir.
@@ -1173,6 +1200,56 @@ pub(crate) mod peer_io {
             count
         }
 
+        /// task-evo-peer-turn-status — LIST the regular-file leaf names under
+        /// `prefix` (fd-anchored, scan-capped, symlink/refuse semantics identical
+        /// to [`peer_dir_count_prefixed`], #1824), sorted by name. Returns
+        /// `Err(FileTooLarge)` when the scan reached its entry budget — the
+        /// budget counts ALL SCANNED entries (not just prefix hits), so a dir
+        /// full of unrelated files can also exhaust it; a truncated list must
+        /// never pose as complete. `Err` also when the dir cannot be opened or a
+        /// read fails mid-scan.
+        pub(crate) fn peer_dir_list_prefixed(
+            peer_dir: &Path,
+            prefix: &str,
+            cap: usize,
+        ) -> std::io::Result<Vec<String>> {
+            let dirfd = open_peer_dir(peer_dir)?;
+            let mut dir = Dir::read_from(&dirfd)?;
+            let prefix = prefix.as_bytes();
+            let mut names: Vec<String> = Vec::new();
+            let mut scanned = 0usize;
+            while scanned < cap {
+                let next = dir.next().transpose()?;
+                let Some(entry) = next else {
+                    // Directory exhausted BEFORE the budget: the list is
+                    // complete.
+                    names.sort();
+                    return Ok(names);
+                };
+                scanned += 1;
+                if !entry.file_name().to_bytes().starts_with(prefix) {
+                    continue;
+                }
+                match entry.file_type() {
+                    FileType::RegularFile => {
+                        names.push(entry.file_name().to_string_lossy().into_owned())
+                    }
+                    // d_type unavailable on this FS → classify with a no-follow
+                    // stat before listing.
+                    FileType::Unknown if entry_is_regular(&dirfd, entry.file_name()) => {
+                        names.push(entry.file_name().to_string_lossy().into_owned())
+                    }
+                    _ => {}
+                }
+            }
+            // The loop exited because the BUDGET was exhausted — more entries
+            // may exist beyond `cap`, so the list is potentially partial.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "peer dir scan hit its entry cap: list is truncated",
+            ))
+        }
+
         /// No-follow `S_ISREG` check of `name` relative to the peer dir fd, for
         /// the rare filesystem that returns `DT_UNKNOWN` from `readdir`.
         fn entry_is_regular(dirfd: &OwnedFd, name: &CStr) -> bool {
@@ -1349,6 +1426,48 @@ pub(crate) mod peer_io {
                 }
             }
             count
+        }
+
+        /// task-evo-peer-turn-status — LIST variant of the count above, same
+        /// non-unix dev-only path-anchored semantics (#1824 documented TOCTOU
+        /// window). Sorted; `Err(FileTooLarge)` when the scan budget (which
+        /// counts ALL scanned entries, hits and non-hits alike) is exhausted
+        /// — a potentially-partial list never poses as complete.
+        pub(crate) fn peer_dir_list_prefixed(
+            peer_dir: &Path,
+            prefix: &str,
+            cap: usize,
+        ) -> std::io::Result<Vec<String>> {
+            if !peer_dir_ok(peer_dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "peer dir is not a real directory",
+                ));
+            }
+            let mut read_dir = std::fs::read_dir(peer_dir)?;
+            let mut names: Vec<String> = Vec::new();
+            let mut scanned = 0usize;
+            while scanned < cap {
+                let next = read_dir.next().transpose()?;
+                let Some(entry) = next else {
+                    names.sort();
+                    return Ok(names);
+                };
+                scanned += 1;
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                if !file_name.starts_with(prefix) {
+                    continue;
+                }
+                if std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file())
+                {
+                    names.push(file_name);
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "peer dir scan hit its entry cap: list is truncated",
+            ))
         }
     }
 }
@@ -4026,6 +4145,239 @@ pub(crate) fn parse_peer_turns_index(
     Some(entries)
 }
 
+// ---------------------------------------------------------------------------
+// task-evo-peer-turn-status — lifetime read-only projection & execution
+// derivation (v3.1 frozen contract).
+//
+// Design (spec Decisions, outer-loop + GLM/k3 reviewed):
+//   * execution's ONLY current-state authorities are (a) the `closed` marker
+//     and (b) a TRUSTED read-only projection of `lifetime.json`. There is NO
+//     parallel state file and NO derivation from `turns.txt` — an old
+//     terminal outcome proves the PAST, never the present (that inference is
+//     precisely the stale-done bug this task fixes, in the other direction).
+//   * `last_outcome` comes from a STRICT cross-check of the last `turns.txt`
+//     entry against the highest-numbered `result-<n>.md` frontmatter
+//     (independent reader — the lenient legacy parser stays untouched for
+//     its existing consumers). Mismatch ⇒ null: the two native terminal
+//     records disagree, so no outcome is asserted.
+//   * Trust is fail-closed and typed (see recovery.rs
+//     `trusted_lifetime_projection`): reuses PeerLifetime's strict enum and
+//     Option field types instead of a hand-rolled serde_json validator, adds
+//     the registry_key check and the Idle digest re-computation. Any failure
+//     degrades the peer to execution=unknown AND nulls the identity fields.
+// ---------------------------------------------------------------------------
+
+/// A [`PeerExecutionFacet`] with NO assertions — the value synthetic (disk-
+/// less) rows use. Real rows get theirs from [`derive_peer_execution_facet`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn unknown_peer_execution_facet() -> PeerExecutionFacet {
+    PeerExecutionFacet {
+        execution: "unknown",
+        last_outcome: None,
+        round: 0,
+        rounds_delivered: 0,
+        master_session_id: None,
+        task_id: None,
+        generation: None,
+        turn_id: None,
+    }
+}
+
+/// The execution facet of one peer, derived per the v3.1 contract. Field
+/// names are the machine contract (docs/peer-status-interface.json).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerExecutionFacet {
+    /// queued | running | idle | failed | closed | unknown
+    pub(crate) execution: &'static str,
+    /// completed | errored | interrupted | rate_limited | None — from the
+    /// STRICT terminal-evidence reader (turns.txt tail cross-checked against
+    /// the highest result-<n>.md), never from lifetime.
+    pub(crate) last_outcome: Option<String>,
+    /// Current round: delivered+1 while queued/running; the just-terminated
+    /// round for idle/failed; the delivered count when unknown.
+    pub(crate) round: u32,
+    /// Delivered rounds = count(result-<n>.md), floored at 1 when a bare
+    /// result.md exists with no versioned files (#2024 floor semantics).
+    pub(crate) rounds_delivered: u32,
+    /// Trusted-lifetime identity fields (anti-cross-runtime / same-slug
+    /// fencing). All `None` when the projection is not trusted.
+    pub(crate) master_session_id: Option<String>,
+    pub(crate) task_id: Option<String>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) turn_id: Option<String>,
+}
+
+/// STRICT recent-terminal-evidence reader (task-evo-peer-turn-status).
+///
+/// Unlike the lenient legacy [`parse_peer_turns_index`] (which silently drops
+/// malformed lines and feeds the display history), this validates that the
+/// LAST turns.txt entry and the HIGHEST-numbered `result-<n>.md` frontmatter
+/// agree on `(round, outcome)`. Any disagreement, corruption, or absence on
+/// either side ⇒ `None` — no outcome is asserted from a single uncorroborated
+/// source.
+///
+/// Deliberately does NOT touch `parse_peer_turns_index` itself: its lenient
+/// semantics are load-bearing for existing consumers.
+fn read_last_terminal_evidence(peer_dir: &Path, slug: &str) -> Option<(u32, String)> {
+    // Side A: the last turns.txt line must parse STRICTLY (a corrupt tail is
+    // not allowed to fall back to an older entry — that would resurrect a
+    // stale outcome).
+    let turns_text =
+        peer_io::read_peer_file(peer_dir, "turns.txt", peer_io::PEER_FILE_READ_CAP_SMALL)?;
+    let last_line = turns_text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let mut parts = last_line.split_whitespace();
+    let round: u32 = parts.next()?.parse().ok()?;
+    let outcome = parts.next()?;
+    let updated_unix: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some()
+        || !matches!(
+            outcome,
+            "completed" | "errored" | "interrupted" | "rate_limited"
+        )
+    {
+        return None;
+    }
+    // Side B: the highest-numbered result-<n>.md must exist and its
+    // frontmatter must state the SAME (turn, outcome). The versioned result
+    // is the terminal payload; turns.txt is the index — both are written by
+    // the same single terminal path, so a mismatch means corruption or a
+    // torn write.
+    let versions = enumerate_peer_result_versions(peer_dir)?;
+    let (highest_round, highest_leaf) = versions.last()?;
+    if highest_round != &round {
+        return None;
+    }
+    let body = peer_io::read_peer_file(peer_dir, highest_leaf, peer_io::PEER_FILE_READ_CAP_LARGE)?;
+    let (header, _) = body.split_once("\n---\n\n")?;
+    let mut lines = header.lines();
+    if lines.next()? != "---" {
+        return None;
+    }
+    // The frontmatter must name THIS peer — a foreign slug's result file
+    // (copied/moved in) must not become this peer's outcome evidence.
+    let mut saw_slug = false;
+    let mut saw_turn = None;
+    let mut saw_outcome = None;
+    for line in lines {
+        if let Some(slug_line) = line.strip_prefix("slug: ") {
+            saw_slug = slug_line == slug;
+        } else if let Some(turn) = line.strip_prefix("turn: ") {
+            saw_turn = turn.parse::<u32>().ok();
+        } else if let Some(outcome_line) = line.strip_prefix("outcome: ") {
+            saw_outcome = Some(outcome_line.to_owned());
+        }
+    }
+    if !saw_slug || saw_turn != Some(round) || saw_outcome.as_deref() != Some(outcome) {
+        return None;
+    }
+    let _ = updated_unix;
+    Some((round, outcome.to_owned()))
+}
+
+/// Enumerate `result-<n>.md` leaves with their PARSED round numbers, sorted
+/// ascending. Only well-formed regular files count (fd-anchored scan, #1824);
+/// a malformed number skips that leaf (legacy scan semantics). `None` when
+/// the scan hit its cap (a TRUNCATED list must never pose as complete —
+/// its "highest" would be an arbitrary cutoff, not the newest round).
+fn enumerate_peer_result_versions(peer_dir: &Path) -> Option<Vec<(u32, String)>> {
+    // The scanner itself reports truncation (Err → None here): its budget
+    // counts ALL scanned entries, not just result- hits, so a dir full of
+    // unrelated files is also caught — no second-guessing by hit count.
+    let names = peer_io::peer_dir_list_prefixed(peer_dir, "result-", peer_io::PEER_DIR_SCAN_CAP)?;
+    let mut parsed: Vec<(u32, String)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let stem = name.strip_prefix("result-")?;
+            let stem = stem.strip_suffix(".md")?;
+            let round: u32 = stem.parse().ok()?;
+            Some((round, name))
+        })
+        .collect();
+    parsed.sort_by_key(|(round, _)| *round);
+    Some(parsed)
+}
+
+/// Derive the execution facet for one staged peer dir. `closed` short-
+/// circuits everything (lifecycle terminal state; not a success claim).
+/// `profile_id` comes from the caller's explicit context (CLI `--profile`,
+/// serve's known profile) — NEVER derived from the peers_root path.
+pub(crate) fn derive_peer_execution_facet(
+    peer_dir: &Path,
+    profile_id: &str,
+    slug: &str,
+    closed: bool,
+) -> PeerExecutionFacet {
+    let versions = count_peer_result_versions(peer_dir);
+    let has_bare_result = peer_io::peer_regular_file_exists(peer_dir, "result.md");
+    // #2024 floor: pre-#435 peers wrote only the bare result.md; their
+    // delivered count reads 1, never 0.
+    let rounds_delivered = if versions > 0 {
+        versions
+    } else if has_bare_result {
+        1
+    } else {
+        0
+    };
+    // last_outcome: STRICT terminal evidence (turns tail × highest result-N
+    // cross-check). Independent of the execution authority so an errored
+    // round stays visible even when the lifetime projection is untrusted.
+    let terminal = read_last_terminal_evidence(peer_dir, slug);
+    let last_outcome = terminal.as_ref().map(|(_, outcome)| outcome.clone());
+    if closed {
+        return PeerExecutionFacet {
+            execution: "closed",
+            last_outcome,
+            round: rounds_delivered,
+            rounds_delivered,
+            master_session_id: None,
+            task_id: None,
+            generation: None,
+            turn_id: None,
+        };
+    }
+    match trusted_lifetime_projection(peer_dir, profile_id, slug) {
+        Some(projection) => {
+            let execution = match projection.phase {
+                LifetimePhase::Pending => "queued",
+                LifetimePhase::Running => "running",
+                LifetimePhase::Idle => "idle",
+                LifetimePhase::Failed => "failed",
+            };
+            let round = match execution {
+                // A queued/running round is the one ABOUT to run / running.
+                "queued" | "running" => rounds_delivered.saturating_add(1),
+                // idle/failed report the round that just terminated; the
+                // strict terminal evidence pins it, else the delivered count.
+                _ => terminal.map(|(round, _)| round).unwrap_or(rounds_delivered),
+            };
+            PeerExecutionFacet {
+                execution,
+                last_outcome,
+                round,
+                rounds_delivered,
+                master_session_id: Some(projection.master),
+                task_id: Some(projection.task_id),
+                generation: Some(projection.generation),
+                turn_id: projection.turn_id,
+            }
+        }
+        // No trusted current-state authority (missing, corrupt, mismatched,
+        // or legacy): execution=unknown AND identity all-null. The strict
+        // terminal evidence still carries last_outcome — the PAST round's
+        // outcome — which is evidence, not a claim about the present.
+        None => PeerExecutionFacet {
+            execution: "unknown",
+            last_outcome,
+            round: rounds_delivered,
+            rounds_delivered,
+            master_session_id: None,
+            task_id: None,
+            generation: None,
+            turn_id: None,
+        },
+    }
+}
+
 pub(crate) const PEER_GATHER_BRIEF_CAP: usize = 16 * 1024;
 
 pub(crate) const PEER_GATHER_RESULT_CAP: usize = 48 * 1024;
@@ -4063,6 +4415,12 @@ pub(crate) struct PeerBlackboardRow {
     /// `sub_provider` this peer runs its turns on), trimmed; `None` for a peer
     /// on the profile's primary model.
     pub(crate) model_lane: Option<String>,
+    /// task-evo-peer-turn-status — the execution facet (execution /
+    /// last_outcome / round / rounds_delivered + identity), derived per the
+    /// v3.1 contract. `profile_id` for the lifetime projection is supplied by
+    /// the CALLER (serve knows its own; the CLI takes `--profile`) — never
+    /// derived from the peers_root path.
+    pub(crate) execution_facet: PeerExecutionFacet,
 }
 
 /// #1801: row-reading core of the peer blackboard — every staged peer dir
@@ -4074,6 +4432,23 @@ pub(crate) struct PeerBlackboardRow {
 pub(crate) fn read_peer_blackboard(
     peers_root: &Path,
     slugs: Option<&[String]>,
+) -> Vec<PeerBlackboardRow> {
+    read_peer_blackboard_with_profile(peers_root, slugs, DEFAULT_PEER_LIST_PROFILE)
+}
+
+/// The profile id the blackboard reader uses for lifetime projection checks
+/// when the caller supplies none — the CLI default profile (`octos`). A
+/// caller that knows better (serve) always passes its real profile_id.
+pub(crate) const DEFAULT_PEER_LIST_PROFILE: &str = "octos";
+
+/// Profile-aware blackboard read (task-evo-peer-turn-status): identical to
+/// [`read_peer_blackboard`] but threads the caller's EXPLICIT profile id into
+/// the lifetime projection's registry_key check (spec: profile is never
+/// derived from the peers_root path).
+pub(crate) fn read_peer_blackboard_with_profile(
+    peers_root: &Path,
+    slugs: Option<&[String]>,
+    profile_id: &str,
 ) -> Vec<PeerBlackboardRow> {
     let mut rows: Vec<PeerBlackboardRow> = Vec::new();
     if let Ok(read_dir) = std::fs::read_dir(peers_root) {
@@ -4118,6 +4493,11 @@ pub(crate) fn read_peer_blackboard(
                 .map(|n| n.trim().to_owned())
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| slug.clone());
+            // task-evo-peer-turn-status — derive the execution facet BEFORE
+            // the struct literal borrows `slug` (the literal moves it).
+            let closed = peer_io::peer_regular_file_exists(&dir, "closed");
+            let execution_facet =
+                derive_peer_execution_facet(&dir, profile_id, slug.as_str(), closed);
             rows.push(PeerBlackboardRow {
                 slug,
                 name,
@@ -4127,8 +4507,9 @@ pub(crate) fn read_peer_blackboard(
                 result_truncated,
                 result_updated_unix,
                 has_worktree: dir.join("wt").is_dir(),
-                closed: peer_io::peer_regular_file_exists(&dir, "closed"),
+                closed,
                 turn_history: parse_peer_turns_index(&dir),
+                execution_facet,
                 // #peer-model — the recorded model lane, if any (fd-anchored
                 // no-follow read so a symlinked/FIFO `model` leaf is refused;
                 // trimmed, empty treated as absent).
@@ -4251,6 +4632,22 @@ pub(crate) fn compose_peer_list_text(
         lines.push(format!(
             "- {addr}  {status}  updated {updated}  turns {turns}{worktree}{model}{awaiting_note}"
         ));
+        // task-evo-peer-turn-status — surface the CURRENT execution state
+        // and the most recent terminal outcome on the index line so a peer
+        // mid-round2 (queued/running) with a round1 result on disk no longer
+        // reads as settled. Rendered as a suffix (outcome=…/exec=…) to keep
+        // the line shape stable for existing readers.
+        if status != "closed" || row.execution_facet.last_outcome.is_some() {
+            let exec = row.execution_facet.execution;
+            if exec != "unknown" {
+                lines.push(format!("  · exec={exec}"));
+            } else {
+                lines.push("  · exec=?".to_owned());
+            }
+            if let Some(outcome) = row.execution_facet.last_outcome.as_deref() {
+                lines.push(format!("  · outcome={outcome}"));
+            }
+        }
     }
     if rows.len() > PEER_LIST_MAX_ROWS {
         lines.push(format!("… and {} more", rows.len() - PEER_LIST_MAX_ROWS));
@@ -4271,7 +4668,9 @@ pub(crate) fn build_peer_list_callback(
     profile_id: String,
 ) -> octos_agent::PeerListCallback {
     Arc::new(move || {
-        let rows = read_peer_blackboard(&peers_root, None);
+        // task-evo-peer-turn-status — serve KNOWS its profile; pass it so the
+        // lifetime projection validates registry_key against the real one.
+        let rows = read_peer_blackboard_with_profile(&peers_root, None, &profile_id);
         // #peer-respond — the AUTHORITATIVE awaiting-input set comes from the
         // process-global store, joined to each open peer by its TRUSTED wire
         // session (never a filesystem marker). A peer with no wire (not open) or
@@ -5885,5 +6284,503 @@ mod peer_task_registry_tests {
             }
             other => panic!("expected Err, got {other:?}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task-evo-peer-turn-status — RED tests for the v3.1 contract (15 spec
+// scenarios). Fixtures write the exact disk shapes the production writers
+// produce (recovery.rs lifetime.json, ui_protocol_transport terminal path
+// result-<n>.md/turns.txt) through the same peer_io primitives.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod peer_turn_status_tests {
+    use super::*;
+
+    /// Fixture factory: stage a peer with brief.md (+ optional originator so
+    /// lifetime projections can be trusted) and return its dir.
+    fn staged(data_dir: &Path, slug: &str, originator: Option<&str>) -> PathBuf {
+        let dir = data_dir.join("peers").join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "brief.md", "brief").unwrap();
+        if let Some(origin) = originator {
+            peer_io::write_peer_file_atomic(&dir, "originator", origin).unwrap();
+        }
+        dir
+    }
+
+    /// Write a lifetime.json in the EXACT production shape (recovery.rs
+    /// writers): registry_key = peer_wire_key(profile, slug).
+    fn lifetime(
+        dir: &Path,
+        profile: &str,
+        slug: &str,
+        phase: &str,
+        generation: u64,
+        turn_id: Option<&str>,
+        result_digest: Option<&str>,
+    ) {
+        let json = serde_json::json!({
+            "version": 1,
+            "task_id": format!("task-{slug}"),
+            "registry_key": peer_wire_key(profile, slug),
+            "master": format!("master-{slug}"),
+            "generation": generation,
+            "phase": phase,
+            "turn_id": turn_id,
+            "result_digest": result_digest,
+        });
+        peer_io::write_peer_file_atomic(dir, "lifetime.json", &json.to_string()).unwrap();
+        // The originator leaf must name the same master session.
+        peer_io::write_peer_file_atomic(dir, "originator", &format!("master-{slug}")).unwrap();
+    }
+
+    /// Write the terminal-path output for one round: result-<n>.md with the
+    /// production frontmatter + a matching turns.txt line (+ prior lines).
+    fn terminal(dir: &Path, slug: &str, round: u32, outcome: &str) {
+        let text = format!(
+            "---\nslug: {slug}\noutcome: {outcome}\nupdated_unix: 100\nturn: {round}\n---\n\nbody\n"
+        );
+        peer_io::write_peer_file_atomic(dir, &format!("result-{round}.md"), &text).unwrap();
+        peer_io::write_peer_file_atomic(dir, "result.md", &text).unwrap();
+        peer_io::append_peer_line(dir, "turns.txt", &format!("{round} {outcome} 100\n")).unwrap();
+    }
+
+    fn facet(data_dir: &Path, slug: &str) -> PeerExecutionFacet {
+        let dir = data_dir.join("peers").join(slug);
+        derive_peer_execution_facet(
+            &dir,
+            "octos",
+            slug,
+            peer_io::peer_regular_file_exists(&dir, "closed"),
+        )
+    }
+
+    #[test]
+    fn peer_list_done_peer_with_errored_outcome_shows_failed_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "beta", None);
+        terminal(&dir, "beta", 1, "errored");
+        lifetime(&dir, "octos", "beta", "failed", 0, Some("t1"), None);
+        let f = facet(temp.path(), "beta");
+        assert_eq!(f.execution, "failed");
+        assert_eq!(f.last_outcome.as_deref(), Some("errored"));
+        assert_eq!(f.rounds_delivered, 1);
+    }
+
+    #[test]
+    fn peer_list_round2_queued_shows_queued_not_stale_done() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "q2", None);
+        terminal(&dir, "q2", 1, "completed");
+        lifetime(&dir, "octos", "q2", "pending", 1, None, None);
+        let f = facet(temp.path(), "q2");
+        assert_eq!(f.execution, "queued");
+        assert_eq!(f.last_outcome.as_deref(), Some("completed"));
+        assert_eq!(f.round, 2, "queued round = delivered+1");
+    }
+
+    #[test]
+    fn peer_list_round2_running_overrides_round1_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "r2", None);
+        terminal(&dir, "r2", 1, "completed");
+        lifetime(&dir, "octos", "r2", "running", 1, Some("t2"), None);
+        let f = facet(temp.path(), "r2");
+        assert_eq!(f.execution, "running");
+        assert_eq!(f.round, 2);
+        assert_eq!(f.turn_id.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn peer_list_interrupted_turn_reports_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "ir", None);
+        terminal(&dir, "ir", 1, "completed");
+        terminal(&dir, "ir", 2, "interrupted");
+        lifetime(&dir, "octos", "ir", "failed", 1, Some("t2"), None);
+        let f = facet(temp.path(), "ir");
+        assert_eq!(f.execution, "failed");
+        assert_eq!(f.last_outcome.as_deref(), Some("interrupted"));
+        assert_eq!(f.rounds_delivered, 2);
+    }
+
+    #[test]
+    fn peer_list_rate_limited_outcome_surfaces() {
+        // K3 first-review F13: rate_limited is in the strict whitelist
+        // (mod.rs:4235) but had no fixture coverage. Same shape as the
+        // interrupted scenario: terminal evidence + trusted Failed
+        // lifetime → execution=failed, last_outcome=rate_limited.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "rl", None);
+        terminal(&dir, "rl", 1, "rate_limited");
+        lifetime(&dir, "octos", "rl", "failed", 1, Some("t1"), None);
+        let f = facet(temp.path(), "rl");
+        assert_eq!(f.execution, "failed");
+        assert_eq!(f.last_outcome.as_deref(), Some("rate_limited"));
+        assert_eq!(f.rounds_delivered, 1);
+    }
+
+    #[test]
+    fn peer_list_no_lifetime_execution_unknown_outcome_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "nl", None);
+        terminal(&dir, "nl", 1, "errored");
+        // No lifetime.json at all: unknown execution, evidence kept.
+        let f = facet(temp.path(), "nl");
+        assert_eq!(f.execution, "unknown");
+        assert_eq!(f.last_outcome.as_deref(), Some("errored"));
+    }
+
+    #[test]
+    fn peer_list_lifetime_projection_phases_and_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        for (slug, phase, expect) in [
+            ("p-run", "running", "running"),
+            ("p-fail", "failed", "failed"),
+        ] {
+            let dir = staged(temp.path(), slug, None);
+            terminal(&dir, slug, 1, "errored");
+            lifetime(&dir, "octos", slug, phase, 0, Some("t1"), None);
+            let f = facet(temp.path(), slug);
+            assert_eq!(f.execution, expect, "{slug}");
+            assert_eq!(f.task_id.as_deref(), Some(format!("task-{slug}").as_str()));
+            assert_eq!(f.generation, Some(0));
+        }
+        // idle needs a digest bound to the CURRENT result.md bytes.
+        let dir = staged(temp.path(), "p-idle", None);
+        terminal(&dir, "p-idle", 1, "completed");
+        let body =
+            peer_io::read_peer_file(&dir, "result.md", peer_io::PEER_FILE_READ_CAP_LARGE).unwrap();
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
+        lifetime(
+            &dir,
+            "octos",
+            "p-idle",
+            "idle",
+            0,
+            Some("t1"),
+            Some(&digest),
+        );
+        let f = facet(temp.path(), "p-idle");
+        assert_eq!(f.execution, "idle");
+        assert_eq!(f.master_session_id.as_deref(), Some("master-p-idle"));
+    }
+
+    #[test]
+    fn peer_list_untrusted_lifetime_degrades_to_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "ut", None);
+        terminal(&dir, "ut", 1, "errored");
+        // Wrong registry_key (other profile): projection untrusted.
+        lifetime(&dir, "other-profile", "ut", "running", 0, Some("t1"), None);
+        let f = facet(temp.path(), "ut");
+        assert_eq!(f.execution, "unknown");
+        assert_eq!(f.last_outcome.as_deref(), Some("errored"));
+        assert!(
+            f.task_id.is_none() && f.generation.is_none(),
+            "untrusted identity is null"
+        );
+    }
+
+    #[test]
+    fn peer_list_idle_digest_mismatch_degrades_to_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "dg", None);
+        terminal(&dir, "dg", 1, "completed");
+        // Nonempty but WRONG digest: idle must not be believed.
+        lifetime(&dir, "octos", "dg", "idle", 0, Some("t1"), Some("deadbeef"));
+        let f = facet(temp.path(), "dg");
+        assert_eq!(f.execution, "unknown");
+    }
+
+    #[test]
+    fn peer_list_corrupt_lifetime_degrades_to_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "cx", None);
+        terminal(&dir, "cx", 1, "errored");
+        peer_io::write_peer_file_atomic(&dir, "lifetime.json", "{\"version\":1,\"task_i").unwrap();
+        let f = facet(temp.path(), "cx");
+        assert_eq!(f.execution, "unknown");
+        assert_eq!(f.last_outcome.as_deref(), Some("errored"));
+    }
+
+    #[test]
+    fn peer_list_legacy_no_metadata_reports_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "lg", None);
+        peer_io::write_peer_file_atomic(&dir, "result.md", "old findings").unwrap();
+        let f = facet(temp.path(), "lg");
+        assert_eq!(f.execution, "unknown");
+        assert!(f.last_outcome.is_none());
+        assert_eq!(f.rounds_delivered, 1, "#2024 floor: bare result.md");
+    }
+
+    #[test]
+    fn peer_list_symlinked_turns_index_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "sl", None);
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "1 completed 100\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("turns.txt")).unwrap();
+        let f = facet(temp.path(), "sl");
+        assert_eq!(
+            f.execution, "unknown",
+            "symlinked turns.txt reads as absent"
+        );
+        assert!(f.last_outcome.is_none());
+    }
+
+    #[test]
+    fn peer_list_closed_peer_reports_closed_execution_with_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "cl", None);
+        terminal(&dir, "cl", 1, "errored");
+        peer_io::write_peer_file_atomic(&dir, "closed", "closer\n1\n").unwrap();
+        let f = facet(temp.path(), "cl");
+        assert_eq!(f.execution, "closed");
+        assert_eq!(f.last_outcome.as_deref(), Some("errored"));
+    }
+
+    #[test]
+    fn peer_list_execution_derivation_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        // closed + errored evidence
+        let d1 = staged(temp.path(), "a-closed", None);
+        terminal(&d1, "a-closed", 1, "errored");
+        peer_io::write_peer_file_atomic(&d1, "closed", "x").unwrap();
+        // trusted lifetime running + old completed evidence
+        let d2 = staged(temp.path(), "b-running", None);
+        terminal(&d2, "b-running", 1, "completed");
+        lifetime(&d2, "octos", "b-running", "running", 1, Some("t2"), None);
+        // no lifetime (turns evidence only) -> unknown
+        let d3 = staged(temp.path(), "c-nolife", None);
+        terminal(&d3, "c-nolife", 1, "errored");
+        // nothing at all
+        staged(temp.path(), "d-nothing", None);
+        assert_eq!(facet(temp.path(), "a-closed").execution, "closed");
+        assert_eq!(facet(temp.path(), "b-running").execution, "running");
+        assert_eq!(facet(temp.path(), "c-nolife").execution, "unknown");
+        assert_eq!(facet(temp.path(), "d-nothing").execution, "unknown");
+    }
+
+    #[test]
+    fn peer_list_terminal_evidence_cross_check_mismatch_is_null() {
+        // turns.txt tail says completed but the highest result-N says errored
+        // (or is missing): NO outcome may be asserted.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "xm", None);
+        let text = "---\nslug: xm\noutcome: errored\nupdated_unix: 100\nturn: 1\n---\n\nbody\n";
+        peer_io::write_peer_file_atomic(&dir, "result-1.md", text).unwrap();
+        peer_io::append_peer_line(&dir, "turns.txt", "1 completed 100\n").unwrap();
+        let f = facet(temp.path(), "xm");
+        assert!(
+            f.last_outcome.is_none(),
+            "disagreeing native records assert nothing"
+        );
+        // Corrupt tail must not fall back to an older line either.
+        let dir2 = staged(temp.path(), "xt", None);
+        terminal(&dir2, "xt", 1, "completed");
+        peer_io::write_peer_file_atomic(&dir2, "turns.txt", "1 completed 100\n2 bogus\n").unwrap();
+        let f2 = facet(temp.path(), "xt");
+        assert!(f2.last_outcome.is_none(), "corrupt tail asserts nothing");
+    }
+
+    #[test]
+    fn peer_list_untrusted_writer_shape_and_malformed_fields_degrade() {
+        // Running without a turn_id violates the writer shape: untrusted.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "ws", None);
+        terminal(&dir, "ws", 1, "completed");
+        lifetime(&dir, "octos", "ws", "running", 0, None, None);
+        let f = facet(temp.path(), "ws");
+        assert_eq!(
+            f.execution, "unknown",
+            "running without turn_id is a torn write"
+        );
+        // Numeric turn_id must fail typed deserialization, not be coerced.
+        let dir2 = staged(temp.path(), "nm", None);
+        terminal(&dir2, "nm", 1, "completed");
+        let bad = serde_json::json!({
+            "version": 1, "task_id": "t", "registry_key": peer_wire_key("octos", "nm"),
+            "master": "m", "generation": 0, "phase": "running",
+            "turn_id": 7, "result_digest": null,
+        });
+        peer_io::write_peer_file_atomic(&dir2, "lifetime.json", &bad.to_string()).unwrap();
+        peer_io::write_peer_file_atomic(&dir2, "originator", "m").unwrap();
+        let f2 = facet(temp.path(), "nm");
+        assert_eq!(
+            f2.execution, "unknown",
+            "numeric turn_id fails the typed parse"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task-evo-peer-turn-status — outer-loop review #2 regressions (real-entry
+// compatibility): numbered-only legacy done, explicit name==slug, foreign
+// FM slug, scan-cap truncation, empty-identity projection, --profile data
+// root.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod peer_turn_status_compat_tests {
+    use super::*;
+
+    #[test]
+    fn peer_list_numbered_only_peer_stays_done() {
+        // A peer with ONLY result-1.md (no bare result.md) was `done` under
+        // the legacy CLI semantics and must remain so.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("peers").join("num-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+        let text =
+            "---\nslug: num-only\noutcome: completed\nupdated_unix: 100\nturn: 1\n---\n\nbody\n";
+        peer_io::write_peer_file_atomic(&dir, "result-1.md", text).unwrap();
+        peer_io::append_peer_line(&dir, "turns.txt", "1 completed 100\n").unwrap();
+        let rows = crate::commands::peer_list_for_test(temp.path(), "octos");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "done",
+            "numbered-only result proves delivery"
+        );
+        assert_eq!(rows[0].execution, "unknown", "no lifetime authority");
+        assert_eq!(rows[0].last_outcome.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn peer_list_oversized_bare_result_still_done() {
+        // An over-cap bare result.md fails the blackboard's content read
+        // (row.result=None) but its EXISTENCE still proves delivery.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("peers").join("big");
+        std::fs::create_dir_all(&dir).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+        let big = "x".repeat(peer_io::PEER_FILE_READ_CAP_LARGE + 1);
+        peer_io::write_peer_file_atomic(&dir, "result.md", &big).unwrap();
+        let rows = crate::commands::peer_list_for_test(temp.path(), "octos");
+        assert_eq!(
+            rows[0].status, "done",
+            "unreadable-but-present bare result still proves delivery"
+        );
+        assert_eq!(rows[0].rounds_delivered, 1, "#2024 floor applies");
+    }
+
+    #[test]
+    fn peer_list_explicit_name_equal_to_slug_is_preserved() {
+        // Three REAL fixtures pinning the ORIGINAL optional-name semantics:
+        // no name file → None; empty name file → None; explicit name (even
+        // == slug) → Some(recorded). The blackboard's slug fallback is an
+        // ADDRESSING convenience and must not leak into the CLI field.
+        let temp = tempfile::tempdir().unwrap();
+        let fixtures = [
+            ("missing", None, None),
+            ("blank", Some("   \n"), None),
+            ("echo", Some("echo"), Some("echo")),
+            ("distinct", Some("Ada"), Some("Ada")),
+        ];
+        for (slug, name_file, _expect) in &fixtures {
+            let dir = temp.path().join("peers").join(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+            if let Some(content) = name_file {
+                peer_io::write_peer_file_atomic(&dir, "name", content).unwrap();
+            }
+        }
+        let rows = crate::commands::peer_list_for_test(temp.path(), "octos");
+        // Each REAL fixture asserts its OWN expectation (missing → None,
+        // empty → None, explicit == slug → Some(slug), distinct → Some).
+        for (slug, _name_file, expect) in &fixtures {
+            let row = rows.iter().find(|r| r.slug == *slug).unwrap();
+            assert_eq!(
+                row.name.as_deref(),
+                *expect,
+                "fixture {slug}: optional-name semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_list_foreign_slug_frontmatter_is_not_outcome_evidence() {
+        // result-1.md frontmatter naming ANOTHER peer must not certify this
+        // peer's last_outcome even when turns.txt agrees.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("peers").join("mine");
+        std::fs::create_dir_all(&dir).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+        let text = "---\nslug: someone-else\noutcome: completed\nupdated_unix: 100\nturn: 1\n---\n\nbody\n";
+        peer_io::write_peer_file_atomic(&dir, "result-1.md", text).unwrap();
+        peer_io::append_peer_line(&dir, "turns.txt", "1 completed 100\n").unwrap();
+        let facet = derive_peer_execution_facet(&dir, "octos", "mine", false);
+        assert!(
+            facet.last_outcome.is_none(),
+            "foreign slug cannot vouch for this peer"
+        );
+    }
+
+    #[test]
+    fn peer_list_scan_cap_truncation_yields_no_outcome() {
+        // Scanner-level truncation: a SMALL cap with MIXED entries (result
+        // files + unrelated files) exhausts the scan budget before the dir
+        // ends — the scanner must report truncation (not a partial "highest")
+        // and the strict reader must assert nothing. Mirrors the outer-loop
+        // correction: the budget counts ALL scanned entries.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("peers").join("capped");
+        std::fs::create_dir_all(&dir).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+        peer_io::write_peer_file_atomic(&dir, "originator", "m").unwrap();
+        for round in 1..=3u32 {
+            let text = format!(
+                "---\nslug: capped\noutcome: completed\nupdated_unix: 100\nturn: {round}\n---\n\nbody\n"
+            );
+            peer_io::write_peer_file_atomic(&dir, &format!("result-{round}.md"), &text).unwrap();
+        }
+        peer_io::append_peer_line(&dir, "turns.txt", "3 completed 100\n").unwrap();
+        // cap=4 with 3 result files + brief + originator + turns.txt = 6
+        // entries: the scan MUST hit the budget and report truncated. Test
+        // the imp scanner directly (Err) — the public wrapper maps Err→None.
+        assert!(
+            peer_io::peer_dir_list_prefixed_raw(&dir, "result-", 4).is_err(),
+            "mixed entries exhaust the scan budget: truncation must be explicit"
+        );
+        // And a cap large enough to finish cleanly returns the full hit list.
+        let full = peer_io::peer_dir_list_prefixed(&dir, "result-", 100).unwrap();
+        assert_eq!(full.len(), 3);
+        // The strict evidence reader consumes the wrapper with the PRODUCTION
+        // cap (100k), which this 6-entry fixture cannot exhaust — the
+        // truncation-to-no-outcome path is therefore exercised at the
+        // scanner level above (Err ⇒ wrapper None ⇒ no outcome by
+        // construction in read_last_terminal_evidence: `?` on the Option).
+        let facet = derive_peer_execution_facet(&dir, "octos", "capped", false);
+        assert_eq!(facet.rounds_delivered, 3, "count semantics unaffected");
+    }
+
+    #[test]
+    fn peer_projection_rejects_empty_identity_strings() {
+        // Empty-string master / turn_id pass the legacy restore reader but
+        // fence nothing — the projection must refuse to vouch for them.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("peers").join("empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+        let bad_master = serde_json::json!({
+            "version": 1, "task_id": "t", "registry_key": peer_wire_key("octos", "empty"),
+            "master": "  ", "generation": 0, "phase": "pending",
+            "turn_id": null, "result_digest": null,
+        });
+        peer_io::write_peer_file_atomic(&dir, "lifetime.json", &bad_master.to_string()).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "originator", "  ").unwrap();
+        assert!(trusted_lifetime_projection(&dir, "octos", "empty").is_none());
+        // Pending + Some("") turn_id: also refused.
+        let empty_turn = serde_json::json!({
+            "version": 1, "task_id": "t", "registry_key": peer_wire_key("octos", "empty"),
+            "master": "m", "generation": 0, "phase": "pending",
+            "turn_id": "", "result_digest": null,
+        });
+        peer_io::write_peer_file_atomic(&dir, "lifetime.json", &empty_turn.to_string()).unwrap();
+        peer_io::write_peer_file_atomic(&dir, "originator", "m").unwrap();
+        assert!(trusted_lifetime_projection(&dir, "octos", "empty").is_none());
     }
 }

@@ -33,6 +33,7 @@ pub(crate) mod oup_peers;
 pub(crate) mod oup_session;
 #[cfg(feature = "api")]
 mod oup_text;
+#[cfg_attr(test, allow(unused_imports))]
 mod peer;
 mod profile;
 #[cfg(feature = "api")]
@@ -80,7 +81,10 @@ pub use mcp_serve::McpServeCommand;
 pub use memory::MemoryCommand;
 pub(crate) use obs_resolve as obs;
 pub use office::OfficeCommand;
+#[cfg_attr(not(test), allow(unused_imports))]
 pub use peer::PeerCommand;
+#[cfg(test)]
+pub(crate) use peer::peer_list_for_test;
 pub use profile::ProfileCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
