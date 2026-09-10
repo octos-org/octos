@@ -3,7 +3,7 @@
 审计源：merged-review-audit-20260910/REVIEW-AUDIT.md（#2272）。基线 329566d3。
 
 ## 步骤
-1. 设计+测试计划 → /Users/zhangalex/.local/tmp/octoloop-review-repair-20260910/peer-design.md ✅
+1. 设计+测试计划 → 修复工作目录下 peer-design.md（会话 scratch 交接件，不入库） ✅
 2. 行为修复（实际历史：实现与测试同 turn 连续完成，非测试先行；RED 为步骤 4a 的事后补做可执行验证）：closed 分支改走 trusted_lifetime_projection 同一校验，通过保留身份、否则 null ✅（5 新测试 + 1 既有测试修改）
 3. 文档同步：interface（identity note/idle_no_turns round≥1/cli --profile/spec_revision+versioning_note/serve 超集说明）、spec（generation 1 对齐/closed 条款/serve 超集）、peer.rs 注释 ✅
 4. Cargo 窗口授予后的真实 RED/GREEN 顺序（ROOT review 2 修正）：
