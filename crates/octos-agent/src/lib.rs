@@ -144,7 +144,8 @@ pub use harness_events::{
     emit_registered_credential_rotation_event,
 };
 pub use hooks::{
-    HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookPayloadEnricher, HookResult,
+    HookConfig, HookContext, HookDeniedError, HookEvent, HookExecutor, HookPayload,
+    HookPayloadEnricher, HookResult,
 };
 pub use mcp::{McpClient, McpServerConfig};
 pub use memory_segment::{

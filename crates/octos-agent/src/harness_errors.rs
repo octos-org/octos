@@ -58,6 +58,9 @@ pub enum RecoveryHint {
     /// requests, content filtered responses, and structural budget violations
     /// like delegation depth exceeded.
     FailFast,
+    /// Expected policy behaviour, not a fault — e.g. a lifecycle hook denied
+    /// the call (#2249). Surface for audit, never page, never retry.
+    Expected,
     /// Internal invariant violation — log and bail out; operators must
     /// investigate. Not retryable.
     Bug,
@@ -72,6 +75,7 @@ impl RecoveryHint {
             RecoveryHint::SwitchProvider => "switch_provider",
             RecoveryHint::CompactContext => "compact_context",
             RecoveryHint::FailFast => "fail_fast",
+            RecoveryHint::Expected => "expected",
             RecoveryHint::Bug => "bug",
         }
     }
@@ -155,6 +159,11 @@ pub enum HarnessError {
         limit: u32,
         message: String,
     },
+    /// A lifecycle hook denied the operation (#2249). Expected policy
+    /// behaviour, not a harness fault — classified apart from `Internal` so
+    /// operator dashboards and alerting do not treat a policy decision as a
+    /// bug.
+    PolicyDeny { message: String },
     /// Catch-all for agent-internal bugs (poisoned locks, unexpected state,
     /// etc.). Treat as `RecoveryHint::Bug`.
     Internal { message: String },
@@ -211,6 +220,7 @@ impl HarnessError {
             HarnessError::PluginTimeout { .. } => "plugin_timeout",
             HarnessError::PluginProtocol { .. } => "plugin_protocol",
             HarnessError::DelegateDepthExceeded { .. } => "delegate_depth_exceeded",
+            HarnessError::PolicyDeny { .. } => "policy",
             HarnessError::Internal { .. } => "internal",
         }
     }
@@ -277,6 +287,10 @@ impl HarnessError {
             | HarnessError::PluginSpawn { .. }
             | HarnessError::PluginProtocol { .. } => RecoveryHint::FailFast,
 
+            // Non-retryable, but NOT a fault: a lifecycle hook denied the
+            // call (#2249). Surface for audit; never page, never retry.
+            HarnessError::PolicyDeny { .. } => RecoveryHint::Expected,
+
             // Internal invariant broken — bug, not recoverable.
             HarnessError::Internal { .. } => RecoveryHint::Bug,
         }
@@ -300,6 +314,7 @@ impl HarnessError {
             | HarnessError::PluginTimeout { message, .. }
             | HarnessError::PluginProtocol { message, .. }
             | HarnessError::DelegateDepthExceeded { message, .. }
+            | HarnessError::PolicyDeny { message }
             | HarnessError::Internal { message } => message,
         }
     }
@@ -325,8 +340,10 @@ impl HarnessError {
     }
 
     /// Classify a raw `eyre::Report` at an agent-loop boundary. Downcasts to
-    /// `LlmError` first; falls back to `ToolExecution` with the provided
-    /// `tool_name`, or `Internal` when no tool context is available.
+    /// `LlmError` first, then to [`crate::hooks::HookDeniedError`] (#2249 — a
+    /// hook deny is policy, not a bug); falls back to `ToolExecution` with
+    /// the provided `tool_name`, or `Internal` when no tool context is
+    /// available.
     ///
     /// This is the canonical entry point that enforces invariant #1 ("no raw
     /// `eyre::Report` escapes the agent loop without classification"): every
@@ -334,6 +351,16 @@ impl HarnessError {
     pub fn classify_report(report: &eyre::Report, tool_name: Option<&str>) -> Self {
         if let Some(llm) = report.downcast_ref::<LlmError>() {
             return Self::from_llm_error(llm);
+        }
+        // #2249 — a before-hook deny is expected policy behaviour: classify it
+        // `policy`/`expected` so dashboards stop paging on it as `internal`/`bug`.
+        if report
+            .downcast_ref::<crate::hooks::HookDeniedError>()
+            .is_some()
+        {
+            return HarnessError::PolicyDeny {
+                message: truncate(&report.to_string(), MAX_HARNESS_ERROR_MESSAGE_BYTES),
+            };
         }
         let message = truncate(&report.to_string(), MAX_HARNESS_ERROR_MESSAGE_BYTES);
         match tool_name {
@@ -498,6 +525,7 @@ impl HarnessError {
             | HarnessError::ContentFiltered { .. }
             | HarnessError::Network { .. }
             | HarnessError::Timeout { .. }
+            | HarnessError::PolicyDeny { .. }
             | HarnessError::Internal { .. } => {}
         }
         out
@@ -702,6 +730,21 @@ mod tests {
         assert_eq!(err.recovery_hint(), RecoveryHint::SwitchProvider);
         assert!(err.message().contains("MiniMax-M2.5-highspeed"));
         assert!(err.message().contains("top up or switch provider"));
+    }
+
+    #[test]
+    fn classify_report_downcasts_hook_deny_through_eyre() {
+        // #2249 — a `before_llm_call` deny bails with a typed HookDeniedError;
+        // the loop boundary must classify it `policy`/`expected`, never
+        // `internal`/`bug` (a policy deny pages nobody).
+        let report: eyre::Report = crate::hooks::HookDeniedError {
+            reason: "no network calls today".into(),
+        }
+        .into();
+        let classified = HarnessError::classify_report(&report, None);
+        assert_eq!(classified.variant_name(), "policy");
+        assert_eq!(classified.recovery_hint(), RecoveryHint::Expected);
+        assert!(classified.message().contains("no network calls today"));
     }
 
     #[test]

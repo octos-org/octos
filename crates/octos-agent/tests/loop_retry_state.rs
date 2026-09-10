@@ -19,6 +19,35 @@ use octos_agent::{LoopDecision, LoopRetryLimits, LoopRetryState};
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
+fn should_escalate_hook_deny_immediately_and_exhaust_bucket() {
+    // #2249 — a hook deny is expected policy behaviour: never retried
+    // (Escalate on the first observation), bucket capped at 1 like the
+    // other non-retryable variants.
+    let mut state = LoopRetryState::new();
+    let err = HarnessError::PolicyDeny {
+        message: "LLM call denied by hook: policy".into(),
+    };
+    assert_eq!(state.observe(&err), LoopDecision::Escalate);
+    assert_eq!(state.observe(&err), LoopDecision::Exhausted);
+}
+
+#[test]
+fn should_deserialize_legacy_retry_state_without_policy_bucket() {
+    // #2249 — retry-state sidecars written before the PolicyDeny variant
+    // have no `policy` field: limits must fall back to the canonical
+    // default (1), counters to 0 — not fail deserialization.
+    let state = LoopRetryState::new();
+    let mut json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&state).expect("serialize")).expect("value");
+    json["limits"].as_object_mut().unwrap().remove("policy");
+    json["counters"].as_object_mut().unwrap().remove("policy");
+    let restored: LoopRetryState =
+        serde_json::from_value(json).expect("legacy JSON without policy bucket deserializes");
+    assert_eq!(restored.limits.policy, 1);
+    assert_eq!(restored.counters.policy, 0);
+}
+
+#[test]
 fn should_escalate_after_invalid_tool_call_limit() {
     let mut state = LoopRetryState::with_limits(LoopRetryLimits {
         invalid_request: 2,
