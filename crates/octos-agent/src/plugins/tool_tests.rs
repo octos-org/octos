@@ -1448,7 +1448,7 @@ async fn execute_preserves_plugin_structured_metadata() {
         make_tool_def("metadata_tool", "returns structured metadata"),
         script_path,
     )
-    .with_timeout(Duration::from_secs(5));
+    .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({}))
