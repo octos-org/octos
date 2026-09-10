@@ -1903,15 +1903,32 @@ pub fn create_provider_with_api_type(
                     entry.name
                 )
             })?;
-        let mut provider = octos_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m);
-        if let Some(url) = base_url {
-            provider = provider.with_base_url(&url);
+        let mut provider = octos_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m)
+            .with_response_continuation(true);
+        if let Some(url) = base_url.as_ref() {
+            provider = provider.with_base_url(url.as_str());
         }
         if let Some(t) = llm_timeout_secs {
             let c = llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
             provider = provider.with_http_timeout(t, c);
         }
-        return Ok(Arc::new(provider));
+        let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+        if let Some(url) = base_url
+            .as_deref()
+            .filter(|url| url.trim_end_matches('/') != "https://api.openai.com/v1")
+        {
+            let timeout = match (llm_timeout_secs, llm_connect_timeout_secs) {
+                (None, None) => None,
+                (t, c) => Some((
+                    t.unwrap_or(octos_llm::DEFAULT_LLM_TIMEOUT_SECS),
+                    c.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS),
+                )),
+            };
+            return Ok(octos_llm::LocalContextProbe::new(
+                provider, url, Some(key), timeout,
+            ));
+        }
+        return Ok(provider);
     }
 
     let params = octos_llm::registry::CreateParams {
