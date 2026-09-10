@@ -3712,7 +3712,13 @@ async fn list_sessions_hides_internal_child_and_task_ledger_sessions() {
         .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
         .collect();
 
-    assert_eq!(ids, vec!["web-123", "web-raw"]);
+    // #2267: the session list comes from unordered map iteration — the
+    // order differs per platform/run (flake on the nightly ARM64 lane).
+    // Assert as a sorted set; the hiding semantics under test do not
+    // depend on ordering.
+    let mut sorted_ids = ids.clone();
+    sorted_ids.sort_unstable();
+    assert_eq!(sorted_ids, vec!["web-123", "web-raw"]);
 }
 
 #[tokio::test]

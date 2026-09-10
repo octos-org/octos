@@ -294,6 +294,262 @@ impl GoalCompletionVerdict {
     }
 }
 
+/// Structured classification of why a goal-completion verifier outcome was
+/// not a clean `Done` — the orthogonal axis to [`GoalCompletionVerdict`].
+///
+/// The verdict answers "is the objective met?"; this kind answers "how
+/// healthy was the verification call itself?". Mixing the two (the
+/// pre-evo-verifier `NotDone { reason }`) made infrastructure failures
+/// indistinguishable from semantic evidence gaps, so callers could neither
+/// retry sensibly nor report what was missing.
+///
+/// `None` on the outcome ⟺ `Done` (a successful verification has no failure
+/// kind — the illegal `Done + CallFailed` state is unrepresentable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalVerifierFailureKind {
+    /// The provider call itself failed (`chat` returned `Err`). Transient —
+    /// retried at most once when the underlying error is retryable.
+    CallFailed,
+    /// Provider returned `Ok` with empty/whitespace content (including the
+    /// reasoning-only case: `reasoning_content` non-empty, `content` empty —
+    /// thinking burned the budget, #23 family). Transient — retried once.
+    EmptyResponse,
+    /// Non-empty reply that violates the verdict protocol: `DONE` with
+    /// trailing text, multi-line residue, unpaired backticks, prose
+    /// negation, `Done.` — anything that is not an exact verdict. NOT
+    /// retried (same prompt ⇒ same malformed answer; blind retry just burns
+    /// 2× tokens). The reason embeds a truncated quote of the raw reply so
+    /// the agent can self-correct next turn.
+    InvalidResponse,
+    /// The verifier answered `NOT_DONE: <reason>` — a *semantic* verdict
+    /// that the objective is not yet met. Never retried; `missing_evidence`
+    /// carries what the verifier found lacking.
+    InsufficientEvidence,
+}
+
+impl GoalVerifierFailureKind {
+    /// Whether this kind is eligible for the single bounded retry (transient
+    /// infrastructure classes only — see spec Decision 3).
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::CallFailed | Self::EmptyResponse)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CallFailed => "call_failed",
+            Self::EmptyResponse => "empty_response",
+            Self::InvalidResponse => "invalid_response",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
+}
+
+impl fmt::Display for GoalVerifierFailureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Ledger `outcome` value: the failure kinds plus the success value, so a
+/// `Done` verdict is representable in the persistent verifier ledger.
+pub const GOAL_VERIFIER_OUTCOME_DONE: &str = "done";
+
+/// Structured result of one bounded goal-completion verification run.
+///
+/// Wraps the (unchanged) [`GoalCompletionVerdict`] with the orthogonal
+/// failure classification, attempt count, semantic gap, replay provenance
+/// and the usage summed across *all* attempts (failures included).
+// `TokenUsage` (octos-llm) implements neither PartialEq nor Eq, so the
+// outcome derives only Debug/Clone; structural comparison in tests asserts
+// the individual fields (verdict/kind/attempts) instead.
+#[derive(Debug, Clone)]
+pub struct GoalVerifierOutcome {
+    /// The semantic verdict — unchanged type, so `maybe_complete_goal_from_model`
+    /// and its guards see exactly what they saw before.
+    pub verdict: GoalCompletionVerdict,
+    /// `None` ⟺ `verdict` is `Done`.
+    pub kind: Option<GoalVerifierFailureKind>,
+    /// Number of provider calls made in this run (≤2; 0 on a gate replay).
+    pub attempts: u32,
+    /// What the verifier said is missing (InsufficientEvidence) or a
+    /// truncated quote of a protocol-violating reply (InvalidResponse).
+    pub missing_evidence: Option<String>,
+    /// True when no new call was made — the persistent same-evidence gate
+    /// replayed a ledger verdict (`replayed_of_ts` is that record's ts).
+    pub replayed: bool,
+    pub replayed_of_ts_ms: Option<u64>,
+    /// Composite diagnostic (k3 round-3 B): set when the verification could
+    /// not complete its bookkeeping — e.g. a Done verdict whose ledger write
+    /// failed (fail-closed), or an unreadable gate ledger. The goal stays
+    /// open; the message names the remediation path.
+    pub diagnostic: Option<String>,
+    /// Usage summed per-field across every attempt, billed or not.
+    pub usage: octos_llm::TokenUsage,
+}
+
+impl GoalVerifierOutcome {
+    pub fn is_done(&self) -> bool {
+        self.verdict.is_done()
+    }
+
+    /// NotDone reason for call sites: classification + attempts, never the
+    /// bare `verifier returned: ` of the pre-evo-verifier era.
+    pub fn not_done_reason(&self) -> Option<&str> {
+        match &self.verdict {
+            GoalCompletionVerdict::Done => None,
+            GoalCompletionVerdict::NotDone { reason } => Some(reason),
+        }
+    }
+}
+
+/// evo-goal-verifier (spec Decision 1/6, M5): ONE canonical human-readable
+/// NotDone line shared by every call site — goal_tool's ToolResult output
+/// and the three sentinel stations' failure notes — so the structured
+/// `{kind} (attempt n/2): reason [replayed…][diagnostic]` format cannot
+/// drift between the four entry points. Done renders as `done`.
+impl fmt::Display for GoalVerifierOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_done() {
+            return f.write_str("done");
+        }
+        let kind = self.kind.map(|k| k.as_str()).unwrap_or("unknown");
+        write!(
+            f,
+            "verifier {kind} (attempt {}/{}): {}",
+            self.attempts,
+            crate::autonomy::agent_orchestrator::VERIFIER_MAX_ATTEMPTS,
+            self.not_done_reason().unwrap_or("unknown")
+        )?;
+        if self.replayed {
+            match self.replayed_of_ts_ms {
+                Some(ts) => write!(f, " [replayed verdict from {ts}]")?,
+                None => f.write_str(" [replayed verdict from history]")?,
+            }
+        }
+        if let Some(d) = &self.diagnostic {
+            write!(f, " [diagnostic: {d}]")?;
+        }
+        Ok(())
+    }
+}
+
+/// Parsed verdict of a raw verifier reply — the pure, sync, provider-free
+/// core of the strict DONE protocol (spec Decision 2, final rule).
+///
+/// Deterministic ladder (no heuristics):
+/// 1. `None`/whitespace-only content → `EmptyResponse` (reasoning-only
+///    replies land here too — thinking burned the budget).
+/// 2. Strip at most one layer of a *paired* markdown fence.
+/// 3. Strip *paired* backticks (repeatable; unpaired are left alone).
+/// 4. Let L = the non-blank lines.
+/// 5. `|L| == 1` and `L[0]` case-insensitively `DONE` → `Done`.
+/// 6. Else `L[0]` (after paired-backtick strip) case-insensitively starts
+///    with `NOT_DONE` → `InsufficientEvidence`, missing = text after the
+///    colon (capped at 200 chars).
+/// 7. Else (trailing text, multi-line residue, `Done.`, prose) →
+///    `InvalidResponse` with a truncated quote of the raw reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedVerifierReply {
+    pub verdict: GoalCompletionVerdict,
+    pub kind: Option<GoalVerifierFailureKind>,
+    pub missing_evidence: Option<String>,
+}
+
+/// Max chars of the raw reply quoted into an InvalidResponse reason —
+/// enough for the agent to see and fix its format next turn (spec Decision 2).
+pub const VERIFIER_INVALID_QUOTE_CHARS: usize = 120;
+/// Max chars of the NOT_DONE tail kept as missing evidence (pre-existing
+/// `take(200)` cap, preserved).
+pub const VERIFIER_MISSING_EVIDENCE_CHARS: usize = 200;
+
+fn strip_paired_backticks(mut text: &str) -> &str {
+    loop {
+        let bytes = text.as_bytes();
+        if bytes.len() >= 2 && bytes.first() == Some(&b'`') && bytes.last() == Some(&b'`') {
+            text = &text[1..text.len() - 1];
+        } else {
+            return text;
+        }
+    }
+}
+
+/// The strict verdict protocol parser (pure; see [`ParsedVerifierReply`]).
+pub fn classify_verifier_reply(
+    content: Option<&str>,
+    _reasoning_present: bool,
+) -> ParsedVerifierReply {
+    let raw = content.unwrap_or("");
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ParsedVerifierReply {
+            verdict: GoalCompletionVerdict::NotDone {
+                reason: "verifier returned EMPTY content (Ok but no text)".to_owned(),
+            },
+            kind: Some(GoalVerifierFailureKind::EmptyResponse),
+            missing_evidence: None,
+        };
+    }
+    // At most one layer of a paired ``` fence.
+    let mut t = trimmed;
+    if let Some(inner) = t.strip_prefix("```") {
+        if let Some(body) = inner.strip_suffix("```") {
+            t = body.trim();
+        }
+    }
+    t = strip_paired_backticks(t);
+    let lines: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() == 1 && lines[0].eq_ignore_ascii_case("done") {
+        return ParsedVerifierReply {
+            verdict: GoalCompletionVerdict::Done,
+            kind: None,
+            missing_evidence: None,
+        };
+    }
+    let first = strip_paired_backticks(lines.first().copied().unwrap_or(""));
+    // Safe prefix match: NO arbitrary byte slicing (a multi-byte reply like
+    // 💡💡💡 has no char boundary at any fixed byte index — the previous
+    // `first[..9]` sliced into a code point and panicked). Also NOT_DONE is
+    // 8 bytes, not 9: match the exact prefix case-INSENSITIVELY over ASCII
+    // (spec Decision 2 keeps `done`/`Done` Done — the same leniency applies
+    // to `not_done`/`nOt_DoNe`; outer defect ⑥), and require the next char
+    // to be a delimiter (`:`/space/end) so fused tokens like NOT_DONEgarbage
+    // stay protocol violations (InvalidResponse), not semantic NOT_DONEs.
+    let bytes = first.as_bytes();
+    let prefix_matches = bytes.len() >= 8
+        && bytes[..8]
+            .iter()
+            .zip(b"NOT_DONE")
+            .all(|(b, p)| b.eq_ignore_ascii_case(p));
+    let not_done_tail = if prefix_matches {
+        Some(&first[8..])
+    } else {
+        None
+    }
+    .filter(|tail| tail.is_empty() || tail.starts_with(':') || tail.starts_with(' '));
+    if let Some(tail) = not_done_tail {
+        let missing = tail.trim_start_matches([':', ' ']).trim();
+        let missing: String = missing
+            .chars()
+            .take(VERIFIER_MISSING_EVIDENCE_CHARS)
+            .collect();
+        return ParsedVerifierReply {
+            verdict: GoalCompletionVerdict::NotDone {
+                reason: format!("insufficient evidence: {missing}"),
+            },
+            kind: Some(GoalVerifierFailureKind::InsufficientEvidence),
+            missing_evidence: Some(missing),
+        };
+    }
+    let quote: String = trimmed.chars().take(VERIFIER_INVALID_QUOTE_CHARS).collect();
+    ParsedVerifierReply {
+        verdict: GoalCompletionVerdict::NotDone {
+            reason: format!("verifier reply violated the verdict protocol: {quote}"),
+        },
+        kind: Some(GoalVerifierFailureKind::InvalidResponse),
+        missing_evidence: None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalBudgetResolution {
     pub goal_id: GoalId,
@@ -1117,6 +1373,189 @@ mod tests {
 
     fn at(seconds: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    // ── classify_verifier_reply: strict verdict protocol (spec Decision 2) ──
+    // NOTE (process honesty, outer round 3): the production parser was written
+    // FIRST and these tests were added after — including two RED reproductions
+    // of defects the outer loop found by probing the extracted functions:
+    // (1) NOT_DONE is 8 bytes, the old `first[..9]` slice never matched, so
+    //     `NOT_DONE: missing X` was misclassified InvalidResponse;
+    // (2) byte-9 slicing panicked on multi-byte UTF-8 (💡💡💡 has no char
+    //     boundary at byte 9). Both must FAIL against the old code and PASS
+    //     after the fix (safe prefix matching, no arbitrary byte slicing).
+
+    #[test]
+    fn classify_not_done_prefix_is_recognized() {
+        // RED reproduction (outer defect 1): the 8-vs-9 byte bug.
+        let parsed = classify_verifier_reply(Some("NOT_DONE: missing X"), false);
+        assert_eq!(
+            parsed.kind,
+            Some(GoalVerifierFailureKind::InsufficientEvidence)
+        );
+        assert!(!parsed.verdict.is_done());
+        let missing = parsed.missing_evidence.expect("missing evidence recorded");
+        assert!(missing.contains("missing X"), "got {missing:?}");
+    }
+
+    #[test]
+    fn classify_multibyte_reply_does_not_panic() {
+        // RED reproduction (outer defect 2): byte slicing on UTF-8 must not
+        // panic; the emoji reply is prose → InvalidResponse, not a crash.
+        let parsed = classify_verifier_reply(Some("💡💡💡"), false);
+        assert_eq!(parsed.kind, Some(GoalVerifierFailureKind::InvalidResponse));
+        assert!(!parsed.verdict.is_done());
+    }
+
+    #[test]
+    fn classify_rejects_not_done_garbage_fusion() {
+        // Boundary from outer round 3: NOT_DONEgarbage is a protocol
+        // violation (InvalidResponse), NOT insufficient evidence — the
+        // prefix rule must not swallow fused tokens.
+        let parsed = classify_verifier_reply(Some("NOT_DONEgarbage"), false);
+        assert_eq!(parsed.kind, Some(GoalVerifierFailureKind::InvalidResponse));
+    }
+
+    #[test]
+    fn classify_accepts_exact_done_variants() {
+        for text in [
+            "DONE", "done", "Done", "`DONE`", "``DONE``", "DONE\n", "  DONE  ",
+        ] {
+            let parsed = classify_verifier_reply(Some(text), false);
+            assert!(parsed.verdict.is_done(), "{text:?} must be Done");
+            assert_eq!(parsed.kind, None, "{text:?} must have no failure kind");
+        }
+    }
+
+    #[test]
+    fn classify_accepts_mixed_case_done_and_not_done() {
+        // Outer defect ⑥: the final rule (spec Decision 2) makes the
+        // verdict protocol case-insensitive over ASCII — `dOnE` is Done
+        // and `nOt_DoNe: X` is InsufficientEvidence, exactly like the
+        // lower/capital forms the first version enumerated.
+        for text in ["dOnE", "DoNe", "dONE"] {
+            let parsed = classify_verifier_reply(Some(text), false);
+            assert!(parsed.verdict.is_done(), "{text:?} must be Done");
+            assert_eq!(parsed.kind, None, "{text:?} must have no failure kind");
+        }
+        for text in [
+            "nOt_DoNe: missing X",
+            "NOT_done: missing X",
+            "not_DONE missing X",
+        ] {
+            let parsed = classify_verifier_reply(Some(text), false);
+            assert_eq!(
+                parsed.kind,
+                Some(GoalVerifierFailureKind::InsufficientEvidence),
+                "{text:?} must be InsufficientEvidence"
+            );
+            assert!(
+                parsed
+                    .missing_evidence
+                    .as_deref()
+                    .is_some_and(|m| m.contains("missing X")),
+                "{text:?} must carry the tail"
+            );
+        }
+        // The fused-token boundary survives case-insensitivity:
+        // NOT_DONEgarbage stays a protocol violation in ANY casing.
+        for text in ["nOt_DoNegarbage", "not_DONEgarbage"] {
+            let parsed = classify_verifier_reply(Some(text), false);
+            assert_eq!(
+                parsed.kind,
+                Some(GoalVerifierFailureKind::InvalidResponse),
+                "{text:?} must be InvalidResponse"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_accepts_single_paired_fence() {
+        let parsed = classify_verifier_reply(Some("```\nDONE\n```"), false);
+        assert!(parsed.verdict.is_done());
+    }
+
+    #[test]
+    fn classify_rejects_done_with_trailing_text() {
+        for text in [
+            "DONE: but the build log was never checked",
+            "DONE\nNOT_DONE: tests failing",
+            "DONEgarbage",
+            "Done.",
+        ] {
+            let parsed = classify_verifier_reply(Some(text), false);
+            assert!(!parsed.verdict.is_done(), "{text:?} must not be Done");
+            assert_eq!(
+                parsed.kind,
+                Some(GoalVerifierFailureKind::InvalidResponse),
+                "{text:?} must be InvalidResponse"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_rejects_unpaired_backticks() {
+        for text in ["`DONE", "DONE`"] {
+            let parsed = classify_verifier_reply(Some(text), false);
+            assert!(!parsed.verdict.is_done(), "{text:?} must not be Done");
+            assert_eq!(parsed.kind, Some(GoalVerifierFailureKind::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn classify_empty_and_reasoning_only_is_empty_response() {
+        for content in [None, Some(""), Some("   ")] {
+            let parsed = classify_verifier_reply(content, true);
+            assert_eq!(parsed.kind, Some(GoalVerifierFailureKind::EmptyResponse));
+            assert!(!parsed.verdict.is_done());
+        }
+    }
+
+    #[test]
+    fn classify_prose_negation_is_invalid_response_with_quote() {
+        let parsed =
+            classify_verifier_reply(Some("The build is still failing, tests not run"), false);
+        assert_eq!(parsed.kind, Some(GoalVerifierFailureKind::InvalidResponse));
+        let GoalCompletionVerdict::NotDone { reason } = parsed.verdict else {
+            panic!("prose must be NotDone");
+        };
+        assert!(
+            reason.contains("The build is still failing"),
+            "reason must quote the raw reply: {reason}"
+        );
+    }
+
+    #[test]
+    fn classify_not_done_with_multibyte_reason_does_not_panic() {
+        // Regression companion of the emoji-panic fix: a real NOT_DONE whose
+        // reason contains multi-byte chars must parse safely and keep the
+        // tail (no byte-slice anywhere in the path).
+        let parsed = classify_verifier_reply(Some("NOT_DONE: 💡缺测试"), false);
+        assert_eq!(
+            parsed.kind,
+            Some(GoalVerifierFailureKind::InsufficientEvidence)
+        );
+        assert!(parsed.missing_evidence.unwrap().contains("💡缺测试"));
+    }
+
+    #[test]
+    fn classify_missing_evidence_capped_at_200_chars() {
+        let long = "x".repeat(500);
+        let parsed = classify_verifier_reply(Some(&format!("NOT_DONE: {long}")), false);
+        let missing = parsed.missing_evidence.expect("missing");
+        assert_eq!(missing.chars().count(), VERIFIER_MISSING_EVIDENCE_CHARS);
+    }
+
+    #[test]
+    fn classify_not_done_without_colon_still_insufficient() {
+        // NOT_DONE followed directly by the reason (no colon) is still a
+        // semantic NOT_DONE verdict; the tail is the missing evidence.
+        let parsed = classify_verifier_reply(Some("NOT_DONE tests not run"), false);
+        assert_eq!(
+            parsed.kind,
+            Some(GoalVerifierFailureKind::InsufficientEvidence)
+        );
+        assert!(parsed.missing_evidence.unwrap().contains("tests not run"));
     }
 
     #[test]

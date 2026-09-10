@@ -285,6 +285,10 @@ impl ChannelManager {
 
     /// Start all channels and the outbound dispatcher.
     /// Consumes the BusPublisher to own the outbound receiver.
+    ///
+    /// Returns `Err` if the dispatcher cannot start (e.g. the outbound bus is
+    /// already closed). An `Err` is a fatal startup condition: channel
+    /// listeners already spawned keep running until the runtime shuts down.
     pub async fn start_all(&self, publisher: BusPublisher) -> Result<()> {
         // Decompose publisher: drop its in_tx so channels are the sole senders
         let inbound_tx = publisher.inbound_sender();
@@ -309,9 +313,17 @@ impl ChannelManager {
         // Drop extra inbound sender so bus closes when all channels stop
         drop(inbound_tx);
 
-        // Outbound dispatcher — routes messages to the correct channel
+        // Outbound dispatcher — routes messages to the correct channel.
+        // Reports startup readiness (or a dead outbound bus) via oneshot so
+        // start_all fails instead of silently running without routing.
         let channels = self.channels.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let dispatcher_handle = tokio::spawn(async move {
+            if out_rx.is_closed() {
+                let _ = ready_tx.send(Err("outbound bus closed before dispatcher start"));
+                return;
+            }
+            let _ = ready_tx.send(Ok(()));
             while let Some(msg) = out_rx.recv().await {
                 if let Some(channel) = channels.get(&msg.channel) {
                     if !msg.media.is_empty() {
@@ -372,7 +384,13 @@ impl ChannelManager {
             }
         });
 
-        Ok(())
+        match ready_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(eyre::eyre!("outbound dispatcher failed to start: {e}")),
+            Err(_) => Err(eyre::eyre!(
+                "outbound dispatcher task died before signaling readiness"
+            )),
+        }
     }
 
     /// Get a channel by name, for direct access (typing indicators, message editing).
@@ -478,6 +496,23 @@ mod tests {
         let messages = sent.lock().await;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], "hello from agent");
+    }
+
+    #[tokio::test]
+    async fn should_fail_start_all_when_outbound_senders_gone() {
+        let mgr = ChannelManager::new();
+        let (agent, publisher) = crate::bus::create_bus();
+        // Drop the only outbound sender: the dispatcher would exit on its
+        // first poll, so message routing can never run.
+        drop(agent);
+
+        let result = mgr.start_all(publisher).await;
+        let err = result.expect_err("start_all must fail when the outbound bus is already closed");
+        assert!(
+            err.to_string()
+                .contains("outbound dispatcher failed to start"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

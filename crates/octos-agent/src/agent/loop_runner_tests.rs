@@ -6949,6 +6949,57 @@ async fn should_not_emit_turn_failure_when_hook_denies_llm_call_under_failfast()
     );
 }
 
+/// #2249 — a `before_llm_call` deny is expected policy behaviour, not a
+/// harness bug: the classified error event must carry `variant="policy"
+/// recovery="expected"` so operator dashboards stop paging on it.
+#[tokio::test]
+#[cfg(unix)]
+async fn should_classify_hook_deny_as_policy_not_internal_bug() {
+    use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+
+    let dir = tempfile::tempdir().unwrap();
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysErrorProvider {
+        chat_calls: chat_calls.clone(),
+    });
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+        event: HookEvent::BeforeLlmCall,
+        command: vec!["false".into()],
+        timeout_ms: 5000,
+        tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
+    }]));
+    let sink_path = dir.path().join("harness-events.jsonl");
+    let agent = Agent::new(AgentId::new("hookdeny-policy"), provider, tools, memory)
+        .with_hooks(hooks)
+        .with_harness_event_sink(sink_path.to_string_lossy().into_owned());
+
+    let result = agent.run_task(&task_for("hi", dir.path())).await;
+
+    assert!(result.is_err(), "hook-deny must still bail with Err");
+    assert_eq!(
+        chat_calls.load(AtomicOrdering::SeqCst),
+        0,
+        "hook denied the call before the provider was reached"
+    );
+    let sink = std::fs::read_to_string(&sink_path).expect("error event written to sink");
+    let error_events: Vec<_> = sink
+        .lines()
+        .filter_map(|line| crate::harness_events::HarnessEvent::from_json_line(line).ok())
+        .filter_map(|event| match event.payload {
+            crate::harness_events::HarnessEventPayload::Error { data } => Some(data),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(error_events.len(), 1, "exactly one classified error event");
+    assert_eq!(error_events[0].variant, "policy");
+    assert_eq!(error_events[0].recovery, "expected");
+    assert!(error_events[0].message.contains("denied by hook"));
+}
+
 /// Records the message contents of every LLM call and returns EndTurn
 /// immediately. Used to assert what the model actually saw and that it was
 /// (or was not) called at all.

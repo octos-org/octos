@@ -3220,3 +3220,223 @@ async fn should_not_migrate_legacy_file_when_exporting_transcript() {
         "export must not create the per-user tree"
     );
 }
+
+/// Issue #2006: a torn tail (crash mid-write leaves a partial final line
+/// without a newline) must not fuse with the NEXT appended row — the fused
+/// line is unparseable and silently takes the complete row down with it.
+/// The append path seals the torn tail with the missing terminator first,
+/// so only the torn bytes are lost, never the row written after them.
+#[tokio::test]
+async fn torn_tail_does_not_eat_next_appended_message() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-append");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "before torn"))
+        .await
+        .unwrap();
+
+    // Simulate a crash mid-write: partial JSON row, no trailing newline.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(mgr.session_path(&key))
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+
+    mgr.add_message(&key, make_message(MessageRole::User, "after torn"))
+        .await
+        .unwrap();
+
+    // A fresh manager reloads from disk: the torn row is skipped, but the
+    // complete row appended after it must survive.
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["before torn", "after torn"],
+        "torn tail must not eat the next appended message"
+    );
+}
+
+/// Issue #2006: the same seal must protect the rollback control line —
+/// otherwise the marker fuses with a torn tail, is dropped on reload, and
+/// `/undo` un-does itself (the rolled-back turn resurrects).
+#[tokio::test]
+async fn torn_tail_does_not_eat_rollback_marker() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-rollback");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    for n in 1..=2 {
+        let tid = format!("t{n}");
+        let mut user = make_message(MessageRole::User, &format!("turn {n}"));
+        user.client_message_id = Some(tid.clone());
+        user.thread_id = Some(tid.clone());
+        mgr.add_message(&key, user).await.unwrap();
+        let mut asst = make_message(MessageRole::Assistant, &format!("reply {n}"));
+        asst.thread_id = Some(tid.clone());
+        mgr.add_message(&key, asst).await.unwrap();
+    }
+
+    // Crash mid-write leaves a torn tail right before the rollback marker.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(mgr.session_path(&key))
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+
+    let dropped = mgr.rollback_last_n_user_turns(&key, 1).await.unwrap();
+    assert_eq!(dropped, 1);
+
+    // Fresh reload replays the marker: turn 2 must stay rolled back.
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["turn 1", "reply 1"],
+        "rollback marker fused with a torn tail resurrects the rolled-back turn"
+    );
+}
+
+/// Issue #2006: the SessionHandle append path seals the same way.
+#[tokio::test]
+async fn torn_tail_does_not_eat_handle_appended_message() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-handle");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle
+        .add_message(Message::user("before torn"))
+        .await
+        .unwrap();
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(handle.session_path())
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+
+    handle
+        .add_message(Message::user("after torn"))
+        .await
+        .unwrap();
+
+    let reloaded = SessionHandle::open(tmp.path(), &key);
+    let contents: Vec<&str> = reloaded
+        .session()
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["before torn", "after torn"],
+        "torn tail must not eat the next handle-appended message"
+    );
+}
+
+/// Issue #2006: torn bytes that are actually a COMPLETE row missing only
+/// their terminator are preserved, never truncated — once sealed, the read
+/// path recovers the row (mirrors the supervisor store's
+/// `append_seals_a_complete_row_missing_its_trailing_newline`).
+#[tokio::test]
+async fn torn_tail_complete_row_is_recovered() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-complete-row");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "complete row"))
+        .await
+        .unwrap();
+
+    // Simulate the exact crash point: the row's bytes landed but its
+    // terminator did not — drop the trailing newline.
+    let path = mgr.session_path(&key);
+    let len = std::fs::metadata(&path).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+
+    mgr.add_message(&key, make_message(MessageRole::User, "after torn"))
+        .await
+        .unwrap();
+
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["complete row", "after torn"],
+        "a complete row that lost only its terminator must be recovered"
+    );
+}
+
+/// Issue #2006: when the per-user layout exists the rollback marker lands
+/// THERE (the production-canonical layout) — the seal must protect the
+/// marker on that file too.
+#[tokio::test]
+async fn torn_tail_does_not_eat_rollback_marker_in_per_user_layout() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-rollback-per-user");
+
+    // Seed via SessionHandle so the transcript lives in the per-user layout.
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    for n in 1..=2 {
+        let tid = format!("t{n}");
+        let mut user = make_message(MessageRole::User, &format!("turn {n}"));
+        user.client_message_id = Some(tid.clone());
+        user.thread_id = Some(tid.clone());
+        handle.add_message(user).await.unwrap();
+        let mut asst = make_message(MessageRole::Assistant, &format!("reply {n}"));
+        asst.thread_id = Some(tid.clone());
+        handle.add_message(asst).await.unwrap();
+    }
+
+    // Crash mid-write leaves a torn tail on the per-user file.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(handle.session_path())
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+    drop(handle);
+
+    // Roll back through a manager over the same dir: the marker targets the
+    // per-user file (the only layout present) and must survive the torn tail.
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let dropped = mgr.rollback_last_n_user_turns(&key, 1).await.unwrap();
+    assert_eq!(dropped, 1);
+
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["turn 1", "reply 1"],
+        "rollback marker on the per-user file must survive a torn tail"
+    );
+}

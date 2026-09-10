@@ -51,9 +51,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::autonomy::agent_orchestrator::{
-    InProcessAgentOrchestrator, default_agent_orchestrator, run_goal_completion_verifier_with_usage,
-};
+use crate::autonomy::agent_orchestrator::{InProcessAgentOrchestrator, default_agent_orchestrator};
 use crate::autonomy::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
 };
@@ -5428,39 +5426,60 @@ impl SessionActor {
             // the sentinel verifier (it runs outside the turn's routing scopes),
             // so a failover attributes to this session instead of publishing
             // unattributed. Autonomous turns are Normal policy → router only.
-            let (verdict, verifier_usage) = octos_llm::with_router_context(
+            // evo-goal-verifier: the wrapper owns gate/charge/retry/ledger;
+            // per-attempt usage is charged inside it, so nothing is charged
+            // here anymore.
+            let outcome = octos_llm::with_router_context(
                 octos_llm::RouterContext {
                     session_id: Some(self.session_key.to_string()),
                     ..Default::default()
                 },
-                run_goal_completion_verifier_with_usage(
+                orchestrator.verify_goal_completion_bounded(
+                    &self.session_key,
+                    profile_id,
+                    &snapshot,
                     verifier_provider,
-                    &snapshot.objective,
                     &assistant_tail,
+                    Some(self.data_dir.as_path()),
                 ),
             )
             .await;
-            // #1958 — the verifier call is real goal spend: fold it into the
-            // goal's tokens_used BEFORE `maybe_complete_goal_from_model` can
-            // flip the goal (a `complete` goal can no longer be charged).
-            // `record_goal_turn` above only charged the turn's own tokens.
-            let _ = orchestrator.charge_goal_verifier_usage(
-                &self.session_key,
-                profile_id,
-                Some(&snapshot.goal_id),
-                &verifier_usage,
-            );
             if orchestrator.maybe_complete_goal_from_model(
                 &self.session_key,
                 profile_id,
                 &assistant_tail,
-                &verdict,
+                &outcome.verdict,
                 &snapshot,
                 // #1957 (codex #1) — this interactive-chat goal path carries the
                 // profile data dir, so a sentinel completion syncs to the ledger.
                 Some(self.data_dir.as_path()),
             ) {
                 return;
+            }
+            // evo-goal-verifier M1 (cross A1): a claimed-but-UNVERIFIED
+            // completion must surface the structured failure kind on the
+            // sentinel path too — session_actor previously dropped
+            // `outcome.kind` entirely. The canonical Display line keeps the
+            // format identical to goal_update's ToolResult output.
+            if !outcome.is_done() {
+                tracing::warn!(
+                    session_id = %self.session_key,
+                    goal_id = %snapshot.goal_id,
+                    "sentinel goal completion not verified: {outcome}"
+                );
+                let note = format!("goal completion not verified — {outcome}");
+                {
+                    let mut handle = self.session_handle.lock().await;
+                    handle.push_message_in_memory(octos_core::Message::system(note.clone()));
+                }
+                // Canonical durable append (per-key lock → fresh open →
+                // seq'd write), mirroring `persist_assistant_message`.
+                let _ = octos_bus::session::persist_message_through_canonical_path(
+                    &self.data_dir,
+                    &self.session_key,
+                    octos_core::Message::system(note),
+                )
+                .await;
             }
         }
         // Re-queue another continuation only if we are still idle AND
@@ -10248,3 +10267,79 @@ fn format_thinking_prefix(reasoning: Option<&str>) -> String {
 #[cfg(test)]
 #[path = "session_actor_tests.rs"]
 mod tests;
+
+/// evo-goal-verifier GAP-6/7 test hook: construct a SessionActor directly
+/// with the pieces the goal-accountant path reads (session_handle, verifier
+/// lane, data_dir) so the REAL `maybe_advance_goal_runtime_after_turn` can
+/// be driven end-to-end without a full registry bootstrap.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments, private_interfaces)]
+pub(crate) fn session_actor_for_goal_test(
+    session_key: SessionKey,
+    agent: Arc<Agent>,
+    session_handle: Arc<Mutex<SessionHandle>>,
+    out_tx: mpsc::Sender<OutboundMessage>,
+    inbox: mpsc::Receiver<ActorMessage>,
+    self_tx: mpsc::Sender<ActorMessage>,
+    data_dir: std::path::PathBuf,
+    goal_verifier_llm: Option<Arc<dyn LlmProvider>>,
+) -> SessionActor {
+    let (dummy_spawn_tx, _dummy_spawn_rx): (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<ActorMessage>,
+    ) = mpsc::channel(1);
+    let actor = SessionActor {
+        session_key,
+        channel: "api".to_owned(),
+        chat_id: String::new(),
+        tenant_id: None,
+        inbox,
+        agent,
+        hooks: None,
+        hook_context: None,
+        session_handle,
+        out_tx,
+        status_indicator: None,
+        sender_user_id: None,
+        user_status_config: UserStatusConfig::default(),
+        data_dir: data_dir.clone(),
+        usage_ledger: None,
+        session_usage: octos_agent::SharedSessionUsage::default(),
+        max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+        idle_timeout: Duration::from_secs(60),
+        session_timeout: Duration::from_secs(120),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        global_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        queue_mode: QueueMode::Followup,
+        responsiveness: ResponsivenessObserver::new(),
+        adaptive_router: None,
+        lane_routing: None,
+        memory_store: None,
+        usage_profile_id: "gap67-prof".to_owned(),
+        active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        overflow_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        active_sessions: Arc::new(RwLock::new(
+            ActiveSessionStore::open(std::path::Path::new("/tmp/octos-gap67-active-sessions"))
+                .expect("active session store"),
+        )),
+        user_workspace: data_dir.clone(),
+        cron_tool: None,
+        self_tx,
+        pending_approvals: HumanPendingApprovalStore::default(),
+        approvals_audit: Arc::new(crate::approvals_audit::ApprovalsAuditLog::new(
+            &data_dir,
+            crate::approvals_audit::ApprovalsAuditConfig::from_env(),
+        )),
+        persistent_retry_state: Arc::new(std::sync::Mutex::new(LoopRetryState::default())),
+        context_manager: Arc::new(std::sync::Mutex::new(ContextManager::new("gap67", None))),
+        retry_state_path: Some(data_dir.clone().join("retry_state.json")),
+        recovered_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        consecutive_recovery_turns: Arc::new(std::sync::Mutex::new(0)),
+        current_command_cmid: None,
+        last_turn_total_tokens: 0,
+        goal_verifier_llm,
+    };
+    let _ = dummy_spawn_tx;
+    actor
+}

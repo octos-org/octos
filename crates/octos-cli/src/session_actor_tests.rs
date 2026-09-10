@@ -10674,3 +10674,131 @@ async fn gateway_terminal_dual_sink_installer_ignores_sessionless_reentry() {
     );
     assert_eq!(runtime.pending_continuation_count_for_test(), 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// evo-goal-verifier GAP-6/7 (spec Filters: sentinel_paths_keep_goal_active_
+// on_empty_response / session_actor_sentinel_reports_verifier_failure_kind)
+// — REAL session_actor path: factory-wired goal_verifier_llm whose replies
+// are empty, a claimed completion, and the post-turn goal accountant
+// (`maybe_advance_goal_runtime_after_turn`) must (a) keep the goal ACTIVE
+// and (b) surface the structured kind in a durable system note.
+// ─────────────────────────────────────────────────────────────────────────
+struct EmptyReplyVerifier;
+
+#[async_trait::async_trait]
+impl LlmProvider for EmptyReplyVerifier {
+    async fn chat(
+        &self,
+        _m: &[octos_core::Message],
+        _t: &[octos_llm::ToolSpec],
+        _c: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        Ok(octos_llm::ChatResponse {
+            content: None,
+            reasoning_content: Some("thinking…".to_owned()),
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: octos_llm::TokenUsage {
+                input_tokens: 3,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            provider_index: None,
+        })
+    }
+    fn model_id(&self) -> &str {
+        "empty-verifier"
+    }
+    fn provider_name(&self) -> &str {
+        "empty-verifier"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_sentinel_reports_verifier_failure_kind() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let task_store = SessionTaskQueryStore::default();
+    let (mut factory, _out_tx, _out_rx) =
+        build_minimal_actor_factory(&dir, task_store, Some("gap67-prof".to_owned())).await;
+    // Wire the empty-reply verifier into the REAL factory field the
+    // session_actor reads at :5422 — no wrapper shortcut.
+    factory.goal_verifier_llm = Some(Arc::new(EmptyReplyVerifier));
+
+    // Set an active goal for the session the actor will own.
+    let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+    let key = octos_core::SessionKey("gap67-prof:api:gap67-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "gap67-prof".to_owned(),
+            objective: "surface failure kind".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let snapshot_before = orchestrator
+        .goal_verification_snapshot(&key, "gap67-prof")
+        .expect("snapshot before");
+
+    // Drive the actor's real post-turn goal accountant with a CLAIMED
+    // completion in the session history: `maybe_advance_goal_runtime_after_
+    // turn` reads the assistant tail, detects the claim, runs the wired
+    // verifier (empty replies → empty_response, 2/2 attempts), refuses the
+    // completion, and appends the structured system note.
+    let mut session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    session_handle
+        .session_mut()
+        .messages
+        .push(octos_core::Message::assistant(
+            "All tasks complete. <goal:complete>",
+        ));
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+
+    // Build the actor via the registry spawn path.
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("gap67-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        factory.goal_verifier_llm.clone(),
+    );
+    let mut actor = actor;
+    actor
+        .maybe_advance_goal_runtime_after_turn("gap67-prof", None, std::time::Instant::now())
+        .await;
+
+    // (a) the goal stays ACTIVE — an unverified claim never flips it.
+    let after = orchestrator
+        .goal_verification_snapshot(&key, "gap67-prof")
+        .expect("snapshot after");
+    assert_eq!(after.goal_id, snapshot_before.goal_id, "goal not flipped");
+    // (b) the structured failure kind is surfaced in the durable session
+    // history via the canonical Display line.
+    let guard = actor.session_handle.lock().await;
+    let surfaced = guard.session().messages.iter().any(|m| {
+        m.role == octos_core::MessageRole::System
+            && m.content.contains("verifier empty_response (attempt 2/2)")
+    });
+    assert!(
+        surfaced,
+        "session_actor sentinel path must append the structured failure note"
+    );
+    drop(guard);
+}

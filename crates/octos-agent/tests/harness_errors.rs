@@ -230,6 +230,7 @@ fn should_count_errors_per_variant_in_metrics() {
         "plugin_timeout",
         "plugin_protocol",
         "delegate_depth_exceeded",
+        "policy",
         "internal",
     ] {
         assert!(
@@ -265,6 +266,38 @@ fn should_classify_403_quota_as_quota_with_provider_label() {
     // failing the turn (pre-27b this asserted FailFast).
     assert_eq!(classified.recovery_hint(), RecoveryHint::SwitchProvider);
     assert!(classified.message().contains("MiniMax-M2.5-highspeed"));
+}
+
+#[test]
+fn should_classify_hook_deny_as_policy_not_bug() {
+    // #2249 — a `before_llm_call` hook deny escapes the LLM call as a typed
+    // `HookDeniedError` report. It is expected policy behaviour, not a
+    // harness fault: it must classify `variant=policy recovery=expected`
+    // instead of `variant=internal recovery=bug`, so operator dashboards
+    // stop paging on policy decisions.
+    let report: eyre::Report = octos_agent::hooks::HookDeniedError {
+        reason: "no network calls today".into(),
+    }
+    .into();
+    let classified = HarnessError::classify_report(&report, None);
+    assert!(
+        matches!(classified, HarnessError::PolicyDeny { .. }),
+        "expected PolicyDeny, got {classified:?}"
+    );
+    assert_eq!(classified.variant_name(), "policy");
+    assert_eq!(classified.recovery_hint(), RecoveryHint::Expected);
+    assert!(classified.message().contains("no network calls today"));
+
+    // The emitted event stays schema-conformant and round-trips.
+    let event = classified.to_event("s", "t", None, None);
+    let json = serde_json::to_string(&event).expect("serialize");
+    let restored = HarnessEvent::from_json_line(&json).expect("round-trip");
+    let HarnessEventPayload::Error { data } = restored.payload else {
+        panic!("expected Error payload");
+    };
+    assert_eq!(data.variant, "policy");
+    assert_eq!(data.recovery, "expected");
+    assert_eq!(data.schema_version, HARNESS_ERROR_SCHEMA_VERSION);
 }
 
 #[test]

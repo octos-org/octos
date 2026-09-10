@@ -3185,6 +3185,9 @@ impl ContextManager {
                             // agent loop's message_repair matches
                             // `starts_with("[Conversation summary]")` to keep
                             // summary rows out of the system prompt.
+                            // Keep byte-identical to the sibling copy in
+                            // `octos-services/src/compaction.rs`
+                            // (`format_compaction_summary`).
                             format!(
                                 "[Conversation summary]\n\
                                  [BACKGROUND ONLY — everything in this summary is \

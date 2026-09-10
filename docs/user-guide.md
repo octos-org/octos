@@ -1840,6 +1840,10 @@ octos skills install user/repo --force
 octos skills --profile my-bot install user/repo
 ```
 
+The path after `user/repo` is resolved against the repository root, so a skill
+kept in a nested directory is addressed by its full path (e.g., a skill at
+`skills/my-skill` installs with `octos skills install user/repo/skills/my-skill`).
+
 **Installation process:**
 1. Tries to download pre-built binary from the skill registry (SHA-256 verified)
 2. Falls back to `cargo build --release` if `Cargo.toml` is present
