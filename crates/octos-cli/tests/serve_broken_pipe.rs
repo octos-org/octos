@@ -15,14 +15,20 @@
 //! `cargo test -p octos-cli --features api --test serve_broken_pipe -- --test-threads=1`
 
 // Process-control tests require libc pipe/kill/setsid — unsafe is inherent.
-// #39 — the whole `imp` module is unix-only BY ORIGINAL DESIGN (libc pipes,
+// #39 — the test module is unix-only BY ORIGINAL DESIGN (libc pipes,
 // raw-fd Stdio, SIGINT/SIGKILL): the #37 hardening broke the cfg structure
 // by leaving the imports and several `libc::` call sites outside any gate
 // (E0432/E0433 on Windows). Gate the entire module so the file compiles on
-// Windows with the SAME existence shape as before #37: no tests, no imp.
+// Windows with the SAME existence shape as before #37: no tests, no module.
+// The module is named `serve_broken_pipe` so every test name carries the
+// target name: the broad CI integration step excludes these
+// process-spawning e2e with `--skip serve_broken_pipe` (they run in the
+// dedicated serial step below it), and --skip matches test names, not
+// target names — under the old `imp` name the filter silently matched
+// nothing and the e2e leaked into the parallel step, flaking under load.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-mod imp {
+mod serve_broken_pipe {
     use std::os::fd::FromRawFd;
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
