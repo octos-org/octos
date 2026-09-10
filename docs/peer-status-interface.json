@@ -4,7 +4,7 @@
   "spec": "specs/task-evo-peer-turn-status.spec.md",
   "change_note": "v2 依外层复核：删除并行 turn-state.json 设计，current 执行/身份改为 lifetime.json 只读安全投影；outcome 恒取 turns.txt 终止证据；closed 表现为 execution=closed 而非 idle；身份含 task/generation/turn_id；契约文件移入 tracked docs/。",
   "producer": {
-    "cli_command": "octos peer list [--json] [--data-dir DIR]",
+    "cli_command": "octos peer list [--json] [--data-dir DIR] [--profile ID]",
     "tool": "peer_list (serve)",
     "assembly": "crates/octos-cli/src/commands/peer.rs::list_peers（CLI JSON/表格共用）；crates/octos-cli/src/peers/mod.rs（投影 + blackboard + compose_peer_list_text）"
   },
@@ -13,7 +13,7 @@
     "authority_outcome": "peers/<slug>/turns.txt 最后一条 '<round> <outcome> <ts>'（与最高编号 result-<n>.md 互为印证）；result.md 正文不作成功证据",
     "lifecycle": "peers/<slug>/closed — 终态标记，status=closed 且 execution=closed（不代表上一执行成功，last_outcome 保留）"
   },
-  "identity_fields_note": "master_session_id/task_id/generation/turn_id 来自可信 lifetime 投影（master_session_id=lifetime.master）。消费端以 runtime/master_session_id/slug/task_id/generation/turn_id 关联，防跨 runtime/同 slug 串线。不可信或缺失时为 null；closed 分支同样全部 null（closed 标记优先于投影，身份不随 closed 保留——保守契约）。",
+  "identity_fields_note": "master_session_id/task_id/generation/turn_id 来自可信 lifetime 投影（master_session_id=lifetime.master）。消费端以 runtime/master_session_id/slug/task_id/generation/turn_id 关联，防跨 runtime/同 slug 串线。不可信或缺失时为 null；closed 分支同样走同一完整信任校验（registry_key/writer 形状/非空身份/Idle digest 重算）——通过则保留身份供终止事件关联，未通过则 null，closed 标记不绕过校验。",
   "output_fields": {
     "slug": "String",
     "status": "running | done | closed — 不变：目录交付语义（done=result 文件存在）",
@@ -47,7 +47,7 @@
   "known_limitations": {
     "gateway_inbox_path": "session_actor.rs 的 gateway in-process inbox 直投路径无 begin_peer_lifetime_turn（代码事实核实 2026-09-09）：该路径 round2 从 queued 直达 terminal，无 running 中间态。呈现按投影如实输出。",
     "crash_window": "真实写序（ui_protocol_transport.rs）：result.md → lifetime(finish_peer_lifetime_turn) → result-<n>.md → turns.txt。各点崩溃呈现：finish 前崩溃 → 投影仍 Running（孤儿 Running 语义见 begin_crash_orphan_running）；finish 后、turns append 前崩溃 → phase 已 Idle/Pending/Failed，呈现 idle/queued/failed，last_outcome 取决于 turns 尾行与最高 result-<n>.md 互证结果——尾行尚未更新时可能为旧 outcome 或 null（双侧不一致即 null），不绝对保留旧值。不用时间戳裁决。",
-    "idle_no_turns": "lifetime=Idle 且 turns.txt 空（测试工厂可构造）→ execution=idle, last_outcome=null, round=0。合法组合。",
+    "idle_no_turns": "lifetime=Idle 且 turns.txt 空（测试工厂可构造）→ execution=idle、last_outcome=null。round 取 rounds_delivered：可信 Idle 必有 result.md（digest 绑定），故裸 result 下限使 round>=1，历史示例 round=0 不可达。",
     "digest_mismatch_test": "反例测试必须包含 nonempty 但不匹配的 digest（peer_list_idle_digest_mismatch_degrades_to_unknown）。",
     "begin_crash_orphan_running": "begin_peer_lifetime_turn 后、terminal 前崩溃 → 盘上残留 phase=Running。跨重启恢复扫描不处理 Running（仅 closed 退休与 Idle 摘要重绑）；孤儿 Running 保持 running 呈现直到真实生命周期更新，无自动降级，可能长期呈 running。"
   },
@@ -56,5 +56,8 @@
   "clarifications": {
     "round_on_terminal_phases": "idle/failed 时若有严格终止证据（turns 尾行 × 最高 result-<n>.md 互证）则取该证据的轮号，否则 rounds_delivered；正常连续编号盘面两者恒等。（GLM 首审 LOW#3 裁决采纳：保留实现的更大信息量，契约措辞对齐）",
     "legacy_bare_only_outcome": "last_outcome 需要 result-<n>.md 印证（Side B）；bare-only（仅 result.md+turns.txt）legacy 盘面为 null——保守方向，不 assert 无印证的 outcome。（GLM 首审 LOW#4 裁决采纳）"
-  }
+  },
+  "spec_revision": "v3.1（冻结合约代次；与 schema version 不同维度）",
+  "versioning_note": "schema \"version\" 是输出字段集版本（新增/变更字段才 bump，当前 2）；\"spec_revision\" 是冻结合约代次（当前 v3.1）。两者独立演进：行为语义澄清（如 closed 身份保留）不改字段集，故不 bump version。",
+  "serve_text_note": "serve 的 peer_list 索引文本（compose_peer_list_text）实际对全部列表行（done/awaiting_input/running 等）附 `exec=<execution|?>` 与 `outcome=<last_outcome>` 后缀（closed 且无 outcome 的行除外）——是 spec 94 行'done 行追加'描述的实际超集；行形状对既有读者稳定。"
 }
