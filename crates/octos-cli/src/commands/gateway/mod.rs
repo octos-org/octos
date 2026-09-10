@@ -562,6 +562,41 @@ mod tests {
     }
 
     #[test]
+    fn matrix_user_settings_default_mention_policy_strict_and_parse_open() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Strict
+        );
+
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            MATRIX_SETTING_MENTION_POLICY: "open",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Open
+        );
+
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            MATRIX_SETTING_MENTION_POLICY_CAMEL: "open",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Open
+        );
+    }
+
+    #[test]
     fn matrix_user_settings_require_credentials() {
         let entry = matrix_entry(serde_json::json!({
             MATRIX_SETTING_MODE: MATRIX_MODE_USER,
