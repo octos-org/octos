@@ -4126,6 +4126,7 @@ fn golden_session_hydrate_result_serde() {
         pending_questions: Some(vec![sample_user_question_requested_event()]),
         replayed_envelopes: Some(vec![]),
         replayed_tool_envelopes: Some(vec![]),
+        replayed_projection_envelopes: Some(vec![]),
     };
     let value = serde_json::to_value(&result).expect("serialize hydrate result");
     let parsed: SessionHydrateResult =
