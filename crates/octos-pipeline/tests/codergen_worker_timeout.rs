@@ -89,8 +89,19 @@ async fn codergen_timeout_secs_cancels_stalled_worker() {
         "unexpected outcome: {}",
         outcome.content
     );
+    // #1932 — the ceiling's job is to prove the timeout is not WEDGED (a
+    // regression there hangs on the provider's 3_600s sleep, three orders of
+    // magnitude out). The fixed overhead on top of the 1s timeout is machine
+    // weather: 13ms measured on a fast dev host, but 620–730ms SOLO on the
+    // Windows Server runner that reported the flake (1.62s/1.63s/1.73s solo
+    // against the old 1_750ms ceiling — a ~20ms margin any suite-level load
+    // consumed). 5s still catches a unit-scale regression (secs↔minutes =
+    // 60s); what it no longer catches on fast hosts is a 2–4x wrong-scale
+    // timeout, a trade-off any ceiling above ~2.7s accepts — and on the
+    // runner that flaked, 1_750ms never had that coverage either (2s + 730ms
+    // overhead already exceeds it).
     assert!(
-        elapsed < Duration::from_millis(1_750),
+        elapsed < Duration::from_secs(5),
         "worker timeout should trip promptly, got {elapsed:?}"
     );
 }
