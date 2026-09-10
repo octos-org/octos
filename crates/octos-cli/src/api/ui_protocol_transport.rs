@@ -34706,6 +34706,13 @@ async fn run_standalone_turn(
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
         request_agent = request_agent.with_hooks(hooks);
     }
+    // #2246 — the per-turn rebuild starts from `Agent::new_shared`, so the
+    // bootstrap agent's hook context does not carry over; re-apply it here
+    // (same ids the session's spawn tool receives above).
+    request_agent = request_agent.with_hook_context(octos_agent::HookContext {
+        session_id: Some(session_id.to_string()),
+        profile_id: Some(session_runtime.profile.profile_id.clone()),
+    });
     // Phase 3-A plumbing follow-up (Phase 1 gap): propagate the
     // `SessionScope` the cached `SessionRuntime` constructed at
     // `runtime/session.rs::bootstrap` onto this per-turn rebuilt agent.

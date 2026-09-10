@@ -43268,3 +43268,29 @@ async fn ui_transport_autonomous_consumer_emits_verifier_warning_wire_shape() {
         "an unverified claim never completes the goal"
     );
 }
+
+/// #2246 — structural guard: `run_standalone_turn` rebuilds the turn agent
+/// from `Agent::new_shared`, so the bootstrap agent's hook context does not
+/// carry over; the re-application must stay wired (this is the path
+/// `octos chat` / `serve --stdio` actually serve turns on, and the one the
+/// issue reporter observed empty `session_id`/`profile_id` through).
+#[test]
+fn standalone_turn_reapplies_hook_context() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/ui_protocol_transport.rs");
+    let text = std::fs::read_to_string(&path).expect("read ui_protocol_transport.rs");
+    let start = text
+        .find("async fn run_standalone_turn")
+        .expect("run_standalone_turn exists");
+    let body = &text[start..];
+    let hooks_at = body
+        .find("request_agent = request_agent.with_hooks(hooks);")
+        .expect("run_standalone_turn attaches the profile hook executor");
+    let ctx_at = body.find("request_agent.with_hook_context(").expect(
+        "run_standalone_turn must re-apply the hook context onto the per-turn agent (#2246)",
+    );
+    assert!(
+        ctx_at > hooks_at,
+        "hook context must be re-applied alongside the hook executor wiring"
+    );
+}

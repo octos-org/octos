@@ -674,6 +674,16 @@ impl SessionRuntime {
             agent = agent.with_hooks(hooks);
         }
 
+        // #2246 — populate the hook payload context at session construction,
+        // where both ids are known; before this, chat/serve-stdio turns fired
+        // `before_llm_call` / `after_llm_call` / `after_tool_call` payloads
+        // with no `session_id` / `profile_id` (gateway sessions were already
+        // covered via `ActorFactory::hook_context_template`).
+        agent = agent.with_hook_context(octos_agent::HookContext {
+            session_id: Some(session_key.to_string()),
+            profile_id: Some(profile.profile_id.clone()),
+        });
+
         // RFC-1 (issue #1290): same pattern for the `mofa_make`
         // dispatcher. The loader registered it but its `Weak<ToolRegistry>`
         // back-reference needs the Arc-wrapped registry; we plant it here.
@@ -2199,6 +2209,39 @@ tools = ["read_file"]
             Arc::ptr_eq(&agent_hooks, &executor),
             "agent.hooks() must be the same Arc as profile.hook_executor",
         );
+    }
+
+    /// #2246 — the session agent's hook context must carry both ids at
+    /// session construction: before this, `octos chat` / `serve --stdio`
+    /// fired `before_llm_call` / `after_llm_call` / `after_tool_call`
+    /// payloads with no `session_id` / `profile_id`, leaving per-session
+    /// hook policy (budget, rate limit, audit) stateless-blind.
+    #[tokio::test]
+    async fn session_runtime_agent_carries_hook_context_ids() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let hook = octos_agent::HookConfig {
+            event: octos_agent::HookEvent::BeforeLlmCall,
+            command: vec!["/bin/true".to_string()],
+            timeout_ms: 1000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = Arc::new(octos_agent::HookExecutor::new(vec![hook]));
+        let profile = make_profile_with_hooks(data_dir, executor).await;
+
+        let key = SessionKey::new("api", "hook-probe");
+        let rt = SessionRuntime::bootstrap(&profile, key.clone(), None)
+            .await
+            .expect("bootstrap");
+
+        let ctx = rt
+            .agent
+            .hook_context()
+            .expect("session agent must carry a hook context (#2246)");
+        assert_eq!(ctx.session_id.as_deref(), Some(key.to_string().as_str()));
+        assert_eq!(ctx.profile_id.as_deref(), Some("_main"));
     }
 
     #[tokio::test]

@@ -1200,6 +1200,13 @@ impl Agent {
         self.hooks.clone()
     }
 
+    /// Returns the session-level context injected into hook payloads, if
+    /// any. Counterpart to [`Self::hooks`] — the runtime layer uses it to
+    /// assert the context survives session construction (#2246).
+    pub fn hook_context(&self) -> Option<HookContext> {
+        self.hook_ctx()
+    }
+
     /// Set session-level context for hook payloads.
     pub fn with_hook_context(self, ctx: HookContext) -> Self {
         *self.hook_context.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
