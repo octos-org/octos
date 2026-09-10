@@ -52,6 +52,10 @@ const DM_PROBE_CACHE_TTL: Duration = Duration::from_secs(60);
 /// How long a FAILED probe suppresses further probes; the failure itself
 /// still fails open (answer) on every candidate message.
 const DM_PROBE_FAILURE_CACHE_TTL: Duration = Duration::from_secs(10);
+/// Bound on a single `joined_members` probe request. Unlike `/sync` the probe
+/// has no server-side backstop, so without this a hung homeserver would stall
+/// the forward loop on the first suppression candidate.
+const DM_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Matrix invite auto-join policy.
 ///
@@ -133,10 +137,10 @@ struct ParsedMessage {
     body: String,
     event_id: Option<String>,
     mentioned_self: bool,
-    /// The message carries explicit user mentions (`m.mentions`, a matrix.to
-    /// pill, or a hand-typed MXID) and at least one of them targets a user
-    /// other than this bot.
-    mentions_other: bool,
+    /// Users other than this bot explicitly mentioned by the message
+    /// (`m.mentions`, a matrix.to pill, or a hand-typed MXID). Empty when
+    /// only the bot (or nobody) is addressed.
+    other_mentions: Vec<String>,
 }
 
 /// A room invite extracted from `/sync`.
@@ -380,14 +384,14 @@ fn parse_sync(payload: &Value, self_user_id: &str) -> ParsedSync {
                     .map(str::to_owned);
                 let mentioned_self = content_mentions_user(content, self_user_id)
                     || contains_matrix_user_id_mention(body, self_user_id);
-                let mentions_other = content_mentions_other_user(content, body, self_user_id);
+                let other_mentions = content_other_mentions(content, body, self_user_id);
                 messages.push(ParsedMessage {
                     room_id: room_id.clone(),
                     sender: sender.to_owned(),
                     body: body.to_owned(),
                     event_id,
                     mentioned_self,
-                    mentions_other,
+                    other_mentions,
                 });
             }
         }
@@ -500,47 +504,55 @@ fn content_mentions_user(content: &Value, user_id: &str) -> bool {
         .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(user_id)))
 }
 
-/// Whether the message explicitly mentions at least one user other than
-/// `self_user_id`, via a structured `m.mentions` entry, a matrix.to pill in
-/// `formatted_body`, or a hand-typed MXID in the plain body.
+/// The users other than `self_user_id` explicitly mentioned by the message,
+/// via a structured `m.mentions` entry, a matrix.to pill in `formatted_body`,
+/// or a hand-typed MXID in the plain body.
 ///
 /// Rich-reply context is not explicit addressing: clients auto-include the
 /// replied-to sender in `m.mentions` and embed an `<mx-reply>` fallback with
 /// a matrix.to pill plus `> `-quoted lines. All three are stripped first, so
 /// a reply that addresses the bot by name is still answered.
-fn content_mentions_other_user(content: &Value, body: &str, self_user_id: &str) -> bool {
+fn content_other_mentions(content: &Value, body: &str, self_user_id: &str) -> Vec<String> {
     let replied_to = reply_fallback_sender(content, body);
-    let is_other = |id: &str| {
-        !id.eq_ignore_ascii_case(self_user_id)
-            && replied_to.is_none_or(|rt| !id.eq_ignore_ascii_case(rt))
+    let mut mentions: Vec<String> = Vec::new();
+    let mut push = |id: &str| {
+        if id.eq_ignore_ascii_case(self_user_id)
+            || replied_to.is_some_and(|rt| id.eq_ignore_ascii_case(rt))
+            || mentions.iter().any(|m| m.eq_ignore_ascii_case(id))
+        {
+            return;
+        }
+        mentions.push(id.to_owned());
     };
 
     if let Some(ids) = content
         .get("m.mentions")
         .and_then(|m| m.get("user_ids"))
         .and_then(Value::as_array)
-        && ids.iter().filter_map(Value::as_str).any(&is_other)
     {
-        return true;
+        for id in ids.iter().filter_map(Value::as_str) {
+            push(id);
+        }
     }
 
     if let Some(formatted_body) = content.get("formatted_body").and_then(Value::as_str) {
         let mut rest = strip_mx_reply(formatted_body);
         while let Some(at) = rest.find("matrix.to/#/@") {
             rest = &rest[at + "matrix.to/#/".len()..];
-            if let Some(mxid) = scan_mxid(rest, 0)
-                && is_other(mxid)
-            {
-                return true;
+            if let Some(mxid) = scan_mxid(rest, 0) {
+                push(mxid);
             }
         }
     }
 
-    text_mentions_other_user(
+    for id in text_other_mentions(
         strip_reply_fallback(content, body),
         self_user_id,
         replied_to,
-    )
+    ) {
+        push(&id);
+    }
+    mentions
 }
 
 /// The MXID a rich reply falls back to, if this event is a reply
@@ -641,12 +653,13 @@ fn is_mxid_server_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')
 }
 
-/// Whether `text` contains a hand-typed MXID mention targeting a user other
-/// than `self_user_id` (and, inside a reply, other than the replied-to
-/// sender). The `@` must start a token (preceded by whitespace or opening
+/// The hand-typed MXID mentions in `text` targeting users other than
+/// `self_user_id` (and, inside a reply, other than the replied-to sender).
+/// The `@` must start a token (preceded by whitespace or opening
 /// punctuation) so email addresses do not count.
-fn text_mentions_other_user(text: &str, self_user_id: &str, replied_to: Option<&str>) -> bool {
+fn text_other_mentions(text: &str, self_user_id: &str, replied_to: Option<&str>) -> Vec<String> {
     let bytes = text.as_bytes();
+    let mut mentions: Vec<String> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'@' {
@@ -659,15 +672,18 @@ fn text_mentions_other_user(text: &str, self_user_id: &str, replied_to: Option<&
             .is_none_or(|c| c.is_whitespace() || matches!(c, '<' | '(' | '['));
         if before_ok && let Some(mxid) = scan_mxid(text, i) {
             let is_replied_to = replied_to.is_some_and(|rt| mxid.eq_ignore_ascii_case(rt));
-            if !mxid.eq_ignore_ascii_case(self_user_id) && !is_replied_to {
-                return true;
+            if !mxid.eq_ignore_ascii_case(self_user_id)
+                && !is_replied_to
+                && !mentions.iter().any(|m| m.eq_ignore_ascii_case(mxid))
+            {
+                mentions.push(mxid.to_owned());
             }
             i += mxid.len();
             continue;
         }
         i += 1;
     }
-    false
+    mentions
 }
 
 fn contains_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
@@ -808,6 +824,12 @@ pub struct MatrixUserChannel {
     /// [`DM_PROBE_CACHE_TTL`]; failed probes (`None`) are cached only for
     /// [`DM_PROBE_FAILURE_CACHE_TTL`] and keep failing open.
     dm_probe_cache: Mutex<HashMap<String, (Option<bool>, Instant)>>,
+    /// Rooms whose first mention-gate suppression was already logged at info.
+    /// The gate flips pre-#1547 behaviour for `require_mention: false`
+    /// deployments, so the first suppression per room is announced at info
+    /// (with the policy and the mention set) for operators to notice;
+    /// repeats stay at debug to avoid log spam on a busy room.
+    suppression_logged_rooms: Mutex<HashSet<String>>,
     shutdown: Arc<AtomicBool>,
     http: reqwest::Client,
     dedup: Arc<MessageDedup>,
@@ -865,6 +887,7 @@ impl MatrixUserChannel {
                 .collect(),
             direct_rooms: Mutex::new(HashSet::new()),
             dm_probe_cache: Mutex::new(HashMap::new()),
+            suppression_logged_rooms: Mutex::new(HashSet::new()),
             shutdown,
             http: matrix_http_client(),
             dedup: Arc::new(MessageDedup::new()),
@@ -1207,31 +1230,48 @@ impl MatrixUserChannel {
             "/_matrix/client/v3/rooms/{}/joined_members",
             percent_encode_path(room_id)
         ));
-        let resp = match self
-            .http
-            .get(&url)
-            .bearer_auth(&resolved.access_token)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                debug!(room_id, error = %e, "Matrix joined_members probe failed for mention gate");
+        // One deadline for the whole exchange (connect, request, headers,
+        // body): a trickling homeserver must not stretch the stall past
+        // `DM_PROBE_TIMEOUT` either.
+        let body = tokio::time::timeout(DM_PROBE_TIMEOUT, async {
+            let resp = match self
+                .http
+                .get(&url)
+                .bearer_auth(&resolved.access_token)
+                .send()
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    debug!(room_id, error = %e, "Matrix joined_members probe failed for mention gate");
+                    return None;
+                }
+            };
+            if !resp.status().is_success() {
+                debug!(
+                    room_id,
+                    status = resp.status().as_u16(),
+                    "Matrix joined_members probe returned non-success for mention gate"
+                );
                 return None;
             }
-        };
-        if !resp.status().is_success() {
-            debug!(
-                room_id,
-                status = resp.status().as_u16(),
-                "Matrix joined_members probe returned non-success for mention gate"
-            );
-            return None;
-        }
-        let body: Value = match resp.json().await {
-            Ok(body) => body,
-            Err(e) => {
-                debug!(room_id, error = %e, "failed to parse joined_members for mention gate");
+            match resp.json::<Value>().await {
+                Ok(body) => Some(body),
+                Err(e) => {
+                    debug!(room_id, error = %e, "failed to parse joined_members for mention gate");
+                    None
+                }
+            }
+        })
+        .await;
+        let body: Value = match body {
+            Ok(Some(body)) => body,
+            Ok(None) => return None,
+            Err(_) => {
+                debug!(
+                    room_id,
+                    "Matrix joined_members probe timed out for mention gate"
+                );
                 return None;
             }
         };
@@ -1272,11 +1312,26 @@ impl MatrixUserChannel {
             // commands. Runs after the `require_mention` gate so a message
             // that gate would drop anyway never triggers a membership probe.
             if self.mention_policy == MatrixMentionPolicy::Strict
-                && msg.mentions_other
+                && !msg.other_mentions.is_empty()
                 && !msg.mentioned_self
                 && !is_slash_command(&msg.body)
                 && !self.is_direct_room(&msg.room_id).await
             {
+                if self
+                    .suppression_logged_rooms
+                    .lock()
+                    .await
+                    .insert(msg.room_id.clone())
+                {
+                    info!(
+                        room_id = %msg.room_id,
+                        sender = %msg.sender,
+                        policy = ?self.mention_policy,
+                        mentions = ?msg.other_mentions,
+                        "Matrix group message suppressed; explicitly mentions another user \
+                         (first suppression in this room since startup)"
+                    );
+                }
                 debug!(
                     room_id = %msg.room_id,
                     sender = %msg.sender,
@@ -2187,6 +2242,164 @@ mod tests {
         );
     }
 
+    /// A homeserver that accepts the probe but never answers must not stall
+    /// the forward loop: after [`DM_PROBE_TIMEOUT`] the probe fails open and
+    /// the candidate message is answered (paused clock, so this runs fast).
+    #[tokio::test(start_paused = true)]
+    async fn should_fail_open_when_membership_probe_hangs() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let app = Router::new()
+            .route(
+                "/_matrix/client/v3/sync",
+                get(|| async {
+                    axum::Json(json!({
+                        "next_batch": "s2",
+                        "rooms": { "join": { "!room:example.org": { "timeline": { "events": [
+                            {
+                                "type": "m.room.message",
+                                "sender": "@alice:example.org",
+                                "event_id": "$evt1",
+                                "content": {
+                                    "msgtype": "m.text",
+                                    "body": "@otherbot:example.org ping",
+                                    "m.mentions": { "user_ids": ["@otherbot:example.org"] }
+                                }
+                            }
+                        ] } } } }
+                    }))
+                }),
+            )
+            // The probe route never responds, simulating a hung homeserver.
+            .fallback(get(|| std::future::pending::<axum::Json<Value>>()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ch = MatrixUserChannel::new(
+            &format!("http://{addr}"),
+            Some("@bot:example.org".into()),
+            Some("tok".into()),
+            None,
+            None,
+            vec![],
+            MatrixAutoJoin::Off,
+            vec![],
+            MatrixGroupPolicy::Open,
+            false,
+            MatrixMentionPolicy::Strict,
+            vec![],
+            shutdown,
+        );
+        seed_resolved(&ch).await;
+
+        let parsed = ch
+            .sync_once("tok", "@bot:example.org", None, 0)
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        // `tokio::time::Instant` follows the paused virtual clock.
+        let started = tokio::time::Instant::now();
+        ch.forward_messages(parsed.messages, &tx).await.unwrap();
+        assert!(
+            rx.try_recv().is_ok(),
+            "a hung probe must fail open after DM_PROBE_TIMEOUT"
+        );
+        // The paused clock jumped straight to the probe deadline: the stall
+        // is exactly one DM_PROBE_TIMEOUT, not more, not less.
+        assert_eq!(started.elapsed(), DM_PROBE_TIMEOUT);
+        // The hang is cached as a failed probe, like any other failure.
+        assert!(
+            ch.dm_probe_cache
+                .lock()
+                .await
+                .contains_key("!room:example.org")
+        );
+    }
+
+    /// The first suppression per room is logged once at info (with the
+    /// policy and the mention set) so operators discover the behaviour
+    /// change from their logs; repeats in the same room stay at debug.
+    #[tokio::test]
+    async fn should_log_first_suppression_per_room_at_info() {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let ch = gate_test_channel(false, MatrixMentionPolicy::Strict);
+        ch.dm_probe_cache
+            .lock()
+            .await
+            .insert("!room:example.org".into(), (Some(false), Instant::now()));
+        let (tx, mut rx) = mpsc::channel(8);
+        ch.forward_messages(
+            vec![
+                gate_test_message("$e1", false, true),
+                gate_test_message("$e2", false, true),
+            ],
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        let logs = capture.contents();
+        let notices = logs.matches("first suppression in this room").count();
+        assert_eq!(
+            notices, 1,
+            "exactly one info notice per room, got logs: {logs}"
+        );
+        assert!(
+            logs.contains("Strict"),
+            "notice must name the policy: {logs}"
+        );
+        assert!(
+            logs.contains("@other:example.org"),
+            "notice must include the mention set: {logs}"
+        );
+    }
+
+    /// Captures `tracing` output so log-emitting behaviour (the once-per-room
+    /// suppression notice) can be asserted.
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     fn gate_test_channel(
         require_mention: bool,
         mention_policy: MatrixMentionPolicy,
@@ -2219,7 +2432,11 @@ mod tests {
             body: "hello".into(),
             event_id: Some(event_id.into()),
             mentioned_self,
-            mentions_other,
+            other_mentions: if mentions_other {
+                vec!["@other:example.org".to_owned()]
+            } else {
+                vec![]
+            },
         }
     }
 
@@ -2307,108 +2524,75 @@ mod tests {
             "m.relates_to": { "m.in_reply_to": { "event_id": "$orig" } }
         });
         let body = "> <@bob:example.org> see this\n\nbot, summarize this thread";
-        assert!(!content_mentions_other_user(
-            &reply_to_bob,
-            body,
-            "@bot:example.org"
-        ));
+        assert!(content_other_mentions(&reply_to_bob, body, "@bot:example.org").is_empty());
 
         // A reply that ALSO explicitly mentions Carol still counts.
         let mut with_carol = reply_to_bob.clone();
         with_carol["m.mentions"] =
             json!({ "user_ids": ["@bob:example.org", "@carol:example.org"] });
-        assert!(content_mentions_other_user(
-            &with_carol,
-            body,
-            "@bot:example.org"
-        ));
+        assert!(!content_other_mentions(&with_carol, body, "@bot:example.org").is_empty());
 
         // A pill AFTER the </mx-reply> fallback is a real mention.
         let pill_after_fallback = json!({
             "formatted_body": "<mx-reply><blockquote><a href=\"https://matrix.to/#/@bob:example.org\">Bob</a></blockquote></mx-reply>ask <a href=\"https://matrix.to/#/@carol:example.org\">Carol</a>",
             "m.relates_to": { "m.in_reply_to": { "event_id": "$orig" } }
         });
-        assert!(content_mentions_other_user(
-            &pill_after_fallback,
-            body,
-            "@bot:example.org"
-        ));
+        assert!(!content_other_mentions(&pill_after_fallback, body, "@bot:example.org").is_empty());
 
         // A hand-typed MXID in the reply text (after the fallback) counts.
         let typed = json!({
             "m.relates_to": { "m.in_reply_to": { "event_id": "$orig" } }
         });
-        assert!(content_mentions_other_user(
-            &typed,
-            "> <@bob:example.org> see this\n\n@carol:example.org what do you think?",
-            "@bot:example.org"
-        ));
+        assert!(
+            !content_other_mentions(
+                &typed,
+                "> <@bob:example.org> see this\n\n@carol:example.org what do you think?",
+                "@bot:example.org"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn should_detect_mentions_other_with_edge_mxid_shapes() {
         // `+` is a valid localpart byte.
-        assert!(text_mentions_other_user(
-            "@user+device:example.org hi",
-            "@bot:example.org",
-            None
-        ));
+        assert!(
+            !text_other_mentions("@user+device:example.org hi", "@bot:example.org", None)
+                .is_empty()
+        );
         // Self-comparison ignores ASCII case.
-        assert!(!text_mentions_other_user(
-            "@BOT:EXAMPLE.ORG hi",
-            "@bot:example.org",
-            None
-        ));
+        assert!(text_other_mentions("@BOT:EXAMPLE.ORG hi", "@bot:example.org", None).is_empty());
         // …but a differently-cased OTHER user still counts.
-        assert!(text_mentions_other_user(
-            "@CAROL:example.org hi",
-            "@bot:example.org",
-            None
-        ));
+        assert!(!text_other_mentions("@CAROL:example.org hi", "@bot:example.org", None).is_empty());
         // A port suffix is part of the server name.
-        assert!(text_mentions_other_user(
-            "@carol:localhost:8448 hi",
-            "@bot:example.org",
-            None
-        ));
+        assert!(
+            !text_other_mentions("@carol:localhost:8448 hi", "@bot:example.org", None).is_empty()
+        );
         // The replied-to sender does not count, even hand-typed.
-        assert!(!text_mentions_other_user(
-            "@bob:example.org agreed?",
-            "@bot:example.org",
-            Some("@bob:example.org")
-        ));
+        assert!(
+            text_other_mentions(
+                "@bob:example.org agreed?",
+                "@bot:example.org",
+                Some("@bob:example.org")
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn should_detect_mentions_other_from_structured_mentions() {
         let other = json!({ "m.mentions": { "user_ids": ["@other:example.org"] } });
-        assert!(content_mentions_other_user(
-            &other,
-            "hi",
-            "@bot:example.org"
-        ));
+        assert!(!content_other_mentions(&other, "hi", "@bot:example.org").is_empty());
 
         let only_self = json!({ "m.mentions": { "user_ids": ["@bot:example.org"] } });
-        assert!(!content_mentions_other_user(
-            &only_self,
-            "hi",
-            "@bot:example.org"
-        ));
+        assert!(content_other_mentions(&only_self, "hi", "@bot:example.org").is_empty());
 
         let self_and_other =
             json!({ "m.mentions": { "user_ids": ["@bot:example.org", "@other:example.org"] } });
-        assert!(content_mentions_other_user(
-            &self_and_other,
-            "hi",
-            "@bot:example.org"
-        ));
+        assert!(!content_other_mentions(&self_and_other, "hi", "@bot:example.org").is_empty());
 
         let empty = json!({ "m.mentions": { "user_ids": [] } });
-        assert!(!content_mentions_other_user(
-            &empty,
-            "hi",
-            "@bot:example.org"
-        ));
+        assert!(content_other_mentions(&empty, "hi", "@bot:example.org").is_empty());
     }
 
     #[test]
@@ -2416,57 +2600,35 @@ mod tests {
         let pill_other = json!({
             "formatted_body": "<a href=\"https://matrix.to/#/@other:example.org\">other</a> hi"
         });
-        assert!(content_mentions_other_user(
-            &pill_other,
-            "hi",
-            "@bot:example.org"
-        ));
+        assert!(!content_other_mentions(&pill_other, "hi", "@bot:example.org").is_empty());
 
         let pill_self = json!({
             "formatted_body": "<a href=\"https://matrix.to/#/@bot:example.org\">bot</a> hi"
         });
-        assert!(!content_mentions_other_user(
-            &pill_self,
-            "hi",
-            "@bot:example.org"
-        ));
+        assert!(content_other_mentions(&pill_self, "hi", "@bot:example.org").is_empty());
     }
 
     #[test]
     fn should_detect_mentions_other_from_plain_text_mxid() {
-        assert!(text_mentions_other_user(
-            "@otherbot:example.org 你是谁",
-            "@bot:example.org",
-            None
-        ));
-        assert!(text_mentions_other_user(
-            "hi @otherbot:example.org!",
-            "@bot:example.org",
-            None
-        ));
+        assert!(
+            !text_other_mentions("@otherbot:example.org 你是谁", "@bot:example.org", None)
+                .is_empty()
+        );
+        assert!(
+            !text_other_mentions("hi @otherbot:example.org!", "@bot:example.org", None).is_empty()
+        );
         // A trailing sentence dot is not part of the MXID.
-        assert!(!text_mentions_other_user(
-            "thanks @bot:example.org.",
-            "@bot:example.org",
-            None
-        ));
+        assert!(
+            text_other_mentions("thanks @bot:example.org.", "@bot:example.org", None).is_empty()
+        );
         // Only the bot itself is mentioned.
-        assert!(!text_mentions_other_user(
-            "@bot:example.org hi",
-            "@bot:example.org",
-            None
-        ));
+        assert!(text_other_mentions("@bot:example.org hi", "@bot:example.org", None).is_empty());
         // Email addresses and casual "@name:" text are not MXID mentions.
-        assert!(!text_mentions_other_user(
-            "write to user@example.com: soon",
-            "@bot:example.org",
-            None
-        ));
-        assert!(!text_mentions_other_user(
-            "@alice: hi",
-            "@bot:example.org",
-            None
-        ));
+        assert!(
+            text_other_mentions("write to user@example.com: soon", "@bot:example.org", None)
+                .is_empty()
+        );
+        assert!(text_other_mentions("@alice: hi", "@bot:example.org", None).is_empty());
     }
 
     #[test]

@@ -307,7 +307,15 @@ impl MatrixUserChannelSettings {
             MATRIX_SETTING_MENTION_POLICY,
             MATRIX_SETTING_MENTION_POLICY_CAMEL,
         ])
-        .map(|raw| octos_bus::MatrixMentionPolicy::parse(&raw))
+        .map(|raw| {
+            if !matches!(raw.trim().to_ascii_lowercase().as_str(), "open" | "strict") {
+                warn!(
+                    value = %raw,
+                    "unrecognized matrix mention_policy; falling back to strict"
+                );
+            }
+            octos_bus::MatrixMentionPolicy::parse(&raw)
+        })
         .unwrap_or_default();
 
         Ok(Self {
