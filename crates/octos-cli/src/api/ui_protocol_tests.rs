@@ -14562,8 +14562,9 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
     );
 }
 
-/// #2067 boundaries 2 and 3 (session/open replay send loop + live forwarder):
-/// neither may put profile-b's durable goal frames on a profile-a connection.
+/// #2067 boundaries 1 and 3 (the `open_session_result` retain + live
+/// forwarder), observed on the wire: neither may put profile-b's durable goal
+/// frames on a profile-a connection.
 #[tokio::test]
 async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_profile() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -14626,7 +14627,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
     .await;
     assert!(opened, "alpha must be able to open the shared session");
 
-    // Boundary 2 — the replay send loop.
+    // Boundary 1's retain, observed through the replay send loop.
     let frames = drain_session_open_frames(&mut rx).await;
     assert_eq!(
         replayed_goal_objectives(&frames),
