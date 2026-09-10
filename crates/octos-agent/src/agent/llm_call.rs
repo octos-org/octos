@@ -125,7 +125,11 @@ impl Agent {
                 ctx.as_ref(),
             );
             if let HookResult::Deny(reason) = hooks.run(HookEvent::BeforeLlmCall, &payload).await {
-                eyre::bail!("LLM call denied by hook: {reason}");
+                // #2249: a typed error (not a bare `eyre::bail!`) so the loop
+                // boundary classifies the deny as policy/expected instead of
+                // internal/bug. `HookDeniedError`'s Display keeps the exact
+                // user-facing wording this bail used to produce.
+                return Err(crate::hooks::HookDeniedError { reason }.into());
             }
         }
 
