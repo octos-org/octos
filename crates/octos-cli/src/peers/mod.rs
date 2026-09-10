@@ -2060,10 +2060,14 @@ mod build_cache_peer_tests {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");
         std::fs::create_dir_all(&peers_root).unwrap();
-        set_build_cache_config(
-            &peers_root,
-            Some(crate::build_cache::BuildCacheConfig::default()),
-        );
+        // Slot namespaces / release semantics are under test here, not the
+        // free-space gate (covered by the pool's own tests) — disable it so
+        // the result does not depend on the host's disk.
+        let config = BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        set_build_cache_config(&peers_root, Some(config.clone()));
         // Two DIFFERENT repo keys so each pool has capacity; the assertion is
         // per-pool namespace semantics + distinct paths for distinct peers.
         let repo_a = data.path().join("repo-a");
@@ -2076,7 +2080,7 @@ mod build_cache_peer_tests {
             "slug-a",
             Some("goal-1"),
             Some("t1"),
-            &crate::build_cache::BuildCacheConfig::default(),
+            &config,
         )
         .expect("peer A acquires");
         let slot_b = build_cache_peer::acquire_for_staging(
@@ -2085,7 +2089,7 @@ mod build_cache_peer_tests {
             "slug-b",
             Some("goal-1"),
             Some("t2"),
-            &crate::build_cache::BuildCacheConfig::default(),
+            &config,
         )
         .expect("peer B acquires");
         assert_ne!(
@@ -2107,7 +2111,7 @@ mod build_cache_peer_tests {
             "slug-a",
             Some("goal-1"),
             Some("t3"),
-            &crate::build_cache::BuildCacheConfig::default(),
+            &config,
         )
         .expect("freed slot reusable by next turn");
         drop(slot_c);
@@ -2118,10 +2122,13 @@ mod build_cache_peer_tests {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");
         std::fs::create_dir_all(&peers_root).unwrap();
-        set_build_cache_config(
-            &peers_root,
-            Some(crate::build_cache::BuildCacheConfig::default()),
-        );
+        // See two_staged_peers_… above: the free-space gate is not what this
+        // test pins, so keep it off the host's real disk.
+        let config = BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        set_build_cache_config(&peers_root, Some(config.clone()));
         let repo = data.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         // Staging acquired slot-1 (peer_slots default 2 → slot-2 free). The
@@ -2136,7 +2143,7 @@ mod build_cache_peer_tests {
             "slug-x",
             Some("g"),
             Some("t1"),
-            &crate::build_cache::BuildCacheConfig::default(),
+            &config,
         )
         .unwrap();
         std::fs::create_dir_all(peers_root.join("slug-x")).unwrap();
@@ -2147,7 +2154,7 @@ mod build_cache_peer_tests {
             "slug-x",
             Some("g"),
             Some("t2"),
-            &crate::build_cache::BuildCacheConfig::default(),
+            &config,
         )
         .unwrap();
         assert_ne!(
@@ -2176,10 +2183,13 @@ mod build_cache_peer_tests {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");
         std::fs::create_dir_all(&peers_root).unwrap();
-        set_build_cache_config(
-            &peers_root,
-            Some(crate::build_cache::BuildCacheConfig::default()),
-        );
+        // See two_staged_peers_… above: the free-space gate is not what this
+        // test pins, so keep it off the host's real disk.
+        let config = BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        };
+        set_build_cache_config(&peers_root, Some(config.clone()));
         let repo = data.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let slot = build_cache_peer::acquire_for_staging(
@@ -2188,7 +2198,7 @@ mod build_cache_peer_tests {
             "slug-i",
             Some("g"),
             Some("t1"),
-            &crate::build_cache::BuildCacheConfig::default(),
+            &config,
         )
         .unwrap();
         let key = build_cache_slot_registry_key(&peers_root, "slug-i");
