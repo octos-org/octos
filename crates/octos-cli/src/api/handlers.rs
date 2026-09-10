@@ -2002,6 +2002,177 @@ pub async fn upload_site_files(
     Ok(Json(saved))
 }
 
+#[derive(Deserialize)]
+pub struct FileMutationRequest {
+    path: String,
+    session: Option<String>,
+    #[serde(flatten)]
+    operation: FileMutation,
+}
+
+#[derive(Deserialize)]
+pub struct SlideEditQuery {
+    session_id: String,
+    slug: String,
+}
+
+async fn slide_edit_location(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    query: &SlideEditQuery,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), Response> {
+    if query.session_id.is_empty()
+        || query.session_id.len() > 512
+        || super::file_mutations::validate_filename(&query.slug).is_err()
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid slides project.").into_response());
+    }
+    let data_dir = resolve_file_access_data_dir(state, headers, identity).await?;
+    let root = data_dir
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND.into_response())?;
+    let project = api_session_workspace_dirs(&root, &query.session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("slides").join(&query.slug))
+        .find(|path| path.is_dir())
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Slides scaffold not found.").into_response())?;
+    let relative = project
+        .strip_prefix(&root)
+        .map_err(|_| StatusCode::FORBIDDEN.into_response())?
+        .join(super::slide_edits::FILENAME);
+    Ok((root, relative))
+}
+
+fn slide_edit_error(error: std::io::Error) -> Response {
+    let status = match error.kind() {
+        std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+        std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+        std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let message = if status == StatusCode::CONFLICT {
+        "Another editor saved a newer revision. Reload before saving."
+    } else {
+        "Unable to access slide edits. Check the project and retry."
+    };
+    (status, message).into_response()
+}
+
+pub async fn get_slide_edits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Query(query): axum::extract::Query<SlideEditQuery>,
+) -> Response {
+    let (root, relative) = match slide_edit_location(
+        &state,
+        &headers,
+        identity.as_ref().map(|ext| &ext.0),
+        &query,
+    )
+    .await
+    {
+        Ok(location) => location,
+        Err(response) => return response,
+    };
+    match tokio::task::spawn_blocking(move || super::slide_edits::read(&root, &relative)).await {
+        Ok(Ok(document)) => Json(document).into_response(),
+        Ok(Err(error)) => slide_edit_error(error),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub async fn save_slide_edits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Query(query): axum::extract::Query<SlideEditQuery>,
+    Json(request): Json<super::slide_edits::SaveRequest>,
+) -> Response {
+    let (root, relative) = match slide_edit_location(
+        &state,
+        &headers,
+        identity.as_ref().map(|ext| &ext.0),
+        &query,
+    )
+    .await
+    {
+        Ok(location) => location,
+        Err(response) => return response,
+    };
+    match tokio::task::spawn_blocking(move || super::slide_edits::save(&root, &relative, request))
+        .await
+    {
+        Ok(Ok(document)) => Json(document).into_response(),
+        Ok(Err(error)) => slide_edit_error(error),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum FileMutation {
+    Delete,
+    Rename { filename: String },
+}
+
+pub async fn mutate_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    Json(request): Json<FileMutationRequest>,
+) -> Response {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
+        Ok(dir) => dir,
+        Err(response) => return response,
+    };
+    let profile = request_owner_profile(&state, &headers, identity);
+    let workspace = request.session.as_deref().and_then(|session| {
+        resolve_session_workspace_root(&state, &data_dir, profile.as_deref(), session)
+    });
+    let Some(path) = resolve_scoped_download_path(
+        &data_dir,
+        &request.path,
+        profile.as_deref(),
+        workspace.as_deref(),
+    ) else {
+        return (StatusCode::NOT_FOUND, "File not found in this profile.").into_response();
+    };
+    let root = if let Some(owner) = upload_tmpdir_tenant(&path) {
+        octos_bus::file_handle::temp_upload_root().join(owner)
+    } else {
+        data_dir.clone()
+    };
+    let filename = match request.operation {
+        FileMutation::Delete => None,
+        FileMutation::Rename { filename } => Some(filename),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        super::file_mutations::mutate(&root, &path, filename.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(path)) => Json(serde_json::json!({
+            "path": path.as_deref().and_then(|path| response_path_for_profile_file(&data_dir, path)),
+            "filename": path.as_deref().and_then(|path| path.file_name()).map(|name| name.to_string_lossy().to_string()),
+        })).into_response(),
+        Ok(Err(err)) => {
+            let status = match err.kind() {
+                std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+                std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+                std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, "Unable to change file. Check its name and permissions.").into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "File mutation failed.").into_response(),
+    }
+}
+
 /// GET /api/files?path=... -- serve files by query parameter (for absolute paths).
 pub async fn serve_file_by_query(
     State(state): State<Arc<AppState>>,
@@ -2989,6 +3160,15 @@ async fn serve_preview_file(project_dir: &std::path::Path, path: std::path::Path
                 preview_content_type(&leaf_for_headers),
             ),
             (axum::http::header::CACHE_CONTROL, cache_control),
+            // Generated HTML must keep an opaque origin even when opened
+            // directly in a new tab. An iframe attribute alone cannot protect
+            // the application's localStorage or parent/opener documents.
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "sandbox allow-scripts allow-forms",
+            ),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         data,
     )
@@ -4079,6 +4259,13 @@ async fn serve_signed_preview_impl(
         axum::http::header::REFERRER_POLICY,
         axum::http::HeaderValue::from_static("no-referrer"),
     );
+    // Only this signed capability route is public. Opaque preview documents
+    // send Origin: null for ES modules/fonts; allow those asset reads without
+    // relaxing the authenticated API's exact-origin CORS policy.
+    resp.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
     resp
 }
 
@@ -4106,6 +4293,27 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn generated_preview_documents_are_sandboxed_when_opened_directly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("index.html");
+        std::fs::write(&file, b"<script>window.previewRuns = true</script>").unwrap();
+        let response = serve_preview_file(dir.path(), file).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_SECURITY_POLICY],
+            "sandbox allow-scripts allow-forms"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::REFERRER_POLICY],
+            "no-referrer"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+    }
 
     #[tokio::test]
     async fn read_file_no_follow_reads_regular_file_bytes() {
@@ -6331,6 +6539,191 @@ mod tests {
             ..AppState::empty_for_tests()
         };
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn review_file_mutations_persist_for_owner_and_reject_foreign_profile() {
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("report.txt");
+        std::fs::write(&path, "owner report").unwrap();
+        let handle = response_path_for_profile_file(&root, &path).unwrap();
+        let identity = || {
+            Some(Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }))
+        };
+        let state = Arc::new(state);
+        let mut foreign_headers = HeaderMap::new();
+        foreign_headers.insert("X-Profile-Id", "bob".parse().unwrap());
+        let denied = mutate_file(
+            State(state.clone()),
+            foreign_headers,
+            identity(),
+            Json(FileMutationRequest {
+                path: handle.clone(),
+                session: None,
+                operation: FileMutation::Delete,
+            }),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(path.exists());
+        let renamed = mutate_file(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            Json(FileMutationRequest {
+                path: handle,
+                session: None,
+                operation: FileMutation::Rename {
+                    filename: "final.txt".into(),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(renamed.into_body(), 4096)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("final.txt")).unwrap(),
+            "owner report"
+        );
+        let deleted = mutate_file(
+            State(state),
+            HeaderMap::new(),
+            identity(),
+            Json(FileMutationRequest {
+                path: response["path"].as_str().unwrap().into(),
+                session: None,
+                operation: FileMutation::Delete,
+            }),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert!(!root.join("final.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn review_slide_edit_api_restores_revisions_and_checks_profile_ownership() {
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        let project = api_session_workspace_dirs(&root, "slides-review")[0].join("slides/deck");
+        std::fs::create_dir_all(&project).unwrap();
+        let state = Arc::new(state);
+        let identity = || {
+            Some(Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }))
+        };
+        let query = || {
+            axum::extract::Query(SlideEditQuery {
+                session_id: "slides-review".into(),
+                slug: "deck".into(),
+            })
+        };
+        let request = || {
+            Json(serde_json::from_value(serde_json::json!({ "expectedRevision": null, "baseGeneratedAt": "baseline", "slides": [{ "index": 0, "title": "Updated title", "notes": "Private notes", "layout": "title" }] })).unwrap())
+        };
+        let saved = save_slide_edits(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            query(),
+            request(),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert!(project.join("manual-edits.json").exists());
+        let loaded =
+            get_slide_edits(State(state.clone()), HeaderMap::new(), identity(), query()).await;
+        assert_eq!(loaded.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(loaded.into_body(), 4096)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["slides"][0]["title"], "Updated title");
+        let stale = save_slide_edits(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            query(),
+            request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Profile-Id", "bob".parse().unwrap());
+        let denied = get_slide_edits(State(state), headers, identity(), query()).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn review_signed_preview_modules_allow_opaque_cors_and_sandbox_direct_navigation() {
+        use tower::ServiceExt;
+        let (_dir, mut state) = state_with_profiles(&[("alice", None)]);
+        state.auth_token = Some("review-admin-token".into());
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        let project = api_session_workspace_dirs(&root, "site-review")[0].join("sites/demo");
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        let mut metadata = crate::project_templates::build_site_project_metadata(
+            "alice",
+            "site-review",
+            "site react",
+            &project,
+        )
+        .unwrap();
+        metadata.site_slug = "demo".into();
+        std::fs::write(
+            project.join("mofa-site-session.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("dist/index.html"),
+            "<script type=module src=./module.js></script>",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("dist/module.js"),
+            "document.body.dataset.ready = 'true'",
+        )
+        .unwrap();
+        let grant = state
+            .preview_tokens
+            .issue(
+                "review-admin-token".into(),
+                AuthIdentity::Admin,
+                "alice".into(),
+                "site-review".into(),
+                "demo".into(),
+            )
+            .await
+            .unwrap();
+        let app = super::super::router::build_router(Arc::new(state));
+        for asset in ["index.html", "module.js"] {
+            let request = axum::http::Request::builder()
+                .uri(format!("/api/preview-signed/{}/{asset}", grant.token))
+                .header("Origin", "null")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                "*"
+            );
+            assert_eq!(
+                response.headers()[axum::http::header::CONTENT_SECURITY_POLICY],
+                "sandbox allow-scripts allow-forms"
+            );
+        }
     }
 
     #[test]
