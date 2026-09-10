@@ -18,7 +18,9 @@
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use eyre::{Result, WrapErr, bail, eyre};
+#[cfg(all(unix, feature = "api"))]
+use eyre::WrapErr;
+use eyre::{Result, bail, eyre};
 
 use super::Executable;
 use crate::autonomy::supervisor_store::{
@@ -107,10 +109,14 @@ const GOAL_OPERATOR_TRANSITION_METHOD: &str = "session/goal/operator_transition"
 /// `sun_path` capacity for a bound unix socket. The terminating NUL is not
 /// representable in the path, so the limit is exclusive — a path of exactly
 /// this many bytes still fails to bind.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "api", any(target_os = "linux", target_os = "android")))]
 const SUN_PATH_CAPACITY: usize = 108;
 /// Conservative value for every other unix target (macOS/BSD).
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(all(
+    feature = "api",
+    unix,
+    not(any(target_os = "linux", target_os = "android"))
+))]
 const SUN_PATH_CAPACITY: usize = 104;
 
 /// Marker file a relocated serve publishes inside the data dir, carrying the
@@ -119,7 +125,11 @@ const SUN_PATH_CAPACITY: usize = 104;
 const GOAL_OPERATOR_CONTROL_SOCKET_POINTER: &str = ".octos-goal-control.sock.path";
 
 /// Bind-side resolution of the goal operator-control socket (#2248).
-#[cfg(unix)]
+///
+/// The bind side only exists under the `api` feature (serve), so these
+/// helpers are gated to match — the minimal production library build
+/// (`--no-default-features`) would otherwise see them as dead code.
+#[cfg(all(unix, feature = "api"))]
 struct GoalControlSocketPath {
     path: PathBuf,
     /// True when the canonical in-data-dir path did not fit `sun_path` and
@@ -135,7 +145,7 @@ struct GoalControlSocketPath {
 /// the real path is published in a pointer file inside the data dir for the
 /// connect side. The length decision runs on the canonicalized path so a
 /// short symlink spelling cannot split the two sides' choices.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "api"))]
 fn goal_control_bind_path(data_dir: &Path) -> Result<GoalControlSocketPath> {
     let resolved = std::fs::canonicalize(data_dir).unwrap_or_else(|error| {
         tracing::debug!(%error, data_dir = %data_dir.display(), "canonicalize failed; using the spelled data dir");
@@ -179,7 +189,7 @@ fn goal_control_connect_path(data_dir: &Path) -> PathBuf {
 /// where the socket actually lives: write it when relocated, remove a stale
 /// one when canonical. A missing pointer while the serve lock is held means
 /// an old serve, which the connect side already fails closed against.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "api"))]
 fn publish_goal_control_socket(data_dir: &Path, socket: &GoalControlSocketPath) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -228,7 +238,7 @@ fn publish_goal_control_socket(data_dir: &Path, socket: &GoalControlSocketPath) 
 ///
 /// The returned bool marks a subdir the caller must create and chmod 0700.
 /// Pure: environment and mode bits come in as parameters for testability.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "api"))]
 fn fallback_base_dir(
     xdg_runtime_dir: Option<PathBuf>,
     temp_dir: PathBuf,
@@ -244,7 +254,7 @@ fn fallback_base_dir(
     (temp_dir, false)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "api"))]
 fn fallback_socket_base_dir() -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -280,7 +290,7 @@ fn fallback_socket_base_dir() -> Result<PathBuf> {
 
 /// Deterministic relocated socket name under `base`, keyed by a stable hash
 /// of the canonical data dir.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "api"))]
 fn hashed_fallback_socket(base: &Path, canonical_data_dir: &Path) -> Result<PathBuf> {
     let path = base.join(format!(
         ".octos-goal-control-{:016x}.sock",
@@ -298,7 +308,7 @@ fn hashed_fallback_socket(base: &Path, canonical_data_dir: &Path) -> Result<Path
 /// Cheap 64-bit FNV-1a hash of a path (same idiom as octos-agent's
 /// file_state_cache) — stable across processes and releases, which is what
 /// the connect side needs.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "api"))]
 fn fnv1a64(path: &Path) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1334,7 +1344,7 @@ mod tests_2116_readonly {
 /// #2248 — long data dirs must not kill `octos serve`: the goal
 /// operator-control socket relocates, publishing its real path in a pointer
 /// file inside the data dir.
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "api"))]
 mod tests_2248_sun_len {
     use super::*;
 
