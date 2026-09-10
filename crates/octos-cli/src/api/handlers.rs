@@ -3605,7 +3605,7 @@ pub async fn list_content_files(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
-    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
@@ -6539,6 +6539,42 @@ mod tests {
             ..AppState::empty_for_tests()
         };
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn review_file_listing_without_gateway_keeps_profile_scope() {
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        assert!(state.process_manager.is_none());
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        let project = api_session_workspace_dirs(&root, "slides-cold")[0].join("slides/deck");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("script.js"), "real scaffold").unwrap();
+        let state = Arc::new(state);
+        let identity = || {
+            Some(Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }))
+        };
+        let query = || {
+            axum::extract::Query(HashMap::from([
+                ("dirs".into(), "slides/deck".into()),
+                ("session_id".into(), "slides-cold".into()),
+            ]))
+        };
+        let response =
+            list_content_files(State(state.clone()), HeaderMap::new(), identity(), query()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let files: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["filename"], "script.js");
+        let mut foreign = HeaderMap::new();
+        foreign.insert("X-Profile-Id", "bob".parse().unwrap());
+        let denied = list_content_files(State(state), foreign, identity(), query()).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -20972,6 +20972,22 @@ fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<Str
     ))
 }
 
+fn profile_bootstrap_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
 /// Generation guard for the dynamic ProfileRuntime cache (#2164): the
 /// post-commit Profile LLM transition bumps the generation BEFORE dropping
 /// the cached runtime, so an in-flight bootstrap that read the PRE-commit
@@ -21029,6 +21045,13 @@ pub(crate) async fn ensure_session_profile_runtime(
     let Some(key) = dynamic_profile_runtime_key(state, profile_id) else {
         return Ok(None);
     };
+
+    // First-page auxiliary requests and session/open can observe the same
+    // cold cache. Bootstrap only once per profile; otherwise our own parallel
+    // attempt holds redb's exclusive lock and the other reports a false
+    // "another process" failure (#2299). Recheck the cache under this guard.
+    let bootstrap_lock = profile_bootstrap_lock(&key);
+    let _bootstrap_guard = bootstrap_lock.lock().await;
 
     if let Some(runtime) = dynamic_profile_runtimes()
         .read()
@@ -25103,6 +25126,24 @@ async fn handle_session_hydrate(
         None
     };
 
+    let replayed_projection_envelopes = if features.projection_envelope_v2 && include_set.messages {
+        Some(
+            replayed
+                .iter()
+                .filter_map(|event| {
+                    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                        project_v2_ledger_event(ledger, &event.event, &event.cursor)?
+                    else {
+                        return None;
+                    };
+                    Some(envelope.envelope)
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+
     let expose_message_id = features.projection_envelope_v2 && include_set.messages;
     // Identity provenance is independent of the caller's replay window AND
     // the hot-ring cap. Read only eligible canonical references through the
@@ -25293,6 +25334,7 @@ async fn handle_session_hydrate(
         pending_questions,
         replayed_envelopes,
         replayed_tool_envelopes,
+        replayed_projection_envelopes,
     };
     send_serialized_rpc_result(
         ws,
@@ -25506,6 +25548,7 @@ async fn handle_session_rollback(
         pending_questions: None,
         replayed_envelopes: None,
         replayed_tool_envelopes: None,
+        replayed_projection_envelopes: None,
     };
     let result = SessionRollbackResult {
         dropped_turns,

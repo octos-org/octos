@@ -4145,6 +4145,7 @@ fn golden_session_hydrate_result_serde() {
         pending_questions: None,
         replayed_envelopes: None,
         replayed_tool_envelopes: None,
+        replayed_projection_envelopes: None,
     };
     let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
     let object = value.as_object().expect("hydrate result is object");
@@ -4202,6 +4203,7 @@ fn session_rollback_command_and_result_round_trip() {
             pending_questions: None,
             replayed_envelopes: None,
             replayed_tool_envelopes: None,
+            replayed_projection_envelopes: None,
         },
     };
     let wire = UiRpcResult::SessionRollback(result.clone());

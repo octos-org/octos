@@ -43295,3 +43295,115 @@ fn standalone_turn_reapplies_hook_context() {
         "hook context must be re-applied alongside the hook executor wiring"
     );
 }
+
+#[tokio::test]
+async fn session_hydrate_preserves_canonical_user_and_terminal_sequences() {
+    let session_id = SessionKey("local:hydrate-canonical-sequences".into());
+    let turn_id = TurnId::new();
+    let thread = turn_id.0.to_string();
+    let state = prg_state_with_session(&session_id, |session| {
+        session.messages.push(Message::user_rooting_thread(
+            "hello",
+            octos_core::ClientMessageId(thread.clone()),
+        ));
+    });
+    let ledger = event_ledger(&state).await;
+    ledger
+        .emit_envelope_v2(
+            &session_id,
+            thread.clone(),
+            PayloadV2::UserMessage {
+                text: "hello".into(),
+                files: vec![],
+            },
+            Some(thread.clone()),
+        )
+        .unwrap();
+    ledger
+        .emit_envelope_v2(
+            &session_id,
+            thread.clone(),
+            PayloadV2::AssistantDelta {
+                text: "answer".into(),
+                assistant_segment_id: "segment".into(),
+            },
+            None,
+        )
+        .unwrap();
+    ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id,
+        cursor: None,
+        tokens_in: None,
+        tokens_out: None,
+        session_result: None,
+    }));
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features_for_projection_envelope_v2_test(),
+        "canonical-hydrate".into(),
+        SessionHydrateParams {
+            session_id,
+            after: None,
+            include: vec!["messages".into()],
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let events = frame["result"]["replayed_projection_envelopes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["seq"], 1);
+    assert_eq!(events[0]["payload"]["type"], "user_message");
+    assert_eq!(events[1]["seq"], 2);
+    assert_eq!(events[2]["seq"], 3);
+    assert_eq!(events[2]["payload"]["type"], "turn_terminal");
+    assert!(
+        events
+            .iter()
+            .all(|entry| entry["cursor"]["seq"].as_u64().is_some())
+    );
+}
+
+#[tokio::test]
+async fn review_concurrent_cold_profile_requests_share_one_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "seed-cold",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            Some("http://127.0.0.1:9/v1"),
+            true,
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let key = dynamic_profile_runtime_key(&state, "dev").unwrap();
+    dynamic_profile_runtimes().write().unwrap().remove(&key);
+    assert!(dynamic_cached_profile_runtime(&state, "dev").is_none());
+    let (a, b, c) = tokio::join!(
+        ensure_session_profile_runtime(&state, Some("dev")),
+        ensure_session_profile_runtime(&state, Some("dev")),
+        ensure_session_profile_runtime(&state, Some("dev")),
+    );
+    let a = a.expect("first request").unwrap();
+    let b = b.expect("concurrent second request").unwrap();
+    let c = c.expect("concurrent third request").unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    assert!(Arc::ptr_eq(&a, &c));
+}

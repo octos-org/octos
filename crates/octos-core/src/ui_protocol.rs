@@ -2971,6 +2971,11 @@ pub struct SessionHydrateResult {
     /// live delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_tool_envelopes: Option<Vec<EnvelopeV2>>,
+    /// All retained canonical v2 records through `cursor`, including user
+    /// roots and terminals. Their per-thread sequence numbers are unchanged.
+    /// Older transcript rows may fall outside this bounded retained window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_projection_envelopes: Option<Vec<EnvelopeV2>>,
 }
 
 /// Params for `session/rollback` — conversation-only rewind. Drops the last
