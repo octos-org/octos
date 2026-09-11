@@ -77,7 +77,7 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> Result<Pa
 // updated_at: {}
 // change_summary: Initial scaffold created by /new slides
 // EMPTY: The agent must write slide content here before generating.
-// Use mofa_slides with input pointing to this file after writing content.
+// Use mofa_make with content_type "slides" and args.input pointing here after writing content.
 //
 // Example format:
 // module.exports = [
@@ -1212,13 +1212,23 @@ mod tests {
     }
 
     #[test]
+    fn review_slides_prompt_uses_visible_content_dispatcher() {
+        let prompt = slides_system_prompt("Deck");
+        assert!(prompt.contains("mofa_describe_content_type({content_type: \"slides\"})"));
+        assert!(prompt.contains("mofa_make({content_type: \"slides\", args:"));
+        assert!(prompt.contains("intentionally hidden from the model"));
+        assert!(!prompt.contains("Call it directly"));
+        assert!(!prompt.contains("only mini1 had"));
+    }
+
+    #[test]
     fn slides_prompt_uses_task_and_workspace_state_for_status_checks() {
         let prompt = slides_system_prompt("Deck");
         assert!(prompt.contains("check_background_tasks"));
         assert!(prompt.contains("check_workspace_contract"));
         assert!(prompt.contains("task state tells you what happened in execution"));
         assert!(prompt.contains("workspace state tells you what is true about the deliverable"));
-        assert!(prompt.contains("If `mofa_slides` is not available"));
+        assert!(prompt.contains("If `mofa_make` is unavailable"));
         assert!(prompt.contains("Runtime owns workspace contract enforcement"));
         assert!(prompt.contains("PROMPT-OWNED GUIDANCE"));
         assert!(prompt.contains("runtime auto-delivers"));
