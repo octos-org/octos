@@ -110,6 +110,9 @@ keyring = { version = "3", default-features = false }
 # HTTP client (using rustls for pure Rust, no OpenSSL)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "multipart"] }
 htmd = "0.5"
+# Match the parser already used by htmd for plain-text DOM extraction.
+html5ever = "0.35"
+markup5ever_rcdom = "0.35"
 # Database (pure Rust)
 redb = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
