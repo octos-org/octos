@@ -2971,6 +2971,16 @@ pub struct SessionHydrateResult {
     /// live delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_tool_envelopes: Option<Vec<EnvelopeV2>>,
+    /// Bounded retained canonical v2 records through `cursor`. Complete
+    /// threads retain their sequence; compacted threads retain terminals and
+    /// reconstruct visible content from `messages` and tool replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_projection_envelopes: Option<Vec<EnvelopeV2>>,
+    /// Highest canonical per-thread sequence included in the atomic ledger
+    /// snapshot. A transcript reconstruction resumes live delivery after this
+    /// checkpoint even when the retained event prefix was evicted/compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_thread_sequences: Option<BTreeMap<String, u64>>,
 }
 
 /// Params for `session/rollback` — conversation-only rewind. Drops the last
