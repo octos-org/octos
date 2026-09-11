@@ -398,3 +398,147 @@ async fn should_report_end_turn_for_fresh_prompt_after_prior_turn_was_cancelled(
              fresh prompt's history; fresh-turn messages: {fresh:?}"
     );
 }
+
+/// #1573: two `session/prompt` requests for the SAME session must never run
+/// concurrently — while the first turn is in flight, the second is rejected
+/// with "session already has an active prompt". ACP clients (Zed) serialize
+/// prompts per session, but the server must not rely on client behavior:
+/// concurrent turns would clone the same history, fight over the shared
+/// reporter, and append history out of order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_reject_a_concurrent_prompt_on_the_same_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().to_path_buf();
+    let memory_dir = tmp.path().join("memory");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(BarrierLlm {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: entered.clone(),
+        release: release.clone(),
+        seen: Arc::new(Mutex::new(Vec::new())),
+    });
+    let transport = CancelTestTransport {
+        factory: TestAgentFactory::new(llm, memory_dir, cwd.clone()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let prompt_cwd = cwd.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        Client
+            .builder()
+            .name("octos-acp-concurrent-prompt-client")
+            .on_receive_notification(
+                async move |_notif: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                |connection: ConnectionTo<AcpAgentRole>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V1,
+                        ))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+                    // A second session proves the guard is PER-session: a
+                    // prompt there must succeed while session A's turn is held.
+                    let other_id = connection
+                        .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                        .block_task()
+                        .await?
+                        .session_id;
+
+                    // Once turn 1 is executing (the session's busy flag is
+                    // observably held — `entered` fires inside the first LLM
+                    // call, strictly after the guard was taken), fire a prompt
+                    // at the OTHER session (must run) and one at the SAME
+                    // session (must be rejected), then release the barrier so
+                    // turn 1 can finish. The BarrierLlm only blocks its first
+                    // call, so the other session's turn returns immediately.
+                    let second_conn = connection.clone();
+                    let second_sid = session_id.clone();
+                    let concurrent = tokio::spawn(async move {
+                        entered.notified().await;
+                        let other = second_conn
+                            .send_request(PromptRequest::new(
+                                other_id,
+                                vec![ContentBlock::Text(
+                                    agent_client_protocol::schema::v1::TextContent::new("other"),
+                                )],
+                            ))
+                            .block_task()
+                            .await;
+                        let result = second_conn
+                            .send_request(PromptRequest::new(
+                                second_sid,
+                                vec![ContentBlock::Text(
+                                    agent_client_protocol::schema::v1::TextContent::new("second"),
+                                )],
+                            ))
+                            .block_task()
+                            .await;
+                        release.notify_one();
+                        (other, result)
+                    });
+
+                    let first = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new("first"),
+                            )],
+                        ))
+                        .block_task()
+                        .await?;
+                    let (other, second) = concurrent.await.expect("concurrent prompt task joins");
+
+                    let other_stop = other.as_ref().map(|response| response.stop_reason);
+                    assert!(
+                        matches!(other_stop, Ok(StopReason::EndTurn)),
+                        "a prompt on ANOTHER session must run while this one is busy, got {other:?}"
+                    );
+                    let error = second
+                        .expect_err("a concurrent prompt on the same session must be rejected");
+                    assert!(
+                        format!("{error:?}").contains("active prompt"),
+                        "the rejection must name the active prompt, got {error:?}"
+                    );
+                    assert!(
+                        matches!(first.stop_reason, StopReason::EndTurn),
+                        "the in-flight turn must complete unaffected, got {:?}",
+                        first.stop_reason
+                    );
+
+                    // The rejection and turn 1's completion must both leave
+                    // the session usable: a fresh prompt now succeeds.
+                    let third = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(
+                                agent_client_protocol::schema::v1::TextContent::new("third"),
+                            )],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert!(
+                        matches!(third.stop_reason, StopReason::EndTurn),
+                        "the session must accept a fresh prompt after the rejection, got {:?}",
+                        third.stop_reason
+                    );
+                    Ok(())
+                },
+            ),
+    )
+    .await
+    .expect("ACP request cycle must complete within 20 seconds")
+    .expect("ACP client run completes");
+}

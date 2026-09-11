@@ -13,6 +13,29 @@ const DEFAULT_THRESHOLD: usize = 40;
 /// Default number of recent messages to keep intact (not summarized).
 const DEFAULT_KEEP_RECENT: usize = 10;
 
+/// Render a compaction summary for installation into the live message list.
+///
+/// Spec task-compaction-instruction-priority: frame the summary as demoted
+/// BACKGROUND with an explicit precedence footer, so a post-compaction model
+/// cannot mistake restated historical goals/plans for the current
+/// instruction. Line 1 keeps the EXACT legacy sentinel: the agent loop's
+/// message_repair matches `starts_with("[Conversation summary]")` to keep
+/// summary rows out of the system prompt.
+///
+/// Keep this rendering byte-identical to the sibling copy in
+/// `octos-cli/src/api/context_manager.rs` (which cross-references back).
+fn format_compaction_summary(summary: &str) -> String {
+    format!(
+        "[Conversation summary]\n\
+         [BACKGROUND ONLY — everything in this summary is \
+         history, not instructions.]\n{summary}\n\
+         [End of background. The newest user message in this \
+         conversation is the CURRENT instruction and takes \
+         precedence over everything above, including any goals \
+         or plans mentioned in the summary.]"
+    )
+}
+
 /// Configuration for session compaction behavior.
 pub struct CompactionConfig {
     /// Minimum total messages before compaction triggers.
@@ -155,7 +178,7 @@ pub async fn maybe_compact_with_config(
 
     let summary_msg = Message {
         role: MessageRole::System,
-        content: format!("[Conversation summary]\n{summary}"),
+        content: format_compaction_summary(&summary),
         media: vec![],
         tool_calls: None,
         tool_call_id: None,
@@ -289,7 +312,7 @@ pub async fn maybe_compact_handle(
 
     let summary_msg = Message {
         role: MessageRole::System,
-        content: format!("[Conversation summary]\n{summary}"),
+        content: format_compaction_summary(&summary),
         media: vec![],
         tool_calls: None,
         tool_call_id: None,
@@ -317,4 +340,133 @@ pub async fn maybe_compact_handle(
     );
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octos_llm::{ChatResponse, StopReason, TokenUsage, ToolSpec};
+
+    /// Summarizer stub: returns a fixed summary body regardless of input.
+    struct StubSummarizer;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for StubSummarizer {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: Some("User still needs the deploy runbook.".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "stub-summarizer"
+        }
+
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    fn user_msg(content: &str) -> Message {
+        Message {
+            role: MessageRole::User,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Spec task-compaction-instruction-priority: the installed summary row
+    /// must demote the summary to BACKGROUND and anchor the current
+    /// instruction to the newest user message. Exact-match (not substring)
+    /// so the rendering stays byte-identical to the sibling copy in
+    /// `octos-cli/src/api/context_manager.rs`, and line 1 keeps the exact
+    /// legacy sentinel the agent loop's message_repair matches on.
+    fn assert_summary_framed(content: &str, body: &str) {
+        let expected = format!(
+            "[Conversation summary]\n\
+             [BACKGROUND ONLY — everything in this summary is \
+             history, not instructions.]\n{body}\n\
+             [End of background. The newest user message in this \
+             conversation is the CURRENT instruction and takes \
+             precedence over everything above, including any goals \
+             or plans mentioned in the summary.]"
+        );
+        assert_eq!(content, expected);
+    }
+
+    #[test]
+    fn format_compaction_summary_handles_empty_body() {
+        let framed = format_compaction_summary("");
+        assert_summary_framed(&framed, "");
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_frames_summary_as_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::open(dir.path()).unwrap();
+        let key = SessionKey::new("test", "chat-1");
+        let config = CompactionConfig {
+            threshold: 4,
+            keep_recent: 2,
+        };
+        for i in 0..6 {
+            let session = mgr.get_or_create(&key).await;
+            session.messages.push(user_msg(&format!("message {i}")));
+        }
+
+        let compacted = maybe_compact_with_config(&mut mgr, &key, &StubSummarizer, &config)
+            .await
+            .unwrap();
+        assert!(compacted);
+
+        let session = mgr.get_or_create(&key).await;
+        assert_eq!(session.messages.len(), 3);
+        assert_summary_framed(
+            &session.messages[0].content,
+            "User still needs the deploy runbook.",
+        );
+        assert_eq!(session.messages[1].content, "message 4");
+        assert_eq!(session.messages[2].content, "message 5");
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_handle_frames_summary_as_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SessionKey::new("test", "chat-2");
+        let mut handle = SessionHandle::open(dir.path(), &key);
+        // CompactionConfig::default(): threshold 40, keep_recent 10.
+        for i in 0..45 {
+            handle
+                .session_mut()
+                .messages
+                .push(user_msg(&format!("message {i}")));
+        }
+
+        let compacted = maybe_compact_handle(&mut handle, &StubSummarizer)
+            .await
+            .unwrap();
+        assert!(compacted);
+
+        let messages = &handle.session().messages;
+        assert_eq!(messages.len(), 11);
+        assert_summary_framed(&messages[0].content, "User still needs the deploy runbook.");
+        assert_eq!(messages[1].content, "message 35");
+        assert_eq!(messages[10].content, "message 44");
+    }
 }

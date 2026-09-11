@@ -4961,6 +4961,7 @@ dependencies = [
 name = "octos-services"
 version = "2.0.3-rc.11"
 dependencies = [
+ "async-trait",
  "chrono",
  "dirs",
  "eyre",

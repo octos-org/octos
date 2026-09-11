@@ -17,7 +17,7 @@ const CURRENT_SESSION_SCHEMA: u32 = 1;
 
 /// Observer callback invoked AFTER a successful durable commit by
 /// [`SessionManager::add_message_with_seq`] (and the equivalent
-/// `SessionHandle` path). Implements the post-fsync hook UPCR-2026-012's
+/// `SessionHandle` path). Implements the post-commit hook UPCR-2026-012's
 /// `message/persisted` notification dispatches through.
 ///
 /// Strict-ordering invariant: `add_message_with_seq` calls observers
@@ -149,6 +149,32 @@ fn rewrite_tmp_path(target: &Path) -> PathBuf {
     let pid = std::process::id();
     let seq = REWRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     target.with_extension(format!("jsonl.{pid}-{seq}.tmp"))
+}
+
+/// Seal a torn tail before appending: if the file is non-empty and does
+/// not end in a newline (a crash split an earlier write), write the
+/// missing terminator first so the next row can never fuse with the torn
+/// bytes into one unparseable line. The torn bytes are preserved, never
+/// truncated — they may be a complete row that merely lost its
+/// terminator; the read path skips what it cannot parse. Mirrors
+/// `supervisor_store::write_rows_sealed_locked`.
+///
+/// Callers serialize appends per session key (the persist lock), like the
+/// supervisor store's append lock; the seal does not defend against
+/// unsynchronized cross-process writers to the same file.
+///
+/// O_APPEND: the sealing write lands at EOF regardless of the read seek.
+fn seal_torn_tail(file: &mut std::fs::File, file_len: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    if file_len > 0 {
+        file.seek(SeekFrom::Start(file_len - 1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(())
 }
 
 /// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
@@ -1396,12 +1422,13 @@ impl SessionManager {
         session.updated_at = Utc::now();
         record_session_persist("committed");
         let committed_seq = session.messages.len().saturating_sub(1);
-        // UPCR-2026-012: post-fsync observer fan-out. Fires AFTER the
+        // UPCR-2026-012: post-commit observer fan-out. Fires AFTER the
         // append_to_disk above succeeded and the in-memory mirror is
         // updated, so a `message/persisted` notification reflects a row
-        // that is durably visible. A failed disk write returns above
-        // before this point, so the observer never sees a row that did
-        // not commit.
+        // the OS has accepted (the append write returned; per-append
+        // fsync is deliberately not done). A failed disk write returns
+        // above before this point, so the observer never sees a row
+        // that did not commit.
         if let Some(committed) = session.messages.last() {
             notify_message_commit(&observer_root, key, committed, committed_seq);
         }
@@ -1876,6 +1903,7 @@ impl SessionManager {
             use std::io::Write;
 
             let mut file = std::fs::OpenOptions::new()
+                .read(true)
                 .create(true)
                 .append(true)
                 .open(&path)?;
@@ -1921,6 +1949,8 @@ impl SessionManager {
                     updated_at: Utc::now(),
                 };
                 writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+            } else {
+                seal_torn_tail(&mut file, file_len)?;
             }
 
             writeln!(file, "{msg_json}")?;
@@ -1933,7 +1963,9 @@ impl SessionManager {
     }
 
     /// Rewrite a session's JSONL file from the in-memory state.
-    /// Uses atomic write-then-rename to avoid corruption on crash.
+    /// Uses atomic write-then-rename to avoid corruption on crash; the
+    /// temp file is fsynced before the rename and the parent directory
+    /// after it, so the rewrite is durable, not just atomic.
     /// Uses spawn_blocking to avoid blocking the async runtime.
     ///
     /// Serialises on the per-key persist lock so the whole-file rewrite
@@ -1982,12 +2014,25 @@ impl SessionManager {
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = rewrite_tmp_path(&path);
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-            // Atomic rename (on same filesystem)
-            std::fs::rename(&tmp_path, &path)?;
-            Ok::<_, eyre::Report>(())
+            let write_result = (|| -> Result<(), eyre::Report> {
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(content.as_bytes())?;
+                // `flush()` on a std File is a no-op (no userspace buffer) —
+                // `sync_all` is what actually gets the bytes to stable
+                // storage before the rename swaps the inode.
+                file.sync_all()?;
+                // Atomic rename (on same filesystem)
+                std::fs::rename(&tmp_path, &path)?;
+                if let Some(dir) = path.parent() {
+                    fsync_dir(dir);
+                }
+                Ok(())
+            })();
+            if write_result.is_err() {
+                // Best-effort tmp cleanup, same as rewrite_blocking_inner.
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            write_result
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
@@ -2249,7 +2294,15 @@ impl SessionManager {
         let line = rollback_marker_line(num_turns)?;
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&target)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&target)?;
+            let file_len = file.metadata()?.len();
+            // The marker is what makes `/undo` survive a reload — if it
+            // fused with a torn tail the rollback would silently revert
+            // on the next load.
+            seal_torn_tail(&mut file, file_len)?;
             writeln!(file, "{line}")?;
             Ok::<_, eyre::Report>(())
         })
@@ -2938,11 +2991,24 @@ impl SessionHandle {
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = rewrite_tmp_path(&path);
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-            std::fs::rename(&tmp_path, &path)?;
-            Ok::<_, eyre::Report>(())
+            let write_result = (|| -> Result<(), eyre::Report> {
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(content.as_bytes())?;
+                // `flush()` on a std File is a no-op (no userspace buffer) —
+                // `sync_all` is what actually gets the bytes to stable
+                // storage before the rename swaps the inode.
+                file.sync_all()?;
+                std::fs::rename(&tmp_path, &path)?;
+                if let Some(dir) = path.parent() {
+                    fsync_dir(dir);
+                }
+                Ok(())
+            })();
+            if write_result.is_err() {
+                // Best-effort tmp cleanup, same as rewrite_blocking_inner.
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            write_result
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
@@ -3018,15 +3084,22 @@ impl SessionHandle {
         let write_result = (|| -> Result<()> {
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(content.as_bytes())?;
-            file.flush()?;
+            // `flush()` on a std File is a no-op (no userspace buffer) —
+            // `sync_all` is what actually gets the bytes to stable
+            // storage before the rename swaps the inode.
+            file.sync_all()?;
             std::fs::rename(&tmp_path, path)?;
+            if let Some(dir) = path.parent() {
+                fsync_dir(dir);
+            }
             Ok(())
         })();
         if write_result.is_err() {
-            // Best-effort tmp cleanup. If the rename succeeded but a later
-            // step failed (currently impossible — rename is the last step)
-            // we'd skip this; if `File::create` or `write_all` fail, the
-            // tmp file may exist and must not leak.
+            // Best-effort tmp cleanup. If `File::create`, `write_all`, or
+            // `sync_all` fail, the tmp file may exist and must not leak.
+            // (After a successful rename the tmp path no longer exists and
+            // the removal is a harmless no-op; the trailing `fsync_dir`
+            // cannot fail the closure.)
             let _ = std::fs::remove_file(&tmp_path);
         }
         write_result
@@ -3047,6 +3120,7 @@ impl SessionHandle {
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
+                .read(true)
                 .create(true)
                 .append(true)
                 .open(&path)?;
@@ -3090,6 +3164,8 @@ impl SessionHandle {
                     updated_at: Utc::now(),
                 };
                 writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+            } else {
+                seal_torn_tail(&mut file, file_len)?;
             }
 
             writeln!(file, "{msg_json}")?;

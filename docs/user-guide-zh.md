@@ -1748,6 +1748,8 @@ octos skills install user/repo --force
 octos skills --profile my-bot install user/repo
 ```
 
+`user/repo` 之后的路径相对仓库根目录解析，因此嵌套目录中的技能需写完整路径——例如位于 `skills/my-skill` 的技能用 `octos skills install user/repo/skills/my-skill` 安装。
+
 **安装过程：**
 1. 尝试从技能注册表下载预编译二进制文件（SHA-256 验证）
 2. 如果存在 `Cargo.toml`，回退到 `cargo build --release`

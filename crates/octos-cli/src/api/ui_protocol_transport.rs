@@ -19055,10 +19055,12 @@ async fn handle_session_open(
     // so dropping them is not lossy from their perspective.
     //
     // Reusing the helper keeps replay and live capability behavior in lockstep.
+    //
+    // No profile-scope arm here: `open_session_result` already retained this
+    // exact vector against this exact scope (`outcome.profile_scope`), so a
+    // second filter could never fire — and reading it as an independent gate
+    // would overstate the delivery path's defences.
     for event in outcome.replay {
-        if !ledger_event_matches_profile_scope(&event.event, outcome.profile_scope.as_deref()) {
-            continue;
-        }
         let projected = features
             .projection_envelope_v2
             .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
@@ -19208,9 +19210,9 @@ fn ledger_event_matches_topic_scope(
 }
 
 /// #2067 — a durable event that names a profile must reach ONLY connections
-/// resolved to that profile. This filter runs at all three delivery boundaries
-/// (the `replay.retain` in `open_session_result`, the session/open replay send
-/// loop, and the live forwarder pump), so a variant it does not recognise
+/// resolved to that profile. This filter runs at both delivery boundaries
+/// (the `replay.retain` in `open_session_result` and the live forwarder
+/// pump), so a variant it does not recognise
 /// leaks across tenants on every shared/unprofiled wire session key — which is
 /// exactly what `session/goal/updated` and `session/goal/cleared` did — and
 /// what the `loop/*` and `monitor/*` frames beside them did, since most of them
