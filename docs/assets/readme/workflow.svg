@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="920" viewBox="0 0 1200 920" role="img" aria-labelledby="title description">
+<title id="title">An OUP-controlled workflow</title>
+<desc id="description">Connect, assign, supervise, and collect. The controller exchanges commands and events with the kernel while it prepares context, calls models, and executes tools as needed. Acceptance precedes the completed, failed, or interrupted outcome.</desc>
+<defs><linearGradient id="paper" x2="1" y2="1"><stop stop-color="#f5f9ff"/><stop offset="1" stop-color="#f7fbf9"/></linearGradient><linearGradient id="kernel" x2="1" y2="1"><stop stop-color="#173f73"/><stop offset="1" stop-color="#1e3156"/></linearGradient><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="context-stroke" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<style>text{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif} .code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}</style>
+<rect x="0" y="0" width="1200" height="920" rx="28" fill="url(#paper)" stroke="none"/>
+<text x="48" y="53" font-size="14" font-weight="650" fill="#3468ce" text-anchor="start">OCTOS / WORKFLOW</text>
+<text x="48" y="101" font-size="34" font-weight="650" fill="#182b45" text-anchor="start">From a request to a recorded result</text>
+<text x="48" y="135" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">Your controller directs the work. The kernel runs it.</text>
+<rect x="48" y="174" width="252" height="142" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<rect x="66" y="193" width="34" height="28" rx="8" fill="#edf3ff" stroke="none"/>
+<text x="83" y="213" font-size="15" font-weight="650" fill="#3468ce" text-anchor="middle">01</text>
+<text x="112" y="215" font-size="23" font-weight="650" fill="#182b45" text-anchor="start">Connect</text>
+<text x="66" y="252" font-size="17" font-weight="400" fill="#5c6f86" text-anchor="start">Negotiate · open a session</text>
+<text x="66" y="291" font-size="13" font-weight="400" fill="#3468ce" text-anchor="start" class="code">session/open</text>
+<path d="M306 241h19" fill="none" stroke="#b5c6d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="332" y="174" width="252" height="142" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<rect x="350" y="193" width="34" height="28" rx="8" fill="#edf3ff" stroke="none"/>
+<text x="367" y="213" font-size="15" font-weight="650" fill="#3468ce" text-anchor="middle">02</text>
+<text x="396" y="215" font-size="23" font-weight="650" fill="#182b45" text-anchor="start">Assign</text>
+<text x="350" y="252" font-size="17" font-weight="400" fill="#5c6f86" text-anchor="start">Start a scoped turn</text>
+<text x="350" y="291" font-size="13" font-weight="400" fill="#3468ce" text-anchor="start" class="code">turn/start</text>
+<path d="M590 241h19" fill="none" stroke="#b5c6d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="616" y="174" width="252" height="142" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<rect x="634" y="193" width="34" height="28" rx="8" fill="#edf3ff" stroke="none"/>
+<text x="651" y="213" font-size="15" font-weight="650" fill="#3468ce" text-anchor="middle">03</text>
+<text x="680" y="215" font-size="23" font-weight="650" fill="#182b45" text-anchor="start">Supervise</text>
+<text x="634" y="252" font-size="17" font-weight="400" fill="#5c6f86" text-anchor="start">Observe · respond · steer</text>
+<text x="634" y="291" font-size="13" font-weight="400" fill="#3468ce" text-anchor="start" class="code">tool/* · turn/steer</text>
+<path d="M874 241h19" fill="none" stroke="#b5c6d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="900" y="174" width="252" height="142" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<rect x="918" y="193" width="34" height="28" rx="8" fill="#edf3ff" stroke="none"/>
+<text x="935" y="213" font-size="15" font-weight="650" fill="#3468ce" text-anchor="middle">04</text>
+<text x="964" y="215" font-size="23" font-weight="650" fill="#182b45" text-anchor="start">Collect</text>
+<text x="918" y="252" font-size="17" font-weight="400" fill="#5c6f86" text-anchor="start">Inspect final outcomes</text>
+<text x="918" y="291" font-size="13" font-weight="400" fill="#3468ce" text-anchor="start" class="code">turn/completed · turn/error</text>
+<rect x="48" y="356" width="1104" height="428" rx="22" fill="#ffffff" stroke="#dce5ef"/>
+<text x="80" y="392" font-size="14" font-weight="650" fill="#5c6f86" text-anchor="start">DURING THE TURN</text>
+<rect x="80" y="416" width="270" height="288" rx="16" fill="#eef3fd" stroke="#d2def4"/>
+<g transform="translate(103 440) scale(1)" fill="none" stroke="#3468ce" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="24" height="21" rx="4"/><path d="M2 10h24"/><path d="M7 6.5h.1M11 6.5h.1"/></g>
+<text x="145" y="461" font-size="23" font-weight="650" fill="#3468ce" text-anchor="start">Your controller</text>
+<text x="103" y="491" font-size="17" font-weight="400" fill="#5c6f86" text-anchor="start">Owns coordination policy</text>
+<rect x="104" y="522" width="6" height="6" rx="3" fill="#6d96de" stroke="none"/>
+<text x="124" y="535" font-size="19" font-weight="400" fill="#182b45" text-anchor="start">Assign a task</text>
+<rect x="104" y="564" width="6" height="6" rx="3" fill="#6d96de" stroke="none"/>
+<text x="124" y="577" font-size="19" font-weight="400" fill="#182b45" text-anchor="start">Inspect progress</text>
+<rect x="104" y="606" width="6" height="6" rx="3" fill="#6d96de" stroke="none"/>
+<text x="124" y="619" font-size="19" font-weight="400" fill="#182b45" text-anchor="start">Resolve approvals</text>
+<rect x="104" y="648" width="6" height="6" rx="3" fill="#6d96de" stroke="none"/>
+<text x="124" y="661" font-size="19" font-weight="400" fill="#182b45" text-anchor="start">Steer or interrupt</text>
+<path d="M356 520H464" fill="none" stroke="#3468ce" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="410" y="499" font-size="15" font-weight="500" fill="#3468ce" text-anchor="middle">Commands</text>
+<path d="M464 651H356" fill="none" stroke="#168575" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="5 7"/>
+<text x="410" y="633" font-size="15" font-weight="500" fill="#168575" text-anchor="middle">Events</text>
+<rect x="470" y="416" width="650" height="288" rx="18" fill="url(#kernel)" stroke="none"/>
+<text x="496" y="461" font-size="25" font-weight="650" fill="#ffffff" text-anchor="start">Octos kernel</text>
+<rect x="939" y="436" width="153" height="31" rx="15" fill="#2b5280" stroke="none"/>
+<text x="1015" y="457" font-size="16" font-weight="500" fill="#b9f2e1" text-anchor="middle">Turn running</text>
+<rect x="496" y="507" width="180" height="91" rx="12" fill="#2b4c77" stroke="#49678e"/>
+<text x="586" y="543" font-size="22" font-weight="600" fill="#ffffff" text-anchor="middle">Context</text>
+<text x="586" y="576" font-size="16" font-weight="400" fill="#c6d8ef" text-anchor="middle">Prepare / compact</text>
+<path d="M682 552h16" fill="none" stroke="#8dcfc6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="704" y="507" width="180" height="91" rx="12" fill="#2b4c77" stroke="#49678e"/>
+<text x="794" y="543" font-size="22" font-weight="600" fill="#ffffff" text-anchor="middle">Model</text>
+<text x="794" y="576" font-size="16" font-weight="400" fill="#c6d8ef" text-anchor="middle">Decide next step</text>
+<path d="M890 552h16" fill="none" stroke="#8dcfc6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="912" y="507" width="180" height="91" rx="12" fill="#2b4c77" stroke="#49678e"/>
+<text x="1002" y="543" font-size="22" font-weight="600" fill="#ffffff" text-anchor="middle">Tools</text>
+<text x="1002" y="576" font-size="16" font-weight="400" fill="#c6d8ef" text-anchor="middle">When requested</text>
+<path d="M1002 606V646H586V606" fill="none" stroke="#8dcfc6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="685" y="631" width="220" height="29" rx="8" fill="#1e365d" stroke="none"/>
+<text x="795" y="651" font-size="16" font-weight="400" fill="#cae9e5" text-anchor="middle">Continue as needed</text>
+<text x="80" y="746" font-size="18" font-weight="400" fill="#5c6f86" text-anchor="start">A pending approval or question waits for the controller&#x27;s response through OUP.</text>
+<text x="48" y="833" font-size="14" font-weight="650" fill="#5c6f86" text-anchor="start">FINAL OUTCOME</text>
+<rect x="244" y="805" width="256" height="44" rx="22" fill="#e6f5ed" stroke="none"/>
+<text x="372" y="834" font-size="19" font-weight="600" fill="#297353" text-anchor="middle">Completed</text>
+<rect x="526" y="805" width="256" height="44" rx="22" fill="#faedee" stroke="none"/>
+<text x="654" y="834" font-size="19" font-weight="600" fill="#a44a59" text-anchor="middle">Failed</text>
+<rect x="808" y="805" width="256" height="44" rx="22" fill="#f8f0df" stroke="none"/>
+<text x="936" y="834" font-size="19" font-weight="600" fill="#916f25" text-anchor="middle">Interrupted</text>
+<text x="48" y="889" font-size="18" font-weight="400" fill="#5c6f86" text-anchor="start">Acceptance starts the work; a terminal event closes the turn.</text>
+</svg>
