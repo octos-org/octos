@@ -43407,3 +43407,39 @@ async fn review_concurrent_cold_profile_requests_share_one_runtime() {
     assert!(Arc::ptr_eq(&a, &b));
     assert!(Arc::ptr_eq(&a, &c));
 }
+
+#[test]
+fn review_large_hydrate_replay_preserves_transcript_and_continuation_checkpoint() {
+    let make = |seq: u64, payload: serde_json::Value| -> EnvelopeV2 {
+        serde_json::from_value(json!({
+            "thread_id": "long-turn", "turn_id": "long-turn", "seq": seq,
+            "cursor": { "stream": "long-session", "seq": seq + 10 }, "payload": payload,
+        }))
+        .unwrap()
+    };
+    let mut events = (1..=5000).map(|seq| make(seq, json!({
+        "type": "assistant_delta", "data": { "text": "small streaming chunk", "assistant_segment_id": "segment" }
+    }))).collect::<Vec<_>>();
+    events.push(make(
+        5001,
+        json!({ "type": "turn_terminal", "data": { "outcome": "completed" } }),
+    ));
+    assert!(serde_json::to_vec(&events).unwrap().len() > MAX_TEXT_FRAME_BYTES);
+    let (retained, checkpoints) = compact_hydrate_projection_replay(events);
+    assert_eq!(checkpoints["long-turn"], 5001);
+    assert_eq!(retained.len(), 1);
+    assert!(matches!(
+        retained[0].payload,
+        PayloadV2::TurnTerminal { .. }
+    ));
+    let response = json!({ "jsonrpc": "2.0", "id": "long-hydrate", "result": {
+        "messages": [{ "role": "user", "content": "ordinary user question" },
+                     { "role": "assistant", "content": "complete durable answer" }],
+        "replayed_projection_envelopes": retained, "projection_thread_sequences": checkpoints,
+    }});
+    let serialized = serde_json::to_string(&response).unwrap();
+    assert_eq!(
+        frame_text_within_cap(serialized.clone()).unwrap(),
+        serialized
+    );
+}

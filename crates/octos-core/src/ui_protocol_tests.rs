@@ -4127,6 +4127,7 @@ fn golden_session_hydrate_result_serde() {
         replayed_envelopes: Some(vec![]),
         replayed_tool_envelopes: Some(vec![]),
         replayed_projection_envelopes: Some(vec![]),
+        projection_thread_sequences: Some(BTreeMap::new()),
     };
     let value = serde_json::to_value(&result).expect("serialize hydrate result");
     let parsed: SessionHydrateResult =
@@ -4147,6 +4148,7 @@ fn golden_session_hydrate_result_serde() {
         replayed_envelopes: None,
         replayed_tool_envelopes: None,
         replayed_projection_envelopes: None,
+        projection_thread_sequences: None,
     };
     let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
     let object = value.as_object().expect("hydrate result is object");
@@ -4205,6 +4207,7 @@ fn session_rollback_command_and_result_round_trip() {
             replayed_envelopes: None,
             replayed_tool_envelopes: None,
             replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
         },
     };
     let wire = UiRpcResult::SessionRollback(result.clone());
