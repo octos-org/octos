@@ -2050,7 +2050,8 @@ impl Agent {
                     name: tc_name.clone(),
                     tool_id: tc_id.clone(),
                     success: true,
-                    output_preview: "Running in background — results will be delivered when ready.".into(),
+                    output_preview: "Running in background — results will be delivered when ready."
+                        .into(),
                     duration: tool_start.elapsed(),
                 });
                 // M10 Phase 4 — agent context isolation: hand the LLM a
