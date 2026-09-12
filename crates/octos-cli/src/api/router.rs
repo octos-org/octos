@@ -1477,6 +1477,12 @@ mod tests {
             .unwrap();
 
         tracing::subscriber::with_default(subscriber, || {
+            // #2276: this shared debug_span! callsite may have been lazily
+            // registered by a no-subscriber sibling test first (the JustOne
+            // rebuilder only asks the current thread's default), leaving a
+            // stale NEVER in the interest cache. Force a rebuild so the
+            // victim's DEBUG span is re-asked under this subscriber.
+            tracing_core::callsite::rebuild_interest_cache();
             runtime.block_on(async {
                 for uri in [
                     "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
