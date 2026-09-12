@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::router::AuthIdentity;
 use super::{AppState, ominix_runtime};
-use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
+use crate::profiles::{ProfileConfig, ProfileStore, UserProfile, mask_secrets};
 
 const DEFAULT_SERVE_LOG_TAIL_N: usize = 200;
 const MAX_SERVE_LOG_TAIL_N: usize = 5_000;
@@ -1851,6 +1851,48 @@ pub(crate) fn validate_channel_credentials(
     Ok(())
 }
 
+/// The secret-relocation hook applied to a profile's env vars before they are
+/// persisted — the signature of [`relocate_keychain_backed_secrets`]. Carried
+/// as a parameter so tests can drive the failure path without writing to the
+/// developer's keychain.
+pub(crate) type RelocateSecretsHook =
+    fn(&mut std::collections::HashMap<String, String>, &str) -> Result<(), (StatusCode, String)>;
+
+/// Apply freshly supplied sub-account env vars, relocating keychain-backed
+/// secrets (e.g. the Vertex SA JSON) into the OS keychain before the save so a
+/// sub-account never writes a private key to plaintext config. The store has
+/// already persisted the fresh profile by the time this runs, so a relocation
+/// failure rolls the profile back — otherwise the API would report "creation
+/// failed" while leaving a sub-account whose id can never be retried ("already
+/// exists", #1472).
+pub(crate) fn apply_sub_account_env_vars(
+    store: &ProfileStore,
+    sub: &mut UserProfile,
+    env_vars: std::collections::HashMap<String, String>,
+    relocate: RelocateSecretsHook,
+) -> Result<(), (StatusCode, String)> {
+    sub.config.env_vars = env_vars;
+    let sub_id = sub.id.clone();
+    if let Err(e) = relocate(&mut sub.config.env_vars, &sub_id) {
+        // Roll the just-created profile back: the sub-account was saved
+        // keychain-less minutes ago and nothing else references it yet, so
+        // removing it restores the pre-request state instead of stranding a
+        // half-configured id behind "already exists".
+        if let Err(rollback) = store.delete(&sub.id) {
+            tracing::error!(
+                profile = %sub.id,
+                error = %rollback,
+                "failed to roll back sub-account after secret relocation failure"
+            );
+        }
+        return Err(e);
+    }
+    sub.updated_at = Utc::now();
+    store
+        .save(sub)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 /// POST /api/admin/profiles/:id/accounts — Create a sub-account.
 pub async fn create_sub_account(
     State(state): State<Arc<AppState>>,
@@ -1884,15 +1926,12 @@ pub async fn create_sub_account(
 
     // Set channel-specific env vars if provided
     if !req.env_vars.is_empty() {
-        sub.config.env_vars = req.env_vars;
-        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
-        // persisting so a sub-account never writes a private key to disk.
-        let sub_id = sub.id.clone();
-        relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
-        sub.updated_at = Utc::now();
-        store
-            .save(&sub)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        apply_sub_account_env_vars(
+            store,
+            &mut sub,
+            req.env_vars,
+            relocate_keychain_backed_secrets,
+        )?;
     }
 
     // Create a User entry so the sub-account can log in via OTP
@@ -5630,6 +5669,156 @@ mod tests {
             );
             assert!(slot.starts_with('{'), "raw value left untouched");
         }
+    }
+
+    // #1472 test fixture: a persisted parent profile plus a fresh (already
+    // saved, env-less) sub-account, i.e. the state `create_sub_account`
+    // handlers have when they reach the env-var step.
+    fn parent_profile() -> UserProfile {
+        UserProfile {
+            id: "parent".into(),
+            name: "Parent".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn fresh_sub_account_with_parent(store: &ProfileStore) -> UserProfile {
+        store.save(&parent_profile()).unwrap();
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .unwrap()
+    }
+
+    // #1472: the store has already persisted the fresh sub-account when a
+    // keychain-backed secret fails to relocate (raw Vertex SA JSON on a host
+    // with no secret store, or a keychain write error) — the failed creation
+    // must roll the profile back so retrying the same id doesn't hit
+    // "already exists".
+    #[test]
+    fn should_roll_back_fresh_sub_account_when_secret_relocation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([(
+                "VERTEX_SA_JSON".to_string(),
+                r#"{"type":"service_account","private_key":"x"}"#.to_string(),
+            )]),
+            |_env_vars, _profile_id| {
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    "VERTEX_SA_JSON: keychain-backed credential storage is unavailable".into(),
+                ))
+            },
+        );
+
+        assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(
+            store.get(&sub_id).unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .expect("retrying the same id must succeed after the rollback");
+    }
+
+    // The happy path is unchanged: benign env vars (nothing needing
+    // relocation) pass through the production relocate hook untouched and are
+    // persisted on the sub-account.
+    #[test]
+    fn should_persist_env_vars_when_nothing_needs_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([("DEPLOY_ENV".to_string(), "production".to_string())]),
+            relocate_keychain_backed_secrets,
+        );
+
+        assert!(res.is_ok());
+        let saved = store.get(&sub_id).unwrap().expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    // #1472 wiring: the admin create path routes env vars through the shared
+    // helper — benign vars (nothing to relocate) still land on the saved
+    // sub-account.
+    #[tokio::test]
+    async fn should_create_sub_account_with_env_vars_via_admin_handler() {
+        use crate::api::AppState;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = AppState {
+            profile_store: Some(profile_store.clone()),
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..AppState::empty_for_tests()
+        };
+        profile_store.save(&parent_profile()).unwrap();
+
+        let (status, Json(resp)) = create_sub_account(
+            axum::extract::State(Arc::new(state)),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: None,
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::from([(
+                    "DEPLOY_ENV".to_string(),
+                    "production".to_string(),
+                )]),
+            }),
+        )
+        .await
+        .expect("creation succeeds");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.profile.id, "parent--sub1");
+        let saved = profile_store
+            .get("parent--sub1")
+            .unwrap()
+            .expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
     }
 
     #[test]
