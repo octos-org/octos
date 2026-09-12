@@ -7,7 +7,7 @@
 // matching TypeScript decode + invariant-check layer.
 //
 // Once the server-emit + per-connection live filter cutover lands
-// (this PR), a WS connection that negotiated `projection.envelope.v1`
+// (this PR), a WS connection that negotiated `projection.envelope.v2`
 // receives ONLY `projection/envelope` notifications for the events
 // that surface had legacy analogs (`message/delta`, `message/persisted`,
 // `tool/*`, `turn/completed`, `file/attached`). Legacy clients keep
@@ -43,7 +43,7 @@
 // Spec: `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` § 14.
 
 import type { Envelope, ThreadId, Seq } from './ui-protocol-types.js';
-import { UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1 } from './ui-protocol-types.js';
+import { UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2 } from './ui-protocol-types.js';
 
 /** Method literal for the projection-envelope notification.
  *  Mirrors `methods::PROJECTION_ENVELOPE` in the Rust types. */
@@ -282,4 +282,4 @@ export class ProjectionEnvelopeBridge {
  *  for caller ergonomics — passing this string into a `session/open`
  *  request's `X-Octos-Ui-Features` opts the connection into the M9-γ
  *  cutover. */
-export const REQUIRED_FEATURE = UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1;
+export const REQUIRED_FEATURE = UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2;

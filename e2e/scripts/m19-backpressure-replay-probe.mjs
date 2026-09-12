@@ -37,7 +37,7 @@ const requestedFeatures = [
   'state.turn_state_get.v1',
   'event.message_persisted.v1',
   'event.spawn_complete.v1',
-  'projection.envelope.v1',
+  'projection.envelope.v2',
   'auxiliary.rest_to_ws.v1',
 ];
 

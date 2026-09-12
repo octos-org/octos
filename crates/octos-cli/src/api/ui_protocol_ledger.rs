@@ -60,9 +60,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
-    Envelope, EnvelopeNotification, EnvelopeV2, EnvelopeV2Notification, Payload, PayloadV2,
-    RpcError, RpcNotification, SessionOpened, TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent,
-    UiCursor, UiNotification, UiProgressEvent, methods,
+    EnvelopeV2, EnvelopeV2Notification, PayloadV2, RpcError, RpcNotification, SessionOpened,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, UiCursor, UiNotification,
+    UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -655,7 +655,7 @@ fn legacy_attachment_owner(
     let mut index = 0_u64;
     let mut open = false;
     for entry in inner.sessions.get(session)?.entries.iter() {
-        let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(event)) = &entry.event
+        let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(event)) = &entry.event
         else {
             continue;
         };
@@ -663,11 +663,11 @@ fn legacy_attachment_owner(
             continue;
         }
         match event.envelope.payload {
-            Payload::AssistantDelta { .. } | Payload::AssistantPersisted { .. } if !open => {
+            PayloadV2::AssistantDelta { .. } | PayloadV2::AssistantPersisted { .. } if !open => {
                 index += 1;
                 open = true;
             }
-            Payload::ToolStart { .. } | Payload::ToolEnd { .. } => open = false,
+            PayloadV2::ToolStart { .. } | PayloadV2::ToolEnd { .. } => open = false,
             _ => {}
         }
     }
@@ -1587,74 +1587,10 @@ impl UiProtocolLedger {
         )
     }
 
-    /// UPCR-2026-014 (M9-γ) — emit a canonical projection envelope with
-    /// server-allocated `seq` and hard-barrier enforcement.
-    ///
-    /// Per [§ 14.6 of the v1 spec](../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md),
-    /// every envelope for a `(session_id, thread_id)` pair gets a
-    /// strictly-monotonic `seq: u64` issued from 1; once a
-    /// [`Payload::TurnCompleted`] envelope is emitted for a thread, any
-    /// further envelope on that thread is DROPPED at the live emit site
-    /// and counted in the
-    /// `octos_projection_post_completion_drop_total` metric.
-    ///
-    /// Returns the [`LedgeredUiProtocolEvent`] when the envelope is
-    /// emitted, or `None` when the hard barrier dropped it (the metric
-    /// is already bumped on the drop path).
-    ///
-    /// The drop is applied at the *live* emit site only — ledger replay
-    /// (post-reconnect) bypasses the drop, so a client that reconnects
-    /// with a pre-completion cursor still observes the full envelope
-    /// history.
-    ///
-    /// Topic defaults to `session_id.topic()`. Callers that have stripped
-    /// the topic suffix from `session_id` (see the P0-A wire-gap fix in
-    /// `emit_files_attached_from_background`) MUST use
-    /// [`emit_envelope_with_topic`] to thread the captured topic
-    /// explicitly. This single-arg helper preserves the call sites that
-    /// emit on an unmodified `SessionKey` and do not have a separate
-    /// topic source.
-    pub(crate) fn emit_envelope(
-        &self,
-        session_id: &SessionKey,
-        thread_id: String,
-        payload: Payload,
-        client_message_id: Option<String>,
-    ) -> Option<LedgeredUiProtocolEvent> {
-        let topic = session_id.topic().map(ToOwned::to_owned);
-        self.emit_envelope_inner(session_id, thread_id, payload, client_message_id, topic)
-    }
-
-    /// Codex BLOCKER #1336-round-2 (BLOCKER 5): variant of
-    /// [`emit_envelope`] that accepts an explicit topic. Required by
-    /// callers that strip the `#<topic>` suffix from `session_id` before
-    /// publishing — without this hook the envelope would derive topic
-    /// from `session_id.topic()` (which is now `None`) and silently lose
-    /// routing.
-    ///
-    /// The caller-provided `topic` is the SOURCE OF TRUTH: an
-    /// `Some("…")` always wins over `session_id.topic()`, and `None`
-    /// means "no topic" (the call site has already decided the envelope
-    /// does not belong to any topic scope).
-    pub(crate) fn emit_envelope_with_topic(
-        &self,
-        session_id: &SessionKey,
-        thread_id: String,
-        payload: Payload,
-        client_message_id: Option<String>,
-        topic: Option<&str>,
-    ) -> Option<LedgeredUiProtocolEvent> {
-        let topic = topic
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(ToOwned::to_owned);
-        self.emit_envelope_inner(session_id, thread_id, payload, client_message_id, topic)
-    }
-
     /// Emit one canonical v2 projection envelope under the same per-thread
-    /// sequence and terminal-barrier discipline as the older projection
-    /// writer. The cursor is assigned by the durable append path, never by a
-    /// caller, so live delivery and replay observe the identical envelope.
+    /// sequence and terminal-barrier discipline. The cursor is assigned by the
+    /// durable append path, never by a caller, so live delivery and replay
+    /// observe the identical envelope.
     pub(crate) fn emit_envelope_v2(
         &self,
         session_id: &SessionKey,
@@ -1809,17 +1745,6 @@ impl UiProtocolLedger {
             .filter(|entry| entry.seq < before_cursor_seq)
         {
             let phase = match &entry.event {
-                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
-                    if envelope.envelope.thread_id == thread_id =>
-                {
-                    match &envelope.envelope.payload {
-                        Payload::AssistantDelta { .. } | Payload::AssistantPersisted { .. } => {
-                            Some(true)
-                        }
-                        Payload::ToolStart { .. } | Payload::ToolEnd { .. } => Some(false),
-                        _ => None,
-                    }
-                }
                 UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
                     if envelope.envelope.thread_id == thread_id =>
                 {
@@ -1903,11 +1828,6 @@ impl UiProtocolLedger {
         let (durable_seq, durable_cursor_seq) = entries
             .iter()
             .filter_map(|entry| match &entry.event {
-                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope))
-                    if envelope.envelope.thread_id == thread_id =>
-                {
-                    Some((envelope.envelope.seq, entry.seq))
-                }
                 UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
                     if envelope.envelope.thread_id == thread_id =>
                 {
@@ -2006,126 +1926,6 @@ impl UiProtocolLedger {
                 }
                 _ => false,
             })
-    }
-
-    fn emit_envelope_inner(
-        &self,
-        session_id: &SessionKey,
-        thread_id: String,
-        payload: Payload,
-        client_message_id: Option<String>,
-        topic: Option<String>,
-    ) -> Option<LedgeredUiProtocolEvent> {
-        // Codex #1336 round-2 BLOCKER 2: allocate envelope seq, apply
-        // hard barrier, build the notification, append to the ledger
-        // entries (in-memory ring + disk write), AND publish to live
-        // subscribers — all inside ONE critical section. Previously
-        // `allocate_envelope_seq` took its own lock, returned, and
-        // then `append` re-acquired — letting two concurrent emits
-        // interleave `(seq=1 allocate, seq=2 allocate, seq=2 append,
-        // seq=1 append)`. Combined with a `Payload::TurnCompleted`
-        // arriving as seq=2, the wire observed `TurnCompleted(seq=2)`
-        // before the pre-completion delta `(seq=1)`, which the
-        // client bridge then dropped as post-completion.
-        //
-        // The broadcast `publish_live` is held inside the lock too so
-        // the broadcast send order strictly matches the seq allocation
-        // order. `broadcast::Sender::send` is non-blocking (try_send on
-        // a bounded queue) so the lock-hold is microseconds.
-        let session_id_clone = session_id.clone();
-        // Storage identity for ring/seq/disk/LRU; `session_id_clone` (the
-        // plain wire id) still stamps the envelope payload and keys the live
-        // subscriber lookup below.
-        let storage_id = self.storage_session_id(session_id);
-        let preload_snapshot = self.snapshot_if_session_absent(&storage_id);
-        let cursor;
-        let stamped;
-        let on_disk_delta;
-        let ledgered;
-        let broadcast_sender;
-        {
-            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-
-            // --- step 1: envelope seq allocation + hard barrier ---
-            // Seq/thread state follows the STORAGE identity so two projects
-            // sharing a wire key allocate independent, per-project seq
-            // streams consistent with their separate rings/dirs.
-            let alloc = self.allocate_projection_seq_locked(
-                &storage_id,
-                &thread_id,
-                matches!(&payload, Payload::TurnCompleted { .. }),
-                &mut inner,
-            );
-            let seq = match alloc {
-                Ok(seq) => seq,
-                Err(kind) => {
-                    drop(inner);
-                    metrics::counter!(
-                        "octos_projection_post_completion_drop_total",
-                        "kind" => kind,
-                    )
-                    .increment(1);
-                    return None;
-                }
-            };
-
-            // --- step 2: build the notification with allocated seq ---
-            let envelope = Envelope {
-                thread_id,
-                seq,
-                client_message_id,
-                payload,
-            };
-            let mut event = UiProtocolLedgerEvent::Notification(UiNotification::Envelope(
-                EnvelopeNotification {
-                    session_id: session_id_clone.clone(),
-                    topic,
-                    envelope,
-                },
-            ));
-            event.stamp_topic_from_session();
-
-            // --- step 3: append to the ledger (LRU, ring, disk) ---
-            let append_outcome =
-                self.append_locked(&storage_id, event, None, preload_snapshot, &mut inner);
-            cursor = append_outcome.cursor;
-            stamped = append_outcome.stamped;
-            on_disk_delta = append_outcome.on_disk_delta;
-            ledgered = LedgeredUiProtocolEvent {
-                cursor: cursor.clone(),
-                event: stamped.clone(),
-                from_connection: None,
-            };
-
-            // Accounting that the original `append` does after entry
-            // push — keep inside the same critical section so the
-            // next emit observes consistent state.
-            if on_disk_delta >= 0 {
-                inner.on_disk_bytes = inner.on_disk_bytes.saturating_add(on_disk_delta as u64);
-            } else {
-                inner.on_disk_bytes = inner.on_disk_bytes.saturating_sub((-on_disk_delta) as u64);
-            }
-            inner.touch_lru(&storage_id);
-
-            // --- step 4: publish to live subscribers WHILE STILL
-            // HOLDING THE LOCK so the broadcast send order strictly
-            // matches the seq allocation order. Another emit cannot
-            // acquire the lock + send its own envelope between our
-            // append and our broadcast send.
-            //
-            // `broadcast::Sender::send` is non-blocking (try_send on a
-            // bounded tokio channel) so the lock-hold is microseconds.
-            // `Err` is returned only when all receivers have been
-            // dropped, which is a no-op for our durable contract —
-            // the ledger record stands and any future reconnect
-            // catches up via cursor replay.
-            broadcast_sender = inner.subscribers.get(&session_id_clone).cloned();
-            if let Some(sender) = broadcast_sender.as_ref() {
-                let _ = sender.send(ledgered.clone());
-            }
-        }
-        let _ = broadcast_sender; // silence dead-store warning
-        Some(ledgered)
     }
 
     /// Per-thread envelope seq allocator with hard-barrier check.
@@ -2230,16 +2030,6 @@ impl UiProtocolLedger {
         };
         for entry in &session_state.entries {
             match &entry.event {
-                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev))
-                    if ev.envelope.thread_id == thread_id =>
-                {
-                    if ev.envelope.seq >= state.next_seq {
-                        state.next_seq = ev.envelope.seq + 1;
-                    }
-                    if matches!(ev.envelope.payload, Payload::TurnCompleted { .. }) {
-                        state.completed = true;
-                    }
-                }
                 UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(ev))
                     if ev.envelope.thread_id == thread_id =>
                 {
@@ -3771,7 +3561,6 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         // land the event on whichever session the client has focused.
         UiNotification::BackgroundActivity(event) => &event.session_id,
         UiNotification::UserQuestionRequested(event) => &event.session_id,
-        UiNotification::Envelope(event) => &event.session_id,
         UiNotification::EnvelopeV2(event) => &event.session_id,
     }
 }
@@ -3871,20 +3660,6 @@ pub(crate) fn redact_ui_notification_secrets(notification: &mut UiNotification) 
             redact_opt_in_place(&mut decided.client_note);
             redact_opt_in_place(&mut decided.scope);
         }
-        UiNotification::Envelope(envelope) => match &mut envelope.envelope.payload {
-            Payload::ToolStart {
-                arguments_preview, ..
-            } => redact_opt_in_place(arguments_preview),
-            Payload::ToolEnd {
-                error,
-                output_preview,
-                ..
-            } => {
-                redact_opt_in_place(error);
-                redact_opt_in_place(output_preview);
-            }
-            _ => {}
-        },
         UiNotification::EnvelopeV2(envelope) => match &mut envelope.envelope.payload {
             PayloadV2::ToolStart {
                 arguments_preview, ..
@@ -6088,14 +5863,14 @@ mod tests {
 
     fn envelope_seq(ledgered: &LedgeredUiProtocolEvent) -> u64 {
         match &ledgered.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) => ev.envelope.seq,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(ev)) => ev.envelope.seq,
             other => panic!("expected envelope ledger event, got {other:?}"),
         }
     }
 
-    fn envelope_payload(ledgered: &LedgeredUiProtocolEvent) -> Payload {
+    fn envelope_payload(ledgered: &LedgeredUiProtocolEvent) -> PayloadV2 {
         match &ledgered.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) => {
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(ev)) => {
                 ev.envelope.payload.clone()
             }
             other => panic!("expected envelope ledger event, got {other:?}"),
@@ -6109,26 +5884,35 @@ mod tests {
         let thread_id = "thread-A".to_owned();
 
         let a = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id.clone(),
-                Payload::AssistantDelta { text: "a".into() },
+                PayloadV2::AssistantDelta {
+                    text: "a".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .expect("first emit");
         let b = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id.clone(),
-                Payload::AssistantDelta { text: "b".into() },
+                PayloadV2::AssistantDelta {
+                    text: "b".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .expect("second emit");
         let c = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id.clone(),
-                Payload::AssistantDelta { text: "c".into() },
+                PayloadV2::AssistantDelta {
+                    text: "c".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .expect("third emit");
@@ -6144,34 +5928,46 @@ mod tests {
         let session_id = SessionKey("local:multi-thread".into());
 
         let a1 = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 "thread-A".into(),
-                Payload::AssistantDelta { text: "a1".into() },
+                PayloadV2::AssistantDelta {
+                    text: "a1".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .unwrap();
         let b1 = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 "thread-B".into(),
-                Payload::AssistantDelta { text: "b1".into() },
+                PayloadV2::AssistantDelta {
+                    text: "b1".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .unwrap();
         let a2 = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 "thread-A".into(),
-                Payload::AssistantDelta { text: "a2".into() },
+                PayloadV2::AssistantDelta {
+                    text: "a2".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .unwrap();
         let b2 = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 "thread-B".into(),
-                Payload::AssistantDelta { text: "b2".into() },
+                PayloadV2::AssistantDelta {
+                    text: "b2".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .unwrap();
@@ -6189,45 +5985,53 @@ mod tests {
         let thread_id = "thread-X".to_owned();
 
         let _ = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id.clone(),
-                Payload::AssistantDelta { text: "hi".into() },
+                PayloadV2::AssistantDelta {
+                    text: "hi".into(),
+                    assistant_segment_id: String::new(),
+                },
                 None,
             )
             .expect("pre-completion emit");
         let completed = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id.clone(),
-                Payload::TurnCompleted {
-                    token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+                PayloadV2::TurnTerminal {
+                    outcome: octos_core::ui_protocol::TurnTerminalOutcome::Completed,
+                    error: None,
+                    token_usage: Some(octos_core::ui_protocol::EnvelopeTokenUsage::default()),
                 },
                 None,
             )
             .expect("turn_completed emit");
         assert!(matches!(
             envelope_payload(&completed),
-            Payload::TurnCompleted { .. }
+            PayloadV2::TurnTerminal { .. }
         ));
 
         // Post-completion: ANY further envelope on this thread is dropped.
-        let dropped = ledger.emit_envelope(
+        let dropped = ledger.emit_envelope_v2(
             &session_id,
             thread_id.clone(),
-            Payload::AssistantDelta {
+            PayloadV2::AssistantDelta {
                 text: "should be dropped".into(),
+                assistant_segment_id: String::new(),
             },
             None,
         );
         assert!(dropped.is_none(), "post-completion emit must be dropped");
 
         // A second TurnCompleted is also dropped.
-        let dup = ledger.emit_envelope(
+        let dup = ledger.emit_envelope_v2(
             &session_id,
             thread_id,
-            Payload::TurnCompleted {
-                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            PayloadV2::TurnTerminal {
+                outcome: octos_core::ui_protocol::TurnTerminalOutcome::Completed,
+                error: None,
+                token_usage: Some(octos_core::ui_protocol::EnvelopeTokenUsage::default()),
             },
             None,
         );
@@ -6252,15 +6056,18 @@ mod tests {
         // state where the ring is hydrated from disk but the per-thread
         // allocator hasn't observed an emit yet).
         for seq in [1u64, 2, 3, 4] {
-            let envelope = Envelope {
+            let envelope = EnvelopeV2 {
                 thread_id: thread_id.clone(),
                 seq,
+                cursor: None,
+                turn_id: thread_id.clone(),
                 client_message_id: None,
-                payload: Payload::AssistantDelta {
+                payload: PayloadV2::AssistantDelta {
                     text: format!("delta-{seq}"),
+                    assistant_segment_id: String::new(),
                 },
             };
-            let notif = UiNotification::Envelope(EnvelopeNotification {
+            let notif = UiNotification::EnvelopeV2(EnvelopeV2Notification {
                 session_id: session_id.clone(),
                 topic: None,
                 envelope,
@@ -6277,11 +6084,12 @@ mod tests {
 
         // Now emit_envelope: the allocator must resume from seq=5.
         let recovered = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id,
-                Payload::AssistantDelta {
+                PayloadV2::AssistantDelta {
                     text: "post-recovery".into(),
+                    assistant_segment_id: String::new(),
                 },
                 None,
             )
@@ -6334,11 +6142,12 @@ mod tests {
             let thread_id = thread_id.clone();
             handles.push(thread::spawn(move || {
                 ledger
-                    .emit_envelope(
+                    .emit_envelope_v2(
                         &session_id,
                         thread_id,
-                        Payload::AssistantDelta {
+                        PayloadV2::AssistantDelta {
                             text: format!("concurrent-{i}"),
+                            assistant_segment_id: String::new(),
                         },
                         None,
                     )
@@ -6383,7 +6192,7 @@ mod tests {
         for _ in 0..N {
             match subscriber.try_recv() {
                 Ok(event) => {
-                    if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(ev)) =
+                    if let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(ev)) =
                         &event.event
                     {
                         assert!(
@@ -6436,11 +6245,12 @@ mod tests {
             let s = session_id.clone();
             let t = thread_id.clone();
             handles.push(thread::spawn(move || {
-                l.emit_envelope(
+                l.emit_envelope_v2(
                     &s,
                     t,
-                    Payload::AssistantDelta {
+                    PayloadV2::AssistantDelta {
                         text: "delta".into(),
+                        assistant_segment_id: String::new(),
                     },
                     None,
                 )
@@ -6457,11 +6267,13 @@ mod tests {
         // Now emit TurnCompleted on the same thread — it MUST land
         // at seq=31 (after all the deltas).
         let tc = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id.clone(),
-                Payload::TurnCompleted {
-                    token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+                PayloadV2::TurnTerminal {
+                    outcome: octos_core::ui_protocol::TurnTerminalOutcome::Completed,
+                    error: None,
+                    token_usage: Some(octos_core::ui_protocol::EnvelopeTokenUsage::default()),
                 },
                 None,
             )
@@ -6469,10 +6281,13 @@ mod tests {
         assert_eq!(envelope_seq(&tc), 31);
 
         // And any further envelope on this thread is hard-barriered.
-        let post = ledger.emit_envelope(
+        let post = ledger.emit_envelope_v2(
             &session_id,
             thread_id,
-            Payload::AssistantDelta { text: "x".into() },
+            PayloadV2::AssistantDelta {
+                text: "x".into(),
+                assistant_segment_id: String::new(),
+            },
             None,
         );
         assert!(post.is_none());
@@ -6499,10 +6314,13 @@ mod tests {
             let ledger = UiProtocolLedger::with_config(config);
             for _ in 0..3 {
                 let _ = ledger
-                    .emit_envelope(
+                    .emit_envelope_v2(
                         &session_id,
                         thread_id.clone(),
-                        Payload::AssistantDelta { text: "d".into() },
+                        PayloadV2::AssistantDelta {
+                            text: "d".into(),
+                            assistant_segment_id: String::new(),
+                        },
                         None,
                     )
                     .expect("emit");
@@ -6515,11 +6333,12 @@ mod tests {
         // the persistent watermark file.
         let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         let resumed = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id,
-                Payload::AssistantDelta {
+                PayloadV2::AssistantDelta {
                     text: "after-evict".into(),
+                    assistant_segment_id: String::new(),
                 },
                 None,
             )
@@ -6553,10 +6372,13 @@ mod tests {
         // Emit on thread-A; watermark records next_seq=3.
         for _ in 0..2 {
             let _ = ledger
-                .emit_envelope(
+                .emit_envelope_v2(
                     &session_id,
                     thread_id_a.clone(),
-                    Payload::AssistantDelta { text: "a".into() },
+                    PayloadV2::AssistantDelta {
+                        text: "a".into(),
+                        assistant_segment_id: String::new(),
+                    },
                     None,
                 )
                 .expect("emit a");
@@ -6564,10 +6386,13 @@ mod tests {
         // Hammer thread-B to push thread-A out of the ring.
         for _ in 0..10 {
             let _ = ledger
-                .emit_envelope(
+                .emit_envelope_v2(
                     &session_id,
                     thread_id_b.clone(),
-                    Payload::AssistantDelta { text: "b".into() },
+                    PayloadV2::AssistantDelta {
+                        text: "b".into(),
+                        assistant_segment_id: String::new(),
+                    },
                     None,
                 )
                 .expect("emit b");
@@ -6579,11 +6404,12 @@ mod tests {
         drop(ledger);
         let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         let resumed = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session_id,
                 thread_id_a,
-                Payload::AssistantDelta {
+                PayloadV2::AssistantDelta {
                     text: "after-compact".into(),
+                    assistant_segment_id: String::new(),
                 },
                 None,
             )
@@ -6608,19 +6434,24 @@ mod tests {
         {
             let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
             let _ = ledger
-                .emit_envelope(
+                .emit_envelope_v2(
                     &session_id,
                     thread_id.clone(),
-                    Payload::AssistantDelta { text: "d".into() },
+                    PayloadV2::AssistantDelta {
+                        text: "d".into(),
+                        assistant_segment_id: String::new(),
+                    },
                     None,
                 )
                 .expect("delta");
             let _ = ledger
-                .emit_envelope(
+                .emit_envelope_v2(
                     &session_id,
                     thread_id.clone(),
-                    Payload::TurnCompleted {
-                        token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+                    PayloadV2::TurnTerminal {
+                        outcome: octos_core::ui_protocol::TurnTerminalOutcome::Completed,
+                        error: None,
+                        token_usage: Some(octos_core::ui_protocol::EnvelopeTokenUsage::default()),
                     },
                     None,
                 )
@@ -6629,11 +6460,12 @@ mod tests {
         let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
         // Post-completion emit on the same thread MUST be barriered
         // even though the in-memory ring is empty.
-        let dropped = ledger.emit_envelope(
+        let dropped = ledger.emit_envelope_v2(
             &session_id,
             thread_id,
-            Payload::AssistantDelta {
+            PayloadV2::AssistantDelta {
                 text: "should be barriered".into(),
+                assistant_segment_id: String::new(),
             },
             None,
         );
@@ -6642,40 +6474,6 @@ mod tests {
             "completed=true MUST survive restart so post-completion \
              envelopes stay barriered even without an in-memory ring"
         );
-    }
-
-    #[test]
-    fn envelope_notification_round_trips_through_ledger_wrapper() {
-        // On mini3 we saw 5 ledger records dropped on replay with
-        //   error=Error("duplicate field `envelope`", ...)
-        // because the outer `tag = "envelope"` discriminator flattened
-        // alongside `EnvelopeNotification.envelope` and produced two
-        // identical keys in the same JSON object. The wider standalone
-        // round-trip test for `EnvelopeNotification` in octos-core missed
-        // this — only the ledger wrapper exhibits the collision.
-        let session = SessionKey("local:envelope-round-trip".into());
-        let event =
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(EnvelopeNotification {
-                session_id: session.clone(),
-                topic: Some("planning".into()),
-                envelope: Envelope {
-                    thread_id: "round-trip-thread".into(),
-                    seq: 7,
-                    client_message_id: None,
-                    payload: Payload::AssistantDelta {
-                        text: "round-trip me".into(),
-                    },
-                },
-            }));
-
-        let serialized = serde_json::to_string(&event).expect("ledger event serializes");
-        assert!(
-            !serialized.contains("\"envelope\":\"notification\""),
-            "outer ledger discriminator must NOT be named `envelope` — got {serialized}"
-        );
-        let parsed: UiProtocolLedgerEvent = serde_json::from_str(&serialized)
-            .unwrap_or_else(|e| panic!("ledger replay MUST succeed: {e}; payload={serialized}"));
-        assert_eq!(parsed, event, "round-trip must be field-equal");
     }
 
     // ---------- #1358 back-compat: legacy `envelope` outer tag ----------
@@ -6933,96 +6731,6 @@ mod tests {
             parse_ledger_disk_record(&dup_session_line).is_err(),
             "duplicate inner `session_id` (legacy record) must error — got {dup_session_line}"
         );
-    }
-
-    #[test]
-    fn legacy_envelope_variant_record_errors_gracefully_not_recovered() {
-        // STEP 0 finding: pre-#1358 `UiNotification::Envelope` records were
-        // NEVER cleanly (de)serializable. The outer ledger tag was named
-        // `envelope` AND `EnvelopeNotification` carries a nested `envelope`
-        // OBJECT field, so internally-tagged flattening emitted TWO
-        // `envelope` keys in the same object — exactly the
-        // `duplicate field 'envelope'` that #1358 fixed by renaming the
-        // outer tag to `record_kind`. Such records are duplicate-key
-        // garbage on disk; recovering them is inherently impossible.
-        //
-        // The contract here is therefore NOT "recover" but "fail
-        // gracefully": the record must ERROR (so the read loop counts it as
-        // a skip) and MUST NOT panic. This is NOT a regression — these
-        // records were always unreadable.
-        //
-        // Build the fixture authentically: serialize a real
-        // `UiNotification::Envelope` event (with the canonical `record_kind`
-        // tag) then rename the outer key back to the legacy `envelope` — the
-        // exact byte shape the pre-#1358 binary wrote. This produces the
-        // genuine two-`envelope`-keys-in-one-object collision.
-        let session = SessionKey("local:env".into());
-        let event =
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(EnvelopeNotification {
-                session_id: session,
-                topic: Some("planning".into()),
-                envelope: Envelope {
-                    thread_id: "t".into(),
-                    seq: 1,
-                    client_message_id: None,
-                    payload: Payload::AssistantDelta { text: "x".into() },
-                },
-            }));
-        let legacy_event = legacy_envelope_tagged_json(&event);
-        // The collision: the outer string tag AND the nested object field
-        // both serialize to the key `envelope`.
-        assert!(
-            legacy_event.matches("\"envelope\":").count() >= 2,
-            "legacy Envelope record must carry the duplicate `envelope` key \
-             collision — got {legacy_event}"
-        );
-
-        // The bare strict event parse rejects it (no `record_kind`).
-        assert!(
-            serde_json::from_str::<UiProtocolLedgerEvent>(&legacy_event).is_err(),
-            "bare legacy Envelope event must error under the strict canonical parse"
-        );
-
-        // The actual READ PATH must also reject it gracefully: the legacy
-        // shim hits `duplicate field 'envelope'` and errors — counted as a
-        // skip, never recovered, never a panic.
-        let line = legacy_envelope_tagged_record_line(&event, 1);
-        let result = parse_ledger_disk_record(&line);
-        assert!(
-            result.is_err(),
-            "legacy Envelope-variant records are inherently duplicate-key \
-             garbage (#1358 collision) and must error gracefully, got {result:?}"
-        );
-
-        // Whole-chain: a log file containing ONLY such records recovers
-        // zero events and counts each as a skip (no panic).
-        let temp = tempfile::tempdir().expect("tempdir");
-        let session_id = SessionKey("local:env-disk".into());
-        let session_dir = temp
-            .path()
-            .join("ui-protocol")
-            .join(encode_session_dir_name(&session_id));
-        fs::create_dir_all(&session_dir).expect("session dir");
-        let log_path = session_dir.join(new_log_file_name());
-        fs::write(&log_path, format!("{line}\n")).expect("write envelope log");
-
-        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(temp.path().into()));
-        let snapshot = ledger
-            .read_session_disk_snapshot(&session_id, &session_dir, None, false)
-            .expect("scan ok");
-        // An empty snapshot (`None`) is also acceptable (nothing
-        // recovered); when present it must show zero recovered + one skip.
-        if let Some(snap) = snapshot {
-            assert_eq!(
-                snap.retained_entries.len(),
-                0,
-                "legacy Envelope-variant records must not be recovered"
-            );
-            assert_eq!(
-                snap.skipped_records, 1,
-                "the single unreadable Envelope-variant record must be counted as a skip"
-            );
-        }
     }
 
     #[test]
@@ -7291,10 +6999,10 @@ mod tests {
         let preview = format!("cmd: \"curl -H 'Authorization: Bearer {LEAKED_BEARER_KEY}'\"");
 
         let legacy = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session,
                 thread_id.clone(),
-                Payload::ToolStart {
+                PayloadV2::ToolStart {
                     tool_call_id: "tc-1".into(),
                     name: "shell".into(),
                     arguments_preview: Some(preview.clone()),
@@ -7473,10 +7181,10 @@ mod tests {
         assert!(completed_json.contains("DATABASE_URL=postgres://localhost/db"));
 
         let legacy = ledger
-            .emit_envelope(
+            .emit_envelope_v2(
                 &session,
                 thread_id.clone(),
-                Payload::ToolEnd {
+                PayloadV2::ToolEnd {
                     tool_call_id: "tc-out".into(),
                     status: octos_core::ui_protocol::EnvelopeToolEndStatus::Error,
                     error: Some(preview.clone()),
