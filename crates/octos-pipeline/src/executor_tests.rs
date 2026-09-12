@@ -2882,7 +2882,7 @@ async fn resolve_provider_falls_back_to_default_when_key_absent() {
     router.register("strong", Arc::new(NamedMock("research-strong")));
 
     // The bug: an assigned-but-unregistered model must NOT fail the run.
-    let fallback = resolve_provider(&default, Some(&router), Some("qwen3-max"))
+    let fallback = resolve_provider(&default, Some(&router), Some("qwen3-max"), "synthesize")
         .expect("an unresolvable model key must not error the pipeline");
     assert_eq!(
         fallback.model_id(),
@@ -2892,7 +2892,7 @@ async fn resolve_provider_falls_back_to_default_when_key_absent() {
 
     // A registered key still resolves to its own lane — the fallback must not
     // swallow everything.
-    let resolved = resolve_provider(&default, Some(&router), Some("strong"))
+    let resolved = resolve_provider(&default, Some(&router), Some("strong"), "analyze")
         .expect("a registered key must resolve");
     assert_eq!(
         resolved.model_id(),
@@ -2901,6 +2901,7 @@ async fn resolve_provider_falls_back_to_default_when_key_absent() {
     );
 
     // No key at all: unchanged behaviour.
-    let none = resolve_provider(&default, Some(&router), None).expect("no key must resolve");
+    let none =
+        resolve_provider(&default, Some(&router), None, "analyze").expect("no key must resolve");
     assert_eq!(none.model_id(), "pipeline-default");
 }
