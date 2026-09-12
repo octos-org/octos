@@ -3221,6 +3221,359 @@ async fn should_not_migrate_legacy_file_when_exporting_transcript() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// evening 2026-09-10: persist_system_note_once_through_canonical_path —
+// idempotency, concurrency, strict-read fail-closed, and durable-row
+// identity (original timestamp/content preserved).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Same id twice → exactly one durable row; the second call returns the
+/// ORIGINAL row (same timestamp and content).
+#[tokio::test]
+async fn system_note_once_same_id_returns_original_row_without_duplicate() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:same-id".to_owned());
+
+    let first = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note A"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await
+    .expect("first append");
+    let first_ts = first.timestamp;
+
+    // Different content, SAME id → the durable original wins.
+    let second = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note A-prime"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await
+    .expect("second call resolves");
+    assert_eq!(second.content, "note A", "first-writer-wins content");
+    assert_eq!(second.timestamp, first_ts, "original timestamp preserved");
+
+    let durable = SessionHandle::open(dir.path(), &key);
+    let count = durable
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.client_message_id.as_deref() == Some("goal-verifier-note:v1:g1:d1")
+        })
+        .count();
+    assert_eq!(count, 1, "exactly one durable row for the id");
+}
+
+/// Different ids → independent rows.
+#[tokio::test]
+async fn system_note_once_distinct_ids_append_independently() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:distinct-ids".to_owned());
+    for id in ["g1:d1", "g1:d2", "g2:d1"] {
+        let note_id = format!("goal-verifier-note:v1:{id}");
+        persist_system_note_once_through_canonical_path(
+            dir.path(),
+            &key,
+            octos_core::Message::system(format!("note {id}")),
+            &note_id,
+        )
+        .await
+        .expect("append");
+    }
+    let durable = SessionHandle::open(dir.path(), &key);
+    assert_eq!(
+        durable.session().messages.len(),
+        3,
+        "three independent notes"
+    );
+}
+
+/// Concurrent same-id calls → exactly one durable row (the shared per-key
+/// persist lock serializes check+append).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn system_note_once_concurrent_same_id_single_durable_row() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:concurrent".to_owned());
+    let data_dir = dir.path().to_path_buf();
+    let mut joins = Vec::new();
+    for i in 0..8 {
+        let data_dir = data_dir.clone();
+        let key = key.clone();
+        joins.push(tokio::spawn(async move {
+            persist_system_note_once_through_canonical_path(
+                &data_dir,
+                &key,
+                octos_core::Message::system(format!("concurrent {i}")),
+                "goal-verifier-note:v1:g1:d1",
+            )
+            .await
+        }));
+    }
+    for j in joins {
+        j.await.expect("join").expect("call ok");
+    }
+    let durable = SessionHandle::open(dir.path(), &key);
+    let count = durable
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.client_message_id.as_deref() == Some("goal-verifier-note:v1:g1:d1")
+        })
+        .count();
+    assert_eq!(count, 1, "concurrency commits exactly one row");
+}
+
+/// Strict read: a corrupt meta header means Err and the file is left
+/// byte-identical (no append past a broken head).
+#[tokio::test]
+async fn system_note_once_bad_header_fails_closed_file_untouched() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:bad-header".to_owned());
+    // Seed a valid session, then corrupt the meta line.
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let original = std::fs::read(&canonical).expect("read");
+    let body_start = original
+        .iter()
+        .position(|b| *b == b'\n')
+        .expect("meta newline")
+        + 1;
+    let mut corrupted = b"{not json\n".to_vec();
+    corrupted.extend_from_slice(&original[body_start..]);
+    assert_eq!(corrupted.last(), Some(&b'\n'), "isolate header corruption");
+    std::fs::write(&canonical, &corrupted).expect("corrupt");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "bad header must fail closed");
+    let after = std::fs::read(&canonical).expect("read after");
+    assert_eq!(after, corrupted, "failed call must preserve every byte");
+}
+
+/// Strict read: a body line that parses as neither Message nor control
+/// record means Err (never treat a corrupt tail as absence).
+#[tokio::test]
+async fn system_note_once_bad_body_line_fails_closed() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:bad-body".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let text = std::fs::read_to_string(&canonical).expect("read");
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.push("!!!not a message or control record!!!");
+    std::fs::write(&canonical, lines.join("\n") + "\n").expect("append bad line");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "bad body line must fail closed");
+}
+
+/// Strict read: a non-empty final line WITHOUT a trailing newline means Err
+/// (an append would concatenate onto it).
+#[tokio::test]
+async fn system_note_once_missing_trailing_newline_fails_closed() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:no-newline".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let text = std::fs::read_to_string(&canonical).expect("read");
+    std::fs::write(&canonical, text.trim_end()).expect("strip trailing newline");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "missing trailing newline must fail closed");
+}
+
+/// Test util: first .jsonl under the users/ tree (single-session tempdir).
+fn find_first_jsonl(users_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn visit(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = visit(&path) {
+                    return Some(found);
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    visit(users_dir)
+}
+
+/// Meta-only file WITHOUT a trailing newline: fail closed; the file bytes
+/// are unchanged (an append would glue the note JSON onto the meta line).
+#[tokio::test]
+async fn system_note_once_meta_only_no_newline_fails_closed_bytes_unchanged() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:meta-nonl".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    // Keep ONLY the meta line, no trailing newline.
+    let text = std::fs::read_to_string(&canonical).expect("read");
+    let meta_only = text.lines().next().expect("meta line").to_owned();
+    std::fs::write(&canonical, &meta_only).expect("meta-only, no newline");
+    let before = std::fs::read(&canonical).expect("bytes before");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "meta-only file without newline must fail closed"
+    );
+    let after = std::fs::read(&canonical).expect("bytes after");
+    assert_eq!(before, after, "file bytes unchanged by the failed call");
+}
+
+/// Invalid UTF-8 in the transcript: fail closed; bytes unchanged.
+#[tokio::test]
+async fn system_note_once_invalid_utf8_fails_closed_bytes_unchanged() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:bad-utf8".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let mut bytes = std::fs::read(&canonical).expect("read");
+    // Corrupt INSIDE a valid JSON string: lossy UTF-8 decoding would still
+    // produce a valid Message, so only strict decoding rejects this case.
+    let offset = bytes
+        .windows(4)
+        .rposition(|part| part == b"seed")
+        .expect("seed content");
+    bytes[offset] = 0xFF;
+    let lossy = String::from_utf8_lossy(&bytes);
+    let body = lossy.lines().nth(1).expect("message line");
+    assert!(serde_json::from_str::<octos_core::Message>(body).is_ok());
+    std::fs::write(&canonical, &bytes).expect("invalid utf8 body");
+    let before = std::fs::read(&canonical).expect("bytes before");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "invalid UTF-8 must fail closed");
+    let after = std::fs::read(&canonical).expect("bytes after");
+    assert_eq!(before, after, "file bytes unchanged by the failed call");
+}
+
+/// The canonical path is a DIRECTORY: fail closed; the directory's bytes
+/// (its listing) are unchanged — nothing is written through it.
+#[tokio::test]
+async fn system_note_once_target_is_directory_fails_closed() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:target-dir".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let backup = canonical.with_extension("jsonl.backup");
+    std::fs::rename(&canonical, &backup).expect("rename aside");
+    std::fs::create_dir(&canonical).expect("dir at target");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "a directory target must fail closed");
+    assert!(
+        canonical.is_dir(),
+        "the directory is untouched (still a directory, empty)"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&canonical).expect("read dir").collect();
+    assert!(entries.is_empty(), "nothing written through the directory");
+
+    // Restore for cleanup.
+    std::fs::remove_dir(&canonical).expect("remove dir");
+    std::fs::rename(&backup, &canonical).expect("restore");
+}
+
+/// Recovery after file creation succeeds but the initial metadata write fails.
+#[tokio::test]
+async fn system_note_once_zero_byte_file_recovers_and_stays_idempotent() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:empty-file".to_owned());
+    let canonical = SessionHandle::open(dir.path(), &key).session_path();
+    std::fs::create_dir_all(canonical.parent().unwrap()).expect("parent");
+    std::fs::write(&canonical, []).expect("real empty canonical file");
+    assert_eq!(std::fs::metadata(&canonical).unwrap().len(), 0);
+    let id = "goal-verifier-note:v1:g1:d1";
+    let first = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("recovered note"),
+        id,
+    )
+    .await
+    .expect("recover empty file");
+    let second = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("must not replace"),
+        id,
+    )
+    .await
+    .expect("idempotent replay");
+    assert_eq!(second.content, first.content);
+    assert_eq!(second.timestamp, first.timestamp);
+    let reopened = SessionHandle::open(dir.path(), &key);
+    assert_eq!(reopened.session().messages.len(), 1);
+    assert_eq!(
+        reopened.session().messages[0].client_message_id.as_deref(),
+        Some(id)
+    );
+    assert_eq!(reopened.session().messages[0].content, "recovered note");
+}
+
 /// Issue #2006: a torn tail (crash mid-write leaves a partial final line
 /// without a newline) must not fuse with the NEXT appended row — the fused
 /// line is unparseable and silently takes the complete row down with it.

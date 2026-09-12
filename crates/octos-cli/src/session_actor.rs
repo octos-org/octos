@@ -5467,19 +5467,61 @@ impl SessionActor {
                     goal_id = %snapshot.goal_id,
                     "sentinel goal completion not verified: {outcome}"
                 );
-                let note = format!("goal completion not verified — {outcome}");
-                {
-                    let mut handle = self.session_handle.lock().await;
-                    handle.push_message_in_memory(octos_core::Message::system(note.clone()));
-                }
-                // Canonical durable append (per-key lock → fresh open →
-                // seq'd write), mirroring `persist_assistant_message`.
-                let _ = octos_bus::session::persist_message_through_canonical_path(
+                // evening 2026-09-10 (PR #2283 follow-up): the note is
+                // persisted IDEMPOTENTLY under a stable per-verdict identity
+                // — goal id + the same evidence digest the wrapper gates on
+                // (objective ‖ evidence ‖ revision). The `!replayed` gate is
+                // GONE: a replay whose note never landed (crash window or a
+                // previous persist failure) now recovers it, while an
+                // already-persisted note is returned as-is (original
+                // timestamp/content) and never duplicated. RAM mirrors ONLY
+                // the durable row the helper returns — a failed append
+                // leaves no phantom. Goal status, charging and TTL live in
+                // the wrapper and are untouched.
+                let digest = crate::autonomy::agent_orchestrator::verifier_evidence_digest(
+                    &snapshot.objective,
+                    &assistant_tail,
+                    snapshot.revision,
+                );
+                let note_id = format!("goal-verifier-note:v1:{}:{digest}", snapshot.goal_id);
+                match octos_bus::session::persist_system_note_once_through_canonical_path(
                     &self.data_dir,
                     &self.session_key,
-                    octos_core::Message::system(note),
+                    octos_core::Message::system(format!(
+                        "goal completion not verified — {outcome}"
+                    )),
+                    &note_id,
                 )
-                .await;
+                .await
+                {
+                    Ok(durable_row) => {
+                        // Mirror the durable row into RAM only when this
+                        // actor's mirror lacks a System row with the same
+                        // note id (covers: fresh append, disk-had-it-but-
+                        // RAM-didn't repair, and the no-duplicate case).
+                        let mut handle = self.session_handle.lock().await;
+                        let mirrored = handle.session().messages.iter().any(|m| {
+                            m.role == octos_core::MessageRole::System
+                                && m.client_message_id.as_deref() == Some(note_id.as_str())
+                        });
+                        if !mirrored {
+                            handle.push_message_in_memory(durable_row);
+                        }
+                    }
+                    Err(error) => {
+                        // Fail-closed: record and leave RAM untouched. The
+                        // next same-evidence verification (replay) retries
+                        // the same note id naturally — no background loop,
+                        // no charging/TTL changes.
+                        tracing::error!(
+                            session_id = %self.session_key,
+                            goal_id = %snapshot.goal_id,
+                            note_id = %note_id,
+                            error = %error,
+                            "goal verifier failure note persist failed; will retry on next verification"
+                        );
+                    }
+                }
             }
         }
         // Re-queue another continuation only if we are still idle AND

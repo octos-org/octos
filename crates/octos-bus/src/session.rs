@@ -2489,6 +2489,150 @@ pub async fn persist_message_through_canonical_path(
     handle.add_message_with_seq_unlocked(message).await
 }
 
+/// Idempotently persist ONE system note to a session through the canonical
+/// per-key persist path, returning the durable message.
+///
+/// Semantics (PR #2283 follow-up): the existence check and the append run
+/// inside the SAME `persist_lock_for` critical section as every other
+/// canonical write, so two concurrent callers for the same `note_id` commit
+/// exactly one row and both receive that row.
+///
+/// STRICT canonical read (this helper does NOT relax the legacy loader):
+/// - the file's size is bounded by `MAX_SESSION_FILE_SIZE`;
+/// - the first line must be a valid `SessionMeta` with a supported schema;
+/// - every non-empty subsequent line must parse as a `Message` OR a
+///   `SessionControlRecord` — an unparsable line, a missing trailing
+///   newline on a non-empty final line, or an unreadable-but-existing file
+///   are `Err` (fail-closed: never treated as "absent", never appended past
+///   a corrupt tail);
+/// - visibility follows rollback semantics: the note is "present" only if
+///   `assemble_session_messages` (the same fold every reload uses) still
+///   shows it — a rolled-back note is legitimately absent and is re-added.
+///
+/// On success returns the durable `Message` — the row this call appended,
+/// or the pre-existing row with its ORIGINAL timestamp and content (the
+/// note is never re-stamped with a fresh timestamp).
+///
+/// The id rides `client_message_id`; `role` is forced to `System` and
+/// `thread_id` to `None` (no thread semantics implied).
+pub async fn persist_system_note_once_through_canonical_path(
+    data_dir: &Path,
+    key: &SessionKey,
+    note: Message,
+    note_id: &str,
+) -> Result<Message> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let mut handle = SessionHandle::open(data_dir, key);
+
+    let canonical = handle.session_path();
+    let file_meta = match std::fs::metadata(&canonical) {
+        // Genuinely absent: a new session — the append below writes the
+        // meta line itself. Only NotFound counts as absent; permission or
+        // any other stat error is fail-closed (never "treated as absent").
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(eyre::eyre!(
+                "session transcript stat failed ({}): {error}",
+                canonical.display()
+            ));
+        }
+        Ok(meta) => Some(meta),
+    };
+    // A zero-byte regular file can remain after creation but before the
+    // metadata write; the canonical append initializes it on retry.
+    if let Some(meta) = file_meta.filter(|meta| !meta.is_file() || meta.len() != 0) {
+        if meta.len() > MAX_SESSION_FILE_SIZE {
+            return Err(eyre::eyre!(
+                "session transcript exceeds size limit ({}: {} > {})",
+                canonical.display(),
+                meta.len(),
+                MAX_SESSION_FILE_SIZE
+            ));
+        }
+        let bytes = std::fs::read(&canonical).map_err(|error| {
+            eyre::eyre!(
+                "session transcript exists but cannot be read ({}): {error}",
+                canonical.display()
+            )
+        })?;
+        let text = String::from_utf8(bytes.clone()).map_err(|error| {
+            eyre::eyre!(
+                "session transcript is not valid UTF-8 ({}): {error}",
+                canonical.display()
+            )
+        })?;
+        let mut lines = text.lines();
+        let header = lines.next().ok_or_else(|| {
+            eyre::eyre!(
+                "session transcript is empty (no meta line): {}",
+                canonical.display()
+            )
+        })?;
+        let session_meta: SessionMeta = serde_json::from_str(header).map_err(|error| {
+            eyre::eyre!(
+                "session transcript meta line is invalid ({}): {error}",
+                canonical.display()
+            )
+        })?;
+        if session_meta.schema_version > CURRENT_SESSION_SCHEMA {
+            return Err(eyre::eyre!(
+                "session transcript schema {} is newer than supported {} ({}): refusing",
+                session_meta.schema_version,
+                CURRENT_SESSION_SCHEMA,
+                canonical.display()
+            ));
+        }
+        let body = lines.collect::<Vec<_>>();
+        // Trailing newline: ANY non-empty file must end with one — a bare
+        // meta line (or any final line) without it would make the append
+        // concatenate the note JSON onto the last row. Only a genuinely
+        // EMPTY (0-byte) file counts as new and is safe to append into.
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            return Err(eyre::eyre!(
+                "session transcript does not end with a newline ({}): refusing to append",
+                canonical.display()
+            ));
+        }
+        // Every non-empty post-meta line must parse as Message or control
+        // record (strict — no skip-past-corruption). Errors carry the LINE
+        // NUMBER, never the line content.
+        let mut line_no = 1usize; // meta line is line 1
+        for line in body.iter().filter(|l| !l.trim().is_empty()) {
+            let parses = serde_json::from_str::<SessionControlRecord>(line).is_ok()
+                || serde_json::from_str::<Message>(line).is_ok();
+            if !parses {
+                line_no += 1;
+                return Err(eyre::eyre!(
+                    "session transcript line {} is neither a Message nor a control record ({}): refusing",
+                    line_no,
+                    canonical.display()
+                ));
+            }
+            line_no += 1;
+        }
+        // Visibility follows the same rollback-aware fold as every reload.
+        for message in assemble_session_messages(body.iter().copied()) {
+            if message.role == MessageRole::System
+                && message.client_message_id.as_deref() == Some(note_id)
+            {
+                return Ok(message);
+            }
+        }
+    }
+
+    // Absent (or no file yet): append through the same locked canonical
+    // path, then return the durable row.
+    let mut message = note;
+    message.role = MessageRole::System;
+    message.client_message_id = Some(note_id.to_owned());
+    message.thread_id = None;
+    handle
+        .add_message_with_seq_unlocked(message.clone())
+        .await
+        .map(|_| message)
+}
+
 /// Upsert a durable child-session contract through the canonical locked
 /// path: per-key persist lock → FRESH open (latest disk state) → mutate →
 /// rewrite, all inside one critical section.

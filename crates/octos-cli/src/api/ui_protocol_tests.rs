@@ -43295,3 +43295,147 @@ fn standalone_turn_reapplies_hook_context() {
         "hook context must be re-applied alongside the hook executor wiring"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// merged-review 2026-09-10 Fix 1: the interactive sentinel failure warning
+// must carry the WIRE session id (no NUL, no `~cwd-` scope suffix) while the
+// goal lookup still uses the scoped key. Driven at the REAL send site with a
+// real WsConnection channel — not a helper-only call.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn interactive_sentinel_failure_warning_carries_wire_session_id() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    // A SCOPED goal key in the real internal form: wire session id, then
+    // the NUL byte and cwd-scope suffix (as a unicode escape in the literal).
+    let scoped_key = octos_core::SessionKey(
+        "wirefix-prof:api:wirefix-session\u{0}~cwd-76ac4758abceb96a".to_owned(),
+    );
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: scoped_key.clone(),
+            profile_id: "wirefix-prof".to_owned(),
+            objective: "wire key on warning".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal under the scoped key");
+    let snapshot = orchestrator
+        .goal_verification_snapshot(&scoped_key, "wirefix-prof")
+        .expect("snapshot resolves through the scoped key");
+
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let sentinel_outcome = run_interactive_sentinel_completion(
+        &orchestrator,
+        std::sync::Arc::new(EmptyReplyVerifier),
+        &scoped_key,
+        "wirefix-prof",
+        &snapshot.goal_id,
+        "All tasks are complete. <goal:complete>",
+        Some(temp.path()),
+    )
+    .await;
+    let (kind, line) = sentinel_outcome
+        .failure
+        .expect("structured failure produced");
+
+    // THE shared production boundary: the same constructor the
+    // interactive callsite uses (single normalization route), exercised
+    // through a real WsConnection + send_notification_ephemeral.
+    let notification = goal_verifier_failure_warning(&scoped_key, kind, &line);
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(8);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = UiProtocolLedger::new(16);
+    send_notification_ephemeral(&ws, &ledger, notification).expect("send");
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ws_rx.recv())
+        .await
+        .expect("frame")
+        .expect("open");
+    let WsMessage::Text(text) = frame else {
+        panic!("text frame")
+    };
+    let json: serde_json::Value = serde_json::from_str(text.as_str()).expect("parse");
+    let sid = json["params"]["session_id"].as_str().expect("session_id");
+    assert!(
+        !sid.contains('\u{0}'),
+        "wire session id must not carry the NUL scope separator, got: {sid:?}"
+    );
+    assert!(
+        !sid.contains("~cwd-"),
+        "wire session id must not leak the cwd scope suffix, got: {sid:?}"
+    );
+    assert_eq!(
+        sid, "wirefix-prof:api:wirefix-session",
+        "the warning session id is the WIRE form of the scoped goal key"
+    );
+    // And the goal lookup DID use the scoped key (goal stays active).
+    let still = orchestrator
+        .goal_verification_snapshot(&scoped_key, "wirefix-prof")
+        .expect("scoped lookup still works");
+    assert_eq!(still.goal_id, snapshot.goal_id);
+}
+
+#[tokio::test]
+async fn interactive_sentinel_failure_warning_plain_session_unchanged() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    let plain = octos_core::SessionKey("plainfix-prof:api:plainfix-session".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: plain.clone(),
+            profile_id: "plainfix-prof".to_owned(),
+            objective: "plain key".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set goal");
+    orchestrator
+        .goal_verification_snapshot(&plain, "plainfix-prof")
+        .expect("snapshot");
+
+    // Plain keys pass through wire_key_from_goal_key unchanged — assert the
+    // constructor keeps the exact session id.
+    let notification = goal_verifier_failure_warning(
+        &plain,
+        "empty_response",
+        "verifier empty_response (attempt 2/2): no verdict text",
+    );
+    let UiNotification::Warning(event) = notification else {
+        panic!("warning")
+    };
+    assert_eq!(event.session_id, plain, "plain session id unchanged");
+}

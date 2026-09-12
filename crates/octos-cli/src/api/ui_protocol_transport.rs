@@ -32274,10 +32274,14 @@ struct InteractiveSentinelOutcome {
     failure: Option<(&'static str, String)>,
 }
 
-/// evo-goal-verifier M1: the canonical verifier-failure notification the
-/// sentinel stations emit on a claimed-but-unverified completion. ONE
-/// constructor shared by the interactive (:36659) and autonomous (:37553)
-/// consumers so the wire shape cannot drift between them.
+/// evo-goal-verifier M1: the verifier-failure notification the AUTONOMOUS
+/// station emits. Its `session_id` argument is the turn's plain WIRE
+/// session id (`params.session_id`) — the goal record is addressed
+/// separately through the scoped `goal_ctx.goal_session_key` (see the
+/// accountant block) — so no scope stripping is needed here. The
+/// INTERACTIVE station uses `goal_verifier_failure_warning`, which DOES
+/// strip the cwd-scope suffix because its caller holds the turn-pinned
+/// scoped goal key.
 fn goal_verifier_warning_event(
     session_id: &SessionKey,
     outcome: &crate::autonomy::goal_loop_runtime::GoalVerifierOutcome,
@@ -32300,8 +32304,14 @@ fn goal_verifier_failure_warning(
     kind: &str,
     line: &str,
 ) -> UiNotification {
+    // merged-review 2026-09-10 Fix 1: the WarningEvent carries the WIRE
+    // session id. Goal lookups keep the scoped key; this shared
+    // constructor is the single production boundary that strips the
+    // `\0~cwd-…` scope suffix, so every caller (the interactive sentinel
+    // consumer in `run_standalone_turn` and the tests) routes through the
+    // SAME normalization.
     UiNotification::Warning(octos_core::ui_protocol::WarningEvent {
-        session_id: session_id.clone(),
+        session_id: crate::autonomy::agent_orchestrator::wire_key_from_goal_key(session_id),
         turn_id: None,
         code: format!("goal_verifier_{kind}"),
         message: format!("goal completion not verified — {line}"),
