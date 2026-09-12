@@ -2498,11 +2498,21 @@ async fn master_continuation_tick_reenters_actor_loop() {
         })
         .unwrap();
 
-    for _ in 0..10 {
+    // #2011: `advance` moves VIRTUAL time, but the tick → drain →
+    // process_inbound → persist chain also needs REAL scheduling (blocking
+    // I/O threads), so a fixed iteration budget races machine load and
+    // flaked ~25% under high load. Bound the wait by a wall-clock deadline
+    // (std Instant — tokio's clock is paused in this test) and pace each
+    // virtual advance with a real sleep so starved OS threads get CPU.
+    // Pacing is not what keeps the actor alive: the pre-loop upsert is
+    // synchronous, the first interval tick drains it immediately (which
+    // resets idle_sleep), and idle_sleep cannot fire mid-turn — the
+    // deadline only has to cover [actor start → first drain].
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while provider.call_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
         tokio::time::advance(Duration::from_millis(250)).await;
-        if provider.call_count.load(Ordering::Relaxed) > 0 {
-            break;
-        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     assert!(
@@ -2510,24 +2520,19 @@ async fn master_continuation_tick_reenters_actor_loop() {
         "periodic actor tick must drain queued child completion into process_inbound"
     );
 
-    // `process_inbound` persists through the real spawn-blocking JSONL path.
-    // This test uses a paused Tokio clock, so advancing virtual time alone
-    // cannot guarantee that the blocking-pool completion has been observed.
-    // Poll in bounded real-time slices, matching the goal-continuation test
-    // below, instead of racing the durable append.
-    for _ in 0..500 {
-        tokio::task::spawn_blocking(|| {
-            std::thread::sleep(Duration::from_millis(2));
-        })
-        .await
-        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
         let session_handle = SessionHandle::open(dir.path(), &session_id);
         if session_handle.session().messages.iter().any(|message| {
             message.role == MessageRole::Assistant
                 && message.content.contains("child progress summary")
-        }) {
+        }) || std::time::Instant::now() >= deadline
+        {
             break;
         }
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(10));
     }
     let session_handle = SessionHandle::open(dir.path(), &session_id);
     let session = session_handle.session();
