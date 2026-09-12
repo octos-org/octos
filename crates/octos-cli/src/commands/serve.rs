@@ -455,6 +455,114 @@ fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTa
     stdio.then(crate::session_actor::SessionTaskQueryStore::default)
 }
 
+/// How long the serve keeps draining in-flight connections after the stop
+/// signal before it stops waiting and proceeds to `stop_all()` + exit anyway.
+/// Axum's graceful shutdown waits for open connections, and an SSE stream
+/// (`GET /api/events/harness`) never ends on its own — without a cap a
+/// `systemctl stop` would hang until `TimeoutStopSec` escalates to SIGKILL,
+/// skipping `stop_all()` and orphaning the gateways exactly like the pre-fix
+/// #2086 behavior.
+const SERVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Install the HTTP serve's stop-signal handlers EARLY — before the gateway
+/// auto-start loop — and return the watch half the graceful-shutdown future
+/// will await.
+///
+/// Registration must precede auto-start: each enabled profile spends ~2s in
+/// its gateway startup health check before the loop moves on, so with the
+/// handlers installed only inside `axum::serve`'s shutdown future there is a
+/// N×2s window (right when a restarting supervisor sends its SIGTERM) in
+/// which the signal still hits the OS default disposition — the exact #2086
+/// orphaning this fix targets. A dedicated watcher task owns the signal
+/// listeners and latches the first one into the watch channel; because the
+/// channel is stateful, a signal that arrives before `axum::serve` starts
+/// polling its shutdown future is not lost — the future observes it on its
+/// first poll.
+///
+/// On Unix this catches SIGINT (ctrl-c) and SIGTERM — the signal
+/// `pkill`/`systemctl stop`/supervisors send. Off Unix only ctrl-c exists.
+/// If the SIGTERM listener cannot be installed the watcher degrades to
+/// ctrl-c-only with a warning instead of panicking: a panic here would
+/// unwind nowhere near `stop_all()` and reintroduce the orphaning the
+/// handler exists to prevent.
+///
+/// The SIGTERM listener is registered synchronously, before the watcher
+/// task spawns: tokio installs the handler only when `signal()` runs, and a
+/// spawned task is not polled until the runtime yields — deferring
+/// registration into the task would leave a window in which the caller has
+/// already spawned the first gateway while SIGTERM is still on the OS
+/// default disposition. Once the first signal latches the watcher task
+/// ends, but tokio keeps the handler installed for the process lifetime, so
+/// a second signal during the bounded drain is captured-but-unobserved: it
+/// cannot kill the serve before `stop_all()` runs.
+fn spawn_serve_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bool> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    #[cfg(unix)]
+    let sigterm = {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(sigterm) => Some(sigterm),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to install SIGTERM handler; serving until ctrl-c"
+                );
+                None
+            }
+        }
+    };
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            match sigterm {
+                Some(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = shutdown_tx.send(true);
+    });
+    shutdown_rx
+}
+
+/// The graceful-shutdown future: resolve once the early-registered watcher
+/// (see `spawn_serve_shutdown_signal_watcher`) latched a stop signal.
+async fn serve_shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    // The watcher may already have fired (signal arrived during auto-start,
+    // before this future was first polled) — borrow first so a latched true
+    // resolves immediately instead of waiting for another change.
+    if !*shutdown_rx.borrow() {
+        let _ = shutdown_rx.changed().await;
+    }
+    let _ = super::serve_console::print_stdout("");
+    let _ = super::serve_console::print_stdout(&format!("{}", "Shutting down server...".yellow()));
+}
+
+/// Resolve `grace` after the stop signal latches — the drain cap the serve
+/// loop races against. Waiting for the latch FIRST matters: wrapping
+/// `axum::serve` in a plain `tokio::time::timeout(grace, ..)` would start
+/// the clock when the serve future is first polled and kill a healthy,
+/// signal-free serve once the grace period passes.
+async fn shutdown_drain_deadline(
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    grace: std::time::Duration,
+) {
+    if !*shutdown_rx.borrow() {
+        let _ = shutdown_rx.changed().await;
+    }
+    tokio::time::sleep(grace).await;
+}
+
 /// Bind the HTTP listener before constructing `AppState`.
 ///
 /// Port `0` asks the OS for an ephemeral port. Resolving it here ensures every
@@ -1571,6 +1679,15 @@ impl ServeCommand {
             return Ok(());
         }
 
+        // Install the stop-signal watcher BEFORE the gateway auto-start loop:
+        // each profile's startup health check holds the loop for ~2s, and a
+        // SIGTERM arriving in that window (a restarting supervisor's pkill is
+        // exactly this) must already be caught, or it hits the OS default
+        // disposition and orphans every gateway (#2086). The stdio path above
+        // returns before this point and keeps its existing behavior — it
+        // spawns no gateways, so there is nothing to orphan.
+        let shutdown_rx = spawn_serve_shutdown_signal_watcher();
+
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
         let enabled_count = profiles.iter().filter(|p| p.enabled).count();
@@ -1588,6 +1705,20 @@ impl ServeCommand {
                             "skipping auto-start: no LLM provider configured"
                         );
                         continue;
+                    }
+                    // A stop signal already latched must not START more
+                    // gateways: each `start()` spends ~2s in its startup
+                    // health check, so finishing the loop for every profile
+                    // would keep spawning children for N×2s after the
+                    // operator asked to stop — children `stop_all()` then
+                    // has to reap under the drain deadline. The in-flight
+                    // `start()` completes (it cannot be interrupted); the
+                    // loop just stops starting new ones.
+                    if *shutdown_rx.borrow() {
+                        tracing::info!(
+                            "stop signal latched during auto-start; skipping remaining gateways"
+                        );
+                        break;
                     }
                     tracing::info!(profile = %p.id, "auto-starting gateway");
                     if let Err(e) = process_manager.start(p).await {
@@ -1834,16 +1965,33 @@ impl ServeCommand {
         }
         let _ = serve_console::print_stdout("");
 
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            let _ = serve_console::print_stdout("");
-            let _ = serve_console::print_stdout(&format!("{}", "Shutting down server...".yellow()));
-        })
-        .await?;
+        // Cap the drain: after the stop signal axum waits for in-flight
+        // connections, and an SSE stream never closes on its own. Past the
+        // cap we proceed to stop_all() + exit(0) anyway — better to cut a
+        // long-lived stream than to let the supervisor SIGKILL us with the
+        // gateways still running (#2086).
+        // Both arms funnel into the gateway cleanup below: a serve-loop
+        // error must not `?`-return past `stop_all()` (that would orphan
+        // the gateways it spawned), so log it, reap the children, and
+        // reflect it in the exit code instead.
+        let serve_result = tokio::select! {
+            result = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(serve_shutdown_signal(shutdown_rx.clone())) => result,
+
+            _ = shutdown_drain_deadline(shutdown_rx, SERVE_SHUTDOWN_GRACE) => {
+                tracing::warn!(
+                    grace_secs = SERVE_SHUTDOWN_GRACE.as_secs(),
+                    "shutdown grace period expired with connections still open; stopping gateways anyway"
+                );
+                Ok(())
+            }
+        };
+        if let Err(e) = &serve_result {
+            tracing::error!(error = %e, "HTTP serve loop failed; stopping gateways before exit");
+        }
 
         // Stop all gateway child processes before exiting
         tracing::info!("stopping all gateway child processes");
@@ -1856,7 +2004,7 @@ impl ServeCommand {
 
         // Force exit — background tokio tasks (profile watcher, auth cleanup,
         // admin bot) have no shutdown signal and would hang indefinitely.
-        std::process::exit(0);
+        std::process::exit(if serve_result.is_ok() { 0 } else { 1 });
     }
 
     /// F-010: construct an `Option<Arc<SwarmState>>` from the

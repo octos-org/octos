@@ -44,8 +44,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The serve_sigterm e2e spawns real `octos serve` children that starve
+      # under default test parallelism; ci.yml runs it in a dedicated serial
+      # step (see the #21 outer-loop ruling there).
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --skip serve_sigterm
 
       - name: API feature tests
         run: cargo test -p octos-cli --features api api::auth_handlers
@@ -83,7 +86,9 @@ jobs:
           cargo build --workspace
           cargo build -p octos-cli --features ${{ env.FEATURES }}
           cargo test --workspace --no-run
-          cargo test --workspace
+          # serve_sigterm e2e: serial-only (see the ci.yml #21 ruling); the
+          # broad run skips it.
+          cargo test --workspace -- --skip serve_sigterm
 
   windows:
     name: windows
