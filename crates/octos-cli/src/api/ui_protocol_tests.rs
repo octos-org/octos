@@ -554,6 +554,100 @@ async fn session_open_snapshot_without_provider_never_compacts() {
     assert!(events.is_empty(), "no provider => no lifecycle events");
 }
 
+#[tokio::test]
+async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ReadyProvider(AtomicBool);
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for ReadyProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("session/open must not generate a response")
+        }
+        async fn ensure_ready(&self) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn context_window(&self) -> u32 {
+            if self.0.load(Ordering::SeqCst) {
+                262_144
+            } else {
+                65_536
+            }
+        }
+        fn model_id(&self) -> &str {
+            "tiny"
+        }
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(ReadyProvider(AtomicBool::new(false)));
+    let dir = tempfile::tempdir().unwrap();
+    let profile = "open-probed-window";
+    let (state, profile_runtime) =
+        state_with_profile_llm(dir.path(), profile, provider.clone()).await;
+    let session = SessionKey::with_profile(profile, "api", "saved-history");
+    let runtime = state
+        .session_cache
+        .get_or_init(&profile_runtime, session.clone(), None)
+        .await
+        .unwrap();
+    runtime
+        .sessions
+        .lock()
+        .await
+        .get_or_create(&session)
+        .await
+        .messages = open_snapshot_padding_history(120);
+    // Exercise the actual open RPC: the fallback would compact this history.
+    assert_eq!(provider.context_window(), 65_536);
+    let outcome = open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some(profile),
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        SessionOpenParams {
+            session_id: session,
+            topic: None,
+            profile_id: Some(profile.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .unwrap();
+    let context_state = outcome.result.opened.context_state.unwrap();
+
+    assert_eq!(provider.context_window(), 262_144);
+    assert!(context_state.token_estimate > 100_000);
+    assert!(
+        context_state.token_estimate < appui_context_compact_threshold_tokens(provider.as_ref())
+    );
+    assert!(context_state.last_compaction_id.is_none());
+    assert!(
+        !outcome.replay.iter().any(|entry| matches!(
+            entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ContextCompactionStarted(_))
+                | UiProtocolLedgerEvent::Notification(UiNotification::ContextCompactionCompleted(
+                    _
+                ))
+        )),
+        "the fallback window must not compact saved history"
+    );
+}
+
 #[test]
 fn post_terminal_drain_skips_late_tokens_but_keeps_background_progress() {
     // Regression for the "queued N messages after active turn" wedge: the

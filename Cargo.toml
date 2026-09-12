@@ -216,3 +216,9 @@ tag-message = "Release {{version}}"
 pre-release-commit-message = "chore: release {{version}}"
 pre-release-hook = ["git-cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
 publish = false
+
+# mmap-rs only needs memory mapping, process IDs and sysconf. Its default nix
+# features include unsupported ptrace/socket ABIs on OpenHarmony.
+[patch.crates-io]
+mmap-rs = { path = "vendor/mmap-rs" }
+nix = { path = "vendor/nix" }
