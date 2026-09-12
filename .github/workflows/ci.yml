@@ -833,6 +833,41 @@ jobs:
         if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test --workspace --doc
 
+  check-darwin:
+    # Runs on PRs, like check-windows: the workspace has 89
+    # `cfg(target_os = "macos")` sites that NEVER compile on the Linux runners
+    # every other PR job uses, so a macOS-only break was invisible until after
+    # merge — #2239 alone produced two such breaks (#2258's E0599 in the
+    # default build, #2263's E0425 in api-feature test code) while every
+    # required check stayed green. The existing macOS jobs do not close this:
+    # e2e-tool-regression builds octos-cli (api+telegram features) but fires
+    # only on e2e path changes, and the security suite compiles one
+    # octos-agent test binary only on security-path changes — so an ordinary
+    # PR gets no macOS compile signal at all.
+    #
+    # Compile-only, so the cost is one macos-14 runner for a cargo check, not
+    # a test run. Both steps pass --all-targets so cfg(test) code is compiled
+    # too — #2263's break lived in feature-gated test modules, which a
+    # lib-only check would never see.
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: darwin
+
+      - name: Check workspace (all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: Check octos-cli + all features (all targets)
+        run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
+
   # ── Release artifact builds (main only) ──────────────────────────
   build-macos-arm:
     if: github.event_name == 'push'
@@ -1254,6 +1289,7 @@ jobs:
       - test-octos-cli
       - check-matrix
       - check-windows
+      - check-darwin
       - e2e-changes
       - e2e-tool-regression
       - security
@@ -1270,7 +1306,7 @@ jobs:
           for job in dashboard swarm-app typos ux-gate-report \
             windows-deploy-script web-app-base-url-windows check \
             test-octos-agent test-octos-cli check-matrix check-windows \
-            e2e-changes security; do
+            check-darwin e2e-changes security; do
             result=$(echo "$RESULTS" | jq -r --arg job "$job" '.[$job].result')
             if [ "$result" != success ]; then
               echo "::error::required job $job finished with $result"
