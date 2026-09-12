@@ -2283,7 +2283,64 @@ pub(crate) fn build_completion_review_prompt(
     )
 }
 
-fn git_turn_summary(content: &str) -> String {
+/// Run one observe-only lifecycle hook payload (`on_resume` / `on_turn_end`)
+/// and log — never honor — blocking outcomes: these events fire after the
+/// fact, so a deny/modify cannot stop anything and is a warning, and an
+/// infrastructure failure surfaces as a warning rather than aborting the
+/// turn. Shared by the `SessionActor` chat path and the ui_protocol OUP turn
+/// path (#2244).
+pub(crate) async fn emit_lifecycle_hook_payload(
+    hooks: Option<&Arc<HookExecutor>>,
+    session_key: &SessionKey,
+    payload: HookPayload,
+) {
+    let Some(hooks) = hooks else {
+        return;
+    };
+    let event = payload.event;
+    match hooks.run(event, &payload).await {
+        HookResult::Allow => {}
+        HookResult::Modified(_) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                "lifecycle hook attempted to modify payload; ignoring"
+            );
+        }
+        // Context injection is a `user_prompt_submit`-only outcome; these
+        // emitted lifecycle events never produce it. Exhaustive-match arm.
+        HookResult::Context(_) => {}
+        // Feedback is an AfterToolCall-only outcome (checker diagnostics
+        // appended by the agent's own dispatch sites); these lifecycle
+        // events have no tool result to carry it — log and continue.
+        HookResult::Feedback(entries) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                count = entries.len(),
+                "lifecycle hook produced feedback; ignored"
+            );
+        }
+        HookResult::Deny(reason) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                reason,
+                "lifecycle hook attempted to deny a non-blocking event"
+            );
+        }
+        HookResult::Error(error) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                error,
+                "lifecycle hook failed"
+            );
+        }
+    }
+}
+
+pub(crate) fn git_turn_summary(content: &str) -> String {
     let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
         "agent turn update".to_string()
@@ -4755,50 +4812,7 @@ impl SessionActor {
     }
 
     async fn emit_hook_payload(&self, payload: HookPayload) {
-        let Some(hooks) = self.hooks.as_ref() else {
-            return;
-        };
-        let event = payload.event;
-        match hooks.run(event, &payload).await {
-            HookResult::Allow => {}
-            HookResult::Modified(_) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    "lifecycle hook attempted to modify payload; ignoring"
-                );
-            }
-            // Context injection is a `user_prompt_submit`-only outcome; these
-            // emitted lifecycle events never produce it. Exhaustive-match arm.
-            HookResult::Context(_) => {}
-            // Feedback is an AfterToolCall-only outcome (checker diagnostics
-            // appended by the agent's own dispatch sites); these lifecycle
-            // events have no tool result to carry it — log and continue.
-            HookResult::Feedback(entries) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    count = entries.len(),
-                    "lifecycle hook produced feedback; ignored"
-                );
-            }
-            HookResult::Deny(reason) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    reason,
-                    "lifecycle hook attempted to deny a non-blocking event"
-                );
-            }
-            HookResult::Error(error) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    error,
-                    "lifecycle hook failed"
-                );
-            }
-        }
+        emit_lifecycle_hook_payload(self.hooks.as_ref(), &self.session_key, payload).await;
     }
 
     async fn emit_resume_hook(&self) {
