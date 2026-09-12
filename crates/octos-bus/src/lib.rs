@@ -88,7 +88,8 @@ pub use matrix_channel::{
 };
 #[cfg(feature = "matrix")]
 pub use matrix_user_channel::{
-    MatrixAutoJoin, MatrixGroupPolicy, MatrixInviteStore, MatrixPendingInvite, MatrixUserChannel,
+    MatrixAutoJoin, MatrixGroupPolicy, MatrixInviteStore, MatrixMentionPolicy, MatrixPendingInvite,
+    MatrixUserChannel,
 };
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;

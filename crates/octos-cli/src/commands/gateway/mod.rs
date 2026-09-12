@@ -562,6 +562,122 @@ mod tests {
     }
 
     #[test]
+    fn matrix_user_settings_default_mention_policy_strict_and_parse_open() {
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Strict
+        );
+
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            MATRIX_SETTING_MENTION_POLICY: "open",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Open
+        );
+
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            MATRIX_SETTING_MENTION_POLICY_CAMEL: "open",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Open
+        );
+    }
+
+    #[test]
+    fn matrix_user_settings_warn_on_unrecognized_mention_policy() {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            MATRIX_SETTING_MENTION_POLICY: "stric",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Strict
+        );
+        let logs = capture.contents();
+        assert!(
+            logs.contains("unrecognized matrix mention_policy"),
+            "a typo must warn, got logs: {logs}"
+        );
+        assert!(logs.contains("stric"), "warn must echo the value: {logs}");
+
+        // Legitimate values parse silently.
+        let entry = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_token",
+            MATRIX_SETTING_MENTION_POLICY: "Strict",
+        }));
+        let settings = MatrixUserChannelSettings::from_entry(&entry).unwrap();
+        assert_eq!(
+            settings.mention_policy,
+            octos_bus::MatrixMentionPolicy::Strict
+        );
+        assert_eq!(
+            capture
+                .contents()
+                .matches("unrecognized matrix mention_policy")
+                .count(),
+            1,
+            "recognized values must not warn"
+        );
+    }
+
+    /// Captures `tracing` output so warn-on-misconfig behaviour can be
+    /// asserted.
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
     fn matrix_user_settings_require_credentials() {
         let entry = matrix_entry(serde_json::json!({
             MATRIX_SETTING_MODE: MATRIX_MODE_USER,

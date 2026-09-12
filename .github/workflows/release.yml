@@ -96,7 +96,12 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: macos-arm
-          path: octos-bundle-aarch64-apple-darwin.tar.gz
+          # Fail loudly when the bundle or its sidecar is missing instead of
+          # letting verify-release fail 3 jobs later with a cryptic gap.
+          if-no-files-found: error
+          path: |
+            octos-bundle-aarch64-apple-darwin.tar.gz
+            octos-bundle-aarch64-apple-darwin.tar.gz.sha256
 
   build-linux-x86:
     needs: check-version
@@ -144,7 +149,10 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linux-x86
-          path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+          path: |
+            octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+            octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
 
   build-linux-arm:
     needs: check-version
@@ -194,7 +202,10 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linux-arm
-          path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+          path: |
+            octos-bundle-aarch64-unknown-linux-gnu.tar.gz
+            octos-bundle-aarch64-unknown-linux-gnu.tar.gz.sha256
 
   build-windows:
     needs: check-version
@@ -246,7 +257,10 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: windows
-          path: octos-bundle-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+          path: |
+            octos-bundle-x86_64-pc-windows-msvc.zip
+            octos-bundle-x86_64-pc-windows-msvc.zip.sha256
 
   # TODO: uncomment after Dockerfile is fixed
   # build-docker:
@@ -348,9 +362,13 @@ jobs:
           set -euo pipefail
           actual=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           expected='octos-bundle-aarch64-apple-darwin.tar.gz
+          octos-bundle-aarch64-apple-darwin.tar.gz.sha256
           octos-bundle-aarch64-unknown-linux-gnu.tar.gz
+          octos-bundle-aarch64-unknown-linux-gnu.tar.gz.sha256
           octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+          octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
           octos-bundle-x86_64-pc-windows-msvc.zip
+          octos-bundle-x86_64-pc-windows-msvc.zip.sha256
           install.sh
           install.ps1
           deploy.ps1
@@ -364,7 +382,12 @@ jobs:
 
           mkdir verify
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'octos-bundle-x86_64-unknown-linux-gnu.tar.gz' --dir verify
+            --pattern 'octos-bundle-*' --dir verify
+          # Every published sidecar must match the published bytes — this is
+          # the exact verification octoscode's auto-install performs (#1929).
+          # Darwin sidecars are produced by shasum, the rest by sha256sum, so
+          # checking all four covers both producer paths.
+          (cd verify && sha256sum -c ./*.sha256)
           tar -tzf verify/octos-bundle-x86_64-unknown-linux-gnu.tar.gz >/dev/null
 
   package-publishers:

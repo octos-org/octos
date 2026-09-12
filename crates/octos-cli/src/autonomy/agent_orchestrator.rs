@@ -47088,28 +47088,45 @@ mod tests {
                 .expect("epoch segment")
                 .to_owned()
         };
-        // Turn 1: the restored epoch-0 scatter record re-enqueues (it
+        // Turns 1-2: the restored epoch-0 scatter record re-enqueues (it
         // persisted `Queued`; A never tombstoned it — only its MARKS were
-        // seeded) and delivers as a SUPERSEDED-epoch control row. This is
-        // the already-accepted SF1/Nit2 behavior (`restart_reenqueues_in_
-        // deterministic_epoch_order` drains persisted epochs 0/1/2; the Nit2
-        // dual-sink test allows one superseded epoch-0 control row).
+        // seeded) and delivers as a SUPERSEDED-epoch control row (#2309)
+        // beside agent-3's ChildCompleted (persisted Queued, never delivered
+        // pre-crash). Their relative order is stamp-resolution dependent: A
+        // persisted them microseconds apart, and when both `queued_at_ms`
+        // stamps land in the SAME millisecond the SF1 restart sort's final
+        // `continuation_id` tiebreak deterministically orders `child/…`
+        // before `scatter_join/…` ('c' < 's' — pinned by
+        // `restart_reenqueue_orders_equal_queued_at_ms_by_continuation_id`),
+        // so either delivery order satisfies the restored-queue contract.
         let turn0 = &turns[0];
         assert_eq!(turn0.len(), 1);
-        assert_eq!(
-            turn0[0].reason,
-            MasterContinuationReason::ScatterJoinComplete
-        );
-        assert_eq!(
-            epoch_of(&turn0[0]),
-            0,
-            "the superseded epoch-0 control row drains first (SF1 epoch order)"
-        );
-        // Turn 2: agent-3's ChildCompleted (persisted Queued, never
-        // delivered pre-crash) delivers.
         let turn1 = &turns[1];
         assert_eq!(turn1.len(), 1);
-        assert_eq!(turn1[0].reason, MasterContinuationReason::ChildCompleted);
+        assert!(
+            matches!(
+                (&turn0[0].reason, &turn1[0].reason),
+                (
+                    MasterContinuationReason::ScatterJoinComplete,
+                    MasterContinuationReason::ChildCompleted,
+                ) | (
+                    MasterContinuationReason::ChildCompleted,
+                    MasterContinuationReason::ScatterJoinComplete,
+                )
+            ),
+            "the two pre-crash pending rows deliver in either order, got {:?} then {:?}",
+            turn0[0].reason,
+            turn1[0].reason,
+        );
+        let epoch0_row = [turn0[0].clone(), turn1[0].clone()]
+            .into_iter()
+            .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .expect("exactly one ScatterJoinComplete among the first two turns");
+        assert_eq!(
+            epoch_of(&epoch0_row),
+            0,
+            "the superseded epoch-0 control row is one of the first two turns (SF1 epoch order)"
+        );
         // Turn 3: THE FIX — the reconcile pass re-emitted the lost epoch-1
         // join (its persist failed pre-crash, so nothing for epoch 1 was in
         // the store; only the `GroupEpochBumped` marker lifting the restored
@@ -47140,6 +47157,98 @@ mod tests {
             3,
             "exactly three single-item turns; further turns {:?}",
             &turns[3.min(turns.len())..],
+        );
+    }
+
+    /// #2309 — SF1 restart-order tiebreak pin. Two still-`Queued` records
+    /// whose durable `queued_at_ms` stamps are IDENTICAL (a fast host
+    /// persists the epoch-0 join and the next child terminal within one
+    /// millisecond; CI observed this flipping the turn order in
+    /// `multi_epoch_scatter_persist_failure_then_restart_reemits_latest_join`)
+    /// order by the restart sort's final `continuation_id` tiebreak, which
+    /// deterministically puts `child/…` before `scatter_join/…` ('c' < 's').
+    /// Two fresh orchestrators over the same store must agree on that order
+    /// (the SF1 determinism contract).
+    #[test]
+    fn restart_reenqueue_orders_equal_queued_at_ms_by_continuation_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = "tenant-tie:api:tie";
+        let group = format!("agent-group:tenant-tie:{session}:master");
+        let scatter_id = format!(
+            "scatter_join/{group}/{session}/tenant-tie/{}/0",
+            scatter_cwd_hash(&None)
+        );
+        let child_id = format!("child/{group}/{session}/agent-3");
+        let record = |continuation_id: &str, reason: &str, child_id: Option<&str>| {
+            let mut metadata = SupervisorMetadata::new();
+            metadata.insert("session_id".into(), json!(session));
+            metadata.insert("profile_id".into(), json!("tenant-tie"));
+            metadata.insert("reason".into(), json!(reason));
+            metadata.insert("dedupe_key".into(), json!(continuation_id));
+            metadata.insert("priority".into(), json!(20));
+            PendingContinuationRecord {
+                group_id: group.clone(),
+                continuation_id: continuation_id.to_owned(),
+                child_id: child_id.map(str::to_owned),
+                prompt: None,
+                status: ContinuationStatus::Queued,
+                queued_at_ms: 4242,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: None,
+                attempt: 1,
+                metadata,
+            }
+        };
+        let store = SupervisorStore::new(dir.path());
+        store
+            .record_continuation_queued(record(&scatter_id, "scatter_join_complete", None))
+            .unwrap();
+        store
+            .record_continuation_queued(record(&child_id, "child_completed", Some("agent-3")))
+            .unwrap();
+        drop(store);
+
+        let session_key = SessionKey::with_profile("tenant-tie", "api", "tie");
+        let drain_order = |runtime: &InProcessAgentOrchestrator| {
+            let mut order = Vec::new();
+            for _ in 0..4 {
+                let drained = runtime.drain_ready_continuations_for_session(
+                    &session_key,
+                    "tenant-tie",
+                    MasterContinuationRuntimeState::idle(),
+                    1,
+                );
+                let Some(item) = drained.first() else {
+                    break;
+                };
+                order.push(item.reason.clone());
+            }
+            order
+        };
+
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        let first_order = drain_order(&first);
+        assert_eq!(
+            first_order,
+            vec![
+                MasterContinuationReason::ChildCompleted,
+                MasterContinuationReason::ScatterJoinComplete,
+            ],
+            "equal queued_at_ms falls through to the continuation_id tiebreak, \
+             which orders `child/…` before `scatter_join/…`"
+        );
+        drop(first);
+
+        let second = InProcessAgentOrchestrator::default();
+        second
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        assert_eq!(
+            drain_order(&second),
+            first_order,
+            "two fresh orchestrators over the same store re-enqueue identically (SF1 determinism)"
         );
     }
 
