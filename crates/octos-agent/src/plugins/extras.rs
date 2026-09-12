@@ -235,19 +235,20 @@ fn resolve_hook(def: &SkillHookDef, skill_dir: &Path) -> Option<HookConfig> {
         _ => return None,
     };
 
-    // Resolve the first element of command if it's a relative path.
+    // Resolve every `./`/`../` element against the skill dir; bare commands
+    // (e.g. "python3") are left for PATH. The hook process's cwd is the
+    // payload's workspace root when the payload carries one
+    // (after_tool_call / user_prompt_submit), otherwise the daemon's cwd —
+    // never the skill dir — so a script argument like
+    // `["python3", "./hooks/x.py"]` must resolve here too; resolving only
+    // argv[0] leaves it pointing at the wrong root.
     let command: Vec<String> = def
         .command
         .iter()
-        .enumerate()
-        .map(|(i, arg)| {
-            if i == 0 {
-                let p = Path::new(arg);
-                if p.is_relative() && (arg.starts_with("./") || arg.starts_with("../")) {
-                    skill_dir.join(p).to_string_lossy().into_owned()
-                } else {
-                    arg.clone()
-                }
+        .map(|arg| {
+            let p = Path::new(arg);
+            if p.is_relative() && (arg.starts_with("./") || arg.starts_with("../")) {
+                skill_dir.join(p).to_string_lossy().into_owned()
             } else {
                 arg.clone()
             }
@@ -359,6 +360,45 @@ mod tests {
                 hook.command[0]
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_hook_relative_args() {
+        // The hook process's cwd is never the skill dir, so every
+        // `./`/`../` argv element — not just argv[0] — must resolve against
+        // the skill dir, otherwise `["python3", "./hooks/x.py"]` fails to
+        // find the script.
+        let def = SkillHookDef {
+            event: "after_tool_call".into(),
+            command: vec![
+                "python3".into(),
+                "./hooks/audit.py".into(),
+                "../shared/lib.py".into(),
+                "-c".into(),
+                "/abs/path.cfg".into(),
+                "plain-arg".into(),
+            ],
+            timeout_ms: 3000,
+            tool_filter: vec![],
+        };
+        let hook = resolve_hook(&def, Path::new("/skills/s")).unwrap();
+        assert_eq!(hook.command[0], "python3");
+        assert!(
+            hook.command[1] == "/skills/s/./hooks/audit.py"
+                || hook.command[1] == "/skills/s\\./hooks/audit.py",
+            "unexpected resolved arg: {}",
+            hook.command[1]
+        );
+        assert!(
+            hook.command[2] == "/skills/s/../shared/lib.py"
+                || hook.command[2] == "/skills/s\\../shared/lib.py",
+            "unexpected resolved arg: {}",
+            hook.command[2]
+        );
+        // Flags, absolute paths, and plain arguments stay untouched.
+        assert_eq!(hook.command[3], "-c");
+        assert_eq!(hook.command[4], "/abs/path.cfg");
+        assert_eq!(hook.command[5], "plain-arg");
     }
 
     #[test]
