@@ -50,6 +50,7 @@ eyre = { workspace = true }
 uuid = { workspace = true }
 color-eyre = { workspace = true }
 tracing = { workspace = true }
+tracing-core = "0.1.36"
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 rustyline = { workspace = true }
