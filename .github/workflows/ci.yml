@@ -211,6 +211,14 @@ jobs:
         shell: bash
         run: '"$BASH" scripts/tests/test-build-web-app-base-url.sh'
 
+  bundle-release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test bundle checksum sidecar
+        run: scripts/test-bundle-release.sh
+
   check:
     runs-on: ubuntu-latest
     env:
