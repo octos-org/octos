@@ -444,16 +444,17 @@ jobs:
         run: cargo test -p octos-cli --lib
 
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm
 
-      # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe). These
-      # spawn real `octos serve` children that contend for model catalog /
-      # profile store resources with other test binaries; under the default
+      # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe) and
+      # SIGTERM gateway-reap e2e (serve_sigterm). These spawn real
+      # `octos serve` children that contend for model catalog / profile
+      # store resources with other test binaries; under the default
       # thread-per-core parallelism the children starve and the 15s port
       # barrier times out. Dedicated serial step per the #21 outer-loop
       # ruling (2026-08-27): layer at the CI command level, never #[ignore].
-      - name: serve BrokenPipe process e2e (serial)
-        run: cargo test -p octos-cli --features api --test serve_broken_pipe -- --test-threads=1
+      - name: serve BrokenPipe/SIGTERM process e2e (serial)
+        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm -- --test-threads=1
 
       # Co-located here so they reuse this job's warm octos-cli build cache.
       - name: API feature tests
@@ -621,8 +622,13 @@ jobs:
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
-      - name: Test octos-cli (integration)
-        run: cargo test -p octos-cli --tests
+      # Same serve-process exclusions as the test-octos-cli PR job: the
+      # serve_broken_pipe / serve_sigterm e2e suites spawn real `octos serve`
+      # children that starve under default thread-per-core parallelism. They
+      # get their dedicated serial run in test-octos-cli; skipping here keeps
+      # this manual lane's coverage semantics identical to the PR lane's.
+      - name: Test octos-cli (integration, excluding serve process e2e)
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -696,8 +702,10 @@ jobs:
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
-      - name: Test octos-cli (integration)
-        run: cargo test -p octos-cli --tests
+      # Same serve-process exclusions as the test-octos-cli PR job (see the
+      # matching comment in check-arm).
+      - name: Test octos-cli (integration, excluding serve process e2e)
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
