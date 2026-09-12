@@ -246,7 +246,7 @@ Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`
 
 ## 3. Setting Up LLM Providers
 
-Octos supports 16 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
+Octos supports 17 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
 
 ### 3.1 Supported Providers
 
@@ -262,6 +262,7 @@ Octos supports 16 LLM provider families out of the box. Cloud providers require 
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | — |
+| `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
 | `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
@@ -315,12 +316,12 @@ Octos supports 16 LLM provider families out of the box. Cloud providers require 
 5. Set it: `export ANTHROPIC_API_KEY="your-key"`
 
 **MiniMax:**
-1. Go to [MiniMax Open Platform](https://platform.minimaxi.com/)
+1. Go to the MiniMax platform for your key's region: [international](https://platform.minimax.io/), or [China](https://platform.minimaxi.com/) — Token-plan subscription keys are issued by the China platform and are region-bound (they 401 against the international endpoint and need the `minimax-cn` family)
 2. Sign up or log in
 3. Navigate to **API Keys** in the console
 4. Click "Create API Key"
 5. Copy the key
-6. Set it: `export MINIMAX_API_KEY="your-key"`
+6. Set it: `export MINIMAX_API_KEY="your-key"` (international) or `export MINIMAX_CN_API_KEY="your-key"` (China)
 
 **Z.AI:**
 1. Go to [Z.AI Platform](https://z.ai/)

@@ -184,7 +184,7 @@ export SMTP_PASSWORD="your-app-password"
 
 ## 3. 配置 LLM 提供商
 
-Octos 开箱即用支持 16 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
+Octos 开箱即用支持 17 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
 
 ### 3.1 支持的提供商
 
@@ -200,6 +200,7 @@ Octos 开箱即用支持 16 个 LLM 提供商家族。云端提供商需要设�
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI 兼容 | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI 兼容 | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI 兼容 | — |
+| `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI 兼容 | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI 兼容 | `glm` |
 | `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic 兼容 | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
@@ -253,12 +254,12 @@ Octos 开箱即用支持 16 个 LLM 提供商家族。云端提供商需要设�
 5. 设置环境变量：`export ANTHROPIC_API_KEY="your-key"`
 
 **MiniMax（稀宇科技）：**
-1. 访问 [MiniMax 开放平台](https://platform.minimaxi.com/)
+1. 按密钥所属区域访问对应平台：[国际站](https://platform.minimax.io/)，或[国内站](https://platform.minimaxi.com/)——Token 套餐订阅密钥由国内站签发且有区域绑定（在国际端点会 401，需改用 `minimax-cn` 家族）
 2. 注册或登录
 3. 在控制台中进入 **API Keys** 管理页面
 4. 点击"创建 API Key"
 5. 复制密钥
-6. 设置环境变量：`export MINIMAX_API_KEY="your-key"`
+6. 设置环境变量：`export MINIMAX_API_KEY="your-key"`（国际站）或 `export MINIMAX_CN_API_KEY="your-key"`（国内站）
 
 **Z.AI：**
 1. 访问 [Z.AI 平台](https://z.ai/)
