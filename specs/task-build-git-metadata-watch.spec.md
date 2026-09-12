@@ -9,6 +9,8 @@ tags: [build, cargo, git, octos-cli]
 - 路径解析：git rev-parse --path-format=absolute --git-path（HEAD / refs/heads/<branch> / packed-refs），逐个存在才输出 rerun-if-changed。
 - 同分支提交触发：refs/heads/<branch> 文件内容随提交改写（HEAD 文本不变）→ 必须监听该 ref 文件。detached HEAD 场景 HEAD 文件本身含 commit。
 - packed refs：存在 packed-refs 时监听之；提交/分支操作改写它或生成 loose ref，build script 重跑后重解析路径集合。
+- loose ref 缺失时监听该分支最近的已存在父目录；refs/heads 存在时不因 refs/remotes 更新重编译。更窄目录均缺失才退回 refs，不依赖 reflog。
+- 测试子进程使用 --color never 覆盖继承的颜色配置；Fresh 检查先证明首次构建能够检测到一次 probe 编译。
 - 无 Git/归档防误采：包目录祖父为项目根，要求根有 .git 且 Git 解析的 canonical toplevel 与根相等；Git 自行处理相对或绝对 gitdir。无 Git 时版本 hash 为空，仅监听 build.rs。
 - 禁止硬编码本机路径；零新增依赖。
 
@@ -107,7 +109,7 @@ Scenario: pack-refs --prune 后同分支提交刷新 hash
     Filter: build_git_watch_packed_pruned_same_branch_commit_refreshes
   Given pack-refs --all --prune 后预热的 fixture（无 loose ref）
   When 同分支新 commit（仅创建 loose ref，HEAD/packed-refs 不变）
-  Then 重建且 hash == 新短 SHA（refs 目录监听发现创建）
+  Then 重建且 hash == 新短 SHA（分支最近已存在父目录监听发现创建）
 
 Scenario: 相对 gitdir 与 linked worktree 提交更新
   Test:
@@ -124,3 +126,27 @@ Scenario: fixture 清理不修改父仓库
   Given fixture 位于含过期 worktree 登记的自有外层测试仓库
   When 清理无 Git 的子 fixture
   Then 仅删除该 fixture,外层仓库登记保持不变
+
+Scenario: 彩色环境不能让编译检测失效
+  Test:
+    Package: octos-cli
+    Filter: build_git_watch_color_override_keeps_detection_live
+  Given 子进程环境显式设置 CARGO_TERM_COLOR=always
+  When 执行首次构建、无改动重建，再注入不存在路径的错误监听
+  Then 首次准确检测到一次编译，无改动检测到零次，错误监听准确检测到 Dirty 和重复编译
+
+Scenario: packed 分支在远端引用更新后不误重编译
+  Test:
+    Package: octos-cli
+    Filter: build_git_watch_packed_remote_fetch_stays_fresh
+  Given 普通仓库的当前分支已 packed/pruned 且关闭并移除 reflog
+  When 两次 fetch 本地远端更新，随后在当前分支提交
+  Then fetch 后 probe 保持 Fresh，当前分支提交后编译且 hash 更新
+
+Scenario: linked packed 分支目录缺失时仍正确监听
+  Test:
+    Package: octos-cli
+    Filter: build_git_watch_linked_packed_remote_fetch_stays_fresh
+  Given linked worktree 当前分支 review/topic 已打包，review 目录和 reflog 不存在
+  When 两次 fetch 本地远端更新，随后在当前分支提交并创建嵌套目录
+  Then fetch 后 probe 保持 Fresh，当前分支提交后编译且 hash 更新

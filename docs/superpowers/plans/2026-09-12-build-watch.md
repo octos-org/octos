@@ -21,3 +21,21 @@ Linked worktrees store `.git` as a pointer file. Watching nonexistent
 
 kache is a separate optional cache experiment; this fix does not install it or
 change global Cargo configuration.
+
+## Claude review follow-up (2026-09-12)
+
+Approved scope: make the regression detectors independent of inherited Cargo
+colors and avoid rebuilding for unrelated remote refs after packing a branch.
+
+- [ ] Reproduce the existing test under `CARGO_TERM_COLOR=always`, and add a
+  real Cargo positive/negative control with an intentionally missing watch path.
+- [ ] Add ordinary and linked packed-branch fixtures that fetch local remote
+  updates, stay Fresh, then commit on the current branch and refresh the hash.
+  Include disabled reflogs and a missing nested branch directory.
+- [ ] Force `cargo build --color never` in the fixture subprocess and check the
+  first compile in Fresh tests. Watch the nearest existing parent of the current
+  branch ref; keep the wider fallback only when narrower parents do not exist.
+  This retains direct ref correctness without depending on reflog settings.
+- [ ] Update the behavior contract; run fmt, clippy, all-targets and color
+  matrix checks. Verify the old build script still fails the no-op regression.
+- [ ] Review the final diff, commit owned files and update PR #2310 and its CI.

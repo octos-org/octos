@@ -125,7 +125,8 @@ fn init_repo(dir: &Path) {
 fn cargo_vv(ws: &Path, extra_env: &[(&str, &str)]) -> (i32, String) {
     let target = ws.join("fixture-target");
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
-    cmd.args(["build", "--offline", "-vv"])
+    // CLI precedence also defeats an explicit inherited/extra color setting.
+    cmd.args(["build", "--offline", "--color", "never", "-vv"])
         .current_dir(ws)
         .env("CARGO_TARGET_DIR", &target)
         .env_remove("RUSTC_WRAPPER")
@@ -243,6 +244,7 @@ fn build_git_watch_linked_worktree_second_build_fresh() {
     commit_fixture(&linked, "fixture", None);
     let (e1, l1) = cargo_vv(&linked, &[]);
     assert_eq!(e1, 0, "linked first: {l1}");
+    assert_eq!(probe_rustc_count(&l1), 1, "first compile: {l1}");
     let (e2, l2) = cargo_vv(&linked, &[]);
     assert_eq!(e2, 0, "linked second: {l2}");
     assert!(
@@ -340,6 +342,7 @@ fn build_git_watch_packed_refs_fresh_and_commit_triggers() {
     git(&ws, &["pack-refs", "--all"]);
     let (e1, l1) = cargo_vv(&ws, &[]);
     assert_eq!(e1, 0, "packed first: {l1}");
+    assert_eq!(probe_rustc_count(&l1), 1, "first compile: {l1}");
     let (e2, l2) = cargo_vv(&ws, &[]);
     assert_eq!(e2, 0);
     assert!(
@@ -375,6 +378,7 @@ fn build_git_watch_no_git_dir_builds_without_rerun() {
     // SECOND build — so Fresh-on-rebuild IS the observable contract.
     let (e1, l1) = cargo_vv(&ws, &[]);
     assert_eq!(e1, 0, "no-git first build ok: {l1}");
+    assert_eq!(probe_rustc_count(&l1), 1, "first compile: {l1}");
     let (e2, l2) = cargo_vv(&ws, &[]);
     assert_eq!(e2, 0);
     assert!(
@@ -400,6 +404,7 @@ fn build_git_watch_archive_inside_outer_repo_not_adopted() {
     write_fixture(&archive_ws);
     let (e1, l1) = cargo_vv(&archive_ws, &[]);
     assert_eq!(e1, 0, "archive build ok: {l1}");
+    assert_eq!(probe_rustc_count(&l1), 1, "first compile: {l1}");
     assert_eq!(
         run_binary_hash(&archive_ws),
         "",
@@ -444,6 +449,7 @@ fn build_git_watch_tracked_archive_inside_outer_repo_not_adopted() {
     git(&outer, &["commit", "-q", "-m", "track archive"]);
     let (e1, l1) = cargo_vv(&archive_ws, &[]);
     assert_eq!(e1, 0, "tracked-archive build ok: {l1}");
+    assert_eq!(probe_rustc_count(&l1), 1, "first compile: {l1}");
     assert_eq!(
         run_binary_hash(&archive_ws),
         "",
@@ -543,6 +549,7 @@ fn build_git_watch_relative_gitdir_and_linked_commit_refresh() {
     .unwrap();
     let (exit, log) = cargo_vv(&linked, &[]);
     assert_eq!(exit, 0, "{log}");
+    assert_eq!(probe_rustc_count(&log), 1, "first compile: {log}");
     assert_eq!(
         run_binary_hash(&linked),
         git(&linked, &["rev-parse", "--short", "HEAD"])
@@ -579,4 +586,139 @@ fn build_git_fixture_cleanup_preserves_ancestor_worktrees() {
         registration.exists(),
         "cleanup must not prune the ancestor repository"
     );
+}
+
+#[test]
+fn build_git_watch_color_override_keeps_detection_live() {
+    let dir = FixtureDir::new("color-control");
+    let ws = dir.path();
+    init_repo(ws);
+    write_fixture(ws);
+    let colors = [("CARGO_TERM_COLOR", "always")];
+    let (exit, log) = cargo_vv(ws, &colors);
+    assert_eq!(exit, 0, "{log}");
+    assert_eq!(
+        probe_rustc_count(&log),
+        1,
+        "first compile must be visible: {log}"
+    );
+    let (exit, log) = cargo_vv(ws, &colors);
+    assert_eq!(exit, 0, "{log}");
+    assert!(!probe_dirty(&log), "{log}");
+    assert_eq!(probe_rustc_count(&log), 0, "{log}");
+
+    // A deliberately broken watch must be detected even with inherited colors.
+    fs::write(
+        ws.join("crates/probe/build.rs"),
+        "fn main() { println!(\"cargo:rerun-if-changed=missing-color-control\"); }\n",
+    )
+    .unwrap();
+    let (exit, log) = cargo_vv(ws, &colors);
+    assert_eq!(exit, 0, "{log}");
+    let (exit, log) = cargo_vv(ws, &colors);
+    assert_eq!(exit, 0, "{log}");
+    assert!(probe_dirty(&log), "broken watch must be detected: {log}");
+    assert_eq!(
+        probe_rustc_count(&log),
+        1,
+        "unexpected recompilation must be visible: {log}"
+    );
+}
+
+fn packed_remote_fetch_stays_fresh(linked_worktree: bool) {
+    let holder = FixtureDir::new("packed-fetch");
+    let main = holder.path().join("main");
+    init_repo(&main);
+    write_fixture(&main);
+    commit_fixture(&main, "fixture", None);
+    let ws = if linked_worktree {
+        let linked = holder.path().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                linked.to_str().unwrap(),
+                "-b",
+                "review/topic",
+            ],
+        );
+        linked
+    } else {
+        main.clone()
+    };
+    // A separate local remote avoids network access and local branch updates.
+    let remote = holder.path().join("remote");
+    init_repo(&remote);
+    git(&ws, &["config", "core.logAllRefUpdates", "false"]);
+    git(&ws, &["pack-refs", "--all", "--prune"]);
+    // Exercise the fallback above a missing nested branch directory.
+    let nested = main.join(".git/refs/heads/review");
+    if nested.exists() {
+        fs::remove_dir(&nested).unwrap();
+    }
+    let logs = main.join(".git/logs");
+    fs::remove_dir_all(&logs).unwrap();
+    if linked_worktree {
+        let log = PathBuf::from(git(
+            &ws,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "logs/HEAD",
+            ],
+        ));
+        if log.exists() {
+            fs::remove_file(log).unwrap();
+        }
+    }
+    let (exit, log) = cargo_vv(&ws, &[]);
+    assert_eq!(exit, 0, "{log}");
+    assert_eq!(probe_rustc_count(&log), 1, "{log}");
+    let before = run_binary_hash(&ws);
+    for msg in ["fetch-one", "fetch-two"] {
+        fs::write(remote.join("readme.txt"), msg).unwrap();
+        git(&remote, &["add", "--", "readme.txt"]);
+        git(&remote, &["commit", "-q", "-m", msg]);
+        git(
+            &ws,
+            &[
+                "fetch",
+                "--no-tags",
+                remote.to_str().unwrap(),
+                "main:refs/remotes/test/main",
+            ],
+        );
+        let (exit, log) = cargo_vv(&ws, &[]);
+        assert_eq!(exit, 0, "{log}");
+        assert!(
+            !probe_dirty(&log),
+            "remote-only fetch must stay Fresh: {log}"
+        );
+        assert_eq!(probe_rustc_count(&log), 0, "{log}");
+        assert_eq!(run_binary_hash(&ws), before);
+    }
+    fs::write(ws.join("readme.txt"), "current-branch-commit\n").unwrap();
+    commit_fixture(&ws, "current branch", Some("readme.txt"));
+    let (exit, log) = cargo_vv(&ws, &[]);
+    assert_eq!(exit, 0, "{log}");
+    assert_eq!(
+        probe_rustc_count(&log),
+        1,
+        "current branch must rebuild: {log}"
+    );
+    let after = run_binary_hash(&ws);
+    assert_ne!(before, after);
+    assert_eq!(after, git(&ws, &["rev-parse", "--short", "HEAD"]));
+}
+
+#[test]
+fn build_git_watch_packed_remote_fetch_stays_fresh() {
+    packed_remote_fetch_stays_fresh(false);
+}
+
+#[test]
+fn build_git_watch_linked_packed_remote_fetch_stays_fresh() {
+    packed_remote_fetch_stays_fresh(true);
 }

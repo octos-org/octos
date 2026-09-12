@@ -84,7 +84,7 @@ fn main() {
     //    leaves the hash stale).
     //  * packed-refs — when refs are packed there is no loose ref file;
     //    packing/pruning changes this file. A later commit may instead
-    //    create a loose ref, detected by the refs-directory watch below.
+    //    create a loose ref, detected by its nearest existing parent below.
     // Watching a nonexistent path (the old `../../.git/HEAD` shapes) makes
     // cargo treat the unit as dirty on every no-change build — the
     // linked-worktree rebuild bug. In git-less trees (and non-adopted
@@ -103,11 +103,18 @@ fn main() {
             } else {
                 // Packed refs: the loose ref file does not exist YET. A
                 // same-branch commit then creates it WITHOUT touching HEAD
-                // or packed-refs — watch the refs DIRECTORY so the creation
-                // (a new entry in the dir) re-runs the script, which
-                // re-resolves and switches to watching the loose file.
-                if let Some(refs_dir) = existing_git_path(manifest, "refs") {
-                    println!("cargo:rerun-if-changed={}", refs_dir.display());
+                // or packed-refs. Watch its nearest existing parent so the
+                // creation is detected, without watching unrelated remote
+                // refs when refs/heads (or a narrower parent) exists. Walk
+                // upward because packing may remove nested branch dirs.
+                // Direct refs also work when HEAD reflogs are disabled.
+                let mut ancestor = branch.as_str();
+                while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                    if let Some(directory) = existing_git_path(manifest, parent) {
+                        println!("cargo:rerun-if-changed={}", directory.display());
+                        break;
+                    }
+                    ancestor = parent;
                 }
             }
         }
