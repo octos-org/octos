@@ -276,6 +276,12 @@ impl ConfigWatcher {
         if old.plugins != new.plugins {
             restart_fields.push("plugins".into());
         }
+        // #2217: tool_policy is applied to the tool registry at bootstrap
+        // (`apply_policy`); a live edit never reaches the running registry,
+        // so a policy-only change must surface as restart-required.
+        if old.tool_policy != new.tool_policy {
+            restart_fields.push("tool_policy".into());
+        }
 
         // Queue mode change requires restart (affects message processing loop)
         let old_queue_mode = old.gateway.as_ref().map(|g| &g.queue_mode);
@@ -490,6 +496,152 @@ mod tests {
                 );
             }
             other => panic!("expected RestartRequired, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_require_restart_when_tool_policy_changed() {
+        // #2217: tool_policy is applied to the tool registry at bootstrap
+        // (`apply_policy`), so a policy-only edit must surface as
+        // restart-required — otherwise the running gateway keeps enforcing
+        // the stale allow/deny list with no signal.
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, r#"{"provider": "anthropic"}"#);
+        let old_config = Config::from_file(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"provider": "anthropic", "tool_policy": {"deny": ["bash"]}}"#,
+        )
+        .unwrap();
+        let new_config = Config::from_file(&path).unwrap();
+
+        let (tx, rx) = watch::channel(None);
+        let watcher = ConfigWatcher::new(vec![path], old_config, tx);
+        watcher.diff_and_emit(&new_config);
+
+        let change = rx.borrow().clone();
+        match change {
+            Some(ConfigChange::RestartRequired(fields)) => {
+                assert!(
+                    fields.iter().any(|f| f == "tool_policy"),
+                    "expected tool_policy in restart fields, got: {fields:?}"
+                );
+            }
+            other => panic!("expected RestartRequired, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_policy_file_edit_emits_restart_required_via_check() {
+        // #2217: same guarantee through the real polling path — a
+        // tool_policy-only edit to the watched file must be picked up by
+        // `check()` and classified restart-required.
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, r#"{"provider": "anthropic"}"#);
+        let initial = Config::from_file(&path).unwrap();
+
+        let (tx, mut rx) = watch::channel(None);
+        let mut watcher = ConfigWatcher::new(vec![path.clone()], initial, tx);
+
+        std::fs::write(
+            &path,
+            r#"{"provider": "anthropic", "tool_policy": {"deny": ["bash"]}}"#,
+        )
+        .unwrap();
+        watcher.check();
+
+        match rx.borrow_and_update().clone() {
+            Some(ConfigChange::RestartRequired(fields)) => {
+                assert!(
+                    fields.iter().any(|f| f == "tool_policy"),
+                    "a tool_policy-only file edit must emit a tool_policy restart, got {fields:?}"
+                );
+            }
+            other => {
+                panic!("expected RestartRequired(tool_policy) from a file edit, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_tool_policy_does_not_spuriously_restart_on_unrelated_edit() {
+        // #2217 review: in profile-mode the gateway seeds the watcher with a
+        // flattened config whose tool_policy was ALREADY resolved through
+        // `profile-defaults.json` (the FIX 2 threading in gateway_runtime),
+        // while `parse_first` re-layers the same defaults on every edit. An
+        // unrelated edit must not diff the inherited policy as a change.
+        let dir = TempDir::new().unwrap();
+        let profile_path = dir.path().join("p.json");
+        std::fs::write(&profile_path, PROFILE_JSON).unwrap();
+        let defaults_path = dir.path().join("profile-defaults.json");
+        let defaults = ProfileConfig {
+            tool_policy: Some(octos_agent::ToolPolicy {
+                deny: vec!["bash".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(&defaults_path, serde_json::to_string(&defaults).unwrap()).unwrap();
+
+        // Seed the way gateway_runtime does post-FIX 2: raw profile-derived
+        // config, with tool_policy threaded from the defaults-resolved view.
+        let buffers = ConfigWatcher::read_files(std::slice::from_ref(&profile_path));
+        let mut seed = ConfigWatcher::parse_first(&buffers, None).unwrap();
+        let resolved = ConfigWatcher::parse_first(&buffers, Some(&defaults)).unwrap();
+        seed.tool_policy = resolved.tool_policy.clone();
+        let (tx, mut rx) = watch::channel(None);
+        let mut watcher =
+            ConfigWatcher::new(vec![profile_path], seed, tx).with_profile_defaults(defaults_path);
+
+        // Unrelated edit: bump only `updated_at` — the file hash changes and
+        // the watcher re-parses, but the flattened config is identical. (A
+        // hot-reloadable edit would mask a spurious RestartRequired: the
+        // watch channel retains only the LAST send, and diff_and_emit emits
+        // HotReload after RestartRequired.)
+        std::fs::write(
+            dir.path().join("p.json"),
+            r#"{"id":"p","name":"p","enabled":true,"config":{},"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-02T00:00:00Z"}"#,
+        )
+        .unwrap();
+        watcher.check();
+
+        if let Some(ConfigChange::RestartRequired(fields)) = rx.borrow_and_update().clone() {
+            panic!(
+                "inherited tool_policy must not diff as changed on an unrelated edit, got {fields:?}"
+            );
+        }
+
+        // Control: the same edit against a watcher seeded WITHOUT the
+        // threading (raw profile-derived config, as gateway_runtime seeded
+        // before the #2217 fix) must surface the false positive — this keeps
+        // the seed construction above load-bearing.
+        let raw_seed = ConfigWatcher::parse_first(
+            &ConfigWatcher::read_files(std::slice::from_ref(&dir.path().join("p.json"))),
+            None,
+        )
+        .unwrap();
+        assert!(
+            raw_seed.tool_policy.is_none(),
+            "control requires the raw profile to carry no tool_policy"
+        );
+        let (tx2, mut rx2) = watch::channel(None);
+        let mut unthreaded = ConfigWatcher::new(vec![dir.path().join("p.json")], raw_seed, tx2)
+            .with_profile_defaults(dir.path().join("profile-defaults.json"));
+        std::fs::write(
+            dir.path().join("p.json"),
+            r#"{"id":"p","name":"p","enabled":true,"config":{},"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-03T00:00:00Z"}"#,
+        )
+        .unwrap();
+        unthreaded.check();
+        match rx2.borrow_and_update().clone() {
+            Some(ConfigChange::RestartRequired(fields)) => {
+                assert!(
+                    fields.iter().any(|f| f == "tool_policy"),
+                    "control: unthreaded seed must false-positive on tool_policy, got {fields:?}"
+                );
+            }
+            other => panic!("control: expected spurious RestartRequired, got {other:?}"),
         }
     }
 
