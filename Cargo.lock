@@ -4630,6 +4630,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
 ]
@@ -4710,6 +4711,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-appender",
+ "tracing-core",
  "tracing-subscriber",
  "url",
  "uuid",

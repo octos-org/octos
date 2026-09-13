@@ -64,8 +64,10 @@ numbered results 终止证据。
   unknown，turns.txt 只产出 last_outcome，不推导 execution）：
   1. `closed` 标记存在 → status=closed（不变），execution=`closed`（不是
      idle——closed 是生命周期终态，不代表上一执行成功），last_outcome 保留
-     turns.txt 证据值；closed 分支身份四元组为 null（closed 标记优先于
-     投影，保守契约）。
+     turns.txt 证据值；closed 分支身份走与开放分支完全相同的完整信任
+     校验（registry_key/writer 形状/非空身份/Idle digest 重算）：通过则
+     保留四元组供终止事件关联，缺失/伪造/foreign/corrupt 则 null，
+     closed 标记不绕过校验（merged-review 2026-09-10 行为修复）。
   2. lifetime 投影可信 → Pending→`queued`、Running→`running`、
      Failed→`failed`、Idle→`idle`。
   3. lifetime 缺失或不可信（含 legacy）→ execution=`unknown`（turns.txt
@@ -92,8 +94,10 @@ numbered results 终止证据。
   契约落在 tracked 文件 docs/peer-status-interface.json（CI 可依赖），
   .octos/ 下仅为交接草稿。
 - serve `peer_list` 索引文本（compose_peer_list_text）同步：done 行追加
-  `outcome=<last_outcome>` 与 `exec=<execution>`；awaiting_input 优先级
-  不变；进程内 wire 活性只在 serve 回调叠加、只收紧不放宽。
+  `outcome=<last_outcome>` 与 `exec=<execution>`（实现实际对全部列表行
+  附此后缀、closed 无 outcome 行除外——spec 描述为最小集，实现为审定的
+  实际超集）；awaiting_input 优先级不变；进程内 wire 活性只在 serve
+  回调叠加、只收紧不放宽。
 
 ## Boundaries
 
@@ -134,7 +138,7 @@ Scenario: round1 completed 后 round2 queued 不显示旧完成
   Test:
     Package: octos-cli
     Filter: peer_list_round2_queued_shows_queued_not_stale_done
-  Given turns.txt 记录 `1 completed <ts1>` 且 lifetime.json 为 phase=pending generation=2（可信投影）
+  Given turns.txt 记录 `1 completed <ts1>` 且 lifetime.json 为 phase=pending generation=1（可信投影）
   When 调用 `list_peers`
   Then status=="done" 且 execution=="queued" 且 round==2 且 last_outcome=="completed"
 
@@ -218,10 +222,26 @@ Scenario: closed peer 保持 closed 优先
   Test:
     Package: octos-cli
     Filter: peer_list_closed_peer_reports_closed_execution_with_outcome
-  Given 一个 closed peer（closed 标记 + result.md + turns.txt `1 errored`）
+  Given 一个 closed peer（closed 标记 + result.md + turns.txt `1 errored` + 可信 Failed lifetime）
   When 调用 `list_peers`
-  Then status=="closed" 且 execution=="closed" 且 last_outcome=="errored"
+  Then status=="closed" 且 execution=="closed" 且 last_outcome=="errored" 且身份四元组保留（master/task/generation/turn_id 为真实值）
 
+
+Scenario: closed + 损坏 lifetime 身份仍 null
+  Test:
+    Package: octos-cli
+    Filter: peer_list_closed_with_malformed_lifetime_keeps_null_identity
+  Given closed 标记 + turns `1 errored` + lifetime.json 为截断 JSON（malformed）
+  When 调用 `list_peers`
+  Then execution=="closed" 且 last_outcome=="errored" 且身份四元组全 null（closed 标记不修复撕裂记录）
+
+Scenario: closed + Idle digest 损坏身份仍 null
+  Test:
+    Package: octos-cli
+    Filter: peer_list_closed_with_corrupt_idle_digest_keeps_null_identity
+  Given closed 标记 + turns `1 completed` + lifetime.json 为 phase=idle 且 result_digest 与 result.md 实际 SHA256 不匹配
+  When 调用 `list_peers`
+  Then execution=="closed" 且身份四元组全 null（digest 重算绑定属于同一完整校验）且 last_outcome=="completed"
 ### Rule: derivation-precedence — execution 派生优先级
 Scenario: 派生优先级 closed > 可信 lifetime > unknown
   Test:

@@ -4334,15 +4334,33 @@ pub(crate) fn derive_peer_execution_facet(
     let terminal = read_last_terminal_evidence(peer_dir, slug);
     let last_outcome = terminal.as_ref().map(|(_, outcome)| outcome.clone());
     if closed {
+        // The closed marker wins the EXECUTION label (lifecycle terminal),
+        // but it does NOT bypass the trust check: identity is retained only
+        // when the SAME full projection validation as the open branch passes
+        // (registry_key, writer shape, non-empty identity, Idle digest
+        // re-bind). Missing/forged/foreign/corrupt ⇒ all-null, exactly like
+        // an untrusted open peer (merged-review audit 2026-09-10, PR #2272).
+        // Destructure ONCE (ROOT review 2: successive `identity.map` calls
+        // move the Option after the first consumption — compile error).
+        let (master, task_id, generation, turn_id) =
+            match trusted_lifetime_projection(peer_dir, profile_id, slug) {
+                Some(p) => (
+                    Some(p.master),
+                    Some(p.task_id),
+                    Some(p.generation),
+                    p.turn_id,
+                ),
+                None => (None, None, None, None),
+            };
         return PeerExecutionFacet {
             execution: "closed",
             last_outcome,
             round: rounds_delivered,
             rounds_delivered,
-            master_session_id: None,
-            task_id: None,
-            generation: None,
-            turn_id: None,
+            master_session_id: master,
+            task_id,
+            generation,
+            turn_id,
         };
     }
     match trusted_lifetime_projection(peer_dir, profile_id, slug) {
@@ -6551,10 +6569,115 @@ mod peer_turn_status_tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = staged(temp.path(), "cl", None);
         terminal(&dir, "cl", 1, "errored");
+        lifetime(&dir, "octos", "cl", "failed", 1, Some("t1"), None);
         peer_io::write_peer_file_atomic(&dir, "closed", "closer\n1\n").unwrap();
         let f = facet(temp.path(), "cl");
         assert_eq!(f.execution, "closed");
         assert_eq!(f.last_outcome.as_deref(), Some("errored"));
+        // merged-review fix: a TRUSTED lifetime under a closed marker keeps
+        // its identity for terminal-event correlation.
+        assert_eq!(f.master_session_id.as_deref(), Some("master-cl"));
+        assert_eq!(f.task_id.as_deref(), Some("task-cl"));
+        assert_eq!(f.generation, Some(1));
+        assert_eq!(f.turn_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn peer_list_closed_with_foreign_lifetime_keeps_null_identity() {
+        // The closed marker must NOT bypass validation: a lifetime minted
+        // for a DIFFERENT profile (foreign registry_key) stays untrusted.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "fc", None);
+        terminal(&dir, "fc", 1, "errored");
+        lifetime(&dir, "octosfix", "fc", "failed", 1, Some("t1"), None);
+        peer_io::write_peer_file_atomic(&dir, "closed", "x").unwrap();
+        let f = facet(temp.path(), "fc"); // facet() reads with profile "octos"
+        assert_eq!(f.execution, "closed");
+        assert!(f.master_session_id.is_none());
+        assert!(f.task_id.is_none());
+        assert!(f.generation.is_none());
+        assert!(f.turn_id.is_none());
+    }
+
+    #[test]
+    fn peer_list_closed_with_missing_lifetime_keeps_null_identity() {
+        // Legacy closed peer (no lifetime.json): identity stays null — the
+        // pre-fix conservative shape, now an explicit regression pin.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "mc", None);
+        terminal(&dir, "mc", 1, "completed");
+        peer_io::write_peer_file_atomic(&dir, "closed", "x").unwrap();
+        let f = facet(temp.path(), "mc");
+        assert_eq!(f.execution, "closed");
+        assert_eq!(f.last_outcome.as_deref(), Some("completed"));
+        assert!(f.master_session_id.is_none());
+        assert!(f.task_id.is_none());
+        assert!(f.generation.is_none());
+        assert!(f.turn_id.is_none());
+    }
+
+    #[test]
+    fn peer_list_closed_with_malformed_lifetime_keeps_null_identity() {
+        // ROOT review 1 (Peer): malformed lifetime under a closed marker must
+        // degrade to null identity — the marker never repairs a torn record.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "ml", None);
+        terminal(&dir, "ml", 1, "errored");
+        peer_io::write_peer_file_atomic(&dir, "lifetime.json", "{\"version\": 1, \"phase\":")
+            .unwrap();
+        peer_io::write_peer_file_atomic(&dir, "originator", "m").unwrap();
+        peer_io::write_peer_file_atomic(&dir, "closed", "x").unwrap();
+        let f = facet(temp.path(), "ml");
+        assert_eq!(f.execution, "closed");
+        assert_eq!(f.last_outcome.as_deref(), Some("errored"));
+        assert!(f.master_session_id.is_none());
+        assert!(f.task_id.is_none());
+        assert!(f.generation.is_none());
+        assert!(f.turn_id.is_none());
+    }
+
+    #[test]
+    fn peer_list_closed_with_corrupt_idle_digest_keeps_null_identity() {
+        // ROOT review 1 (Peer): a closed peer whose lifetime is Idle with a
+        // NON-MATCHING result digest stays identity-free — the digest re-bind
+        // is part of the same full trust check, closed or not.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "cd", None);
+        terminal(&dir, "cd", 1, "completed");
+        // Idle REQUIRES a digest; write one that does NOT match result.md.
+        lifetime(&dir, "octos", "cd", "idle", 1, Some("t1"), Some("deadbeef"));
+        peer_io::write_peer_file_atomic(&dir, "closed", "x").unwrap();
+        let f = facet(temp.path(), "cd");
+        assert_eq!(f.execution, "closed");
+        assert!(
+            f.master_session_id.is_none(),
+            "digest corruption must not certify identity"
+        );
+        assert!(f.task_id.is_none());
+        assert!(f.generation.is_none());
+        assert!(f.turn_id.is_none());
+        // The strict terminal evidence still carries the real history.
+        assert_eq!(f.last_outcome.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn peer_list_closed_after_failed_round_keeps_outcome() {
+        // Orthogonal to identity retention: the REAL history (an errored
+        // round) stays visible on a closed row with a trusted lifetime.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = staged(temp.path(), "of", None);
+        // Write rounds in ORDER (round1 first): `terminal` rewrites result.md
+        // each call, so a reverse order would leave result.md bound to the
+        // LOWER round and break the highest-version cross-check.
+        terminal(&dir, "of", 1, "completed");
+        terminal(&dir, "of", 2, "interrupted");
+        lifetime(&dir, "octos", "of", "failed", 2, Some("t2"), None);
+        peer_io::write_peer_file_atomic(&dir, "closed", "x").unwrap();
+        let f = facet(temp.path(), "of");
+        assert_eq!(f.execution, "closed");
+        assert_eq!(f.last_outcome.as_deref(), Some("interrupted"));
+        assert_eq!(f.rounds_delivered, 2);
+        assert_eq!(f.generation, Some(2));
     }
 
     #[test]

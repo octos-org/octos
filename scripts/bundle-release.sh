@@ -63,6 +63,15 @@ case "$out" in
   *) echo "error: unknown archive format: $out (want .tar.gz or .zip)" >&2; exit 1 ;;
 esac
 
+# Checksum sidecar so installers can verify the download (`sha256sum -c`
+# format) — without it octoscode's auto-provision silently skips verification
+# (#1929). macOS runners ship shasum instead of sha256sum; output is identical.
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$(dirname "$out")" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256")
+else
+  (cd "$(dirname "$out")" && shasum -a 256 "$(basename "$out")" > "$(basename "$out").sha256")
+fi
+
 echo "bundled $out:"
 case "$out" in
   *.tar.gz) tar tzf "$out" ;;

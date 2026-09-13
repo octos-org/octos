@@ -2283,7 +2283,64 @@ pub(crate) fn build_completion_review_prompt(
     )
 }
 
-fn git_turn_summary(content: &str) -> String {
+/// Run one observe-only lifecycle hook payload (`on_resume` / `on_turn_end`)
+/// and log — never honor — blocking outcomes: these events fire after the
+/// fact, so a deny/modify cannot stop anything and is a warning, and an
+/// infrastructure failure surfaces as a warning rather than aborting the
+/// turn. Shared by the `SessionActor` chat path and the ui_protocol OUP turn
+/// path (#2244).
+pub(crate) async fn emit_lifecycle_hook_payload(
+    hooks: Option<&Arc<HookExecutor>>,
+    session_key: &SessionKey,
+    payload: HookPayload,
+) {
+    let Some(hooks) = hooks else {
+        return;
+    };
+    let event = payload.event;
+    match hooks.run(event, &payload).await {
+        HookResult::Allow => {}
+        HookResult::Modified(_) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                "lifecycle hook attempted to modify payload; ignoring"
+            );
+        }
+        // Context injection is a `user_prompt_submit`-only outcome; these
+        // emitted lifecycle events never produce it. Exhaustive-match arm.
+        HookResult::Context(_) => {}
+        // Feedback is an AfterToolCall-only outcome (checker diagnostics
+        // appended by the agent's own dispatch sites); these lifecycle
+        // events have no tool result to carry it — log and continue.
+        HookResult::Feedback(entries) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                count = entries.len(),
+                "lifecycle hook produced feedback; ignored"
+            );
+        }
+        HookResult::Deny(reason) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                reason,
+                "lifecycle hook attempted to deny a non-blocking event"
+            );
+        }
+        HookResult::Error(error) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                error,
+                "lifecycle hook failed"
+            );
+        }
+    }
+}
+
+pub(crate) fn git_turn_summary(content: &str) -> String {
     let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
         "agent turn update".to_string()
@@ -4755,50 +4812,7 @@ impl SessionActor {
     }
 
     async fn emit_hook_payload(&self, payload: HookPayload) {
-        let Some(hooks) = self.hooks.as_ref() else {
-            return;
-        };
-        let event = payload.event;
-        match hooks.run(event, &payload).await {
-            HookResult::Allow => {}
-            HookResult::Modified(_) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    "lifecycle hook attempted to modify payload; ignoring"
-                );
-            }
-            // Context injection is a `user_prompt_submit`-only outcome; these
-            // emitted lifecycle events never produce it. Exhaustive-match arm.
-            HookResult::Context(_) => {}
-            // Feedback is an AfterToolCall-only outcome (checker diagnostics
-            // appended by the agent's own dispatch sites); these lifecycle
-            // events have no tool result to carry it — log and continue.
-            HookResult::Feedback(entries) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    count = entries.len(),
-                    "lifecycle hook produced feedback; ignored"
-                );
-            }
-            HookResult::Deny(reason) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    reason,
-                    "lifecycle hook attempted to deny a non-blocking event"
-                );
-            }
-            HookResult::Error(error) => {
-                warn!(
-                    session = %self.session_key,
-                    event = ?event,
-                    error,
-                    "lifecycle hook failed"
-                );
-            }
-        }
+        emit_lifecycle_hook_payload(self.hooks.as_ref(), &self.session_key, payload).await;
     }
 
     async fn emit_resume_hook(&self) {
@@ -5467,19 +5481,61 @@ impl SessionActor {
                     goal_id = %snapshot.goal_id,
                     "sentinel goal completion not verified: {outcome}"
                 );
-                let note = format!("goal completion not verified — {outcome}");
-                {
-                    let mut handle = self.session_handle.lock().await;
-                    handle.push_message_in_memory(octos_core::Message::system(note.clone()));
-                }
-                // Canonical durable append (per-key lock → fresh open →
-                // seq'd write), mirroring `persist_assistant_message`.
-                let _ = octos_bus::session::persist_message_through_canonical_path(
+                // evening 2026-09-10 (PR #2283 follow-up): the note is
+                // persisted IDEMPOTENTLY under a stable per-verdict identity
+                // — goal id + the same evidence digest the wrapper gates on
+                // (objective ‖ evidence ‖ revision). The `!replayed` gate is
+                // GONE: a replay whose note never landed (crash window or a
+                // previous persist failure) now recovers it, while an
+                // already-persisted note is returned as-is (original
+                // timestamp/content) and never duplicated. RAM mirrors ONLY
+                // the durable row the helper returns — a failed append
+                // leaves no phantom. Goal status, charging and TTL live in
+                // the wrapper and are untouched.
+                let digest = crate::autonomy::agent_orchestrator::verifier_evidence_digest(
+                    &snapshot.objective,
+                    &assistant_tail,
+                    snapshot.revision,
+                );
+                let note_id = format!("goal-verifier-note:v1:{}:{digest}", snapshot.goal_id);
+                match octos_bus::session::persist_system_note_once_through_canonical_path(
                     &self.data_dir,
                     &self.session_key,
-                    octos_core::Message::system(note),
+                    octos_core::Message::system(format!(
+                        "goal completion not verified — {outcome}"
+                    )),
+                    &note_id,
                 )
-                .await;
+                .await
+                {
+                    Ok(durable_row) => {
+                        // Mirror the durable row into RAM only when this
+                        // actor's mirror lacks a System row with the same
+                        // note id (covers: fresh append, disk-had-it-but-
+                        // RAM-didn't repair, and the no-duplicate case).
+                        let mut handle = self.session_handle.lock().await;
+                        let mirrored = handle.session().messages.iter().any(|m| {
+                            m.role == octos_core::MessageRole::System
+                                && m.client_message_id.as_deref() == Some(note_id.as_str())
+                        });
+                        if !mirrored {
+                            handle.push_message_in_memory(durable_row);
+                        }
+                    }
+                    Err(error) => {
+                        // Fail-closed: record and leave RAM untouched. The
+                        // next same-evidence verification (replay) retries
+                        // the same note id naturally — no background loop,
+                        // no charging/TTL changes.
+                        tracing::error!(
+                            session_id = %self.session_key,
+                            goal_id = %snapshot.goal_id,
+                            note_id = %note_id,
+                            error = %error,
+                            "goal verifier failure note persist failed; will retry on next verification"
+                        );
+                    }
+                }
             }
         }
         // Re-queue another continuation only if we are still idle AND

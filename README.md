@@ -11,648 +11,401 @@
 
 </div>
 
-> Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
+# Octos
 
-Octos is your own AI assistant, running on your own computer. Install one small program, connect any major AI provider (Anthropic, OpenAI, Gemini, DeepSeek, …), and chat with an agent that can run code, browse the web, remember things, schedule jobs, and build documents — from your browser, your terminal, or apps like Telegram, WhatsApp, and Discord. Your sessions, memory, and data stay on your machine — prompts go only to the AI provider you choose.
+**An embeddable AI agent harness kernel, written in Rust.**
 
-## Start here
+Octos provides the execution loop, context management, memory, tools, skills,
+workflows, and agent coordination for applications built around AI agents.
+Compile the kernel into your own application, or host it behind **OUP — the
+Octos UI Protocol** — and control it from a native app, a terminal, a browser,
+or another agent.
 
-The fastest way to a working assistant, on the supported platforms (macOS Apple Silicon, Linux x86-64/arm64, Windows x64):
+The defining architecture is **a reusable kernel with a programmable protocol
+boundary**. Your application owns its interface and product workflow; Octos
+owns agent execution and runtime state. The same OUP contract lets a human-facing
+client and an automated controller operate that runtime.
 
-```bash
-# 1. Install
-brew tap octos-org/octos https://github.com/octos-org/octos
-brew install octos-org/octos/octos      # or: npm install -g @octos-org/octos
+[Build with Octos](#build-with-octos) · [Control through OUP](#control-through-oup) ·
+[Documentation](https://octos-org.github.io/octos/) · [中文](README-zh.md)
 
-# 2. Choose your AI provider and a model (interactive — pick a real
-#    model name; some providers reject the "auto" default)
-octos init
+<a id="start-here"></a>
+<a id="quick-start"></a>
 
-# 3. Sign in to that provider — or paste its API key; stored securely
-octos auth login --provider deepseek    # use the provider you chose above
+## Looking for a coding agent to use?
 
-# 4. Start your agent with password-free local sign-in
-octos serve --solo
-```
+Start with an application built on the kernel:
 
-Now open **http://localhost:50080** (it lands on `/app/`), click the local sign-in button, and say hello. That's the whole setup.
+| Application | Where to start |
+| --- | --- |
+| **[Octoscode](https://github.com/octos-org/octoscode)** | Install the terminal client. It provisions a compatible local Octos runtime on first launch. |
+| **[Octoscode Web](https://github.com/octos-org/octoscode-web)** | Set up the browser client using its [getting-started guide](https://github.com/octos-org/octoscode-web/blob/main/docs/getting-started.md), and connect it to an Octos runtime. |
 
-Prefer a hands-off install that runs Octos as a background service (auto-start, bundled skills, dashboard on port 8080)? Use the installer script instead — see [self-hosted install options](https://github.com/octos-org/octos-web#self-hosting--deployment):
+This repository is for developers embedding, extending, or integrating the
+harness kernel. Application installation and everyday coding workflows belong
+in the client repositories above.
 
-```bash
-# macOS / Linux
-curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash
-```
+<a id="embed-octos"></a>
 
-### If something looks wrong
+## Build with Octos
 
-| Symptom | Fix |
-|---|---|
-| The page doesn't load | Is `octos serve --solo` still running? Solo serve uses port **50080**; the service installer uses port **8080** — check the one you set up. |
-| The agent doesn't reply | No provider credential yet — run `octos auth login --provider <name>` (or export the provider's API key env var, or add the key in the dashboard settings). An `invalid model` error means the provider rejected the configured model name — re-run `octos init` and pick a real one (e.g. `deepseek-v4-flash`). |
-| The dashboard (`/admin/`) asks for a login | Use the **"Login with admin token"** tab with the `Auth token:` the installer printed (also stored in the service file — see *First login to the dashboard* in the [octos-web self-hosting guide](https://github.com/octos-org/octos-web#self-hosting--deployment)). |
-| Not sure what's wrong | `octos status` shows what's running; `octos doctor` checks your environment. |
+Use Octos as the foundation for a coding application, an agent-powered desktop
+app, a research service, a workflow engine, or a fleet of cooperating agents.
+Bring your own interface, model providers, tools, and host environment.
 
-### The pieces
+### Kernel architecture
 
-- **octos** (this repo) — the **kernel**: the agent runtime, LLM providers, tools, sandbox, memory, channels, and the API everything else speaks. Install this first — then live in a client:
-- **[octos-web](https://github.com/octos-org/octos-web)** — the full app experience in the browser (chat, voice, projects, slides, admin, and the hosted multi-tenant signup). A build ships inside the server — open `/app/`.
-- **[octoscode](https://github.com/octos-org/octoscode)** — the terminal experience, in the spirit of Claude Code.
+Embed the Rust crates or task bindings in your application, or connect through
+OUP to a hosted runtime. OUP carries both commands into the kernel and responses
+and events back to the client or controller.
 
-**Stuck?** [Documentation](https://octos-org.github.io/octos/) · [Issues](https://github.com/octos-org/octos/issues)
+![Octos harness kernel architecture](docs/assets/readme/architecture.svg)
 
----
+### Native kernel and libraries
 
-A Rust-native, API-first Agentic OS.
+The Rust workspace lets you compose the parts your application needs:
 
-31MB static binary. 80+ REST endpoints + UI Protocol v1 over WebSocket/stdio. 16 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
+| Crate | Role in your application |
+| --- | --- |
+| [`octos-core`](crates/octos-core) | Shared types, OUP commands, notifications, and wire codecs |
+| [`octos-agent`](crates/octos-agent) | Agent execution, context handling, tools, hooks, sandboxing, and task supervision |
+| [`octos-memory`](crates/octos-memory) | Persistent memory, episodes, and retrieval |
+| [`octos-llm`](crates/octos-llm) | Provider interfaces, model routing, retries, and failover |
+| [`octos-plugin`](crates/octos-plugin) | Skill and plugin integration |
+| [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | Workflow graphs, parallel workers, validation, and result aggregation |
+| [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | Session infrastructure, runtime composition, and OUP hosting/adapters |
 
-## What is Octos?
-
-Octos is an open-source AI agent platform that lets you run your own AI system on a single machine or across a cloud-and-device pair. You deploy one Rust binary, connect your LLM provider and channels, and Octos handles routing, sessions, tools, memory, and multi-user isolation through a web dashboard and REST API.
-
-You can think of it as the **backend operating system for AI agents**. Instead of building a new chatbot stack for every use case, you configure Octos profiles with their own prompts, models, tools, and channels, then manage them from one control plane.
-
-Beyond the quick local setup above, Octos can be deployed three ways:
-
-1. **Octos Cloud signup** — a hosted multi-tenant account at [octos.cloud](https://octos.cloud); the signup experience belongs to the web client (see the [octos-web README](https://github.com/octos-org/octos-web#octos-cloud)).
-2. **Self-hosted local** — run Octos only on your own machine or local network.
-3. **Self-hosted cloud + tenant pair** — run your own public VPS plus your own tenant device for internet-accessible remote use.
-
-## Why Octos
-
-Most agentic systems are single-tenant chat assistants — one user, one model, one conversation at a time. Octos is different:
-
-- **API-first Agentic OS**: 80+ REST endpoints (chat, sessions, admin, profiles, skills, swarm, pipeline, metrics, webhooks) plus **UI Protocol v1** — a JSON-RPC contract over WebSocket and stdio for interactive clients. Any frontend — web, mobile, CLI, CI/CD — can be built on top.
-- **Multi-tenant by design**: One 31MB binary serves 200+ profiles on a 16GB machine. Each profile is a separate OS process with isolated memory, sessions, and data. Family Plan sub-accounts.
-- **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime, with bounded concurrency for fleet stability.
-- **Multi-agent topologies**: sub-agents (in-process children you own), peer agents (sovereign sibling sessions via `peer_handoff`/`peer_gather`), and a **swarm dispatcher** (fan contracts to N workers — native or external `claude -p`/`codex exec` — validator-gated, cost rolled up, at `/api/swarm/dispatch`). See [Agent topologies](#agent-topologies-sub-agents-peers--swarm).
-- **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, lane scoring, circuit breakers.
-- **Static, profile-scoped tool surface**: every enabled tool's full schema is sent to the LLM each turn (no dynamic eviction — the prompt prefix stays cache-stable). Runtime profiles such as `coding` narrow the enabled set; `coding-full` restores the broad surface. `spawn_only` tools auto-redirect to background execution.
-- **5 queue modes per session**: Followup, Collect, Steer, Interrupt, Speculative — users control agent concurrency via `/queue`.
-- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, DingTalk, Matrix, Feishu.
-- **Sticky thread_id + committed_seq**: Every SSE event is bound to a thread; replay is deterministic by committed sequence number (M8.10).
-- **3-layer memory**: Long-term (entity bank, auto-injected), episodic (task outcomes in redb), session (JSONL + LLM compaction, three-tier).
-- **Autonomy — goals & loops**: `/goal <objective>` keeps the agent working across turns via checkpointed continuations (under a token budget); `/loop` runs a task on a fixed interval or self-paced. The agent keeps going between your messages — see [Autonomy: goals & loops](#autonomy-goals--loops).
-- **Session time-travel**: `session/rollback` RPC with resume/rewind checkpoint pickers in both clients; every session can be rolled back to any prior user turn.
-- **Live reasoning**: streams the model's thinking as it happens, with per-session `/thinking` effort control.
-- **Voice**: per-profile cloud TTS voices, rich HTML/image voice output, dedicated batch-ASR routing via `ASR_API_URL`, and an OMiniX fallback for local ASR/TTS.
-- **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
-- **Sandbox isolation**: bwrap + Landlock/seccomp + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
-
-## Self-hosting & deployment
-
-The full setup and hosting guide — the three deployment paths (Octos Cloud
-signup, self-hosted local, and self-hosted cloud + tenant pair), the install
-scripts, package-manager installs, first dashboard login, uninstall, config
-locations, and runtime modes — lives in the **[octos-web README →
-Self-hosting & deployment](https://github.com/octos-org/octos-web#self-hosting--deployment)**.
-
-The [Start here](#start-here) steps above are the quickest local install; that
-guide covers the managed-signup, background-service, and public-VPS options.
-
-## Build from source
-
-For development against an unreleased checkout:
-
-### Local development shortcuts
-
-The repository's `Makefile` wraps the common local workflow while retaining
-the existing build scripts. Run `make help` to see every target.
+From a checkout, build the native agent library or a library for a non-Rust host:
 
 ```bash
-make init                         # creates ./.octos/config.json interactively
-# set the API key variable for the provider selected during init, for example:
-export OPENAI_API_KEY=your-key-here
-make serve                        # API + local password-free sign-in
-make dev                          # build /admin/ and /app/, then start the server
+cargo build --release -p octos-agent
+cargo build --release -p octos-ffi
 ```
 
-`make serve` builds only the `api` feature and serves on `127.0.0.1:50080` by
-default. Override values when needed, for example
-`make serve PORT=50081 FEATURES=api,telegram`. `make dev` requires Node.js;
-it initializes the `octos-web` submodule and invokes the existing frontend
-build scripts.
+Pin related Octos crates to the same Git revision when integrating them into
+another workspace. For other host languages, use the
+[C ABI](crates/octos-ffi/README.md), [native Python binding](crates/octos-pyo3/README.md),
+or [Swift/Kotlin bindings](crates/octos-uniffi/README.md). The C ABI produces
+shared and static libraries. These bindings expose task execution; OUP provides
+the session, turn, supervision, and replay interface described below.
 
-```bash
-# Build and install. The features below are the canonical default
-# (matches scripts/milestone-ci.sh) — `octos serve` requires `api`,
-# and the gateway needs the relevant channel feature for each
-# transport (telegram, discord, etc.). A bare `cargo install --path
-# crates/octos-cli` will give you a binary missing `serve` and
-# without channel adapters.
-cargo install --path crates/octos-cli \
-    --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"
+### Platforms and architectures
 
-# Initialize workspace
-octos init
+Build native applications for **Linux, Windows, and macOS**. CI configurations
+include Linux x86-64 and ARM64, macOS ARM64, and Windows x86-64. **RISC-V** has a
+manual CI definition, but remains an unverified target: the configuration records
+that no runner has executed the job. Select the crates, features, and native
+dependencies for your target; support depends on that combination.
 
-# Set API key (any supported provider — auto-detected during install)
-export OPENAI_API_KEY=your-key-here    # or ANTHROPIC_API_KEY, GEMINI_API_KEY, etc.
+Other operating systems can connect an application through OUP or port the
+kernel's platform integrations, including process execution, filesystem access,
+and sandboxing. The application/protocol boundary stays the same.
 
-# Interactive chat
-octos chat
+For browser applications, [the WASM crate](crates/octos-wasm/README.md) supplies
+protocol and utility types. The full agent kernel runs natively, with the
+browser communicating over OUP.
 
-# Multi-channel gateway
-octos gateway
+## Control through OUP
 
-# Web dashboard + REST API + UI Protocol
-octos serve
-octos serve --solo     # same, plus password-free local login for the web app
-octos serve --stdio    # UI Protocol over stdio (how octoscode embeds a backend)
-```
+**OUP (Octos UI Protocol)** is a JSON-RPC 2.0 interface for applications and agent
+controllers. It carries requests, responses, and typed runtime events over
+WebSocket or newline-delimited stdio. Local runtime adapters also use an
+in-process connection to the OUP dispatcher.
 
-The full CLI surface (see `octos help`):
+For a local controller, the reference host is `octos serve --stdio`, built from
+`octos-cli` with the `api` feature. A WebSocket client connects to a running
+host's `/api/ui-protocol/ws` endpoint using that host's authentication settings.
+Use string JSON-RPC request IDs.
 
-| Command | Purpose |
-|---|---|
-| `chat` / `gateway` / `serve` | the three runtime modes |
-| `init` / `status` / `doctor` | workspace init, node status, environment diagnostics |
-| `auth` / `account` / `admin` | provider login (OAuth/PKCE), sub-accounts, tenant & tunnel admin |
-| `channels` / `cron` / `skills` | messaging channels, scheduled jobs, skill install/remove |
-| `mcp-serve` | run octos as an MCP server, so outer orchestrators can drive it as a sub-agent |
-| `mcp` | `mcp login` / `logout` for OAuth-gated MCP servers octos connects to as a **client** (external MCP tools are declared in `config.json` → `mcp_servers`) |
-| `acp` | run octos as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio, so editors like Zed drive it as their coding agent |
-| `office` | PPTX/DOCX/XLSX manipulation from the shell |
-| `update` / `clean` / `completions` / `docs` | release check, cache cleanup, shell completions, doc generation |
+Stdio clients negotiate features with `client_hello`; WebSocket clients request
+them through `X-Octos-Ui-Features` or the `ui_feature` query parameter. Query
+`config/capabilities/list` to discover supported methods, then use the advertised
+capabilities to choose controls and event formats. The runtime owns conversation history, execution state,
+compaction, permissions, and committed results; clients render or act on that
+state through the protocol.
 
-For a repo-local tenant deploy (builds from source, sets up the same service + tunnel as `install.sh`), use `scripts/local-tenant-deploy.sh --full`.
+### Drive Octos from another agent
 
-### Iterating on a system-installed octos
+A controller integration can expose OUP requests as tools callable by **Codex,
+Claude Code, or another agent**. This gives the controlling agent a way to
+assign work to Octos agents, observe execution, intervene, and collect results.
+The integration supplies the OUP client or bridge.
 
-`cargo install --path crates/octos-cli --features "api,..."` only drops a binary into `~/.cargo/bin`. It does **not** rebuild the embedded admin dashboard or touch the service installed by `scripts/install.sh` (the LaunchDaemon on macOS / systemd unit on Linux runs `/usr/local/bin/octos`). If you have already run `install.sh` and want to redeploy local changes, use:
+A typical controller flow is:
 
-```bash
-./scripts/build-local-bundle.sh --install           # build + bundle + reinstall
-./scripts/build-local-bundle.sh --install --tunnel  # same, with tunnel flags passed through
-./scripts/build-local-bundle.sh --skip-dashboard    # only Rust changed, skip npm/vite
-```
+1. **Connect and negotiate.** Establish a transport, negotiate feature support,
+   and query `config/capabilities/list`.
+2. **Open a scoped session.** Use `session/open` with the session identity,
+   profile, and workspace; retain the identity confirmed by the runtime.
+3. **Assign work.** Send `turn/start` with a fresh turn ID and structured input.
+   The RPC acknowledgement means the turn was accepted; follow the negotiated
+   event stream to its terminal outcome.
+4. **Observe and intervene.** Consume message, tool, task, and progress events.
+   Use `turn/steer` to add instructions, `turn/interrupt` to stop a turn, and
+   `approval/respond` or `user_question/respond` when an authorized decision or
+   answer is needed.
+5. **Coordinate and recover.** Use `peer/prepare` to stage a peer's brief and
+   optional worktree, then open its session and start its turn. Gather durable
+   peer results through `peer/gather`; inspect task output and artifacts through
+   `task/*`. Rehydrate a session or resume from its committed cursor after a
+   reconnect.
 
-What it does:
+The controller follows the event stream after a turn is accepted. Approvals,
+questions, and interventions are optional; completion, failure, or interruption
+ends the turn.
 
-1. Detects your host triple (mirrors `install.sh`'s platform mapping).
-2. Runs `scripts/build-dashboard.sh` (admin SPA → `/admin/`) and `scripts/build-web-app.sh` (the octos-web submodule → `/app/`) so `rust_embed` bakes both SPAs into the binary. Skip the dashboard build and `/admin/` returns a 503 `admin_bundle_missing` diagnostic; skip the web build and `/app/` returns `web_bundle_missing` (and the root `/` falls back to redirecting to `/admin/`).
-3. Delegates `cargo build --release` to `scripts/milestone-ci.sh release-bundle` (single source of truth for `FEATURES` / `SKILL_CRATES`).
-4. Tars binaries into `scripts/octos-bundle-<TRIPLE>.tar.gz`, which `install.sh` auto-detects via `file://`, skipping the GitHub download.
-5. With `--install`, chains into `install.sh` — copies binaries to `$PREFIX`, rewrites the service plist/unit, reloads the daemon.
+![OUP controller workflow: connect, assign, supervise, and collect](docs/assets/readme/workflow.svg)
 
-Use this when:
+For example, after opening a session, a controller can send this `turn/start`
+request. Replace the session placeholder with the confirmed session ID and use
+a new UUID for each turn:
 
-- You changed Rust **or** dashboard code and need to see it running under the installed service.
-- You want to exercise the full installer flow against a local build.
-
-Skip it when you just need the CLI — `cargo install --path crates/octos-cli --features "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot"` is faster. Trim the feature list to only the channels you need (or just `api` for `octos chat` + `octos serve`); leaving `api` off is what causes `octos serve` to fail with `unrecognized subcommand 'serve'`.
-
-## Use octos as a library
-
-Everything above builds the **binary**. octos is also embeddable — as Rust crates, or through C/Python/Swift/Kotlin/JS bindings that wrap the same agent loop.
-
-### Rust
-
-The crates are **not published to crates.io** (`publish = false` in the workspace), so depend on them by git. Pin a tag; `main` moves fast:
-
-```toml
-[dependencies]
-octos-core  = { git = "https://github.com/octos-org/octos", tag = "v2.0.2" }
-octos-agent = { git = "https://github.com/octos-org/octos", tag = "v2.0.2" }
-```
-
-```rust
-use octos_agent::{HookConfig, HookEvent, HookExecutor};
-
-let executor = HookExecutor::new(vec![HookConfig {
-    event: HookEvent::BeforeSpawnVerify,
-    command: vec!["/usr/local/bin/verify-motion".into()],
-    timeout_ms: 5000,
-    tool_filter: vec![],
-    path_filter: vec![],
-    requires_bin: None,
-}]);
-```
-
-Take the smallest layer that does the job — each row pulls in the ones above it:
-
-| Crate | Use it for | Weight |
-| --- | --- | --- |
-| `octos-core` | protocol types, task model, IDs, codecs | leaf — pure deps, the only crate that compiles to `wasm32` |
-| `octos-llm` | provider abstraction, failover/routing | + HTTP/TLS |
-| `octos-memory` | episodic store, hybrid BM25 + vector recall | + `redb` (filesystem) |
-| `octos-agent` | the full loop: tools, sandbox, approvals, hooks | + `tokio` multi-thread, browser/CDP |
-
-Worked examples live in `crates/octos-agent/examples/` — `robot_domain_hook.rs` shows the domain-hook pattern integrators use to veto a dispatched sub-task from live telemetry, without adding domain-specific variants to the core.
-
-Feature flags worth knowing: `octos-agent` defaults to `browser` (CDP `web_search` fallback) and offers `git` and `ast`; in-process embeddings come from `octos-embed-llama` (`embed-llama`, plus `metal` / `cuda`), which is cross-platform and defaults to a CPU backend.
-
-### From other languages
-
-`octos-ffi` is the native core; `octos-pyo3` and `octos-uniffi` are built over it, so those three share behaviour and feature flags. `octos-wasm` is separate — it binds `octos-core` only (see below).
-
-| Binding | Target | Build |
-| --- | --- | --- |
-| **`octos-pyo3`** | Python — **the recommended Python path** | `maturin build --release` (from `crates/octos-pyo3/`) |
-| `octos-ffi` | C ABI — C, Go, Node, anything with FFI | `cargo build -p octos-ffi --release` → `.a` / `.dylib` / `.so` + generated header |
-| `octos-uniffi` | Python, Swift, Kotlin from one definition | `cargo build -p octos-uniffi`, then `cargo run -p octos-uniffi --bin uniffi-bindgen -- generate ...` |
-| `octos-wasm` | Browser / JS | `wasm-pack build --target web` |
-
-Add the in-process GGUF embedder to any of them with the same flag, e.g. `cargo build -p octos-ffi --release --features embed-llama` (or `embed-llama-metal` on Apple GPUs).
-
-**The browser is protocol-only.** `octos-wasm` binds `octos-core` — wire (de)serialization, message/task/ID modelling — and nothing more. The agent loop cannot run in a browser: `redb` needs a filesystem, `tokio`'s multi-thread runtime needs OS threads, and native TLS and llama.cpp do not target `wasm32-unknown-unknown`. Run the agent behind `octos serve` and talk to it over the network.
-
-Each binding has its own README with the full API and examples: [octos-ffi](crates/octos-ffi/README.md) · [octos-pyo3](crates/octos-pyo3/README.md) · [octos-uniffi](crates/octos-uniffi/README.md) · [octos-wasm](crates/octos-wasm/README.md).
-
-## Clients and the UI Protocol
-
-Interactive clients talk to `octos serve` over **UI Protocol v1** — a JSON-RPC contract carried on WebSocket (`/api/ui-protocol/ws`) or stdio (`octos serve --stdio`). It covers session open with cursor replay, streamed turns, durable persistence events, tool activity, approvals, background tasks, and rollback. The protocol spec is the contract: server and clients release independently against it.
-
-- **[octos-web](https://github.com/octos-org/octos-web)** — the browser client: chat, voice/video, studio, slides, and sites. A build is embedded in the server binary at `/app/`, so `octos serve` works with zero extra deploys. (The admin dashboard is a separate SPA, embedded at `/admin/`.)
-- **[octoscode](https://github.com/octos-org/octoscode)** — the terminal client. Connects to a running server over WebSocket, or spawns `octos serve --stdio` as its own private backend.
-- **`octos mcp-serve`** — the inverse direction: octos as an MCP server, callable as a sub-agent from outer orchestrators.
-- **MCP client** — octos also *consumes* external MCP servers. Declare them in `config.json` under `mcp_servers` and any octos agent (`chat`, `serve`, `gateway`, `acp`) gains their tools in its own registry — stdio (`command` + `args`) or HTTP (`url`); run `octos mcp login <url>` for OAuth-gated servers.
-
-  ```json
-  "mcp_servers": [
-    { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"] },
-    { "url": "https://mcp.example.com/mcp", "oauth": true }
-  ]
-  ```
-
-  Stdio children receive a **sanitized environment** — only the names explicitly listed under the server's `env` map are forwarded (injection vectors like `LD_PRELOAD` are stripped even from that map), so a server expecting inherited credentials must get them explicitly or read its own secrets file. Set `"concurrency_class": "exclusive"` to serialize a server's tools (default `"safe"` allows concurrent calls) — the right knob for a single-resource server such as a one-device driver. Handshake timeout is 30s and each `tools/call` times out after 60s, so long-running work should be started detached by the server and polled through read-only tools.
-- **`octos acp`** — the editor-facing direction: octos as an **[Agent Client Protocol](https://agentclientprotocol.com) (ACP)** agent over stdio, so ACP-speaking editors (Zed and others) run octos as their coding agent — with the **same capabilities as `octos chat`** (your tools + sandbox, long-term memory + `MEMORY.md`, skills/plugins, MCP, hooks, context compaction, provider failover). It appears in the editor's agent picker alongside Claude Code and Gemini CLI. See [Use octos in Zed](#use-octos-in-zed-acp).
-
-### Use octos in Zed (ACP)
-
-`octos acp` turns octos into an **ACP server** that [Zed](https://zed.dev) (and other ACP editors) drive as a first-class coding agent. You get the same agent stack as `octos chat` — your tools + sandbox, long-term memory + `MEMORY.md` injection, bundled skills/plugins, MCP servers, hooks, and context compaction — but inside the editor.
-
-> **One gap today:** interactive tool-approval prompts and `ask_user_question` aren't surfaced to the editor yet — octos runs tools under its own (non-interactive) approval policy rather than ACP `session/request_permission`, so a tool that would pause for approval in `octos chat` won't prompt you in Zed. Everything else matches.
-
-**1. Install octos and initialize it** (skip if you already have it — see [Start here](#start-here) for all install options):
-
-```bash
-npm install -g @octos-org/octos      # or Homebrew / build from source — see Start here
-octos init                           # pick a provider + model, then paste that provider's API key
-```
-
-`octos init` walks you through choosing a provider + model (this guide uses **DeepSeek**) and then prompts you to **paste that provider's API key** — stored securely in `auth.json` and read regardless of environment (`octos acp` resolves its LLM exactly like `octos chat`). Pressed Enter to skip it? Add the key later with `octos auth login --provider deepseek`. A Dock-launched Zed does **not** inherit your shell's env vars, so if you'd rather pass the key by an env var, put it in the `env` block below instead.
-
-**2. Register octos as an agent server** in Zed's settings (`~/.config/zed/settings.json`, or run *zed: open settings*). Use `"command": "octos"` if it's on your `PATH`, or the absolute path from `which octos` — a Dock-launched Zed has a minimal `PATH` and may not find a bare `octos`:
-
-```jsonc
+```json
 {
-  "agent_servers": {
-    "Octos": {
-      "command": "octos",
-      "args": ["acp", "--provider", "deepseek", "--model", "deepseek-chat"],
-      "env": {}
-    }
+  "jsonrpc": "2.0",
+  "id": "request-1",
+  "method": "turn/start",
+  "params": {
+    "session_id": "<confirmed-session-id>",
+    "turn_id": "550e8400-e29b-41d4-a716-446655440000",
+    "input": [
+      { "kind": "text", "text": "Review the changes in this workspace and report findings with file and line references." }
+    ]
   }
 }
 ```
 
-> The `--provider`/`--model` in `args` must match the provider you set up in step 1 (this guide uses DeepSeek). `octos acp` inherits the rest — `base_url`, `api_type`, `api_key_env` — from your `octos init` config, so pointing `deepseek` args at a differently-configured provider sends the wrong key/endpoint and the session fails.
+The same controller can let Octos perform research or implementation, inspect
+its findings, then steer the next turn. OUP exposes the controls and evidence
+needed to build that collaboration into your own application.
 
-**3. Play with it in Zed.**
-- **Open a folder** — external agents need a workspace (with none open, the Agent Panel just shows *"Open Project"*).
-- Open the **Agent Panel** (right dock), click the **＋ New Thread** dropdown (or press `⌥⌘⇧N`), and choose **Octos**.
-- Type a prompt. octos runs the agent loop and streams tools, thinking, and results back into Zed — and it remembers across turns via your `MEMORY.md`.
+## Kernel capabilities through the OUP lens
 
-> **Can't find Octos?** It lives in the **＋ New Thread** menu (external agents) — **not** the `⋯` → *MCP / Context Servers* list (that's a different feature). After editing `agent_servers`, fully quit and reopen Zed (`Cmd-Q`) so it reloads the config.
+OUP makes the harness programmable throughout a task's lifecycle. An application
+can inspect the context an agent is using, respond to a tool approval, supervise
+parallel work, and recover committed results through the same runtime contract.
+The kernel manages execution and persistence; the application decides how to
+present that state and when to intervene.
 
-Flags mirror `octos chat`: `--provider`, `--model`, `--base-url`, `--config`, `--data-dir`, `--cwd`, `--profile`, and `--max-iterations`. Zed sends a per-session working directory with `session/new`; that's where octos roots tools, skills, and the filesystem scope.
+The surfaces below depend on the runtime, transport, and negotiated features.
+Discover them through `config/capabilities/list`, check `supported_methods` and
+`supported_features`, and consume the negotiated event format. Capability
+discovery lets an integration adapt to the runtime it is actually connected to.
 
-## Headless agent mode & code review (`octos chat`)
+### Context management
 
-`octos chat` is both an interactive REPL and a **one-shot headless agent** — the
-`claude -p "…"` / `codex exec` equivalent. It has file, search, and shell tools,
-so it reads code, runs `git diff`, and runs tests on its own; you just give it a
-task.
+Long tasks accumulate conversation, tool output, and intermediate results.
+Octos manages the model's context budget, compacts older material, and preserves
+recent tool-call/result relationships. Compaction can use LLM summarization or
+heuristics. Stable prompt prefixes support provider cache reuse, while changing
+task state remains part of the evolving conversation.
+
+- **Inspect:** `session/status/read` and `session/hydrate` expose the runtime's
+  context state when `context.lifecycle.v1` is negotiated, including compaction
+  metadata. These describe the context available to the model after processing.
+- **Control:** `session/compact` requests a compaction pass;
+  `session/compact/mode/set` selects the session's compaction mode.
+- **Observe:** `context/compaction_started` and `context/compaction_completed`
+  let an application explain when and how context changed during execution.
+
+A coding app can show context usage and compaction history; an agent controller
+can inspect that state before assigning the next stage of a long task.
+
+### Memory across tasks
+
+The memory layer provides long-term notes and entity pages, episodic task
+records, and retrieval. Its hybrid index combines keyword search with vector
+similarity when embeddings are available. An application can retain project
+conventions, decisions, and useful task outcomes across sessions.
+
+- **Inspect stored knowledge:** `memory/overview` and `memory/entity` expose
+  profile memory on WebSocket connections that advertise
+  `auxiliary.rest_to_ws.v1`. These methods are unavailable over stdio.
+- **Use memory during execution:** agents equipped with memory tools can
+  retrieve and update knowledge through tools such as `recall_memory` and
+  `save_memory`. Those are agent tools, not OUP RPC method names.
+- **Keep the roles distinct:** memory supplies reusable knowledge; session
+  history and event replay record what happened in a particular conversation.
+
+### Durable sessions and recovery
+
+Octos owns session identity, workspace scope, conversation history, and committed
+events. A client can reconstruct the runtime's view of a conversation after a
+reload, or build a different interface over the same stored session.
+
+- **Open and inspect:** `session/open` establishes the session and confirmed
+  workspace. `session/hydrate` restores messages, turns, pending approvals, and
+  other requested state; `turn/state/get` inspects a specific turn's lifecycle.
+- **Reconnect:** retain the last applied durable cursor and pass `after` when
+  reopening the session. The runtime replays retained committed events before
+  live delivery. Uncommitted deltas may be lost, and expired cursors require
+  fresh hydration; replay does not imply an active turn survived a disconnect.
+- **Branch or rewind:** `session/fork` creates a conversation branch, and
+  `session/rollback` rewinds conversation turns. Conversation rollback does not
+  undo filesystem changes.
+
+### Tools, permissions, and human input
+
+The kernel executes filesystem, shell, web, and MCP tools under the host's tool
+policy and platform sandbox configuration. Host-configured lifecycle hooks can
+participate around model calls and tool execution. OUP exposes execution and
+decision points so the application can provide its own approval interface or
+delegate authorized decisions to a controller.
+
+- **Discover and observe:** `tool/status/list` and `mcp/status/list` report
+  available integrations. `tool/started`, `tool/progress`, and `tool/completed`
+  expose tool execution to the client.
+- **Control permissions:** discover and select permission profiles through
+  `permission/profile/list` and `permission/profile/set`. For a pending change
+  proposal, `diff/preview/get` provides the canonical diff preview.
+- **Resolve a pending decision:** answer `approval/requested` with
+  `approval/respond`, or `user_question/requested` with `user_question/respond`,
+  using the originating request's identity and the host's authorization policy.
+
+This supports an application that shows a proposed edit, collects a decision,
+and resumes the waiting operation while preserving its connection to the turn.
+
+### Skills and extensions
+
+Skills package reusable instructions and executable capabilities. Plugins add
+manifest-declared tools and actions, with discovery and environment gating.
+These let a host give its agents domain-specific behavior while reusing the
+kernel's execution and supervision machinery.
+
+- **Manage the profile's skills:** use `profile/skills/list`,
+  `profile/skills/registry/search`, `profile/skills/install`, and
+  `profile/skills/remove`.
+- **Expose application actions:** `skill/action/list` discovers declared
+  actions; `skill/action/invoke` runs them. A host can present an action as a
+  button, an automation step, or a tool for another agent.
+- **Track background actions:** `skill/action/job/list` and
+  `skill/action/job/read` inspect persisted jobs;
+  `skill/action/job/updated` reports lifecycle changes when supported.
+
+### Workflows and task supervision
+
+The pipeline library represents multi-step work as DOT graphs, with per-node
+model selection, parallel branches, conditions, checkpoints, human gates, and
+artifact validation. A host can compose workflows through the Rust library, or
+let an agent launch a configured workflow through its tools. OUP exposes the
+resulting supervised tasks to the application.
+
+- **Follow execution:** `task/list`, `task/updated`, and `task/output/delta`
+  provide task state and live output. `task/output/read` retrieves recorded
+  output; `task/artifact/list` and `task/artifact/read` expose retained artifacts.
+- **Intervene and recover:** `task/cancel` stops a scoped active task.
+  `task/restart_from_node` relaunches a terminal task and returns a new task ID;
+  supported pipeline tasks can restart from a selected node.
+- **Use a built-in orchestration entry point:** when advertised, `review/start`
+  starts the runtime's supervised review workflow and reports progress through
+  the same turn, task, and agent surfaces.
+
+An application can present a workflow's progress, inspect a failed validation
+and its output, then request an appropriate retry and track the successor task.
+
+### Sub-agents and peers
+
+Octos supports several forms of concurrent work. A child agent handles a
+delegated task and returns its result to its parent. A peer owns an independent
+session that a client or controller can inspect and steer. A supervised
+background tool task can run without creating another LLM loop.
+
+- **Supervise delegated work:** `agent/list`, `agent/status/read`,
+  `agent/output/read`, and `agent/artifact/*` expose status, output, and
+  artifacts. This supervision surface also covers supported background tasks;
+  an entry does not necessarily represent a separate model conversation.
+- **Prepare independent peers:** `peer/prepare` stores a durable brief and can
+  create a separate Git worktree. Preparation stages resources; the controller
+  then uses `session/open` and `turn/start` to launch each peer's work.
+- **Coordinate and gather:** steer a peer through its ordinary turn controls,
+  and use `peer/gather` to read staged briefs and the latest results persisted
+  at peer turn termination. The controller decides how to combine those results.
+
+For example, a host can give implementation and review separate sessions and
+worktrees, point the reviewer at the implementation's changes, then collect
+their findings into a coordinating session.
+
+### Goals, loops, and monitors
+
+A goal records what the agent is working toward. A loop schedules recurring
+turns. A monitor watches a command's output and wakes an agent when matching
+events arrive. Together, these primitives support work that spans multiple
+turns, with state the application can inspect and control.
+
+- **Persist an objective:** `session/goal/set`, `session/goal/get`, and
+  `session/goal/clear` manage goal state. Goal records include status, token
+  budget, token usage, and elapsed usage time; `session/goal/updated` reports
+  changes.
+- **Schedule recurring work:** `loop/create`, `loop/list`, `loop/pause`,
+  `loop/resume`, `loop/fire_now`, and `loop/delete` manage recurring execution.
+  Loop events expose when runs fire and complete.
+- **React to external signals:** `monitor/create` configures a command, output
+  filter, and delivery limits. `monitor/list`, `monitor/pause`, `monitor/resume`,
+  and `monitor/delete` manage it; `monitor/fired` reports matching activity.
+
+A host might schedule periodic project checks or wake an agent when a monitored
+build emits an error. Its interface can show the objective, consumed budget,
+active schedules, and controls for pausing further work.
+
+### Model providers and routing
+
+The model layer provides provider adapters, configurable model choices, retry
+and fallback chains, and adaptive routing. The application can choose models
+for interactive work and configure separate provider lanes for workflow nodes.
+
+- **Configure providers:** `profile/llm/catalog`, `profile/llm/list`,
+  `profile/llm/upsert`, `profile/llm/test`, and `profile/llm/select` support
+  discovery, configuration, connection testing, and selection.
+- **Configure workflow lanes:** the advertised `profile/sub_providers/*`
+  methods manage named provider lanes for per-node routing. Changes take effect
+  when the corresponding runtime is rebuilt.
+- **Inspect routing:** `router/status` and `router/failover` expose routing
+  events; `router/get_metrics` and `router/set_mode` provide the advertised
+  metrics and control surface.
+
+### Putting the capabilities together
+
+A Codex, Claude Code, or custom-agent integration can build a review-and-fix
+controller around these primitives:
+
+1. Open a workspace-scoped session, discover capabilities, and set a concrete
+   objective and budget if goal support is available.
+2. Prepare peers for bounded implementation or investigation tasks, open their
+   sessions, and start their turns with explicit briefs.
+3. Follow tool and task events, resolve authorized approvals, and steer ongoing
+   work when new constraints arrive. The kernel manages context and executes
+   the configured tools and workflows within each session.
+4. Gather peer results, inspect task output and artifacts, then launch review or
+   verification work. Use that evidence to decide whether another turn is needed.
+5. Retain session identities and durable cursors so the interface can rehydrate
+   committed state when it reconnects.
+
+The host implements the coordination policy. Octos supplies the execution,
+state, and control primitives that make that policy observable through OUP.
+
+## Developer documentation
+
+- [OUP specification](api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md)
+- [OUP types and codecs](crates/octos-core/src/ui_protocol.rs)
+- [Runtime architecture](docs/ARCHITECTURE.md)
+- [Harness developer interface](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
+- [Artifact and workflow integration guide](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
+- [Harness compatibility and versioning](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
+- [Documentation site](https://octos-org.github.io/octos/)
+
+## Contributing
+
+Run the checks appropriate to the crates you change. The workspace checks are:
 
 ```bash
-octos chat                             # interactive REPL
-octos chat "explain crates/octos-agent/src/agent.rs"   # one-shot: run one turn, exit
-octos chat -m "…" --json               # one-shot, machine-readable result on stdout
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-### Modes: interactive, one-shot, JSON
-
-| Invocation | Behavior |
-| --- | --- |
-| `octos chat` | interactive REPL (multi-turn) |
-| `octos chat "PROMPT"` **or** `octos chat -m "PROMPT"` | one-shot: run a single turn and exit (`claude -p` parity) |
-| `octos chat -m "PROMPT" --json` | one-shot, one JSON result object on **stdout** (logs/UI → stderr) |
-
-Rules: give the prompt **positionally OR** via `-m`/`--message`, never both (that's
-an error — the positional prompt is otherwise folded into `--message`). `--json`
-needs a **one-shot prompt** (positional *or* `-m`); only **interactive** `--json`
-(no prompt at all) is rejected, since a REPL can't keep stdout clean. On any error
-`--json` still prints `{"error":"…"}` on stdout and exits non-zero, so stdout stays
-machine-parseable.
-
-### Scripting: the JSON result & exit codes
-
-In `--json` mode stdout carries exactly one object (everything else — logs, the
-status line, approval prompts — goes to stderr). On success:
-
-```json
-{ "text": "…final answer…", "model": "glm-5.3", "input_tokens": 1234, "output_tokens": 567 }
-```
-
-`text` is the final assistant answer; `model` is the model that actually
-produced it (honest about adaptive failover to a fallback lane); the token
-counts cover the whole turn. On any failure the object is `{"error":"…"}`
-instead, so stdout is always parseable:
-
-```bash
-out=$(octos chat --profile dev -m "summarize the branch diff" --json)
-echo "$out" | jq -r '.text'           # the answer
-echo "$out" | jq -r '.output_tokens'  # token usage, e.g. for cost tracking
-```
-
-| Exit | Meaning |
-| --- | --- |
-| `0` | success |
-| `2` | usage error — unknown / conflicting flags, `--json` without `-m`, or the prompt given both positionally and via `-m` |
-| `1` | runtime error (auth / provider / agent). In `--json` mode `{"error":…}` is still written to stdout first, so a caller can read the reason |
-
-### Sandbox × approval — every combination
-
-Two orthogonal axes set what the agent may do unattended: **`--sandbox`**
-(filesystem/network reach) and **`--ask-for-approval`** (whether risky commands
-pause). `--yolo` is a shortcut for the most permissive corner. What each
-combination resolves to:
-
-| `--sandbox` | `--ask-for-approval` | Resolves to | The agent can… |
-| --- | --- | --- | --- |
-| *(omitted)* | *(omitted)* | **workspace-write + ask** — the default | read + write inside `--cwd`; pause for approval on risky commands |
-| `read-only` | *(omitted → `ask`)* | read-only + ask | read + read-only commands (`git diff`, `grep`); write/edit tools fail |
-| `read-only` | `never` | read-only + never | **unattended review** — reads only, never pauses |
-| `workspace-write` | *(omitted → `ask`)* | workspace-write + ask | edit inside `--cwd`, pause on risky |
-| `workspace-write` | `never` | workspace-write + never | **unattended edits** inside `--cwd` |
-| `danger-full-access` | *(forced `never`)* | full access, no prompts | host filesystem + network, no approvals |
-| `--yolo` | — | = `danger-full-access` + `never` | **full autonomy** (the shortcut) |
-
-**Contradictions are rejected — the command errors, it doesn't silently pick one:**
-- `--yolo` (or `--sandbox danger-full-access`) **+** `--ask-for-approval ask` — danger-full-access never asks.
-- `--yolo` **+** `--sandbox read-only`/`workspace-write` — `--yolo` *is* danger-full-access.
-
-`--ask-for-approval never` fails a risky command **closed** at the tool boundary
-(there's no interactive approver in a headless run) rather than prompting.
-Guardrails that stay on even under `danger-full-access`/`--yolo`:
-`before_tool_call` hooks, `ToolPolicy` deny-lists, SSRF protection,
-`BLOCKED_ENV_VARS`.
-
-### Reuse an existing profile (model + API key)
-
-`--profile <id>` reads a stored serve/onboarding profile
-(`~/.octos/profiles/<id>.json`, created by `octos serve` or octoscode) and
-reuses its provider, model, route, and API key — so you don't re-enter them:
-
-```bash
-octos chat --profile dev --yolo "refactor this module"   # uses dev's model + key
-```
-
-Precedence: `--config` > `--profile <id>` > ambient `config.json`.
-`--provider` / `--model` / `--base-url` / `--api-type` each override their own
-field on top. Naming a **different** `--provider` than the profile's does a
-**clean switch** — it detaches the profile's route (base-url, key-env, wire
-protocol) so the new provider's own defaults apply, rather than reusing the old
-provider's key against the new one; add `--model` too, since the profile's model
-won't fit the new provider. Re-naming the *same* provider keeps the route.
-
-### Code review
-
-The agent reads the code and returns its findings as its final answer on
-**stdout** — capture it with your shell. (Stdout is outside the sandbox, so a
-`read-only` reviewer, which cannot touch the repo, can still "produce a file".)
-
-```bash
-octos chat --profile dev --cwd ~/repo \
-  --sandbox read-only --ask-for-approval never --effort high \
-  -m "Review the diff of this branch against main. For each issue give file:line,
-      severity, and a concrete failure scenario. Rank most-severe first." \
-  > review.md
-```
-
-If you want the **agent itself** to write files (not shell capture), use
-`--sandbox workspace-write` and tell it to write them — `read-only` blocks the
-write. `workspace-write` lets it write anywhere under `--cwd`, so for a contained
-run point it at a fresh `git worktree` and inspect the diff afterward.
-
-### Run many agents in parallel on one profile
-
-Add `--no-session-persistence` and point N agents at one `--data-dir` (hence one
-shared `--profile`); they run concurrently — the ephemeral flag drops the
-exclusive episode-store lock that would otherwise serialize them.
-
-```bash
-# Review fan-out — one repo, many lenses, each writes its own report
-for lens in correctness security performance; do
-  octos chat --profile dev --cwd ~/repo \
-    --sandbox read-only --ask-for-approval never --no-session-persistence \
-    -m "Review only for $lens. Write findings to REVIEW-$lens.md." &
-done; wait
-
-# Edit fan-out — one agent per folder, each changes its own tree
-for d in svc-a svc-b svc-c; do
-  octos chat --profile dev --cwd ~/work/$d \
-    --sandbox workspace-write --ask-for-approval never --no-session-persistence \
-    -m "Implement the TODOs in this folder." &
-done; wait
-```
-
-Without `--no-session-persistence`, a second `octos chat` on the same
-`--data-dir` fails with `Database already open` — that flag is what makes the
-fan-out non-blocking.
-
-### Full flag reference
-
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `PROMPT` *(positional)* / `-m`, `--message <s>` | — | one-shot prompt (two spellings of the same thing; supplying both errors) |
-| `--json` | off | one JSON result object on stdout; needs a one-shot prompt (positional or `-m`) — only interactive `--json` is rejected |
-| `--sandbox <mode>` | `workspace-write` | `read-only` \| `workspace-write` \| `danger-full-access` (see the matrix above) |
-| `--ask-for-approval <mode>` | `ask` | `ask` \| `never` (danger-full-access is always `never`) |
-| `--yolo` | off | shortcut for `--sandbox danger-full-access` (approvals never). Alias of `--dangerously-bypass-approvals-and-sandbox`. **Local single-user boxes only.** |
-| `--profile <id>` | `coding` | runtime **tool surface** (`coding` = files/shell/search/memory/spawn; `coding-full` adds web/pipelines/skills; or a user id). If `<id>` names a stored serve/tui profile, also reuses its **model + API key**. |
-| `--provider <name>` | from config/profile | LLM provider override |
-| `--model <id>` | from config/profile | model override |
-| `--base-url <url>` | from config/profile | custom API endpoint |
-| `--api-type <t>` | from config/profile | wire protocol for `--base-url`: `anthropic` \| `openai` \| `responses` (alias `--api-style`) |
-| `--config <path>` | — | explicit flat config file — **wins over** `--profile` |
-| `--cwd <dir>` | current dir | workspace root the agent reads/writes |
-| `--data-dir <dir>` | `$OCTOS_HOME` / `~/.octos` | episodes / memory / sessions store |
-| `--effort <e>` | provider default | `none` \| `low` \| `medium` \| `high` \| `max` (`none` disables reasoning where supported) |
-| `--no-session-persistence` | off | ephemeral run (no episode saved); also **enables parallel agents** on one `--data-dir` |
-| `--max-iterations <n>` | `20` | per-turn tool-call cap |
-| `--no-retry` | off | disable automatic retry on transient LLM errors |
-| `-v`, `--verbose` | off | show tool outputs |
-
-**Model/credential precedence:** `--config` > `--profile <id>` > ambient
-`config.json`; `--provider` / `--model` / `--base-url` / `--api-type` override
-whichever of those supplied them. **Prerequisite:** a configured provider
-(`octos auth login`, or the provider's API-key env var) **or** a `--profile` that
-already carries one.
-
-## Autonomy: goals & loops
-
-Beyond a single turn, octos can keep working on its own — between your messages,
-or on a schedule. Both are driven by slash commands in any client (octos-web,
-octoscode) or channel session, and run on `octos serve` / `octos gateway`.
-
-### Goals — keep going until it's done
-
-`/goal <objective>` gives the agent a standing objective. After each turn it
-checkpoints a **continuation** and re-fires itself to keep making progress across
-turns — without you prompting again — until the objective is met or its budget
-runs out.
-
-```text
-/goal build a REST API for the todo app, with tests   # start a goal
-/goal <objective> --budget 5000000                    # cap it (default 2,000,000 tokens)
-/goal stop                                            # end the goal
-/goal resume                                          # re-activate a stopped goal
-```
-
-Each goal carries a **token budget** (default **2M**). When it's exhausted the
-goal moves to `budget_limited`, wraps up the current state, and tells you how to
-resume — reply `/goal <objective> --budget <N>` with a higher `N`, or `/goal
-stop`. Continuations are rate-limited (≥30s apart, ≤12/hour) so a goal can't spin.
-
-### Loops — run on a cadence
-
-`/loop <prompt>` runs a recurring task. Give it an interval (`s`/`m`/`h`/`d`) for
-a **fixed-interval** loop, or omit one for a **self-paced** loop where the agent
-decides when to wake itself next:
-
-```text
-/loop 30m check CI and triage new failures        # fixed interval (leading)
-/loop summarize unread email every 1h             # fixed interval (trailing)
-/loop watch the deploy and report when it's green  # self-paced (no interval)
-/loop resume <id>                                 # resume a paused loop
-```
-
-Loops persist across restarts (parked as paused on a solo reboot; you resume
-them explicitly), and can be paused, listed, fired now, or deleted.
-
-## Agent topologies: sub-agents, peers & swarm
-
-A single `octos chat` or session runs one agent. When work needs *several*
-agents, octos offers three relationships — they differ by **who owns whom** and
-**how results come back**:
-
-| | **Sub-agents** | **Peer agents** | **Agent swarm** |
-| --- | --- | --- | --- |
-| Relationship | hierarchical — a parent **owns** its children | lateral — **sovereign** sibling sessions | a dispatcher fans **contracts** to N workers |
-| Started by | the `spawn_agent` tool, mid-turn | `peer_handoff` stages one; the **client** opens it | `Swarm::dispatch` / `POST /api/swarm/dispatch` |
-| Live where | in-process children of the caller | independent sessions (own history, own client tab) | wherever the backend runs |
-| Results | returned to the parent (final answer only; internals stay private) | fan-in via `peer_gather` over a shared blackboard | aggregated, validator-gated, cost rolled up |
-| Workers | native octos agents | native octos sessions | native **or external CLI/MCP** agents |
-
-### Sub-agents — delegation you own
-
-A running agent calls **`spawn_agent`** (or its MCP-backed `delegate` variant)
-to hand a scoped task to a child that runs **in the same process**. The parent
-supervises the whole tree: status and token cost surface upward, cancelling the
-parent cascade-fails its live children, and each child runs in its own sandbox.
-A child's internal messages never leak back — only its final result. Spawns nest
-(bounded by a max depth). The tools sit in the default `coding` tool surface, so
-any agent with that profile can delegate; background (`spawn_only`) children run
-detached and report when done.
-
-### Peer agents — sovereign siblings
-
-Sometimes you want a *second, equal* session rather than a child — its own tab
-with its own history that a human can watch and steer. Sessions are coupled to a
-client connection, so the model can't open one itself: **`peer_handoff`** instead
-*stages* a peer server-side (a durable brief ≤ 64 KB, optionally fenced in its
-own git worktree) and the host asks your **client** to open it in the background.
-The originating agent later pulls results back with **`peer_gather`** — a shared
-blackboard where handoff fans out and gather fans in. Guardrails live at the
-serve layer: peer sessions can't themselves hand off (depth-1) and a per-turn
-handoff cap applies. This path is **opt-in** and exists only on the
-`serve`/WebSocket turn path (a client that can open sessions) — not `chat`,
-`gateway`, or ACP.
-
-### Agent swarm — a dispatcher over N workers
-
-For fan-out at scale, **`octos-swarm`** runs the PM/supervisor pattern as a
-primitive: a supervisor writes a **contract**, `Swarm::dispatch` fans it into N
-sub-contracts across a **topology** — `Parallel` (bounded concurrency),
-`Sequential` (one-at-a-time, aborts on the first terminal failure, crash/resume
-aware), `Pipeline` (output of *i* feeds *i+1*), or `Fanout` (expand a typed
-pattern, then run it parallel) — aggregates the artifacts, gates the aggregate
-through a **validator**, and rolls up cost in an idempotent redb **ledger**
-(re-dispatching the same id returns the stored result verbatim). Reachable at
-`POST /api/swarm/dispatch`. A swarm worker need **not** be a native octos agent:
-with **`--swarm-backend`**, contracts dispatch to *external* agents — an MCP
-server, or a one-shot CLI like `claude -p` / `codex exec` (`CliAgentBackend`).
-
-### "External agent" points two ways
-
-The term is directional — check who is calling whom:
-
-- **Inbound** — an outside orchestrator drives octos: a Zed/ACP client, or any
-  MCP client via `octos mcp-serve`. Octos is the *callee* (a sub-agent to someone
-  else).
-- **Outbound** — octos drives an outside agent as a **swarm worker** via
-  `--swarm-backend`. Octos is the *caller*.
-
-Same phrase, opposite arrows.
-
-## Documentation
-
-📖 **[Full Documentation](https://octos-org.github.io/octos/)** — installation, configuration, channels, providers, memory, skills, advanced features, and more.
-
-**Quick links:**
-- [Installation & Deployment](https://octos-org.github.io/octos/installation.html)
-- [Configuration](https://octos-org.github.io/octos/configuration.html)
-- [LLM Providers & Routing](https://octos-org.github.io/octos/providers.html)
-- [Gateway & Channels](https://octos-org.github.io/octos/channels.html)
-- [Memory & Skills](https://octos-org.github.io/octos/memory-skills.html)
-- [Advanced Features](https://octos-org.github.io/octos/advanced.html) (queue modes, hooks, sandbox, tools)
-- [CLI Reference](https://octos-org.github.io/octos/cli-reference.html)
-- [Skill Development](https://octos-org.github.io/octos/skill-development.html)
-
-**中文:** [中文 README](README-zh.md) | [用户指南](https://octos-org.github.io/octos/zh/) (doc site)
-
-## Architecture
-
-12 `octos-*` crates + 13 app-skill crates + 1 platform-skill crate (26 workspace members total). The runtime auto-installs only the 8 entries in `BUNDLED_APP_SKILLS` plus the `voice` platform-skill — see `crates/octos-agent/src/bundled_app_skills.rs`.
-
-```
-octos-cli   (CLI entrypoint, REST API server, dashboard, config watcher, wizard)
-   │
-octos-agent (agent loop, tool registry, MCP, hooks, three-tier compaction,
-             profile system, sub-agent output router, task supervisor)
-   │
-   ├─ octos-bus       (14 channels, sessions w/ sticky thread_id, coalescing, cron)
-   ├─ octos-llm       (15 providers, AdaptiveRouter → ProviderChain → RetryProvider)
-   ├─ octos-memory    (long-term + episodic + HNSW vector + BM25 hybrid search)
-   ├─ octos-pipeline  (DOT-graph workflows, per-node model, bounded fan-out)
-   ├─ octos-plugin    (skill manifest, discovery, gating, lifecycle, protocol v2)
-   ├─ octos-sandbox   (platform sandbox helper binary — bwrap/Landlock/seccomp)
-   ├─ octos-swarm     (PM/swarm dispatcher, ledger, topology, validator gate)
-   ├─ octos-diagnostics (shared doctor diagnostics + update planning)
-   ├─ octos-dora-mcp  (compat re-export of the dora bridge in octos-agent)
-   └─ octos-core      (Task, Message, Error types — no internal deps)
-
-Runtime view:
-  octos serve (control plane + dashboard, 80+ REST endpoints + UI Protocol WS)
-    ├── Profile A → gateway process (Telegram, WhatsApp)
-    ├── Profile B → gateway process (Feishu, Slack, Matrix)
-    └── Profile C → gateway process (CLI)
-         │
-         ├── LLM Provider (Anthropic, OpenAI, Gemini, DeepSeek, Moonshot, …)
-         │   └── AdaptiveRouter → ProviderChain → RetryProvider
-         ├── Tool Registry (~50 built-in + plugins + 8 app-skills)
-         │   └── Full enabled set emitted per turn (profiles narrow it)
-         ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
-         ├── Swarm Dispatcher (fan-out → aggregate → validator gate → cost rollup)
-         ├── Sandbox (bwrap / Landlock+seccomp / sandbox-exec / Docker / AppContainer)
-         ├── Session Store (JSONL, LRU cache, three-tier compaction, thread_id)
-         ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
-         └── Skills (bundled + installable from octos-hub)
-```
+Protocol changes must keep the specification, Rust types, runtime dispatch,
+capability advertisement, and client behavior aligned.
 
 ## License
 
-See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

@@ -205,11 +205,13 @@ mod serve_broken_pipe {
             std::time::Duration::from_secs(10),
         );
         assert!(banner, "startup banner never arrived on the stdout pipe");
-        // …but the banner is printed BEFORE axum::serve runs, and tokio's
-        // ctrl_c() handler is only registered once the graceful-shutdown
-        // future is polled inside axum::serve. A settle wait lets that
-        // happen; without it an early SIGINT hits the default disposition
-        // and kills the process (observed: signal=Some(2)).
+        // …but the banner is printed BEFORE axum::serve runs. Before #2086
+        // tokio's ctrl_c() handler was only registered once the
+        // graceful-shutdown future was polled inside axum::serve, so an
+        // early SIGINT could hit the default disposition and kill the
+        // process (observed: signal=Some(2)); serve now installs its
+        // stop-signal watcher before gateway auto-start, and the settle
+        // wait stays as defense-in-depth for the watcher task's first poll.
         // #37 — settle was a fixed 1500ms sleep; on a fast runner that is
         // wasted time and on a slow CI runner it may STILL be too early for
         // the ctrl_c handler registration. Poll the stdout pipe for the
