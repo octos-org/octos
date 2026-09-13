@@ -1117,17 +1117,22 @@ fn spawn_pipeline_heartbeat(
 }
 
 /// Resolve an LLM provider from a model key using an optional router.
+///
+/// `node` names the pipeline node the key came from so the fallback warn
+/// pins WHICH node has the router gap (#1901 Layer 4) instead of leaving
+/// the operator to correlate the bare model key against the graph by hand.
 fn resolve_provider(
     default: &Arc<dyn LlmProvider>,
     router: Option<&Arc<ProviderRouter>>,
     model_key: Option<&str>,
+    node: &str,
 ) -> Result<Arc<dyn LlmProvider>> {
     match (model_key, router) {
         // A missing/unknown model key must degrade to the default provider,
-        // matching CodergenHandler::resolve_provider (handler.rs) — the
-        // model-assignment pass may rewrite lane keys (e.g. `strong`) to
-        // catalog models this profile's router never registered, and that
-        // must not fail the whole pipeline.
+        // matching CodergenHandler::resolve_provider (handler.rs) — an
+        // explicit `model=` the router never registered (e.g. a stale
+        // catalog or a hand-written lane key on a narrower profile) must
+        // not fail the whole pipeline.
         (Some(key), Some(r)) => match r.resolve(key) {
             Ok(provider) => Ok(provider),
             // Keep the router's error: it names the keys that ARE registered
@@ -1136,6 +1141,7 @@ fn resolve_provider(
             // but not what would have worked.
             Err(err) => {
                 warn!(
+                    node,
                     model = key,
                     %err,
                     "pipeline model not in provider router; using default provider"
@@ -1145,6 +1151,7 @@ fn resolve_provider(
         },
         (Some(key), None) => {
             warn!(
+                node,
                 model = key,
                 "model override but no provider router; using default"
             );
@@ -1805,7 +1812,11 @@ impl PipelineExecutor {
             .catalog_dir
             .as_deref()
             .unwrap_or(&self.config.working_dir);
-        crate::model_assignment::assign_from_catalog_dir(&mut graph, catalog_dir);
+        crate::model_assignment::assign_from_catalog_dir(
+            &mut graph,
+            catalog_dir,
+            self.config.provider_router.as_deref(),
+        );
 
         // ── Pipeline start: log graph structure ──
         let node_summary: Vec<String> = graph
@@ -3161,6 +3172,7 @@ impl PipelineExecutor {
                         .as_deref()
                         .or(node.model.as_deref())
                         .or(graph.default_model.as_deref()),
+                    &node.id,
                 )?;
                 let planner_provider: Arc<dyn LlmProvider> = Arc::new(
                     SemaphoreThrottledProvider::new(planner_provider, llm_semaphore.clone()),
