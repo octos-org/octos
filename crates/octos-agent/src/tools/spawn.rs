@@ -1815,28 +1815,23 @@ impl SpawnTool {
 }
 
 /// Upper bound for a spawn's `max_iterations` override. A repo-scale review or
-/// deep research legitimately needs well over the interactive default 50
-/// one-tool-call-at-a-time steps, but an unbounded value is a runaway-loop /
-/// cost footgun, so the caller-supplied value is clamped to this ceiling.
+/// deep research legitimately needs many one-tool-call-at-a-time steps, but an
+/// unattended worker still needs a finite runaway backstop, so the
+/// caller-supplied value is clamped to this ceiling.
 const MAX_SPAWN_MAX_ITERATIONS: u32 = 300;
 
 /// Default iteration budget for a spawned sub-agent when the caller does not set
-/// `max_iterations`. The bare `AgentConfig` default (50) is tuned for a snappy
+/// `max_iterations`. The bare `AgentConfig` default (`0`) is unlimited for a
 /// *interactive* turn; a background sub-agent does bounded-but-substantive work
 /// (a from-scratch repo review runs ~100–150 one-tool-call-at-a-time steps), so
-/// blindly inheriting 50 starved real work (agents capped on their first
-/// exploration pass, producing nothing). The token budget and loop detection
-/// remain the real runaway guards; the iteration cap is a secondary backstop, so
-/// a more generous spawn default trades a little worst-case runaway headroom for
-/// first-try success on the common substantive-task case. Callers can still
-/// raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it explicitly.
-const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
+/// the historical 50-call default starved real work (agents capped on their
+/// first exploration pass, producing nothing). The token budget and loop
+/// detection remain the primary runaway guards; this cap is a secondary
+/// backstop. Callers can raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it
+/// explicitly.
+pub(crate) const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
 
-/// The whole point of the constant above is that it exceeds the interactive
-/// default of 50 (`AgentConfig::max_iterations`). Asserted at compile time:
-/// both sides are consts, so a runtime `assert!` in a test is really a
-/// `clippy::assertions_on_constants` — and this way an edit that breaks the
-/// invariant fails the build instead of a test run.
+/// Keep enough headroom for repo-scale review while remaining finite.
 const _: () = assert!(DEFAULT_SPAWN_MAX_ITERATIONS > 50);
 
 /// Resolve the effective iteration budget for a spawn: a caller-supplied value

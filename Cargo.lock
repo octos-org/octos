@@ -4531,7 +4531,7 @@ dependencies = [
 
 [[package]]
 name = "octos-agent"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
  "base64",
@@ -4592,7 +4592,7 @@ dependencies = [
 
 [[package]]
 name = "octos-bus"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "aes",
  "async-imap",
@@ -4628,13 +4628,14 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
 ]
 
 [[package]]
 name = "octos-cli"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "agent-client-protocol",
  "argon2",
@@ -4708,6 +4709,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-appender",
+ "tracing-core",
  "tracing-subscriber",
  "url",
  "uuid",
@@ -4717,7 +4719,7 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "chrono",
  "eyre",
@@ -4732,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "octos-diagnostics"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "eyre",
  "octos-core",
@@ -4744,14 +4746,14 @@ dependencies = [
 
 [[package]]
 name = "octos-dora-mcp"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "octos-agent",
 ]
 
 [[package]]
 name = "octos-embed-llama"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
  "eyre",
@@ -4765,8 +4767,10 @@ dependencies = [
 
 [[package]]
 name = "octos-ffi"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
+ "async-trait",
+ "eyre",
  "libc",
  "octos-agent",
  "octos-cli",
@@ -4781,7 +4785,7 @@ dependencies = [
 
 [[package]]
 name = "octos-fleet"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "eyre",
  "octos-core",
@@ -4797,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "octos-fleet-worker"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
  "eyre",
@@ -4814,7 +4818,7 @@ dependencies = [
 
 [[package]]
 name = "octos-llm"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
  "base64",
@@ -4829,6 +4833,7 @@ dependencies = [
  "secrecy 0.10.3",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-test",
@@ -4838,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "octos-memory"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "bincode",
  "chrono",
@@ -4858,7 +4863,7 @@ dependencies = [
 
 [[package]]
 name = "octos-pipeline"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4882,7 +4887,7 @@ dependencies = [
 
 [[package]]
 name = "octos-plugin"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "eyre",
  "metrics",
@@ -4898,7 +4903,7 @@ dependencies = [
 
 [[package]]
 name = "octos-pyo3"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "octos-ffi",
  "pyo3",
@@ -4919,7 +4924,7 @@ dependencies = [
 
 [[package]]
 name = "octos-server"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -4956,8 +4961,9 @@ dependencies = [
 
 [[package]]
 name = "octos-services"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
+ "async-trait",
  "chrono",
  "dirs",
  "eyre",
@@ -4977,7 +4983,7 @@ dependencies = [
 
 [[package]]
 name = "octos-store"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "base64",
  "chrono",
@@ -4997,7 +5003,7 @@ dependencies = [
 
 [[package]]
 name = "octos-swarm"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5017,7 +5023,7 @@ dependencies = [
 
 [[package]]
 name = "octos-uniffi"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "octos-ffi",
  "uniffi",
@@ -5025,7 +5031,7 @@ dependencies = [
 
 [[package]]
 name = "octos-wasm"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -5041,7 +5047,7 @@ dependencies = [
 
 [[package]]
 name = "octos-workflows"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "chrono",
  "eyre",
@@ -8497,7 +8503,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-bridge"
-version = "2.0.3-rc.10"
+version = "2.0.3-rc.11"
 dependencies = [
  "clap",
  "futures-util",

@@ -14,6 +14,9 @@ use serde::Deserialize;
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::cache_manifest::{
+    PromptCacheInputManifest, prompt_cache_features_enabled, without_cache_markers,
+};
 use crate::config::ChatConfig;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::types::ProviderMetadata;
@@ -29,6 +32,9 @@ pub struct OpenAIResponsesProvider {
     api_key: SecretString,
     model: String,
     base_url: String,
+    /// Only official OpenAI Responses endpoints receive reserved prompt-cache
+    /// request fields by default. Compatibility endpoints must opt in.
+    prompt_cache_affinity: bool,
 }
 
 impl OpenAIResponsesProvider {
@@ -44,11 +50,22 @@ impl OpenAIResponsesProvider {
             api_key: SecretString::from(api_key.into()),
             model: model.into(),
             base_url: "https://api.openai.com/v1".to_string(),
+            prompt_cache_affinity: true,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        let base_url = base_url.into();
+        self.prompt_cache_affinity = base_url.trim_end_matches('/') == "https://api.openai.com/v1";
+        self.base_url = base_url;
+        self
+    }
+
+    /// Explicit override for an endpoint known to implement the OpenAI
+    /// Responses `prompt_cache_key` contract. Custom endpoints stay opt-out
+    /// unless their route configuration deliberately enables it.
+    pub fn with_prompt_cache_affinity(mut self, enabled: bool) -> Self {
+        self.prompt_cache_affinity = enabled;
         self
     }
 
@@ -56,6 +73,17 @@ impl OpenAIResponsesProvider {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
         self.stream_client = crate::provider::build_streaming_http_client(connect_timeout_secs);
         self
+    }
+
+    /// Lane-attributed wording for operational failures (see
+    /// [`crate::provider::operational_error_message`]).
+    fn operational_message(&self, stage: crate::provider::OperationalStage) -> String {
+        crate::provider::operational_error_message(
+            stage,
+            self.provider_name(),
+            &self.model,
+            crate::provider::ApiStyle::OpenAiResponses,
+        )
     }
 
     fn build_request(
@@ -75,6 +103,13 @@ impl OpenAIResponsesProvider {
             body["max_output_tokens"] = max.into();
         }
 
+        if self.prompt_cache_affinity
+            && prompt_cache_features_enabled()
+            && let Some(cache) = config.prompt_cache_context.as_ref()
+        {
+            body["prompt_cache_key"] = cache.affinity_key.clone().into();
+        }
+
         if !tools.is_empty() {
             let api_tools: Vec<serde_json::Value> = tools
                 .iter()
@@ -88,6 +123,9 @@ impl OpenAIResponsesProvider {
                 })
                 .collect();
             body["tools"] = serde_json::Value::Array(api_tools);
+        }
+        if let Some(tool_choice) = config.tool_choice.openai_responses_wire(!tools.is_empty()) {
+            body["tool_choice"] = tool_choice;
         }
 
         // Reasoning effort maps to the reasoning object
@@ -107,6 +145,62 @@ impl OpenAIResponsesProvider {
 
         body
     }
+
+    fn prompt_cache_input_manifest(
+        &self,
+        request: &serde_json::Value,
+        config: &ChatConfig,
+    ) -> PromptCacheInputManifest {
+        let normalized = without_cache_markers(request.clone());
+        let mut stable = Vec::new();
+        let mut conversation = Vec::new();
+        if let Some(input) = normalized
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+        {
+            for (index, item) in input.iter().enumerate() {
+                let kind = item
+                    .get("role")
+                    .or_else(|| item.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let segment = (format!("input:{index}:{kind}"), item.clone());
+                if kind == "system" || kind == "developer" {
+                    stable.push(segment);
+                } else {
+                    conversation.push(segment);
+                }
+            }
+        }
+        if let Some(tools) = normalized
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+        {
+            stable.extend(
+                tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| (format!("tool:{index}"), tool.clone())),
+            );
+        }
+        let metadata = self.provider_metadata();
+        PromptCacheInputManifest::from_normalized_segments(
+            metadata.provider,
+            metadata.model,
+            config
+                .prompt_cache_context
+                .as_ref()
+                .map(|context| context.epoch_id.as_str()),
+            stable,
+            conversation,
+        )
+    }
+
+    fn trace_prompt_cache_input(&self, request: &serde_json::Value, config: &ChatConfig) {
+        if tracing::enabled!(target: "octos.prompt_cache", tracing::Level::TRACE) {
+            self.prompt_cache_input_manifest(request, config).trace();
+        }
+    }
 }
 
 #[async_trait]
@@ -118,6 +212,7 @@ impl LlmProvider for OpenAIResponsesProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         let body = self.build_request(messages, tools, config);
+        self.trace_prompt_cache_input(&body, config);
 
         let response = self
             .client
@@ -130,7 +225,14 @@ impl LlmProvider for OpenAIResponsesProvider {
             .json(&body)
             .send()
             .await
-            .wrap_err("failed to send request to OpenAI Responses API")?;
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    false,
+                    self.provider_name(),
+                    &self.model,
+                    crate::provider::ApiStyle::OpenAiResponses,
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -139,15 +241,15 @@ impl LlmProvider for OpenAIResponsesProvider {
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                format!("openai-responses/{}", self.model),
+                format!("{}/{}", self.provider_name(), self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::OpenAiResponses)
             .into());
         }
 
-        let api_response: ResponsesApiResponse = response
-            .json()
-            .await
-            .wrap_err("failed to parse OpenAI Responses API response")?;
+        let api_response: ResponsesApiResponse = response.json().await.wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::ParseResponse)
+        })?;
 
         Ok(parse_responses_api(api_response))
     }
@@ -160,6 +262,7 @@ impl LlmProvider for OpenAIResponsesProvider {
     ) -> Result<ChatStream> {
         let mut body = self.build_request(messages, tools, config);
         body["stream"] = true.into();
+        self.trace_prompt_cache_input(&body, config);
 
         // Stream client: no total timeout, so a long healthy generation is not
         // cut off. Stalls are bounded by the client's per-read timeout and the
@@ -175,7 +278,14 @@ impl LlmProvider for OpenAIResponsesProvider {
             .json(&body)
             .send()
             .await
-            .wrap_err("failed to send streaming request to OpenAI Responses API")?;
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    true,
+                    self.provider_name(),
+                    &self.model,
+                    crate::provider::ApiStyle::OpenAiResponses,
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -184,8 +294,9 @@ impl LlmProvider for OpenAIResponsesProvider {
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                format!("openai-responses/{}", self.model),
+                format!("{}/{}", self.provider_name(), self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::OpenAiResponses)
             .into());
         }
 
@@ -207,6 +318,10 @@ impl LlmProvider for OpenAIResponsesProvider {
 
     fn provider_name(&self) -> &str {
         "openai"
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        Some(crate::provider::ApiStyle::OpenAiResponses)
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
@@ -392,8 +507,19 @@ struct ResponsesUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Automatic prompt-cache breakdown. `cached_tokens` counts the portion
+    /// of `input_tokens` served from OpenAI's cache (INCLUDED in
+    /// `input_tokens`, unlike Anthropic's disjoint accounting).
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
     #[serde(default)]
     output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -469,9 +595,20 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
         }
     };
 
+    // The Responses API reports cached tokens INSIDE input_tokens; the
+    // TokenUsage contract is disjoint (Anthropic-style: total prompt =
+    // input + cache_read), so subtract at the boundary — the same
+    // normalization the chat-completions parser applies.
+    let cached = resp
+        .usage
+        .input_tokens_details
+        .as_ref()
+        .map(|d| d.cached_tokens)
+        .unwrap_or(0);
     let reasoning_tokens = resp
         .usage
         .output_tokens_details
+        .as_ref()
         .map(|d| d.reasoning_tokens)
         .unwrap_or(0);
 
@@ -481,9 +618,10 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
         tool_calls,
         stop_reason,
         usage: TokenUsage {
-            input_tokens: resp.usage.input_tokens,
+            input_tokens: resp.usage.input_tokens.saturating_sub(cached),
             output_tokens: resp.usage.output_tokens,
             reasoning_tokens,
+            cache_read_tokens: cached,
             ..Default::default()
         },
         provider_index: None,
@@ -574,6 +712,12 @@ fn map_responses_sse(
             let usage = &data["response"]["usage"];
             let input = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
             let output = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+            // Cached tokens are reported INSIDE input_tokens; normalize to
+            // the disjoint TokenUsage contract (total = input + cache_read),
+            // same as the non-streaming parse.
+            let cached = usage["input_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32;
             let reasoning = usage["output_tokens_details"]["reasoning_tokens"]
                 .as_u64()
                 .unwrap_or(0) as u32;
@@ -592,9 +736,10 @@ fn map_responses_sse(
 
             vec![
                 StreamEvent::Usage(TokenUsage {
-                    input_tokens: input,
+                    input_tokens: input.saturating_sub(cached),
                     output_tokens: output,
                     reasoning_tokens: reasoning,
+                    cache_read_tokens: cached,
                     ..Default::default()
                 }),
                 StreamEvent::Done(stop_reason),
@@ -638,6 +783,7 @@ pub fn is_responses_capable(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PromptCacheContext;
     use octos_core::{Message, MessageRole};
 
     fn msg(role: MessageRole, content: &str) -> Message {
@@ -765,6 +911,141 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_key_is_capability_gated_to_official_responses_endpoint() {
+        let config = ChatConfig {
+            prompt_cache_context: Some(PromptCacheContext {
+                affinity_key: "octos-stable-affinity".into(),
+                epoch_id: "epoch-1".into(),
+                stable_prefix_hash: "stable-1".into(),
+                semantic_boundaries: vec![],
+            }),
+            ..Default::default()
+        };
+        let messages = vec![msg(MessageRole::User, "hello")];
+
+        let official = OpenAIResponsesProvider::new("test-key", "gpt-5");
+        let official_body = official.build_request(&messages, &[], &config);
+        assert_eq!(official_body["prompt_cache_key"], "octos-stable-affinity");
+
+        let compatible = OpenAIResponsesProvider::new("test-key", "gpt-5")
+            .with_base_url("https://compatible.example/v1");
+        let compatible_body = compatible.build_request(&messages, &[], &config);
+        assert!(
+            compatible_body.get("prompt_cache_key").is_none(),
+            "reserved OpenAI fields must stay absent on unknown compatibility endpoints"
+        );
+
+        let explicitly_capable = compatible.with_prompt_cache_affinity(true);
+        let opted_in_body = explicitly_capable.build_request(&messages, &[], &config);
+        assert_eq!(opted_in_body["prompt_cache_key"], "octos-stable-affinity");
+    }
+
+    /// The Responses lane used to label manifests `openai-responses` while
+    /// its metadata (and therefore every usage row) said `openai`; nothing
+    /// ever correlated. Both must carry the same lane identity.
+    #[test]
+    fn should_build_responses_manifest_with_the_same_provider_label_as_provider_metadata() {
+        let provider = OpenAIResponsesProvider::new("test-key", "gpt-4.1");
+        let config = ChatConfig::default();
+        let messages = vec![msg(MessageRole::User, "hello")];
+        let body = provider.build_request(&messages, &[], &config);
+        let manifest = provider.prompt_cache_input_manifest(&body, &config);
+        let metadata = provider.provider_metadata();
+        assert_eq!(manifest.provider, metadata.provider);
+        assert_eq!(manifest.model, metadata.model);
+        assert_eq!(
+            manifest.provider,
+            provider.provider_metadata_for_index(None).provider
+        );
+    }
+
+    #[test]
+    fn should_serialize_responses_tool_choice_only_when_explicit() {
+        let provider = OpenAIResponsesProvider::new("test-key", "gpt-4.1");
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let messages = vec![msg(MessageRole::User, "hello")];
+        let auto = provider.build_request(&messages, &tools, &ChatConfig::default());
+        assert!(auto.get("tool_choice").is_none(), "{auto}");
+        let none = ChatConfig {
+            tool_choice: crate::ToolChoice::None,
+            ..Default::default()
+        };
+        assert_eq!(
+            provider.build_request(&messages, &tools, &none)["tool_choice"],
+            "none"
+        );
+        assert!(
+            provider
+                .build_request(&messages, &[], &none)
+                .get("tool_choice")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prompt_cache_manifest_uses_final_responses_shape_and_redacts_content() {
+        let provider = OpenAIResponsesProvider::new("test-key", "gpt-4.1");
+        let tools = vec![ToolSpec {
+            name: "private_tool".into(),
+            description: "tool description secret".into(),
+            input_schema: serde_json::json!({"type": "object", "secret": "schema secret"}),
+        }];
+        let config = ChatConfig {
+            prompt_cache_context: Some(PromptCacheContext {
+                affinity_key: "session-affinity".into(),
+                epoch_id: "epoch-9".into(),
+                stable_prefix_hash: "canonical-hash".into(),
+                semantic_boundaries: vec![],
+            }),
+            ..Default::default()
+        };
+        let first_messages = vec![
+            msg(MessageRole::System, "system prompt secret"),
+            msg(MessageRole::User, "first user secret"),
+        ];
+        let next_messages = vec![
+            msg(MessageRole::System, "system prompt secret"),
+            msg(MessageRole::User, "first user secret"),
+            msg(MessageRole::Assistant, "assistant suffix secret"),
+        ];
+        let first_body = provider.build_request(&first_messages, &tools, &config);
+        let mut next_body = provider.build_request(&next_messages, &tools, &config);
+        next_body["stream"] = true.into();
+
+        let first_manifest = provider.prompt_cache_input_manifest(&first_body, &config);
+        let next_manifest = provider.prompt_cache_input_manifest(&next_body, &config);
+        let comparison = first_manifest.compare_prefix(&next_manifest);
+
+        assert!(comparison.compatible_route);
+        assert!(comparison.stable_prefix_matches);
+        assert_eq!(comparison.conversation_prefix_segments, 1);
+        // The manifest carries the lane identity the metadata reports, so
+        // usage rows correlate with it.
+        assert_eq!(
+            first_manifest.provider,
+            provider.provider_metadata().provider
+        );
+        assert_eq!(first_manifest.epoch_id.as_deref(), Some("epoch-9"));
+        assert_eq!(first_manifest.stable_segments.len(), 2);
+
+        let redacted = serde_json::to_string(&next_manifest).unwrap();
+        for secret in [
+            "system prompt secret",
+            "first user secret",
+            "assistant suffix secret",
+            "private_tool",
+            "tool description secret",
+            "schema secret",
+        ] {
+            assert!(!redacted.contains(secret));
+        }
+    }
+
+    #[test]
     fn test_build_request_reasoning_effort() {
         let provider = OpenAIResponsesProvider::new("test-key", "o3");
         let messages = vec![msg(MessageRole::User, "think")];
@@ -802,6 +1083,7 @@ mod tests {
             usage: ResponsesUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                input_tokens_details: None,
                 output_tokens_details: None,
             },
         };
@@ -850,6 +1132,7 @@ mod tests {
             usage: ResponsesUsage {
                 input_tokens: 20,
                 output_tokens: 30,
+                input_tokens_details: None,
                 output_tokens_details: Some(OutputTokensDetails {
                     reasoning_tokens: 15,
                 }),
@@ -859,6 +1142,31 @@ mod tests {
         assert_eq!(result.content.as_deref(), Some("The answer is 42."));
         assert_eq!(result.reasoning_content.as_deref(), Some("Let me think..."));
         assert_eq!(result.usage.reasoning_tokens, 15);
+    }
+
+    #[test]
+    fn test_parse_response_cached_tokens_normalized_to_disjoint_accounting() {
+        // The Responses API reports the cached portion INSIDE input_tokens;
+        // the TokenUsage contract is disjoint, so the total prompt is
+        // input + cache_read — same normalization as the chat-completions
+        // parser. Deserialize the full wire body so the serde shape is
+        // covered, not just the conversion.
+        let resp: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "Hello!" }]
+            }],
+            "status": "completed",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "input_tokens_details": { "cached_tokens": 75 }
+            }
+        }))
+        .unwrap();
+        let result = parse_responses_api(resp);
+        assert_eq!(result.usage.input_tokens, 25);
+        assert_eq!(result.usage.cache_read_tokens, 75);
     }
 
     #[test]
@@ -941,6 +1249,26 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_completed_cached_tokens_normalized_to_disjoint_accounting() {
+        // Cached tokens arrive INSIDE input_tokens; the streamed Usage event
+        // must normalize to the disjoint contract exactly like the
+        // non-streaming parse (total = input + cache_read).
+        let mut state = ResponsesStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 100, "output_tokens": 50, "input_tokens_details": {"cached_tokens": 75}}}}"#.into(),
+        };
+        let events = map_responses_sse(&mut state, &event);
+        match &events[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 25);
+                assert_eq!(u.cache_read_tokens, 75);
+            }
+            _ => panic!("expected Usage"),
+        }
+    }
+
+    #[test]
     fn test_sse_done_sentinel() {
         let mut state = ResponsesStreamState::default();
         let event = crate::sse::SseEvent {
@@ -956,5 +1284,37 @@ mod tests {
         let provider = OpenAIResponsesProvider::new("key", "o4-mini");
         assert_eq!(provider.model_id(), "o4-mini");
         assert_eq!(provider.provider_name(), "openai");
+    }
+}
+
+#[cfg(test)]
+mod lane_attributed_operational_errors {
+    use octos_core::Message;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::OpenAIResponsesProvider;
+    use crate::config::ChatConfig;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::assert_error_names_lane;
+
+    #[tokio::test]
+    async fn should_name_lane_and_api_style_when_response_body_is_malformed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json{"))
+            .mount(&server)
+            .await;
+        let provider = OpenAIResponsesProvider::new("key", "gpt-5").with_base_url(server.uri());
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(
+            &err,
+            "openai/gpt-5",
+            "api_style=openai_responses",
+            &["OpenAI Responses API response"],
+        );
     }
 }

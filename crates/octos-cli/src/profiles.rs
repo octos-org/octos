@@ -307,6 +307,11 @@ pub struct ProfileConfig {
     /// (`snapshots.enabled` + `keep_last`). Default OFF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots: Option<octos_agent::SnapshotConfig>,
+    /// Build-cache pool configuration (outer-loop #3; design
+    /// docs/build-cache-pool.md §2). Projected into
+    /// `Config.build_cache`. Absent = defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<crate::build_cache::BuildCacheConfig>,
     /// Sandbox configuration for tool isolation.
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
@@ -2855,6 +2860,7 @@ pub(crate) fn config_from_profile(
         // #1768: thread the profile's snapshot opt-in so serve sessions
         // honor it (parity with format_after_edit).
         snapshots: profile.config.snapshots.clone(),
+        build_cache: profile.config.build_cache.clone(),
         // #2168: carry the profile's tool policy so a serve / UserProfile
         // session can slim its roster (the serve path already applies this).
         tool_policy: profile.config.tool_policy.clone(),
@@ -3188,7 +3194,8 @@ pub enum ProfileChange {
 /// Compare two profiles and classify the nature of changes.
 ///
 /// Restart-required: llm, review, search, deep_crawl, apps, robot, channels,
-///   env_vars, email, hooks, sandbox, routing, credential_pool, plugins.
+///   env_vars, email, hooks, sandbox, routing, credential_pool, plugins,
+///   tool_policy.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -3261,6 +3268,13 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     }
     if oc.lane_routing != nc.lane_routing {
         restart_fields.push("lane_routing".into());
+    }
+    // #2217: tool_policy is applied to the tool registry only at bootstrap
+    // (`apply_policy` in gateway setup), so a policy-only edit must trigger
+    // a restart — otherwise the running gateway keeps enforcing the stale
+    // allow/deny list indefinitely, with no signal.
+    if oc.tool_policy != nc.tool_policy {
+        restart_fields.push("tool_policy".into());
     }
 
     if !restart_fields.is_empty() {
@@ -5128,6 +5142,51 @@ mod tests {
         assert!(matches!(
             diff_profiles(&base, &changed),
             ProfileChange::HotReloadable
+        ));
+    }
+
+    #[test]
+    fn test_diff_profiles_tool_policy_requires_restart() {
+        // #2217: a tool_policy-only edit must classify as restart-required —
+        // the policy is applied to the tool registry at bootstrap
+        // (`apply_policy`), so without a restart the running gateway keeps
+        // enforcing the stale allow/deny list.
+        let base = UserProfile {
+            id: "diff-test".into(),
+            name: "Diff".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.config.tool_policy = Some(octos_agent::ToolPolicy {
+            deny: vec!["bash".into()],
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            diff_profiles(&base, &changed),
+            ProfileChange::RestartRequired(fields) if fields == vec!["tool_policy"]
+        ));
+
+        // Policy-to-policy edit and policy removal are the same transition class.
+        let mut edited = changed.clone();
+        edited.config.tool_policy = Some(octos_agent::ToolPolicy {
+            allow: vec!["read_file".into()],
+            ..Default::default()
+        });
+        assert!(matches!(
+            diff_profiles(&changed, &edited),
+            ProfileChange::RestartRequired(fields) if fields == vec!["tool_policy"]
+        ));
+        assert!(matches!(
+            diff_profiles(&changed, &base),
+            ProfileChange::RestartRequired(fields) if fields == vec!["tool_policy"]
         ));
     }
 

@@ -674,6 +674,29 @@ pub trait HookPayloadEnricher: Send + Sync {
     fn enrich(&self, event: &HookEvent, payload: &mut HookPayload);
 }
 
+/// Typed error for a before-hook policy deny that escapes as an
+/// `eyre::Report` (#2249). A deny is expected policy behaviour, not a
+/// harness fault — carrying a type (instead of a bare `eyre::bail!` string)
+/// lets `HarnessError::classify_report` downcast it into the `policy` /
+/// `expected` classification instead of `internal` / `bug`.
+///
+/// The `Display` wording is load-bearing: it surfaces verbatim to users as
+/// the permission-denial message, and the FailFast hook-deny exclusion in
+/// `loop_runner.rs` prefix-matches it.
+#[derive(Debug)]
+pub struct HookDeniedError {
+    /// Deny reason reported by the hook (empty when the hook gave none).
+    pub reason: String,
+}
+
+impl std::fmt::Display for HookDeniedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LLM call denied by hook: {}", self.reason)
+    }
+}
+
+impl std::error::Error for HookDeniedError {}
+
 /// Result of running hooks for an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookResult {

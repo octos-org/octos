@@ -2,6 +2,53 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Provider-neutral prompt-cache metadata attached by the agent immediately
+/// before dispatch. Providers may consume only the fields they explicitly
+/// support; compatible/unknown endpoints must omit provider-specific wire
+/// fields entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheContext {
+    /// Stable, privacy-preserving traffic-affinity key (max 64 chars).
+    pub affinity_key: String,
+    /// Identity of the current cache-relevant System/tool/model epoch.
+    pub epoch_id: String,
+    pub stable_prefix_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_boundaries: Vec<SemanticCheckpointHint>,
+}
+
+/// Optional semantic boundary offered to local/hybrid runtimes. It is a hint,
+/// never proof that a checkpoint exists and never required for correctness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticCheckpointHint {
+    pub boundary_id: String,
+    pub boundary_kind: String,
+    pub prefix_hash: String,
+    pub prefix_token_estimate: usize,
+    pub estimated_recompute_tokens: usize,
+    pub checkpoint_priority: u8,
+}
+
+impl PromptCacheContext {
+    /// Deepest semantic checkpoint whose exact prefix survives in both
+    /// contexts. A local runtime can use this to avoid restoring state past an
+    /// edited tool/thinking boundary.
+    pub fn deepest_shared_checkpoint<'a>(
+        &'a self,
+        next: &Self,
+    ) -> Option<&'a SemanticCheckpointHint> {
+        self.semantic_boundaries
+            .iter()
+            .zip(next.semantic_boundaries.iter())
+            .take_while(|(previous, current)| {
+                previous.boundary_kind == current.boundary_kind
+                    && previous.prefix_hash == current.prefix_hash
+            })
+            .map(|(previous, _)| previous)
+            .last()
+    }
+}
+
 /// Configuration for a chat completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConfig {
@@ -68,6 +115,9 @@ pub struct ChatConfig {
     /// Providers without explicit cache breakpoints ignore this field.
     #[serde(default, skip_serializing_if = "CacheRetention::is_default")]
     pub cache_retention: CacheRetention,
+    /// Internal prompt-cache affinity and semantic checkpoint metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_context: Option<PromptCacheContext>,
 }
 
 /// Prompt-cache retention for a single request. See
@@ -144,6 +194,7 @@ impl Default for ChatConfig {
             context_management: None,
             sampling_params: None,
             cache_retention: CacheRetention::Default,
+            prompt_cache_context: None,
         }
     }
 }
@@ -161,6 +212,144 @@ pub enum ToolChoice {
     None,
     /// Model must use a specific tool.
     Specific { name: String },
+}
+
+impl ToolChoice {
+    /// Whether this choice needs an explicit wire field. `Auto` is every
+    /// provider's default, so it is omitted and request bodies built before
+    /// `tool_choice` was serialized stay byte-identical (cache-relevant on
+    /// providers that key on the whole request).
+    fn is_explicit(&self, has_tools: bool) -> bool {
+        has_tools && !matches!(self, Self::Auto)
+    }
+
+    /// OpenAI chat-completions / OpenRouter form: `"none" | "required" |
+    /// {"type":"function","function":{"name":…}}`.
+    pub fn openai_chat_wire(&self, has_tools: bool) -> Option<serde_json::Value> {
+        if !self.is_explicit(has_tools) {
+            return Option::None;
+        }
+        Some(match self {
+            Self::Auto => serde_json::Value::String("auto".into()),
+            Self::Required => serde_json::Value::String("required".into()),
+            Self::None => serde_json::Value::String("none".into()),
+            Self::Specific { name } => serde_json::json!({
+                "type": "function",
+                "function": { "name": name },
+            }),
+        })
+    }
+
+    /// OpenAI Responses form: `"none" | "required" |
+    /// {"type":"function","name":…}`.
+    pub fn openai_responses_wire(&self, has_tools: bool) -> Option<serde_json::Value> {
+        if !self.is_explicit(has_tools) {
+            return Option::None;
+        }
+        Some(match self {
+            Self::Auto => serde_json::Value::String("auto".into()),
+            Self::Required => serde_json::Value::String("required".into()),
+            Self::None => serde_json::Value::String("none".into()),
+            Self::Specific { name } => serde_json::json!({
+                "type": "function",
+                "name": name,
+            }),
+        })
+    }
+
+    /// Anthropic Messages form: `{"type":"none"|"auto"|"any"|"tool","name":…}`.
+    pub fn anthropic_wire(&self, has_tools: bool) -> Option<serde_json::Value> {
+        if !self.is_explicit(has_tools) {
+            return Option::None;
+        }
+        Some(match self {
+            Self::Auto => serde_json::json!({ "type": "auto" }),
+            Self::Required => serde_json::json!({ "type": "any" }),
+            Self::None => serde_json::json!({ "type": "none" }),
+            Self::Specific { name } => serde_json::json!({ "type": "tool", "name": name }),
+        })
+    }
+
+    /// Gemini `toolConfig.functionCallingConfig` form.
+    pub fn gemini_function_calling_config(&self, has_tools: bool) -> Option<serde_json::Value> {
+        if !self.is_explicit(has_tools) {
+            return Option::None;
+        }
+        Some(match self {
+            Self::Auto => serde_json::json!({ "mode": "AUTO" }),
+            Self::Required => serde_json::json!({ "mode": "ANY" }),
+            Self::None => serde_json::json!({ "mode": "NONE" }),
+            Self::Specific { name } => serde_json::json!({
+                "mode": "ANY",
+                "allowed_function_names": [name],
+            }),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_wire_tests {
+    use super::ToolChoice;
+
+    #[test]
+    fn should_omit_tool_choice_for_the_default_and_for_tool_less_requests() {
+        assert!(ToolChoice::Auto.openai_chat_wire(true).is_none());
+        assert!(ToolChoice::None.openai_chat_wire(false).is_none());
+        assert!(ToolChoice::None.anthropic_wire(false).is_none());
+        assert!(
+            ToolChoice::None
+                .gemini_function_calling_config(false)
+                .is_none()
+        );
+        assert!(ToolChoice::None.openai_responses_wire(false).is_none());
+    }
+
+    #[test]
+    fn should_render_every_provider_wire_form_for_explicit_choices() {
+        assert_eq!(ToolChoice::None.openai_chat_wire(true).unwrap(), "none");
+        assert_eq!(
+            ToolChoice::Required.openai_chat_wire(true).unwrap(),
+            "required"
+        );
+        assert_eq!(
+            ToolChoice::Specific {
+                name: "read".into()
+            }
+            .openai_chat_wire(true)
+            .unwrap(),
+            serde_json::json!({"type": "function", "function": {"name": "read"}})
+        );
+        assert_eq!(
+            ToolChoice::Specific {
+                name: "read".into()
+            }
+            .openai_responses_wire(true)
+            .unwrap(),
+            serde_json::json!({"type": "function", "name": "read"})
+        );
+        assert_eq!(
+            ToolChoice::None.anthropic_wire(true).unwrap(),
+            serde_json::json!({"type": "none"})
+        );
+        assert_eq!(
+            ToolChoice::Required.anthropic_wire(true).unwrap(),
+            serde_json::json!({"type": "any"})
+        );
+        assert_eq!(
+            ToolChoice::None
+                .gemini_function_calling_config(true)
+                .unwrap(),
+            serde_json::json!({"mode": "NONE"})
+        );
+        assert_eq!(
+            ToolChoice::Specific {
+                name: "read".into()
+            }
+            .gemini_function_calling_config(true)
+            .unwrap(),
+            serde_json::json!({"mode": "ANY", "allowed_function_names": ["read"]})
+        );
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +424,7 @@ mod tests {
             context_management: None,
             sampling_params: None,
             cache_retention: CacheRetention::Default,
+            prompt_cache_context: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ChatConfig = serde_json::from_str(&json).unwrap();
@@ -256,12 +446,14 @@ mod tests {
             context_management: None,
             sampling_params: None,
             cache_retention: CacheRetention::Default,
+            prompt_cache_context: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("max_tokens").is_none());
         assert!(json.get("temperature").is_none());
         assert!(json.get("stop_sequences").is_none());
         assert!(json.get("context_management").is_none());
+        assert!(json.get("prompt_cache_context").is_none());
     }
 
     #[test]
@@ -278,6 +470,37 @@ mod tests {
         let cm = json.get("context_management").expect("field present");
         assert!(cm.is_object());
         assert!(cm.get("edits").is_some());
+    }
+
+    #[test]
+    fn deepest_shared_checkpoint_stops_before_edited_semantic_suffix() {
+        fn hint(id: &str, hash: &str) -> SemanticCheckpointHint {
+            SemanticCheckpointHint {
+                boundary_id: id.to_owned(),
+                boundary_kind: "message:user".to_owned(),
+                prefix_hash: hash.to_owned(),
+                prefix_token_estimate: 1,
+                estimated_recompute_tokens: 1,
+                checkpoint_priority: 1,
+            }
+        }
+        let previous = PromptCacheContext {
+            affinity_key: "key".to_owned(),
+            epoch_id: "epoch".to_owned(),
+            stable_prefix_hash: "stable".to_owned(),
+            semantic_boundaries: vec![hint("one", "h1"), hint("two", "h2")],
+        };
+        let edited = PromptCacheContext {
+            semantic_boundaries: vec![hint("one-new-id", "h1"), hint("two", "changed")],
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            previous
+                .deepest_shared_checkpoint(&edited)
+                .map(|hint| hint.boundary_id.as_str()),
+            Some("one")
+        );
     }
 
     #[test]

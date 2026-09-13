@@ -2264,6 +2264,7 @@ fn conversation_response_with_usage(
         files_modified: vec![],
         files_to_send: vec![],
         streamed: false,
+        assistant_segments: Default::default(),
         messages: vec![],
         tool_results: vec![],
         synthesized_from_spawn_only: false,
@@ -2480,8 +2481,8 @@ async fn master_continuation_tick_reenters_actor_loop() {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
-    crate::autonomy::agent_orchestrator::default_agent_orchestrator().upsert_agent(
-        crate::autonomy::agent_orchestrator::AgentUpsert {
+    crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+        .upsert_agent(crate::autonomy::agent_orchestrator::AgentUpsert {
             agent_id: agent_id.clone(),
             parent_agent_id: Some("master".into()),
             session_id: session_id.clone(),
@@ -2494,14 +2495,24 @@ async fn master_continuation_tick_reenters_actor_loop() {
             last_task: Some("review finished".into()),
             cwd: None,
             profile_id: MAIN_PROFILE_ID.into(),
-        },
-    );
+        })
+        .unwrap();
 
-    for _ in 0..10 {
+    // #2011: `advance` moves VIRTUAL time, but the tick → drain →
+    // process_inbound → persist chain also needs REAL scheduling (blocking
+    // I/O threads), so a fixed iteration budget races machine load and
+    // flaked ~25% under high load. Bound the wait by a wall-clock deadline
+    // (std Instant — tokio's clock is paused in this test) and pace each
+    // virtual advance with a real sleep so starved OS threads get CPU.
+    // Pacing is not what keeps the actor alive: the pre-loop upsert is
+    // synchronous, the first interval tick drains it immediately (which
+    // resets idle_sleep), and idle_sleep cannot fire mid-turn — the
+    // deadline only has to cover [actor start → first drain].
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while provider.call_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
         tokio::time::advance(Duration::from_millis(250)).await;
-        if provider.call_count.load(Ordering::Relaxed) > 0 {
-            break;
-        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     assert!(
@@ -2509,16 +2520,19 @@ async fn master_continuation_tick_reenters_actor_loop() {
         "periodic actor tick must drain queued child completion into process_inbound"
     );
 
-    for _ in 0..10 {
-        tokio::time::advance(Duration::from_millis(250)).await;
-        tokio::task::yield_now().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
         let session_handle = SessionHandle::open(dir.path(), &session_id);
         if session_handle.session().messages.iter().any(|message| {
             message.role == MessageRole::Assistant
                 && message.content.contains("child progress summary")
-        }) {
+        }) || std::time::Instant::now() >= deadline
+        {
             break;
         }
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(10));
     }
     let session_handle = SessionHandle::open(dir.path(), &session_id);
     let session = session_handle.session();
@@ -5176,6 +5190,551 @@ async fn test_agent_error_persists_to_history() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
 
+#[cfg(feature = "api")]
+struct PartialReasoningProvider(Arc<DelayedMockProvider>);
+
+#[cfg(feature = "api")]
+#[async_trait]
+impl LlmProvider for PartialReasoningProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        self.0.chat(messages, tools, config).await
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatStream> {
+        // The trait's compatibility default does not emit reasoning deltas.
+        // Model a real reasoning-capable stream so the carrier is exercised.
+        let response = self.chat(messages, tools, config).await?;
+        let mut events = Vec::new();
+        if let Some(reasoning) = response.reasoning_content {
+            events.push(octos_llm::StreamEvent::ReasoningDelta(reasoning));
+        }
+        if let Some(text) = response.content {
+            events.push(octos_llm::StreamEvent::TextDelta(text));
+        }
+        for (index, call) in response.tool_calls.into_iter().enumerate() {
+            events.push(octos_llm::StreamEvent::ToolCallDelta {
+                index,
+                id: Some(call.id),
+                name: Some(call.name),
+                arguments_delta: call.arguments.to_string(),
+            });
+        }
+        events.push(octos_llm::StreamEvent::Usage(response.usage));
+        events.push(octos_llm::StreamEvent::Done(response.stop_reason));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+    fn model_id(&self) -> &str {
+        "partial-reasoning"
+    }
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+}
+
+async fn assert_incomplete_gateway_turn_preserves_partial(mode: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    let artifact = dir.path().join("partial-artifact.txt");
+    std::fs::write(&artifact, "actual partial artifact").unwrap();
+    let mut tool_response = make_response("partial preamble");
+    tool_response.stop_reason = StopReason::ToolUse;
+    tool_response.tool_calls = vec![octos_core::ToolCall {
+        id: "partial-read-call".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({"path": artifact}),
+        metadata: None,
+    }];
+    let mut partial_response = make_response("actual unfinished assistant text");
+    partial_response.stop_reason = StopReason::MaxTokens;
+    partial_response.reasoning_content = Some("actual partial reasoning".into());
+    partial_response.usage.cache_read_tokens = 17;
+    partial_response.usage.cache_write_tokens = 19;
+    let provider = Arc::new(DelayedMockProvider::new(
+        "partial-provider",
+        vec![
+            (Duration::ZERO, tool_response),
+            (Duration::ZERO, partial_response),
+        ],
+    ));
+    let memory = Arc::new(
+        EpisodeStore::open(dir.path().join("partial-memory"))
+            .await
+            .unwrap(),
+    );
+    let gateway_provider: Arc<dyn LlmProvider> = {
+        #[cfg(feature = "api")]
+        {
+            Arc::new(PartialReasoningProvider(provider.clone()))
+        }
+        #[cfg(not(feature = "api"))]
+        {
+            provider.clone()
+        }
+    };
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("partial-gateway"),
+            gateway_provider,
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    // API metadata must retain a machine-readable incomplete outcome, while
+    // the visible content still contains the actual partial answer.
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("keep this user input") else {
+        unreachable!()
+    };
+    message.channel = "api".into();
+    message.metadata = serde_json::json!({"client_message_id": "partial-gateway-turn"});
+    match mode {
+        "serial" => actor.process_inbound(message, vec![], vec![], None).await,
+        "primary" => {
+            actor
+                .process_inbound_speculative(message, vec![], vec![], None)
+                .await
+        }
+        "overflow" => {
+            actor.serve_overflow(&message, &[]);
+            tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+                while actor.active_overflow_tasks.load(Ordering::Acquire) > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("overflow settles");
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "actual partial artifact"
+    );
+    let persisted = SessionHandle::open(dir.path(), &actor.session_key);
+    let rows = &persisted.session().messages;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.role == MessageRole::Assistant
+                && row.content == "actual unfinished assistant text")
+            .count(),
+        1,
+        "{mode}: the actual partial final must be persisted exactly once"
+    );
+    #[cfg(feature = "api")]
+    let partial_row = rows
+        .iter()
+        .find(|row| {
+            row.role == MessageRole::Assistant && row.content == "actual unfinished assistant text"
+        })
+        .unwrap();
+    #[cfg(feature = "api")]
+    assert_eq!(
+        partial_row.reasoning_content.as_deref(),
+        Some("actual partial reasoning")
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.role == MessageRole::User && row.content == "keep this user input")
+            .count(),
+        1
+    );
+    if mode != "overflow" {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::Assistant
+                    && row.content == "partial preamble"
+                    && row
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| calls[0].id == "partial-read-call"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::Tool
+                    && row.tool_call_id.as_deref() == Some("partial-read-call"))
+                .count(),
+            1
+        );
+        let tool_row = rows
+            .iter()
+            .find(|row| {
+                row.role == MessageRole::Tool
+                    && row.tool_call_id.as_deref() == Some("partial-read-call")
+            })
+            .unwrap();
+        assert!(
+            tool_row.content.contains("actual partial artifact"),
+            "actual tool output retained: {}",
+            tool_row.content
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row.role, MessageRole::Assistant | MessageRole::Tool))
+                .all(|row| row.thread_id.as_deref() == Some("partial-gateway-turn"))
+        );
+    } else {
+        assert!(
+            rows.iter()
+                .all(|row| row.role != MessageRole::Tool && row.tool_calls.is_none()),
+            "overflow retains its final-only concurrency policy"
+        );
+    }
+    let usage = actor.session_usage.snapshot();
+    assert_eq!(
+        usage.input_tokens, 100,
+        "{mode}: partial usage is still billed"
+    );
+    assert_eq!(usage.output_tokens, 20);
+    if mode == "serial" {
+        assert_eq!(actor.last_turn_total_tokens, 156);
+    }
+    let mut outbound = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        outbound.push(message);
+    }
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("actual unfinished assistant text")),
+        "{mode}: the caller must receive the partial text"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.metadata["truncated"] == true
+                && message.metadata["outcome"] == "incomplete"),
+        "{mode}: an actual partial response must never be reported as successful completion: {outbound:?}"
+    );
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content.contains("incomplete")),
+        "{mode}: visible error notice is retained alongside the partial text"
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_serial_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("serial").await;
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_primary_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("primary").await;
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_overflow_gateway_turn() {
+    assert_incomplete_gateway_turn_preserves_partial("overflow").await;
+}
+
+#[derive(Default)]
+struct PartialStreamChannel {
+    finishes: std::sync::Mutex<Vec<String>>,
+    starts: std::sync::atomic::AtomicUsize,
+}
+
+/// Fail only the final session append, after serve_overflow durably writes
+/// its user row and before the provider returns its streamed partial answer.
+struct PersistFailureStreamProvider {
+    inner: StreamingMockProvider,
+    sessions_dir: std::path::PathBuf,
+    preserved_dir: std::path::PathBuf,
+}
+
+#[async_trait]
+impl LlmProvider for PersistFailureStreamProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        std::fs::rename(&self.sessions_dir, &self.preserved_dir)?;
+        std::fs::write(&self.sessions_dir, "fixture final-append blocker")?;
+        self.inner.chat(messages, tools, config).await
+    }
+
+    fn model_id(&self) -> &str {
+        "partial-persist-failure"
+    }
+    fn provider_name(&self) -> &str {
+        "test"
+    }
+}
+
+#[async_trait]
+impl octos_bus::Channel for PartialStreamChannel {
+    fn name(&self) -> &str {
+        "api"
+    }
+    async fn start(&self, _: mpsc::Sender<InboundMessage>) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn send(&self, _: &OutboundMessage) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn send_with_id(&self, _: &OutboundMessage) -> eyre::Result<Option<String>> {
+        self.starts.fetch_add(1, Ordering::Relaxed);
+        Ok(Some("partial-stream".into()))
+    }
+    async fn edit_message(&self, _: &str, _: &str, _: &str) -> eyre::Result<()> {
+        Ok(())
+    }
+    async fn finish_stream(&self, _: &str, _: &str, text: &str) -> eyre::Result<()> {
+        self.finishes.lock().unwrap().push(text.to_string());
+        Ok(())
+    }
+    fn supports_edit(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_streamed_overflow_without_second_bubble() {
+    streamed_incomplete_overflow_case(false).await;
+}
+
+#[tokio::test]
+async fn should_not_send_empty_overflow_notification_when_partial_persistence_fails() {
+    streamed_incomplete_overflow_case(true).await;
+}
+
+async fn streamed_incomplete_overflow_case(fail_final_persistence: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    let sessions_dir = actor
+        .session_handle
+        .lock()
+        .await
+        .task_state_path()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let preserved_dir = dir.path().join("preserved-overflow-user-session");
+    let mut response = make_response("streamed unfinished content");
+    response.stop_reason = StopReason::MaxTokens;
+    let provider = StreamingMockProvider::new(
+        "partial-stream",
+        vec![(
+            Duration::from_millis(250),
+            "streamed unfinished content".into(),
+            response,
+        )],
+    );
+    let provider: Arc<dyn LlmProvider> = if fail_final_persistence {
+        Arc::new(PersistFailureStreamProvider {
+            inner: provider,
+            sessions_dir: sessions_dir.clone(),
+            preserved_dir: preserved_dir.clone(),
+        })
+    } else {
+        Arc::new(provider)
+    };
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("partial-stream"),
+            provider,
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            Arc::new(
+                EpisodeStore::open(dir.path().join("stream-memory"))
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 0,
+            ..Default::default()
+        }),
+    );
+    let stream = Arc::new(PartialStreamChannel::default());
+    actor.status_indicator = Some(Arc::new(StatusComposer::new(
+        stream.clone(),
+        vec!["Thinking".into()],
+    )));
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("stream this") else {
+        unreachable!()
+    };
+    message.channel = "api".into();
+    message.metadata = serde_json::json!({"client_message_id": "overflow-partial-stream"});
+    actor.serve_overflow(&message, &[]);
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while actor.active_overflow_tasks.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        stream.starts.load(Ordering::Relaxed) > 0,
+        "actual streaming branch exercised"
+    );
+    {
+        let finishes = stream.finishes.lock().unwrap();
+        let final_edit = finishes.last().expect("the existing bubble is finalized");
+        assert_eq!(final_edit.matches("streamed unfinished content").count(), 1);
+        assert!(final_edit.contains("incomplete"));
+    }
+    let mut replies = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        replies.push(message);
+    }
+    assert!(
+        replies
+            .iter()
+            .all(|message| !message.content.contains("streamed unfinished content")),
+        "no second visible bubble after streaming"
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|message| message.metadata.get("_completion").is_none()),
+        "an overflow error must not close the primary stream"
+    );
+    let results: Vec<_> = replies
+        .iter()
+        .filter_map(|message| message.metadata.get("_session_result"))
+        .filter(|result| result["role"] == "assistant")
+        .collect();
+    if fail_final_persistence {
+        assert!(
+            sessions_dir.is_file() && preserved_dir.is_dir(),
+            "actual I/O fault exercised"
+        );
+        let rows = actor.session_handle.lock().await.session().messages.clone();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.role == MessageRole::User && row.content == "stream this")
+                .count(),
+            1,
+            "the user committed before the injected final-append failure"
+        );
+        assert!(
+            rows.iter().all(|row| row.role != MessageRole::Assistant),
+            "failed final append cannot claim persistence"
+        );
+        assert!(
+            results.is_empty(),
+            "no invented committed result after an I/O error"
+        );
+        assert!(
+            replies.iter().all(|message| !message.content.is_empty()
+                || message.metadata.get("_session_result").is_some()),
+            "no empty notification without durable identity after the existing bubble was finalized: {replies:?}"
+        );
+        return;
+    }
+    assert_eq!(
+        results.len(),
+        1,
+        "one authoritative durable fanout survives a closed primary"
+    );
+    assert_eq!(results[0]["outcome"], "incomplete");
+    assert_eq!(results[0]["tokens_in"], 50);
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("streamed unfinished content")
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_max_tokens_partial_in_silent_serial_failure_without_fake_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut actor = build_unspawned_actor(&dir, None).await;
+    // Literal empty / thinking-only responses are retried before MaxTokens.
+    // The silence marker is a real nonempty response, but must not suppress
+    // the incomplete outcome or fabricate a success answer in a cron turn.
+    let raw_partial = "[SILENT]";
+    let mut response = make_response(raw_partial);
+    response.stop_reason = StopReason::MaxTokens;
+    actor.agent = Arc::new(
+        Agent::new(
+            AgentId::new("empty-partial"),
+            Arc::new(DelayedMockProvider::new(
+                "empty-partial",
+                vec![(Duration::ZERO, response)],
+            )),
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            Arc::new(
+                EpisodeStore::open(dir.path().join("empty-memory"))
+                    .await
+                    .unwrap(),
+            ),
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        }),
+    );
+    actor.channel = "api".into();
+    let (out_tx, mut out_rx) = mpsc::channel(64);
+    actor.out_tx = out_tx;
+    let ActorMessage::Inbound { mut message, .. } = make_inbound("silent partial") else {
+        unreachable!()
+    };
+    message.channel = "system".into();
+    message.sender_id = "cron".into();
+    actor.process_inbound(message, vec![], vec![], None).await;
+    let mut replies = Vec::new();
+    while let Ok(message) = out_rx.try_recv() {
+        replies.push(message);
+    }
+    assert!(
+        replies
+            .iter()
+            .any(|message| message.content.contains("incomplete"))
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|message| !message.content.contains("Session Summary")
+                && !message.content.contains("empty response"))
+    );
+    let persisted = SessionHandle::open(dir.path(), &actor.session_key);
+    let assistant_rows: Vec<_> = persisted
+        .session()
+        .messages
+        .iter()
+        .filter(|row| row.role == MessageRole::Assistant)
+        .collect();
+    assert_eq!(assistant_rows.len(), 1);
+    assert_eq!(
+        assistant_rows[0].content, raw_partial,
+        "no invented final row"
+    );
+    let terminal = replies
+        .iter()
+        .find(|message| message.metadata.get("_completion").is_some())
+        .unwrap();
+    assert_eq!(terminal.metadata["outcome"], "incomplete");
+    assert_eq!(terminal.metadata["tokens_in"], 50);
+}
+
 #[tokio::test]
 async fn test_attachment_hints_do_not_persist_in_session_history() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -7371,6 +7930,7 @@ fn make_supervisor_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
     }
 }
 
@@ -7390,7 +7950,12 @@ async fn terminal_task_status_survives_actor_inbox_backpressure() {
         octos_agent::TaskStatus::Completed,
         octos_agent::TaskRuntimeState::Completed,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain the filler so the spawned awaited send can proceed.
     let _ = rx.recv().await.expect("filler");
@@ -7426,7 +7991,12 @@ async fn non_terminal_task_status_drops_under_inbox_backpressure() {
         octos_agent::TaskStatus::Running,
         octos_agent::TaskRuntimeState::ExecutingTool,
     );
-    forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+    forward_task_status_to_actor_inbox(
+        &InProcessAgentOrchestrator::default(),
+        &tx,
+        &data_dir,
+        &task,
+    );
 
     // Drain filler. There must be no durable retry queued behind it.
     let _ = rx.recv().await.expect("filler");
@@ -9741,4 +10311,1333 @@ async fn should_wire_goal_task_row_observers_when_gateway_actor_is_spawned() {
 
     drop(tx);
     handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// #48a — OLP observability: `fallback_switch` event rows from the failover
+// forwarder. Best-effort, per-session, written on every REAL lane switch
+// regardless of the client-notice debounce.
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_48a {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    async fn spawn_forwarder(
+        data_dir: &std::path::Path,
+    ) -> (
+        tokio::sync::broadcast::Sender<octos_llm::adaptive::FailoverEvent>,
+        mpsc::Receiver<OutboundMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let (out_tx, out_rx) = mpsc::channel(4);
+        let session_key = test_session_key(data_dir);
+        let handle = tokio::spawn(crate::session_actor::forward_router_failovers_for_test(
+            crate::session_actor::FailoverForwarderParams {
+                rx,
+                out_tx,
+                session_id: session_key.to_string(),
+                session_key,
+                channel: "telegram".to_string(),
+                chat_id: "c1".to_string(),
+                profile_data_dir: data_dir.to_path_buf(),
+            },
+        ));
+        (tx, out_rx, handle)
+    }
+
+    fn own_event(session: &str) -> octos_llm::adaptive::FailoverEvent {
+        octos_llm::adaptive::FailoverEvent {
+            from_provider: "a".into(),
+            to_provider: "b".into(),
+            reason: "quota".into(),
+            elapsed_ms: 120,
+            originating_session_id: Some(session.to_string()),
+            originating_turn_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_writes_own_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one fallback_switch row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            rows[0].get("model_lane").and_then(|s| s.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            rows[0].get("detail").and_then(|s| s.as_str()),
+            Some("router failover: a -> b (quota, 120ms)")
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_other_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let other = own_event("some-other-session");
+        tx.send(other).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "other-session failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_gateway_ignores_none_originator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, _out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let mut none_event = own_event("unused");
+        none_event.originating_session_id = None;
+        tx.send(none_event).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        assert!(
+            read_events(dir.path()).is_empty(),
+            "None-originator failover must not write any event row"
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_write_failure_does_not_block_notice() {
+        // data_dir points at a path that cannot host events.jsonl (a FILE
+        // where a directory is needed): the write fails, the notice still
+        // goes out, and the forwarder task stays alive.
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not-a-dir").unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(&blocker).await;
+        // The forwarder's session identity derives from the blocker path
+        // (its "data dir"); the event's originator must match THAT session.
+        let sid = test_session_key(&blocker).to_string();
+        tx.send(own_event(&sid)).unwrap();
+        let push = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("notice must still be sent when the obs write fails")
+            .expect("channel open");
+        assert!(
+            push.content.starts_with("↺ Router failover:"),
+            "{}",
+            push.content
+        );
+        // The forwarder did NOT exit (still joinable, not finished).
+        assert!(
+            !handle.is_finished(),
+            "write failure must not kill the forwarder"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_written_even_when_notice_debounced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tx, mut out_rx, handle) = spawn_forwarder(dir.path()).await;
+        let sid = test_session_key(dir.path()).to_string();
+        // Two rapid events — inside the debounce window.
+        tx.send(own_event(&sid)).unwrap();
+        tx.send(own_event(&sid)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.abort();
+        let events = read_events(dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 2, "both real switches write rows: {events:?}");
+        // Client notice: exactly ONE (the second was debounced).
+        let mut notices = 0;
+        while out_rx.try_recv().is_ok() {
+            notices += 1;
+        }
+        assert_eq!(notices, 1, "debounce still collapses the client push");
+    }
+}
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_delivers_one_profiled_carrier() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    use crate::autonomy::supervisor_store::SupervisorStore;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let profile = "gateway-dual-sink";
+    let session = SessionKey::with_profile(profile, "matrix", "completion");
+    assert_eq!(session.profile_id(), Some(profile));
+    let ids: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|call| {
+            let id = supervisor.register("shell", call, Some(&session.0));
+            supervisor.mark_running(&id);
+            id
+        })
+        .collect();
+    for id in &ids {
+        supervisor.mark_completed(id, vec![]);
+    }
+    let mut terminal_ids = std::collections::HashSet::new();
+    while let Ok(message) = rx.try_recv() {
+        if let ActorMessage::TaskStatusChanged { task_json } = message {
+            let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+            if row["lifecycle_state"] == "ready" {
+                terminal_ids.insert(row["id"].as_str().unwrap().to_owned());
+            }
+        }
+    }
+    assert_eq!(
+        terminal_ids,
+        ids.into_iter().collect(),
+        "actual on_change inbox delivery"
+    );
+    assert_eq!(
+        runtime.pending_continuation_count_for_session_for_test(&session, profile),
+        3,
+        "two child verdicts and one final scatter; both real sinks share dedupe"
+    );
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                MAIN_PROFILE_ID,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let durable = SupervisorStore::new(dir.path()).load_state().unwrap();
+    assert_eq!(durable.children.len(), 2);
+    let drained = runtime.drain_ready_continuations_for_session(
+        &session,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        1,
+    );
+    assert_eq!(drained.len(), 1);
+    let carrier = &drained[0];
+    assert_eq!(
+        carrier.reason,
+        MasterContinuationReason::ScatterJoinComplete
+    );
+    assert_eq!(
+        carrier.metadata.get("coalesced_count").map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        carrier
+            .metadata
+            .get("terminal_children")
+            .map(String::as_str),
+        Some("2")
+    );
+    for child in durable.children.values() {
+        assert!(carrier.metadata["coalesced_child_ids"].contains(&child.child_id));
+    }
+    runtime.mark_continuation_completed(carrier, None);
+    assert!(
+        runtime
+            .drain_ready_continuations_for_session(
+                &session,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                20
+            )
+            .is_empty()
+    );
+    let restarted = InProcessAgentOrchestrator::default();
+    restarted.configure_supervisor_store(dir.path()).unwrap();
+    assert_eq!(
+        restarted.pending_continuation_count_for_session_for_test(&session, profile),
+        0
+    );
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_filters_failure_recovery() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    for acked in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = InProcessAgentOrchestrator::default();
+        runtime.configure_supervisor_store(dir.path()).unwrap();
+        let supervisor = TaskSupervisor::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        install_gateway_task_status_sinks(
+            &supervisor,
+            tx,
+            dir.path().to_path_buf(),
+            runtime.clone(),
+        );
+        let profile = "gateway-failure-sink";
+        let session = SessionKey::with_profile(profile, "matrix", &format!("failure-{acked}"));
+        assert_eq!(session.profile_id(), Some(profile));
+        let id = supervisor.register("shell", "failure-call", Some(&session.0));
+        supervisor.mark_running(&id);
+        if acked {
+            supervisor.mark_synth_ack_emitted("failure-call");
+        }
+        supervisor.mark_failed(&id, "owner failed".into());
+        let mut saw_failed = false;
+        while let Ok(message) = rx.try_recv() {
+            if let ActorMessage::TaskStatusChanged { task_json } = message {
+                let row: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+                saw_failed |= row["id"] == id && row["status"] == "failed";
+            }
+        }
+        assert!(
+            saw_failed,
+            "on_change must project failures with or without ack"
+        );
+        assert!(
+            runtime
+                .drain_ready_continuations_for_session(
+                    &session,
+                    MAIN_PROFILE_ID,
+                    MasterContinuationRuntimeState::idle(),
+                    20
+                )
+                .is_empty()
+        );
+        let drained = runtime.drain_ready_continuations_for_session(
+            &session,
+            profile,
+            MasterContinuationRuntimeState::idle(),
+            20,
+        );
+        let recoveries = drained
+            .iter()
+            .filter(|item| {
+                matches!(&item.reason,
+            MasterContinuationReason::External(kind) if kind == "spawn_only_failure")
+            })
+            .count();
+        assert_eq!(
+            recoveries,
+            usize::from(acked),
+            "only the actual terminal sink can enqueue acked recovery"
+        );
+        assert!(
+            drained
+                .iter()
+                .any(|item| item.reason == MasterContinuationReason::ChildCompleted),
+            "on_change still mirrors unacked Failed child verdicts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_terminal_dual_sink_installer_ignores_sessionless_reentry() {
+    use crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = InProcessAgentOrchestrator::default();
+    runtime.configure_supervisor_store(dir.path()).unwrap();
+    let supervisor = TaskSupervisor::new();
+    let (tx, mut rx) = mpsc::channel(32);
+    install_gateway_task_status_sinks(&supervisor, tx, dir.path().to_path_buf(), runtime.clone());
+    let completed = supervisor.register("shell", "sessionless-complete", None);
+    supervisor.mark_completed(&completed, vec![]);
+    let failed = supervisor.register("shell", "sessionless-fail", None);
+    supervisor.mark_synth_ack_emitted("sessionless-fail");
+    supervisor.mark_failed(&failed, "failed".into());
+    let mut delivered = 0;
+    while let Ok(message) = rx.try_recv() {
+        if matches!(message, ActorMessage::TaskStatusChanged { .. }) {
+            delivered += 1;
+        }
+    }
+    assert_eq!(
+        delivered, 2,
+        "truthful status delivery still reaches the actor"
+    );
+    assert_eq!(runtime.pending_continuation_count_for_test(), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// evo-goal-verifier GAP-6/7 (spec Filters: sentinel_paths_keep_goal_active_
+// on_empty_response / session_actor_sentinel_reports_verifier_failure_kind)
+// — REAL session_actor path: factory-wired goal_verifier_llm whose replies
+// are empty, a claimed completion, and the post-turn goal accountant
+// (`maybe_advance_goal_runtime_after_turn`) must (a) keep the goal ACTIVE
+// and (b) surface the structured kind in a durable system note.
+// ─────────────────────────────────────────────────────────────────────────
+struct EmptyReplyVerifier;
+
+#[async_trait::async_trait]
+impl LlmProvider for EmptyReplyVerifier {
+    async fn chat(
+        &self,
+        _m: &[octos_core::Message],
+        _t: &[octos_llm::ToolSpec],
+        _c: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        Ok(octos_llm::ChatResponse {
+            content: None,
+            reasoning_content: Some("thinking…".to_owned()),
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: octos_llm::TokenUsage {
+                input_tokens: 3,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            provider_index: None,
+        })
+    }
+    fn model_id(&self) -> &str {
+        "empty-verifier"
+    }
+    fn provider_name(&self) -> &str {
+        "empty-verifier"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_sentinel_reports_verifier_failure_kind() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let task_store = SessionTaskQueryStore::default();
+    let (mut factory, _out_tx, _out_rx) =
+        build_minimal_actor_factory(&dir, task_store, Some("gap67-prof".to_owned())).await;
+    // Wire the empty-reply verifier into the REAL factory field the
+    // session_actor reads at :5422 — no wrapper shortcut.
+    factory.goal_verifier_llm = Some(Arc::new(EmptyReplyVerifier));
+
+    // Set an active goal for the session the actor will own.
+    let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+    let key = octos_core::SessionKey("gap67-prof:api:gap67-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "gap67-prof".to_owned(),
+            objective: "surface failure kind".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let snapshot_before = orchestrator
+        .goal_verification_snapshot(&key, "gap67-prof")
+        .expect("snapshot before");
+
+    // Drive the actor's real post-turn goal accountant with a CLAIMED
+    // completion in the session history: `maybe_advance_goal_runtime_after_
+    // turn` reads the assistant tail, detects the claim, runs the wired
+    // verifier (empty replies → empty_response, 2/2 attempts), refuses the
+    // completion, and appends the structured system note.
+    let mut session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    session_handle
+        .session_mut()
+        .messages
+        .push(octos_core::Message::assistant(
+            "All tasks complete. <goal:complete>",
+        ));
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+
+    // Build the actor via the registry spawn path.
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("gap67-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        factory.goal_verifier_llm.clone(),
+    );
+    let mut actor = actor;
+    actor
+        .maybe_advance_goal_runtime_after_turn("gap67-prof", None, std::time::Instant::now())
+        .await;
+
+    // (a) the goal stays ACTIVE — an unverified claim never flips it.
+    let after = orchestrator
+        .goal_verification_snapshot(&key, "gap67-prof")
+        .expect("snapshot after");
+    assert_eq!(after.goal_id, snapshot_before.goal_id, "goal not flipped");
+    // (b) the structured failure kind is surfaced in the durable session
+    // history via the canonical Display line.
+    let guard = actor.session_handle.lock().await;
+    let surfaced = guard.session().messages.iter().any(|m| {
+        m.role == octos_core::MessageRole::System
+            && m.content.contains("verifier empty_response (attempt 2/2)")
+    });
+    assert!(
+        surfaced,
+        "session_actor sentinel path must append the structured failure note"
+    );
+    drop(guard);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// merged-review 2026-09-10 Fix 2: a REPLAYED verifier failure must not
+// re-append the durable structured note (same evidence re-checked across
+// turns is a replay, not a new failure event). A NEW failure after changed
+// evidence still appends. Real `maybe_advance_goal_runtime_after_turn`
+// + real durable session files.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_replayed_failure_does_not_duplicate_durable_note() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let task_store = SessionTaskQueryStore::default();
+    let (factory, _out_tx, _out_rx) =
+        build_minimal_actor_factory(&dir, task_store, Some("replay-note-prof".to_owned())).await;
+
+    let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+    let key = octos_core::SessionKey("replay-note-prof:api:replay-note-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "replay-note-prof".to_owned(),
+            objective: "one note per distinct failure".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+
+    // Wire the verifier through the REAL factory field the actor reads.
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    // Actor with a claimed completion in its (durable-backed) history.
+    let mut session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    session_handle
+        .session_mut()
+        .messages
+        .push(octos_core::Message::assistant(
+            "All tasks complete. <goal:complete>",
+        ));
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("replay-note-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        Some(Arc::new(EmptyReplyVerifier)),
+    );
+
+    // Count durable structured notes in the REAL session file.
+    let durable_note_count = |dir: &tempfile::TempDir, key: &octos_core::SessionKey| -> usize {
+        let handle = octos_bus::session::SessionHandle::open(dir.path(), key);
+        handle
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count()
+    };
+
+    let mut actor = actor;
+    // First turn: fresh failure → exactly ONE durable note.
+    actor
+        .maybe_advance_goal_runtime_after_turn("replay-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        durable_note_count(&dir, &key),
+        1,
+        "fresh failure appends one note"
+    );
+
+    // Same evidence again: the wrapper REPLAYS the stored verdict — the
+    // durable note must NOT duplicate (and the actor's in-memory history
+    // stays at one structured note too).
+    actor
+        .maybe_advance_goal_runtime_after_turn("replay-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        durable_note_count(&dir, &key),
+        1,
+        "replayed failure must not re-append the durable note"
+    );
+    {
+        let h = actor.session_handle.lock().await;
+        let in_memory = h
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count();
+        assert_eq!(
+            in_memory, 1,
+            "replayed failure must not duplicate the in-memory note either"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_new_evidence_failure_appends_fresh_note() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let task_store = SessionTaskQueryStore::default();
+    let (factory, _out_tx, _out_rx) =
+        build_minimal_actor_factory(&dir, task_store, Some("fresh-note-prof".to_owned())).await;
+
+    let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+    let key = octos_core::SessionKey("fresh-note-prof:api:fresh-note-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "fresh-note-prof".to_owned(),
+            objective: "fresh note on new failure".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+
+    // Scripted provider: first call EMPTY (fresh failure), then the SAME
+    // evidence replays without consuming more script, and after we change
+    // the session history (new evidence tail), the next call fails again.
+    struct EmptyAlwaysVerifier;
+    #[async_trait::async_trait]
+    impl LlmProvider for EmptyAlwaysVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let mut session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    session_handle
+        .session_mut()
+        .messages
+        .push(octos_core::Message::assistant(
+            "Step one done. <goal:complete>",
+        ));
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("fresh-note-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let mut actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        Some(Arc::new(EmptyAlwaysVerifier)),
+    );
+
+    let durable_note_count = |dir: &tempfile::TempDir, key: &octos_core::SessionKey| -> usize {
+        let handle = octos_bus::session::SessionHandle::open(dir.path(), key);
+        handle
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count()
+    };
+
+    actor
+        .maybe_advance_goal_runtime_after_turn("fresh-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(durable_note_count(&dir, &key), 1, "first failure appends");
+
+    // CHANGED evidence: a different assistant tail → new digest → fresh
+    // (non-replayed) failure → a SECOND durable note.
+    {
+        let mut h = actor.session_handle.lock().await;
+        h.session_mut()
+            .messages
+            .push(octos_core::Message::assistant(
+                "Step two also done now. <goal:complete>",
+            ));
+    }
+    actor
+        .maybe_advance_goal_runtime_after_turn("fresh-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        durable_note_count(&dir, &key),
+        2,
+        "new evidence failure appends a fresh note"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// evening 2026-09-10 recovery regressions (PR #2283 follow-up review):
+// the durable session note must be recoverable across a restart and must
+// not leave a phantom in-memory note when its own persist fails. These run
+// against the CURRENT actor behavior first — both MUST fail (RED) before
+// any behavior change.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// T1 (crash-gap recovery): the verifier ledger already holds the verdict
+/// (written by a direct wrapper call) while the session file does NOT yet
+/// hold the note (the crash window between the ledger append and the note
+/// persist). A NEWLY-BUILT actor over the same session/goal/evidence — with
+/// a REAL completion-claim sentinel — surfaces the durable note without a
+/// second provider call (the idempotent note path recovers the missing
+/// row).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_restart_with_ledger_verdict_but_missing_note_appends_it() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSetRequest, default_agent_orchestrator,
+    };
+
+    struct CountingEmptyVerifier {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingEmptyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let orchestrator = default_agent_orchestrator();
+    let key = octos_core::SessionKey("restart-note-prof:api:restart-note-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "restart-note-prof".to_owned(),
+            objective: "restart note recovery".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+
+    // The REAL completion-claim sentinel (the known-green tests use this
+    // exact shape) — both the pre-crash evidence AND the actor's tail.
+    let claim = "All tasks are complete. <goal:complete>";
+
+    // Phase 1 (pre-crash): ONE direct wrapper call so the verifier ledger
+    // holds the EmptyResponse verdict durably for this evidence. The
+    // session NOTE never lands (we do not run the actor here) — that is
+    // the crash window under test.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let snapshot = orchestrator
+        .goal_verification_snapshot(&key, "restart-note-prof")
+        .expect("snapshot");
+    let first = orchestrator
+        .verify_goal_completion_bounded(
+            &key,
+            "restart-note-prof",
+            &snapshot,
+            std::sync::Arc::new(CountingEmptyVerifier {
+                calls: calls.clone(),
+            }),
+            claim,
+            Some(dir.path()),
+        )
+        .await;
+    assert!(
+        !first.replayed,
+        "precondition: the phase-1 wrapper call is a FRESH verdict"
+    );
+    let provider_calls_phase1 = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        provider_calls_phase1 >= 1,
+        "phase 1 actually called the provider"
+    );
+
+    // Phase 2 (crash-gap): seed the durable claim row FIRST, then build
+    // the actor's handle from a FRESH SessionHandle::open — the claim loads
+    // from the real disk state (no manual RAM fabrication), while the NOTE
+    // row is absent (the crash lost it). The wrapper replays the ledger
+    // verdict (same goal + same evidence digest); the note must still be
+    // appended.
+    let cmid = octos_core::ClientMessageId::new("restart-seed-cmid");
+    octos_bus::session::persist_message_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::assistant_with_thread(claim, octos_core::ThreadId::rooted_at(&cmid)),
+    )
+    .await
+    .expect("seed durable claim row");
+    let loaded = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    assert!(
+        loaded
+            .session()
+            .messages
+            .iter()
+            .any(|m| m.role == octos_core::MessageRole::Assistant && m.content == claim),
+        "fresh reader loaded the durable claim row"
+    );
+    let handle = Arc::new(tokio::sync::Mutex::new(loaded));
+
+    let (factory, _out_tx, _out_rx) = build_minimal_actor_factory(
+        &dir,
+        SessionTaskQueryStore::default(),
+        Some("restart-note-prof".to_owned()),
+    )
+    .await;
+
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("restart-note-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let mut actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        Some(std::sync::Arc::new(CountingEmptyVerifier {
+            calls: calls.clone(),
+        })),
+    );
+
+    actor
+        .maybe_advance_goal_runtime_after_turn("restart-note-prof", None, std::time::Instant::now())
+        .await;
+
+    // No additional provider call: the ledger verdict replayed, not a new
+    // verification.
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        provider_calls_phase1,
+        "the replay must not add provider calls"
+    );
+
+    // The durable session file must now carry the structured failure note.
+    let durable = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    let notes = durable
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.content.contains("goal completion not verified")
+        })
+        .count();
+    assert_eq!(
+        notes, 1,
+        "the crash window between the ledger append and the note persist must not lose the note"
+    );
+}
+
+/// T2 (persist failure): the note's own durable append FAILS through a real
+/// I/O error — the canonical JSONL path is replaced by a DIRECTORY (appends
+/// to a directory fail on every platform; the verifier ledger lives in a
+/// SIBLING directory and is untouched). No phantom in-memory note remains;
+/// after restoring the file, the same-evidence retry persists exactly ONE
+/// note without extra provider calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_note_persist_failure_no_phantom_and_retry_recovers() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSetRequest, default_agent_orchestrator,
+    };
+
+    struct CountingEmptyVerifier {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingEmptyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let orchestrator = default_agent_orchestrator();
+    let key = octos_core::SessionKey("phantom-note-prof:api:phantom-note-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "phantom-note-prof".to_owned(),
+            objective: "no phantom notes".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+
+    let claim = "All tasks are complete. <goal:complete>";
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Create the canonical JSONL on disk with the durable claim row, then
+    // locate it (the tempdir hosts exactly one session).
+    let cmid = octos_core::ClientMessageId::new("seed-claim-cmid");
+    octos_bus::session::persist_message_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::assistant_with_thread(claim, octos_core::ThreadId::rooted_at(&cmid)),
+    )
+    .await
+    .expect("seed durable claim row");
+    let users_dir = dir.path().join("users");
+    let canonical = walkdir_find_session_jsonl(&users_dir).expect("canonical session file on disk");
+
+    let (factory, _out_tx, _out_rx) = build_minimal_actor_factory(
+        &dir,
+        SessionTaskQueryStore::default(),
+        Some("phantom-note-prof".to_owned()),
+    )
+    .await;
+    let session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("phantom-note-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let mut actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        Some(std::sync::Arc::new(CountingEmptyVerifier {
+            calls: calls.clone(),
+        })),
+    );
+
+    // REAL I/O failure: rename the JSONL aside and put an empty DIRECTORY
+    // at its path — appends to a directory fail everywhere; the verifier
+    // ledger (sibling goal-verifier-ledgers/ dir) is unaffected.
+    let backup = canonical.with_extension("jsonl.backup");
+    std::fs::rename(&canonical, &backup).expect("rename jsonl aside");
+    std::fs::create_dir(&canonical).expect("place dir at jsonl path");
+
+    // First turn: fresh failure verdict + note append FAILS (target is a dir).
+    actor
+        .maybe_advance_goal_runtime_after_turn("phantom-note-prof", None, std::time::Instant::now())
+        .await;
+    let calls_after_failure = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        calls_after_failure >= 1,
+        "the failing turn really ran the verifier"
+    );
+
+    // (a) No PHANTOM in-memory note: the memory mirror must not contain a
+    // note whose durable append failed.
+    {
+        let h = actor.session_handle.lock().await;
+        let phantom = h
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count();
+        assert_eq!(
+            phantom, 0,
+            "a failed durable append must not leave a phantom in-memory note"
+        );
+    }
+
+    // (b) Restore the file; the same-evidence replay retries and the
+    // durable file ends with EXACTLY ONE note — with no additional
+    // provider call.
+    std::fs::remove_dir(&canonical).expect("remove dir placeholder");
+    std::fs::rename(&backup, &canonical).expect("restore jsonl");
+    actor
+        .maybe_advance_goal_runtime_after_turn("phantom-note-prof", None, std::time::Instant::now())
+        .await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls_after_failure,
+        "the recovery retry replays the ledger verdict — no extra provider call"
+    );
+    let durable = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    let notes = durable
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.content.contains("goal completion not verified")
+        })
+        .count();
+    assert_eq!(
+        notes, 1,
+        "after the persist failure resolves, exactly one durable note exists"
+    );
+}
+
+fn walkdir_find_session_jsonl(users_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // The test tempdir hosts exactly ONE session; the first .jsonl under
+    // users/ IS the canonical file for it.
+    fn visit(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = visit(&path) {
+                    return Some(found);
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    visit(users_dir)
+}
+
+/// evening T3 (RAM repair): the durable file already carries the note for
+/// this goal/evidence (written by another path — e.g. a previous actor
+/// generation), but THIS actor's in-memory mirror does not. Driving the
+/// verification surfaces (mirrors) the existing durable row into RAM
+/// WITHOUT appending a second durable row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_actor_missing_ram_note_mirrors_existing_durable_row() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSetRequest, default_agent_orchestrator,
+    };
+
+    struct EmptyAlwaysVerifier;
+    #[async_trait::async_trait]
+    impl LlmProvider for EmptyAlwaysVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let orchestrator = default_agent_orchestrator();
+    let key = octos_core::SessionKey("ramfix-prof:api:ramfix-actor".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "ramfix-prof".to_owned(),
+            objective: "mirror missing ram note".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let claim = "All tasks are complete. <goal:complete>";
+
+    // Durable claim row (thread-stamped).
+    let cmid = octos_core::ClientMessageId::new("ramfix-seed-cmid");
+    octos_bus::session::persist_message_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::assistant_with_thread(claim, octos_core::ThreadId::rooted_at(&cmid)),
+    )
+    .await
+    .expect("seed durable claim row");
+
+    // Capture the second actor's mirror BEFORE the other actor appends a
+    // note. A fresh open after that write would already include the note
+    // and would not exercise RAM repair.
+    let handle2 = Arc::new(tokio::sync::Mutex::new(
+        octos_bus::session::SessionHandle::open(dir.path(), &key),
+    ));
+
+    // Phase 1: run the actor ONCE so the verdict lands in the ledger and
+    // the note is persisted durably.
+    let (factory, _out_tx, _out_rx) = build_minimal_actor_factory(
+        &dir,
+        SessionTaskQueryStore::default(),
+        Some("ramfix-prof".to_owned()),
+    )
+    .await;
+    let session_handle = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    let handle = Arc::new(tokio::sync::Mutex::new(session_handle));
+    let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+    let memory = factory.memory.clone();
+    let agent = Arc::new(octos_agent::Agent::new(
+        AgentId::new("ramfix-agent"),
+        factory.llm.clone(),
+        tools,
+        memory,
+    ));
+    let (proxy_tx, _proxy_rx) = mpsc::channel(64);
+    let (_inbox_tx, inbox_rx) = mpsc::channel(8);
+    let (self_tx, _self_rx) = mpsc::channel(8);
+    let mut actor = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        agent,
+        handle,
+        proxy_tx,
+        inbox_rx,
+        self_tx,
+        dir.path().to_path_buf(),
+        Some(Arc::new(EmptyAlwaysVerifier)),
+    );
+    actor
+        .maybe_advance_goal_runtime_after_turn("ramfix-prof", None, std::time::Instant::now())
+        .await;
+    let durable = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    let disk_notes = durable
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.content.contains("goal completion not verified")
+        })
+        .count();
+    assert_eq!(disk_notes, 1, "phase 1 persisted exactly one note");
+
+    // The disk has a note, but this already-open mirror still has none.
+    {
+        let stale = handle2.lock().await;
+        assert!(stale.session().messages.iter().any(|m| m.content == claim));
+        assert!(
+            !stale.session().messages.iter().any(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            }),
+            "repair must start from a genuinely missing RAM note"
+        );
+    }
+    let mut actor2 = crate::session_actor::tests::session_actor_for_goal_test(
+        key.clone(),
+        Arc::new(octos_agent::Agent::new(
+            AgentId::new("ramfix-agent-2"),
+            factory.llm.clone(),
+            octos_agent::ToolRegistry::with_builtins(dir.path()),
+            factory.memory.clone(),
+        )),
+        handle2,
+        {
+            let (proxy2, _rx2) = mpsc::channel(64);
+            proxy2
+        },
+        {
+            let (_tx2, rx2) = mpsc::channel(8);
+            rx2
+        },
+        {
+            let (tx3, _rx3) = mpsc::channel(8);
+            tx3
+        },
+        dir.path().to_path_buf(),
+        Some(Arc::new(EmptyAlwaysVerifier)),
+    );
+    actor2
+        .maybe_advance_goal_runtime_after_turn("ramfix-prof", None, std::time::Instant::now())
+        .await;
+
+    // RAM now mirrors the note (exactly one), and the DURABLE file still
+    // holds exactly one — no duplicate append.
+    {
+        let h = actor2.session_handle.lock().await;
+        let ram_notes = h
+            .session()
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == octos_core::MessageRole::System
+                    && m.content.contains("goal completion not verified")
+            })
+            .count();
+        assert_eq!(ram_notes, 1, "RAM mirrors the existing durable note");
+    }
+    let durable2 = octos_bus::session::SessionHandle::open(dir.path(), &key);
+    let disk_notes2 = durable2
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.content.contains("goal completion not verified")
+        })
+        .count();
+    assert_eq!(disk_notes2, 1, "no duplicate durable note");
 }

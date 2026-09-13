@@ -2678,3 +2678,90 @@ async fn test_unfit_lane_is_skipped_without_breaker_pollution() {
         "skips must not open the unfit lane's breaker"
     );
 }
+
+mod lane_attribution {
+    use std::sync::Arc;
+
+    use octos_core::Message;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::adaptive::{AdaptiveConfig, AdaptiveRouter};
+    use crate::anthropic::AnthropicProvider;
+    use crate::config::ChatConfig;
+    use crate::openai::OpenAIProvider;
+    use crate::provider::LlmProvider;
+    use crate::retry::RetryProvider;
+    use crate::{LlmCallPolicy, with_llm_call_policy};
+
+    async fn refused_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn should_name_every_failed_lane_with_api_style_when_k3_fails_over_to_anthropic_compatible_lane()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("k3 upstream exploded"))
+            .mount(&server)
+            .await;
+        let k3: Arc<dyn LlmProvider> = Arc::new(
+            OpenAIProvider::new("key", "k3")
+                .with_base_url(server.uri())
+                .with_provider_label("moonshot-coding@api"),
+        );
+        let zai: Arc<dyn LlmProvider> = Arc::new(
+            AnthropicProvider::new("key", "glm-5.3")
+                .with_base_url(refused_url().await)
+                .with_provider_label("zai-coding"),
+        );
+        let router = AdaptiveRouter::new(
+            vec![k3, zai],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let result = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            router
+                .chat_stream(&[Message::user("hi")], &[], &ChatConfig::default())
+                .await
+        })
+        .await;
+        let Err(err) = result else {
+            panic!("both lanes fail")
+        };
+
+        let display = err.to_string();
+        let alternate = format!("{err:#}");
+        for rendered in [&display, &alternate] {
+            for needle in [
+                "moonshot-coding@api",
+                "k3",
+                "zai-coding",
+                "glm-5.3",
+                "api_style=anthropic_messages",
+                "api_style=openai_chat_completions",
+            ] {
+                assert!(
+                    rendered.contains(needle),
+                    "missing {needle:?} in: {rendered}"
+                );
+            }
+            assert!(
+                !rendered.contains("request to Anthropic"),
+                "a lane the user never configured must not be named: {rendered}"
+            );
+        }
+        assert!(
+            RetryProvider::should_failover(&err),
+            "wrapping must keep the typed lane error classifiable: {alternate}"
+        );
+    }
+}

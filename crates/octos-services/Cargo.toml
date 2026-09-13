@@ -30,6 +30,7 @@ futures = { workspace = true }
 test-util = []
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

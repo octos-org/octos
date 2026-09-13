@@ -44,6 +44,12 @@ Octos 是一个 Rust 原生的 AI 智能体平台，支持三种运行模式：
 - **`octos gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、Matrix、飞书、邮件、微信、企业微信、企业微信群机器人、QQ 机器人、Twilio）。
 - **`octos chat`** — 交互式 CLI 聊天，用于开发和测试。
 
+chat 和 `octos acp` 通过进程内连接使用与 OctosCode 相同的 OUP 会话 runtime，
+共享历史、压缩、权限和取消逻辑，不再各自执行另一套 Agent 循环。
+两者需要默认启用的 `api` feature，无需额外启动服务进程或网络监听。
+ACP 支持 `session/load` 回放和工具权限请求；OUP 结构化用户提问仍由
+终端 chat／OctosCode 提供交互。
+
 ### 架构
 
 ```
@@ -1742,6 +1748,8 @@ octos skills install user/repo --force
 octos skills --profile my-bot install user/repo
 ```
 
+`user/repo` 之后的路径相对仓库根目录解析，因此嵌套目录中的技能需写完整路径——例如位于 `skills/my-skill` 的技能用 `octos skills install user/repo/skills/my-skill` 安装。
+
 **安装过程：**
 1. 尝试从技能注册表下载预编译二进制文件（SHA-256 验证）
 2. 如果存在 `Cargo.toml`，回退到 `cargo build --release`
@@ -2048,7 +2056,7 @@ chmod +x .octos/skills/translator/main
   ],
 
   // 智能体设置
-  "max_iterations": 50,
+  "max_iterations": 0, // 交互回合不设硬上限；spawn/MCP 仍有独立上限
 
   // 嵌入（用于记忆中的向量搜索）。
   // 远程，OpenAI 兼容：
@@ -2125,6 +2133,11 @@ chmod +x .octos/skills/translator/main
 
 | 变量 | 说明 |
 |------|------|
+| **长时间运行回合** | |
+| `OCTOS_CONVERGENCE_LLM_CALLS` | 按 LLM 调用次数触发无工具反思（默认 `20`） |
+| `OCTOS_CONVERGENCE_ACTIVE_TOKENS` | 按非缓存输入 + 输出 token 触发反思（默认 `100000`） |
+| `OCTOS_CONVERGENCE_SECS` | 按经过秒数触发反思（默认 `300`） |
+| `OCTOS_FILE_CHURN_THRESHOLD` | 同一文件成功修改多少次后提前反思；第二次越阈同时请求模型/provider 升级（默认 `5`） |
 | **LLM 提供商** | |
 | `ANTHROPIC_API_KEY` | Anthropic（Claude）API 密钥 |
 | `OPENAI_API_KEY` | OpenAI API 密钥 |

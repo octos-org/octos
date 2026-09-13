@@ -443,8 +443,20 @@ impl LlmProvider for RetryProvider {
     fn provider_metadata_for_index(
         &self,
         provider_index: Option<usize>,
-    ) -> crate::ProviderMetadata {
+    ) -> crate::types::ProviderMetadata {
         self.inner.provider_metadata_for_index(provider_index)
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.inner.provider_lane_count()
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.inner.api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.inner.supports_semantic_checkpoint_hints()
     }
 
     fn report_late_failure(&self) {
@@ -1012,7 +1024,7 @@ mod tests {
     // These drive a real `reqwest` client at a local TCP server that fails
     // the request in the same way z.ai's endpoint does under load, then wrap
     // the error EXACTLY like `anthropic.rs`
-    // (`.send().await.wrap_err("failed to send streaming request to Anthropic")`)
+    // (`.send().await.wrap_err(crate::provider::transport_error_message(true, "zai", "glm-5.2", crate::provider::ApiStyle::AnthropicMessages))`)
     // and assert the retry/failover verdict.
     // ──────────────────────────────────────────────────────────────────────
     use eyre::WrapErr;
@@ -1042,7 +1054,12 @@ mod tests {
                 .await;
             return res
                 .map(|_| ())
-                .wrap_err("failed to send streaming request to Anthropic")
+                .wrap_err(crate::provider::transport_error_message(
+                    true,
+                    "zai",
+                    "glm-5.2",
+                    crate::provider::ApiStyle::AnthropicMessages,
+                ))
                 .unwrap_err();
         }
 
@@ -1067,7 +1084,12 @@ mod tests {
             .await;
         let _ = accept.await;
         res.map(|_| ())
-            .wrap_err("failed to send streaming request to Anthropic")
+            .wrap_err(crate::provider::transport_error_message(
+                true,
+                "zai",
+                "glm-5.2",
+                crate::provider::ApiStyle::AnthropicMessages,
+            ))
             .unwrap_err()
     }
 
@@ -1124,7 +1146,12 @@ mod tests {
             .send()
             .await
             .map(|_| ())
-            .wrap_err("failed to send streaming request to Anthropic")
+            .wrap_err(crate::provider::transport_error_message(
+                true,
+                "zai",
+                "glm-5.2",
+                crate::provider::ApiStyle::AnthropicMessages,
+            ))
             .unwrap_err();
 
         let is_timeout = err
@@ -1188,7 +1215,12 @@ mod tests {
             .send()
             .await
             .map(|_| ())
-            .wrap_err("failed to send streaming request to Anthropic")
+            .wrap_err(crate::provider::transport_error_message(
+                true,
+                "zai",
+                "glm-5.2",
+                crate::provider::ApiStyle::AnthropicMessages,
+            ))
             .unwrap_err();
         accept.abort();
 
@@ -1200,5 +1232,63 @@ mod tests {
             RetryProvider::should_failover(&err),
             "request timeout must failover to another provider: {err:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_tests {
+    use std::sync::Arc;
+
+    use super::RetryProvider;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::TwoLaneStub;
+
+    #[test]
+    fn should_forward_provider_metadata_for_index_to_inner_lane_when_wrapped() {
+        let wrapped = RetryProvider::new(Arc::new(TwoLaneStub));
+        let metadata = wrapped.provider_metadata_for_index(Some(1));
+        assert_eq!(
+            (metadata.provider.as_str(), metadata.model.as_str()),
+            ("lane-b", "model-b"),
+            "slot 1 identity must survive the wrapper: {metadata:?}"
+        );
+        assert_eq!(metadata.endpoint.as_deref(), Some("b.example"));
+        assert_eq!(wrapped.provider_metadata().provider, "lane-a");
+    }
+}
+
+#[cfg(test)]
+mod lane_summary_classification_tests {
+    use super::RetryProvider;
+    use crate::error::{LlmError, LlmErrorKind};
+
+    /// A composite provider wraps the last lane's error with an all-lanes
+    /// summary; the typed kind/status underneath must stay visible to both
+    /// classifiers so failover/backoff semantics are unchanged.
+    #[test]
+    fn should_still_classify_wrapped_lane_errors_when_summary_context_is_added() {
+        let rate_limited: eyre::Report = LlmError::new(
+            LlmErrorKind::RateLimited {
+                retry_after_secs: Some(2),
+            },
+            "slow down",
+        )
+        .with_provider("zai-coding/glm-5.3")
+        .into();
+        let wrapped = rate_limited
+            .wrap_err("all lanes failed: moonshot-coding@api/k3 (api_style=openai_chat_completions): boom; zai-coding/glm-5.3 (api_style=anthropic_messages): slow down");
+        assert!(RetryProvider::should_failover(&wrapped));
+        assert!(RetryProvider::is_retryable_error(&wrapped));
+
+        let server_error: eyre::Report =
+            LlmError::new(LlmErrorKind::ServerError { status: 503 }, "unavailable").into();
+        let wrapped = server_error
+            .wrap_err("all lanes failed: a/b (api_style=openai_chat_completions): unavailable");
+        assert!(RetryProvider::should_failover(&wrapped));
+        assert!(RetryProvider::is_retryable_error(&wrapped));
+
+        let filtered: eyre::Report = LlmError::new(LlmErrorKind::ContentFiltered, "blocked").into();
+        let wrapped = filtered.wrap_err("lane failed: a/b (api_style=anthropic_messages): blocked");
+        assert!(!RetryProvider::should_failover(&wrapped));
     }
 }

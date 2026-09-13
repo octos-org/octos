@@ -43,6 +43,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use octos_llm::ProviderRouter;
 use serde::Deserialize;
 
 use crate::graph::{HandlerKind, PipelineGraph};
@@ -127,12 +128,28 @@ impl ModelPools {
 /// operator's explicit choice takes precedence so this remains a default
 /// rather than a policy.
 ///
-/// Returns `Ok(())` even when no catalog is found or no models match —
-/// the policy is "best-effort default-fill, never block a pipeline".
-/// Tracing emits a single `info!` line indicating how many nodes were
-/// touched (or `debug!` for the no-op cases) so operators can confirm
-/// the assignment fired without scraping per-node logs.
-pub fn assign_from_catalog_dir(graph: &mut PipelineGraph, data_dir: &Path) {
+/// When `router` is present, candidates are filtered to models the
+/// `ProviderRouter` can actually `resolve` (#1901). The persisted
+/// `model_catalog.json` is a deliberate superset (researched entries +
+/// live scores), so without this filter a profile whose router registers
+/// only lane keys (`cheap`/`strong`) gets nodes assigned catalog models
+/// it can never resolve — the executor then silently degrades every such
+/// node to the default provider. Filtering uses the router's own
+/// resolution semantics (exact → case-insensitive → prefix split →
+/// suffix alias), NOT `keys()` membership, so lane keys and aliases keep
+/// passing; the pre-execution validator is intentionally not narrowed.
+/// `None` (no router) fails open: assignment behaves as before.
+///
+/// Never blocks a pipeline: a missing catalog, no healthy models, or a
+/// fully-unresolvable pool each leave the graph untouched (with a
+/// `debug!` line). Tracing emits a single `info!` line indicating how
+/// many nodes were touched so operators can confirm the assignment
+/// fired without scraping per-node logs.
+pub fn assign_from_catalog_dir(
+    graph: &mut PipelineGraph,
+    data_dir: &Path,
+    router: Option<&ProviderRouter>,
+) {
     let Some(catalog) = load_catalog(data_dir) else {
         tracing::debug!(
             data_dir = %data_dir.display(),
@@ -141,8 +158,11 @@ pub fn assign_from_catalog_dir(graph: &mut PipelineGraph, data_dir: &Path) {
         return;
     };
 
-    let Some(pools) = build_pools(&catalog) else {
-        tracing::debug!("model_assignment: catalog had no healthy strong/fast models");
+    let Some(pools) = build_pools(&catalog, router) else {
+        tracing::debug!(
+            "model_assignment: no usable strong/fast pool \
+             (unhealthy or unresolvable by the provider router)"
+        );
         return;
     };
 
@@ -216,15 +236,42 @@ fn load_catalog(data_dir: &Path) -> Option<ModelCatalog> {
     None
 }
 
-fn build_pools(catalog: &ModelCatalog) -> Option<ModelPools> {
+fn build_pools(catalog: &ModelCatalog, router: Option<&ProviderRouter>) -> Option<ModelPools> {
     // Keep only entries with passable stability so we don't herd-route
     // to a broken provider. The 0.5 threshold matches the historical
     // plugin so behavior is preserved.
-    let healthy: Vec<&CatalogEntry> = catalog
+    let mut healthy: Vec<&CatalogEntry> = catalog
         .models
         .iter()
         .filter(|m| m.stability > 0.5)
         .collect();
+
+    // #1901 Layer 1: an assignment is only useful if the executor can later
+    // resolve it, so keep candidates to what THIS profile's ProviderRouter
+    // resolves. The persisted `model_catalog.json` is a deliberate superset
+    // (all researched entries + live scores for configured lanes), so an
+    // unfiltered pool hands nodes models the router never registered — every
+    // such node then silently degrades to the default provider at execution
+    // time. The predicate is the router's own `resolve` (exact →
+    // case-insensitive → prefix split → suffix alias), NOT `keys()`
+    // membership: the router resolves lane keys and aliases that a literal
+    // membership check rejects (#1904's defect). With no router, fail open —
+    // assignment keeps using the catalog as-is.
+    if let Some(router) = router {
+        let before = healthy.len();
+        healthy.retain(|m| router.resolve(m.model_key()).is_ok());
+        let dropped = before - healthy.len();
+        if dropped > 0 {
+            // Sorted so repeated runs diff cleanly (`keys()` iterates a HashMap).
+            let mut router_keys = router.keys();
+            router_keys.sort();
+            tracing::warn!(
+                dropped,
+                ?router_keys,
+                "model_assignment: skipped healthy catalog models the provider router cannot resolve"
+            );
+        }
+    }
 
     let mut strong: Vec<&CatalogEntry> = healthy
         .iter()
@@ -384,11 +431,17 @@ fn assign_to_graph(graph: &mut PipelineGraph, pools: &ModelPools) {
     }
 
     if assigned > 0 {
+        // #1901 Layer 4: log the lane→model pools alongside the counts, so a
+        // later "no provider registered for key '…'" resolution failure can
+        // be traced back to the lane (strong/fast) that produced the model
+        // in one grep instead of re-deriving the assignment by hand.
         tracing::info!(
             assigned,
             skipped_explicit,
             strong_pool_size = pools.strong.len(),
             fast_pool_size = pools.fast.len(),
+            strong_pool = ?pools.strong,
+            fast_pool = ?pools.fast,
             "model_assignment: applied defaults to {} pipeline node attribute(s)",
             assigned
         );
@@ -555,10 +608,195 @@ mod tests {
                 },
             ],
         };
-        let pools = build_pools(&catalog).expect("non-empty");
+        let pools = build_pools(&catalog, None).expect("non-empty");
         // The unstable strong should have been filtered out — only
         // healthy-strong survives.
         assert_eq!(pools.strong, vec!["healthy-strong".to_string()]);
         assert_eq!(pools.fast, vec!["fast-a".to_string()]);
+    }
+
+    /// Minimal lane provider for router-backed tests: `resolve()` only
+    /// clones Arcs, `chat` is never reached.
+    struct LaneStub(&'static str);
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for LaneStub {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("assignment must not call chat()")
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatStream> {
+            unreachable!("assignment must not call chat_stream()")
+        }
+
+        fn model_id(&self) -> &str {
+            self.0
+        }
+
+        fn provider_name(&self) -> &str {
+            self.0
+        }
+    }
+
+    /// A router registering only the given lane keys, mirroring a profile
+    /// whose research lanes are `cheap`/`strong` but nothing else.
+    fn lane_router(keys: &[&str]) -> std::sync::Arc<ProviderRouter> {
+        use std::sync::Arc;
+        let router = Arc::new(ProviderRouter::new());
+        for key in keys {
+            router.register(key, Arc::new(LaneStub("lane")));
+        }
+        router
+    }
+
+    fn write_catalog(dir: &Path, models_json: &str) {
+        std::fs::write(
+            dir.join("model_catalog.json"),
+            format!(r#"{{"models":[{models_json}]}}"#),
+        )
+        .unwrap();
+    }
+
+    /// #1901 Layer 1: the persisted `model_catalog.json` is a deliberate
+    /// superset, so a profile whose router registers only lane keys
+    /// (`cheap`/`strong`) must not have those catalog models assigned to
+    /// nodes — every assignment would be unresolvable at execution time and
+    /// silently run on the default provider instead. Unset nodes stay unset
+    /// (the documented no-catalog behavior); explicit models keep winning.
+    #[test]
+    fn unregistered_catalog_models_are_never_assigned() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(
+            dir.path(),
+            concat!(
+                r#"{"provider":"x/qwen3-max","type":"strong","stability":0.99,"score":0.10},"#,
+                r#"{"provider":"y/kimi-fast","type":"fast","stability":0.95,"score":0.15}"#,
+            ),
+        );
+        let router = lane_router(&["cheap", "strong"]);
+
+        let mut g = graph_with(vec![
+            n("plan_and_search", HandlerKind::DynamicParallel),
+            n("search_news", HandlerKind::Codergen),
+            (
+                "analyze".into(),
+                PipelineNode {
+                    id: "analyze".into(),
+                    handler: HandlerKind::Codergen,
+                    model: Some("operator-pinned".into()),
+                    ..Default::default()
+                },
+            ),
+            n("synthesize", HandlerKind::Codergen),
+        ]);
+        assign_from_catalog_dir(&mut g, dir.path(), Some(&router));
+
+        for id in ["plan_and_search", "search_news", "synthesize"] {
+            assert!(
+                g.nodes[id].model.is_none(),
+                "node `{id}` must not be assigned an unregistered catalog model"
+            );
+        }
+        assert_eq!(g.nodes["analyze"].model.as_deref(), Some("operator-pinned"));
+        assert!(
+            g.nodes["plan_and_search"].planner_model.is_none(),
+            "the strong pool was entirely unregistered, so no planner model either"
+        );
+    }
+
+    /// The filter uses the router's own resolution semantics (exact →
+    /// case-insensitive → prefix split → suffix alias), NOT `keys()`
+    /// membership — narrowing to `keys()` was the #1904 defect, because the
+    /// router resolves lane keys and aliases a literal membership check
+    /// rejects. `moonshotai/kimi-k2.5` registered as a compound key keeps a
+    /// `moonshotai/kimi-k2.5` catalog entry assignable via the suffix-alias
+    /// arm, while `qwen3-max` (resolvable by nothing) is skipped.
+    #[test]
+    fn router_filter_uses_resolution_semantics_not_key_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(
+            dir.path(),
+            concat!(
+                r#"{"provider":"x/qwen3-max","type":"strong","stability":0.99,"score":0.05},"#,
+                r#"{"provider":"moonshotai/kimi-k2.5","type":"strong","stability":0.98,"score":0.10}"#,
+            ),
+        );
+        let router = lane_router(&["moonshotai/kimi-k2.5", "cheap"]);
+
+        let mut g = graph_with(vec![n("synthesize", HandlerKind::Codergen)]);
+        assign_from_catalog_dir(&mut g, dir.path(), Some(&router));
+
+        assert_eq!(
+            g.nodes["synthesize"].model.as_deref(),
+            Some("kimi-k2.5"),
+            "the resolvable catalog model must be assigned (via the router's \
+             suffix-alias arm), not skipped for not being a literal router key"
+        );
+    }
+
+    /// Fails open: with no router in play, assignment keeps using the
+    /// catalog as-is (#1902's tolerance semantics — a router-less profile
+    /// must not lose strong/fast defaults).
+    #[test]
+    fn absent_router_keeps_catalog_assignment_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(
+            dir.path(),
+            r#"{"provider":"x/qwen3-max","type":"strong","stability":0.99,"score":0.10}"#,
+        );
+
+        let mut g = graph_with(vec![n("synthesize", HandlerKind::Codergen)]);
+        assign_from_catalog_dir(&mut g, dir.path(), None);
+
+        assert_eq!(
+            g.nodes["synthesize"].model.as_deref(),
+            Some("qwen3-max"),
+            "no router ⇒ no new strictness; the catalog pool still fills unset nodes"
+        );
+    }
+
+    /// The DynamicParallel `model=` attribute is a comma-joined POOL, so the
+    /// filter must apply per entry: only resolvable fast-lane models may end
+    /// up in the joined string (every entry is round-robined onto a worker
+    /// that later resolves it individually).
+    #[test]
+    fn dynamic_parallel_pool_joins_only_resolvable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(
+            dir.path(),
+            concat!(
+                r#"{"provider":"x/qwen3-max","type":"strong","stability":0.99,"score":0.10},"#,
+                r#"{"provider":"y/kimi-fast","type":"fast","stability":0.95,"score":0.15},"#,
+                r#"{"provider":"z/gpt-4o-mini","type":"fast","stability":0.97,"score":0.20}"#,
+            ),
+        );
+        let router = lane_router(&["cheap", "strong", "kimi-fast"]);
+
+        let mut g = graph_with(vec![n("plan_and_search", HandlerKind::DynamicParallel)]);
+        assign_from_catalog_dir(&mut g, dir.path(), Some(&router));
+
+        // qwen3-max (strong pool) and gpt-4o-mini (fast pool) are
+        // unregistered → skipped; kimi-fast survives. The strong pool is
+        // empty, so it aliases to the surviving fast pool.
+        assert_eq!(
+            g.nodes["plan_and_search"].model.as_deref(),
+            Some("kimi-fast"),
+            "only router-resolvable entries may appear in the worker pool"
+        );
+        assert_eq!(
+            g.nodes["plan_and_search"].planner_model.as_deref(),
+            Some("kimi-fast"),
+            "empty strong pool aliases to the surviving fast pool (existing behavior)"
+        );
     }
 }

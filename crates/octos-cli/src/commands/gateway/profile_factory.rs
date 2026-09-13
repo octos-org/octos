@@ -41,6 +41,8 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "VERTEX_BASE_URL",
     "DASHSCOPE_API_KEY",
     "DASHSCOPE_BASE_URL",
+    "ARK_API_KEY",
+    "ARK_BASE_URL",
 ];
 
 /// Google / Vertex credential material: the raw service-account JSON, the
@@ -154,6 +156,30 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
             .or_else(|| std::env::var(key).ok())
         {
             push_env_once(&mut env, *key, value);
+        }
+    }
+
+    // Give first-party skills the same non-secret model selection that the
+    // profile runtime uses. Skills still declare these names in their manifest
+    // before the strict environment gate will expose them, and an explicit
+    // skill-specific override remains free to take precedence inside the
+    // skill. Provider credentials continue through the existing, separately
+    // allowlisted secret path above.
+    if let Some(primary) = profile
+        .config
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.primary.as_ref())
+    {
+        if let Some(provider) = primary
+            .family_id
+            .as_deref()
+            .or_else(|| primary.model_id.as_deref().and_then(detect_provider))
+        {
+            push_env_once(&mut env, "OCTOS_PROFILE_LLM_PROVIDER", provider.to_string());
+        }
+        if let Some(model) = primary.model_id.as_deref() {
+            push_env_once(&mut env, "OCTOS_PROFILE_LLM_MODEL", model.to_string());
         }
     }
 
@@ -1187,6 +1213,42 @@ mod tests {
         assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
         assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
+    }
+
+    #[test]
+    fn profile_plugin_env_forwards_primary_llm_selection_to_declaring_skills() {
+        let profile = UserProfile {
+            id: "skill-llm".to_string(),
+            name: "Skill LLM".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("google".to_string()),
+                        model_id: Some("gemini-3.6-flash".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(env.contains(&(
+            "OCTOS_PROFILE_LLM_PROVIDER".to_string(),
+            "google".to_string()
+        )));
+        assert!(env.contains(&(
+            "OCTOS_PROFILE_LLM_MODEL".to_string(),
+            "gemini-3.6-flash".to_string()
+        )));
     }
 
     #[test]

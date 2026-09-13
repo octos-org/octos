@@ -21,7 +21,8 @@ header = """
  *    Never use a handle after octos_runtime_free(); never free it twice or
  *    concurrently with any other call on the same handle. Free it from a plain
  *    (non-async) thread.
- *  - Strings returned by octos_run_task()/octos_embed() are owned by YOU and
+ *  - Strings returned by octos_run_task()/octos_embed() or
+ *    octos_take_last_partial_result() are owned by YOU and
  *    must be freed, UNMODIFIED, with octos_string_free() -- never free(3),
  *    never twice, and do not alter the bytes or NUL terminator before freeing.
  *  - const char* from octos_last_error()/octos_version() must NOT be freed.

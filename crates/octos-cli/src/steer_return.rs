@@ -97,6 +97,8 @@ mod tests {
             turn_id: turn_id.clone(),
             code: "interrupted".into(),
             message: "turn interrupted by client".into(),
+            token_usage: None,
+            partial_result: None,
         })
         .into_rpc_notification()
         .expect("serialize turn/error");

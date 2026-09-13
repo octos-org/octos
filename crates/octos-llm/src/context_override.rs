@@ -79,8 +79,20 @@ impl LlmProvider for ContextWindowOverride {
     fn provider_metadata_for_index(
         &self,
         provider_index: Option<usize>,
-    ) -> crate::ProviderMetadata {
+    ) -> crate::types::ProviderMetadata {
         self.inner.provider_metadata_for_index(provider_index)
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.inner.provider_lane_count()
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.inner.api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.inner.supports_semantic_checkpoint_hints()
     }
 
     fn report_late_failure(&self) {
@@ -131,5 +143,27 @@ mod tests {
         assert_eq!(overridden.context_window(), 4_000);
         assert_eq!(overridden.model_id(), "test-model");
         assert_eq!(overridden.provider_name(), "test");
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_tests {
+    use std::sync::Arc;
+
+    use super::ContextWindowOverride;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::TwoLaneStub;
+
+    #[test]
+    fn should_forward_provider_metadata_for_index_to_inner_lane_when_wrapped() {
+        let wrapped = ContextWindowOverride::new(Arc::new(TwoLaneStub), 4_000);
+        let metadata = wrapped.provider_metadata_for_index(Some(1));
+        assert_eq!(
+            (metadata.provider.as_str(), metadata.model.as_str()),
+            ("lane-b", "model-b"),
+            "slot 1 identity must survive the wrapper: {metadata:?}"
+        );
+        assert_eq!(metadata.endpoint.as_deref(), Some("b.example"));
+        assert_eq!(wrapped.provider_metadata().provider, "lane-a");
     }
 }

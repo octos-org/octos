@@ -595,13 +595,14 @@ impl CodergenHandler {
     /// the resolved provider is wrapped with capability-compatible fallbacks.
     /// This ensures that if the primary model times out or errors, the pipeline
     /// automatically falls back to another provider with sufficient max_output_tokens.
-    fn resolve_provider(&self, model: Option<&str>) -> Result<Arc<dyn LlmProvider>> {
+    fn resolve_provider(&self, model: Option<&str>, node_id: &str) -> Result<Arc<dyn LlmProvider>> {
         match (model, &self.provider_router) {
             (Some(model_key), Some(router)) => match router.resolve(model_key) {
                 Ok(primary) => {
                     let fallbacks = router.compatible_fallbacks(model_key);
                     if !fallbacks.is_empty() {
                         info!(
+                            node = node_id,
                             model = model_key,
                             fallback_count = fallbacks.len(),
                             "pipeline node provider resolved with fallbacks"
@@ -619,6 +620,7 @@ impl CodergenHandler {
                 // partially-configured (or absent) research lane still runs.
                 Err(_) => {
                     warn!(
+                        node = node_id,
                         model = model_key,
                         "pipeline node model not in provider router; using default provider"
                     );
@@ -627,6 +629,7 @@ impl CodergenHandler {
             },
             (Some(model_key), None) => {
                 warn!(
+                    node = node_id,
                     model = model_key,
                     "model override specified but no provider router; using default"
                 );
@@ -646,7 +649,7 @@ impl Handler for CodergenHandler {
         let worker_id = AgentId::new(format!("pipeline-{}-{worker_num}", node.id));
 
         // Resolve LLM provider
-        let base_provider = self.resolve_provider(node.model.as_deref())?;
+        let base_provider = self.resolve_provider(node.model.as_deref(), &node.id)?;
         let provider: Arc<dyn LlmProvider> = match node.context_window {
             Some(cw) => Arc::new(ContextWindowOverride::new(base_provider, cw)),
             None => base_provider,
@@ -1603,7 +1606,9 @@ mod tests {
         .with_provider_router(router);
 
         // Absent key ("cheap" not registered) → coding default, node still runs.
-        let fallback = handler.resolve_provider(Some("cheap")).unwrap();
+        let fallback = handler
+            .resolve_provider(Some("cheap"), "test-node")
+            .unwrap();
         assert_eq!(
             fallback.model_id(),
             "coding-default",
@@ -1611,7 +1616,9 @@ mod tests {
         );
 
         // Present key ("strong") → the research lane, NOT the coding default.
-        let resolved = handler.resolve_provider(Some("strong")).unwrap();
+        let resolved = handler
+            .resolve_provider(Some("strong"), "test-node")
+            .unwrap();
         assert_ne!(
             resolved.model_id(),
             "coding-default",
@@ -1619,7 +1626,7 @@ mod tests {
         );
 
         // No model key → the shared coding provider (unchanged behavior).
-        let default = handler.resolve_provider(None).unwrap();
+        let default = handler.resolve_provider(None, "test-node").unwrap();
         assert_eq!(default.model_id(), "coding-default");
     }
 

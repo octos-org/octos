@@ -163,6 +163,33 @@ pub fn compose_memory_segment(memory_ctx: &str, include_capture_policy: bool) ->
     }
 }
 
+/// Stable instruction half of the memory prompt. OUP keeps this in System for
+/// the lifetime of a prompt-cache epoch even when the injected memory payload
+/// changes between turns.
+pub fn stable_memory_instructions(include_capture_policy: bool) -> String {
+    match include_capture_policy {
+        true => {
+            format!("{MEMORY_USE_GUIDANCE}\n{MEMORY_USAGE_FEEDBACK}\n\n{MEMORY_CAPTURE_POLICY}")
+        }
+        false => format!("{MEMORY_USE_GUIDANCE}\n{MEMORY_USAGE_FEEDBACK}"),
+    }
+}
+
+/// Recover the volatile memory payload from the legacy combined named
+/// segment. This is exact for values produced by [`compose_memory_segment`]
+/// and fail-safe for custom/older segment content (the whole value is treated
+/// as data rather than promoted back to System authority).
+pub fn volatile_memory_content(rendered: &str, include_capture_policy: bool) -> String {
+    if rendered.is_empty() || rendered == MEMORY_CAPTURE_POLICY {
+        return String::new();
+    }
+    let stable = stable_memory_instructions(include_capture_policy);
+    rendered
+        .strip_suffix(&format!("\n\n{stable}"))
+        .unwrap_or(rendered)
+        .to_owned()
+}
+
 #[async_trait::async_trait]
 impl PromptSegmentProvider for MemorySegmentProvider {
     fn segment_name(&self) -> &str {
@@ -226,6 +253,16 @@ mod tests {
             .unwrap();
         let refreshed = provider.refresh().await;
         assert!(refreshed.is_some_and(|c| c.contains("version two")));
+    }
+
+    #[test]
+    fn stable_and_volatile_memory_halves_roundtrip_combined_segment() {
+        for capture in [false, true] {
+            let combined = compose_memory_segment("remember this", capture);
+            assert_eq!(volatile_memory_content(&combined, capture), "remember this");
+            assert!(!stable_memory_instructions(capture).contains("remember this"));
+        }
+        assert_eq!(volatile_memory_content(MEMORY_CAPTURE_POLICY, true), "");
     }
 
     #[tokio::test]

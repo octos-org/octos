@@ -20,6 +20,7 @@ pub(crate) mod master_continuation_scheduler;
 pub(crate) mod monitor_runtime;
 pub(crate) mod specialist_runner;
 pub(crate) mod supervisor_store;
+pub(crate) mod workspace_scope;
 
 /// Stable, collision-resistant filename-safe hash of a session id.
 /// Renders as 16 hex chars (64 bits) from `DefaultHasher` (SipHash-1-3).

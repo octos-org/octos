@@ -17,7 +17,7 @@ const CURRENT_SESSION_SCHEMA: u32 = 1;
 
 /// Observer callback invoked AFTER a successful durable commit by
 /// [`SessionManager::add_message_with_seq`] (and the equivalent
-/// `SessionHandle` path). Implements the post-fsync hook UPCR-2026-012's
+/// `SessionHandle` path). Implements the post-commit hook UPCR-2026-012's
 /// `message/persisted` notification dispatches through.
 ///
 /// Strict-ordering invariant: `add_message_with_seq` calls observers
@@ -71,12 +71,47 @@ fn current_message_commit_observer() -> Option<MessageCommitObserver> {
         .clone()
 }
 
+type ScopedCommitObservers = std::collections::HashMap<
+    PathBuf,
+    std::sync::Weak<dyn Fn(&SessionKey, &Message, usize) + Send + Sync>,
+>;
+
+fn scoped_commit_observers() -> &'static std::sync::Mutex<ScopedCommitObservers> {
+    static OBSERVERS: std::sync::OnceLock<std::sync::Mutex<ScopedCommitObservers>> =
+        std::sync::OnceLock::new();
+    OBSERVERS.get_or_init(Default::default)
+}
+
+/// Bind an observer to a runtime's storage root. The runtime must retain the
+/// supplied Arc; weak registration never keeps a closed runtime alive.
+pub fn set_scoped_message_commit_observer(data_dir: &Path, observer: &MessageCommitObserver) {
+    let root = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_owned());
+    let mut observers = scoped_commit_observers().lock().unwrap();
+    observers.retain(|_, observer| observer.strong_count() > 0);
+    observers.insert(root, std::sync::Arc::downgrade(observer));
+}
+
 /// Fire the observer if installed. Panics inside the observer are caught
 /// (best-effort) so a faulty subscriber cannot poison the commit path. The
 /// commit has already succeeded by the time we get here — observer failure
 /// is fan-out failure, not commit failure.
-fn notify_message_commit(key: &SessionKey, message: &Message, committed_seq: usize) {
-    let Some(observer) = current_message_commit_observer() else {
+fn notify_message_commit(
+    data_dir: &Path,
+    key: &SessionKey,
+    message: &Message,
+    committed_seq: usize,
+) {
+    let root = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_owned());
+    let scoped = scoped_commit_observers()
+        .lock()
+        .unwrap()
+        .get(&root)
+        .cloned();
+    let observer = match scoped {
+        Some(observer) => observer.upgrade(),
+        None => current_message_commit_observer(),
+    };
+    let Some(observer) = observer else {
         return;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -114,6 +149,32 @@ fn rewrite_tmp_path(target: &Path) -> PathBuf {
     let pid = std::process::id();
     let seq = REWRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     target.with_extension(format!("jsonl.{pid}-{seq}.tmp"))
+}
+
+/// Seal a torn tail before appending: if the file is non-empty and does
+/// not end in a newline (a crash split an earlier write), write the
+/// missing terminator first so the next row can never fuse with the torn
+/// bytes into one unparseable line. The torn bytes are preserved, never
+/// truncated — they may be a complete row that merely lost its
+/// terminator; the read path skips what it cannot parse. Mirrors
+/// `supervisor_store::write_rows_sealed_locked`.
+///
+/// Callers serialize appends per session key (the persist lock), like the
+/// supervisor store's append lock; the seal does not defend against
+/// unsynchronized cross-process writers to the same file.
+///
+/// O_APPEND: the sealing write lands at EOF regardless of the read seek.
+fn seal_torn_tail(file: &mut std::fs::File, file_len: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    if file_len > 0 {
+        file.seek(SeekFrom::Start(file_len - 1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(())
 }
 
 /// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
@@ -1355,19 +1416,21 @@ impl SessionManager {
             record_session_persist("failed");
             return Err(error);
         }
+        let observer_root = self.data_dir();
         let session = self.get_or_create(key).await;
         session.messages.push(message);
         session.updated_at = Utc::now();
         record_session_persist("committed");
         let committed_seq = session.messages.len().saturating_sub(1);
-        // UPCR-2026-012: post-fsync observer fan-out. Fires AFTER the
+        // UPCR-2026-012: post-commit observer fan-out. Fires AFTER the
         // append_to_disk above succeeded and the in-memory mirror is
         // updated, so a `message/persisted` notification reflects a row
-        // that is durably visible. A failed disk write returns above
-        // before this point, so the observer never sees a row that did
-        // not commit.
+        // the OS has accepted (the append write returned; per-append
+        // fsync is deliberately not done). A failed disk write returns
+        // above before this point, so the observer never sees a row
+        // that did not commit.
         if let Some(committed) = session.messages.last() {
-            notify_message_commit(key, committed, committed_seq);
+            notify_message_commit(&observer_root, key, committed, committed_seq);
         }
         Ok(committed_seq)
     }
@@ -1840,6 +1903,7 @@ impl SessionManager {
             use std::io::Write;
 
             let mut file = std::fs::OpenOptions::new()
+                .read(true)
                 .create(true)
                 .append(true)
                 .open(&path)?;
@@ -1885,6 +1949,8 @@ impl SessionManager {
                     updated_at: Utc::now(),
                 };
                 writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+            } else {
+                seal_torn_tail(&mut file, file_len)?;
             }
 
             writeln!(file, "{msg_json}")?;
@@ -1897,7 +1963,9 @@ impl SessionManager {
     }
 
     /// Rewrite a session's JSONL file from the in-memory state.
-    /// Uses atomic write-then-rename to avoid corruption on crash.
+    /// Uses atomic write-then-rename to avoid corruption on crash; the
+    /// temp file is fsynced before the rename and the parent directory
+    /// after it, so the rewrite is durable, not just atomic.
     /// Uses spawn_blocking to avoid blocking the async runtime.
     ///
     /// Serialises on the per-key persist lock so the whole-file rewrite
@@ -1946,12 +2014,25 @@ impl SessionManager {
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = rewrite_tmp_path(&path);
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-            // Atomic rename (on same filesystem)
-            std::fs::rename(&tmp_path, &path)?;
-            Ok::<_, eyre::Report>(())
+            let write_result = (|| -> Result<(), eyre::Report> {
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(content.as_bytes())?;
+                // `flush()` on a std File is a no-op (no userspace buffer) —
+                // `sync_all` is what actually gets the bytes to stable
+                // storage before the rename swaps the inode.
+                file.sync_all()?;
+                // Atomic rename (on same filesystem)
+                std::fs::rename(&tmp_path, &path)?;
+                if let Some(dir) = path.parent() {
+                    fsync_dir(dir);
+                }
+                Ok(())
+            })();
+            if write_result.is_err() {
+                // Best-effort tmp cleanup, same as rewrite_blocking_inner.
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            write_result
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
@@ -2213,7 +2294,15 @@ impl SessionManager {
         let line = rollback_marker_line(num_turns)?;
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&target)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&target)?;
+            let file_len = file.metadata()?.len();
+            // The marker is what makes `/undo` survive a reload — if it
+            // fused with a torn tail the rollback would silently revert
+            // on the next load.
+            seal_torn_tail(&mut file, file_len)?;
             writeln!(file, "{line}")?;
             Ok::<_, eyre::Report>(())
         })
@@ -2329,6 +2418,7 @@ impl SessionManager {
 pub struct SessionHandle {
     sessions_dir: PathBuf,
     session: Session,
+    observer_root: PathBuf,
 }
 
 /// Per-key persist lock map.
@@ -2397,6 +2487,150 @@ pub async fn persist_message_through_canonical_path(
     // the tokio mutex is not reentrant — calling the locking
     // `add_message_with_seq` here would deadlock.
     handle.add_message_with_seq_unlocked(message).await
+}
+
+/// Idempotently persist ONE system note to a session through the canonical
+/// per-key persist path, returning the durable message.
+///
+/// Semantics (PR #2283 follow-up): the existence check and the append run
+/// inside the SAME `persist_lock_for` critical section as every other
+/// canonical write, so two concurrent callers for the same `note_id` commit
+/// exactly one row and both receive that row.
+///
+/// STRICT canonical read (this helper does NOT relax the legacy loader):
+/// - the file's size is bounded by `MAX_SESSION_FILE_SIZE`;
+/// - the first line must be a valid `SessionMeta` with a supported schema;
+/// - every non-empty subsequent line must parse as a `Message` OR a
+///   `SessionControlRecord` — an unparsable line, a missing trailing
+///   newline on a non-empty final line, or an unreadable-but-existing file
+///   are `Err` (fail-closed: never treated as "absent", never appended past
+///   a corrupt tail);
+/// - visibility follows rollback semantics: the note is "present" only if
+///   `assemble_session_messages` (the same fold every reload uses) still
+///   shows it — a rolled-back note is legitimately absent and is re-added.
+///
+/// On success returns the durable `Message` — the row this call appended,
+/// or the pre-existing row with its ORIGINAL timestamp and content (the
+/// note is never re-stamped with a fresh timestamp).
+///
+/// The id rides `client_message_id`; `role` is forced to `System` and
+/// `thread_id` to `None` (no thread semantics implied).
+pub async fn persist_system_note_once_through_canonical_path(
+    data_dir: &Path,
+    key: &SessionKey,
+    note: Message,
+    note_id: &str,
+) -> Result<Message> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let mut handle = SessionHandle::open(data_dir, key);
+
+    let canonical = handle.session_path();
+    let file_meta = match std::fs::metadata(&canonical) {
+        // Genuinely absent: a new session — the append below writes the
+        // meta line itself. Only NotFound counts as absent; permission or
+        // any other stat error is fail-closed (never "treated as absent").
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(eyre::eyre!(
+                "session transcript stat failed ({}): {error}",
+                canonical.display()
+            ));
+        }
+        Ok(meta) => Some(meta),
+    };
+    // A zero-byte regular file can remain after creation but before the
+    // metadata write; the canonical append initializes it on retry.
+    if let Some(meta) = file_meta.filter(|meta| !meta.is_file() || meta.len() != 0) {
+        if meta.len() > MAX_SESSION_FILE_SIZE {
+            return Err(eyre::eyre!(
+                "session transcript exceeds size limit ({}: {} > {})",
+                canonical.display(),
+                meta.len(),
+                MAX_SESSION_FILE_SIZE
+            ));
+        }
+        let bytes = std::fs::read(&canonical).map_err(|error| {
+            eyre::eyre!(
+                "session transcript exists but cannot be read ({}): {error}",
+                canonical.display()
+            )
+        })?;
+        let text = String::from_utf8(bytes.clone()).map_err(|error| {
+            eyre::eyre!(
+                "session transcript is not valid UTF-8 ({}): {error}",
+                canonical.display()
+            )
+        })?;
+        let mut lines = text.lines();
+        let header = lines.next().ok_or_else(|| {
+            eyre::eyre!(
+                "session transcript is empty (no meta line): {}",
+                canonical.display()
+            )
+        })?;
+        let session_meta: SessionMeta = serde_json::from_str(header).map_err(|error| {
+            eyre::eyre!(
+                "session transcript meta line is invalid ({}): {error}",
+                canonical.display()
+            )
+        })?;
+        if session_meta.schema_version > CURRENT_SESSION_SCHEMA {
+            return Err(eyre::eyre!(
+                "session transcript schema {} is newer than supported {} ({}): refusing",
+                session_meta.schema_version,
+                CURRENT_SESSION_SCHEMA,
+                canonical.display()
+            ));
+        }
+        let body = lines.collect::<Vec<_>>();
+        // Trailing newline: ANY non-empty file must end with one — a bare
+        // meta line (or any final line) without it would make the append
+        // concatenate the note JSON onto the last row. Only a genuinely
+        // EMPTY (0-byte) file counts as new and is safe to append into.
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            return Err(eyre::eyre!(
+                "session transcript does not end with a newline ({}): refusing to append",
+                canonical.display()
+            ));
+        }
+        // Every non-empty post-meta line must parse as Message or control
+        // record (strict — no skip-past-corruption). Errors carry the LINE
+        // NUMBER, never the line content.
+        let mut line_no = 1usize; // meta line is line 1
+        for line in body.iter().filter(|l| !l.trim().is_empty()) {
+            let parses = serde_json::from_str::<SessionControlRecord>(line).is_ok()
+                || serde_json::from_str::<Message>(line).is_ok();
+            if !parses {
+                line_no += 1;
+                return Err(eyre::eyre!(
+                    "session transcript line {} is neither a Message nor a control record ({}): refusing",
+                    line_no,
+                    canonical.display()
+                ));
+            }
+            line_no += 1;
+        }
+        // Visibility follows the same rollback-aware fold as every reload.
+        for message in assemble_session_messages(body.iter().copied()) {
+            if message.role == MessageRole::System
+                && message.client_message_id.as_deref() == Some(note_id)
+            {
+                return Ok(message);
+            }
+        }
+    }
+
+    // Absent (or no file yet): append through the same locked canonical
+    // path, then return the durable row.
+    let mut message = note;
+    message.role = MessageRole::System;
+    message.client_message_id = Some(note_id.to_owned());
+    message.thread_id = None;
+    handle
+        .add_message_with_seq_unlocked(message.clone())
+        .await
+        .map(|_| message)
 }
 
 /// Upsert a durable child-session contract through the canonical locked
@@ -2505,6 +2739,7 @@ impl SessionHandle {
                     return Self {
                         sessions_dir: user_sessions_dir,
                         session: loaded.clone(),
+                        observer_root: data_dir.to_owned(),
                     };
                 }
                 if std::fs::remove_file(&legacy_path).is_ok() {
@@ -2520,6 +2755,7 @@ impl SessionHandle {
         Self {
             sessions_dir: user_sessions_dir,
             session,
+            observer_root: data_dir.to_owned(),
         }
     }
 
@@ -2805,7 +3041,12 @@ impl SessionHandle {
         // commit failure (`append_to_disk` Err) returns above without
         // firing, satisfying the "MUST NOT emit on commit failure"
         // invariant.
-        notify_message_commit(&self.session.key, &message, committed_seq);
+        notify_message_commit(
+            &self.observer_root,
+            &self.session.key,
+            &message,
+            committed_seq,
+        );
         Ok(committed_seq)
     }
 
@@ -2894,11 +3135,24 @@ impl SessionHandle {
         let rewrite_result = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let tmp_path = rewrite_tmp_path(&path);
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-            std::fs::rename(&tmp_path, &path)?;
-            Ok::<_, eyre::Report>(())
+            let write_result = (|| -> Result<(), eyre::Report> {
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(content.as_bytes())?;
+                // `flush()` on a std File is a no-op (no userspace buffer) —
+                // `sync_all` is what actually gets the bytes to stable
+                // storage before the rename swaps the inode.
+                file.sync_all()?;
+                std::fs::rename(&tmp_path, &path)?;
+                if let Some(dir) = path.parent() {
+                    fsync_dir(dir);
+                }
+                Ok(())
+            })();
+            if write_result.is_err() {
+                // Best-effort tmp cleanup, same as rewrite_blocking_inner.
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            write_result
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
@@ -2974,15 +3228,22 @@ impl SessionHandle {
         let write_result = (|| -> Result<()> {
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(content.as_bytes())?;
-            file.flush()?;
+            // `flush()` on a std File is a no-op (no userspace buffer) —
+            // `sync_all` is what actually gets the bytes to stable
+            // storage before the rename swaps the inode.
+            file.sync_all()?;
             std::fs::rename(&tmp_path, path)?;
+            if let Some(dir) = path.parent() {
+                fsync_dir(dir);
+            }
             Ok(())
         })();
         if write_result.is_err() {
-            // Best-effort tmp cleanup. If the rename succeeded but a later
-            // step failed (currently impossible — rename is the last step)
-            // we'd skip this; if `File::create` or `write_all` fail, the
-            // tmp file may exist and must not leak.
+            // Best-effort tmp cleanup. If `File::create`, `write_all`, or
+            // `sync_all` fail, the tmp file may exist and must not leak.
+            // (After a successful rename the tmp path no longer exists and
+            // the removal is a harmless no-op; the trailing `fsync_dir`
+            // cannot fail the closure.)
             let _ = std::fs::remove_file(&tmp_path);
         }
         write_result
@@ -3003,6 +3264,7 @@ impl SessionHandle {
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
+                .read(true)
                 .create(true)
                 .append(true)
                 .open(&path)?;
@@ -3046,6 +3308,8 @@ impl SessionHandle {
                     updated_at: Utc::now(),
                 };
                 writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+            } else {
+                seal_torn_tail(&mut file, file_len)?;
             }
 
             writeln!(file, "{msg_json}")?;

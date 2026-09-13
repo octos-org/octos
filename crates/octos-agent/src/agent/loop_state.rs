@@ -73,7 +73,17 @@ const DEFAULT_PLUGIN_TIMEOUT_LIMIT: u32 = 3;
 const DEFAULT_PLUGIN_PROTOCOL_LIMIT: u32 = 2;
 const DEFAULT_DELEGATE_DEPTH_LIMIT: u32 = 1;
 const DEFAULT_INTERNAL_LIMIT: u32 = 1;
+/// Hook-deny (policy) errors escalate immediately — retrying a policy
+/// decision can never succeed (#2249).
+const DEFAULT_POLICY_LIMIT: u32 = 1;
 const DEFAULT_SHELL_SPIRAL_LIMIT: u32 = 1;
+
+/// `#[serde(default = "...")]` helper for `LoopRetryLimits::policy`. Lets
+/// legacy retry-state JSON (pre-policy field) deserialize cleanly with the
+/// canonical default instead of `0`, which would disable the bucket.
+fn default_policy_limit() -> u32 {
+    DEFAULT_POLICY_LIMIT
+}
 
 /// Per-bucket hard limits. Tuned for M6.2 defaults, exposed so integration
 /// tests and operators can override them if needed.
@@ -97,6 +107,10 @@ pub struct LoopRetryLimits {
     pub plugin_protocol: u32,
     pub delegate_depth_exceeded: u32,
     pub internal: u32,
+    /// Added with the PolicyDeny variant (#2249). `serde(default)` keeps
+    /// legacy retry-state sidecar JSON (pre-policy) deserializable.
+    #[serde(default = "default_policy_limit")]
+    pub policy: u32,
     pub shell_spiral: u32,
 }
 
@@ -118,6 +132,7 @@ impl Default for LoopRetryLimits {
             plugin_protocol: DEFAULT_PLUGIN_PROTOCOL_LIMIT,
             delegate_depth_exceeded: DEFAULT_DELEGATE_DEPTH_LIMIT,
             internal: DEFAULT_INTERNAL_LIMIT,
+            policy: DEFAULT_POLICY_LIMIT,
             shell_spiral: DEFAULT_SHELL_SPIRAL_LIMIT,
         }
     }
@@ -208,6 +223,11 @@ pub struct LoopRetryCounters {
     pub plugin_protocol: u32,
     pub delegate_depth_exceeded: u32,
     pub internal: u32,
+    /// Added with the PolicyDeny variant (#2249). `serde(default)` keeps
+    /// legacy retry-state sidecar JSON (pre-policy) deserializable; a
+    /// missing field deserializes to `0`.
+    #[serde(default)]
+    pub policy: u32,
     pub shell_spiral: u32,
 }
 
@@ -270,6 +290,9 @@ impl LoopRetryCounters {
         self.internal = self
             .internal
             .saturating_add(turn.internal.saturating_sub(base.internal));
+        self.policy = self
+            .policy
+            .saturating_add(turn.policy.saturating_sub(base.policy));
         self.shell_spiral = self
             .shell_spiral
             .saturating_add(turn.shell_spiral.saturating_sub(base.shell_spiral));
@@ -508,6 +531,7 @@ impl LoopRetryState {
                 self.limits.delegate_depth_exceeded,
             ),
             HarnessError::Internal { .. } => (&mut self.counters.internal, self.limits.internal),
+            HarnessError::PolicyDeny { .. } => (&mut self.counters.policy, self.limits.policy),
         };
         *counter_ref = counter_ref.saturating_add(1);
         (*counter_ref, limit)
@@ -536,6 +560,9 @@ fn decide_for_variant(error: &HarnessError) -> LoopDecision {
         RecoveryHint::CompactContext => LoopDecision::CompactAndRetry,
         // Non-retryable, surface to operator.
         RecoveryHint::FailFast => LoopDecision::Escalate,
+        // Expected policy behaviour (hook deny) — not a fault; surface for
+        // audit, never retry (#2249).
+        RecoveryHint::Expected => LoopDecision::Escalate,
         // Internal invariant violation — bug, not recoverable.
         RecoveryHint::Bug => LoopDecision::Escalate,
     }
@@ -719,6 +746,7 @@ mod tests {
             plugin_protocol: v,
             delegate_depth_exceeded: v,
             internal: v,
+            policy: v,
             shell_spiral: v,
         };
         let offset_counters = |v: u32| LoopRetryCounters {
@@ -737,7 +765,8 @@ mod tests {
             plugin_protocol: v + 12,
             delegate_depth_exceeded: v + 13,
             internal: v + 14,
-            shell_spiral: v + 15,
+            policy: v + 15,
+            shell_spiral: v + 16,
         };
         let uniform_limits = |v: u32| LoopRetryLimits {
             rate_limited: v,
@@ -755,6 +784,7 @@ mod tests {
             plugin_protocol: v,
             delegate_depth_exceeded: v,
             internal: v,
+            policy: v,
             shell_spiral: v,
         };
 

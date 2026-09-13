@@ -46,8 +46,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use libc::c_char;
 use octos_agent::{
-    Agent, AgentConfig, GlobTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, ToolRegistry,
-    WriteFileTool,
+    Agent, AgentConfig, ConversationResponse, GlobTool, GrepTool, IncompleteResponseError,
+    ListDirTool, ReadFileTool, ShellTool, ToolRegistry, WriteFileTool,
 };
 use octos_cli::commands::chat::create_provider_with_api_type;
 use octos_cli::config::Config;
@@ -67,6 +67,9 @@ thread_local! {
     /// Most recent failure on this thread. Read (never freed) by
     /// [`octos_last_error`]; overwritten by the next fallible FFI call.
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    /// Task payload, not diagnostic text. Owned by this thread until taken,
+    /// superseded by a fallible call/new error, or dropped at thread exit.
+    static LAST_PARTIAL_RESULT: RefCell<Option<TaskResult>> = const { RefCell::new(None) };
 }
 
 /// Upper bound on a stored error string, so a runaway provider error body can't
@@ -74,6 +77,7 @@ thread_local! {
 const MAX_ERROR_LEN: usize = 600;
 
 fn set_last_error(msg: impl Into<String>) {
+    LAST_PARTIAL_RESULT.with(|slot| *slot.borrow_mut() = None);
     // Redact credential-shaped tokens and cap length BEFORE storing: provider
     // error bodies can echo an auth value, and this string is handed back
     // verbatim by `octos_last_error`.
@@ -92,6 +96,7 @@ fn set_last_error(msg: impl Into<String>) {
 
 fn clear_last_error() {
     LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    LAST_PARTIAL_RESULT.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Replace the caller's EXACT known secret with a placeholder — the reliable
@@ -277,7 +282,7 @@ pub struct TaskBrief {
     pub max_iterations: Option<u32>,
 }
 
-/// Token accounting for a completed [`OctosRuntime::run_task`].
+/// Token accounting for a completed or incomplete [`OctosRuntime::run_task`].
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     pub input: u64,
@@ -298,10 +303,12 @@ pub struct TaskResult {
 /// Native error for the core surface ([`OctosRuntime::from_config`],
 /// [`OctosRuntime::run_task`], [`OctosRuntime::embed`]).
 ///
-/// Every `String` payload is ALREADY credential-scrubbed via [`scrub_secret`]
+/// Every diagnostic `String` is ALREADY credential-scrubbed via [`scrub_secret`]
 /// at the point it is constructed, so `Display` renders it verbatim. The C-ABI
 /// then applies its own [`sanitize_error_text`] length-cap/heuristic backstop
 /// (unchanged) before exposing it via [`octos_last_error`].
+/// `Incomplete.partial` is task output, with the same lossless semantics as a
+/// successful [`TaskResult`]; it is never rendered into the diagnostic.
 #[derive(Debug)]
 pub enum CoreError {
     /// Configuration / runtime-construction failure (bad config, tokio/runtime
@@ -316,6 +323,9 @@ pub enum CoreError {
     /// No embedder is available: either no `embedding_model_path` was configured
     /// or the crate was built without the `embed-llama` feature.
     NoEmbedder,
+    /// The provider truncated a conversational response. This is a failure,
+    /// with the actual partial output and all consumed turn usage available.
+    Incomplete { partial: TaskResult },
 }
 
 impl std::fmt::Display for CoreError {
@@ -326,11 +336,42 @@ impl std::fmt::Display for CoreError {
             | CoreError::Run(m)
             | CoreError::Embed(m) => f.write_str(m),
             CoreError::NoEmbedder => f.write_str("no embedder configured"),
+            CoreError::Incomplete { .. } => f.write_str(INCOMPLETE_RESPONSE_MESSAGE),
         }
     }
 }
 
 impl std::error::Error for CoreError {}
+
+/// A fixed diagnostic shared by the C and generated binding facades. Partial
+/// model output is deliberately excluded from this bounded error channel.
+pub const INCOMPLETE_RESPONSE_MESSAGE: &str =
+    "Model output was truncated (max_tokens); the response is incomplete";
+
+impl From<&ConversationResponse> for TaskResult {
+    fn from(response: &ConversationResponse) -> Self {
+        // Preserve the existing successful iteration count: assistant history
+        // rows, including tool-call carriers (the final may be separate).
+        // The partial's usage already includes all earlier rounds;
+        // do not add PartialTurnUsage again (it is the same accumulated total).
+        let iterations = response
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .count();
+        Self {
+            output: response.content.clone(),
+            iterations: u32::try_from(iterations).unwrap_or(u32::MAX),
+            tokens: TokenUsage {
+                input: u64::from(response.token_usage.input_tokens),
+                output: u64::from(response.token_usage.output_tokens),
+                reasoning: u64::from(response.token_usage.reasoning_tokens),
+                cache_read: u64::from(response.token_usage.cache_read_tokens),
+                cache_write: u64::from(response.token_usage.cache_write_tokens),
+            },
+        }
+    }
+}
 
 /// RAII owner of the ephemeral episodic-memory scratch dir that THIS crate
 /// created under the OS temp dir. Its `Drop` best-effort removes the dir
@@ -540,30 +581,23 @@ impl OctosRuntime {
             .tokio
             .block_on(agent.process_message(&brief.prompt, &[], Vec::new()))
             .map_err(|e| {
+                if let Some(incomplete) = e.downcast_ref::<IncompleteResponseError>() {
+                    let mut partial = TaskResult::from(&incomplete.partial);
+                    // MaxTokens carries the current assistant text separately
+                    // from messages. Use its producer iteration instead of
+                    // silently undercounting that still-consumed final round.
+                    partial.iterations = partial
+                        .iterations
+                        .max(incomplete.partial.assistant_segments.final_iteration);
+                    return CoreError::Incomplete { partial };
+                }
                 CoreError::Run(scrub_secret(
                     format!("agent run failed: {e}"),
                     self.secret.as_deref(),
                 ))
             })?;
 
-        // `ConversationResponse` carries no explicit loop-iteration count, so
-        // derive one: each LLM round contributes exactly one assistant message.
-        let iterations = response
-            .messages
-            .iter()
-            .filter(|m| m.role == MessageRole::Assistant)
-            .count();
-        Ok(TaskResult {
-            output: response.content,
-            iterations: u32::try_from(iterations).unwrap_or(u32::MAX),
-            tokens: TokenUsage {
-                input: u64::from(response.token_usage.input_tokens),
-                output: u64::from(response.token_usage.output_tokens),
-                reasoning: u64::from(response.token_usage.reasoning_tokens),
-                cache_read: u64::from(response.token_usage.cache_read_tokens),
-                cache_write: u64::from(response.token_usage.cache_write_tokens),
-            },
-        })
+        Ok(TaskResult::from(&response))
     }
 
     /// Embed `text`, returning the raw vector. Requires the `embed-llama`
@@ -756,6 +790,8 @@ pub extern "C" fn octos_runtime_free(runtime: *mut OctosRuntime) {
 /// Run a one-shot task. `brief_json` is `{"prompt": "...", "max_iterations"?:
 /// N}`. Returns owned JSON `{"output", "iterations", "tokens"}` that the caller
 /// must free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
+/// On an incomplete response, NULL still means failure; retrieve the partial
+/// output separately with [`octos_take_last_partial_result`] on this thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn octos_run_task(
     runtime: *mut OctosRuntime,
@@ -765,8 +801,11 @@ pub extern "C" fn octos_run_task(
         clear_last_error();
         match run_task_impl(runtime, brief_json) {
             Ok(p) => p,
-            Err(msg) => {
-                set_last_error(msg);
+            Err(error) => {
+                set_last_error(error.to_string());
+                if let CoreError::Incomplete { partial } = error {
+                    LAST_PARTIAL_RESULT.with(|slot| *slot.borrow_mut() = Some(partial));
+                }
                 ptr::null_mut()
             }
         }
@@ -776,23 +815,28 @@ pub extern "C" fn octos_run_task(
 fn run_task_impl(
     runtime: *mut OctosRuntime,
     brief_json: *const c_char,
-) -> Result<*mut c_char, String> {
+) -> Result<*mut c_char, CoreError> {
     // SAFETY: NULL-checked; must be a live handle from `octos_runtime_new`.
-    let rt = unsafe { runtime.as_ref() }.ok_or_else(|| "runtime pointer is null".to_string())?;
+    let rt = unsafe { runtime.as_ref() }
+        .ok_or_else(|| CoreError::Run("runtime pointer is null".to_string()))?;
     // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
-    let raw = unsafe { cstr_to_str(brief_json) }?;
-    let brief: TaskBrief =
-        serde_json::from_str(raw).map_err(|e| format!("invalid brief_json: {e}"))?;
+    let raw = unsafe { cstr_to_str(brief_json) }.map_err(CoreError::Run)?;
+    let brief: TaskBrief = serde_json::from_str(raw)
+        .map_err(|e| CoreError::Run(format!("invalid brief_json: {e}")))?;
     // Preserve the exact C-ABI message for an empty prompt (the native
     // `run_task` also guards this, with its own message, for the uniffi path).
     if brief.prompt.trim().is_empty() {
-        return Err("brief_json.prompt is empty".to_string());
+        return Err(CoreError::Run("brief_json.prompt is empty".to_string()));
     }
 
     // Run through the native core, then serialize its `TaskResult` into the
     // exact JSON shape/order the C-ABI has always emitted.
-    let result = rt.run_task(&brief).map_err(|e| e.to_string())?;
-    let out = json!({
+    let result = rt.run_task(&brief)?;
+    to_owned_ptr(task_result_json(&result)).map_err(CoreError::Run)
+}
+
+fn task_result_json(result: &TaskResult) -> String {
+    json!({
         "output": result.output,
         "iterations": result.iterations,
         "tokens": {
@@ -802,9 +846,8 @@ fn run_task_impl(
             "cache_read": result.tokens.cache_read,
             "cache_write": result.tokens.cache_write,
         }
-    });
-    let serialized = serde_json::to_string(&out).map_err(|e| format!("serialize output: {e}"))?;
-    to_owned_ptr(serialized)
+    })
+    .to_string()
 }
 
 /// Embed `text`. Returns owned JSON `{"embedding": [f32, ...]}` that the caller
@@ -858,8 +901,8 @@ fn embed_serialize(_rt: &OctosRuntime, _text: &str) -> Result<*mut c_char, Strin
     )
 }
 
-/// Free a string returned by [`octos_run_task`] / [`octos_embed`]. NULL is a
-/// no-op.
+/// Free a string returned by [`octos_run_task`], [`octos_embed`], or
+/// [`octos_take_last_partial_result`]. NULL is a no-op.
 ///
 /// The string is owned by the caller and MUST be freed here, UNMODIFIED — do
 /// not alter its bytes or NUL terminator before freeing. (This reclaims via
@@ -889,6 +932,33 @@ pub extern "C" fn octos_last_error() -> *const c_char {
     })
 }
 
+/// Take this thread's last incomplete task result as owned JSON with the same
+/// shape as [`octos_run_task`]. Returns NULL if absent or already taken. This
+/// does not change the error diagnostic and does NOT turn the task into success.
+///
+/// Consume once on the SAME thread, before another `octos_runtime_new`,
+/// `octos_run_task`, or `octos_embed` call (success or failure clears it).
+/// Any new error, including a caught panic, also clears it. Error/version
+/// inspection and successful free calls leave it available. The caller must
+/// free the returned allocation, UNMODIFIED, with [`octos_string_free`].
+/// The payload is lossless model output, not a sanitized/600-byte diagnostic.
+#[unsafe(no_mangle)]
+pub extern "C" fn octos_take_last_partial_result() -> *mut c_char {
+    guard(ptr::null_mut(), "octos_take_last_partial_result", || {
+        let partial = LAST_PARTIAL_RESULT.with(|slot| slot.borrow_mut().take());
+        let Some(partial) = partial else {
+            return ptr::null_mut();
+        };
+        match to_owned_ptr(task_result_json(&partial)) {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                set_last_error(error);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// Return the crate version as a static NUL-terminated string (never freed).
 #[unsafe(no_mangle)]
 pub extern "C" fn octos_version() -> *const c_char {
@@ -909,6 +979,9 @@ impl OctosRuntime {
             .expect("scratch dir present while runtime is alive")
     }
 }
+
+#[cfg(test)]
+mod incomplete_tests;
 
 #[cfg(test)]
 mod tests {

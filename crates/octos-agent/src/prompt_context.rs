@@ -61,4 +61,19 @@ pub trait PromptContextManager: Send + Sync {
         request: PromptContextRequest,
         messages: &mut Vec<Message>,
     ) -> Result<PromptContextReport, String>;
+
+    /// Current durable prompt-cache epoch after the most recent projection or
+    /// compaction. The agent queries this immediately before provider
+    /// dispatch, so an in-turn compaction cannot keep attributing cache usage
+    /// to the epoch captured when the per-turn Agent was constructed.
+    fn prompt_cache_epoch_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Report the concrete provider route that actually produced a response.
+    /// Wrapper providers may fail over after prompt preparation, so the
+    /// durable OUP cache epoch cannot rely only on the wrapper's pre-dispatch
+    /// route prediction. Implementations may rotate their epoch here; the
+    /// default keeps non-OUP callers unchanged.
+    fn observe_effective_provider_route(&self, _provider_name: &str, _model_id: &str) {}
 }

@@ -82,6 +82,10 @@ pub(super) const MATRIX_SETTING_REQUIRE_MENTION: &str = "require_mention";
 #[cfg(feature = "matrix")]
 pub(super) const MATRIX_SETTING_REQUIRE_MENTION_CAMEL: &str = "requireMention";
 #[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_MENTION_POLICY: &str = "mention_policy";
+#[cfg(feature = "matrix")]
+pub(super) const MATRIX_SETTING_MENTION_POLICY_CAMEL: &str = "mentionPolicy";
+#[cfg(feature = "matrix")]
 pub(super) const MATRIX_USER_MISSING_AUTH_ERROR: &str =
     "matrix user channel requires settings.access_token or settings.user_id + settings.password";
 
@@ -231,6 +235,7 @@ pub(super) struct MatrixUserChannelSettings {
     pub(super) auto_join_allowlist: Vec<String>,
     pub(super) group_policy: octos_bus::MatrixGroupPolicy,
     pub(super) require_mention: bool,
+    pub(super) mention_policy: octos_bus::MatrixMentionPolicy,
     pub(super) allowed_senders: Vec<String>,
 }
 
@@ -298,6 +303,20 @@ impl MatrixUserChannelSettings {
             .or_else(|| entry.settings.get(MATRIX_SETTING_REQUIRE_MENTION_CAMEL))
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        let mention_policy = opt_any(&[
+            MATRIX_SETTING_MENTION_POLICY,
+            MATRIX_SETTING_MENTION_POLICY_CAMEL,
+        ])
+        .map(|raw| {
+            if !matches!(raw.trim().to_ascii_lowercase().as_str(), "open" | "strict") {
+                warn!(
+                    value = %raw,
+                    "unrecognized matrix mention_policy; falling back to strict"
+                );
+            }
+            octos_bus::MatrixMentionPolicy::parse(&raw)
+        })
+        .unwrap_or_default();
 
         Ok(Self {
             homeserver: settings_str(
@@ -317,6 +336,7 @@ impl MatrixUserChannelSettings {
             ]),
             group_policy,
             require_mention,
+            mention_policy,
             allowed_senders: entry.allowed_senders.clone(),
         })
     }
@@ -339,6 +359,7 @@ impl MatrixUserChannelSettings {
                 self.auto_join_allowlist.clone(),
                 self.group_policy,
                 self.require_mention,
+                self.mention_policy,
                 self.allowed_senders.clone(),
                 shutdown,
             )

@@ -12,6 +12,9 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::vision;
 
+use crate::cache_manifest::{
+    PromptCacheInputManifest, prompt_cache_features_enabled, without_cache_markers,
+};
 use crate::config::ChatConfig;
 use crate::config::ReasoningEffort;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
@@ -36,10 +39,34 @@ pub struct AnthropicProvider {
     /// Emit `cache_control: {"type": "ephemeral"}` breakpoints so Anthropic
     /// serves the replayed prefix from its prompt cache (~0.1x input rate on
     /// reads) instead of billing the whole conversation at full rate every
-    /// round. Default ON, but the `OCTOS_PROMPT_CACHING` env kill-switch can
-    /// force it off at startup without a rebuild — see
+    /// round. The official endpoint defaults ON, while custom compatible
+    /// endpoints require an explicit opt-in. The `OCTOS_PROMPT_CACHING` env
+    /// kill-switch can force the official default off at startup — see
     /// [`Self::with_prompt_caching`] and [`prompt_caching_default`].
     prompt_caching: bool,
+    /// Whether a builder call explicitly selected the prompt-caching mode.
+    /// Custom Anthropic-compatible endpoints default to off, but an explicit
+    /// override must survive either builder-call order.
+    prompt_caching_override: Option<bool>,
+}
+
+const OFFICIAL_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
+fn is_official_anthropic_base_url(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(OFFICIAL_ANTHROPIC_BASE_URL)
+}
+
+#[cfg(test)]
+fn prompt_caching_default_for_base_url_from(base_url: &str, env_value: Option<&str>) -> bool {
+    is_official_anthropic_base_url(base_url)
+        && crate::cache_manifest::prompt_cache_features_enabled_from(env_value)
+}
+
+fn prompt_caching_default_for_base_url(base_url: &str) -> bool {
+    is_official_anthropic_base_url(base_url) && prompt_cache_features_enabled()
 }
 
 /// Resolve the default prompt-caching state from a raw env value.
@@ -49,20 +76,15 @@ pub struct AnthropicProvider {
 /// other value keeps the default ON. Pure over its input so the kill-switch
 /// is unit-testable without mutating process env (the workspace is
 /// `deny(unsafe_code)`, and `std::env::set_var` is `unsafe` on edition 2024).
+#[cfg(test)]
 fn prompt_caching_default_from(env_value: Option<&str>) -> bool {
-    match env_value {
-        Some(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        None => true,
-    }
+    crate::cache_manifest::prompt_cache_features_enabled_from(env_value)
 }
 
 /// Default prompt-caching state, honoring the `OCTOS_PROMPT_CACHING`
 /// kill-switch. See [`prompt_caching_default_from`].
 fn prompt_caching_default() -> bool {
-    prompt_caching_default_from(std::env::var("OCTOS_PROMPT_CACHING").ok().as_deref())
+    prompt_caching_default_for_base_url(OFFICIAL_ANTHROPIC_BASE_URL)
 }
 
 impl AnthropicProvider {
@@ -78,9 +100,10 @@ impl AnthropicProvider {
             ),
             api_key: SecretString::from(api_key.into()),
             model: model.into(),
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url: OFFICIAL_ANTHROPIC_BASE_URL.to_string(),
             provider_label: "anthropic".to_string(),
             prompt_caching: prompt_caching_default(),
+            prompt_caching_override: None,
         }
     }
 
@@ -94,6 +117,9 @@ impl AnthropicProvider {
     /// Set a custom base URL (for compatible endpoints).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        if self.prompt_caching_override.is_none() {
+            self.prompt_caching = prompt_caching_default_for_base_url(&self.base_url);
+        }
         self
     }
 
@@ -115,7 +141,7 @@ impl AnthropicProvider {
         self
     }
 
-    /// Toggle Anthropic prompt-cache breakpoints (default: enabled).
+    /// Toggle Anthropic prompt-cache breakpoints explicitly.
     ///
     /// When enabled the request carries three ephemeral `cache_control`
     /// breakpoints (Anthropic allows up to 4): the system-prompt block, the
@@ -123,18 +149,27 @@ impl AnthropicProvider {
     /// user-role message — caching the stable prefix (tools + system) plus
     /// the rolling conversation history across loop iterations.
     ///
-    /// Default ON: any endpoint claiming Anthropic Messages API
-    /// compatibility must tolerate `cache_control` (Claude Code sends it
-    /// unconditionally). Disable for odd proxies that reject the field or
-    /// the block-array `system` form; disabling restores the exact
-    /// pre-caching wire shape (plain-string `system`, verbatim tools).
+    /// The official Anthropic endpoint defaults ON. Custom compatible
+    /// endpoints default OFF because some reject `cache_control` or the
+    /// block-array `system` form. Disabling restores the exact pre-caching
+    /// wire shape (plain-string `system`, verbatim tools).
     ///
     /// Operators can flip the default OFF at startup without a rebuild via
     /// `OCTOS_PROMPT_CACHING=0` (see [`prompt_caching_default`]); this
     /// explicit builder still wins over the env default when called.
     pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
         self.prompt_caching = enabled;
+        self.prompt_caching_override = Some(enabled);
         self
+    }
+
+    fn operational_message(&self, stage: crate::provider::OperationalStage) -> String {
+        crate::provider::operational_error_message(
+            stage,
+            &self.provider_label,
+            &self.model,
+            crate::provider::ApiStyle::AnthropicMessages,
+        )
     }
 
     /// Build the shared request struct used by both chat() and chat_stream().
@@ -214,6 +249,64 @@ impl AnthropicProvider {
             temperature,
             top_p,
             top_k,
+            tool_choice: config.tool_choice.anthropic_wire(!tools.is_empty()),
+        }
+    }
+
+    fn prompt_cache_input_manifest(
+        &self,
+        request: &AnthropicRequest<'_>,
+        config: &ChatConfig,
+    ) -> PromptCacheInputManifest {
+        let normalized = without_cache_markers(
+            serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({})),
+        );
+        let mut stable = Vec::new();
+        if let Some(system) = normalized.get("system") {
+            stable.push(("system".to_owned(), system.clone()));
+        }
+        if let Some(tools) = normalized.get("tools").and_then(|value| value.as_array()) {
+            stable.extend(
+                tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| (format!("tool:{index}"), tool.clone())),
+            );
+        }
+        for key in ["thinking", "context_management", "tool_choice"] {
+            if let Some(value) = normalized.get(key) {
+                stable.push((format!("config:{key}"), value.clone()));
+            }
+        }
+        let conversation = normalized
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, message)| {
+                let role = message
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                (format!("message:{index}:{role}"), message.clone())
+            })
+            .collect();
+        PromptCacheInputManifest::from_normalized_segments(
+            self.provider_label.clone(),
+            self.model.clone(),
+            config
+                .prompt_cache_context
+                .as_ref()
+                .map(|context| context.epoch_id.as_str()),
+            stable,
+            conversation,
+        )
+    }
+
+    fn trace_prompt_cache_input(&self, request: &AnthropicRequest<'_>, config: &ChatConfig) {
+        if tracing::enabled!(target: "octos.prompt_cache", tracing::Level::TRACE) {
+            self.prompt_cache_input_manifest(request, config).trace();
         }
     }
 
@@ -355,6 +448,7 @@ impl LlmProvider for AnthropicProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         let request = self.build_request(messages, tools, config);
+        self.trace_prompt_cache_input(&request, config);
 
         let response = self
             .client
@@ -368,7 +462,14 @@ impl LlmProvider for AnthropicProvider {
             .json(&request)
             .send()
             .await
-            .wrap_err("failed to send request to Anthropic")?;
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    false,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::AnthropicMessages,
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -379,13 +480,13 @@ impl LlmProvider for AnthropicProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::AnthropicMessages)
             .into());
         }
 
-        let api_response: AnthropicResponse = response
-            .json()
-            .await
-            .wrap_err("failed to parse Anthropic response")?;
+        let api_response: AnthropicResponse = response.json().await.wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::ParseResponse)
+        })?;
 
         Ok(anthropic_response_to_chat_response(api_response))
     }
@@ -397,11 +498,17 @@ impl LlmProvider for AnthropicProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         let request = self.build_request(messages, tools, config);
+        self.trace_prompt_cache_input(&request, config);
 
-        let mut body =
-            serde_json::to_value(&request).wrap_err("failed to serialize Anthropic request")?;
+        let mut body = serde_json::to_value(&request).wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::SerializeRequest)
+        })?;
         body.as_object_mut()
-            .ok_or_else(|| eyre::eyre!("failed to build Anthropic request body"))?
+            .ok_or_else(|| {
+                eyre::Report::msg(
+                    self.operational_message(crate::provider::OperationalStage::BuildRequestBody),
+                )
+            })?
             .insert("stream".into(), true.into());
 
         // Stream client: no total timeout, so a long healthy generation is not
@@ -416,7 +523,14 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .wrap_err("failed to send streaming request to Anthropic")?;
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    true,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::AnthropicMessages,
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -427,6 +541,7 @@ impl LlmProvider for AnthropicProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::AnthropicMessages)
             .into());
         }
 
@@ -467,6 +582,10 @@ impl LlmProvider for AnthropicProvider {
 
     fn provider_name(&self) -> &str {
         &self.provider_label
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        Some(crate::provider::ApiStyle::AnthropicMessages)
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
@@ -553,6 +672,11 @@ struct AnthropicRequest<'a> {
     /// `top_k` from `ChatConfig::sampling_params`, forwarded verbatim (#2172).
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<&'a serde_json::Value>,
+    /// `ChatConfig.tool_choice` on the wire (`{"type": "none"|"any"|"tool"}`);
+    /// absent for the default `auto`. Anthropic invalidates message-level
+    /// cache entries when this changes, so it is also a manifest segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -653,9 +777,10 @@ enum AnthropicContentBlock {
 /// points within the TTL), so advancing the marker EXTENDS the cache rather
 /// than invalidating it.
 fn apply_message_cache_breakpoint(messages: &mut [AnthropicMessage<'_>]) {
-    let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") else {
+    let Some(last_user_index) = last_complete_user_boundary(messages) else {
         return;
     };
+    let last_user = &mut messages[last_user_index];
     match &mut last_user.content {
         AnthropicContent::Parts(parts) => match parts.last_mut() {
             Some(
@@ -679,6 +804,33 @@ fn apply_message_cache_breakpoint(messages: &mut [AnthropicMessage<'_>]) {
             }]);
         }
     }
+}
+
+/// Last user-role boundary at which every preceding tool-use has a result.
+/// Tracking the full outstanding set prevents a plain user row after a
+/// partially answered parallel batch from receiving a cache marker.
+fn last_complete_user_boundary(messages: &[AnthropicMessage<'_>]) -> Option<usize> {
+    let mut outstanding: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut boundary = None;
+    for (index, message) in messages.iter().enumerate() {
+        if let AnthropicContent::Parts(parts) = &message.content {
+            for part in parts {
+                match part {
+                    AnthropicContentBlock::ToolUse { id, .. } => {
+                        outstanding.insert(id.as_str());
+                    }
+                    AnthropicContentBlock::ToolResult { tool_use_id, .. } => {
+                        outstanding.remove(tool_use_id.as_str());
+                    }
+                    AnthropicContentBlock::Text { .. } | AnthropicContentBlock::Image { .. } => {}
+                }
+            }
+        }
+        if message.role == "user" && outstanding.is_empty() {
+            boundary = Some(index);
+        }
+    }
+    boundary
 }
 
 #[derive(Serialize)]
@@ -1180,6 +1332,40 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn provider_normalized_manifest_ignores_rolling_marker_and_keeps_system_stable() {
+        let provider = AnthropicProvider::new("test-key", "claude-sonnet-4-6");
+        let config = ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "unused".to_owned(),
+                epoch_id: "epoch-one".to_owned(),
+                stable_prefix_hash: "agent-stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let first_messages = vec![Message::system("stable"), Message::user("first")];
+        let mut next_messages = first_messages.clone();
+        next_messages.push(Message::assistant("answer"));
+        next_messages.push(Message::user("next"));
+
+        let first_request = provider.build_request(&first_messages, &tools, &config);
+        let next_request = provider.build_request(&next_messages, &tools, &config);
+        let first = provider.prompt_cache_input_manifest(&first_request, &config);
+        let next = provider.prompt_cache_input_manifest(&next_request, &config);
+        let comparison = first.compare_prefix(&next);
+
+        assert_eq!(first.stable_prefix_hash, next.stable_prefix_hash);
+        assert_eq!(comparison.conversation_prefix_segments, 1);
+        assert_eq!(comparison.invalidation_reason, None);
+        assert!(comparison.reusable_normalized_bytes > 0);
     }
 
     // --- build_anthropic_content tests ---
@@ -1752,6 +1938,112 @@ mod tests {
         assert_eq!(provider.base_url, "https://custom.api.com");
     }
 
+    /// `tool_choice: {"type": "none"}` must reach the wire for an explicit
+    /// choice and stay absent for the default, so ordinary requests are
+    /// byte-identical to before. Anthropic invalidates message-level cache
+    /// entries when it changes, so it is also a stable manifest segment.
+    #[test]
+    fn should_serialize_tool_choice_none_and_record_it_as_a_manifest_segment() {
+        let provider = AnthropicProvider::new("key", "model");
+        let messages = [
+            msg(MessageRole::System, "system"),
+            msg(MessageRole::User, "hello"),
+        ];
+        let tools = [tool_spec("read", "read a file")];
+        let auto =
+            serde_json::to_value(provider.build_request(&messages, &tools, &ChatConfig::default()))
+                .unwrap();
+        assert!(auto.get("tool_choice").is_none(), "{auto}");
+
+        let none = ChatConfig {
+            tool_choice: crate::ToolChoice::None,
+            ..Default::default()
+        };
+        let request = provider.build_request(&messages, &tools, &none);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["tool_choice"], serde_json::json!({"type": "none"}));
+        let manifest = provider.prompt_cache_input_manifest(&request, &none);
+        assert!(
+            manifest
+                .stable_segments
+                .iter()
+                .any(|segment| segment.kind == "config:tool_choice"),
+            "tool_choice changes Anthropic's message cache and must be visible in the manifest"
+        );
+        let tool_less =
+            serde_json::to_value(provider.build_request(&messages, &[], &none)).unwrap();
+        assert!(tool_less.get("tool_choice").is_none(), "{tool_less}");
+    }
+
+    #[test]
+    fn custom_compatible_endpoint_omits_cache_control_by_default() {
+        let provider =
+            AnthropicProvider::new("key", "model").with_base_url("https://custom.api.com");
+        let body = serde_json::to_value(provider.build_request(
+            &[
+                msg(MessageRole::System, "system"),
+                msg(MessageRole::User, "hello"),
+            ],
+            &[tool_spec("read", "read a file")],
+            &ChatConfig::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(body["system"], "system");
+        assert!(body["messages"][0]["content"].is_string(), "{body}");
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "custom endpoints must opt in to Anthropic cache extensions: {body}"
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_caching_opt_in_wins_for_custom_endpoint_in_either_order() {
+        let custom_then_opt_in = AnthropicProvider::new("key", "model")
+            .with_base_url("https://custom.api.com")
+            .with_prompt_caching(true);
+        let opt_in_then_custom = AnthropicProvider::new("key", "model")
+            .with_prompt_caching(true)
+            .with_base_url("https://custom.api.com");
+
+        for provider in [custom_then_opt_in, opt_in_then_custom] {
+            let body = serde_json::to_value(provider.build_request(
+                &[msg(MessageRole::User, "hello")],
+                &[],
+                &ChatConfig::default(),
+            ))
+            .unwrap();
+            assert!(
+                body.to_string().contains("cache_control"),
+                "an explicit opt-in must survive builder call ordering: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_prompt_cache_defaults_are_official_only_and_honor_kill_switch() {
+        assert!(prompt_caching_default_for_base_url_from(
+            "https://api.anthropic.com",
+            None
+        ));
+        assert!(prompt_caching_default_for_base_url_from(
+            " https://API.ANTHROPIC.COM/ ",
+            Some("true")
+        ));
+        assert!(!prompt_caching_default_for_base_url_from(
+            "https://api.anthropic.com",
+            Some("off")
+        ));
+        assert!(!prompt_caching_default_for_base_url_from(
+            "https://custom.api.com",
+            None
+        ));
+        assert!(!prompt_caching_default_for_base_url_from(
+            "https://custom.api.com",
+            Some("true")
+        ));
+    }
+
     // Codex round-4 MAJOR: the chat() and chat_stream() error paths previously
     // hardcoded `format!("anthropic/{}", self.model)` instead of using
     // `self.provider_label`. Registry entries for `r9s` and `zai` lanes call
@@ -1910,6 +2202,34 @@ mod tests {
         assert_eq!(results[1]["cache_control"]["type"], "ephemeral");
         // The plain user message BEFORE the tool loop must stay untouched.
         assert!(msgs[0]["content"].is_string(), "{body}");
+    }
+
+    #[test]
+    fn should_not_mark_an_incomplete_parallel_tool_result_batch() {
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
+        let mut assistant = msg(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![
+            tool_call("toolu_a", "shell", serde_json::json!({"command": "ls"})),
+            tool_call("toolu_b", "read_file", serde_json::json!({"path": "x"})),
+        ]);
+        let mut result_a = msg(MessageRole::Tool, "out-a");
+        result_a.tool_call_id = Some("toolu_a".into());
+        let messages = vec![msg(MessageRole::User, "go"), assistant, result_a];
+
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &[], &ChatConfig::default()))
+                .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let first_user = messages[0]["content"].as_array().unwrap();
+        assert_eq!(
+            first_user.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "the prior complete user turn remains the rolling breakpoint: {body}"
+        );
+        assert!(
+            !messages[2].to_string().contains("cache_control"),
+            "an incomplete tool-result batch must not become a semantic cache boundary: {body}"
+        );
     }
 
     #[test]

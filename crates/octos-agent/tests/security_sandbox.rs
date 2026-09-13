@@ -450,6 +450,7 @@ fn should_restrict_reads_when_configured() {
         read_allow_paths: vec!["/usr".into(), "/opt/custom".into()],
         write_allow_globs: None,
         profile_name: None,
+        build_cache_slot: None,
     };
     let sandbox = octos_agent::create_sandbox(&config);
     let dir = tempfile::tempdir().unwrap();
@@ -680,6 +681,7 @@ fn should_block_dangerous_docker_cwd() {
         read_allow_paths: Vec::new(),
         write_allow_globs: None,
         profile_name: None,
+        build_cache_slot: None,
     });
 
     let cmd = sb.wrap_command("ls", std::path::Path::new("/etc"));

@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="790" viewBox="0 0 1200 790" role="img" aria-labelledby="title description">
+<title id="title">Octos 内核架构</title>
+<desc id="description">应用和 Agent 控制端通过 OUP 接入；原生宿主嵌入库。两条路径连接 Octos Harness 内核，使用状态、执行与协作能力。</desc>
+<defs><linearGradient id="paper" x2="1" y2="1"><stop stop-color="#f5f9ff"/><stop offset="1" stop-color="#f7fbf9"/></linearGradient><linearGradient id="kernel" x2="1" y2="1"><stop stop-color="#173f73"/><stop offset="1" stop-color="#1e3156"/></linearGradient><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="context-stroke" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<style>text{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif} .code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}</style>
+<rect x="0" y="0" width="1200" height="790" rx="28" fill="url(#paper)" stroke="none"/>
+<text x="48" y="53" font-size="14" font-weight="650" fill="#3468ce" text-anchor="start">OCTOS / 内核架构</text>
+<text x="48" y="101" font-size="34" font-weight="650" fill="#182b45" text-anchor="start">用 Octos 内核构建你的应用</text>
+<text x="48" y="135" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">将库嵌入应用，或通过 OUP 控制运行时。</text>
+<rect x="48" y="174" width="352" height="96" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<g transform="translate(72 199) scale(1)" fill="none" stroke="#3468ce" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="24" height="21" rx="4"/><path d="M2 10h24"/><path d="M7 6.5h.1M11 6.5h.1"/></g>
+<text x="116" y="211" font-size="22" font-weight="600" fill="#182b45" text-anchor="start">应用客户端</text>
+<text x="72" y="244" font-size="18" font-weight="400" fill="#5c6f86" text-anchor="start">Octoscode · Octoscode Web</text>
+<rect x="424" y="174" width="352" height="96" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<g transform="translate(448 199) scale(1)" fill="none" stroke="#3468ce" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="14" cy="6" r="4"/><circle cx="5" cy="20" r="4"/><circle cx="23" cy="20" r="4"/><path d="M11 10 7 16m10-6 4 6M9 20h10"/></g>
+<text x="492" y="211" font-size="22" font-weight="600" fill="#182b45" text-anchor="start">Agent 控制端</text>
+<text x="448" y="244" font-size="18" font-weight="400" fill="#5c6f86" text-anchor="start">Codex · Claude Code</text>
+<rect x="800" y="174" width="352" height="96" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<g transform="translate(824 199) scale(1)" fill="none" stroke="#3468ce" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6-7 8 7 8m10-16 7 8-7 8M16 3l-4 22"/></g>
+<text x="868" y="211" font-size="22" font-weight="600" fill="#182b45" text-anchor="start">你的原生应用</text>
+<text x="824" y="244" font-size="18" font-weight="400" fill="#5c6f86" text-anchor="start">桌面应用 · 服务 · 设备</text>
+<path d="M224 276V312" fill="none" stroke="#168575" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M600 276V312" fill="none" stroke="#168575" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<rect x="526" y="282" width="148" height="23" rx="5" fill="#f6fafc" stroke="none"/>
+<text x="600" y="298" font-size="14" font-weight="400" fill="#168575" text-anchor="middle">你的 OUP 适配器</text>
+<path d="M976 276V312" fill="none" stroke="#3468ce" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<rect x="48" y="318" width="728" height="76" rx="16" fill="#eaf7f2" stroke="#c4e5d9"/>
+<g transform="translate(72 341) scale(1)" fill="none" stroke="#168575" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9h22m-6-6 6 6-6 6M25 21H3m6-6-6 6 6 6"/></g>
+<text x="116" y="365" font-size="26" font-weight="700" fill="#168575" text-anchor="start">OUP</text>
+<text x="197" y="364" font-size="19" font-weight="400" fill="#168575" text-anchor="start">命令 · 状态 · 事件</text>
+<text x="752" y="364" font-size="16" font-weight="400" fill="#168575" text-anchor="end">WebSocket / stdio</text>
+<rect x="800" y="318" width="352" height="76" rx="16" fill="#eef3fd" stroke="#d2def4"/>
+<text x="824" y="348" font-size="22" font-weight="650" fill="#3468ce" text-anchor="start">库接口</text>
+<text x="824" y="376" font-size="18" font-weight="400" fill="#5c6f86" text-anchor="start">Rust crates · 任务执行绑定</text>
+<path d="M412 400V434" fill="none" stroke="#168575" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M976 400V434" fill="none" stroke="#3468ce" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<rect x="48" y="440" width="1104" height="100" rx="20" fill="url(#kernel)" stroke="none"/>
+<rect x="68" y="461" width="58" height="58" rx="15" fill="#2b5280" stroke="none"/>
+<g transform="translate(82 475) scale(1.1)" fill="none" stroke="#a1eddd" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="14" cy="14" r="5"/><circle cx="14" cy="2" r="1.5"/><circle cx="26" cy="14" r="1.5"/><circle cx="14" cy="26" r="1.5"/><circle cx="2" cy="14" r="1.5"/><path d="M14 4v5m5 5h5M14 19v5M4 14h5M6 6l4 4m8 8 4 4M6 22l4-4m8-8 4-4"/></g>
+<text x="148" y="482" font-size="31" font-weight="650" fill="#ffffff" text-anchor="start">Octos Harness 内核</text>
+<text x="148" y="516" font-size="19" font-weight="400" fill="#cadbf1" text-anchor="start">Agent 执行 · 会话 · 监督</text>
+<rect x="920" y="471" width="200" height="38" rx="19" fill="#29496f" stroke="#4a688c"/>
+<text x="1020" y="496" font-size="18" font-weight="500" fill="#e2f1ff" text-anchor="middle">使用 Rust 编写</text>
+<path d="M224 546V580" fill="none" stroke="#b5c6d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="48" y="586" width="352" height="134" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<g transform="translate(72 607) scale(1)" fill="none" stroke="#168575" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m2 8 12-6 12 6-12 6-12-6Zm0 7 12 6 12-6M2 22l12 6 12-6"/></g>
+<text x="116" y="629" font-size="22" font-weight="600" fill="#182b45" text-anchor="start">上下文与记忆</text>
+<text x="72" y="666" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">压缩 · 检索</text>
+<text x="72" y="695" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">持久化历史 · 回放</text>
+<path d="M600 546V580" fill="none" stroke="#b5c6d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="424" y="586" width="352" height="134" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<g transform="translate(448 607) scale(1)" fill="none" stroke="#168575" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="1" width="9" height="9" rx="2"/><rect x="18" y="18" width="9" height="9" rx="2"/><path d="M10 5h12v13M5 10v12h13"/></g>
+<text x="492" y="629" font-size="22" font-weight="600" fill="#182b45" text-anchor="start">工具与工作流</text>
+<text x="448" y="666" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">技能 · 模型路由</text>
+<text x="448" y="695" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">权限 · 沙箱</text>
+<path d="M976 546V580" fill="none" stroke="#b5c6d8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="800" y="586" width="352" height="134" rx="16" fill="#ffffff" stroke="#dce5ef"/>
+<g transform="translate(824 607) scale(1)" fill="none" stroke="#168575" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="14" cy="6" r="4"/><circle cx="5" cy="20" r="4"/><circle cx="23" cy="20" r="4"/><path d="M11 10 7 16m10-6 4 6M9 20h10"/></g>
+<text x="868" y="629" font-size="22" font-weight="600" fill="#182b45" text-anchor="start">Agent 与 Peer</text>
+<text x="824" y="666" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">任务委派 · worktree</text>
+<text x="824" y="695" font-size="19" font-weight="400" fill="#5c6f86" text-anchor="start">任务 · 产物 · 结果</text>
+<text x="48" y="762" font-size="18" font-weight="400" fill="#5c6f86" text-anchor="start">为应用客户端与 Agent 控制端提供统一的执行与状态。</text>
+</svg>

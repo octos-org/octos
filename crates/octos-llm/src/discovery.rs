@@ -12,7 +12,8 @@
 //! ([`ModelDiscovery`]) and the HTTP probe resolves from the selected ROUTE —
 //! the same override rules the inference path applies in
 //! `create_provider_with_api_type`: an `api_type` of `anthropic` forces the
-//! Anthropic Messages strategy, everything else follows the family's declared
+//! Anthropic Messages strategy, an `api_type` of `responses` the
+//! OpenAI-compatible listing, everything else follows the family's declared
 //! protocol (unknown families fall back to OpenAI-compatible, exactly like the
 //! runtime's custom-provider fallback). Families whose protocol is selected by
 //! MODEL NAME (r9s: `claude-*` → Anthropic) additionally carry a per-model
@@ -159,13 +160,14 @@ impl DiscoveryOutcome {
 
 /// Resolve the discovery route for a selected route + model.
 ///
-/// Mirrors `create_provider_with_api_type`'s precedence exactly: an explicit
-/// `api_type: "anthropic"` overrides any family (the runtime bypasses the
-/// registry for that case), and for every other `api_type` the registered
-/// family's own factory — hence its declared discovery — rules. Unknown or
-/// `custom` families fall back to the OpenAI-compatible strategy, matching the
-/// runtime's custom-provider default. The protocol is never inferred from a
-/// single literal family id.
+/// Mirrors `create_provider_with_api_type`'s precedence exactly: explicit
+/// `api_type` overrides that bypass the registry at runtime — `"anthropic"`
+/// (Anthropic Messages at the route's root) and `"responses"` (OpenAI
+/// Responses at `{base}`) — override any family here too, and for every other
+/// `api_type` the registered family's own factory — hence its declared
+/// discovery — rules. Unknown or `custom` families fall back to the
+/// OpenAI-compatible strategy, matching the runtime's custom-provider
+/// default. The protocol is never inferred from a single literal family id.
 ///
 /// Families that select the wire protocol by MODEL NAME (r9s: `claude-*` →
 /// Anthropic Messages at a rewritten `{base}/anthropic` root) carry a
@@ -182,15 +184,31 @@ pub fn resolve_model_discovery(
     if api_type == Some("anthropic") {
         return ANTHROPIC_MODELS.into();
     }
+    let entry = family
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .and_then(crate::registry::lookup);
+    // api_type "responses" bypasses the registry at runtime
+    // (OpenAIResponsesProvider at {base}), so the listing to probe is the
+    // OpenAI-compatible `GET {base}/models` — never the family's declared
+    // (possibly Anthropic) strategy, and never a per-model resolver's root
+    // rewrite. A family that declares discovery Unsupported (vertex) stays
+    // manual-only: no protocol override conjures up a listing endpoint it
+    // does not have.
+    if api_type == Some("responses") {
+        return match entry {
+            Some(entry) => match entry.model_discovery {
+                unsupported @ ModelDiscovery::Unsupported(_) => unsupported.into(),
+                ModelDiscovery::Supported(_) => OPENAI_MODELS.into(),
+            },
+            None => OPENAI_MODELS.into(),
+        };
+    }
     // Normalize like `discover_models` does before handing the base URL to a
     // per-model resolver — an empty/whitespace override must fall through to
     // the family default root, never reach the resolver as `Some("")`.
     let base_url = base_url.map(str::trim).filter(|root| !root.is_empty());
-    match family
-        .map(str::trim)
-        .filter(|f| !f.is_empty())
-        .and_then(crate::registry::lookup)
-    {
+    match entry {
         Some(entry) => {
             // The model is matched RAW (no trim), exactly like provider
             // construction's `prefers_anthropic` — a whitespace-padded model
@@ -430,6 +448,39 @@ mod tests {
         assert_eq!(
             resolve_model_discovery(Some("zai"), Some("anthropic"), None, None).discovery,
             ANTHROPIC_MODELS
+        );
+    }
+
+    #[test]
+    fn should_use_openai_strategy_when_api_type_is_the_responses_override() {
+        // The runtime's `create_provider_with_api_type` bypasses the registry
+        // for `api_type: "responses"` and serves the OpenAI Responses API at
+        // {base} — even for families whose declared protocol is Anthropic
+        // Messages or Gemini. Discovery must probe the OpenAI-compatible
+        // listing for that route, not the family's native strategy.
+        for family in ["zai", "anthropic", "gemini"] {
+            assert_eq!(
+                resolve_model_discovery(Some(family), Some("responses"), None, None),
+                OPENAI_MODELS.into()
+            );
+        }
+        // A per-model-protocol family under the responses override speaks
+        // OpenAI at {base} with NO root rewrite, even for a claude-* model
+        // that would otherwise route to {base}/anthropic.
+        assert_eq!(
+            resolve_model_discovery(
+                Some("r9s"),
+                Some("responses"),
+                Some("claude-sonnet-4-6"),
+                None
+            ),
+            OPENAI_MODELS.into()
+        );
+        // A family with NO listing endpoint (vertex) stays manual-only —
+        // the override switches protocols, it cannot conjure a listing.
+        assert_eq!(
+            resolve_model_discovery(Some("vertex"), Some("responses"), None, None),
+            resolve_model_discovery(Some("vertex"), None, None, None)
         );
     }
 
