@@ -29613,6 +29613,17 @@ async fn run_m9_fixture_turn(
                     )),
                 );
             }
+            // UPCR-2026-023: drain pending structured user-questions for the
+            // interrupted fixture turn, mirroring the live interrupt path —
+            // the blocked `ask_user_question` tool unblocks (Cancelled)
+            // instead of leaking until its waiter guard drops with
+            // `waiter_dropped`, and a reconnect never re-shows a question for
+            // the dead turn.
+            contracts.user_questions.cancel_pending_for_turn(
+                &session_id,
+                &turn_id,
+                approval_cancelled_reasons::TURN_INTERRUPTED,
+            );
             try_emit_terminal(
                 &turn_state,
                 TerminalReason::Interrupted,
