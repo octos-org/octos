@@ -33,6 +33,23 @@ use crate::skills_scope::{
     build_account_skills_loader, discover_ominix_url, push_runtime_plugin_env,
 };
 
+/// Create directories that background profile services expect to exist for
+/// the entire runtime lifetime.
+///
+/// Inbox producers also create this directory defensively before writing, but
+/// the serve-side steer sweep starts before the first producer may run. Eager
+/// creation keeps an unused inbox from looking like an I/O failure while
+/// preserving the sweep's warning for a directory that disappears later.
+fn ensure_profile_runtime_directories(data_dir: &Path) -> Result<()> {
+    let inbox_dir = data_dir.join("inbox");
+    std::fs::create_dir_all(&inbox_dir).wrap_err_with(|| {
+        format!(
+            "failed to create profile inbox directory {}",
+            inbox_dir.display()
+        )
+    })
+}
+
 /// Immutable inputs needed to rebuild only a profile's plugin-derived layer.
 /// Long-lived stores, providers, schedulers, and profile services are reused
 /// from the existing [`ProfileRuntime`].
@@ -903,9 +920,10 @@ impl ProfileRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error when the LLM provider construction fails
-    /// (typically a missing API key), when the redb episode store
-    /// cannot open, or when the tool config store cannot be opened.
+    /// Returns an error when runtime directories cannot be created, when the
+    /// LLM provider construction fails (typically a missing API key), when the
+    /// redb episode store cannot open, or when the tool config store cannot be
+    /// opened.
     /// Plugin / MCP loading failures are logged at `warn` and do not
     /// fail bootstrap (the profile still serves with builtins only).
     pub async fn bootstrap(
@@ -970,6 +988,13 @@ impl ProfileRuntime {
         no_retry: bool,
         provider_override: Option<Arc<dyn LlmProvider>>,
     ) -> Result<Arc<Self>> {
+        ensure_profile_runtime_directories(data_dir).wrap_err_with(|| {
+            format!(
+                "failed to initialize runtime directories for profile '{}'",
+                profile.id
+            )
+        })?;
+
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
         // else falls back to `detect_provider(model)`.
@@ -1723,6 +1748,16 @@ mod tests {
     #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
+
+    #[test]
+    fn should_create_inbox_when_ensuring_profile_runtime_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("test").join("data");
+
+        ensure_profile_runtime_directories(&data_dir).unwrap();
+
+        assert!(data_dir.join("inbox").is_dir());
+    }
 
     /// Build a minimal `UserProfile` with no LLM contract. M11-D
     /// bootstrap must reject this with a clear error, not panic.
