@@ -33,23 +33,22 @@ use octos_core::ui_protocol::{
     ContextNormalizationReportedEvent, CronListParams, CronToggleParams, EnvelopeTokenUsage,
     EnvelopeV2, EnvelopeV2Notification, FileRef, HydratedMessage, HydratedTurn, InputItem,
     MemoryEntityParams, MemoryOverviewParams, MessageDeltaEvent, MessageMeta, OutputCursor,
-    Payload, PayloadV2, PeerClosedEvent, PeerStagedEvent, ReplayLossyEvent, RpcError,
-    RpcErrorResponse, RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX,
-    SESSION_MESSAGES_PAGE_DEFAULT_LIMIT, SESSION_MESSAGES_PAGE_MAX_LIMIT,
-    SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS, SessionBtwParams,
-    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
-    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
-    SessionOpened, SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult,
-    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
-    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
-    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
-    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
-    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
-    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnErrorPartialResult, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
+    PayloadV2, PeerClosedEvent, PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse,
+    RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
+    SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
+    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
+    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
+    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
+    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
+    SessionTitleSetParams, SessionWorkspaceGetParams, SkillActionJobUpdatedEvent,
+    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
+    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
+    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
+    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
+    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
+    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
+    TurnErrorPartialResult, TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState,
+    TurnSessionResult, TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
     TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -58,19 +57,19 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
-    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
-    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
-    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
-    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
-    hydrate_sections, progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
+    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
+    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
+    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
+    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
+    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -1932,15 +1931,6 @@ struct ConnectionUiFeatures {
     /// `background/activity`, so a client that cannot render it never sees an
     /// "unknown notification" (the ui-protocol v2 migration trap).
     background_activity: bool,
-    /// UPCR-2026-014 M9-γ `projection.envelope.v1` negotiated. When set,
-    /// the client opts in to the historical v1 envelope shape (spec
-    /// § 14) for projected events. γ-1 wires capability negotiation
-    /// only — no emit site references this flag yet, and legacy
-    /// `message/delta`, `tool/*`, and
-    /// `turn/completed` notifications continue to flow on the wire.
-    /// γ-2 (follow-up) gates emission on this flag; γ-3 deletes the
-    /// legacy notifications.
-    projection_envelope: bool,
     /// Stage 1 `projection.envelope.v2` negotiated. This is deliberately
     /// independent from the v1 flag and defaults to false on every transport.
     /// When set, the connection receives the cursor-stamped v2 projection
@@ -2046,11 +2036,6 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
             ),
-            projection_envelope: has_ui_feature(
-                headers,
-                query,
-                UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
-            ),
             projection_envelope_v2: has_ui_feature(
                 headers,
                 query,
@@ -2131,21 +2116,6 @@ impl ConnectionUiFeatures {
             voice_asr_admission_v1: true,
             plan_todos: true,
             background_activity: true,
-            // Do NOT auto-enable `projection.envelope.v1` for stdio
-            // connections. Legacy `turn/completed` is the turn-lifecycle
-            // source for clients that do not consume `projection/envelope`
-            // (e.g. the octoscode over stdio, which clears its turn-active
-            // state — `live_reply`, backing the send-gate — ONLY on legacy
-            // `turn/completed`). The γ-cutover mutual-exclusion gate in
-            // `live_event_passes_capability_filter` DROPS legacy
-            // `turn/completed` whenever `projection_envelope` is true, so
-            // auto-enabling envelopes here suppresses the only lifecycle
-            // signal such clients understand and wedges them (every message
-            // after turn 1 queues "after active turn" forever). A stdio
-            // client that genuinely consumes envelopes can still opt in via
-            // `client_hello` (`from_requested_feature_tokens`), so this is a
-            // default-only change, not a capability removal.
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: true,
             coding_autonomy_v1: true,
@@ -2195,7 +2165,6 @@ impl ConnectionUiFeatures {
             voice_asr_admission_v1: has(APPUI_FEATURE_VOICE_ASR_ADMISSION_V1),
             plan_todos: has(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1),
             background_activity: has(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1),
-            projection_envelope: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             projection_envelope_v2: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
@@ -2277,9 +2246,6 @@ impl ConnectionUiFeatures {
         }
         if self.background_activity {
             requested.push(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1);
-        }
-        if self.projection_envelope {
-            requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1);
         }
         if self.projection_envelope_v2 {
             requested.push(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2);
@@ -14087,7 +14053,9 @@ async fn raw_peer_prepare(
     let workspace_root = match params.cwd.as_deref() {
         Some(cwd) => {
             let path = PathBuf::from(cwd);
-            let canonical = path.canonicalize().map_err(|err| {
+            // dunce strips the `\\?\` prefix std canonicalize returns on
+            // Windows — the prefixed form breaks `git clone` downstream.
+            let canonical = dunce::canonicalize(&path).map_err(|err| {
                 RpcError::invalid_params(format!("cwd {cwd} is not usable: {err}"))
             })?;
             if !canonical.is_dir() {
@@ -15280,6 +15248,7 @@ fn reserve_peer_build_cache_turn(
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    turn_id: &TurnId,
     outcome: TurnTerminalOutcome,
     content: &str,
     tokens_consumed: u64,
@@ -15327,13 +15296,17 @@ fn write_peer_result_if_peer_session(
         TurnTerminalOutcome::RateLimited => "rate_limited",
     };
 
+    // The runtime TurnId is the join key to model/lifecycle ledger events.
+    // The count below is only a file ordinal: failed writes can skip a real
+    // runtime turn without incrementing this count. Never infer an ID from it.
     // #435: versioned result files prevent silent overwrite when a persistent
     // peer runs multiple turns. Count existing result-*.md files to determine
     // the turn number so the caller doesn't need to track state.
     let turn_count = count_peer_result_versions(&peer_dir) + 1;
 
     let text = format!(
-        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\n---\n\n{body}{truncated}\n"
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\nturn_id: {}\n---\n\n{body}{truncated}\n",
+        turn_id.0
     );
 
     // Failure authority does not depend on the best-effort result write.
@@ -19061,10 +19034,7 @@ async fn handle_session_open(
     // second filter could never fire — and reading it as an independent gate
     // would overstate the delivery path's defences.
     for event in outcome.replay {
-        let projected = features
-            .projection_envelope_v2
-            .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
-            .flatten();
+        let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
         let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
         if !live_event_passes_capability_filter(&event_for_wire, features) {
             continue;
@@ -19470,10 +19440,7 @@ async fn forward_live_ledger_event(
     if !ledger_event_matches_profile_scope(&event.event, profile_scope) {
         return Ok(());
     }
-    let projected = features
-        .projection_envelope_v2
-        .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
-        .flatten();
+    let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
     let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
@@ -19606,15 +19573,18 @@ async fn spawn_live_forwarder(
     forwarders.lock().await.insert(session_id, task);
 }
 
-/// Build the Stage-1 v2 projection for one already-durable source event.
+/// Project one durable ledger event onto the canonical v2 wire envelope.
 ///
-/// The returned notification is a *wire projection*, not a second ledger
-/// append. Its cursor is the cursor of `event`, so enabling v2 cannot shift a
-/// legacy client's cursor sequence or otherwise alter its bytes. V1 envelope
-/// rows remain the durable source for streamed content; legacy terminal,
-/// attachment, and background-completion rows fill the v2 gaps that v1 could
-/// not represent canonically.
-fn project_v2_ledger_event(
+/// Assistant/reasoning/tool content is already stored as native
+/// [`UiNotification::EnvelopeV2`] and passes through unchanged. The server's
+/// internal turn-lifecycle notifications — `TurnCompleted`, `TurnError`,
+/// `FileAttached`, `TurnSpawnComplete` — are kept in the ledger for turn-state
+/// and replay, and are projected here into their canonical v2 shape
+/// (`TurnTerminal`, `FileAttached`, `BackgroundChildCompleted`) so the client
+/// only ever sees the single v2 wire contract. This is a *wire projection*,
+/// not a second ledger append: the returned notification carries the source
+/// event's cursor, so it never shifts the durable sequence.
+fn project_lifecycle_event_to_v2_wire(
     ledger: &UiProtocolLedger,
     event: &UiProtocolLedgerEvent,
     cursor: &UiCursor,
@@ -19625,86 +19595,6 @@ fn project_v2_ledger_event(
 
     let projection = match notification {
         UiNotification::EnvelopeV2(envelope) => envelope.clone(),
-        UiNotification::Envelope(envelope) => {
-            let source = &envelope.envelope;
-            let assistant_segment_id = || {
-                format!(
-                    "{}:assistant:{}",
-                    source.thread_id,
-                    ledger.projection_v2_assistant_segment_index(
-                        &envelope.session_id,
-                        &source.thread_id,
-                        cursor.seq,
-                    )
-                )
-            };
-            let payload = match &source.payload {
-                Payload::UserMessage { text, files } => PayloadV2::UserMessage {
-                    text: text.clone(),
-                    files: files.clone(),
-                },
-                Payload::AssistantDelta { text } => PayloadV2::AssistantDelta {
-                    text: text.clone(),
-                    assistant_segment_id: assistant_segment_id(),
-                },
-                Payload::ReasoningDelta { text } => {
-                    PayloadV2::ReasoningDelta { text: text.clone() }
-                }
-                Payload::AssistantPersisted { text, meta } => PayloadV2::AssistantPersisted {
-                    text: text.clone(),
-                    assistant_segment_id: assistant_segment_id(),
-                    meta: meta.clone(),
-                },
-                Payload::ToolStart {
-                    tool_call_id,
-                    name,
-                    arguments_preview,
-                } => PayloadV2::ToolStart {
-                    tool_call_id: tool_call_id.clone(),
-                    name: name.clone(),
-                    arguments_preview: arguments_preview.clone(),
-                },
-                Payload::ToolProgress {
-                    tool_call_id,
-                    message,
-                } => PayloadV2::ToolProgress {
-                    tool_call_id: tool_call_id.clone(),
-                    message: message.clone(),
-                },
-                Payload::ToolEnd {
-                    tool_call_id,
-                    status,
-                    error,
-                    reason,
-                    output_preview,
-                    duration_ms,
-                } => PayloadV2::ToolEnd {
-                    tool_call_id: tool_call_id.clone(),
-                    status: *status,
-                    error: error.clone(),
-                    reason: reason.clone(),
-                    output_preview: output_preview.clone(),
-                    duration_ms: *duration_ms,
-                },
-                // File ownership and all terminal outcomes originate from
-                // their richer legacy source events below. Mapping these v1
-                // payloads too would create duplicates and lose ownership /
-                // errored / interrupted information.
-                Payload::FileAttached { .. } | Payload::TurnCompleted { .. } => return None,
-            };
-            EnvelopeV2Notification {
-                session_id: envelope.session_id.clone(),
-                topic: envelope.topic.clone(),
-                envelope: EnvelopeV2 {
-                    thread_id: source.thread_id.clone(),
-                    seq: source.seq,
-                    cursor: Some(cursor.clone()),
-                    turn_id: source.thread_id.clone(),
-                    client_message_id: source.client_message_id.clone(),
-                    payload,
-                },
-            }
-        }
         UiNotification::TurnCompleted(completed) => {
             let thread_id = completed.turn_id.0.to_string();
             EnvelopeV2Notification {
@@ -19880,25 +19770,24 @@ fn live_event_passes_capability_filter(
         return true;
     }
 
-    // A v2-capable connection receives only projections for source records.
-    // Keep this branch before the historical capability gates below so a
-    // replayed source event cannot leak beside its v2 projection.
-    if features.projection_envelope_v2 {
-        if let UiProtocolLedgerEvent::Notification(
-            UiNotification::Envelope(_)
-            | UiNotification::MessageDelta(_)
-            | UiNotification::ReasoningDelta(_)
-            | UiNotification::ToolStarted(_)
-            | UiNotification::ToolProgress(_)
-            | UiNotification::ToolCompleted(_)
-            | UiNotification::FileAttached(_)
-            | UiNotification::TurnCompleted(_)
-            | UiNotification::TurnError(_)
-            | UiNotification::TurnSpawnComplete(_),
-        ) = event
-        {
-            return false;
-        }
+    // Every connection is a canonical v2 consumer. A source lifecycle record
+    // is superseded by its v2 projection (native envelope or projected
+    // terminal / file / background-child), so the raw record is never
+    // delivered on the wire — a replayed source event cannot leak beside its
+    // projection. Keep this before the historical capability gates below.
+    if let UiProtocolLedgerEvent::Notification(
+        UiNotification::MessageDelta(_)
+        | UiNotification::ReasoningDelta(_)
+        | UiNotification::ToolStarted(_)
+        | UiNotification::ToolProgress(_)
+        | UiNotification::ToolCompleted(_)
+        | UiNotification::FileAttached(_)
+        | UiNotification::TurnCompleted(_)
+        | UiNotification::TurnError(_)
+        | UiNotification::TurnSpawnComplete(_),
+    ) = event
+    {
+        return false;
     }
     if !features.context_lifecycle_available() {
         if let UiProtocolLedgerEvent::Notification(
@@ -20003,44 +19892,6 @@ fn live_event_passes_capability_filter(
         {
             return false;
         }
-    }
-    // UPCR-2026-014 M9-γ cutover: per-connection mutual exclusion.
-    //
-    // Connections that NEGOTIATED `projection.envelope.v1` see historical
-    // v1 projection envelopes only — the legacy notifications
-    // they supersede are filtered out on this side. Connections that did
-    // NOT negotiate see legacy notifications ONLY — envelopes are
-    // filtered out. This is the cutover gate that makes the M9-γ
-    // projection contract enforceable end-to-end without dual-rendering
-    // the same logical event in two shapes.
-    //
-    // Legacy events superseded by envelopes per spec § 14.7:
-    //   - message/delta             → assistant_delta envelope
-    //   - message/reasoning_delta   → reasoning_delta envelope
-    //   - tool/started              → tool_start envelope
-    //   - tool/progress             → tool_progress envelope
-    //   - tool/completed            → tool_end envelope
-    //   - file/attached             → file_attached envelope
-    //   - turn/completed            → turn_completed envelope
-    //
-    // Note: the legacy *emit* sites stay in place — clients that did
-    // NOT negotiate the feature still need them. What this gate
-    // changes is the per-connection wire delivery.
-    if features.projection_envelope {
-        if let UiProtocolLedgerEvent::Notification(
-            UiNotification::MessageDelta(_)
-            | UiNotification::ReasoningDelta(_)
-            | UiNotification::ToolStarted(_)
-            | UiNotification::ToolProgress(_)
-            | UiNotification::ToolCompleted(_)
-            | UiNotification::FileAttached(_)
-            | UiNotification::TurnCompleted(_),
-        ) = event
-        {
-            return false;
-        }
-    } else if let UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_)) = event {
-        return false;
     }
     true
 }
@@ -20972,6 +20823,22 @@ fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<Str
     ))
 }
 
+fn profile_bootstrap_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
 /// Generation guard for the dynamic ProfileRuntime cache (#2164): the
 /// post-commit Profile LLM transition bumps the generation BEFORE dropping
 /// the cached runtime, so an in-flight bootstrap that read the PRE-commit
@@ -21029,6 +20896,13 @@ pub(crate) async fn ensure_session_profile_runtime(
     let Some(key) = dynamic_profile_runtime_key(state, profile_id) else {
         return Ok(None);
     };
+
+    // First-page auxiliary requests and session/open can observe the same
+    // cold cache. Bootstrap only once per profile; otherwise our own parallel
+    // attempt holds redb's exclusive lock and the other reports a false
+    // "another process" failure (#2299). Recheck the cache under this guard.
+    let bootstrap_lock = profile_bootstrap_lock(&key);
+    let _bootstrap_guard = bootstrap_lock.lock().await;
 
     if let Some(runtime) = dynamic_profile_runtimes()
         .read()
@@ -21343,6 +21217,18 @@ fn build_workspace_pane_snapshot(
     }
 }
 
+/// Wire format uses `/` separators on every platform. Only Windows needs
+/// the conversion — elsewhere `\` is a legal filename character.
+#[cfg(windows)]
+fn wire_relative_path(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn wire_relative_path(relative: &Path) -> String {
+    relative.to_string_lossy().into_owned()
+}
+
 fn collect_workspace_entries(
     root: &Path,
     dir: &Path,
@@ -21377,7 +21263,7 @@ fn collect_workspace_entries(
             continue;
         };
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        let relative_path = relative.to_string_lossy().to_string();
+        let relative_path = wire_relative_path(relative);
         let depth = relative.components().count().saturating_sub(1);
         let (kind, detail) = if metadata.is_dir() {
             ("directory", Some("dir".into()))
@@ -21466,7 +21352,7 @@ fn collect_artifact_items(
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         let updated_at = Some(chrono::DateTime::<Utc>::from(modified));
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        let relative_path = relative.to_string_lossy().to_string();
+        let relative_path = wire_relative_path(relative);
         artifacts.push((
             modified,
             UiArtifactPaneItem {
@@ -24968,6 +24854,52 @@ fn hydrated_canonical_message_identities(
         .collect()
 }
 
+// Keep redundant streaming history below a quarter of the frame ceiling.
+// Otherwise thousands of tiny deltas make the generic frame truncator erase
+// even short user/assistant text before it finally shrinks the replay array.
+fn compact_hydrate_projection_replay(
+    events: Vec<EnvelopeV2>,
+) -> (Vec<EnvelopeV2>, BTreeMap<String, u64>) {
+    let mut threads: BTreeMap<String, Vec<EnvelopeV2>> = BTreeMap::new();
+    let mut checkpoints = BTreeMap::new();
+    for event in events {
+        checkpoints
+            .entry(event.thread_id.clone())
+            .and_modify(|seq: &mut u64| *seq = (*seq).max(event.seq))
+            .or_insert(event.seq);
+        threads
+            .entry(event.thread_id.clone())
+            .or_default()
+            .push(event);
+    }
+    let mut budget = MAX_TEXT_FRAME_BYTES / 4;
+    let mut retained = Vec::new();
+    for (_, mut thread) in threads {
+        thread.sort_by_key(|event| event.seq);
+        let complete = thread
+            .iter()
+            .enumerate()
+            .all(|(index, event)| event.seq == index as u64 + 1);
+        let bytes = serde_json::to_vec(&thread)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if complete && bytes <= budget {
+            budget -= bytes;
+            retained.extend(thread);
+        } else {
+            // Terminal state is not present in transcript rows. Keep it even
+            // when the client reconstructs this thread from durable messages.
+            retained.extend(
+                thread
+                    .into_iter()
+                    .filter(|event| matches!(event.payload, PayloadV2::TurnTerminal { .. })),
+            );
+        }
+    }
+    retained.sort_by_key(|event| event.cursor.as_ref().map(|cursor| cursor.seq).unwrap_or(0));
+    (retained, checkpoints)
+}
+
 /// Per UPCR-2026-009: bundle the chat-state projection into one RPC.
 ///
 /// Atomicity invariant (codex's review ask): the ledger snapshot and the
@@ -25070,7 +25002,7 @@ async fn handle_session_hydrate(
                 .iter()
                 .filter_map(|event| {
                     let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
-                        project_v2_ledger_event(ledger, &event.event, &event.cursor)?
+                        project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor)?
                     else {
                         return None;
                     };
@@ -25091,7 +25023,7 @@ async fn handle_session_hydrate(
                 .iter()
                 .filter_map(|event| {
                     let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
-                        project_v2_ledger_event(ledger, &event.event, &event.cursor)?
+                        project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor)?
                     else {
                         return None;
                     };
@@ -25102,6 +25034,25 @@ async fn handle_session_hydrate(
     } else {
         None
     };
+
+    let (replayed_projection_envelopes, projection_thread_sequences) =
+        if features.projection_envelope_v2 && include_set.messages {
+            let projected = replayed
+                .iter()
+                .filter_map(|event| {
+                    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                        project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor)?
+                    else {
+                        return None;
+                    };
+                    Some(envelope.envelope)
+                })
+                .collect::<Vec<_>>();
+            let (events, checkpoints) = compact_hydrate_projection_replay(projected);
+            (Some(events), Some(checkpoints))
+        } else {
+            (None, None)
+        };
 
     let expose_message_id = features.projection_envelope_v2 && include_set.messages;
     // Identity provenance is independent of the caller's replay window AND
@@ -25122,7 +25073,7 @@ async fn handle_session_hydrate(
             .filter(|event| event.cursor.seq <= head_cursor.seq)
             .filter_map(|event| {
                 let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
-                    project_v2_ledger_event(ledger, &event.event, &event.cursor)?
+                    project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor)?
                 else {
                     return None;
                 };
@@ -25293,6 +25244,8 @@ async fn handle_session_hydrate(
         pending_questions,
         replayed_envelopes,
         replayed_tool_envelopes,
+        replayed_projection_envelopes,
+        projection_thread_sequences,
     };
     send_serialized_rpc_result(
         ws,
@@ -25506,6 +25459,8 @@ async fn handle_session_rollback(
         pending_questions: None,
         replayed_envelopes: None,
         replayed_tool_envelopes: None,
+        replayed_projection_envelopes: None,
+        projection_thread_sequences: None,
     };
     let result = SessionRollbackResult {
         dropped_turns,
@@ -31829,7 +31784,7 @@ print(f"{agent_id}: {finding}")
             spec.title, spec.agent_id, spec.artifact_id
         ),
     });
-    emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
+    emit_progress_envelope(&ledger, &session_id, &delta, None);
     let _ = send_notification_ephemeral(&ws, &ledger, delta);
     append_appui_evidence_jsonl(
         "agent-ledger.jsonl",
@@ -32699,6 +32654,19 @@ async fn run_standalone_turn(
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
+    };
+    // #2244 — `on_turn_end` fires at this turn's terminal below (completed,
+    // errored, or interrupted). On the done/error arms it fires BEFORE the
+    // terminal frame is emitted, so a client that observes the turn's end —
+    // including a one-shot `octos chat -m` whose process exits right after —
+    // can rely on the hook having run; the interrupt arm fires right after
+    // its frame instead, to stay inside the 5s interrupt-ack deadline.
+    // Resolved once here from the same profile the turn's agent hooks come
+    // from; `None` (no hooks configured) makes each fire a no-op.
+    let turn_end_hooks = session_runtime.profile.hook_executor.clone();
+    let turn_end_hook_ctx = octos_agent::HookContext {
+        session_id: Some(session_id.to_string()),
+        profile_id: Some(session_runtime.profile.profile_id.clone()),
     };
     // Outer-loop #4 (§4.2): this turn's peers root — `Some` ONLY when this
     // session is a peer (topic `peer-<slug>`) running under the profile's
@@ -35309,6 +35277,10 @@ async fn run_standalone_turn(
     // `session`/`turn` from this span (postfix `.instrument` keeps the block
     // itself untouched).
     let turn_span = crate::turn_trace::turn_span(&session_id, &turn_id);
+    // #2244 — snapshot the turn summary now that every prompt rewrite above
+    // (STT transcription merge, voice-mode suffix) has landed; `prompt`
+    // itself moves into the agent task below.
+    let turn_end_summary = crate::session_actor::git_turn_summary(&prompt);
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -36334,6 +36306,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
                     final_tokens_consumed,
@@ -36353,6 +36326,17 @@ async fn run_standalone_turn(
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                // #2244 — the turn reached its outcome; fire `on_turn_end`
+                // BEFORE the terminal frame (see the binding above).
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
                 // Keep continuation admission out of the terminal→receipt gap.
                 // The dispatcher takes this same registry lock before claiming
                 // a queued synthesis. No provider work is awaited under it.
@@ -36469,6 +36453,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     turn_outcome,
                     &wire_msg,
                     final_tokens_consumed,
@@ -36489,6 +36474,17 @@ async fn run_standalone_turn(
                 )
                 .await;
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                // #2244 — the turn reached its outcome; fire `on_turn_end`
+                // BEFORE the terminal frame (see the binding above).
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
                 try_emit_terminal(
                     &turn_state,
                     TerminalReason::Errored,
@@ -36927,6 +36923,20 @@ async fn run_standalone_turn(
             steer_buffer.as_ref(),
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
+        )
+        .await;
+        // #2244 — the turn reached its outcome; fire `on_turn_end`. Unlike the
+        // done/error arms this fires AFTER the terminal frame: the interrupt
+        // handler is blocked on that frame within a 5s ack deadline
+        // (INTERRUPT_ACK_TIMEOUT), so an up-to-`timeout_ms` hook wait must not
+        // sit between the state flip and the ack.
+        crate::session_actor::emit_lifecycle_hook_payload(
+            turn_end_hooks.as_ref(),
+            &session_id,
+            octos_agent::HookPayload::on_turn_end(
+                turn_end_summary.clone(),
+                Some(&turn_end_hook_ctx),
+            ),
         )
         .await;
         // codex #2 residual — a client-interrupted peer takes THIS branch, not
@@ -37979,28 +37989,13 @@ async fn try_emit_terminal(
                     session_result: details.session_result,
                 }),
             );
-            // UPCR-2026-014 M9-γ dual-emit: parallel canonical
-            // `turn_completed` envelope. The hard-barrier inside
-            // `emit_envelope` flips the thread's `completed` flag, so
-            // any further envelope on the same thread is dropped at
-            // the live emit site (spec § 14.6). Token usage zero-fills
-            // reasoning / cache_read / cache_write until the upstream
-            // propagation lands (legacy `tokens_in`/`tokens_out` are
-            // `Option<u32>` and only the first two are populated
-            // today).
-            let token_usage = EnvelopeTokenUsage {
-                input_tokens: tokens_in.map(u64::from).unwrap_or(0),
-                output_tokens: tokens_out.map(u64::from).unwrap_or(0),
-                reasoning_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            };
-            let _ = ledger.emit_envelope(
-                session_id,
-                turn_id.0.to_string(),
-                Payload::TurnCompleted { token_usage },
-                None,
-            );
+            // The canonical `turn_completed` terminal reaches the client as a
+            // native v2 `TurnTerminal`, projected from the lifecycle
+            // `UiNotification::TurnCompleted` emitted above (see
+            // `project_lifecycle_event_to_v2_wire`) — the same path errored and
+            // interrupted terminals already take. No separate envelope is
+            // emitted here.
+            let _ = (tokens_in, tokens_out);
         }
         TerminalReason::Errored => {
             // A pre-dispatch failure (for example peer lifetime persistence)
@@ -38123,106 +38118,6 @@ fn envelope_tool_arguments_preview(arguments: &Value) -> String {
     )
 }
 
-/// reachable through `ToolCompleted` today.
-fn emit_envelope_for_legacy_notification(
-    ledger: &UiProtocolLedger,
-    session_id: &SessionKey,
-    notification: &UiNotification,
-) {
-    use octos_core::ui_protocol::EnvelopeToolEndStatus;
-    let (thread_id, payload, client_message_id): (String, Payload, Option<String>) =
-        match notification {
-            UiNotification::MessageDelta(event) => (
-                event.turn_id.0.to_string(),
-                Payload::AssistantDelta {
-                    text: event.text.clone(),
-                },
-                None,
-            ),
-            UiNotification::ReasoningDelta(event) => (
-                event.turn_id.0.to_string(),
-                Payload::ReasoningDelta {
-                    text: event.text.clone(),
-                },
-                None,
-            ),
-            UiNotification::ToolStarted(event) => (
-                event.turn_id.0.to_string(),
-                Payload::ToolStart {
-                    tool_call_id: event.tool_call_id.clone(),
-                    name: event.tool_name.clone(),
-                    // Display fidelity for the tool card (`shell(cd … && …)`),
-                    // bounded so a 1MB tool-arg blob never lands in every
-                    // persisted envelope + hydrate replay.
-                    arguments_preview: event
-                        .arguments
-                        .as_ref()
-                        .map(envelope_tool_arguments_preview)
-                        // `{}` args render as "" — the spec says omit, not
-                        // empty-string.
-                        .filter(|preview| !preview.is_empty()),
-                },
-                None,
-            ),
-            UiNotification::ToolProgress(event) => {
-                let Some(message) = event.message.clone() else {
-                    return;
-                };
-                (
-                    event.turn_id.0.to_string(),
-                    Payload::ToolProgress {
-                        tool_call_id: event.tool_call_id.clone(),
-                        message,
-                    },
-                    None,
-                )
-            }
-            UiNotification::ToolCompleted(event) => {
-                let status = match event.success {
-                    Some(true) | None => EnvelopeToolEndStatus::Complete,
-                    Some(false) => EnvelopeToolEndStatus::Error,
-                };
-                let error = match status {
-                    // Bounded like `output_preview`: the error source can be
-                    // arbitrary-length tool output, and this string lands in
-                    // the durable ledger + every hydrate replay.
-                    EnvelopeToolEndStatus::Error => event.output_preview.as_deref().map(|s| {
-                        octos_core::truncated_utf8(
-                            s,
-                            octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
-                            "…",
-                        )
-                    }),
-                    _ => None,
-                };
-                (
-                    event.turn_id.0.to_string(),
-                    Payload::ToolEnd {
-                        tool_call_id: event.tool_call_id.clone(),
-                        status,
-                        error,
-                        reason: None,
-                        // Result excerpt for the `⎿ …` line under the card.
-                        // `ToolCompletedEvent.output_preview` is already a
-                        // preview upstream; re-bound defensively so ledger
-                        // growth is capped no matter what the emitter sent.
-                        output_preview: event.output_preview.as_deref().map(|preview| {
-                            octos_core::truncated_utf8(
-                                preview,
-                                octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
-                                "…",
-                            )
-                        }),
-                        duration_ms: event.duration_ms,
-                    },
-                    None,
-                )
-            }
-            _ => return,
-        };
-    let _ = ledger.emit_envelope(session_id, thread_id, payload, client_message_id);
-}
-
 async fn try_emit_completed_terminal_with_forced_backpressure(
     turn_state: &TokioMutex<TurnState>,
     ws: &WsConnection,
@@ -38270,30 +38165,118 @@ fn progress_assistant_iteration(event: &Value) -> Option<u32> {
 }
 
 /// Both ordinary and marker-filtered voice deltas use the producer identity.
+/// Emit one live progress notification as its native canonical v2 envelope.
+///
+/// This is the single lane: assistant/reasoning/tool content is written to the
+/// ledger directly as [`PayloadV2`], never as a legacy `Payload` row projected
+/// later. Assistant deltas keep the producer's iteration identity when one is
+/// present (the canonical persisted row adopts the same id, so streamed deltas
+/// and the persisted finalizer stitch into ONE segment); a delta without an
+/// iteration (e.g. a synthesized subagent line) falls back to the durable
+/// segment ordinal, matching what the persisted-row path would compute.
 fn emit_progress_envelope(
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     notification: &UiNotification,
     iteration: Option<u32>,
 ) {
-    if let UiNotification::MessageDelta(delta) = notification
-        && let Some(iteration) = iteration
-    {
-        let thread = delta.turn_id.0.to_string();
-        let _ = ledger.emit_envelope_v2(
-            session_id,
-            thread.clone(),
-            PayloadV2::AssistantDelta {
-                text: delta.text.clone(),
-                assistant_segment_id: super::events::assistant_segment_id_for_iteration(
-                    &thread, iteration,
+    use octos_core::ui_protocol::EnvelopeToolEndStatus;
+    let (thread_id, payload): (String, PayloadV2) = match notification {
+        UiNotification::MessageDelta(event) => {
+            let thread = event.turn_id.0.to_string();
+            let assistant_segment_id = match iteration {
+                Some(iteration) => {
+                    super::events::assistant_segment_id_for_iteration(&thread, iteration)
+                }
+                None => format!(
+                    "{}:assistant:{}",
+                    thread,
+                    ledger.projection_v2_assistant_segment_index(session_id, &thread, u64::MAX)
                 ),
+            };
+            (
+                thread,
+                PayloadV2::AssistantDelta {
+                    text: event.text.clone(),
+                    assistant_segment_id,
+                },
+            )
+        }
+        UiNotification::ReasoningDelta(event) => (
+            event.turn_id.0.to_string(),
+            PayloadV2::ReasoningDelta {
+                text: event.text.clone(),
             },
-            None,
-        );
-    } else {
-        emit_envelope_for_legacy_notification(ledger, session_id, notification);
-    }
+        ),
+        UiNotification::ToolStarted(event) => (
+            event.turn_id.0.to_string(),
+            PayloadV2::ToolStart {
+                tool_call_id: event.tool_call_id.clone(),
+                name: event.tool_name.clone(),
+                // Display fidelity for the tool card (`shell(cd … && …)`),
+                // bounded so a 1MB tool-arg blob never lands in every
+                // persisted envelope + hydrate replay.
+                arguments_preview: event
+                    .arguments
+                    .as_ref()
+                    .map(envelope_tool_arguments_preview)
+                    // `{}` args render as "" — the spec says omit, not
+                    // empty-string.
+                    .filter(|preview| !preview.is_empty()),
+            },
+        ),
+        UiNotification::ToolProgress(event) => {
+            let Some(message) = event.message.clone() else {
+                return;
+            };
+            (
+                event.turn_id.0.to_string(),
+                PayloadV2::ToolProgress {
+                    tool_call_id: event.tool_call_id.clone(),
+                    message,
+                },
+            )
+        }
+        UiNotification::ToolCompleted(event) => {
+            let status = match event.success {
+                Some(true) | None => EnvelopeToolEndStatus::Complete,
+                Some(false) => EnvelopeToolEndStatus::Error,
+            };
+            let error = match status {
+                // Bounded like `output_preview`: the error source can be
+                // arbitrary-length tool output, and this string lands in
+                // the durable ledger + every hydrate replay.
+                EnvelopeToolEndStatus::Error => event.output_preview.as_deref().map(|s| {
+                    octos_core::truncated_utf8(
+                        s,
+                        octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                        "…",
+                    )
+                }),
+                _ => None,
+            };
+            (
+                event.turn_id.0.to_string(),
+                PayloadV2::ToolEnd {
+                    tool_call_id: event.tool_call_id.clone(),
+                    status,
+                    error,
+                    reason: None,
+                    // Result excerpt for the `⎿ …` line under the card.
+                    output_preview: event.output_preview.as_deref().map(|preview| {
+                        octos_core::truncated_utf8(
+                            preview,
+                            octos_core::ui_protocol::ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX,
+                            "…",
+                        )
+                    }),
+                    duration_ms: event.duration_ms,
+                },
+            )
+        }
+        _ => return,
+    };
+    let _ = ledger.emit_envelope_v2(session_id, thread_id, payload, None);
 }
 
 /// Dispatch a single non-terminal progress JSON value out to the WS / ledger.
@@ -41032,10 +41015,7 @@ fn send_notification_lifecycle(
     // ledger append above still happens so the canonical envelope
     // emit (via `ledger.emit_envelope` on the same handler path)
     // delivers via the broadcast forwarder.
-    let projected = features
-        .projection_envelope_v2
-        .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
-        .flatten();
+    let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
     let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
@@ -41218,10 +41198,7 @@ fn send_notification_durable(
     // connections (without the feature) receive the legacy shape via
     // their own forwarders.
     let features = ws.snapshot_live_features();
-    let projected = features
-        .projection_envelope_v2
-        .then(|| project_v2_ledger_event(ledger, &event.event, &event.cursor))
-        .flatten();
+    let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
     let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
@@ -41510,15 +41487,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // #2019: the human sink carries an origin + text + timestamp, not
             // a replay cursor; the surrounding ledger event's cursor is what
             // a reconnecting client resumes from.
-            | UiNotification::BackgroundActivity(_)
-            // UPCR-2026-014 M9-γ: envelopes carry their OWN per-thread
-            // `seq` allocated by `ThreadSeqAllocator`, not the per-session
-            // `UiCursor` the legacy ledger replay uses. The durable
-            // ledger cursor on the surrounding `LedgeredUiProtocolEvent`
-            // is still authoritative for replay; envelopes don't
-            // contribute their per-thread seq into the cursor stream
-            // (which would mix two non-comparable scales).
-            | UiNotification::Envelope(_) => None,
+            | UiNotification::BackgroundActivity(_) => None,
         },
         UiProtocolLedgerEvent::Progress(_) => None,
     }

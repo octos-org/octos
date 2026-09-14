@@ -243,11 +243,11 @@ export interface Envelope {
 
 // ── Capability feature flag ──────────────────────────────────────────────
 
-/** Wire-form capability flag for UPCR-2026-014. Servers advertise it via
- *  `UiProtocolCapabilities.supported_features`; clients request it via
- *  the `X-Octos-Ui-Features` header. Mirrors
- *  `UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1` in the Rust types. */
-export const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1 = 'projection.envelope.v1';
+/** Wire-form capability flag for the canonical projection envelope. Servers
+ *  advertise it via `UiProtocolCapabilities.supported_features`; clients
+ *  request it via the `X-Octos-Ui-Features` header. Mirrors
+ *  `UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2` in the Rust types. */
+export const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2 = 'projection.envelope.v2';
 
 // ── Type guards (optional ergonomic helpers) ─────────────────────────────
 //
