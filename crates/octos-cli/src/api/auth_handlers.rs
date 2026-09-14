@@ -6115,7 +6115,10 @@ mod tests {
     }
 
     // No native Keychain writes without an isolated macOS integration fixture.
-    #[cfg(not(target_os = "macos"))]
+    // Linux-only for now: the injected test store root is cfg(linux), and on
+    // Windows (no backend, no injection) relocation fails before the profile
+    // save, so the env slot the assertions below read never exists.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn my_profile_rejects_service_account_json_under_custom_env_off_macos() {
         // Regression for the dashboard "Custom" bypass: a raw Vertex SA JSON

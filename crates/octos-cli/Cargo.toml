@@ -40,6 +40,9 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 dirs = { workspace = true }
+# Strip the `\\?\` prefix std::fs::canonicalize returns on Windows; the prefix
+# breaks downstream tools (git treats it as a URL). Same use as octos-agent.
+dunce = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 colored = { workspace = true }

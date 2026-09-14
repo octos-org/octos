@@ -2985,12 +2985,16 @@ pub(crate) fn stage_peer(
             }
         };
         let as_os = |s: &str| std::ffi::OsString::from(s);
+        // git rejects the `\\?\` extended-length prefix a canonicalized
+        // Windows path may carry ("hostname contains invalid characters").
+        let clone_src = dunce::simplified(workspace_root);
+        let clone_dst = dunce::simplified(&worktree_path);
         let clone_args: Vec<std::ffi::OsString> = vec![
             as_os("clone"),
             as_os("--quiet"),
             as_os("--no-hardlinks"),
-            workspace_root.as_os_str().to_os_string(),
-            worktree_path.as_os_str().to_os_string(),
+            clone_src.as_os_str().to_os_string(),
+            clone_dst.as_os_str().to_os_string(),
         ];
         let clone_ref: Vec<&std::ffi::OsStr> = clone_args.iter().map(AsRef::as_ref).collect();
         if let Err(detail) = run_git(&clone_ref) {
@@ -3004,7 +3008,7 @@ pub(crate) fn stage_peer(
         // The fence branch now lives in the peer's OWN clone.
         let branch_args: Vec<std::ffi::OsString> = vec![
             as_os("-C"),
-            worktree_path.as_os_str().to_os_string(),
+            clone_dst.as_os_str().to_os_string(),
             as_os("checkout"),
             as_os("-q"),
             as_os("-b"),
@@ -3023,7 +3027,7 @@ pub(crate) fn stage_peer(
         for key in ["user.name", "user.email"] {
             let read = std::process::Command::new("git")
                 .arg("-C")
-                .arg(workspace_root)
+                .arg(clone_src)
                 .args(["config", "--get", key])
                 .output();
             let Ok(out) = read else { continue };
@@ -3036,7 +3040,7 @@ pub(crate) fn stage_peer(
             }
             let _ = std::process::Command::new("git")
                 .arg("-C")
-                .arg(&worktree_path)
+                .arg(clone_dst)
                 .args(["config", key, &value])
                 .output();
         }
@@ -3407,7 +3411,7 @@ fn fence_collision_reasons(
     // "unknown" and do NOT trigger.
     let branch = std::process::Command::new("git")
         .arg("-C")
-        .arg(workspace_root)
+        .arg(dunce::simplified(workspace_root))
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .output()
         .ok()
@@ -5304,6 +5308,9 @@ mod peer_task_registry_tests {
     use super::*;
 
     #[test]
+    // Durable peer writes fail closed off Unix (the directory sync opens the
+    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
+    #[cfg(unix)]
     fn should_keep_modern_peer_parked_when_legacy_result_adoption_runs() {
         for lifetime in ["pending", "running", "failed", "invalid"] {
             let data = tempfile::tempdir().unwrap();
@@ -5366,6 +5373,9 @@ mod peer_task_registry_tests {
     }
 
     #[test]
+    // Durable peer writes fail closed off Unix (the directory sync opens the
+    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
+    #[cfg(unix)]
     fn peer_task_durable_identity_roundtrip_and_missing_new_id_refused() {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");
@@ -5525,6 +5535,9 @@ mod peer_task_registry_tests {
     }
 
     #[test]
+    // Durable peer writes fail closed off Unix (the directory sync opens the
+    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
+    #[cfg(unix)]
     fn peer_task_id_write_failure_stays_unadoptable_after_restart() {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");

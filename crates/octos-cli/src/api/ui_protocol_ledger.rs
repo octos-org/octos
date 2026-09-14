@@ -5117,39 +5117,21 @@ mod tests {
                 ledger.append_notification(delta(&bad, &format!("x-{i}")));
             }
         }
-        // Corrupt the bad session's log directory: a subdirectory NAMED
-        // like a log file. `list_log_files` only picks `is_file()` entries
-        // on its top-level pass, so a directory alone would be silently
-        // skipped — instead we poison the scan by making `read_dir` itself
-        // fail: remove read permission from the session dir. That makes
-        // `list_log_files` (and any sibling scan) return Err(PermissionDenied),
-        // which `read_session_disk_snapshot` propagates as Err → the index
-        // entry latches `failed`.
         let bad_dir = temp
             .path()
             .join("ui-protocol")
             .join(encode_session_dir_name(&bad));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&bad_dir).expect("meta").permissions();
-            perms.set_mode(0o000);
-            fs::set_permissions(&bad_dir, perms).expect("chmod 000");
-        }
-        #[cfg(not(unix))]
-        {
-            // Portable fallback: drop a directory named like the active
-            // log so the sorted-last "active" path cannot be opened as a
-            // file, then remove the real files.
-            for entry in fs::read_dir(&bad_dir).expect("list bad dir").flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    fs::remove_file(&path).expect("remove log");
-                    fs::create_dir(&path).expect("dir named like log");
-                }
-            }
-        }
         let outcome = UiProtocolLedger::recover(LedgerConfig::durable(temp.path().into()));
+        // Poison AFTER boot indexing: the session stays indexed, but its
+        // directory is swapped for a REGULAR FILE, so `list_log_files`'s
+        // read_dir fails with NotADirectory on every platform (Unix ENOTDIR /
+        // Windows ERROR_DIRECTORY) — not the NotFound that
+        // `read_session_disk_snapshot` tolerates — and the error propagates
+        // → the index entry latches `failed`. (chmod 000 on the dir is
+        // Unix-only; a same-named DIRECTORY is silently skipped by
+        // `list_log_files`' is_file() filter and latches nothing.)
+        fs::remove_dir_all(&bad_dir).expect("remove bad dir");
+        fs::write(&bad_dir, b"not a directory").expect("file in dir's place");
         assert_eq!(
             outcome.sessions_recovered, 2,
             "boot indexes both sessions; corruption must not block boot"

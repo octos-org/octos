@@ -1443,20 +1443,13 @@ mod tests {
 
     #[test]
     fn detached_slot_is_held_for_status_between_processes() {
-        // The #6 truth model, end to end: acquire in "process A" (flock
+        // The #6 truth model, live half: acquire in "process A" (flock
         // leaked away = A has exited), then the pool's OWN gc walk — the
         // thing that would reclaim the slot — must treat it as held while
-        // the recorded pid is alive, and must reclaim it once that pid dies.
+        // the recorded pid is alive.
         let pool_root = fixture().pool_root;
         let repo_dir = tempfile::tempdir().unwrap();
         let key = repo_key_for_path(repo_dir.path()).unwrap();
-        let dead_pid = {
-            // Reap a freshly-exited child so test_kill_process(ESRCH)s.
-            let mut child = std::process::Command::new("true").spawn().unwrap();
-            let pid = child.id();
-            child.wait().unwrap();
-            pid
-        };
         let live_holder = HolderInfo {
             pid_override: Some(std::process::id()),
             ..HolderInfo::default()
@@ -1491,8 +1484,8 @@ mod tests {
             "contents untouched"
         );
 
-        // The live GC pass preserves ownership. Release that claim before
-        // exercising the separate dead-holder lifecycle below.
+        // The live GC pass preserves ownership. Release that claim so the
+        // slot returns to the pool.
         pool::release_detached(
             &pool_root,
             &slot.path,
@@ -1500,21 +1493,52 @@ mod tests {
             SlotOutcome::Completed,
         )
         .unwrap();
+    }
 
-        // Dead pid: gc clears the metadata first (HolderCleared — the slot
-        // was just re-acquired so last_used is fresh, nothing to delete),
-        // and a SECOND backdated pass then reclaims the target. Two steps
-        // mirrors §3.5 exactly: dead holder ⇒ demote to ownerless, THEN
-        // staleness applies on its own clock.
+    // Dead-holder reclamation hinges on pid_alive's kill(pid,0) semantics,
+    // which only exist on Unix (the non-Unix stub conservatively reports
+    // every pid as alive, so gc never clears a holder there by design).
+    #[cfg(unix)]
+    #[test]
+    fn detached_slot_dead_holder_is_cleared_then_reclaimed() {
+        // The #6 truth model, dead half: once the recorded pid dies, gc
+        // clears the metadata first (HolderCleared), and a SECOND backdated
+        // pass reclaims the target. Two steps mirrors §3.5 exactly: dead
+        // holder ⇒ demote to ownerless, THEN staleness applies on its own
+        // clock.
+        let pool_root = fixture().pool_root;
+        let repo_dir = tempfile::tempdir().unwrap();
+        let key = repo_key_for_path(repo_dir.path()).unwrap();
+        let dead_pid = {
+            // Reap a freshly-exited child so test_kill_process(ESRCH)s.
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
         let dead_holder = HolderInfo {
             pid_override: Some(dead_pid),
             ..HolderInfo::default()
         };
-        let slot2 = pool::acquire_detached(&pool_root, &key, &config(), &dead_holder).unwrap();
+        // A released live claim frees the slot for the dead-holder claim.
+        let live_holder = HolderInfo {
+            pid_override: Some(std::process::id()),
+            ..HolderInfo::default()
+        };
+        let live_slot = pool::acquire_detached(&pool_root, &key, &config(), &live_holder).unwrap();
+        pool::release_detached(
+            &pool_root,
+            &live_slot.path,
+            &live_slot.claim_token,
+            SlotOutcome::Completed,
+        )
+        .unwrap();
+        let slot = pool::acquire_detached(&pool_root, &key, &config(), &dead_holder).unwrap();
         assert_eq!(
-            slot2.path, slot.path,
+            slot.path, live_slot.path,
             "explicitly released live claim is reusable"
         );
+        std::fs::write(slot.target_dir.join("dep.bin"), vec![0u8; 2048]).unwrap();
         let reports = pool::reclaim_stale(
             &pool_root,
             &GcPolicy {
