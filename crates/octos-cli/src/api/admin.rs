@@ -6051,6 +6051,8 @@ mod tests {
         assert_eq!(state.pending, "partial");
     }
 
+    // admin_shell hardcodes `sh -c`; the happy-path tests need a Unix shell.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_echo_command() {
         let req = ShellRequest {
@@ -6086,6 +6088,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_captures_stderr() {
         let req = ShellRequest {
@@ -6098,6 +6101,7 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_nonzero_exit_code() {
         let req = ShellRequest {
@@ -6109,6 +6113,7 @@ mod tests {
         assert_eq!(result.exit_code, 42);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_timeout() {
         let req = ShellRequest {

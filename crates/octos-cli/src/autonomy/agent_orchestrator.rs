@@ -30656,6 +30656,9 @@ mod tests {
     /// installer, then `enable_persistence` — the restore observer must
     /// adopt the parked peer row whose `result.md` is on the blackboard.
     #[test]
+    // persist_peer_task_id_binding does a durable write, which fails closed
+    // off Unix (Windows refuses File::open on a directory for the dir sync).
+    #[cfg(unix)]
     fn ws_restore_composed_observer_adopts_parked_peer() {
         let dir = tempfile::TempDir::new().unwrap();
         let profile = "tenant-ws-restore";
@@ -30759,6 +30762,9 @@ mod tests {
     /// staged dir's `goal` file), reconcile sees the POST-adoption table, and
     /// the ledger row flips to `complete` instead of idling `running`.
     #[test]
+    // persist_peer_task_id_binding does a durable write, which fails closed
+    // off Unix (Windows refuses File::open on a directory for the dir sync).
+    #[cfg(unix)]
     fn parked_peer_with_result_and_goal_row_settles() {
         let dir = tempfile::TempDir::new().unwrap();
         let profile = "tenant-peer-goal";

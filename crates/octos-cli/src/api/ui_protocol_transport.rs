@@ -14053,7 +14053,9 @@ async fn raw_peer_prepare(
     let workspace_root = match params.cwd.as_deref() {
         Some(cwd) => {
             let path = PathBuf::from(cwd);
-            let canonical = path.canonicalize().map_err(|err| {
+            // dunce strips the `\\?\` prefix std canonicalize returns on
+            // Windows — the prefixed form breaks `git clone` downstream.
+            let canonical = dunce::canonicalize(&path).map_err(|err| {
                 RpcError::invalid_params(format!("cwd {cwd} is not usable: {err}"))
             })?;
             if !canonical.is_dir() {
@@ -21215,6 +21217,18 @@ fn build_workspace_pane_snapshot(
     }
 }
 
+/// Wire format uses `/` separators on every platform. Only Windows needs
+/// the conversion — elsewhere `\` is a legal filename character.
+#[cfg(windows)]
+fn wire_relative_path(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn wire_relative_path(relative: &Path) -> String {
+    relative.to_string_lossy().into_owned()
+}
+
 fn collect_workspace_entries(
     root: &Path,
     dir: &Path,
@@ -21249,7 +21263,7 @@ fn collect_workspace_entries(
             continue;
         };
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        let relative_path = relative.to_string_lossy().to_string();
+        let relative_path = wire_relative_path(relative);
         let depth = relative.components().count().saturating_sub(1);
         let (kind, detail) = if metadata.is_dir() {
             ("directory", Some("dir".into()))
@@ -21338,7 +21352,7 @@ fn collect_artifact_items(
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         let updated_at = Some(chrono::DateTime::<Utc>::from(modified));
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        let relative_path = relative.to_string_lossy().to_string();
+        let relative_path = wire_relative_path(relative);
         artifacts.push((
             modified,
             UiArtifactPaneItem {

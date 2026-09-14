@@ -36805,7 +36805,7 @@ async fn peer_prepare_stages_brief_and_worktree() {
     assert!(result2["worktree_branch"].is_null());
     assert_eq!(
         std::path::PathBuf::from(result2["cwd"].as_str().unwrap()),
-        repo.canonicalize().unwrap()
+        dunce::canonicalize(&repo).unwrap()
     );
 
     // Worktree against a NON-git cwd fails AND releases the reserved slug.
