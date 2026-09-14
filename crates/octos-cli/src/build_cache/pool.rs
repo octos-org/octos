@@ -571,6 +571,17 @@ fn space_gate(pool_root: &Path, min_free_gb: u64) -> Result<(), BuildCacheError>
     if min_free_gb == 0 {
         return Ok(());
     }
+    if !pool_root.exists() {
+        // fs2's Windows available_space only resolves the volume root from
+        // the path string, so a missing path would measure the wrong
+        // filesystem (Unix statvfs reports ENOENT instead). Fail closed.
+        return Err(BuildCacheError::FreeSpaceUnknown {
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("pool root {} does not exist", pool_root.display()),
+            ),
+        });
+    }
     let available = fs2::available_space(pool_root)
         .map_err(|source| BuildCacheError::FreeSpaceUnknown { source })?;
     let min_bytes = min_free_gb.saturating_mul(GIB);
@@ -595,6 +606,14 @@ fn slot_dir(repo_dir: &Path, kind: SlotKind, n: u32) -> PathBuf {
     repo_dir.join(format!("{}{n}", kind.prefix()))
 }
 
+/// Contention on the slot lock, per fs2's platform-aware marker: Unix
+/// flock reports WouldBlock, but Windows LockFileEx fails a locked region
+/// with ERROR_LOCK_VIOLATION, which std does not map to WouldBlock.
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 /// A close-on-exec lock fd can still be inherited by another thread's
 /// fork until its child execs. After the owner drops its fd, that shared
 /// open-file description briefly keeps the flock alive. Retry only this
@@ -606,7 +625,7 @@ fn try_lock_slot(lock: &File, dir: &Path, release_token: Option<&str>) -> std::i
     loop {
         let error = match fs2::FileExt::try_lock_exclusive(lock) {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => error,
+            Err(error) if is_lock_contention(&error) => error,
             Err(error) => return Err(error),
         };
         // Read again on every contention: a newly published live owner must
@@ -621,7 +640,9 @@ fn try_lock_slot(lock: &File, dir: &Path, release_token: Option<&str>) -> std::i
         };
         let remaining = LOCK_RETRY_WINDOW.saturating_sub(start.elapsed());
         if !retry || remaining.is_zero() {
-            return Err(error);
+            // Normalize contention to WouldBlock so callers classifying
+            // "slot held" see the same kind on every platform.
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, error));
         }
         std::thread::sleep(LOCK_RETRY_BACKOFF.min(remaining));
     }
@@ -1348,6 +1369,19 @@ mod tests {
 
     fn key(tmp: &tempfile::TempDir) -> RepoKey {
         repo_key_for_path(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn lock_contention_recognizes_platform_error_shapes() {
+        // Unix flock: WouldBlock.
+        assert!(is_lock_contention(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "held",
+        )));
+        // Whatever shape the platform's lock-contention marker takes
+        // (Windows LockFileEx: ERROR_LOCK_VIOLATION, never WouldBlock).
+        assert!(is_lock_contention(&fs2::lock_contended_error()));
+        assert!(!is_lock_contention(&std::io::Error::from_raw_os_error(5)));
     }
 
     #[cfg(unix)]

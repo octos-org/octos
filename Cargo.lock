@@ -4652,6 +4652,7 @@ dependencies = [
  "colored 2.2.0",
  "constant_time_eq",
  "dirs",
+ "dunce",
  "eyre",
  "flate2",
  "fs2",
