@@ -15246,6 +15246,7 @@ fn reserve_peer_build_cache_turn(
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
+    turn_id: &TurnId,
     outcome: TurnTerminalOutcome,
     content: &str,
     tokens_consumed: u64,
@@ -15293,13 +15294,17 @@ fn write_peer_result_if_peer_session(
         TurnTerminalOutcome::RateLimited => "rate_limited",
     };
 
+    // The runtime TurnId is the join key to model/lifecycle ledger events.
+    // The count below is only a file ordinal: failed writes can skip a real
+    // runtime turn without incrementing this count. Never infer an ID from it.
     // #435: versioned result files prevent silent overwrite when a persistent
     // peer runs multiple turns. Count existing result-*.md files to determine
     // the turn number so the caller doesn't need to track state.
     let turn_count = count_peer_result_versions(&peer_dir) + 1;
 
     let text = format!(
-        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\n---\n\n{body}{truncated}\n"
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\nturn_id: {}\n---\n\n{body}{truncated}\n",
+        turn_id.0
     );
 
     // Failure authority does not depend on the best-effort result write.
@@ -20816,6 +20821,22 @@ fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<Str
     ))
 }
 
+fn profile_bootstrap_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
 /// Generation guard for the dynamic ProfileRuntime cache (#2164): the
 /// post-commit Profile LLM transition bumps the generation BEFORE dropping
 /// the cached runtime, so an in-flight bootstrap that read the PRE-commit
@@ -20873,6 +20894,13 @@ pub(crate) async fn ensure_session_profile_runtime(
     let Some(key) = dynamic_profile_runtime_key(state, profile_id) else {
         return Ok(None);
     };
+
+    // First-page auxiliary requests and session/open can observe the same
+    // cold cache. Bootstrap only once per profile; otherwise our own parallel
+    // attempt holds redb's exclusive lock and the other reports a false
+    // "another process" failure (#2299). Recheck the cache under this guard.
+    let bootstrap_lock = profile_bootstrap_lock(&key);
+    let _bootstrap_guard = bootstrap_lock.lock().await;
 
     if let Some(runtime) = dynamic_profile_runtimes()
         .read()
@@ -24812,6 +24840,52 @@ fn hydrated_canonical_message_identities(
         .collect()
 }
 
+// Keep redundant streaming history below a quarter of the frame ceiling.
+// Otherwise thousands of tiny deltas make the generic frame truncator erase
+// even short user/assistant text before it finally shrinks the replay array.
+fn compact_hydrate_projection_replay(
+    events: Vec<EnvelopeV2>,
+) -> (Vec<EnvelopeV2>, BTreeMap<String, u64>) {
+    let mut threads: BTreeMap<String, Vec<EnvelopeV2>> = BTreeMap::new();
+    let mut checkpoints = BTreeMap::new();
+    for event in events {
+        checkpoints
+            .entry(event.thread_id.clone())
+            .and_modify(|seq: &mut u64| *seq = (*seq).max(event.seq))
+            .or_insert(event.seq);
+        threads
+            .entry(event.thread_id.clone())
+            .or_default()
+            .push(event);
+    }
+    let mut budget = MAX_TEXT_FRAME_BYTES / 4;
+    let mut retained = Vec::new();
+    for (_, mut thread) in threads {
+        thread.sort_by_key(|event| event.seq);
+        let complete = thread
+            .iter()
+            .enumerate()
+            .all(|(index, event)| event.seq == index as u64 + 1);
+        let bytes = serde_json::to_vec(&thread)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if complete && bytes <= budget {
+            budget -= bytes;
+            retained.extend(thread);
+        } else {
+            // Terminal state is not present in transcript rows. Keep it even
+            // when the client reconstructs this thread from durable messages.
+            retained.extend(
+                thread
+                    .into_iter()
+                    .filter(|event| matches!(event.payload, PayloadV2::TurnTerminal { .. })),
+            );
+        }
+    }
+    retained.sort_by_key(|event| event.cursor.as_ref().map(|cursor| cursor.seq).unwrap_or(0));
+    (retained, checkpoints)
+}
+
 /// Per UPCR-2026-009: bundle the chat-state projection into one RPC.
 ///
 /// Atomicity invariant (codex's review ask): the ledger snapshot and the
@@ -24946,6 +25020,25 @@ async fn handle_session_hydrate(
     } else {
         None
     };
+
+    let (replayed_projection_envelopes, projection_thread_sequences) =
+        if features.projection_envelope_v2 && include_set.messages {
+            let projected = replayed
+                .iter()
+                .filter_map(|event| {
+                    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                        project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor)?
+                    else {
+                        return None;
+                    };
+                    Some(envelope.envelope)
+                })
+                .collect::<Vec<_>>();
+            let (events, checkpoints) = compact_hydrate_projection_replay(projected);
+            (Some(events), Some(checkpoints))
+        } else {
+            (None, None)
+        };
 
     let expose_message_id = features.projection_envelope_v2 && include_set.messages;
     // Identity provenance is independent of the caller's replay window AND
@@ -25137,6 +25230,8 @@ async fn handle_session_hydrate(
         pending_questions,
         replayed_envelopes,
         replayed_tool_envelopes,
+        replayed_projection_envelopes,
+        projection_thread_sequences,
     };
     send_serialized_rpc_result(
         ws,
@@ -25350,6 +25445,8 @@ async fn handle_session_rollback(
         pending_questions: None,
         replayed_envelopes: None,
         replayed_tool_envelopes: None,
+        replayed_projection_envelopes: None,
+        projection_thread_sequences: None,
     };
     let result = SessionRollbackResult {
         dropped_turns,
@@ -32544,6 +32641,19 @@ async fn run_standalone_turn(
             return;
         }
     };
+    // #2244 — `on_turn_end` fires at this turn's terminal below (completed,
+    // errored, or interrupted). On the done/error arms it fires BEFORE the
+    // terminal frame is emitted, so a client that observes the turn's end —
+    // including a one-shot `octos chat -m` whose process exits right after —
+    // can rely on the hook having run; the interrupt arm fires right after
+    // its frame instead, to stay inside the 5s interrupt-ack deadline.
+    // Resolved once here from the same profile the turn's agent hooks come
+    // from; `None` (no hooks configured) makes each fire a no-op.
+    let turn_end_hooks = session_runtime.profile.hook_executor.clone();
+    let turn_end_hook_ctx = octos_agent::HookContext {
+        session_id: Some(session_id.to_string()),
+        profile_id: Some(session_runtime.profile.profile_id.clone()),
+    };
     // Outer-loop #4 (§4.2): this turn's peers root — `Some` ONLY when this
     // session is a peer (topic `peer-<slug>`) running under the profile's
     // data dir. The interrupted-terminal release below keys the slot registry
@@ -35153,6 +35263,10 @@ async fn run_standalone_turn(
     // `session`/`turn` from this span (postfix `.instrument` keeps the block
     // itself untouched).
     let turn_span = crate::turn_trace::turn_span(&session_id, &turn_id);
+    // #2244 — snapshot the turn summary now that every prompt rewrite above
+    // (STT transcription merge, voice-mode suffix) has landed; `prompt`
+    // itself moves into the agent task below.
+    let turn_end_summary = crate::session_actor::git_turn_summary(&prompt);
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
@@ -36178,6 +36292,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     TurnTerminalOutcome::Completed,
                     event.get("content").and_then(Value::as_str).unwrap_or(""),
                     final_tokens_consumed,
@@ -36197,6 +36312,17 @@ async fn run_standalone_turn(
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                // #2244 — the turn reached its outcome; fire `on_turn_end`
+                // BEFORE the terminal frame (see the binding above).
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
                 // Keep continuation admission out of the terminal→receipt gap.
                 // The dispatcher takes this same registry lock before claiming
                 // a queued synthesis. No provider work is awaited under it.
@@ -36313,6 +36439,7 @@ async fn run_standalone_turn(
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
+                    &turn_id,
                     turn_outcome,
                     &wire_msg,
                     final_tokens_consumed,
@@ -36333,6 +36460,17 @@ async fn run_standalone_turn(
                 )
                 .await;
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                // #2244 — the turn reached its outcome; fire `on_turn_end`
+                // BEFORE the terminal frame (see the binding above).
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
                 try_emit_terminal(
                     &turn_state,
                     TerminalReason::Errored,
@@ -36771,6 +36909,20 @@ async fn run_standalone_turn(
             steer_buffer.as_ref(),
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
+        )
+        .await;
+        // #2244 — the turn reached its outcome; fire `on_turn_end`. Unlike the
+        // done/error arms this fires AFTER the terminal frame: the interrupt
+        // handler is blocked on that frame within a 5s ack deadline
+        // (INTERRUPT_ACK_TIMEOUT), so an up-to-`timeout_ms` hook wait must not
+        // sit between the state flip and the ack.
+        crate::session_actor::emit_lifecycle_hook_payload(
+            turn_end_hooks.as_ref(),
+            &session_id,
+            octos_agent::HookPayload::on_turn_end(
+                turn_end_summary.clone(),
+                Some(&turn_end_hook_ctx),
+            ),
         )
         .await;
         // codex #2 residual — a client-interrupted peer takes THIS branch, not

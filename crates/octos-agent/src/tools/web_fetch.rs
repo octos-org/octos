@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use html5ever::tendril::TendrilSink;
+use markup5ever_rcdom::{NodeData, RcDom};
 use reqwest::Client;
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -287,26 +289,95 @@ async fn ssrf_safe_fetch(
 }
 
 fn extract_markdown(html: &str) -> String {
-    htmd::convert(html).unwrap_or_else(|_| extract_text(html))
+    htmd::HtmlToMarkdown::builder()
+        .skip_tags(vec!["script", "style", "template", "noscript"])
+        .build()
+        .convert(html)
+        .unwrap_or_else(|_| extract_text(html))
 }
 
 fn extract_text(html: &str) -> String {
+    // Use the same HTML parser as Markdown extraction. Stripping brackets
+    // leaves script/style bodies in the result and mistakes quoted `>` for
+    // the end of a tag, consuming the output budget before page evidence.
+    let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(html);
     let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-
-    for c in html.chars() {
-        if c == '<' {
-            in_tag = true;
-            continue;
-        }
-        if c == '>' {
-            in_tag = false;
+    // Iterative traversal avoids an extra recursive walk for deeply nested
+    // remote documents. Exit markers separate blocks without splitting words
+    // around inline markup such as inter<b>national</b>.
+    let mut pending = vec![(dom.document.clone(), false)];
+    while let Some((node, exiting_block)) = pending.pop() {
+        if exiting_block {
             result.push(' ');
             continue;
         }
-        if !in_tag {
-            result.push(c);
+        match &node.data {
+            NodeData::Text { contents } => result.push_str(&contents.borrow()),
+            NodeData::Element { name, attrs, .. } => {
+                let tag = name.local.as_ref();
+                if matches!(tag, "head" | "script" | "style" | "template" | "noscript")
+                    || attrs
+                        .borrow()
+                        .iter()
+                        .any(|attr| attr.name.local.as_ref() == "hidden")
+                {
+                    continue;
+                }
+                if matches!(
+                    tag,
+                    "address"
+                        | "article"
+                        | "aside"
+                        | "blockquote"
+                        | "br"
+                        | "caption"
+                        | "dd"
+                        | "details"
+                        | "dialog"
+                        | "div"
+                        | "dl"
+                        | "dt"
+                        | "fieldset"
+                        | "figcaption"
+                        | "figure"
+                        | "footer"
+                        | "form"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "header"
+                        | "hr"
+                        | "li"
+                        | "main"
+                        | "nav"
+                        | "ol"
+                        | "p"
+                        | "pre"
+                        | "section"
+                        | "summary"
+                        | "table"
+                        | "td"
+                        | "th"
+                        | "tr"
+                        | "ul"
+                ) {
+                    result.push(' ');
+                    pending.push((node.clone(), true));
+                }
+            }
+            NodeData::Document => {}
+            _ => continue,
         }
+        pending.extend(
+            node.children
+                .borrow()
+                .iter()
+                .rev()
+                .map(|child| (child.clone(), false)),
+        );
     }
 
     result.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -337,6 +408,52 @@ mod tests {
         let html = "<div>\n  <p>  spaced  </p>\n</div>";
         let text = extract_text(html);
         assert_eq!(text, "spaced");
+    }
+
+    #[test]
+    fn text_extraction_keeps_body_evidence_within_the_output_budget() {
+        let html = format!(
+            "<head><style>{}</style><script>{}</script></head>\
+             <body><h1>Shanghai forecast</h1><p>Published 2026-09-11: light rain.</p>\
+             <script>var injected = 'not a forecast';</script></body>",
+            ".weather {{ color: red; }}".repeat(1000),
+            "var pagetype = 'weather';".repeat(1000),
+        );
+        let mut text = extract_text(&html);
+        octos_core::truncate_utf8(&mut text, 120, "[truncated]");
+        assert_eq!(text, "Shanghai forecast Published 2026-09-11: light rain.");
+    }
+
+    #[test]
+    fn text_extraction_handles_entities_and_quoted_attribute_delimiters() {
+        assert_eq!(
+            extract_text("<p title='a > b'>北京 &amp; 上海: 28&#176;C &lt; 30&#176;C</p>"),
+            "北京 & 上海: 28°C < 30°C"
+        );
+    }
+
+    #[test]
+    fn text_extraction_omits_non_content_subtrees_and_comments() {
+        assert_eq!(
+            extract_text(
+                "<STYLE>.secret { color: red }</STYLE><!--not evidence-->\
+                <p>Visible</p><div hidden><p>hidden forecast</p></div>\
+                <template><p>template forecast</p></template>\
+                <noscript>Enable JavaScript</noscript><p>content</p>"
+            ),
+            "Visible content"
+        );
+    }
+
+    #[test]
+    fn text_extraction_preserves_inline_words_and_separates_blocks() {
+        assert_eq!(
+            extract_text(
+                "<p>Inter<b>national</b> weather</p><div>Next<br>line</div>\
+                <table><tr><td>Beijing</td><td>28°C</td></tr></table>"
+            ),
+            "International weather Next line Beijing 28°C"
+        );
     }
 
     #[tokio::test]
@@ -376,6 +493,20 @@ mod tests {
         let md = extract_markdown(html);
         assert!(md.contains("Title"));
         assert!(md.contains("Paragraph"));
+    }
+
+    #[test]
+    fn markdown_extraction_omits_scripts_and_styles_but_keeps_source_links() {
+        let md = extract_markdown(
+            "<body><style>.forecast { color: red; }</style>\
+             <script>var forecast = 'not evidence';</script>\
+             <template>not published</template><noscript>enable scripts</noscript>\
+             <p>Published forecast: <a href='https://example.com/weather'>source</a>.</p></body>",
+        );
+        assert_eq!(
+            md,
+            "Published forecast: [source](https://example.com/weather)."
+        );
     }
 
     #[tokio::test]

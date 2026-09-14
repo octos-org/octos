@@ -507,8 +507,19 @@ struct ResponsesUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Automatic prompt-cache breakdown. `cached_tokens` counts the portion
+    /// of `input_tokens` served from OpenAI's cache (INCLUDED in
+    /// `input_tokens`, unlike Anthropic's disjoint accounting).
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
     #[serde(default)]
     output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -584,9 +595,20 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
         }
     };
 
+    // The Responses API reports cached tokens INSIDE input_tokens; the
+    // TokenUsage contract is disjoint (Anthropic-style: total prompt =
+    // input + cache_read), so subtract at the boundary — the same
+    // normalization the chat-completions parser applies.
+    let cached = resp
+        .usage
+        .input_tokens_details
+        .as_ref()
+        .map(|d| d.cached_tokens)
+        .unwrap_or(0);
     let reasoning_tokens = resp
         .usage
         .output_tokens_details
+        .as_ref()
         .map(|d| d.reasoning_tokens)
         .unwrap_or(0);
 
@@ -596,9 +618,10 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
         tool_calls,
         stop_reason,
         usage: TokenUsage {
-            input_tokens: resp.usage.input_tokens,
+            input_tokens: resp.usage.input_tokens.saturating_sub(cached),
             output_tokens: resp.usage.output_tokens,
             reasoning_tokens,
+            cache_read_tokens: cached,
             ..Default::default()
         },
         provider_index: None,
@@ -689,6 +712,12 @@ fn map_responses_sse(
             let usage = &data["response"]["usage"];
             let input = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
             let output = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+            // Cached tokens are reported INSIDE input_tokens; normalize to
+            // the disjoint TokenUsage contract (total = input + cache_read),
+            // same as the non-streaming parse.
+            let cached = usage["input_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32;
             let reasoning = usage["output_tokens_details"]["reasoning_tokens"]
                 .as_u64()
                 .unwrap_or(0) as u32;
@@ -707,9 +736,10 @@ fn map_responses_sse(
 
             vec![
                 StreamEvent::Usage(TokenUsage {
-                    input_tokens: input,
+                    input_tokens: input.saturating_sub(cached),
                     output_tokens: output,
                     reasoning_tokens: reasoning,
+                    cache_read_tokens: cached,
                     ..Default::default()
                 }),
                 StreamEvent::Done(stop_reason),
@@ -1053,6 +1083,7 @@ mod tests {
             usage: ResponsesUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                input_tokens_details: None,
                 output_tokens_details: None,
             },
         };
@@ -1101,6 +1132,7 @@ mod tests {
             usage: ResponsesUsage {
                 input_tokens: 20,
                 output_tokens: 30,
+                input_tokens_details: None,
                 output_tokens_details: Some(OutputTokensDetails {
                     reasoning_tokens: 15,
                 }),
@@ -1110,6 +1142,31 @@ mod tests {
         assert_eq!(result.content.as_deref(), Some("The answer is 42."));
         assert_eq!(result.reasoning_content.as_deref(), Some("Let me think..."));
         assert_eq!(result.usage.reasoning_tokens, 15);
+    }
+
+    #[test]
+    fn test_parse_response_cached_tokens_normalized_to_disjoint_accounting() {
+        // The Responses API reports the cached portion INSIDE input_tokens;
+        // the TokenUsage contract is disjoint, so the total prompt is
+        // input + cache_read — same normalization as the chat-completions
+        // parser. Deserialize the full wire body so the serde shape is
+        // covered, not just the conversion.
+        let resp: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "Hello!" }]
+            }],
+            "status": "completed",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "input_tokens_details": { "cached_tokens": 75 }
+            }
+        }))
+        .unwrap();
+        let result = parse_responses_api(resp);
+        assert_eq!(result.usage.input_tokens, 25);
+        assert_eq!(result.usage.cache_read_tokens, 75);
     }
 
     #[test]
@@ -1189,6 +1246,26 @@ mod tests {
             _ => panic!("expected Usage"),
         }
         assert!(matches!(&events[1], StreamEvent::Done(StopReason::EndTurn)));
+    }
+
+    #[test]
+    fn test_sse_completed_cached_tokens_normalized_to_disjoint_accounting() {
+        // Cached tokens arrive INSIDE input_tokens; the streamed Usage event
+        // must normalize to the disjoint contract exactly like the
+        // non-streaming parse (total = input + cache_read).
+        let mut state = ResponsesStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 100, "output_tokens": 50, "input_tokens_details": {"cached_tokens": 75}}}}"#.into(),
+        };
+        let events = map_responses_sse(&mut state, &event);
+        match &events[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.input_tokens, 25);
+                assert_eq!(u.cache_read_tokens, 75);
+            }
+            _ => panic!("expected Usage"),
+        }
     }
 
     #[test]

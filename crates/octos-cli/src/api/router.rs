@@ -369,6 +369,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::serve_owned_site_preview_path),
         )
         .route("/api/files/list", get(handlers::list_content_files))
+        .route("/api/files/mutate", post(handlers::mutate_file))
+        .route(
+            "/api/slides/edits",
+            get(handlers::get_slide_edits).put(handlers::save_slide_edits),
+        )
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
         // M7.9 / W2 — task supervisor exposure (kept REST). NOT an AppUI
@@ -1437,8 +1442,18 @@ mod tests {
         });
 
         let logs = captured.as_string();
-        assert_eq!(logs.matches("path=/api/ui-protocol/ws").count(), 2);
-        assert_eq!(logs.matches("token_present=true").count(), 2);
+        // #2276: on failure print the FULL captured logs — the flake's
+        // evidence (span death) is invisible without them.
+        assert_eq!(
+            logs.matches("path=/api/ui-protocol/ws").count(),
+            2,
+            "logs:\n{logs}"
+        );
+        assert_eq!(
+            logs.matches("token_present=true").count(),
+            2,
+            "logs:\n{logs}"
+        );
         assert!(!logs.contains(query));
         assert!(!logs.contains(token));
         assert!(!logs.contains("synthetic-sensitive-marker"));
@@ -1477,6 +1492,12 @@ mod tests {
             .unwrap();
 
         tracing::subscriber::with_default(subscriber, || {
+            // #2276: this shared debug_span! callsite may have been lazily
+            // registered by a no-subscriber sibling test first (the JustOne
+            // rebuilder only asks the current thread's default), leaving a
+            // stale NEVER in the interest cache. Force a rebuild so the
+            // victim's DEBUG span is re-asked under this subscriber.
+            tracing_core::callsite::rebuild_interest_cache();
             runtime.block_on(async {
                 for uri in [
                     "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",

@@ -240,6 +240,161 @@ mod tests {
         found
     }
 
+    // #2244 — a documented lifecycle event must actually fire on the OUP
+    // turn path: register an `on_turn_end` hook, run one turn, and assert
+    // the payload landed. The fire happens BEFORE the turn's terminal
+    // frame, so the line is on disk by the time `session.turn` resolves.
+    #[cfg(unix)]
+    fn turn_end_capture_hook(log_path: &Path) -> octos_agent::HookConfig {
+        octos_agent::HookConfig {
+            event: octos_agent::HookEvent::OnTurnEnd,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"payload=$(cat); printf "%s\n" "$payload" >> "$1""#.into(),
+                "sh".into(),
+                log_path.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 60_000,
+            tool_filter: vec![],
+            path_filter: Vec::new(),
+            requires_bin: None,
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_fire_on_turn_end_hook_after_oup_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let hook_log = home.path().join("turn-end-hooks.jsonl");
+        let mut options = options(data.path(), home.path(), Arc::new(ContextModel::default()));
+        options.config.hooks = vec![turn_end_capture_hook(&hook_log)];
+        let state = bootstrap(options).await.unwrap();
+        let session = OupSession::open(
+            state.clone(),
+            octos_core::SessionKey::with_profile("ephemeral-fixture", "cli", "hooks"),
+            workspace.path(),
+            octos_agent::EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.turn(
+                "hello   on_turn_end   hook",
+                None,
+                &std::sync::atomic::AtomicBool::new(false),
+                &Frontend,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.text, "ephemeral-fixture-answer");
+
+        let payload = std::fs::read_to_string(&hook_log).unwrap();
+        assert_eq!(
+            payload.lines().count(),
+            1,
+            "exactly one on_turn_end fire per turn, payload: {payload}"
+        );
+        let line = payload.lines().next().unwrap();
+        assert!(
+            line.contains("\"event\":\"on_turn_end\""),
+            "payload: {line}"
+        );
+        assert!(
+            line.contains("\"turn_summary\":\"hello on_turn_end hook\""),
+            "whitespace-normalized prompt as summary, payload: {line}"
+        );
+        assert!(
+            line.contains("\"session_id\":\"ephemeral-fixture:cli:hooks\""),
+            "payload: {line}"
+        );
+        assert!(
+            line.contains("\"profile_id\":\"ephemeral-fixture\""),
+            "payload: {line}"
+        );
+        session.close().await.unwrap();
+    }
+
+    struct FailingModel;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingModel {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            Err(octos_llm::LlmError::auth("fixture invalid key").into())
+        }
+
+        fn provider_name(&self) -> &str {
+            "local"
+        }
+
+        fn model_id(&self) -> &str {
+            "ephemeral-fixture"
+        }
+    }
+
+    // #2244 — the errored arm is a turn outcome too: a turn that fails
+    // (here: a non-retryable auth error) must still fire `on_turn_end`
+    // before its terminal frame.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_fire_on_turn_end_hook_after_errored_oup_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let hook_log = home.path().join("errored-turn-end-hooks.jsonl");
+        let mut options = options(data.path(), home.path(), Arc::new(ContextModel::default()));
+        options.provider = Some(Arc::new(FailingModel));
+        options.config.hooks = vec![turn_end_capture_hook(&hook_log)];
+        let state = bootstrap(options).await.unwrap();
+        let session = OupSession::open(
+            state.clone(),
+            octos_core::SessionKey::with_profile("ephemeral-fixture", "cli", "hooks-errored"),
+            workspace.path(),
+            octos_agent::EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.turn(
+                "errored turn",
+                None,
+                &std::sync::atomic::AtomicBool::new(false),
+                &Frontend,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_err(), "rate-limited turn must fail: {outcome:?}");
+
+        let payload = std::fs::read_to_string(&hook_log).unwrap();
+        assert_eq!(
+            payload.lines().count(),
+            1,
+            "exactly one on_turn_end fire per turn, payload: {payload}"
+        );
+        let line = payload.lines().next().unwrap();
+        assert!(
+            line.contains("\"event\":\"on_turn_end\""),
+            "payload: {line}"
+        );
+        assert!(
+            line.contains("\"turn_summary\":\"errored turn\""),
+            "payload: {line}"
+        );
+        session.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn local_oup_preserves_model_defaults_and_gateway_sampling() {
         let home = tempfile::tempdir().unwrap();

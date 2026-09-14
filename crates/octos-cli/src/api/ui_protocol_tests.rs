@@ -37107,9 +37107,11 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     // an unstaged peer topic writes nothing (no dir creation).
     let peer_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-2");
+    let first_turn = TurnId::new();
     write_peer_result_if_peer_session(
         &state,
         &peer_key,
+        &first_turn,
         TurnTerminalOutcome::Completed,
         "All three lenses agree.",
         0,
@@ -37122,11 +37124,16 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         "result.md should contain outcome: completed"
     );
     assert!(written.contains("turn: 1"), "first turn should be turn 1");
+    assert!(
+        written.contains(&format!("\nturn_id: {}\n", first_turn.0)),
+        "native reports must carry the runtime turn identity, not only a file ordinal"
+    );
     assert!(written.contains("All three lenses agree."));
     // #435: versioned result file for historical record.
     let versioned =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
     assert!(versioned.contains("outcome: completed"));
+    assert!(versioned.contains(&format!("\nturn_id: {}\n", first_turn.0)));
     // #435: turns.txt index file.
     let turns =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("turns.txt")).unwrap();
@@ -37139,6 +37146,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     write_peer_result_if_peer_session(
         &state,
         &ghost_key,
+        &TurnId::new(),
         TurnTerminalOutcome::Completed,
         "ghost",
         0,
@@ -37153,6 +37161,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     write_peer_result_if_peer_session(
         &state,
         &coding_key,
+        &TurnId::new(),
         TurnTerminalOutcome::Completed,
         "not a peer",
         0,
@@ -37160,9 +37169,11 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     );
 
     // Overwrite = latest state on result.md, versioned file for turn 2.
+    let second_turn = TurnId::new();
     write_peer_result_if_peer_session(
         &state,
         &peer_key,
+        &second_turn,
         TurnTerminalOutcome::Errored,
         "second turn failed",
         0,
@@ -37176,6 +37187,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         "second turn should be turn 2"
     );
     assert!(!rewritten.contains("All three lenses agree."));
+    assert!(rewritten.contains(&format!("\nturn_id: {}\n", second_turn.0)));
     // #435: historical copy preserved.
     let turn1 =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
@@ -37239,6 +37251,47 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     let rows = filtered["peers"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["slug"], "lens-review-3");
+
+    // Force real best-effort write failures without permissions/ENOSPC
+    // assumptions (which root or platform differences can bypass). Directories
+    // occupy the version/index leaves; only these test-owned leaves are removed.
+    let fault_dir = peers_root.join("lens-review-3");
+    let fault_key = SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-3");
+    std::fs::create_dir(fault_dir.join("result-1.md")).unwrap();
+    std::fs::create_dir(fault_dir.join("turns.txt")).unwrap();
+    let lost_turn = TurnId::new();
+    write_peer_result_if_peer_session(
+        &state,
+        &fault_key,
+        &lost_turn,
+        TurnTerminalOutcome::Completed,
+        "version and index writes fail",
+        0,
+        None,
+    );
+    assert!(fault_dir.join("result-1.md").is_dir());
+    assert!(fault_dir.join("turns.txt").is_dir());
+    assert_eq!(count_peer_result_versions(&fault_dir), 0);
+    std::fs::remove_dir(fault_dir.join("result-1.md")).unwrap();
+    std::fs::remove_dir(fault_dir.join("turns.txt")).unwrap();
+    let recovered_turn = TurnId::new();
+    write_peer_result_if_peer_session(
+        &state,
+        &fault_key,
+        &recovered_turn,
+        TurnTerminalOutcome::Completed,
+        "next actual runtime turn",
+        0,
+        None,
+    );
+    let recovered = std::fs::read_to_string(fault_dir.join("result-1.md")).unwrap();
+    assert!(recovered.contains("\nturn: 1\n"));
+    assert!(recovered.contains(&format!("\nturn_id: {}\n", recovered_turn.0)));
+    assert!(!recovered.contains(&lost_turn.0.to_string()));
+    assert_eq!(
+        std::fs::read_to_string(fault_dir.join("result.md")).unwrap(),
+        recovered
+    );
 }
 
 // --- turn/steer: mid-turn prompt injection (codex parity) ---
@@ -41398,6 +41451,154 @@ fn standalone_turn_reapplies_hook_context() {
     assert!(
         ctx_at > hooks_at,
         "hook context must be re-applied alongside the hook executor wiring"
+    );
+}
+
+#[tokio::test]
+async fn session_hydrate_preserves_canonical_user_and_terminal_sequences() {
+    let session_id = SessionKey("local:hydrate-canonical-sequences".into());
+    let turn_id = TurnId::new();
+    let thread = turn_id.0.to_string();
+    let state = prg_state_with_session(&session_id, |session| {
+        session.messages.push(Message::user_rooting_thread(
+            "hello",
+            octos_core::ClientMessageId(thread.clone()),
+        ));
+    });
+    let ledger = event_ledger(&state).await;
+    ledger
+        .emit_envelope_v2(
+            &session_id,
+            thread.clone(),
+            PayloadV2::UserMessage {
+                text: "hello".into(),
+                files: vec![],
+            },
+            Some(thread.clone()),
+        )
+        .unwrap();
+    ledger
+        .emit_envelope_v2(
+            &session_id,
+            thread.clone(),
+            PayloadV2::AssistantDelta {
+                text: "answer".into(),
+                assistant_segment_id: "segment".into(),
+            },
+            None,
+        )
+        .unwrap();
+    ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id,
+        cursor: None,
+        tokens_in: None,
+        tokens_out: None,
+        session_result: None,
+    }));
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features_for_projection_envelope_v2_test(),
+        "canonical-hydrate".into(),
+        SessionHydrateParams {
+            session_id,
+            after: None,
+            include: vec!["messages".into()],
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let events = frame["result"]["replayed_projection_envelopes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["seq"], 1);
+    assert_eq!(events[0]["payload"]["type"], "user_message");
+    assert_eq!(events[1]["seq"], 2);
+    assert_eq!(events[2]["seq"], 3);
+    assert_eq!(events[2]["payload"]["type"], "turn_terminal");
+    assert!(
+        events
+            .iter()
+            .all(|entry| entry["cursor"]["seq"].as_u64().is_some())
+    );
+}
+
+#[tokio::test]
+async fn review_concurrent_cold_profile_requests_share_one_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "seed-cold",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            Some("http://127.0.0.1:9/v1"),
+            true,
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let key = dynamic_profile_runtime_key(&state, "dev").unwrap();
+    dynamic_profile_runtimes().write().unwrap().remove(&key);
+    assert!(dynamic_cached_profile_runtime(&state, "dev").is_none());
+    let (a, b, c) = tokio::join!(
+        ensure_session_profile_runtime(&state, Some("dev")),
+        ensure_session_profile_runtime(&state, Some("dev")),
+        ensure_session_profile_runtime(&state, Some("dev")),
+    );
+    let a = a.expect("first request").unwrap();
+    let b = b.expect("concurrent second request").unwrap();
+    let c = c.expect("concurrent third request").unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    assert!(Arc::ptr_eq(&a, &c));
+}
+
+#[test]
+fn review_large_hydrate_replay_preserves_transcript_and_continuation_checkpoint() {
+    let make = |seq: u64, payload: serde_json::Value| -> EnvelopeV2 {
+        serde_json::from_value(json!({
+            "thread_id": "long-turn", "turn_id": "long-turn", "seq": seq,
+            "cursor": { "stream": "long-session", "seq": seq + 10 }, "payload": payload,
+        }))
+        .unwrap()
+    };
+    let mut events = (1..=5000).map(|seq| make(seq, json!({
+        "type": "assistant_delta", "data": { "text": "small streaming chunk", "assistant_segment_id": "segment" }
+    }))).collect::<Vec<_>>();
+    events.push(make(
+        5001,
+        json!({ "type": "turn_terminal", "data": { "outcome": "completed" } }),
+    ));
+    assert!(serde_json::to_vec(&events).unwrap().len() > MAX_TEXT_FRAME_BYTES);
+    let (retained, checkpoints) = compact_hydrate_projection_replay(events);
+    assert_eq!(checkpoints["long-turn"], 5001);
+    assert_eq!(retained.len(), 1);
+    assert!(matches!(
+        retained[0].payload,
+        PayloadV2::TurnTerminal { .. }
+    ));
+    let response = json!({ "jsonrpc": "2.0", "id": "long-hydrate", "result": {
+        "messages": [{ "role": "user", "content": "ordinary user question" },
+                     { "role": "assistant", "content": "complete durable answer" }],
+        "replayed_projection_envelopes": retained, "projection_thread_sequences": checkpoints,
+    }});
+    let serialized = serde_json::to_string(&response).unwrap();
+    assert_eq!(
+        frame_text_within_cap(serialized.clone()).unwrap(),
+        serialized
     );
 }
 
