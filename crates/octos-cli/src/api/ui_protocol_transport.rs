@@ -7443,7 +7443,14 @@ async fn drain_connection_turns_for_shutdown(
 }
 
 pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
-    stdio_connection_with_io(state, tokio::io::stdin(), tokio::io::stdout()).await
+    stdio_connection_with_io(
+        state,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        #[cfg(test)]
+        new_stdio_dispatch_count_for_test(),
+    )
+    .await
 }
 
 /// Lifecycle owned by a local frontend, not a second execution policy.
@@ -7465,19 +7472,36 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    stdio_connection_with_io_policy(state, stdin_reader, stdout_writer, Some(control)).await
+    stdio_connection_with_io_policy(
+        state,
+        stdin_reader,
+        stdout_writer,
+        Some(control),
+        #[cfg(test)]
+        new_stdio_dispatch_count_for_test(),
+    )
+    .await
 }
 
 pub(crate) async fn stdio_connection_with_io<R, W>(
     state: Arc<AppState>,
     stdin_reader: R,
     stdout_writer: W,
+    #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    stdio_connection_with_io_policy(state, stdin_reader, stdout_writer, None).await
+    stdio_connection_with_io_policy(
+        state,
+        stdin_reader,
+        stdout_writer,
+        None,
+        #[cfg(test)]
+        dispatch_count,
+    )
+    .await
 }
 
 async fn stdio_connection_with_io_policy<R, W>(
@@ -7485,6 +7509,7 @@ async fn stdio_connection_with_io_policy<R, W>(
     stdin_reader: R,
     stdout_writer: W,
     embedded: Option<EmbeddedStdioControl>,
+    #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -7615,7 +7640,7 @@ where
                 serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
             );
             #[cfg(test)]
-            record_stdio_dispatch_for_test();
+            record_stdio_dispatch_for_test(&dispatch_count);
             let id = request.id.clone();
             // stdio transport is never a session-ingress socket.
             if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features, false) {
@@ -8222,23 +8247,20 @@ where
     dispatch_result
 }
 
+// Per-connection dispatch count: every stdio connection counts its own
+// requests, so tests running in parallel cannot observe each other's
+// traffic through a process-global counter (#2336).
 #[cfg(test)]
-static STDIO_DISPATCH_COUNT_FOR_TEST: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+type StdioDispatchCountForTest = Arc<std::sync::atomic::AtomicUsize>;
 
 #[cfg(test)]
-fn reset_stdio_dispatch_count_for_test() {
-    STDIO_DISPATCH_COUNT_FOR_TEST.store(0, Ordering::SeqCst);
+fn new_stdio_dispatch_count_for_test() -> StdioDispatchCountForTest {
+    Arc::new(std::sync::atomic::AtomicUsize::new(0))
 }
 
 #[cfg(test)]
-fn stdio_dispatch_count_for_test() -> usize {
-    STDIO_DISPATCH_COUNT_FOR_TEST.load(Ordering::SeqCst)
-}
-
-#[cfg(test)]
-fn record_stdio_dispatch_for_test() {
-    STDIO_DISPATCH_COUNT_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+fn record_stdio_dispatch_for_test(count: &StdioDispatchCountForTest) {
+    count.fetch_add(1, Ordering::SeqCst);
 }
 
 enum StdioFrameRead {

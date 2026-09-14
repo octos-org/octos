@@ -3405,7 +3405,7 @@ async fn stdio_ndjson_reader_rejects_oversized_frame_before_newline() {
 
 #[tokio::test]
 async fn stdio_connection_stops_dispatch_after_writer_failure() {
-    reset_stdio_dispatch_count_for_test();
+    let dispatch_count = new_stdio_dispatch_count_for_test();
     let write_failed = Arc::new(tokio::sync::Notify::new());
     let (mut input_tx, input_rx) = tokio::io::duplex(4096);
     let first = format!(
@@ -3444,6 +3444,7 @@ async fn stdio_connection_stops_dispatch_after_writer_failure() {
             Arc::new(AppState::empty_for_tests()),
             input_rx,
             FailingWriter::new(write_failed),
+            dispatch_count.clone(),
         ),
     )
     .await
@@ -3456,11 +3457,66 @@ async fn stdio_connection_stops_dispatch_after_writer_failure() {
         "unexpected error: {error:?}"
     );
     assert_eq!(
-        stdio_dispatch_count_for_test(),
+        dispatch_count.load(Ordering::SeqCst),
         1,
         "no request after the writer failure may be dispatched"
     );
-    reset_stdio_dispatch_count_for_test();
+}
+
+/// Each stdio connection counts only its own dispatched requests, so
+/// parallel tests can never observe each other through the counter (#2336).
+#[tokio::test]
+async fn stdio_dispatch_count_is_isolated_per_connection() {
+    async fn run_one_connection(dispatch_count: StdioDispatchCountForTest) {
+        let (mut input_tx, input_rx) = tokio::io::duplex(4096);
+        // Duplex writer like the OUP embedded tests; the error response
+        // fits in the buffer, so the read half can simply be held.
+        let (_response_rx, response_tx) = tokio::io::duplex(4096);
+        // Any parseable request is counted before routing; an unknown method
+        // keeps the connection on the shallow error path.
+        let request = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req",
+                "method": "nonexistent/method",
+                "params": {}
+            })
+        );
+        input_tx
+            .write_all(request.as_bytes())
+            .await
+            .expect("queue request");
+        drop(input_tx);
+        stdio_connection_with_io(
+            Arc::new(AppState::empty_for_tests()),
+            input_rx,
+            response_tx,
+            dispatch_count,
+        )
+        .await
+        .expect("connection exits on EOF");
+    }
+
+    let first_count = new_stdio_dispatch_count_for_test();
+    let second_count = new_stdio_dispatch_count_for_test();
+    // Drive each connection as a spawned task, like the OUP embedded
+    // tests: polling the policy future through this test's own await
+    // chain overflowed the test-thread stack.
+    let first = tokio::spawn(run_one_connection(first_count.clone()));
+    let second = tokio::spawn(run_one_connection(second_count.clone()));
+    first.await.expect("first connection task joins");
+    second.await.expect("second connection task joins");
+    assert_eq!(
+        first_count.load(Ordering::SeqCst),
+        1,
+        "first connection must count only its own request"
+    );
+    assert_eq!(
+        second_count.load(Ordering::SeqCst),
+        1,
+        "second connection must count only its own request"
+    );
 }
 
 /// Shutdown must WAIT for this connection's in-flight turns to finalize
