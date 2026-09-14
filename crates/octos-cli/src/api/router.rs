@@ -369,6 +369,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::serve_owned_site_preview_path),
         )
         .route("/api/files/list", get(handlers::list_content_files))
+        .route("/api/files/mutate", post(handlers::mutate_file))
+        .route(
+            "/api/slides/edits",
+            get(handlers::get_slide_edits).put(handlers::save_slide_edits),
+        )
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
         // M7.9 / W2 — task supervisor exposure (kept REST). NOT an AppUI
