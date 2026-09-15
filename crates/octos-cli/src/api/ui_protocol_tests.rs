@@ -9,7 +9,8 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
     DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
     DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-    QuestionId, SessionSandboxParams, approval_scopes, methods, rpc_error_codes,
+    QuestionId, SessionSandboxParams, UserQuestion, UserQuestionAnswer, UserQuestionOption,
+    approval_scopes, methods, rpc_error_codes,
 };
 
 #[test]
@@ -21343,6 +21344,146 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
         UiProtocolLedgerEvent::Notification(UiNotification::TurnError(event))
             if event.turn_id == turn_id && event.code == "interrupted"
     )));
+}
+
+/// #1463 — an interrupted M9 fixture turn must drain pending user questions
+/// exactly like the live interrupt path (and like approvals on the same
+/// branch): the runtime waiter closes (Cancelled), a late respond is stale
+/// with `turn_interrupted`, and reconnect hydration no longer re-shows the
+/// dead turn's question.
+#[tokio::test]
+async fn m9_fixture_interrupt_cancels_pending_user_questions() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let surviving_turn = TurnId::new();
+    let question_id = QuestionId::new();
+    let surviving_question_id = QuestionId::new();
+
+    let framework_question = || {
+        vec![UserQuestion {
+            header: "Framework".into(),
+            question: "Which framework?".into(),
+            options: vec![
+                UserQuestionOption {
+                    label: "axum".into(),
+                    description: "tower-based".into(),
+                },
+                UserQuestionOption {
+                    label: "actix".into(),
+                    description: "actor-based".into(),
+                },
+            ],
+            multi_select: false,
+            allow_free_text: true,
+        }]
+    };
+    let waiter_rx = contracts
+        .user_questions
+        .request_runtime(UserQuestionRequestedEvent::new(
+            session_id.clone(),
+            question_id.clone(),
+            turn_id.clone(),
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            framework_question(),
+        ));
+    contracts
+        .user_questions
+        .request_runtime(UserQuestionRequestedEvent::new(
+            session_id.clone(),
+            surviving_question_id.clone(),
+            surviving_turn,
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            framework_question(),
+        ));
+    assert_eq!(
+        contracts
+            .user_questions
+            .pending_for_session(&session_id)
+            .len(),
+        2
+    );
+
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "m9 slow fixture".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    interrupt_tx
+        .try_send(())
+        .expect("preload pending interrupt");
+    drop(interrupt_tx);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        ledger,
+        Arc::clone(&contracts),
+        params,
+        M9ProtocolFixture::Slow,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    // The blocked tool's waiter closed (Cancelled). Bounded wait: without the
+    // fix the sender lives on in the store and this receiver never resolves.
+    let waiter_closed = tokio::time::timeout(std::time::Duration::from_secs(5), waiter_rx)
+        .await
+        .expect("interrupt must close the pending question's runtime waiter");
+    assert!(
+        waiter_closed.is_err(),
+        "a cancelled question's waiter resolves to Cancelled, not answers"
+    );
+    // …a late respond is stale with the precise reason…
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    let err = contracts
+        .user_questions
+        .respond_with_context(&UserQuestionRespondParams::new(
+            session_id.clone(),
+            question_id,
+            answer(),
+        ))
+        .expect_err("late respond against interrupted-turn question");
+    assert_eq!(err.code, rpc_error_codes::USER_QUESTION_STALE);
+    assert_eq!(
+        err.data.as_ref().unwrap()["reason"],
+        json!("turn_interrupted")
+    );
+    // …reconnect hydration only re-shows the surviving turn's question…
+    let pending = contracts.user_questions.pending_for_session(&session_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].question_id, surviving_question_id.clone());
+    // …which stays answerable.
+    let ok = contracts
+        .user_questions
+        .respond_with_context(&UserQuestionRespondParams::new(
+            session_id,
+            surviving_question_id,
+            answer(),
+        ))
+        .expect("non-interrupted turn question still pending");
+    assert!(ok.result.accepted);
 }
 
 #[tokio::test(flavor = "current_thread")]
