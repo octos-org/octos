@@ -842,6 +842,7 @@ async fn fetch_room_member_counts(
 #[derive(Clone)]
 struct AppserviceState {
     inbound_tx: mpsc::Sender<InboundMessage>,
+    routing_key: String,
     homeserver: String,
     as_token: String,
     hs_token: String,
@@ -892,6 +893,7 @@ struct AccessTokenQuery {
 /// Receives events from the homeserver via the Application Service API and sends
 /// messages using the Client-Server API with `?user_id=` identity assertion.
 pub struct MatrixChannel {
+    routing_key: String,
     homeserver: String,
     as_token: String,
     hs_token: String,
@@ -940,6 +942,7 @@ impl MatrixChannel {
     ) -> Self {
         let bot_user_id = format!("@{sender_localpart}:{server_name}");
         Self {
+            routing_key: CHANNEL_NAME.to_string(),
             homeserver: homeserver.trim_end_matches('/').to_string(),
             as_token: as_token.to_string(),
             hs_token: hs_token.to_string(),
@@ -962,6 +965,25 @@ impl MatrixChannel {
             dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
             dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Set the unique message-bus route for this Matrix connection.
+    /// Legacy single-instance channels keep the default `matrix` route.
+    pub fn with_routing_key(mut self, routing_key: impl Into<String>) -> Self {
+        self.routing_key = routing_key.into();
+        self
+    }
+
+    pub fn routing_key(&self) -> &str {
+        &self.routing_key
+    }
+
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
+    pub fn user_prefix(&self) -> &str {
+        &self.user_prefix
     }
 
     /// Set the directory for downloaded media files.
@@ -994,6 +1016,12 @@ impl MatrixChannel {
     /// Configure a `BotRouter` with persistence at `{data_dir}/matrix-bot-routes.json`.
     pub fn with_bot_router(mut self, data_dir: &std::path::Path) -> Self {
         let path = data_dir.join("matrix-bot-routes.json");
+        self.bot_router = Arc::new(BotRouter::new(Some(path)));
+        self
+    }
+
+    /// Configure the exact persistence path for this instance's bot routes.
+    pub fn with_bot_router_path(mut self, path: PathBuf) -> Self {
         self.bot_router = Arc::new(BotRouter::new(Some(path)));
         self
     }
@@ -1830,7 +1858,7 @@ async fn handle_transaction(
         };
 
         let inbound = InboundMessage {
-            channel: CHANNEL_NAME.into(),
+            channel: state.routing_key.clone(),
             sender_id: sender.to_string(),
             chat_id: room_id.to_string(),
             content: content_text,
@@ -2040,7 +2068,7 @@ async fn dispatch_allbots(
 
     for (target_matrix_user_id, profile_id) in deliveries {
         let inbound = InboundMessage {
-            channel: CHANNEL_NAME.into(),
+            channel: state.routing_key.clone(),
             sender_id: sender.to_string(),
             chat_id: room_id.to_string(),
             content: args_str.to_string(),
@@ -2338,6 +2366,10 @@ async fn handle_reload_bots(
 #[async_trait]
 impl Channel for MatrixChannel {
     fn name(&self) -> &str {
+        &self.routing_key
+    }
+
+    fn channel_type(&self) -> &str {
         CHANNEL_NAME
     }
 
@@ -2372,6 +2404,7 @@ impl Channel for MatrixChannel {
 
         let state = AppserviceState {
             inbound_tx,
+            routing_key: self.routing_key.clone(),
             homeserver: self.homeserver.clone(),
             as_token: self.as_token.clone(),
             hs_token: self.hs_token.clone(),

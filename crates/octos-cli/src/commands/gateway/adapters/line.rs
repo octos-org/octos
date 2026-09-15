@@ -52,6 +52,6 @@ pub fn register(
         line = line.with_mention_gating(bot_user_id);
     }
 
-    channel_mgr.register(Arc::new(line));
+    channel_mgr.register_as(entry.routing_key(), Arc::new(line));
     Ok(())
 }

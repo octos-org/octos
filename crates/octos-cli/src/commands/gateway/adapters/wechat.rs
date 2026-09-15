@@ -14,10 +14,13 @@ pub fn register(
 ) -> eyre::Result<()> {
     let default_url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3201");
     let bridge_url = wechat_bridge_url.unwrap_or(&default_url);
-    channel_mgr.register(Arc::new(octos_bus::WeChatChannel::new(
-        bridge_url,
-        entry.allowed_senders.clone(),
-        shutdown.clone(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::WeChatChannel::new(
+            bridge_url,
+            entry.allowed_senders.clone(),
+            shutdown.clone(),
+        )),
+    );
     Ok(())
 }

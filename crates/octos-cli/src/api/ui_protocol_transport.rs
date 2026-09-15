@@ -10400,39 +10400,15 @@ fn session_id_encodes_non_solo_scope(session_id: &SessionKey) -> bool {
 /// Registered gateway-channel name set used by
 /// `session_id_encodes_non_solo_scope` to distinguish a legacy
 /// `{channel}:{chat_id_with_colons}` session from a tenant-scoped
-/// `{profile}:tenant:{chat}` session. This is a SUPERSET of
-/// `octos_core::types::is_channel_name` — core's list omits
-/// feature-gated channels (`line`, `wechat`, `mock`) that the
-/// gateway / bus crates emit in `BusMessage.channel`. Codex round 4
-/// review (#1167) caught the gap: a legacy
+/// `{profile}:tenant:{chat}` session. Core owns the canonical channel
+/// registry, including instance-qualified Matrix routes; `mock` remains a
+/// local test-only addition. Codex round 4 review (#1167) caught the gap: a legacy
 /// `SessionKey::new("line", "tenant:123")` whose chat-id text starts
 /// with `tenant:` would be misclassified as tenant-scoped without
 /// recognising `line` here. Keep in sync when new gateway channels
 /// are added.
 fn is_registered_channel_name(value: &str) -> bool {
-    matches!(
-        value,
-        "api"
-            | "cli"
-            | "dingtalk"
-            | "discord"
-            | "email"
-            | "feishu"
-            | "line"
-            | "local"
-            | "matrix"
-            | "mock"
-            | "qq-bot"
-            | "slack"
-            | "system"
-            | "telegram"
-            | "test"
-            | "twilio"
-            | "wechat"
-            | "wecom"
-            | "wecom-bot"
-            | "whatsapp"
-    )
+    value == "mock" || octos_core::is_reserved_channel_name(value)
 }
 
 fn permission_selection_allowed(

@@ -20,12 +20,15 @@ pub fn register(
         .wrap_err_with(|| format!("{bot_env} environment variable not set"))?;
     let app_token = std::env::var(&app_env)
         .wrap_err_with(|| format!("{app_env} environment variable not set"))?;
-    channel_mgr.register(Arc::new(octos_bus::SlackChannel::new(
-        &bot_token,
-        &app_token,
-        entry.allowed_senders.clone(),
-        shutdown.clone(),
-        media_dir.to_path_buf(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::SlackChannel::new(
+            &bot_token,
+            &app_token,
+            entry.allowed_senders.clone(),
+            shutdown.clone(),
+            media_dir.to_path_buf(),
+        )),
+    );
     Ok(())
 }

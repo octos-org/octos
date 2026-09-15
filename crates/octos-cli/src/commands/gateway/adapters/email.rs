@@ -52,9 +52,9 @@ pub fn register(
         allowed_senders: entry.allowed_senders.clone(),
         max_body_chars,
     };
-    channel_mgr.register(Arc::new(octos_bus::EmailChannel::new(
-        email_config,
-        shutdown.clone(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::EmailChannel::new(email_config, shutdown.clone())),
+    );
     Ok(())
 }

@@ -799,6 +799,7 @@ fn password_login_body(user_id: &str, password: &str, device_name: Option<&str>)
 /// long-polling the Client-Server `/sync` API. Outbound messages are sent via
 /// `PUT .../send/m.room.message/{txn_id}` as that account.
 pub struct MatrixUserChannel {
+    routing_key: String,
     homeserver: String,
     user_id: Option<String>,
     access_token: Option<String>,
@@ -859,6 +860,7 @@ impl MatrixUserChannel {
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            routing_key: CHANNEL_NAME.to_string(),
             homeserver: homeserver.trim_end_matches('/').to_string(),
             user_id: user_id.filter(|s| !s.trim().is_empty()),
             access_token: access_token.filter(|s| !s.trim().is_empty()),
@@ -893,6 +895,13 @@ impl MatrixUserChannel {
             dedup: Arc::new(MessageDedup::new()),
             resolved: Mutex::new(None),
         }
+    }
+
+    /// Set the unique message-bus route for this Matrix connection.
+    /// Legacy single-instance channels keep the default `matrix` route.
+    pub fn with_routing_key(mut self, routing_key: impl Into<String>) -> Self {
+        self.routing_key = routing_key.into();
+        self
     }
 
     pub fn with_channel_index(mut self, channel_index: usize) -> Self {
@@ -1345,7 +1354,7 @@ impl MatrixUserChannel {
                 }
             }
             let inbound = InboundMessage {
-                channel: CHANNEL_NAME.into(),
+                channel: self.routing_key.clone(),
                 sender_id: msg.sender,
                 chat_id: msg.room_id,
                 content: msg.body,
@@ -1366,6 +1375,10 @@ impl MatrixUserChannel {
 #[async_trait]
 impl Channel for MatrixUserChannel {
     fn name(&self) -> &str {
+        &self.routing_key
+    }
+
+    fn channel_type(&self) -> &str {
         CHANNEL_NAME
     }
 
@@ -1534,6 +1547,44 @@ impl Channel for MatrixUserChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn named_instance_forwards_its_unique_route() {
+        let channel = MatrixUserChannel::new(
+            "https://example.org",
+            None,
+            Some("tok".into()),
+            None,
+            None,
+            vec![],
+            MatrixAutoJoin::Off,
+            vec![],
+            MatrixGroupPolicy::Open,
+            false,
+            MatrixMentionPolicy::Strict,
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_routing_key("matrix@work");
+        let (tx, mut rx) = mpsc::channel(1);
+
+        channel
+            .forward_messages(
+                vec![ParsedMessage {
+                    sender: "@alice:example.org".into(),
+                    room_id: "!room:example.org".into(),
+                    body: "hello".into(),
+                    event_id: Some("$route-test".into()),
+                    mentioned_self: false,
+                    other_mentions: vec![],
+                }],
+                &tx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rx.recv().await.unwrap().channel, "matrix@work");
+    }
 
     #[test]
     fn should_parse_text_message_from_join_timeline() {

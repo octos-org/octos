@@ -217,7 +217,7 @@ pub(super) struct GatewayRuntime {
 
     // Matrix (feature-gated)
     #[cfg(feature = "matrix")]
-    matrix_channel: Option<Arc<octos_bus::MatrixChannel>>,
+    matrix_channels: HashMap<String, Arc<octos_bus::MatrixChannel>>,
 }
 
 impl GatewayRuntime {
@@ -329,6 +329,7 @@ impl GatewayRuntime {
             .unwrap_or_else(|| crate::config::GatewayConfig {
                 channels: vec![crate::config::ChannelEntry {
                     channel_type: "cli".into(),
+                    id: None,
                     allowed_senders: vec![],
                     settings: serde_json::json!({}),
                 }],
@@ -739,7 +740,7 @@ impl GatewayRuntime {
         let shutdown_notify = Arc::new(Notify::new());
         let shutdown_notify_clone = shutdown_notify.clone();
         #[cfg(feature = "matrix")]
-        let mut matrix_channel: Option<Arc<octos_bus::MatrixChannel>> = None;
+        let mut matrix_channels: HashMap<String, Arc<octos_bus::MatrixChannel>> = HashMap::new();
 
         let mut tools;
         let mut plugin_result;
@@ -1541,6 +1542,7 @@ impl GatewayRuntime {
         if cmd.api_port.is_some() && !channels_for_reg.iter().any(|c| c.channel_type == "api") {
             channels_for_reg.push(crate::config::ChannelEntry {
                 channel_type: "api".into(),
+                id: None,
                 allowed_senders: vec![],
                 settings: serde_json::json!({}),
             });
@@ -1611,7 +1613,7 @@ impl GatewayRuntime {
                     let _ = delete_tx.send(id.to_string());
                 })),
                 #[cfg(feature = "matrix")]
-                matrix_channel: &mut matrix_channel,
+                matrix_channels: &mut matrix_channels,
             };
             adapters::register_all(&mut channel_mgr, &channels_for_reg, &mut reg_ctx)?;
         }
@@ -1620,10 +1622,9 @@ impl GatewayRuntime {
         let default_cron_channel: String = gw_config
             .channels
             .iter()
-            .map(|e| e.channel_type.as_str())
-            .find(|t| *t != "cli")
-            .unwrap_or("cli")
-            .to_string();
+            .find(|entry| entry.channel_type != "cli")
+            .map(crate::config::ChannelEntry::routing_key)
+            .unwrap_or_else(|| "cli".to_string());
 
         // Default chat_id: first allowed_sender from the first non-CLI channel
         let default_cron_chat_id: String = gw_config
@@ -1637,8 +1638,8 @@ impl GatewayRuntime {
         // Attach bot manager to Matrix channel for slash command handling
         #[cfg(feature = "matrix")]
         if admin_mode {
-            if let Some(ref channel) = matrix_channel {
-                if let Some(ref store) = profile_store {
+            if let Some(ref store) = profile_store {
+                for channel in matrix_channels.values() {
                     let bot_mgr = Arc::new(GatewayBotManager {
                         store: store.clone(),
                         channel: channel.clone(),
@@ -1649,6 +1650,7 @@ impl GatewayRuntime {
                     });
                     channel.set_bot_manager(bot_mgr);
                     info!(
+                        route = channel.routing_key(),
                         "matrix slash commands enabled (/createbot, /deletebot, /listbots, /schedule, /allbots)"
                     );
                 }
@@ -1690,9 +1692,10 @@ impl GatewayRuntime {
         let status_indicators: Arc<HashMap<String, Arc<StatusComposer>>> = {
             let mut map = HashMap::new();
             for entry in &channels_for_reg {
-                if let Some(ch) = channel_mgr.get_channel(&entry.channel_type) {
+                let routing_key = entry.routing_key();
+                if let Some(ch) = channel_mgr.get_channel(&routing_key) {
                     map.insert(
-                        entry.channel_type.clone(),
+                        routing_key,
                         Arc::new(StatusComposer::new(ch, status_words.clone())),
                     );
                 }
@@ -1792,7 +1795,7 @@ impl GatewayRuntime {
             cron_service,
             session_delete_rx,
             #[cfg(feature = "matrix")]
-            matrix_channel,
+            matrix_channels,
         };
         Ok(runtime)
     }
@@ -2191,7 +2194,7 @@ impl GatewayRuntime {
                 };
 
                 #[cfg(feature = "matrix")]
-                let sender_uid = if let Some(ref mc) = self.matrix_channel {
+                let sender_uid = if let Some(mc) = self.matrix_channels.get(&reply_channel) {
                     let uid = mc.bot_router().reverse_route(pid).await;
                     tracing::debug!(profile_id = %pid, sender_uid = ?uid, "resolved sender_user_id for profile");
                     uid

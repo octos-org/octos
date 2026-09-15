@@ -5700,6 +5700,7 @@ fn danger_full_access_chat_id_text_does_not_trigger_tenant_gate_per_1162() {
         "local:cloud:456",
         "telegram:tenant:789",
         "matrix:cloud:!room:abc",
+        "matrix@work:tenant:!room:abc",
         // Codex P2 round 4 — feature-gated channels (`line`,
         // `wechat`, `mock`) must also be recognised so legacy
         // `{channel}:{chat_id_with_colons}` on those gateways

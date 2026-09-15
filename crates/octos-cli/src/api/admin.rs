@@ -4116,6 +4116,7 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             crate::profiles::ChannelCredentials::Slack {
                 bot_token_env,
                 app_token_env,
+                ..
             } => {
                 insert_ref(bot_token_env, "channels");
                 insert_ref(app_token_env, "channels");

@@ -14,6 +14,19 @@ octos channels status
 
 This shows a table with each channel's compile status (feature flags) and config summary (environment variables set or missing).
 
+### Multiple connections of the same type
+
+A gateway can run multiple connections of any channel type. Give each additional entry a stable top-level `id` (1–64 lowercase letters, digits, or hyphens):
+
+```json
+[
+  { "type": "telegram", "id": "support", "settings": { "token_env": "TELEGRAM_SUPPORT_TOKEN" } },
+  { "type": "telegram", "id": "internal", "settings": { "token_env": "TELEGRAM_INTERNAL_TOKEN" } }
+]
+```
+
+The runtime routes these as `telegram@support` and `telegram@internal`, keeping sessions, replies, status indicators, and cron delivery isolated. Existing entries without `id` continue to use the legacy bare route (such as `telegram` or `matrix`) and existing session keys; at most one such entry per type may coexist with named instances. Each Matrix appservice instance must also use a distinct listener `port`; similarly, channel types that listen locally must be configured with non-conflicting ports.
+
 ---
 
 ## Telegram

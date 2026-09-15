@@ -56,6 +56,7 @@ Place this file at `~/.octos/profiles/botfather.json` or pass via `--profile`.
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `type` | yes | — | Must be `"matrix"` |
+| `id` | for multiple instances | — | Stable instance slug; route becomes `matrix@<id>`. Omit on a legacy/default instance to keep route `matrix` |
 | `homeserver` | no | `http://localhost:6167` | Homeserver Client-Server API URL (Palpo/Synapse, NOT the appservice) |
 | `as_token` | **yes** | — | Appservice token. Must match `registration.yaml` |
 | `hs_token` | **yes** | — | Homeserver token. Must match `registration.yaml` |
@@ -63,6 +64,8 @@ Place this file at `~/.octos/profiles/botfather.json` or pass via `--profile`.
 | `sender_localpart` | no | `bot` | Main bot's localpart → `@bot:<server_name>` |
 | `user_prefix` | no | `bot_` | Prefix for virtual users → `@bot_weather:<server_name>` |
 | `port` | no | `8009` | Appservice HTTP listener port (receives events from homeserver) |
+
+Multiple appservices require unique `id` and `port` values. Their bot-route state is persisted independently. Existing single-instance profiles may continue omitting `id` without changing their session keys or route file.
 
 #### Gateway settings (`config.gateway`)
 

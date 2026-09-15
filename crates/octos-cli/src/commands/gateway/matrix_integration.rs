@@ -100,6 +100,8 @@ pub(super) fn matrix_is_user_mode(entry: &crate::config::ChannelEntry) -> bool {
 #[cfg(feature = "matrix")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MatrixChannelSettings {
+    pub(super) routing_key: String,
+    pub(super) instance_id: Option<String>,
     pub(super) homeserver: String,
     pub(super) as_token: String,
     pub(super) hs_token: String,
@@ -141,6 +143,8 @@ impl MatrixChannelSettings {
             .unwrap_or(true);
 
         Ok(Self {
+            routing_key: entry.routing_key(),
+            instance_id: entry.id.clone(),
             homeserver,
             as_token,
             hs_token,
@@ -181,40 +185,29 @@ impl MatrixChannelSettings {
                 self.port,
                 shutdown,
             )
+            .with_routing_key(&self.routing_key)
             .with_admin_allowed_senders(self.allowed_senders.clone())
             .with_media_dir(data_dir.join("media"))
             .with_mention_only(self.mention_only)
-            .with_bot_router(data_dir),
+            .with_bot_router_path(match self.instance_id.as_deref() {
+                Some(id) => data_dir.join(format!("matrix-{id}-bot-routes.json")),
+                None => data_dir.join("matrix-bot-routes.json"),
+            }),
         )
-    }
-}
-
-#[cfg(feature = "matrix")]
-fn get_or_create_matrix_channel(
-    matrix_channel: &mut Option<Arc<octos_bus::MatrixChannel>>,
-    settings: &MatrixChannelSettings,
-    shutdown: &Arc<AtomicBool>,
-    data_dir: &std::path::Path,
-) -> Arc<octos_bus::MatrixChannel> {
-    if let Some(channel) = matrix_channel.clone() {
-        channel
-    } else {
-        let channel = settings.build_channel(shutdown.clone(), data_dir);
-        *matrix_channel = Some(channel.clone());
-        channel
     }
 }
 
 #[cfg(feature = "matrix")]
 pub(super) fn register_matrix_channel(
     channel_mgr: &mut ChannelManager,
-    matrix_channel: &mut Option<Arc<octos_bus::MatrixChannel>>,
+    matrix_channels: &mut std::collections::HashMap<String, Arc<octos_bus::MatrixChannel>>,
     settings: &MatrixChannelSettings,
     shutdown: &Arc<AtomicBool>,
     data_dir: &std::path::Path,
 ) -> Arc<octos_bus::MatrixChannel> {
-    let channel = get_or_create_matrix_channel(matrix_channel, settings, shutdown, data_dir);
+    let channel = settings.build_channel(shutdown.clone(), data_dir);
     channel_mgr.register(channel.clone());
+    matrix_channels.insert(settings.routing_key.clone(), channel.clone());
     channel
 }
 
@@ -225,6 +218,7 @@ pub(super) fn register_matrix_channel(
 #[cfg(feature = "matrix")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MatrixUserChannelSettings {
+    pub(super) routing_key: String,
     pub(super) homeserver: String,
     pub(super) user_id: Option<String>,
     pub(super) access_token: Option<String>,
@@ -319,6 +313,7 @@ impl MatrixUserChannelSettings {
         .unwrap_or_default();
 
         Ok(Self {
+            routing_key: entry.routing_key(),
             homeserver: settings_str(
                 &entry.settings,
                 MATRIX_SETTING_HOMESERVER,
@@ -363,6 +358,7 @@ impl MatrixUserChannelSettings {
                 self.allowed_senders.clone(),
                 shutdown,
             )
+            .with_routing_key(&self.routing_key)
             .with_channel_index(channel_index)
             .with_invite_store(octos_bus::MatrixInviteStore::for_profile_data_dir(data_dir)),
         )
@@ -422,23 +418,18 @@ impl octos_bus::BotManager for GatewayBotManager {
             .get(&self.parent_profile_id)?
             .ok_or_else(|| eyre::eyre!("parent profile '{}' not found", self.parent_profile_id))?;
 
-        let (server_name, user_prefix) = parent
+        if !parent
             .config
             .channels
             .iter()
-            .find_map(|ch| {
-                if let crate::profiles::ChannelCredentials::Matrix {
-                    server_name,
-                    user_prefix,
-                    ..
-                } = ch
-                {
-                    Some((server_name.clone(), user_prefix.clone()))
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| eyre::eyre!("parent profile has no Matrix channel"))?;
+            .any(|channel| matches!(channel, crate::profiles::ChannelCredentials::Matrix { .. }))
+        {
+            eyre::bail!("parent profile has no Matrix channel");
+        }
+        // The manager is attached to one concrete appservice instance.  Read
+        // its namespace rather than the first Matrix entry in the profile.
+        let server_name = self.channel.server_name();
+        let user_prefix = self.channel.user_prefix();
 
         let matrix_user_id = format!("@{user_prefix}{username}:{server_name}");
 
@@ -621,7 +612,7 @@ impl octos_bus::BotManager for GatewayBotManager {
     ) -> eyre::Result<String> {
         Ok(CronTool::add_natural_language_for_context(
             &self.cron_service,
-            "matrix",
+            self.channel.routing_key(),
             room_id,
             request,
         )?
@@ -629,7 +620,12 @@ impl octos_bus::BotManager for GatewayBotManager {
     }
 
     async fn list_schedules(&self, _sender: &str, room_id: &str) -> eyre::Result<String> {
-        Ok(CronTool::list_jobs_for_context(self.cron_service.as_ref(), "matrix", room_id).output)
+        Ok(CronTool::list_jobs_for_context(
+            self.cron_service.as_ref(),
+            self.channel.routing_key(),
+            room_id,
+        )
+        .output)
     }
 
     async fn unschedule_bot_task(
@@ -638,6 +634,12 @@ impl octos_bus::BotManager for GatewayBotManager {
         _sender: &str,
         room_id: &str,
     ) -> eyre::Result<String> {
-        Ok(CronTool::remove_job_for_context(&self.cron_service, "matrix", room_id, job_id).output)
+        Ok(CronTool::remove_job_for_context(
+            &self.cron_service,
+            self.channel.routing_key(),
+            room_id,
+            job_id,
+        )
+        .output)
     }
 }

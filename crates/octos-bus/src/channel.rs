@@ -15,8 +15,16 @@ use crate::coalesce::{ChunkConfig, split_message};
 /// A message channel (CLI, Telegram, Discord, etc.).
 #[async_trait]
 pub trait Channel: Send + Sync {
-    /// Channel name used for routing (e.g. "cli", "telegram").
+    /// Channel route key (e.g. "cli", "telegram", "matrix@operations").
     fn name(&self) -> &str;
+
+    /// Base channel type, independent of an optional instance ID.
+    ///
+    /// Existing single-instance channels inherit the route key as their type.
+    /// Multi-instance channels override this while keeping `name()` unique.
+    fn channel_type(&self) -> &str {
+        self.name()
+    }
 
     /// Start listening for messages. Long-running — sends inbound messages via tx.
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()>;
@@ -261,6 +269,188 @@ pub enum ChannelHealth {
     Unknown,
 }
 
+/// Adds an instance-specific route to an adapter without making every adapter
+/// aware of the routing convention. All platform behavior is delegated to the
+/// wrapped channel; only its route identity and inbound message route change.
+struct RoutedChannel {
+    route: String,
+    inner: Arc<dyn Channel>,
+}
+
+#[async_trait]
+impl Channel for RoutedChannel {
+    fn name(&self) -> &str {
+        &self.route
+    }
+
+    fn channel_type(&self) -> &str {
+        self.inner.channel_type()
+    }
+
+    async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
+        let route = self.route.clone();
+        let (route_tx, mut route_rx) = mpsc::channel::<InboundMessage>(64);
+        let relay = tokio::spawn(async move {
+            while let Some(mut message) = route_rx.recv().await {
+                message.channel = route.clone();
+                if inbound_tx.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let result = self.inner.start(route_tx).await;
+        let _ = relay.await;
+        result
+    }
+
+    async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+        self.inner.send(msg).await
+    }
+
+    fn is_allowed(&self, sender_id: &str) -> bool {
+        self.inner.is_allowed(sender_id)
+    }
+
+    fn max_message_length(&self) -> usize {
+        self.inner.max_message_length()
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn send_typing(&self, chat_id: &str) -> Result<()> {
+        self.inner.send_typing(chat_id).await
+    }
+
+    async fn send_typing_as(&self, chat_id: &str, sender_user_id: Option<&str>) -> Result<()> {
+        self.inner.send_typing_as(chat_id, sender_user_id).await
+    }
+
+    async fn stop_typing(&self, chat_id: &str) -> Result<()> {
+        self.inner.stop_typing(chat_id).await
+    }
+
+    async fn stop_typing_as(&self, chat_id: &str, sender_user_id: Option<&str>) -> Result<()> {
+        self.inner.stop_typing_as(chat_id, sender_user_id).await
+    }
+
+    async fn send_listening(&self, chat_id: &str) -> Result<()> {
+        self.inner.send_listening(chat_id).await
+    }
+
+    fn supports_edit(&self) -> bool {
+        self.inner.supports_edit()
+    }
+
+    async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
+        self.inner.send_with_id(msg).await
+    }
+
+    async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
+        self.inner
+            .edit_message(chat_id, message_id, new_content)
+            .await
+    }
+
+    async fn edit_message_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.inner
+            .edit_message_bound(chat_id, message_id, new_content, thread_id)
+            .await
+    }
+
+    async fn finish_stream(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+    ) -> Result<()> {
+        self.inner
+            .finish_stream(chat_id, message_id, final_content)
+            .await
+    }
+
+    async fn finish_stream_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.inner
+            .finish_stream_bound(chat_id, message_id, final_content, thread_id)
+            .await
+    }
+
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        self.inner.delete_message(chat_id, message_id).await
+    }
+
+    async fn edit_message_with_metadata(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        self.inner
+            .edit_message_with_metadata(chat_id, message_id, new_content, metadata)
+            .await
+    }
+
+    fn format_outbound(&self, content: &str) -> String {
+        self.inner.format_outbound(content)
+    }
+
+    async fn send_raw_sse(&self, chat_id: &str, json: &str) -> Result<()> {
+        self.inner.send_raw_sse(chat_id, json).await
+    }
+
+    async fn send_raw_sse_bound(
+        &self,
+        chat_id: &str,
+        json: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.inner
+            .send_raw_sse_bound(chat_id, json, thread_id)
+            .await
+    }
+
+    async fn react_to_message(&self, chat_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        self.inner
+            .react_to_message(chat_id, message_id, emoji)
+            .await
+    }
+
+    async fn remove_reaction(&self, chat_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        self.inner.remove_reaction(chat_id, message_id, emoji).await
+    }
+
+    async fn send_embed(
+        &self,
+        chat_id: &str,
+        title: &str,
+        description: &str,
+        fields: &[(String, String, bool)],
+        color: Option<u32>,
+    ) -> Result<Option<String>> {
+        self.inner
+            .send_embed(chat_id, title, description, fields, color)
+            .await
+    }
+
+    async fn health_check(&self) -> Result<ChannelHealth> {
+        self.inner.health_check().await
+    }
+}
+
 /// Manages registered channels and dispatches outbound messages.
 pub struct ChannelManager {
     channels: HashMap<String, Arc<dyn Channel>>,
@@ -283,6 +473,26 @@ impl ChannelManager {
         self.channels.insert(channel.name().to_string(), channel);
     }
 
+    /// Register a channel under an explicit route key.
+    ///
+    /// Named channel instances use `type@id` while the concrete adapter keeps
+    /// its platform type. A route-aware wrapper keeps inbound messages and any
+    /// manager-generated outbound/status messages on that same route.
+    pub fn register_as(&mut self, route: impl Into<String>, channel: Arc<dyn Channel>) {
+        let route = route.into();
+        if route == channel.name() {
+            self.channels.insert(route, channel);
+        } else {
+            self.channels.insert(
+                route.clone(),
+                Arc::new(RoutedChannel {
+                    route,
+                    inner: channel,
+                }),
+            );
+        }
+    }
+
     /// Start all channels and the outbound dispatcher.
     /// Consumes the BusPublisher to own the outbound receiver.
     ///
@@ -300,8 +510,9 @@ impl ChannelManager {
             let ch = Arc::clone(channel);
             let tx = inbound_tx.clone();
             tokio::spawn(async move {
+                let result = ch.start(tx).await;
                 let name = ch.name().to_string();
-                match ch.start(tx).await {
+                match result {
                     Ok(()) => {
                         warn!(channel = %name, "Channel listener exited cleanly (may need restart)")
                     }
@@ -456,12 +667,67 @@ mod tests {
         }
     }
 
+    struct InboundMockChannel;
+
+    #[async_trait]
+    impl Channel for InboundMockChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
+            inbound_tx
+                .send(InboundMessage {
+                    channel: "telegram".into(),
+                    sender_id: "user1".into(),
+                    chat_id: "chat1".into(),
+                    content: "routed inbound".into(),
+                    timestamp: Utc::now(),
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                    message_id: None,
+                    origin: octos_core::MessageOrigin::ExternalUser,
+                })
+                .await?;
+            Ok(())
+        }
+
+        async fn send(&self, _msg: &OutboundMessage) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_register_channels() {
         let mut mgr = ChannelManager::new();
         mgr.register(Arc::new(MockChannel::new("ch1")));
         mgr.register(Arc::new(MockChannel::new("ch2")));
         assert_eq!(mgr.channels.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn named_registration_exposes_route_and_delegates_outbound() {
+        let mock = Arc::new(MockChannel::new("telegram"));
+        let sent = Arc::clone(&mock.sent);
+        let mut mgr = ChannelManager::new();
+        mgr.register_as("telegram@support", mock);
+
+        let channel = mgr.get_channel("telegram@support").unwrap();
+        assert_eq!(channel.name(), "telegram@support");
+        assert_eq!(channel.channel_type(), "telegram");
+        channel
+            .send(&OutboundMessage {
+                channel: "telegram@support".into(),
+                chat_id: "c1".into(),
+                content: "named outbound".into(),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(sent.lock().await.as_slice(), ["named outbound"]);
     }
 
     #[tokio::test]
@@ -496,6 +762,19 @@ mod tests {
         let messages = sent.lock().await;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], "hello from agent");
+    }
+
+    #[tokio::test]
+    async fn named_registration_rewrites_inbound_route() {
+        let mut mgr = ChannelManager::new();
+        mgr.register_as("telegram@support", Arc::new(InboundMockChannel));
+        let (mut agent, publisher) = crate::bus::create_bus();
+
+        mgr.start_all(publisher).await.unwrap();
+
+        let message = agent.recv_inbound().await.unwrap();
+        assert_eq!(message.channel, "telegram@support");
+        assert_eq!(message.content, "routed inbound");
     }
 
     #[tokio::test]

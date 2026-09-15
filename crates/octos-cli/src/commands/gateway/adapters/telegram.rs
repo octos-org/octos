@@ -36,6 +36,6 @@ pub fn register(
     if require_mention {
         tg = tg.with_mention_gating(bot_username);
     }
-    channel_mgr.register(Arc::new(tg));
+    channel_mgr.register_as(entry.routing_key(), Arc::new(tg));
     Ok(())
 }

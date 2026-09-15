@@ -14,6 +14,19 @@ octos channels status
 
 该命令会显示一张表格，列出每个频道的编译状态（feature flags）和配置摘要（环境变量的设置情况）。
 
+### 同类型多个接入
+
+一个网关可以同时运行任意频道类型的多个接入。请为每个新增条目设置稳定的顶层 `id`（1–64 个小写字母、数字或连字符）：
+
+```json
+[
+  { "type": "telegram", "id": "support", "settings": { "token_env": "TELEGRAM_SUPPORT_TOKEN" } },
+  { "type": "telegram", "id": "internal", "settings": { "token_env": "TELEGRAM_INTERNAL_TOKEN" } }
+]
+```
+
+运行时路由分别为 `telegram@support` 和 `telegram@internal`，会话、回复、状态指示以及定时任务投递彼此隔离。未配置 `id` 的历史条目继续使用原来的裸路由（例如 `telegram` 或 `matrix`）和会话键；每种类型最多可以有一个此类条目与带 ID 的实例共存。多个 Matrix appservice 必须分别配置不同的监听 `port`；其他需要本地监听端口的频道也必须避免端口冲突。
+
 ---
 
 ## Telegram

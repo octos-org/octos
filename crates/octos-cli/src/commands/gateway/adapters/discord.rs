@@ -17,11 +17,14 @@ pub fn register(
     let env = settings_str(&entry.settings, "token_env", "DISCORD_BOT_TOKEN");
     let token =
         std::env::var(&env).wrap_err_with(|| format!("{env} environment variable not set"))?;
-    channel_mgr.register(Arc::new(octos_bus::DiscordChannel::new(
-        &token,
-        entry.allowed_senders.clone(),
-        shutdown.clone(),
-        media_dir.to_path_buf(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::DiscordChannel::new(
+            &token,
+            entry.allowed_senders.clone(),
+            shutdown.clone(),
+            media_dir.to_path_buf(),
+        )),
+    );
     Ok(())
 }

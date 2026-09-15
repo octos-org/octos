@@ -1265,16 +1265,22 @@ impl LlmModelSelectionConfig {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ChannelCredentials {
     Telegram {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_telegram_env")]
         token_env: String,
         #[serde(default)]
         allowed_senders: String,
     },
     Discord {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_discord_env")]
         token_env: String,
     },
     DingTalk {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_dingtalk_webhook_env")]
         webhook_url_env: String,
         #[serde(default = "default_dingtalk_secret_env")]
@@ -1285,6 +1291,8 @@ pub enum ChannelCredentials {
         webhook_port: Option<u16>,
     },
     Slack {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_slack_bot_env")]
         bot_token_env: String,
         #[serde(default = "default_slack_app_env")]
@@ -1292,10 +1300,14 @@ pub enum ChannelCredentials {
     },
     #[serde(rename = "whatsapp")]
     WhatsApp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_whatsapp_url")]
         bridge_url: String,
     },
     Feishu {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_feishu_id_env")]
         app_id_env: String,
         #[serde(default = "default_feishu_secret_env")]
@@ -1312,6 +1324,8 @@ pub enum ChannelCredentials {
         encrypt_key_env: String,
     },
     Email {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         imap_host: String,
         #[serde(default = "default_imap_port")]
@@ -1326,6 +1340,8 @@ pub enum ChannelCredentials {
         password_env: String,
     },
     Twilio {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_twilio_sid_env")]
         account_sid_env: String,
         #[serde(default = "default_twilio_token_env")]
@@ -1336,6 +1352,8 @@ pub enum ChannelCredentials {
         webhook_port: u16,
     },
     Api {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_api_port")]
         port: u16,
         #[serde(default)]
@@ -1343,12 +1361,17 @@ pub enum ChannelCredentials {
     },
     #[serde(rename = "wecom-bot")]
     WeComBot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         bot_id: String,
         #[serde(default = "default_wecom_bot_secret_env")]
         secret_env: String,
     },
     Matrix {
+        /// Stable instance ID. Omitted legacy entries keep route `matrix`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         homeserver: String,
         // Appservice-mode tokens. Optional so a user-mode entry (which has no
@@ -1406,6 +1429,8 @@ pub enum ChannelCredentials {
     },
     #[serde(rename = "qq-bot")]
     QQBot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         app_id: String,
         #[serde(default = "default_qq_bot_secret_env")]
@@ -1413,12 +1438,16 @@ pub enum ChannelCredentials {
     },
     #[serde(rename = "wechat")]
     WeChat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_wechat_token_env")]
         token_env: String,
         #[serde(default = "default_wechat_base_url")]
         base_url: String,
     },
     Line {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default = "default_line_secret_env")]
         channel_secret_env: String,
         #[serde(default = "default_line_token_env")]
@@ -1432,6 +1461,27 @@ pub enum ChannelCredentials {
         #[serde(default)]
         bot_user_id: String,
     },
+}
+
+impl ChannelCredentials {
+    fn instance_id(&self) -> Option<&str> {
+        match self {
+            Self::Telegram { id, .. }
+            | Self::Discord { id, .. }
+            | Self::DingTalk { id, .. }
+            | Self::Slack { id, .. }
+            | Self::WhatsApp { id, .. }
+            | Self::Feishu { id, .. }
+            | Self::Email { id, .. }
+            | Self::Twilio { id, .. }
+            | Self::Api { id, .. }
+            | Self::WeComBot { id, .. }
+            | Self::Matrix { id, .. }
+            | Self::QQBot { id, .. }
+            | Self::WeChat { id, .. }
+            | Self::Line { id, .. } => id.as_deref(),
+        }
+    }
 }
 
 fn default_telegram_env() -> String {
@@ -1858,7 +1908,9 @@ impl ProfileStore {
                     .find(|old_channel| channel_secret_identity_matches(new_channel, old_channel))
                     .or_else(|| {
                         existing.config.channels.get(idx).filter(|old_channel| {
-                            same_secret_channel_variant(new_channel, old_channel)
+                            new_channel.instance_id().is_none()
+                                && old_channel.instance_id().is_none()
+                                && same_secret_channel_variant(new_channel, old_channel)
                         })
                     });
                 if let Some(old_channel) = old_channel {
@@ -2632,11 +2684,26 @@ fn channel_secret_identity_matches(
 ) -> bool {
     match (new_channel, old_channel) {
         (
-            ChannelCredentials::Api { port: new_port, .. },
-            ChannelCredentials::Api { port: old_port, .. },
-        ) => new_port == old_port,
+            ChannelCredentials::Api {
+                id: new_id,
+                port: new_port,
+                ..
+            },
+            ChannelCredentials::Api {
+                id: old_id,
+                port: old_port,
+                ..
+            },
+        ) => {
+            if new_id.is_some() || old_id.is_some() {
+                new_id.is_some() && new_id == old_id
+            } else {
+                new_port == old_port
+            }
+        }
         (
             ChannelCredentials::Matrix {
+                id: new_id,
                 homeserver: new_homeserver,
                 mode: new_mode,
                 user_id: new_user_id,
@@ -2647,6 +2714,7 @@ fn channel_secret_identity_matches(
                 ..
             },
             ChannelCredentials::Matrix {
+                id: old_id,
                 homeserver: old_homeserver,
                 mode: old_mode,
                 user_id: old_user_id,
@@ -2657,6 +2725,11 @@ fn channel_secret_identity_matches(
                 ..
             },
         ) => {
+            if new_id.is_some() || old_id.is_some() {
+                return new_id.is_some()
+                    && new_id == old_id
+                    && new_mode.eq_ignore_ascii_case(old_mode);
+            }
             if !new_mode.eq_ignore_ascii_case(old_mode) {
                 return false;
             }
@@ -2927,10 +3000,11 @@ pub(crate) fn config_from_profile(
 
 /// Convert a `ChannelCredentials` to a octos `ChannelEntry` JSON value.
 fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
-    match cred {
+    let mut entry = match cred {
         ChannelCredentials::Telegram {
             token_env,
             allowed_senders,
+            ..
         } => {
             let senders: Vec<&str> = allowed_senders
                 .split(',')
@@ -2943,7 +3017,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "settings": { "token_env": token_env }
             })
         }
-        ChannelCredentials::Discord { token_env } => serde_json::json!({
+        ChannelCredentials::Discord { token_env, .. } => serde_json::json!({
             "type": "discord",
             "settings": { "token_env": token_env }
         }),
@@ -2952,6 +3026,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             secret_env,
             allowed_senders,
             webhook_port,
+            ..
         } => {
             let senders: Vec<&str> = allowed_senders
                 .split(',')
@@ -2974,11 +3049,12 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
         ChannelCredentials::Slack {
             bot_token_env,
             app_token_env,
+            ..
         } => serde_json::json!({
             "type": "slack",
             "settings": { "bot_token_env": bot_token_env, "app_token_env": app_token_env }
         }),
-        ChannelCredentials::WhatsApp { bridge_url } => serde_json::json!({
+        ChannelCredentials::WhatsApp { bridge_url, .. } => serde_json::json!({
             "type": "whatsapp",
             "settings": { "bridge_url": bridge_url }
         }),
@@ -2990,6 +3066,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             webhook_port,
             verification_token_env,
             encrypt_key_env,
+            ..
         } => {
             let mut settings = serde_json::json!({
                 "app_id_env": app_id_env,
@@ -3022,6 +3099,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             smtp_port,
             username_env,
             password_env,
+            ..
         } => serde_json::json!({
             "type": "email",
             "settings": {
@@ -3038,6 +3116,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             auth_token_env,
             from_number,
             webhook_port,
+            ..
         } => serde_json::json!({
             "type": "twilio",
             "settings": {
@@ -3047,7 +3126,9 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "webhook_port": webhook_port,
             }
         }),
-        ChannelCredentials::Api { port, auth_token } => {
+        ChannelCredentials::Api {
+            port, auth_token, ..
+        } => {
             let mut settings = serde_json::json!({"port": port});
             if let Some(token) = auth_token {
                 settings["auth_token"] = serde_json::json!(token);
@@ -3057,7 +3138,9 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "settings": settings
             })
         }
-        ChannelCredentials::WeComBot { bot_id, secret_env } => serde_json::json!({
+        ChannelCredentials::WeComBot {
+            bot_id, secret_env, ..
+        } => serde_json::json!({
             "type": "wecom-bot",
             "settings": {
                 "bot_id": bot_id,
@@ -3084,6 +3167,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             auto_join_allowlist,
             group_policy,
             require_mention,
+            ..
         } => {
             let mut settings = serde_json::json!({ "homeserver": homeserver });
             if mode.eq_ignore_ascii_case("user") {
@@ -3130,6 +3214,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
         ChannelCredentials::QQBot {
             app_id,
             client_secret_env,
+            ..
         } => serde_json::json!({
             "type": "qq-bot",
             "settings": {
@@ -3140,6 +3225,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
         ChannelCredentials::WeChat {
             token_env,
             base_url,
+            ..
         } => serde_json::json!({
             "type": "wechat",
             "settings": {
@@ -3154,6 +3240,7 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
             webhook_port,
             require_mention,
             bot_user_id,
+            ..
         } => {
             let senders: Vec<&str> = allowed_senders
                 .split(',')
@@ -3177,7 +3264,11 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "settings": settings,
             })
         }
+    };
+    if let Some(id) = cred.instance_id() {
+        entry["id"] = serde_json::json!(id);
     }
+    entry
 }
 
 /// Classification of changes between two profile versions.
@@ -3687,6 +3778,7 @@ mod tests {
                     vec![],
                 )),
                 channels: vec![ChannelCredentials::Telegram {
+                    id: None,
                     token_env: "TG_TOKEN".into(),
                     allowed_senders: String::new(),
                 }],
@@ -3974,10 +4066,12 @@ mod tests {
                 )),
                 channels: vec![
                     ChannelCredentials::Telegram {
+                        id: None,
                         token_env: "TG".into(),
                         allowed_senders: String::new(),
                     },
                     ChannelCredentials::Slack {
+                        id: None,
                         bot_token_env: "SB".into(),
                         app_token_env: "SA".into(),
                     },
@@ -4412,6 +4506,7 @@ mod tests {
                     vec![],
                 )),
                 channels: vec![ChannelCredentials::WhatsApp {
+                    id: None,
                     bridge_url: "ws://localhost:3001".into(),
                 }],
                 ..Default::default()
@@ -4552,10 +4647,12 @@ mod tests {
                 .into(),
                 channels: vec![
                     ChannelCredentials::Api {
+                        id: None,
                         port: 9911,
                         auth_token: Some("api-token-secret".into()),
                     },
                     ChannelCredentials::Matrix {
+                        id: None,
                         homeserver: "https://matrix.example.org".into(),
                         as_token: "as-token-secret".into(),
                         hs_token: "hs-token-secret".into(),
@@ -4862,10 +4959,12 @@ mod tests {
             config: ProfileConfig {
                 channels: vec![
                     ChannelCredentials::Api {
+                        id: None,
                         port: 9911,
                         auth_token: Some("api-real-token".into()),
                     },
                     ChannelCredentials::Matrix {
+                        id: None,
                         homeserver: "https://old.example.org".into(),
                         as_token: "as-real-token".into(),
                         hs_token: "hs-real-token".into(),
@@ -4958,6 +5057,7 @@ mod tests {
             public_subdomain: None,
             config: ProfileConfig {
                 channels: vec![ChannelCredentials::Matrix {
+                    id: None,
                     homeserver: "https://matrix.example.org".into(),
                     as_token: String::new(),
                     hs_token: String::new(),
@@ -5017,6 +5117,7 @@ mod tests {
         let store = ProfileStore::open_unified(dir.path()).unwrap();
 
         let matrix_channel = |user_id: &str, token: &str| ChannelCredentials::Matrix {
+            id: None,
             homeserver: "https://matrix.example.org".into(),
             as_token: String::new(),
             hs_token: String::new(),
@@ -5500,6 +5601,7 @@ mod tests {
                 "work-bot",
                 "work bot",
                 vec![ChannelCredentials::Telegram {
+                    id: None,
                     token_env: "WORK_TG_TOKEN".into(),
                     allowed_senders: String::new(),
                 }],
@@ -5672,6 +5774,7 @@ mod tests {
             public_subdomain: Some("work".into()),
             config: ProfileConfig {
                 channels: vec![ChannelCredentials::Telegram {
+                    id: None,
                     token_env: "WORK_TG".into(),
                     allowed_senders: String::new(),
                 }],
@@ -5837,26 +5940,32 @@ mod tests {
     fn test_channel_serde_roundtrip() {
         let channels = vec![
             ChannelCredentials::Telegram {
+                id: None,
                 token_env: "TG".into(),
                 allowed_senders: String::new(),
             },
             ChannelCredentials::Discord {
+                id: None,
                 token_env: "DC".into(),
             },
             ChannelCredentials::DingTalk {
+                id: None,
                 webhook_url_env: "DT_WEBHOOK".into(),
                 secret_env: "DT_SECRET".into(),
                 allowed_senders: "staff-1,staff-2".into(),
                 webhook_port: Some(8650),
             },
             ChannelCredentials::Slack {
+                id: None,
                 bot_token_env: "SB".into(),
                 app_token_env: "SA".into(),
             },
             ChannelCredentials::WhatsApp {
+                id: None,
                 bridge_url: "ws://localhost:3001".into(),
             },
             ChannelCredentials::Feishu {
+                id: None,
                 app_id_env: "FID".into(),
                 app_secret_env: "FSE".into(),
                 mode: String::new(),
@@ -5866,6 +5975,7 @@ mod tests {
                 encrypt_key_env: String::new(),
             },
             ChannelCredentials::Email {
+                id: None,
                 imap_host: "imap.test.com".into(),
                 imap_port: 993,
                 smtp_host: "smtp.test.com".into(),
@@ -6112,6 +6222,46 @@ mod tests {
         assert_eq!(json["sender_localpart"], "bot");
         assert_eq!(json["user_prefix"], "bot_");
         assert_eq!(json["port"], 8009);
+        assert!(
+            json.get("id").is_none(),
+            "legacy Matrix JSON stays unchanged"
+        );
+    }
+
+    #[test]
+    fn test_named_matrix_channel_projects_instance_route() {
+        let channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "id": "work",
+            "mode": "user",
+            "homeserver": "https://matrix.example.org",
+            "access_token": "syt_token"
+        }))
+        .unwrap();
+
+        let entry: ChannelEntry = serde_json::from_value(channel_to_entry(&channel)).unwrap();
+        assert_eq!(entry.id.as_deref(), Some("work"));
+        assert_eq!(entry.routing_key(), "matrix@work");
+
+        let json = serde_json::to_value(&channel).unwrap();
+        assert_eq!(json["id"], "work");
+    }
+
+    #[test]
+    fn test_named_telegram_channel_projects_instance_route() {
+        let channel: ChannelCredentials = serde_json::from_value(serde_json::json!({
+            "type": "telegram",
+            "id": "support",
+            "token_env": "TELEGRAM_SUPPORT_TOKEN"
+        }))
+        .unwrap();
+
+        let entry: ChannelEntry = serde_json::from_value(channel_to_entry(&channel)).unwrap();
+        assert_eq!(entry.id.as_deref(), Some("support"));
+        assert_eq!(entry.routing_key(), "telegram@support");
+
+        let json = serde_json::to_value(&channel).unwrap();
+        assert_eq!(json["id"], "support");
     }
 
     #[test]
@@ -6282,6 +6432,7 @@ mod tests {
             api_type: Some("anthropic".to_string()),
             admin_mode: true,
             channels: vec![ChannelCredentials::Discord {
+                id: None,
                 token_env: "DEFAULT_DISCORD".to_string(),
             }],
             ..Default::default()
