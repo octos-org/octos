@@ -38,6 +38,8 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("Moonshot", "KIMI_API_KEY"),
     ("DashScope", "DASHSCOPE_API_KEY"),
     ("MiniMax", "MINIMAX_API_KEY"),
+    // Label lowercases to the registry family id for the key-alias fallback.
+    ("MiniMax-CN", "MINIMAX_CN_API_KEY"),
     ("Zhipu", "ZHIPU_API_KEY"),
 ];
 

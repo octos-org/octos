@@ -20,6 +20,7 @@ fn clear_provider_env(cmd: &mut Command) {
         "KIMI_API_KEY",
         "DASHSCOPE_API_KEY",
         "MINIMAX_API_KEY",
+        "MINIMAX_CN_API_KEY",
         "ZAI_API_KEY",
     ] {
         cmd.env_remove(key);
