@@ -42,9 +42,10 @@ crate compiled against is the one that generates:
 
 ```bash
 cargo build -p octos-uniffi
+# Use liboctos_uniffi.so on Linux.
 cargo run -p octos-uniffi --bin uniffi-bindgen -- generate \
-    --library target/debug/liboctos_uniffi.dylib \   # .so on Linux
-    --language python \
+    --library target/debug/liboctos_uniffi.dylib \
+    --language python --no-format \
     --out-dir crates/octos-uniffi/bindings/python
 
 # Deterministic post-gen tidy so `git diff --check` stays clean (the generator
@@ -124,3 +125,10 @@ responsibility.
 > field, so it runs after the episodic store releases its redb lock). Both the
 > C-ABI's `octos_runtime_free` and a native/uniffi drop reclaim it identically,
 > so a long-lived host does not accumulate scratch dirs.
+
+## Runtime contract checks
+
+Run `./scripts/milestone-ci.sh oup-runtime` to build the native libraries,
+compare generated Python bindings, compile the C header contract, and exercise
+actual C/Python success and incomplete-result calls against a localhost fixture.
+The same suite checks real chat, ACP and OUP subprocesses.

@@ -1,13 +1,19 @@
 # OUP Semantic-Boundary Context and Prompt-Cache Design Record
 
 - Date: 2026-09-02
-- Updated: 2026-09-05
+- Updated: 2026-09-14
 - Status: OUP/OctosCode and chat/ACP implemented; final review, local acceptance and mini3 cloud OUP/tmux soak passed with explicit limits
 - Scope: OUP (`octos serve --stdio/--ws`), OctosCode, and local chat/ACP adapters
 - Octos base revision reviewed: `5ea987813de4fd2afdd1d78f2106ad2868f0d923`
 - OctosCode base revision reviewed: `60376702272c41e024ebcecfbd0a580759c12363`
 - Pi revision reviewed: `5cd93f688aaab89dbb6dfa4aca535f21796ae185`
 - Primary research reference: [FreeToken §3.1, Semantic-Aware State Caching](https://arxiv.org/html/2608.16157v1#S3.SS1)
+
+## Follow-up validation (2026-09-14)
+
+See [OUP/backend integration validation](oup-backend-validation-2026-09-14.md)
+for the cold-profile peer fix and repeatable process/bindings checks. Earlier
+acceptance entries below remain historical records.
 
 ## Decision summary
 

@@ -37120,6 +37120,118 @@ fn should_flush_old_window_and_oversized_new_fragment_in_order_when_task_switche
     assert!(!coalescer.has_pending());
 }
 
+/// Solo stdio profiles are persisted before a runtime exists, then bootstrapped
+/// into the dynamic map. Peer resources must survive both phases.
+#[tokio::test]
+async fn peer_resources_follow_cold_and_dynamic_profile_runtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
+    let profile = crate::profiles::UserProfile {
+        id: "lazy-peer".into(),
+        name: "Lazy peer".into(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    store.save(&profile).unwrap();
+    let data_dir = store.resolve_data_dir(&profile);
+    let state = Arc::new(AppState {
+        profile_store: Some(store),
+        ..AppState::empty_for_tests()
+    });
+    let prepared = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "cold-peer",
+            APPUI_METHOD_PEER_PREPARE,
+            json!({"profile_id": profile.id, "brief": "Review the workspace.",
+                   "title": "Cold peer", "cwd": tmp.path()}),
+        ),
+        None,
+    )
+    .await
+    .expect("staging only needs the persisted profile data root");
+    assert!(resolve_session_profile_runtime(&state, Some(&profile.id)).is_none());
+    let gather = RpcRequest::new(
+        "gather-lazy",
+        APPUI_METHOD_PEER_GATHER,
+        json!({"profile_id": profile.id}),
+    );
+    let cold = raw_peer_gather(&state, &gather, None).unwrap();
+    assert_eq!(cold["peers"].as_array().unwrap().len(), 1);
+    assert!(cold["peers"][0]["result"].is_null());
+
+    let runtime = make_m11e_profile_with_llm_and_sandbox(
+        &profile.id,
+        &data_dir,
+        Arc::new(M11EStubLlm),
+        octos_agent::SandboxConfig::default(),
+    )
+    .await;
+    let key = dynamic_profile_runtime_key(&state, &profile.id).unwrap();
+    struct RemoveDynamicRuntime(String);
+    impl Drop for RemoveDynamicRuntime {
+        fn drop(&mut self) {
+            dynamic_profile_runtimes().write().unwrap().remove(&self.0);
+        }
+    }
+    let _cleanup = RemoveDynamicRuntime(key.clone());
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap()
+        .insert(key, runtime);
+    assert!(state.profiles.is_empty(), "the startup map stays empty");
+    let peer = SessionKey::with_profile_topic(
+        &profile.id,
+        "local",
+        "lazy-peer",
+        prepared["topic"].as_str().unwrap(),
+    );
+    write_peer_result_if_peer_session(
+        &state,
+        &peer,
+        &TurnId::new(),
+        TurnTerminalOutcome::Completed,
+        "Durable lazy result",
+        12,
+        None,
+    );
+    let gathered = raw_peer_gather(&state, &gather, None).unwrap();
+    assert!(
+        gathered["peers"][0]["result"]
+            .as_str()
+            .unwrap()
+            .contains("Durable lazy result")
+    );
+    assert_eq!(
+        gathered["peers"][0]["turn_history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    session_workspaces().set(&profile.id, peer.clone(), tmp.path().to_path_buf());
+    let (_, snapshots) = snapshot_context_for_session(&state, None, &peer).unwrap();
+    assert!(
+        snapshots.is_some(),
+        "snapshot lookup must see the same dynamic runtime"
+    );
+    assert!(!peer_target_is_closed(&state, &peer));
+    let peer_dir = data_dir
+        .join("peers")
+        .join(prepared["slug"].as_str().unwrap());
+    std::fs::write(peer_dir.join("closed"), "closed").unwrap();
+    assert!(
+        peer_target_is_closed(&state, &peer),
+        "continuation gates must honor a dynamically loaded peer's close marker"
+    );
+}
+
 /// #1801 v2: fleet staging (`n`), the peer-result blackboard writer, and
 /// `peer/gather` — end to end on a real profile runtime + git repo.
 #[tokio::test]

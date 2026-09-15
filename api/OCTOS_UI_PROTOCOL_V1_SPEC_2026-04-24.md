@@ -500,14 +500,17 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
   creates a fenced git worktree on branch `peer/<slug>`; returns
   `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
-  resource staging — the client then opens the peer session and starts the
+  resource staging; a stored profile is sufficient even before its runtime
+  is bootstrapped. The client then opens the peer session and starts the
   kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
   adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
   scalar result fields mirror the first peer and `peers: [...]` carries all)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
-  optional `slugs` filter)
+  optional `slugs` filter; reading a stored profile does not bootstrap a
+  runtime. Once bootstrapped, peer staging, results and parent continuation
+  use the same active profile runtime as `session/open` and `turn/start`.)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
@@ -1260,6 +1263,12 @@ Clients must use that method list to enable or disable slash commands.
   backend can expose backend-owned context state for AppUI turns. Clients should
   render this state from `session/status/read` and must not infer it from chat
   rows or local transcript heuristics.
+- When `context.semantic_cache.v1` is also negotiated, `context_state` may
+  include `cache_epoch_id`, `last_cache_invalidation_reason`, `semantic_head_id`,
+  and `semantic_head_kind`. These are opaque, display-only diagnostics owned
+  by the backend; clients must not put them into model prompts or use them to
+  choose compaction boundaries. Missing fields do not establish a cache hit
+  or miss. See [UPCR-2026-029](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_029_SEMANTIC_CONTEXT_CACHE_DIAGNOSTICS.md).
 - `session/open`, `session/hydrate`, legacy REST-bridge
   `session/status.get`, and `turn/state/get` also include `context` and
   `context_state` when `context.lifecycle.v1` is available.
@@ -2095,6 +2104,29 @@ topic for client-side scoping.
 ### `turn/error`
 
 Marks the abnormal terminal event for a turn.
+
+Required fields are `session_id`, `turn_id`, `code`, and `message`; `topic` is
+optional. Provider output-limit termination uses `code: "output_truncated"`
+and remains a failure even when a real answer fragment was persisted.
+
+The additive optional fields from
+[UPCR-2026-030](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_030_INCOMPLETE_TURN_RESULTS.md)
+preserve evidence for failed turns:
+
+- `token_usage`: exact measured usage for this turn, using `EnvelopeTokenUsage`
+  counters. Unknown usage is omitted; this is never session-cumulative usage.
+- `partial_result.session_result`: a producer-authoritative `TurnSessionResult`
+  (`committed_seq`, `message_id`, optional `client_message_id`) for an actual
+  final fragment, or explicit null when there is no final answer. Absence of
+  `partial_result` means legacy/unknown identity and must not select the latest
+  pre-tool, prior-turn or background assistant row as a final fragment.
+
+The v2 `projection/envelope` representation is `turn_terminal` with
+`outcome: "errored"`, the existing `token_usage` field, and the partial marker
+at `error.data.partial_result`. Durable replay preserves the exact counters and
+object/null/absent identity distinction. The fields need no new capability;
+old errors without metadata retain their existing serialization. A second
+terminal cannot overwrite the first terminal's result or usage.
 
 ### `turn/spawn_complete`
 
