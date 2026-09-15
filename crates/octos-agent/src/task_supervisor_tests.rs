@@ -2472,6 +2472,89 @@ fn relaunch_unknown_task_returns_not_found() {
     assert_eq!(result, Err(TaskRelaunchError::NotFound));
 }
 
+/// #1595: the relaunch lineage must live on a first-class task field, not
+/// only inside the `runtime_detail` JSON of the spawn transition — the next
+/// `mark_runtime_state` call replaces that JSON wholesale, which would drop
+/// the edge before any later `task/updated` tick could surface it.
+#[test]
+fn relaunch_lineage_survives_runtime_detail_overwrite() {
+    let supervisor = TaskSupervisor::new();
+    let task_id = supervisor.register("run_pipeline", "call-relaunch-lineage", Some("session-L"));
+    supervisor.mark_running(&task_id);
+    supervisor.mark_failed(&task_id, "node 'design' failed".to_string());
+
+    let new_id = supervisor
+        .relaunch(&task_id, RelaunchOpts::default())
+        .expect("relaunch should succeed");
+
+    let spawned = supervisor.get_task(&new_id).expect("successor registered");
+    assert_eq!(
+        spawned.relaunched_from.as_deref(),
+        Some(task_id.as_str()),
+        "first-class lineage names the predecessor",
+    );
+    assert!(
+        spawned
+            .runtime_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(&task_id)),
+        "spawn transition still stamps the legacy runtime_detail JSON",
+    );
+
+    // The next state tick replaces runtime_detail; the first-class field
+    // must survive so every later `task/updated` frame carries the chain.
+    supervisor.mark_runtime_state(
+        &new_id,
+        TaskRuntimeState::ExecutingTool,
+        Some("executing".into()),
+    );
+    let running = supervisor
+        .get_task(&new_id)
+        .expect("successor still registered");
+    assert_eq!(running.runtime_detail.as_deref(), Some("executing"));
+    assert_eq!(
+        running.relaunched_from.as_deref(),
+        Some(task_id.as_str()),
+        "lineage survives the runtime_detail overwrite",
+    );
+
+    // A plain registration has no predecessor.
+    let plain_id = supervisor.register("run_pipeline", "call-plain", None);
+    assert_eq!(
+        supervisor.get_task(&plain_id).unwrap().relaunched_from,
+        None
+    );
+
+    // Chained relaunch (A -> B -> C): each successor names its IMMEDIATE
+    // predecessor, so a client can walk the chain edge by edge.
+    supervisor.mark_failed(&new_id, "second failure".to_string());
+    let third_id = supervisor
+        .relaunch(&new_id, RelaunchOpts::default())
+        .expect("relaunch of the successor succeeds");
+    let third = supervisor.get_task(&third_id).expect("second successor");
+    assert_eq!(
+        third.relaunched_from.as_deref(),
+        Some(new_id.as_str()),
+        "chained relaunch names the immediate predecessor, not the origin",
+    );
+
+    // The field's whole purpose is surviving transitions, so pin the
+    // persisted-snapshot round trip (same serde pattern as the sibling
+    // projection fields).
+    let snapshot = serde_json::to_string(&third).expect("serialize task snapshot");
+    let restored: BackgroundTask =
+        serde_json::from_str(&snapshot).expect("deserialize task snapshot");
+    assert_eq!(restored.relaunched_from, third.relaunched_from);
+    // ... and a pre-#1595 snapshot that never heard of the field still
+    // restores as None via `#[serde(default)]`.
+    let mut legacy: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&snapshot).expect("snapshot to map");
+    legacy.remove("relaunched_from");
+    let restored_legacy: BackgroundTask =
+        serde_json::from_value(serde_json::Value::Object(legacy)).expect("legacy snapshot");
+    assert_eq!(restored_legacy.relaunched_from, None);
+}
+
 #[test]
 fn relaunch_active_task_returns_still_active() {
     let supervisor = TaskSupervisor::new();
