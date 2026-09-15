@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use chrono::{DateTime, Utc};
 use octos_core::ui_protocol::{
     ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, PlanUpdatedEvent, ReasoningDeltaEvent,
     TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ToolCompletedEvent,
@@ -205,6 +206,11 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
                     .get("runtime_policy_stamp")
                     .cloned()
                     .filter(|v| !v.is_null()),
+                // #1595: thread the server clock and relaunch lineage from
+                // the producer JSON; absent on legacy emitters, which keep
+                // the pre-#1595 bare wire shape.
+                started_at: datetime_field(event, &["started_at"]),
+                relaunched_from: string_field(event, &["relaunched_from"]),
                 // C1 step 4: stamp the originating turn id (see map_task_updated).
                 turn_id: turn_id_field(event).or_else(|| Some(context.turn_id.clone())),
             },
@@ -287,6 +293,11 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
             .get("runtime_policy_stamp")
             .cloned()
             .filter(|v| !v.is_null()),
+        // #1595: thread the server clock and relaunch lineage from the
+        // producer JSON (`background_task_to_progress_json`); absent on
+        // legacy emitters, which keep the pre-#1595 bare wire shape.
+        started_at: datetime_field(event, &["started_at"]),
+        relaunched_from: string_field(event, &["relaunched_from"]),
         // C1 step 4: stamp the originating turn id so the client can
         // reconcile its per-turn "N running" task count when a sub-agent
         // reaches a terminal state. The source is the in-flight standalone
@@ -610,6 +621,15 @@ fn turn_id_field(value: &Value) -> Option<TurnId> {
         .map(TurnId)
 }
 
+/// #1595: extract an RFC 3339 server timestamp from the producer progress
+/// JSON when present. An absent or unparsable value maps to None so legacy
+/// emitters keep the pre-#1595 bare wire shape.
+fn datetime_field(value: &Value, keys: &[&str]) -> Option<DateTime<Utc>> {
+    string_field(value, keys)
+        .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
 fn ui_task_runtime_state(state: &str) -> Option<UiTaskRuntimeState> {
     match state {
         "pending" | "queued" | "spawned" => Some(UiTaskRuntimeState::Pending),
@@ -647,8 +667,18 @@ pub(crate) fn background_task_to_progress_json(task: &octos_agent::BackgroundTas
         "title": task.tool_name,
         "state": task.lifecycle_state(),
         "runtime_detail": stable_task_runtime_detail(task),
+        // #1595: server clock on every frame so clients order rows that
+        // share one `tool_call_id` (pipeline families, relaunch chains)
+        // by server time instead of client receipt time.
+        "started_at": task.started_at,
     });
     if let Value::Object(obj) = &mut payload {
+        if let Some(relaunched_from) = task.relaunched_from.as_ref() {
+            // #1595: first-class relaunch lineage — the runtime_detail
+            // JSON stamp only survives until the next mark_runtime_state,
+            // this field rides every frame.
+            obj.insert("relaunched_from".into(), json!(relaunched_from));
+        }
         if let Some(source) = task.source.as_ref() {
             obj.insert("source".into(), json!(source));
         }
@@ -899,8 +929,78 @@ mod tests {
         );
         assert_eq!(updated.state, UiTaskRuntimeState::Running);
         assert_eq!(updated.runtime_detail.as_deref(), Some("task started"));
+        // #1595: a legacy producer with no clock / lineage fields maps to
+        // None so the wire shape stays bare.
+        assert_eq!(updated.started_at, None);
+        assert_eq!(updated.relaunched_from, None);
         assert_eq!(mapping.status, None);
         assert_eq!(mapping.warning, None);
+    }
+
+    /// #1595: the mapper threads a producer-supplied RFC 3339 `started_at`
+    /// and `relaunched_from` onto the wire event, and a malformed timestamp
+    /// degrades to absent instead of failing the mapping.
+    #[test]
+    fn task_updated_maps_started_at_and_relaunch_lineage() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-0000000000bb",
+                "state": "running",
+                "started_at": "2026-09-15T08:23:01Z",
+                "relaunched_from": "01900000-0000-7000-8000-0000000000aa",
+            }),
+        );
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert_eq!(
+            updated.started_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-15T08:23:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+        );
+        assert_eq!(
+            updated.relaunched_from.as_deref(),
+            Some("01900000-0000-7000-8000-0000000000aa"),
+        );
+
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-0000000000bb",
+                "state": "running",
+                "started_at": "not-a-timestamp",
+            }),
+        );
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("malformed started_at must not fail the mapping");
+        };
+        assert_eq!(updated.started_at, None);
+
+        // A `task_started` producer that supplies the fields gets them
+        // threaded the same way.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_started",
+                "task_id": "01900000-0000-7000-8000-0000000000cc",
+                "started_at": "2026-09-15T08:23:01Z",
+                "relaunched_from": "01900000-0000-7000-8000-0000000000aa",
+            }),
+        );
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert!(updated.started_at.is_some());
+        assert_eq!(
+            updated.relaunched_from.as_deref(),
+            Some("01900000-0000-7000-8000-0000000000aa"),
+        );
     }
 
     #[test]
@@ -1433,6 +1533,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let event = background_task_to_progress_json(&task);
@@ -1482,6 +1583,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let notification = replay_task_updated_notification(&session_id, &task)
@@ -1503,6 +1605,50 @@ mod tests {
         assert_eq!(
             updated.turn_id, None,
             "a session-open replay snapshot must not carry an originating turn_id",
+        );
+    }
+
+    /// #1595: a `task/updated` frame for a relaunched task must carry the
+    /// server-clock `started_at` and the first-class `relaunched_from`
+    /// lineage edge so clients can order relaunch chains by the server's
+    /// timestamps instead of receipt-time heuristics. Drives the production
+    /// path end to end: `TaskSupervisor::relaunch` -> `get_task` ->
+    /// `background_task_to_progress_json` -> `map_progress_json` -> wire
+    /// params.
+    #[test]
+    fn replay_task_updated_carries_started_at_and_relaunch_lineage() {
+        let session_id = SessionKey("local:demo".into());
+        let supervisor = octos_agent::TaskSupervisor::new();
+        let original_id = supervisor.register("run_pipeline", "call-chain", Some("local:demo"));
+        supervisor.mark_running(&original_id);
+        supervisor.mark_failed(&original_id, "node 'design' failed".to_string());
+        let successor_id = supervisor
+            .relaunch(&original_id, octos_agent::RelaunchOpts::default())
+            .expect("relaunch of a failed task succeeds");
+        let successor = supervisor
+            .get_task(&successor_id)
+            .expect("successor task registered");
+
+        let notification = replay_task_updated_notification(&session_id, &successor)
+            .expect("spawned successor should map to a task/updated notification");
+        let UiNotification::TaskUpdated(updated) = notification else {
+            panic!("expected task updated notification");
+        };
+        let params = serde_json::to_value(&updated).expect("serialize event params");
+        assert_eq!(
+            params["relaunched_from"].as_str(),
+            Some(original_id.as_str()),
+            "task/updated must name the relaunch predecessor",
+        );
+        let started_at = params["started_at"].as_str().unwrap_or_else(|| {
+            panic!("task/updated must carry the server started_at; params: {params}")
+        });
+        let parsed_started_at = chrono::DateTime::parse_from_rfc3339(started_at)
+            .expect("wire started_at is RFC 3339")
+            .with_timezone(&Utc);
+        assert_eq!(
+            parsed_started_at, successor.started_at,
+            "wire started_at must be the supervisor's server clock",
         );
     }
 
@@ -1546,6 +1692,7 @@ mod tests {
             runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let event = background_task_to_progress_json(&task);
@@ -1592,6 +1739,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let bare_event = background_task_to_progress_json(&bare);
@@ -1601,5 +1749,13 @@ mod tests {
         assert!(!obj.contains_key("summary"));
         assert!(!obj.contains_key("artifact_count"));
         assert!(!obj.contains_key("runtime_policy_stamp"));
+        // #1595: `started_at` is a required supervisor field so the
+        // producer always emits it; `relaunched_from` follows the same
+        // absent-means-absent rule as the projection fields.
+        assert!(
+            obj.contains_key("started_at"),
+            "server clock rides every producer frame",
+        );
+        assert!(!obj.contains_key("relaunched_from"));
     }
 }

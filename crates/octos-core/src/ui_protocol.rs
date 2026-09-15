@@ -5577,6 +5577,24 @@ pub struct TaskUpdatedEvent {
     /// `BackgroundTask::runtime_policy_stamp`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<Value>,
+    /// #1595: server clock timestamp of task registration (ISO-8601,
+    /// same chrono RFC 3339 wire form as the `task/list` projection
+    /// field of the same name). Clients ranking rows that share one
+    /// `tool_call_id` (pipeline families, relaunch chains) must order
+    /// by this server timestamp — rows hydrated live otherwise only
+    /// have client receipt-time, which a reconnect replay can deliver
+    /// out of order. Mirrors `BackgroundTask::started_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// #1595: first-class relaunch lineage — the predecessor task id
+    /// when this task was created by `TaskSupervisor::relaunch`.
+    /// Surfacing it as a dedicated field (instead of the JSON stamped
+    /// into `runtime_detail` on the spawn transition, which the next
+    /// `mark_runtime_state` overwrite drops) lets clients resolve the
+    /// chain explicitly on every frame. Mirrors
+    /// `BackgroundTask::relaunched_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunched_from: Option<String>,
     /// C1 step 4: the turn that originated this task. Lets the client
     /// reconcile its per-turn "N running" task count when a sub-agent
     /// fails/recovers/errors/is-orphaned — without it the count stayed

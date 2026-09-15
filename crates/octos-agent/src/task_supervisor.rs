@@ -395,6 +395,16 @@ pub struct BackgroundTask {
     /// unchanged; `None` preserves the legacy derivation bit-for-bit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
+    /// #1595: first-class relaunch lineage — the predecessor task id when
+    /// this task was created by [`TaskSupervisor::relaunch`]. The relaunch
+    /// path also stamps the edge into `runtime_detail` JSON for the spawn
+    /// transition, but the next `mark_runtime_state` overwrite drops that
+    /// JSON; this dedicated field survives every later transition, so
+    /// `task/updated` frames can carry the chain explicitly on every tick.
+    /// `#[serde(default)]` so pre-existing persisted snapshots deserialize
+    /// as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunched_from: Option<String>,
 }
 
 impl BackgroundTask {
@@ -2077,6 +2087,22 @@ impl TaskSupervisor {
             "from_node": opts.from_node,
         })
         .to_string();
+        // #1595: also record the edge on the durable first-class field
+        // BEFORE the runtime-state stamp below — the spawn snapshot that
+        // `mark_runtime_state` persists then carries the lineage, and the
+        // field survives the `runtime_detail` overwrite on every later
+        // transition. Note the register above already persisted a
+        // lineage-less snapshot; that placeholder is superseded here by a
+        // strictly-newer `updated_at` (so `task_snapshot_advances` lets
+        // this snapshot win on restore), and the successor's first
+        // UI-visible frame is the `mark_runtime_state` emit below, which
+        // carries the field.
+        {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(&new_task_id) {
+                task.relaunched_from = Some(task_id.to_string());
+            }
+        }
         self.mark_runtime_state(&new_task_id, TaskRuntimeState::Spawned, Some(detail));
 
         let request = RelaunchRequest {
@@ -2686,6 +2712,9 @@ impl TaskSupervisor {
             workspace_root: workspace_scope
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
+            // Set by `relaunch` post-registration when the task is a
+            // relaunch successor; plain registrations have no predecessor.
+            relaunched_from: None,
         };
         // Read configuration before locking the task table: enable_persistence
         // may consult the task table while holding the configuration lock.
