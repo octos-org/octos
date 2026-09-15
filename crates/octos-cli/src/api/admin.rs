@@ -277,6 +277,13 @@ pub async fn get_profile(
 /// declared `VERTEX_SA_JSON` name — so a private key pasted under a custom env
 /// var (e.g. a dashboard "Custom" provider deriving `VERTEX_API_KEY`) can't slip
 /// past into plaintext config.
+///
+/// Relocation is per key and short-circuits on the first failure: keys
+/// already relocated stay in the keychain when a later key fails. Those
+/// entries are scoped per profile id, so they cannot leak across accounts,
+/// and a same-id retry (after the caller's profile rollback) overwrites
+/// them — recording the semantics rather than adding a cleanup pass,
+/// matching `delete_profile`'s keychain behavior (#2316).
 pub(crate) fn relocate_keychain_backed_secrets(
     env_vars: &mut std::collections::HashMap<String, String>,
     profile_id: &str,
@@ -1858,13 +1865,29 @@ pub(crate) fn validate_channel_credentials(
 pub(crate) type RelocateSecretsHook =
     fn(&mut std::collections::HashMap<String, String>, &str) -> Result<(), (StatusCode, String)>;
 
+/// Roll back a just-created sub-account profile after a post-persist
+/// creation step failed: the store saved the profile before these steps ran,
+/// so deleting its registry record keeps the id retryable instead of
+/// stranding it behind "already exists" when the same request is retried
+/// (#1472, #2316). A rollback failure is logged, never reported over the
+/// original error.
+pub(crate) fn rollback_sub_account(store: &ProfileStore, sub_id: &str) {
+    if let Err(rollback) = store.delete(sub_id) {
+        tracing::error!(
+            profile = %sub_id,
+            error = %rollback,
+            "failed to roll back sub-account after creation failure"
+        );
+    }
+}
+
 /// Apply freshly supplied sub-account env vars, relocating keychain-backed
 /// secrets (e.g. the Vertex SA JSON) into the OS keychain before the save so a
 /// sub-account never writes a private key to plaintext config. The store has
-/// already persisted the fresh profile by the time this runs, so a relocation
-/// failure rolls the profile back — otherwise the API would report "creation
-/// failed" while leaving a sub-account whose id can never be retried ("already
-/// exists", #1472).
+/// already persisted the fresh profile by the time this runs, so a failure —
+/// relocation or the final save — rolls the profile back: otherwise the API
+/// would report "creation failed" while leaving a sub-account whose id can
+/// never be retried ("already exists", #1472, #2316).
 pub(crate) fn apply_sub_account_env_vars(
     store: &ProfileStore,
     sub: &mut UserProfile,
@@ -1875,22 +1898,65 @@ pub(crate) fn apply_sub_account_env_vars(
     let sub_id = sub.id.clone();
     if let Err(e) = relocate(&mut sub.config.env_vars, &sub_id) {
         // Roll the just-created profile back: the sub-account was saved
-        // keychain-less minutes ago and nothing else references it yet, so
+        // keychain-less moments ago and nothing else references it yet, so
         // removing it restores the pre-request state instead of stranding a
         // half-configured id behind "already exists".
-        if let Err(rollback) = store.delete(&sub.id) {
-            tracing::error!(
-                profile = %sub.id,
-                error = %rollback,
-                "failed to roll back sub-account after secret relocation failure"
-            );
-        }
+        rollback_sub_account(store, &sub.id);
         return Err(e);
     }
     sub.updated_at = Utc::now();
-    store
-        .save(sub)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    if let Err(e) = store.save(sub) {
+        // Same stranded-id shape: the env-less profile is already on disk,
+        // so a failed save must not leave it behind either.
+        rollback_sub_account(store, &sub.id);
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+    Ok(())
+}
+
+/// Create the User entry that lets a fresh sub-account log in via OTP. Runs
+/// after the profile store has persisted the sub-account, so every failure
+/// (invalid email, already-registered email, user-store save) rolls the
+/// profile back — otherwise the request reports an error while the
+/// sub-account id stays on disk, unretryable behind "already exists" (#2316).
+pub(crate) fn create_sub_account_user_entry(
+    state: &AppState,
+    store: &ProfileStore,
+    sub: &UserProfile,
+    email: &str,
+) -> Result<(), (StatusCode, String)> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return Ok(());
+    }
+    let outcome = (|| -> Result<(), (StatusCode, String)> {
+        validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        if let Some(user_store) = state.user_store.as_ref() {
+            // Check if email is already taken
+            if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Email '{email}' is already registered to another account"),
+                ));
+            }
+            let user = crate::user_store::User {
+                id: sub.id.clone(),
+                email: email.clone(),
+                name: sub.name.clone(),
+                role: crate::user_store::UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            };
+            user_store
+                .save(&user)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        rollback_sub_account(store, &sub.id);
+    }
+    outcome
 }
 
 /// POST /api/admin/profiles/:id/accounts — Create a sub-account.
@@ -1936,30 +2002,7 @@ pub async fn create_sub_account(
 
     // Create a User entry so the sub-account can log in via OTP
     if let Some(email) = &req.email {
-        let email = email.trim().to_lowercase();
-        if !email.is_empty() {
-            validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            if let Some(user_store) = state.user_store.as_ref() {
-                // Check if email is already taken
-                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!("Email '{email}' is already registered to another account"),
-                    ));
-                }
-                let user = crate::user_store::User {
-                    id: sub.id.clone(),
-                    email,
-                    name: sub.name.clone(),
-                    role: crate::user_store::UserRole::User,
-                    created_at: Utc::now(),
-                    last_login_at: None,
-                };
-                user_store
-                    .save(&user)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-        }
+        create_sub_account_user_entry(&state, store, &sub, email)?;
     }
 
     let status = pm.status(&sub.id).await;
@@ -5746,6 +5789,49 @@ mod tests {
             .expect("retrying the same id must succeed after the rollback");
     }
 
+    // #2316: the final `store.save` failing AFTER a successful relocation is
+    // the same stranded-id shape — the env-less profile persisted by the
+    // caller must be rolled back so the id stays retryable. A directory at
+    // the temp file's path makes `fs::write` fail on every platform (Unix
+    // EISDIR / Windows ERROR_ACCESS_DENIED), while the rollback's delete of
+    // the registry JSON stays functional.
+    #[test]
+    fn should_roll_back_fresh_sub_account_when_final_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+        let blocker = dir
+            .path()
+            .join("profiles")
+            .join(format!("{sub_id}.json.tmp"));
+        std::fs::create_dir(&blocker).unwrap();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([("SOME_TOKEN".to_string(), "x".to_string())]),
+            |_env_vars, _profile_id| Ok(()),
+        );
+
+        assert_eq!(res.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            store.get(&sub_id).unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .expect("retrying the same id must succeed after the rollback");
+    }
+
     // The happy path is unchanged: benign env vars (nothing needing
     // relocation) pass through the production relocate hook untouched and are
     // persisted on the sub-account.
@@ -5818,6 +5904,166 @@ mod tests {
         assert_eq!(
             saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
             Some("production")
+        );
+    }
+
+    // #2316 test fixture: an AppState wired like the admin create handler
+    // needs it — profile store, process manager, and a user store.
+    fn sub_account_state(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Arc<AppState>,
+        Arc<ProfileStore>,
+        Arc<crate::user_store::UserStore>,
+    ) {
+        use crate::api::AppState;
+        use std::sync::Arc;
+
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let user_store = Arc::new(crate::user_store::UserStore::open(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store.clone()),
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            user_store: Some(user_store.clone()),
+            ..AppState::empty_for_tests()
+        });
+        (state, profile_store, user_store)
+    }
+
+    fn sub_account_request(email: Option<&str>) -> CreateSubAccountRequest {
+        CreateSubAccountRequest {
+            sub_account_id: "sub1".into(),
+            name: "Sub".into(),
+            public_subdomain: "sub1".into(),
+            email: email.map(str::to_string),
+            channels: vec![],
+            gateway: None,
+            env_vars: std::collections::HashMap::new(),
+        }
+    }
+
+    // #2316: the email-conflict 409 fires after the profile store has
+    // persisted the fresh sub-account — the failed creation must roll the
+    // profile back so retrying the same id doesn't hit "already exists".
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_email_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+        user_store
+            .save(&crate::user_store::User {
+                id: "other".into(),
+                email: "taken@example.com".into(),
+                name: "Other".into(),
+                role: crate::user_store::UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("taken@example.com"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("fresh@example.com"))),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            user_store.get("parent--sub1").unwrap().is_some(),
+            "the user entry lands on the successful retry"
+        );
+    }
+
+    // #2316: an invalid email (BAD_REQUEST) is a post-persist failure too —
+    // same rollback, same retryable id.
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_email_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, _user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("not-an-email"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(None)),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // #2316: a user-store save failure (500) is the third post-persist
+    // failure shape. Blocking the user file's path with a directory makes
+    // the atomic rename fail deterministically while the profile store
+    // stays writable, so the rollback can still delete the sub-account.
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_user_store_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+        let blocker = dir.path().join("users").join("parent--sub1.json");
+        std::fs::create_dir(&blocker).unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("new@example.com"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        std::fs::remove_dir(&blocker).unwrap();
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("new@example.com"))),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            user_store.get("parent--sub1").unwrap().is_some(),
+            "the user entry lands once the save blocker is gone"
         );
     }
 

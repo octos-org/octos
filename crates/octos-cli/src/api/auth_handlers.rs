@@ -3662,29 +3662,7 @@ pub async fn create_my_sub_account(
     }
 
     if let Some(email) = &req.email {
-        let email = email.trim().to_lowercase();
-        if !email.is_empty() {
-            super::admin::validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            if let Some(user_store) = state.user_store.as_ref() {
-                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!("Email '{email}' is already registered to another account"),
-                    ));
-                }
-                let user = crate::user_store::User {
-                    id: sub.id.clone(),
-                    email,
-                    name: sub.name.clone(),
-                    role: crate::user_store::UserRole::User,
-                    created_at: chrono::Utc::now(),
-                    last_login_at: None,
-                };
-                user_store
-                    .save(&user)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-        }
+        super::admin::create_sub_account_user_entry(&state, ps, &sub, email)?;
     }
 
     let status = pm.status(&sub.id).await;
@@ -6373,6 +6351,60 @@ mod tests {
         assert_eq!(
             saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
             Some("production")
+        );
+    }
+
+    // #2316 wiring: the self-service create path shares the rollback helper —
+    // an email conflict after the profile store has persisted rolls the
+    // fresh sub-account back, so the same id stays retryable.
+    #[tokio::test]
+    async fn should_roll_back_my_sub_account_when_email_conflicts() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        user_store
+            .save(&User {
+                id: "other".into(),
+                email: "taken@example.com".into(),
+                name: "Other".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            axum::Json(crate::api::admin::CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: Some("taken@example.com".into()),
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::new(),
+            }),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            profile_store.get("tenant--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
         );
     }
 
