@@ -6,7 +6,7 @@ on:
       ref:
         description: 'Branch or tag to build'
         required: false
-        default: 'fix/pipeline-stream-errors'
+        default: 'main'
 
 permissions:
   contents: read

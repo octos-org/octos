@@ -233,27 +233,6 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
     env
 }
 
-fn discover_ominix_url() -> Option<String> {
-    std::env::var("OMINIX_API_URL")
-        .ok()
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let home = std::env::var_os("HOME")?;
-            for dir in [".ominix", ".OminiX"] {
-                let discovery = std::path::Path::new(&home).join(dir).join("api_url");
-                if let Some(url) = std::fs::read_to_string(discovery)
-                    .ok()
-                    .map(|s| s.trim().trim_end_matches('/').to_string())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(url);
-                }
-            }
-            None
-        })
-}
-
 fn push_runtime_plugin_env(
     plugin_env: &mut Vec<(String, String)>,
     data_dir: &std::path::Path,
@@ -807,7 +786,7 @@ impl ProfileActorFactoryBuilder {
                 &profile_data_dir,
                 &self.project_dir,
                 profile_id,
-                discover_ominix_url().as_deref(),
+                crate::skills_scope::discover_ominix_url().as_deref(),
             );
             let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&profile_data_dir);
             if !plugin_dirs.is_empty() {
