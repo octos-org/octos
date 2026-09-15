@@ -118,7 +118,13 @@ pub fn build_account_plugin_dirs(data_dir: &Path) -> Vec<PathBuf> {
 
 /// Resolve the ominix-api URL the runtime should hand to skills as
 /// `OMINIX_API_URL`. Prefers the explicit env override, falls back to
-/// the `~/.ominix/api_url` discovery file dropped by the installer.
+/// the `<ominix home>/.ominix/api_url` discovery file dropped by the
+/// installer.
+///
+/// The OMiniX home resolution mirrors the runtime installer
+/// (`api::ominix_runtime`): `OCTOS_OMINIX_HOME` relocates the whole
+/// OMiniX home (including the discovery file), falling back to `HOME`
+/// and then the OS home directory.
 ///
 /// Used by both `gateway` and `serve` plugin loaders so dashboard-
 /// installed skills (`mofa-fm`, etc.) can reach the local inference
@@ -129,19 +135,26 @@ pub(crate) fn discover_ominix_url() -> Option<String> {
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            let home = std::env::var_os("HOME")?;
-            for dir in [".ominix", ".OminiX"] {
-                let discovery = std::path::Path::new(&home).join(dir).join("api_url");
-                if let Some(url) = std::fs::read_to_string(discovery)
-                    .ok()
-                    .map(|s| s.trim().trim_end_matches('/').to_string())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(url);
-                }
-            }
-            None
+            let home = std::env::var_os("OCTOS_OMINIX_HOME")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(std::path::PathBuf::from)
+                .or_else(dirs::home_dir)?;
+            discover_ominix_url_under(&home)
         })
+}
+
+fn discover_ominix_url_under(home: &std::path::Path) -> Option<String> {
+    for dir in [".ominix", ".OminiX"] {
+        let discovery = home.join(dir).join("api_url");
+        if let Some(url) = std::fs::read_to_string(discovery)
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(url);
+        }
+    }
+    None
 }
 
 /// Resolve the ASR endpoint independently from OminiX. `ASR_API_URL` is an
@@ -499,5 +512,102 @@ mod tests {
         assert!(keys.contains("OCTOS_DATA_DIR"));
         assert!(keys.contains("OCTOS_HOME"));
         assert!(keys.contains("OCTOS_VOICE_DIR"));
+    }
+
+    #[test]
+    fn discover_ominix_url_under_reads_api_url_from_either_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(discover_ominix_url_under(dir.path()), None);
+
+        let lower = dir.path().join(".ominix");
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::write(lower.join("api_url"), " http://127.0.0.1:8093/\n").unwrap();
+        assert_eq!(
+            discover_ominix_url_under(dir.path()).as_deref(),
+            Some("http://127.0.0.1:8093")
+        );
+
+        // The legacy capitalized directory is honored too; the lowercase
+        // one takes precedence when both exist.
+        std::fs::remove_file(lower.join("api_url")).unwrap();
+        let upper = dir.path().join(".OminiX");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::write(upper.join("api_url"), "http://127.0.0.1:8094").unwrap();
+        assert_eq!(
+            discover_ominix_url_under(dir.path()).as_deref(),
+            Some("http://127.0.0.1:8094")
+        );
+    }
+
+    /// A custom `OCTOS_OMINIX_HOME` relocates the installer's discovery
+    /// file; discovery must prefer it over the default `$HOME` copy.
+    #[test]
+    #[allow(unsafe_code)]
+    fn discover_ominix_url_prefers_custom_ominix_home() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let custom = tempfile::tempdir().unwrap();
+        let default_home = tempfile::tempdir().unwrap();
+        for (home, url) in [
+            (custom.path(), "http://127.0.0.1:8093"),
+            (default_home.path(), "http://127.0.0.1:8081"),
+        ] {
+            let dir = home.join(".ominix");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("api_url"), url).unwrap();
+        }
+
+        let keys = ["OMINIX_API_URL", "OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::remove_var("OMINIX_API_URL");
+            std::env::set_var("OCTOS_OMINIX_HOME", custom.path());
+            std::env::set_var("HOME", default_home.path());
+        }
+        let discovered = discover_ominix_url();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        assert_eq!(discovered.as_deref(), Some("http://127.0.0.1:8093"));
+    }
+
+    /// Without `OCTOS_OMINIX_HOME`, discovery falls back to `$HOME`
+    /// (the pre-custom-home behavior every default install relies on).
+    #[test]
+    #[allow(unsafe_code)]
+    fn discover_ominix_url_falls_back_to_home() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let default_home = tempfile::tempdir().unwrap();
+        let dir = default_home.path().join(".ominix");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("api_url"), "http://127.0.0.1:8081").unwrap();
+
+        let keys = ["OMINIX_API_URL", "OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::remove_var("OMINIX_API_URL");
+            std::env::remove_var("OCTOS_OMINIX_HOME");
+            std::env::set_var("HOME", default_home.path());
+        }
+        let discovered = discover_ominix_url();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        assert_eq!(discovered.as_deref(), Some("http://127.0.0.1:8081"));
     }
 }
