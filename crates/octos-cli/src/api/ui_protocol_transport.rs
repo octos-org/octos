@@ -2852,9 +2852,7 @@ fn register_peer_wire_session(state: &Arc<AppState>, session_id: &SessionKey) {
     // close is never migrated onto the reopened wire. Belt-and-suspenders — the
     // continuation-drain freshness gates also refuse a closed target — but this
     // stops the re-home at the source.
-    if state
-        .profiles
-        .get(profile_id)
+    if resolve_session_profile_runtime(state, Some(profile_id))
         .is_some_and(|runtime| peer_is_closed(&runtime.data_dir.join("peers"), slug))
     {
         return;
@@ -12510,12 +12508,14 @@ fn skill_action_job_record_to_value(job: SkillActionJobRecord) -> Result<Value, 
     })
 }
 
-fn skill_action_profile_data_dir(
+/// Resolve resource storage without bootstrapping a model. A dynamically
+/// loaded or reloaded runtime takes precedence over the startup map.
+fn resolve_profile_data_dir(
     state: &AppState,
     active_profile_id: Option<&str>,
 ) -> Result<(String, PathBuf), RpcError> {
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
-    if let Some(runtime) = state.profiles.get(&profile_id) {
+    if let Some(runtime) = resolve_session_profile_runtime(state, Some(&profile_id)) {
         return Ok((profile_id, runtime.data_dir.clone()));
     }
     let store = profile_store(state)?;
@@ -12573,7 +12573,7 @@ async fn load_skill_action_job_view(
             ))
         }
         Err(_) => {
-            let (profile_id, store_root) = skill_action_profile_data_dir(state, active_profile_id)?;
+            let (profile_id, store_root) = resolve_profile_data_dir(state, active_profile_id)?;
             // #2056 round 3 (R4) — `store_root` IS the profile data dir, so the
             // throwaway supervisor inside can wire the goal-task-row observers
             // and reconcile like every other restore path.
@@ -13910,11 +13910,13 @@ fn snapshot_context_for_session(
     session_id: &SessionKey,
 ) -> Result<(bool, Option<octos_agent::SnapshotManager>), RpcError> {
     let profile_id = raw_scoped_llm_profile_id(None, Some(session_id), connection_profile_id)?;
-    let runtime = state.profiles.get(&profile_id);
+    let runtime = resolve_session_profile_runtime(state, Some(&profile_id));
     let enabled = runtime
+        .as_ref()
         .and_then(|rt| rt.snapshots.as_ref())
         .is_some_and(|cfg| cfg.enabled);
     let keep_last = runtime
+        .as_ref()
         .and_then(|rt| rt.snapshots.as_ref())
         .map(|cfg| cfg.keep_last)
         .unwrap_or(octos_agent::DEFAULT_SNAPSHOT_KEEP_LAST);
@@ -14063,11 +14065,7 @@ async fn raw_peer_prepare(
         params.session_id.as_ref(),
         connection_profile_id,
     )?;
-    let Some(runtime) = state.profiles.get(&profile_id) else {
-        return Err(RpcError::invalid_params(format!(
-            "profile {profile_id} has no bootstrapped runtime"
-        )));
-    };
+    let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
 
     // Workspace root: explicit cwd (validated like a session open) beats the
     // calling session's root. A worktree needs SOME root; a plain peer does
@@ -14115,7 +14113,7 @@ async fn raw_peer_prepare(
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-    let peers_root = runtime.data_dir.join("peers");
+    let peers_root = data_dir.join("peers");
     let n = params.n.unwrap_or(1);
     if !(1..=8).contains(&n) {
         return Err(RpcError::invalid_params("n must be between 1 and 8"));
@@ -14517,7 +14515,7 @@ fn wake_master_on_peer_awaiting_input(
     let Some((profile_id, _slug)) = peer_slug_and_profile(peer_session) else {
         return;
     };
-    let Some(runtime) = state.profiles.get(profile_id) else {
+    let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) else {
         return;
     };
     wake_master_and_record_park_escalation(
@@ -15285,7 +15283,7 @@ fn write_peer_result_if_peer_session(
     let Some(profile_id) = session_id.profile_id() else {
         return;
     };
-    let Some(runtime) = state.profiles.get(profile_id) else {
+    let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) else {
         return;
     };
     // Only write under a REAL staged (non-symlink, safe-slug, brief.md) dir so
@@ -15895,12 +15893,8 @@ fn raw_peer_gather(
         params.session_id.as_ref(),
         connection_profile_id,
     )?;
-    let Some(runtime) = state.profiles.get(&profile_id) else {
-        return Err(RpcError::invalid_params(format!(
-            "profile {profile_id} has no bootstrapped runtime"
-        )));
-    };
-    let peers_root = runtime.data_dir.join("peers");
+    let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
+    let peers_root = data_dir.join("peers");
     let peers: Vec<Value> =
         read_peer_blackboard_with_profile(&peers_root, params.slugs.as_deref(), &profile_id)
             .into_iter()
@@ -17033,7 +17027,7 @@ async fn maybe_enqueue_peer_fleet_synthesis(state: &Arc<AppState>, peer_session:
     let Some((profile_id, finished_slug)) = peer_slug_and_profile(peer_session) else {
         return;
     };
-    let Some(runtime) = state.profiles.get(profile_id) else {
+    let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) else {
         return;
     };
     let peers_root = runtime.data_dir.join("peers");
@@ -17087,7 +17081,7 @@ async fn maybe_enqueue_peer_fleet_synthesis_for_master(
     // bare: deriving the profile only from the key stranded unread peer work
     // whenever the last peer landed while that master was busy.
     let profile_id = runtime_profile_id;
-    let Some(runtime) = state.profiles.get(profile_id) else {
+    let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) else {
         return;
     };
     let peers_root = runtime.data_dir.join("peers");
@@ -20809,8 +20803,9 @@ fn workspace_policy_probe(root: Option<&Path>) -> Value {
     }
 }
 
-/// Resolve the `ProfileRuntime` for the routed session, mirroring
-/// `chat_sync`'s `state.profiles.get(profile_id)` lookup.
+/// Resolve the active `ProfileRuntime` for the routed session. Dynamically
+/// bootstrapped or reloaded runtimes override the immutable startup map, so
+/// execution, peer resources and snapshot state follow the same profile.
 ///
 /// `active_profile_id` is the profile id `validate_session_scope`
 /// produced for this session/open. It may be `None` when the legacy
@@ -22612,7 +22607,9 @@ async fn peer_synthesis_was_consumed(
     {
         return false;
     }
-    let Some(runtime) = state.profiles.get(continuation.profile_id.as_str()) else {
+    let Some(runtime) =
+        resolve_session_profile_runtime(state, Some(continuation.profile_id.as_str()))
+    else {
         return false;
     };
     let root = runtime.data_dir.join("peers");
@@ -23132,9 +23129,7 @@ fn peer_target_is_closed(state: &Arc<AppState>, wire_key: &SessionKey) -> bool {
     let Some((profile_id, slug)) = peer_slug_and_profile(wire_key) else {
         return false;
     };
-    state
-        .profiles
-        .get(profile_id)
+    resolve_session_profile_runtime(state, Some(profile_id))
         .is_some_and(|runtime| peer_is_closed(&runtime.data_dir.join("peers"), slug))
 }
 
@@ -29635,6 +29630,17 @@ async fn run_m9_fixture_turn(
                     )),
                 );
             }
+            // UPCR-2026-023: drain pending structured user-questions for the
+            // interrupted fixture turn, mirroring the live interrupt path —
+            // the blocked `ask_user_question` tool unblocks (Cancelled)
+            // instead of leaking until its waiter guard drops with
+            // `waiter_dropped`, and a reconnect never re-shows a question for
+            // the dead turn.
+            contracts.user_questions.cancel_pending_for_turn(
+                &session_id,
+                &turn_id,
+                approval_cancelled_reasons::TURN_INTERRUPTED,
+            );
             try_emit_terminal(
                 &turn_state,
                 TerminalReason::Interrupted,

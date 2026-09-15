@@ -434,7 +434,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -445,6 +445,9 @@ jobs:
 
       - name: Test octos-cli (integration, excluding serve process e2e)
         run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm
+
+      - name: OUP runtime and C/Python contracts
+        run: ./scripts/milestone-ci.sh oup-runtime
 
       # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe) and
       # SIGTERM gateway-reap e2e (serve_sigterm). These spawn real
@@ -532,6 +535,18 @@ jobs:
       # it here where the build cache is already warm.
       - name: Smart-home skill tests
         run: cargo test -p smart-home
+
+      - name: Minimal OUP frontend contract
+        run: ./scripts/milestone-ci.sh oup-minimal
+
+      - name: Retain OUP runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oup-runtime-evidence
+          path: target/oup-functional/
+          retention-days: 14
+          if-no-files-found: error
 
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`

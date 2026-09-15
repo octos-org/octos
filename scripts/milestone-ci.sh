@@ -15,6 +15,8 @@ Canonical milestone CI suites:
   dashboard               dashboard install/typecheck/build + embedded asset freshness
   swarm-app               swarm-app install/typecheck/build/test + embedded asset freshness
   hosted-fast             fmt + clippy + workspace test + milestone regressions
+  oup-runtime             real chat/ACP/OUP subprocesses + C/Python ABI contracts
+  oup-minimal             minimal-feature CLI tests and strict lint
   workspace-all-features  workspace/all-features build + test compilation + tests
   release-bundle          release binary + skill crate build
 
@@ -98,6 +100,23 @@ run_workspace_all_features() {
   cargo test --workspace
 }
 
+run_oup_runtime() {
+  cargo build --locked -p octos-cli -p octos-ffi -p octos-uniffi
+  local build_dir="${CARGO_TARGET_DIR:-target}/debug"
+  OCTOS_BIN="$build_dir/octos" python3 scripts/tests/test-oup-runtime.py
+  python3 scripts/check-oup-bindings.py --library-dir "$build_dir"
+}
+
+run_oup_minimal() {
+  # These server e2e bootstrap API-enabled binaries into separate target dirs.
+  # CI runs them in its dedicated API step; still compile every minimal target.
+  cargo test --locked -p octos-cli --no-default-features --all-targets -- \
+    --skip serve_broken_pipe --skip serve_sigterm
+  cargo clippy --locked -p octos-cli --no-default-features --all-targets -- -D warnings
+  cargo build --locked -p octos-cli --no-default-features
+  OCTOS_BIN="${CARGO_TARGET_DIR:-target}/debug/octos" python3 scripts/tests/test-oup-runtime.py --minimal
+}
+
 run_release_bundle() {
   cargo build --release -p octos-cli --features "$FEATURES"
   cargo build --release -p octos-sandbox
@@ -115,6 +134,12 @@ case "$SUITE" in
     ;;
   hosted-fast)
     run_hosted_fast
+    ;;
+  oup-runtime)
+    run_oup_runtime
+    ;;
+  oup-minimal)
+    run_oup_minimal
     ;;
   workspace-all-features)
     run_workspace_all_features

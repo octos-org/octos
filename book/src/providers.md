@@ -1,6 +1,6 @@
 # LLM Providers & Routing
 
-Octos supports 16 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama and Vertex AI, which uses a service-account JSON).
+Octos supports 17 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama and Vertex AI, which uses a service-account JSON).
 
 ## Supported Providers
 
@@ -15,7 +15,8 @@ Octos supports 16 LLM providers out of the box. Each provider needs an API key s
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | -- |
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
-| `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | -- |
+| `minimax` | `MINIMAX_API_KEY` | MiniMax-M3 | OpenAI-compatible | -- |
+| `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
 | `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Auto (Anthropic/OpenAI) | `r9s.ai` |
@@ -24,6 +25,8 @@ Octos supports 16 LLM providers out of the box. Each provider needs an API key s
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | -- |
 
 **`vertex`** authenticates with a Google service-account JSON (resolved via `VERTEX_SA_JSON` — keychain marker, config value, or env) instead of an API key; the GCP project is read from the JSON and the region is fixed to `global`. It must be selected explicitly (`provider: "vertex"`) — bare `gemini-*` model names still resolve to the AI Studio `gemini` provider. **`r9s`** is a multi-protocol proxy that auto-detects the Anthropic Messages API for `claude-*` models and OpenAI Chat Completions otherwise.
+
+**`minimax-cn`** is the China region of MiniMax (`https://api.minimaxi.com/v1` instead of the international `https://api.minimax.io/v1`). MiniMax Token-plan subscription keys are issued by the China platform (platform.minimaxi.com) and are region-bound, so they only work against `minimax-cn`; international keys stay on `minimax`. MiniMax Coding-plan keys (`sk-cp-…`) additionally require the Anthropic protocol: choose protocol **Anthropic** during `octos init`, or set `api_type: "anthropic"` with `base_url: "https://api.minimaxi.com/anthropic"` — over the default OpenAI protocol they 401 (see octos#2115).
 
 Any other OpenAI- or Anthropic-compatible endpoint (e.g. `wisemodel`, Together, Fireworks, Azure) is reachable by setting `base_url` on a provider — see [Custom Endpoints](#custom-endpoints).
 

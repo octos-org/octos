@@ -51,7 +51,22 @@ const MINIMAX_API_TYPES: &[ApiTypeOption] = &[
     ApiTypeOption {
         value: Some("anthropic"),
         display: "Anthropic",
-        description: "Messages API",
+        description: "Messages API (required for sk-cp- Coding-plan keys)",
+        base_url: Some("https://api.minimaxi.com/anthropic"),
+    },
+];
+
+const MINIMAX_CN_API_TYPES: &[ApiTypeOption] = &[
+    ApiTypeOption {
+        value: None,
+        display: "OpenAI",
+        description: "Chat Completions API",
+        base_url: Some("https://api.minimaxi.com/v1"),
+    },
+    ApiTypeOption {
+        value: Some("anthropic"),
+        display: "Anthropic",
+        description: "Messages API (required for sk-cp- Coding-plan keys)",
         base_url: Some("https://api.minimaxi.com/anthropic"),
     },
 ];
@@ -120,6 +135,19 @@ const PROVIDERS: &[ProviderInfo] = &[
         base_url: Some("https://api.z.ai/api/anthropic"),
         api_type: Some("anthropic"),
         api_types: &[],
+    },
+    // Region variant of the `minimax` preset: MiniMax Token-plan keys are
+    // issued by the China platform and 401 against the international site
+    // (octos#2125). Appended last so every existing preset index keeps its
+    // number; only the trailing Custom entry (always `PROVIDERS.len() + 1`)
+    // moves.
+    ProviderInfo {
+        name: "minimax-cn",
+        display: "MiniMax China (Token Plan)",
+        api_key_env: "MINIMAX_CN_API_KEY",
+        base_url: Some("https://api.minimaxi.com/v1"),
+        api_type: None,
+        api_types: MINIMAX_CN_API_TYPES,
     },
 ];
 
@@ -1115,6 +1143,68 @@ mod tests {
     // rejected by real APIs (DeepSeek 400s on it). The catalog is now
     // embedded as a compile-time fallback, manual entry requires an explicit
     // model name, and --defaults errors instead of silently writing "auto".
+
+    // octos#2125: the MiniMax China preset is a first-class region variant —
+    // the Token-plan flow (preset -> protocol -> model -> config) must write
+    // the api.minimaxi.com endpoint with no manual base_url override.
+
+    #[test]
+    fn minimax_cn_preset_writes_the_china_endpoint() {
+        let info = provider("minimax-cn");
+        assert_eq!(info.api_key_env, "MINIMAX_CN_API_KEY");
+        assert_eq!(
+            default_api_type_selection(info).base_url,
+            Some("https://api.minimaxi.com/v1")
+        );
+        // Both protocols the China platform documents are offered, OpenAI
+        // first (the default).
+        assert_eq!(info.api_types.len(), 2);
+        let anthropic = select_api_type(info, "2");
+        assert_eq!(anthropic.api_type, Some("anthropic"));
+        assert_eq!(
+            anthropic.base_url,
+            Some("https://api.minimaxi.com/anthropic")
+        );
+
+        let config = build_config(
+            info,
+            "MiniMax-M3",
+            info.api_key_env,
+            default_api_type_selection(info),
+        );
+        assert_eq!(config["provider"], "minimax-cn");
+        assert_eq!(config["base_url"], "https://api.minimaxi.com/v1");
+        assert!(config.get("api_type").is_none());
+
+        // The catalog offers the Token-plan model for the family.
+        let catalog = embedded_catalog_models();
+        assert_eq!(
+            default_model_for("minimax-cn", &catalog).as_deref().ok(),
+            Some("MiniMax-M3")
+        );
+    }
+
+    #[test]
+    fn existing_preset_indices_do_not_shift() {
+        // Piped/scripted init flows select by number; only the trailing
+        // Custom entry (PROVIDERS.len() + 1) may move when a preset is added.
+        for (index, name) in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "deepseek",
+            "moonshot",
+            "dashscope",
+            "minimax",
+            "zai",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(PROVIDERS[index].name, *name, "preset {index} shifted");
+        }
+        assert_eq!(PROVIDERS.last().unwrap().name, "minimax-cn");
+    }
 
     #[test]
     fn should_resolve_models_from_embedded_catalog_when_no_disk_file() {

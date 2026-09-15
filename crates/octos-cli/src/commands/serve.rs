@@ -2128,9 +2128,9 @@ impl ServeCommand {
         //   `ProfileRuntime::bootstrap`) AND swarm dispatch.
         // - `block_injection_env_vars: true`: adds `LD_PRELOAD`,
         //   `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, ... to the env
-        //   denylist so a contract carrying those keys fails closed
-        //   even if the underlying backend's own env handling were to
-        //   regress.
+        //   denylist so a contract carrying those keys — or a backend
+        //   configured to set them (#1601) — fails closed even if the
+        //   underlying backend's own env handling were to regress.
         //
         // Approval bridge, sandbox-required, manifest env allowlists,
         // and per-skill gates are **not** wired here — they are

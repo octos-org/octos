@@ -9,7 +9,8 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
     DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
     DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-    QuestionId, SessionSandboxParams, approval_scopes, methods, rpc_error_codes,
+    QuestionId, SessionSandboxParams, UserQuestion, UserQuestionAnswer, UserQuestionOption,
+    approval_scopes, methods, rpc_error_codes,
 };
 
 #[test]
@@ -21401,6 +21402,146 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
     )));
 }
 
+/// #1463 — an interrupted M9 fixture turn must drain pending user questions
+/// exactly like the live interrupt path (and like approvals on the same
+/// branch): the runtime waiter closes (Cancelled), a late respond is stale
+/// with `turn_interrupted`, and reconnect hydration no longer re-shows the
+/// dead turn's question.
+#[tokio::test]
+async fn m9_fixture_interrupt_cancels_pending_user_questions() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let surviving_turn = TurnId::new();
+    let question_id = QuestionId::new();
+    let surviving_question_id = QuestionId::new();
+
+    let framework_question = || {
+        vec![UserQuestion {
+            header: "Framework".into(),
+            question: "Which framework?".into(),
+            options: vec![
+                UserQuestionOption {
+                    label: "axum".into(),
+                    description: "tower-based".into(),
+                },
+                UserQuestionOption {
+                    label: "actix".into(),
+                    description: "actor-based".into(),
+                },
+            ],
+            multi_select: false,
+            allow_free_text: true,
+        }]
+    };
+    let waiter_rx = contracts
+        .user_questions
+        .request_runtime(UserQuestionRequestedEvent::new(
+            session_id.clone(),
+            question_id.clone(),
+            turn_id.clone(),
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            framework_question(),
+        ));
+    contracts
+        .user_questions
+        .request_runtime(UserQuestionRequestedEvent::new(
+            session_id.clone(),
+            surviving_question_id.clone(),
+            surviving_turn,
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            framework_question(),
+        ));
+    assert_eq!(
+        contracts
+            .user_questions
+            .pending_for_session(&session_id)
+            .len(),
+        2
+    );
+
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "m9 slow fixture".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    interrupt_tx
+        .try_send(())
+        .expect("preload pending interrupt");
+    drop(interrupt_tx);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        ledger,
+        Arc::clone(&contracts),
+        params,
+        M9ProtocolFixture::Slow,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    // The blocked tool's waiter closed (Cancelled). Bounded wait: without the
+    // fix the sender lives on in the store and this receiver never resolves.
+    let waiter_closed = tokio::time::timeout(std::time::Duration::from_secs(5), waiter_rx)
+        .await
+        .expect("interrupt must close the pending question's runtime waiter");
+    assert!(
+        waiter_closed.is_err(),
+        "a cancelled question's waiter resolves to Cancelled, not answers"
+    );
+    // …a late respond is stale with the precise reason…
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    let err = contracts
+        .user_questions
+        .respond_with_context(&UserQuestionRespondParams::new(
+            session_id.clone(),
+            question_id,
+            answer(),
+        ))
+        .expect_err("late respond against interrupted-turn question");
+    assert_eq!(err.code, rpc_error_codes::USER_QUESTION_STALE);
+    assert_eq!(
+        err.data.as_ref().unwrap()["reason"],
+        json!("turn_interrupted")
+    );
+    // …reconnect hydration only re-shows the surviving turn's question…
+    let pending = contracts.user_questions.pending_for_session(&session_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].question_id, surviving_question_id.clone());
+    // …which stays answerable.
+    let ok = contracts
+        .user_questions
+        .respond_with_context(&UserQuestionRespondParams::new(
+            session_id,
+            surviving_question_id,
+            answer(),
+        ))
+        .expect("non-interrupted turn question still pending");
+    assert!(ok.result.accepted);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn approval_respond_ledgers_decided_before_unblocked_turn_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -29697,9 +29838,34 @@ impl octos_llm::LlmProvider for AppuiContinuationLlm {
     }
 }
 
+/// Mirrors `session_actor_tests::waiting_budget` (#2053): scale a test's
+/// WAITING budget on Windows, where loaded check-windows runners miss
+/// fixed-duration waits that pass everywhere else. Deadlines only, never
+/// stimuli.
+fn waiting_budget(base: Duration) -> Duration {
+    #[cfg(windows)]
+    {
+        base * 4
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
+
+/// Poll the mock provider until the drained continuation turn reaches it. A
+/// short fixed ceiling flakes on check-windows (main run 34931713823 failed
+/// two different callers of this helper, one per attempt, each with
+/// `call_count == 0` right after the window expired), so the deadline uses a
+/// generous base through `waiting_budget`; a passing run still exits on the
+/// first poll.
 async fn wait_for_appui_continuation(provider: &AppuiContinuationLlm) {
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + waiting_budget(Duration::from_secs(5));
+    loop {
         if provider.call_count.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -37033,6 +37199,118 @@ fn should_flush_old_window_and_oversized_new_fragment_in_order_when_task_switche
     assert_eq!(flushed[1].first_offset, 0);
     assert_eq!(flushed[1].text, big);
     assert!(!coalescer.has_pending());
+}
+
+/// Solo stdio profiles are persisted before a runtime exists, then bootstrapped
+/// into the dynamic map. Peer resources must survive both phases.
+#[tokio::test]
+async fn peer_resources_follow_cold_and_dynamic_profile_runtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
+    let profile = crate::profiles::UserProfile {
+        id: "lazy-peer".into(),
+        name: "Lazy peer".into(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    store.save(&profile).unwrap();
+    let data_dir = store.resolve_data_dir(&profile);
+    let state = Arc::new(AppState {
+        profile_store: Some(store),
+        ..AppState::empty_for_tests()
+    });
+    let prepared = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "cold-peer",
+            APPUI_METHOD_PEER_PREPARE,
+            json!({"profile_id": profile.id, "brief": "Review the workspace.",
+                   "title": "Cold peer", "cwd": tmp.path()}),
+        ),
+        None,
+    )
+    .await
+    .expect("staging only needs the persisted profile data root");
+    assert!(resolve_session_profile_runtime(&state, Some(&profile.id)).is_none());
+    let gather = RpcRequest::new(
+        "gather-lazy",
+        APPUI_METHOD_PEER_GATHER,
+        json!({"profile_id": profile.id}),
+    );
+    let cold = raw_peer_gather(&state, &gather, None).unwrap();
+    assert_eq!(cold["peers"].as_array().unwrap().len(), 1);
+    assert!(cold["peers"][0]["result"].is_null());
+
+    let runtime = make_m11e_profile_with_llm_and_sandbox(
+        &profile.id,
+        &data_dir,
+        Arc::new(M11EStubLlm),
+        octos_agent::SandboxConfig::default(),
+    )
+    .await;
+    let key = dynamic_profile_runtime_key(&state, &profile.id).unwrap();
+    struct RemoveDynamicRuntime(String);
+    impl Drop for RemoveDynamicRuntime {
+        fn drop(&mut self) {
+            dynamic_profile_runtimes().write().unwrap().remove(&self.0);
+        }
+    }
+    let _cleanup = RemoveDynamicRuntime(key.clone());
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap()
+        .insert(key, runtime);
+    assert!(state.profiles.is_empty(), "the startup map stays empty");
+    let peer = SessionKey::with_profile_topic(
+        &profile.id,
+        "local",
+        "lazy-peer",
+        prepared["topic"].as_str().unwrap(),
+    );
+    write_peer_result_if_peer_session(
+        &state,
+        &peer,
+        &TurnId::new(),
+        TurnTerminalOutcome::Completed,
+        "Durable lazy result",
+        12,
+        None,
+    );
+    let gathered = raw_peer_gather(&state, &gather, None).unwrap();
+    assert!(
+        gathered["peers"][0]["result"]
+            .as_str()
+            .unwrap()
+            .contains("Durable lazy result")
+    );
+    assert_eq!(
+        gathered["peers"][0]["turn_history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    session_workspaces().set(&profile.id, peer.clone(), tmp.path().to_path_buf());
+    let (_, snapshots) = snapshot_context_for_session(&state, None, &peer).unwrap();
+    assert!(
+        snapshots.is_some(),
+        "snapshot lookup must see the same dynamic runtime"
+    );
+    assert!(!peer_target_is_closed(&state, &peer));
+    let peer_dir = data_dir
+        .join("peers")
+        .join(prepared["slug"].as_str().unwrap());
+    std::fs::write(peer_dir.join("closed"), "closed").unwrap();
+    assert!(
+        peer_target_is_closed(&state, &peer),
+        "continuation gates must honor a dynamically loaded peer's close marker"
+    );
 }
 
 /// #1801 v2: fleet staging (`n`), the peer-result blackboard writer, and
