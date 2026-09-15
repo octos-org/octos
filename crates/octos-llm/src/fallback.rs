@@ -9,7 +9,10 @@ use octos_core::Message;
 use tracing::warn;
 
 use crate::config::ChatConfig;
-use crate::provider::LlmProvider;
+use crate::provider::{
+    LANE_FAILED_FAIL_FAST, LANE_FAILED_NOT_FAILOVER_WORTHY, LANES_EXHAUSTED, LaneFailure,
+    LlmProvider, attribute_lane_failures,
+};
 use crate::retry::RetryProvider;
 use crate::router::ProviderRouter;
 use crate::types::{ChatResponse, ChatStream, ToolSpec};
@@ -71,6 +74,41 @@ impl FallbackProvider {
             router.record_failure(model_id);
         }
     }
+
+    /// Slot numbering shared by `chat`, `chat_stream`, and
+    /// [`LlmProvider::provider_metadata_for_index`]: slot 0 is the primary,
+    /// slot `i + 1` is `fallbacks[i]`. Response indices are FLAT leaf-lane
+    /// indices: slot `s` owns `[lane_offset(s), lane_offset(s) + lane_count(s))`,
+    /// so a nested composite's own index is carried inside the slot's range.
+    fn slot_provider_ref(&self, slot: usize) -> &Arc<dyn LlmProvider> {
+        match slot {
+            0 => &self.primary,
+            index => self.fallbacks.get(index - 1).unwrap_or(&self.primary),
+        }
+    }
+
+    fn lane_counts(&self) -> Vec<usize> {
+        std::iter::once(self.primary.provider_lane_count())
+            .chain(self.fallbacks.iter().map(|fb| fb.provider_lane_count()))
+            .collect()
+    }
+
+    fn lane_offset(&self, slot: usize) -> usize {
+        crate::provider::lane_offset_for_slot(&self.lane_counts(), slot)
+    }
+
+    /// Flat index of the lane that served a response from slot `slot`,
+    /// honoring an index a nested composite already tagged.
+    fn flat_index(&self, slot: usize, inner: Option<usize>) -> usize {
+        self.lane_offset(slot) + inner.unwrap_or(0)
+    }
+
+    /// Prefix the stream with the serving slot's flat lane offset, mirroring
+    /// `ProviderChain`, so post-stream cache-usage attribution resolves the
+    /// lane that answered — through a nested composite as well.
+    fn stream_with_provider_index(&self, slot: usize, stream: ChatStream) -> ChatStream {
+        crate::provider::stream_with_lane_offset(self.lane_offset(slot), stream)
+    }
 }
 
 #[async_trait]
@@ -82,13 +120,25 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         match self.primary.chat(messages, tools, config).await {
-            Ok(resp) => Ok(resp),
+            Ok(mut resp) => {
+                resp.provider_index = Some(self.flat_index(0, resp.provider_index));
+                Ok(resp)
+            }
             Err(primary_err) => {
+                let mut failures = vec![LaneFailure::capture(self.primary.as_ref(), &primary_err)];
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
-                    return Err(primary_err);
+                    return Err(attribute_lane_failures(
+                        primary_err,
+                        LANE_FAILED_FAIL_FAST,
+                        &failures,
+                    ));
                 }
                 if !RetryProvider::should_failover(&primary_err) {
-                    return Err(primary_err);
+                    return Err(attribute_lane_failures(
+                        primary_err,
+                        LANE_FAILED_NOT_FAILOVER_WORTHY,
+                        &failures,
+                    ));
                 }
                 self.record_failure(self.primary.model_id());
                 warn!(
@@ -99,13 +149,14 @@ impl LlmProvider for FallbackProvider {
                 );
                 for (i, fb) in self.fallbacks.iter().enumerate() {
                     match fb.chat(messages, tools, config).await {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
                             warn!(
                                 primary = self.primary.model_id(),
                                 fallback = fb.model_id(),
                                 fallback_idx = i,
                                 "fallback provider succeeded"
                             );
+                            resp.provider_index = Some(self.flat_index(i + 1, resp.provider_index));
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -115,10 +166,18 @@ impl LlmProvider for FallbackProvider {
                                 error = %e,
                                 "fallback provider also failed"
                             );
+                            failures.push(LaneFailure::capture(fb.as_ref(), &e));
                         }
                     }
                 }
-                Err(primary_err)
+                // The primary's typed error stays the carrier (unchanged
+                // classification for outer wrappers); the summary names
+                // every lane that failed.
+                Err(attribute_lane_failures(
+                    primary_err,
+                    LANES_EXHAUSTED,
+                    &failures,
+                ))
             }
         }
     }
@@ -130,13 +189,22 @@ impl LlmProvider for FallbackProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         match self.primary.chat_stream(messages, tools, config).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => Ok(self.stream_with_provider_index(0, stream)),
             Err(primary_err) => {
+                let mut failures = vec![LaneFailure::capture(self.primary.as_ref(), &primary_err)];
                 if crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast {
-                    return Err(primary_err);
+                    return Err(attribute_lane_failures(
+                        primary_err,
+                        LANE_FAILED_FAIL_FAST,
+                        &failures,
+                    ));
                 }
                 if !RetryProvider::should_failover(&primary_err) {
-                    return Err(primary_err);
+                    return Err(attribute_lane_failures(
+                        primary_err,
+                        LANE_FAILED_NOT_FAILOVER_WORTHY,
+                        &failures,
+                    ));
                 }
                 self.record_failure(self.primary.model_id());
                 warn!(
@@ -144,16 +212,21 @@ impl LlmProvider for FallbackProvider {
                     error = %primary_err,
                     "primary stream failed, trying fallbacks"
                 );
-                for fb in &self.fallbacks {
+                for (i, fb) in self.fallbacks.iter().enumerate() {
                     match fb.chat_stream(messages, tools, config).await {
-                        Ok(stream) => return Ok(stream),
+                        Ok(stream) => return Ok(self.stream_with_provider_index(i + 1, stream)),
                         Err(e) => {
                             self.record_failure(fb.model_id());
                             warn!(fallback = fb.model_id(), error = %e, "fallback stream also failed");
+                            failures.push(LaneFailure::capture(fb.as_ref(), &e));
                         }
                     }
                 }
-                Err(primary_err)
+                Err(attribute_lane_failures(
+                    primary_err,
+                    LANES_EXHAUSTED,
+                    &failures,
+                ))
             }
         }
     }
@@ -166,12 +239,50 @@ impl LlmProvider for FallbackProvider {
         self.primary.provider_name()
     }
 
+    /// The composite keeps identifying as its primary (backward compatible);
+    /// use [`Self::provider_metadata_for_index`] with the response's
+    /// `provider_index` to attribute a fallback-served response.
+    fn provider_metadata(&self) -> crate::types::ProviderMetadata {
+        self.primary.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(
+        &self,
+        provider_index: Option<usize>,
+    ) -> crate::types::ProviderMetadata {
+        match provider_index {
+            None => self.primary.provider_metadata_for_index(None),
+            Some(index) => match crate::provider::slot_for_lane_index(&self.lane_counts(), index) {
+                Some((slot, inner)) => self
+                    .slot_provider_ref(slot)
+                    .provider_metadata_for_index(Some(inner)),
+                None => self.primary.provider_metadata(),
+            },
+        }
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.lane_counts().iter().sum()
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.primary.api_style()
+    }
+
     fn context_window(&self) -> u32 {
         self.primary.context_window()
     }
 
     fn max_output_tokens(&self) -> u32 {
         self.primary.max_output_tokens()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.primary.supports_semantic_checkpoint_hints()
+            || self
+                .fallbacks
+                .iter()
+                .any(|provider| provider.supports_semantic_checkpoint_hints())
     }
 
     fn report_stream_metrics(&self, output_tokens: u32, stream_duration_us: u64) {
@@ -347,6 +458,244 @@ mod tests {
             fb_calls.load(Ordering::SeqCst),
             1,
             "fallback must be called once"
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_index_tests {
+    use std::sync::Arc;
+
+    use futures::StreamExt;
+
+    use super::FallbackProvider;
+    use crate::config::ChatConfig;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::StubLane;
+    use crate::types::StreamEvent;
+    use crate::{LlmCallPolicy, with_llm_call_policy};
+
+    fn chain_with_failing_primary() -> FallbackProvider {
+        FallbackProvider::new(
+            Arc::new(StubLane::failing("primary", "model-p")),
+            vec![Arc::new(StubLane::ok("secondary", "model-s"))],
+        )
+    }
+
+    /// Nested composition: a `ProviderChain` in the primary slot. The flat
+    /// leaf-lane index must resolve the chain's serving lane (lane 2 =
+    /// `chain-c`), not the fallback slot that shares the number in a flat
+    /// slot numbering, on the chat AND the stream path.
+    #[tokio::test]
+    async fn should_resolve_serving_lane_when_fallback_wraps_provider_chain() {
+        let chain = crate::ProviderChain::new(vec![
+            Arc::new(StubLane::failing("chain-a", "model-a")),
+            Arc::new(StubLane::failing("chain-b", "model-b")),
+            Arc::new(StubLane::ok("chain-c", "model-c")),
+        ]);
+        let composite = FallbackProvider::new(
+            Arc::new(chain),
+            vec![Arc::new(StubLane::ok("secondary", "model-s"))],
+        );
+        assert_eq!(composite.provider_lane_count(), 4);
+
+        let response = composite
+            .chat(&[], &[], &ChatConfig::default())
+            .await
+            .expect("chain lane c serves");
+        assert_eq!(response.provider_index, Some(2));
+        assert_eq!(
+            composite
+                .provider_metadata_for_index(response.provider_index)
+                .provider,
+            "chain-c"
+        );
+        assert_eq!(
+            composite.provider_metadata_for_index(Some(3)).provider,
+            "secondary",
+            "the fallback slot owns the lane after the chain's three lanes"
+        );
+
+        let mut stream = composite
+            .chat_stream(&[], &[], &ChatConfig::default())
+            .await
+            .expect("chain lane c streams");
+        let mut last_index = None;
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::ProviderIndex(index) = event {
+                last_index = Some(index);
+            }
+        }
+        assert_eq!(
+            last_index,
+            Some(2),
+            "nested stream indices are translated into the flat space"
+        );
+        assert_eq!(
+            composite.provider_metadata_for_index(last_index).provider,
+            "chain-c"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_tag_provider_index_one_and_resolve_fallback_identity_when_fallback_serves_chat()
+    {
+        let chain = chain_with_failing_primary();
+        let response = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            chain.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .expect("fallback lane serves the request");
+
+        assert_eq!(
+            response.provider_index,
+            Some(1),
+            "fallback-served responses must be attributable to slot 1"
+        );
+        let metadata = chain.provider_metadata_for_index(response.provider_index);
+        assert_eq!(
+            (metadata.provider.as_str(), metadata.model.as_str()),
+            ("secondary", "model-s"),
+            "slot 1 must resolve to the fallback lane: {metadata:?}"
+        );
+        // Backward compatibility: the composite still identifies as its primary.
+        assert_eq!(chain.provider_metadata().provider, "primary");
+        assert_eq!(
+            chain.provider_metadata_for_index(Some(0)).provider,
+            "primary"
+        );
+        assert_eq!(chain.provider_metadata_for_index(None).provider, "primary");
+    }
+
+    #[tokio::test]
+    async fn should_tag_provider_index_zero_when_primary_serves_chat() {
+        let chain = FallbackProvider::new(
+            Arc::new(StubLane::ok("primary", "model-p")),
+            vec![Arc::new(StubLane::ok("secondary", "model-s"))],
+        );
+        let response = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            chain.chat(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.provider_index, Some(0));
+        assert_eq!(
+            chain
+                .provider_metadata_for_index(response.provider_index)
+                .provider,
+            "primary"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_prepend_provider_index_event_when_fallback_serves_stream() {
+        let chain = chain_with_failing_primary();
+        let mut stream = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            chain.chat_stream(&[], &[], &ChatConfig::default()).await
+        })
+        .await
+        .expect("fallback lane serves the stream");
+        match stream.next().await {
+            Some(StreamEvent::ProviderIndex(index)) => assert_eq!(index, 1),
+            other => panic!("expected ProviderIndex(1) first, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_prepend_provider_index_zero_when_primary_serves_stream() {
+        let chain = FallbackProvider::new(
+            Arc::new(StubLane::ok("primary", "model-p")),
+            vec![Arc::new(StubLane::ok("secondary", "model-s"))],
+        );
+        let mut stream = chain
+            .chat_stream(&[], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+        match stream.next().await {
+            Some(StreamEvent::ProviderIndex(index)) => assert_eq!(index, 0),
+            other => panic!("expected ProviderIndex(0) first, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_attribution_tests {
+    use std::sync::Arc;
+
+    use octos_core::Message;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::FallbackProvider;
+    use crate::anthropic::AnthropicProvider;
+    use crate::config::ChatConfig;
+    use crate::openai::OpenAIProvider;
+    use crate::provider::LlmProvider;
+    use crate::retry::RetryProvider;
+    use crate::{LlmCallPolicy, with_llm_call_policy};
+
+    /// A loopback URL with nothing listening (connection refused).
+    async fn refused_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn should_name_every_failed_lane_with_api_style_when_k3_fails_over_to_anthropic_compatible_lane()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("k3 upstream exploded"))
+            .mount(&server)
+            .await;
+        let k3: Arc<dyn LlmProvider> = Arc::new(
+            OpenAIProvider::new("key", "k3")
+                .with_base_url(server.uri())
+                .with_provider_label("moonshot-coding@api"),
+        );
+        let zai: Arc<dyn LlmProvider> = Arc::new(
+            AnthropicProvider::new("key", "glm-5.3")
+                .with_base_url(refused_url().await)
+                .with_provider_label("zai-coding"),
+        );
+        let chain = FallbackProvider::new(k3, vec![zai]);
+
+        let result = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            chain
+                .chat_stream(&[Message::user("hi")], &[], &ChatConfig::default())
+                .await
+        })
+        .await;
+        let Err(err) = result else {
+            panic!("both lanes fail")
+        };
+
+        let display = err.to_string();
+        let alternate = format!("{err:#}");
+        for rendered in [&display, &alternate] {
+            for needle in [
+                "moonshot-coding@api",
+                "k3",
+                "zai-coding",
+                "glm-5.3",
+                "api_style=anthropic_messages",
+                "api_style=openai_chat_completions",
+            ] {
+                assert!(
+                    rendered.contains(needle),
+                    "missing {needle:?} in: {rendered}"
+                );
+            }
+            assert!(
+                !rendered.contains("request to Anthropic"),
+                "a lane the user never configured must not be named: {rendered}"
+            );
+        }
+        assert!(
+            RetryProvider::should_failover(&err),
+            "wrapping must keep the typed lane error classifiable: {alternate}"
         );
     }
 }

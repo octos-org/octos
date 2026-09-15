@@ -4766,6 +4766,8 @@ dependencies = [
 name = "octos-ffi"
 version = "2.0.3-rc.9"
 dependencies = [
+ "async-trait",
+ "eyre",
  "libc",
  "octos-agent",
  "octos-cli",
@@ -4828,6 +4830,7 @@ dependencies = [
  "secrecy 0.10.3",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-test",

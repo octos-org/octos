@@ -423,13 +423,27 @@ jobs:
       - name: Test octos-cli (integration)
         run: cargo test -p octos-cli --tests
 
+      - name: OUP runtime and native binding contracts
+        run: ./scripts/milestone-ci.sh oup-runtime
+
+      - name: Minimal CLI feature contract
+        run: ./scripts/milestone-ci.sh oup-minimal
+
+      - name: Preserve OUP functional evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oup-runtime-evidence
+          path: target/oup-functional/
+          if-no-files-found: error
+          retention-days: 14
+
       # Co-located here so they reuse this job's warm octos-cli build cache.
       - name: API feature tests
         run: cargo test -p octos-cli --features api api::auth_handlers
 
-      # The §6 catalog guard lives in the feature-gated `api` module, so the
-      # unfeatured lib/integration runs above never compile it. Run it
-      # explicitly so UI Protocol spec/impl drift actually fails CI.
+      # The default build includes api. Keep the focused catalog guard explicit
+      # so its result remains visible beside the broad integration suite.
       - name: UI Protocol §6 catalog guard (octos-cli)
         run: cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
 
@@ -443,9 +457,7 @@ jobs:
       - name: Session-open context compaction (octos-cli)
         run: cargo test -p octos-cli --features api session_open_snapshot -- --nocapture
 
-      # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
-      # unfeatured runs above never compile it — same reason as the §6 guard.
-      # These cover slug reservation, worktree fencing, and the rollback
+      # Focused peer checks cover slug reservation, worktree fencing, and the rollback
       # isolation guard (one peer's cleanup must not delete a SIBLING's
       # worktree, which a repo-global `git worktree prune` used to do).
       - name: Peer staging + worktree fencing (octos-cli)
@@ -460,26 +472,19 @@ jobs:
       - name: serve wiring guards (octos-cli)
         run: cargo test -p octos-cli --features api commands::serve::tests
 
-      # The goal-completion verifier's ledger-evidence fold lives in the
-      # `api`-gated goal_tool module, so the unfeatured runs above never compile
-      # it. Guards the peer-goal convergence fix (#1989): a genuinely-complete
+      # The goal-completion verifier's ledger-evidence fold guards the
+      # peer-goal convergence fix (#1989): a genuinely-complete
       # goal must verify against the durable ledger findings, not the master's
       # reply alone, or the master loops until its token budget drains.
       - name: Goal completion verifier ledger evidence (octos-cli)
         run: cargo test -p octos-cli --features api -- completion_evidence goal_update_folds_ledger --nocapture
 
-      # #2019 human sink: the `background/activity` capability gate and the
-      # durable per-session replay both live in the `api`-gated ui_protocol
-      # module, so the unfeatured runs above never compile them — same reason
-      # as the §6 guard. The routing assertion itself is deliberately in
-      # non-gated `crate::autonomy` and DOES run in the unfeatured lib step;
-      # this covers the two halves that cannot.
+      # #2019 human sink: keep capability-gated background delivery and durable
+      # per-session replay visible as a focused regression group.
       - name: Background activity human sink (octos-cli)
         run: cargo test -p octos-cli --features api background_activity -- --nocapture
 
-      # The smart_home/* WS methods are `api`-gated too, so the unfeatured
-      # integration run above compiles this file to zero tests. Run it
-      # explicitly: it is the only end-to-end coverage of the WS dispatch →
+      # This is the end-to-end coverage of the WS dispatch →
       # bridge-config resolution → real HTTP bridge path.
       - name: Smart-home WS e2e (octos-cli)
         run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
@@ -491,15 +496,9 @@ jobs:
       - name: Smart-home skill tests
         run: cargo test -p smart-home
 
-  # Lightweight check that exercises the `matrix` feature gate. The default
-  # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
-  # job lean, but the Dockerfile and several release configurations enable it.
-  # Without this job, feature-gated compile errors (e.g. an identifier referenced
-  # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
-  # during docker builds. Keep this job intentionally tiny: no tests.
-  # It also carries the clippy gate for the feature-gated api/serve/ui_protocol
-  # modules: octos-cli has `default = []`, so the workspace clippy in `check`
-  # never lints them — and clippy subsumes `cargo check`.
+  # Compile and lint the expanded channel configuration, including optional
+  # adapters absent from the default api build. This job checks all targets;
+  # runtime behavior is covered by the test jobs above.
   check-matrix:
     runs-on: ubuntu-latest
     env:

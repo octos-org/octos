@@ -71,12 +71,47 @@ fn current_message_commit_observer() -> Option<MessageCommitObserver> {
         .clone()
 }
 
+type ScopedCommitObservers = std::collections::HashMap<
+    PathBuf,
+    std::sync::Weak<dyn Fn(&SessionKey, &Message, usize) + Send + Sync>,
+>;
+
+fn scoped_commit_observers() -> &'static std::sync::Mutex<ScopedCommitObservers> {
+    static OBSERVERS: std::sync::OnceLock<std::sync::Mutex<ScopedCommitObservers>> =
+        std::sync::OnceLock::new();
+    OBSERVERS.get_or_init(Default::default)
+}
+
+/// Bind an observer to a runtime's storage root. The runtime must retain the
+/// supplied Arc; weak registration never keeps a closed runtime alive.
+pub fn set_scoped_message_commit_observer(data_dir: &Path, observer: &MessageCommitObserver) {
+    let root = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_owned());
+    let mut observers = scoped_commit_observers().lock().unwrap();
+    observers.retain(|_, observer| observer.strong_count() > 0);
+    observers.insert(root, std::sync::Arc::downgrade(observer));
+}
+
 /// Fire the observer if installed. Panics inside the observer are caught
 /// (best-effort) so a faulty subscriber cannot poison the commit path. The
 /// commit has already succeeded by the time we get here — observer failure
 /// is fan-out failure, not commit failure.
-fn notify_message_commit(key: &SessionKey, message: &Message, committed_seq: usize) {
-    let Some(observer) = current_message_commit_observer() else {
+fn notify_message_commit(
+    data_dir: &Path,
+    key: &SessionKey,
+    message: &Message,
+    committed_seq: usize,
+) {
+    let root = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_owned());
+    let scoped = scoped_commit_observers()
+        .lock()
+        .unwrap()
+        .get(&root)
+        .cloned();
+    let observer = match scoped {
+        Some(observer) => observer.upgrade(),
+        None => current_message_commit_observer(),
+    };
+    let Some(observer) = observer else {
         return;
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1355,6 +1390,7 @@ impl SessionManager {
             record_session_persist("failed");
             return Err(error);
         }
+        let observer_root = self.data_dir();
         let session = self.get_or_create(key).await;
         session.messages.push(message);
         session.updated_at = Utc::now();
@@ -1367,7 +1403,7 @@ impl SessionManager {
         // before this point, so the observer never sees a row that did
         // not commit.
         if let Some(committed) = session.messages.last() {
-            notify_message_commit(key, committed, committed_seq);
+            notify_message_commit(&observer_root, key, committed, committed_seq);
         }
         Ok(committed_seq)
     }
@@ -2329,6 +2365,7 @@ impl SessionManager {
 pub struct SessionHandle {
     sessions_dir: PathBuf,
     session: Session,
+    observer_root: PathBuf,
 }
 
 /// Per-key persist lock map.
@@ -2505,6 +2542,7 @@ impl SessionHandle {
                     return Self {
                         sessions_dir: user_sessions_dir,
                         session: loaded.clone(),
+                        observer_root: data_dir.to_owned(),
                     };
                 }
                 if std::fs::remove_file(&legacy_path).is_ok() {
@@ -2520,6 +2558,7 @@ impl SessionHandle {
         Self {
             sessions_dir: user_sessions_dir,
             session,
+            observer_root: data_dir.to_owned(),
         }
     }
 
@@ -2805,7 +2844,12 @@ impl SessionHandle {
         // commit failure (`append_to_disk` Err) returns above without
         // firing, satisfying the "MUST NOT emit on commit failure"
         // invariant.
-        notify_message_commit(&self.session.key, &message, committed_seq);
+        notify_message_commit(
+            &self.observer_root,
+            &self.session.key,
+            &message,
+            committed_seq,
+        );
         Ok(committed_seq)
     }
 

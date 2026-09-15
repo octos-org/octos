@@ -63,8 +63,8 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use eyre::Result;
 use octos_core::ui_protocol::{
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_V1,
-    UiProtocolCapabilities,
+    UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_V1, UiProtocolCapabilities,
 };
 use octos_diagnostics::{
     Check, CheckStatus, InstallMethod, LocatedBinaries, ProductSpec, Reachability, Report,
@@ -313,9 +313,11 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     // --- Backend / protocol skew ------------------------------------------
     // The server's own compiled-in capabilities are authoritative for the
     // structural skew check. `first_server_slice()` advertises the protocol's
-    // no-header compatibility baseline. `projection.envelope.v2` is known but
-    // strictly opt-in, so exclude it here; otherwise doctor would mistake the
-    // deliberately absent default advertisement for protocol skew.
+    // no-header compatibility baseline. `projection.envelope.v2` and
+    // `context.semantic_cache.v1` are known but strictly opt-in (advertised
+    // only after explicit client negotiation, UPCR-2026-029), so exclude them
+    // here; otherwise doctor would mistake the deliberately absent default
+    // advertisement for protocol skew.
     // TODO Stage 2.5: replace the compiled-in caps with a LIVE WS
     // `config/capabilities/list` probe against a configured/running server (it
     // needs a client WS connection, deliberately out of Stage 2 scope). Until
@@ -326,7 +328,8 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
         UI_PROTOCOL_KNOWN_FEATURES
             .iter()
             .copied()
-            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
     ));
 
     Ok(report)

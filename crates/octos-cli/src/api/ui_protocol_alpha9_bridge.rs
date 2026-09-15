@@ -197,6 +197,7 @@ pub(super) fn emit_file_attached(
         turn_id: turn_id.clone(),
         path: path.clone(),
         tool_call_id,
+        attachment_owner: None,
         mime: mime.clone(),
     });
     let _ = ledger.append_notification(notification);
@@ -437,6 +438,11 @@ fn mime_from_path(path: &str) -> Option<String> {
 ///   `NotConfigured` `send_file` fallback with `sent_files`; left
 ///   empty by the `Satisfied` path because `media` already carries the
 ///   list.
+///
+/// OUP coalesces this effective list onto BOTH its persisted completion row
+/// and canonical envelope, so strict identity reconciliation sees the same
+/// media after reload. Empty per-file companion rows remain durable; the
+/// producer's split fields remain unchanged for other channel consumers.
 ///
 /// The two media lists let the producer preserve durable transcript data
 /// while placing artifacts on the canonical projection. The cost is that EVERY consumer that needs

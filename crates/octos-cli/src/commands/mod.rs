@@ -18,6 +18,14 @@ pub mod mcp;
 pub mod mcp_serve;
 mod memory;
 mod office;
+#[cfg(feature = "api")]
+pub(crate) mod oup_client;
+#[cfg(feature = "api")]
+pub(crate) mod oup_peers;
+#[cfg(feature = "api")]
+pub(crate) mod oup_session;
+#[cfg(feature = "api")]
+mod oup_text;
 mod profile;
 #[cfg(feature = "api")]
 mod serve;
@@ -37,6 +45,7 @@ pub use acp::AcpCommand;
 // wiring with a `MockLlm`-backed agent over an in-process transport. Hidden
 // from docs; not part of the stable surface.
 #[doc(hidden)]
+#[cfg(feature = "api")]
 pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
@@ -144,16 +153,14 @@ pub enum Command {
     Office(OfficeCommand),
 }
 
-/// Whether `command` emits machine-readable output on stdout and therefore
-/// needs the tracing console layer routed to stderr so logs never corrupt that
-/// stream.
+/// Whether stdout is reserved for protocol or assistant output, so tracing
+/// must use stderr instead of interleaving log lines with that output.
 ///
 /// * `acp` speaks ACP JSON-RPC on stdout (one stray log line → a `-32700`
 ///   parse error at strict clients like Zed);
 /// * `mcp-serve --transport stdio` speaks MCP JSON-RPC on stdout;
 /// * `profile` emits payloads meant for `$(...)` capture / piping;
-/// * `chat --json` emits a single JSON result object on stdout (scripting /
-///   agent-to-agent);
+/// * `chat` streams assistant text (or one `--json` result) on stdout;
 /// * `doctor --json` emits the diagnostics support bundle on stdout — the
 ///   config-parse check loads the real config, whose tracing INFO lines
 ///   ("no config.json found, using defaults") would otherwise corrupt the
@@ -162,8 +169,7 @@ pub enum Command {
 /// Every other command keeps its historical stdout console routing untouched.
 pub fn reserve_stdout(command: &Command) -> bool {
     match command {
-        Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) => true,
-        Command::Chat(cmd) => cmd.json,
+        Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) | Command::Chat(_) => true,
         Command::Doctor(cmd) => cmd.json,
         _ => false,
     }
@@ -222,6 +228,7 @@ pub(crate) fn load_prompt(name: &str, compiled_default: &str) -> String {
 /// opening the redb file fails — the caller falls back to the legacy
 /// single-credential flow in that case. Errors are logged but never
 /// fatal so a broken pool configuration cannot brick `octos serve`.
+#[cfg(feature = "api")]
 pub(crate) fn build_credential_pool(
     config: Option<&crate::config::CredentialPoolConfig>,
     data_dir: &std::path::Path,
@@ -392,11 +399,11 @@ mod reserve_stdout_tests {
     }
 
     #[test]
-    fn should_not_reserve_stdout_when_chat_lacks_json() {
-        // Plain `octos chat` keeps its historical stdout console routing.
+    fn should_reserve_stdout_for_plain_chat_streaming() {
+        // Shared OUP bootstrap/progress logs must not split assistant text.
         let args =
             Args::try_parse_from(["octos", "chat", "--message", "hi"]).expect("`chat` must parse");
-        assert!(!reserve_stdout(&args.command));
+        assert!(reserve_stdout(&args.command));
     }
 
     #[test]

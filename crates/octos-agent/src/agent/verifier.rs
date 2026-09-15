@@ -558,11 +558,8 @@ impl Agent {
             .provider
             .provider_metadata_for_index(response.provider_index)
             .model;
-        turn.record_usage(
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-            response.usage.cache_read_tokens,
-            response.usage.cache_write_tokens,
+        turn.record_llm_usage(
+            &response.usage,
             tracker,
             octos_llm::pricing::model_pricing(&verifier_model)
                 .map(|p| p.cost(response.usage.input_tokens, response.usage.output_tokens)),

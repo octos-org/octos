@@ -30,6 +30,7 @@ mod throttle;
 mod types;
 pub mod vision;
 
+mod cache_manifest;
 pub mod catalog;
 pub mod error;
 pub mod high_level;
@@ -51,9 +52,17 @@ pub use adaptive::{
     SharedMetrics, SharedPolicy, SharedProviderMetrics, StatusCallback, current_router_context,
     derive_cold_start_catalog, with_router_context,
 };
+pub use cache_manifest::{
+    PromptCacheInputComparison, PromptCacheInputManifest, PromptCacheInputSegment,
+    PromptCacheObservation, PromptCacheObservedUsage, PromptCacheObserver,
+    record_prompt_cache_usage, with_prompt_cache_observation_context,
+};
 pub use call_policy::{LlmCallPolicy, current_llm_call_policy, with_llm_call_policy};
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
-pub use config::{ChatConfig, ReasoningEffort, ResponseFormat, ToolChoice};
+pub use config::{
+    ChatConfig, PromptCacheContext, ReasoningEffort, ResponseFormat, SemanticCheckpointHint,
+    ToolChoice,
+};
 pub use content_classifier::{
     ClassificationDecision, ContentClassifier, HarnessRoutingDecisionPayload, ModelTier,
     RoutingConfig,
@@ -78,8 +87,10 @@ pub use lane::{
 pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use ominix::{OminixClient, PlatformModels};
 pub use provider::{
-    DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS, DEFAULT_EMBEDDING_TIMEOUT_SECS,
-    DEFAULT_LLM_CONNECT_TIMEOUT_SECS, DEFAULT_LLM_TIMEOUT_SECS, LlmProvider, build_http_client,
+    ApiStyle, DEFAULT_EMBEDDING_CONNECT_TIMEOUT_SECS, DEFAULT_EMBEDDING_TIMEOUT_SECS,
+    DEFAULT_LLM_CONNECT_TIMEOUT_SECS, DEFAULT_LLM_TIMEOUT_SECS, LaneFailure, LlmProvider,
+    OperationalStage, attribute_lane_failures, build_http_client, lane_failure_summary, lane_label,
+    operational_error_message, transport_error_message,
 };
 pub use responsiveness::ResponsivenessObserver;
 pub use retry::{RetryConfig, RetryProvider};
@@ -88,6 +99,6 @@ pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use throttle::SemaphoreThrottledProvider;
 pub use types::{
-    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, ThinkTagStreamSplitter,
-    TokenUsage, ToolSpec, strip_think_tags,
+    ChatResponse, ChatStream, ProviderMetadata, SemanticCheckpointReport, StopReason, StreamEvent,
+    ThinkTagStreamSplitter, TokenUsage, ToolSpec, strip_think_tags,
 };

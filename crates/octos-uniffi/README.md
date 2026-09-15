@@ -19,7 +19,7 @@ credential handling.
 | `Config` (record) | dict / data class of provider, model, key, cwd, … |
 | `Brief` (record) | `{ prompt, max_iterations? }` |
 | `TaskResult` / `TokenUsage` (records) | outputs |
-| `OctosError` (error enum) | exception (`Config`/`Provider`/`Run`/`Embed`/`NoEmbedder`) |
+| `OctosError` (error enum) | exception (`Config`/`Provider`/`Run`/`Embed`/`NoEmbedder`/`Incomplete`) |
 | `Runtime` (object) | `new(config)`, `run_task(brief)`, `embed(text)` |
 
 Methods are **synchronous**: the async agent loop is driven by a `block_on`
@@ -42,9 +42,10 @@ crate compiled against is the one that generates:
 
 ```bash
 cargo build -p octos-uniffi
+# Use liboctos_uniffi.so on Linux.
 cargo run -p octos-uniffi --bin uniffi-bindgen -- generate \
-    --library target/debug/liboctos_uniffi.dylib \   # .so on Linux
-    --language python \
+    --library target/debug/liboctos_uniffi.dylib \
+    --language python --no-format \
     --out-dir crates/octos-uniffi/bindings/python
 
 # Deterministic post-gen tidy so `git diff --check` stays clean (the generator
@@ -56,6 +57,11 @@ perl -i -0pe 's/\n+\z/\n/'  crates/octos-uniffi/bindings/python/octos.py
 Swift and Kotlin generate identically — swap `--language swift` (emits
 `octos.swift` + a `.modulemap`) or `--language kotlin` (emits `octos.kt`). The
 committed Python bindings live in [`bindings/python/octos.py`](bindings/python/).
+
+Run `./scripts/milestone-ci.sh oup-runtime` from the repository root to build
+the libraries, verify generated Python parity and C declarations, and exercise
+actual C/Python success and incomplete-result calls against a localhost fixture.
+The same suite validates the chat, ACP and OUP process interfaces and runs in CI.
 
 ## Python example
 
@@ -79,6 +85,35 @@ required. Set `api_type="anthropic"` (or `"responses"`) to drive a
 Errors surface as an `OctosError` exception; a failed provider build or run
 carries a scrubbed message, and `embed` without an embedder raises
 `OctosError.NoEmbedder`.
+
+A provider `max_tokens` stop raises `OctosError.Incomplete`, **not** a successful
+`TaskResult`. Its `partial` field contains the actual output, accumulated token
+usage, and iterations. The diagnostic string is fixed and short; the partial
+is lossless task payload and is not passed through error redaction or the
+600-byte diagnostic cap. Treat it as unfinished output, not as a final answer.
+
+```python
+from octos import OctosError
+
+try:
+    result = rt.run_task(Brief(prompt="Explain the design"))
+except OctosError.Incomplete as error:
+    unfinished_output = error.partial.output
+    consumed_tokens = error.partial.tokens
+    # Display/store as incomplete; do not report a successful final answer.
+```
+
+The error variant is appended, preserving existing variant ordinals. Regenerate
+bindings together with the library to consume the new structured error; the
+committed Python binding is generated from this version's library metadata.
+
+Offline ABI regression (real C exports and generated Python, localhost fixture
+with a fake key only; both incomplete and successful controls):
+
+```bash
+cargo build -p octos-ffi -p octos-uniffi
+python3 crates/octos-uniffi/tests/incomplete_bindings.py --library-dir target/debug
+```
 
 ## Credentials & safety
 

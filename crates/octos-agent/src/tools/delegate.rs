@@ -711,9 +711,7 @@ impl Tool for DelegateTool {
         // wraps the passed registry in an `Arc`, so we clone that Arc here
         // rather than re-building the registry.
         let child_tools_handle = worker.tool_registry().clone();
-        if let Some(ref config) = self.worker_config {
-            worker = worker.with_config(config.clone());
-        }
+        worker = worker.with_config(delegate_child_config(self.worker_config.as_ref()));
         if let Some(ref prompt) = self.worker_prompt {
             worker = worker.with_system_prompt(prompt.clone());
         }
@@ -880,6 +878,19 @@ impl Tool for DelegateTool {
             ..Default::default()
         })
     }
+}
+
+/// Effective config for a delegated child. A delegate child is an
+/// unattended lane (nobody can interrupt it), and
+/// `AgentConfig::default().max_iterations` is `0` = unlimited (the
+/// interactive default), so an unset worker config — or one that explicitly
+/// says unlimited — falls back to the spawn cap instead of running forever.
+fn delegate_child_config(worker_config: Option<&AgentConfig>) -> AgentConfig {
+    let mut child_config = worker_config.cloned().unwrap_or_default();
+    if child_config.max_iterations == 0 {
+        child_config.max_iterations = crate::tools::spawn::DEFAULT_SPAWN_MAX_ITERATIONS;
+    }
+    child_config
 }
 
 #[cfg(test)]
@@ -1202,5 +1213,28 @@ mod tests {
             .filter(|l| l.contains("\"delegation\""))
             .count();
         assert_eq!(delegations, N / 2, "all delegation lines present and whole");
+    }
+
+    #[test]
+    fn should_cap_delegate_child_iterations_when_worker_config_is_unset() {
+        let unset = delegate_child_config(None);
+        assert_eq!(
+            unset.max_iterations,
+            crate::tools::spawn::DEFAULT_SPAWN_MAX_ITERATIONS
+        );
+        let unlimited = AgentConfig {
+            max_iterations: 0,
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            delegate_child_config(Some(&unlimited)).max_iterations,
+            crate::tools::spawn::DEFAULT_SPAWN_MAX_ITERATIONS,
+            "an explicitly unlimited worker config must not run a delegate child forever"
+        );
+        let capped = AgentConfig {
+            max_iterations: 7,
+            ..AgentConfig::default()
+        };
+        assert_eq!(delegate_child_config(Some(&capped)).max_iterations, 7);
     }
 }

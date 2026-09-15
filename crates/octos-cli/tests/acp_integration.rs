@@ -13,6 +13,8 @@
 //! the background — all on one tokio runtime, exchanging typed JSON-RPC messages
 //! directly.
 
+#![cfg(feature = "api")]
+
 use std::sync::Arc;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -130,6 +132,24 @@ fn user_message_text(update: &SessionUpdate) -> Option<String> {
         },
         _ => None,
     }
+}
+
+/// Keep the server lifetime outside ACP SDK's client `connect_with` task actor.
+/// That actor drops its transport future when the client closure returns; it
+/// does not await the server's asynchronous teardown. Reopen tests must join
+/// this independently owned server before opening the same episode store.
+fn spawn_owned_acp_transport(
+    factory: TestAgentFactory,
+) -> (
+    agent_client_protocol::Channel,
+    tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>,
+) {
+    let (client, server) = agent_client_protocol::Channel::duplex();
+    let task = tokio::spawn(agent_client_protocol::ConnectTo::<Client>::connect_to(
+        OctosAcpAgentTransport::new(factory),
+        server,
+    ));
+    (client, task)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -475,7 +495,7 @@ async fn should_restore_a_conversation_through_session_load() {
     let sessions_dir = tmp.path().join("sessions");
     std::fs::create_dir_all(&memory_dir).unwrap();
 
-    // ---- first process: one turn, then drop the transport entirely ----
+    // First transport: one turn, then await its complete server teardown.
     let seen_one: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_one: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
         seen: seen_one.clone(),
@@ -485,8 +505,9 @@ async fn should_restore_a_conversation_through_session_load() {
     let factory_one = TestAgentFactory::new(llm_one, memory_dir.clone(), cwd.clone())
         .with_session_store(&sessions_dir);
 
+    let (client_one, server_one) = spawn_owned_acp_transport(factory_one);
     let cwd_one = cwd.clone();
-    let session_id = Client
+    let first_result = Client
         .builder()
         .name("octos-acp-persist-1")
         .on_receive_notification(
@@ -495,7 +516,7 @@ async fn should_restore_a_conversation_through_session_load() {
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(
-            OctosAcpAgentTransport::new(factory_one),
+            client_one,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -516,10 +537,14 @@ async fn should_restore_a_conversation_through_session_load() {
                 Ok::<_, agent_client_protocol::Error>(id)
             },
         )
+        .await;
+    server_one
         .await
-        .expect("first session");
+        .expect("first server task")
+        .expect("first server teardown");
+    let session_id = first_result.expect("first session");
 
-    // ---- second process: same store, same id, fresh everything else ----
+    // Second transport: same store and id, after the first owner has exited.
     let seen_two: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_two: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
         seen: seen_two.clone(),
@@ -529,9 +554,10 @@ async fn should_restore_a_conversation_through_session_load() {
     let factory_two =
         TestAgentFactory::new(llm_two, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
 
+    let (client_two, server_two) = spawn_owned_acp_transport(factory_two);
     let cwd_two = cwd.clone();
     let id_two = session_id.clone();
-    Client
+    let second_result = Client
         .builder()
         .name("octos-acp-persist-2")
         .on_receive_notification(
@@ -540,7 +566,7 @@ async fn should_restore_a_conversation_through_session_load() {
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(
-            OctosAcpAgentTransport::new(factory_two),
+            client_two,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -560,10 +586,14 @@ async fn should_restore_a_conversation_through_session_load() {
                 Ok::<_, agent_client_protocol::Error>(())
             },
         )
+        .await;
+    server_two
         .await
-        .expect("second session");
+        .expect("second server task")
+        .expect("second server teardown");
+    second_result.expect("second session");
 
-    // The second process's LLM must have been handed the first turn as context.
+    // The second transport's LLM must receive the first turn as context.
     let calls = seen_two.lock().await;
     let last = calls.last().expect("the reloaded session ran a turn");
     let joined = last.join("\n");
@@ -594,15 +624,16 @@ async fn should_replay_stored_history_as_session_updates_on_load() {
     let sessions_dir = tmp.path().join("sessions");
     std::fs::create_dir_all(&memory_dir).unwrap();
 
-    // ---- first process: one persisted turn ----
+    // First transport: one persisted turn, then await server teardown.
     let llm_one: Arc<dyn octos_llm::LlmProvider> = Arc::new(MockLlm {
         reply: "REMEMBER_THIS".to_string(),
     });
     let factory_one = TestAgentFactory::new(llm_one, memory_dir.clone(), cwd.clone())
         .with_session_store(&sessions_dir);
 
+    let (client_one, server_one) = spawn_owned_acp_transport(factory_one);
     let cwd_one = cwd.clone();
-    let session_id = Client
+    let first_result = Client
         .builder()
         .name("octos-acp-replay-1")
         .on_receive_notification(
@@ -611,7 +642,7 @@ async fn should_replay_stored_history_as_session_updates_on_load() {
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(
-            OctosAcpAgentTransport::new(factory_one),
+            client_one,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -632,21 +663,26 @@ async fn should_replay_stored_history_as_session_updates_on_load() {
                 Ok::<_, agent_client_protocol::Error>(id)
             },
         )
+        .await;
+    server_one
         .await
-        .expect("first session");
+        .expect("first server task")
+        .expect("first server teardown");
+    let session_id = first_result.expect("first session");
 
-    // ---- second process: same store, load, recording every session/update ----
+    // Second transport: same store, recording every replayed session/update.
     let llm_two: Arc<dyn octos_llm::LlmProvider> = Arc::new(MockLlm {
         reply: "SECOND_REPLY".to_string(),
     });
     let factory_two =
         TestAgentFactory::new(llm_two, memory_dir, cwd.clone()).with_session_store(&sessions_dir);
 
+    let (client_two, server_two) = spawn_owned_acp_transport(factory_two);
     let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let updates_for_handler = updates.clone();
     let id_two = session_id.clone();
     let cwd_two = cwd.clone();
-    Client
+    let second_result = Client
         .builder()
         .name("octos-acp-replay-2")
         .on_receive_notification(
@@ -657,7 +693,7 @@ async fn should_replay_stored_history_as_session_updates_on_load() {
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(
-            OctosAcpAgentTransport::new(factory_two),
+            client_two,
             |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
@@ -672,8 +708,12 @@ async fn should_replay_stored_history_as_session_updates_on_load() {
                 Ok::<_, agent_client_protocol::Error>(())
             },
         )
+        .await;
+    server_two
         .await
-        .expect("second session");
+        .expect("second server task")
+        .expect("second server teardown");
+    second_result.expect("second session");
 
     let recorded = updates.lock().await;
     let user_texts: Vec<String> = recorded.iter().filter_map(user_message_text).collect();

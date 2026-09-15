@@ -541,9 +541,9 @@ pub struct Agent {
 }
 
 pub struct AgentConfig {
-    pub max_iterations: u32,          // default: 50 (CLI overrides to 20)
+    pub max_iterations: u32,          // default: 0 (interactive = unlimited)
     pub max_tokens: Option<u32>,      // None = unlimited
-    pub max_timeout: Option<Duration>,// default: 600s wall-clock timeout
+    pub max_timeout: Option<Duration>,// default: 1800s inactivity-aware timeout
     pub save_episodes: bool,          // default: true
 }
 ```
@@ -552,7 +552,7 @@ pub struct AgentConfig {
 
 ```
 1. Build messages: system prompt + profile prompt + history + memory + input
-2. Loop (up to max_iterations):
+2. Loop (unlimited by default; explicit caps for unattended workers):
    a. Check shutdown flag and token budget; emit activity heartbeat
    b. trim_to_context_window() — three-tier compaction if needed (M8.5)
    c. Call LLM via chat_stream() (llm_call.rs)

@@ -1172,6 +1172,34 @@ impl Channel for ApiChannel {
                         done["node_costs"] = node_costs;
                     }
                 }
+                // A typed incomplete response closes the stream with an error,
+                // not a successful done. Its actual partial text was already
+                // delivered through the ordinary reply path; do not fan it out
+                // again here. Retain the same accounting/commit fields.
+                if msg.metadata.get("outcome").and_then(|value| value.as_str())
+                    == Some("incomplete")
+                    && msg
+                        .metadata
+                        .get("truncated")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                {
+                    done["type"] = "error".into();
+                    done["outcome"] = "incomplete".into();
+                    done["truncated"] = true.into();
+                    done["code"] = msg.metadata.get("error_code").cloned().unwrap_or_default();
+                    done["content"] = msg.metadata.get("error").cloned().unwrap_or_default();
+                    done["message"] = done["content"].clone();
+                    for field in [
+                        "cache_read_tokens",
+                        "cache_write_tokens",
+                        "reasoning_tokens",
+                    ] {
+                        if let Some(value) = msg.metadata.get(field) {
+                            done[field] = value.clone();
+                        }
+                    }
+                }
                 let payload = self.ui_event_sink().encode(ctx, done)?;
                 let _ = tx.send(payload);
                 pending.remove(&msg.chat_id);

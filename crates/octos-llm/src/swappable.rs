@@ -106,6 +106,35 @@ impl LlmProvider for SwappableProvider {
         *self.cached_provider_name.read().unwrap()
     }
 
+    fn provider_metadata(&self) -> crate::types::ProviderMetadata {
+        self.inner.read().unwrap().provider_metadata()
+    }
+
+    fn provider_metadata_for_index(
+        &self,
+        provider_index: Option<usize>,
+    ) -> crate::types::ProviderMetadata {
+        self.inner
+            .read()
+            .unwrap()
+            .provider_metadata_for_index(provider_index)
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.inner.read().unwrap().provider_lane_count()
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.inner.read().unwrap().api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .supports_semantic_checkpoint_hints()
+    }
+
     fn export_metrics(&self) -> Option<serde_json::Value> {
         self.inner.read().unwrap().export_metrics()
     }
@@ -192,5 +221,27 @@ mod tests {
         }));
         let resp = p.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.unwrap(), "from other");
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_tests {
+    use std::sync::Arc;
+
+    use super::SwappableProvider;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::TwoLaneStub;
+
+    #[test]
+    fn should_forward_provider_metadata_for_index_to_inner_lane_when_wrapped() {
+        let wrapped = SwappableProvider::new(Arc::new(TwoLaneStub));
+        let metadata = wrapped.provider_metadata_for_index(Some(1));
+        assert_eq!(
+            (metadata.provider.as_str(), metadata.model.as_str()),
+            ("lane-b", "model-b"),
+            "slot 1 identity must survive the wrapper: {metadata:?}"
+        );
+        assert_eq!(metadata.endpoint.as_deref(), Some("b.example"));
+        assert_eq!(wrapped.provider_metadata().provider, "lane-a");
     }
 }

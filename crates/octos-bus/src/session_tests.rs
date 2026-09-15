@@ -1,4 +1,36 @@
 use super::*;
+
+#[tokio::test]
+async fn scoped_commit_observers_follow_storage_roots_for_managers_and_handles() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let a = Arc::new(AtomicUsize::new(0));
+    let b = Arc::new(AtomicUsize::new(0));
+    let count_a = a.clone();
+    let count_b = b.clone();
+    let observer_a: MessageCommitObserver = Arc::new(move |_, _, _| {
+        count_a.fetch_add(1, Ordering::SeqCst);
+    });
+    let observer_b: MessageCommitObserver = Arc::new(move |_, _, _| {
+        count_b.fetch_add(1, Ordering::SeqCst);
+    });
+    set_scoped_message_commit_observer(first.path(), &observer_a);
+    set_scoped_message_commit_observer(second.path(), &observer_b);
+    let key = SessionKey::new("acp", "same-wire-key");
+    let mut manager = SessionManager::open(first.path()).unwrap();
+    manager
+        .add_message(&key, Message::user("first"))
+        .await
+        .unwrap();
+    let mut handle = SessionHandle::open(second.path(), &key);
+    handle.add_message(Message::user("second")).await.unwrap();
+    assert_eq!(a.load(Ordering::SeqCst), 1);
+    assert_eq!(b.load(Ordering::SeqCst), 1);
+}
 use octos_core::MessageRole;
 use tempfile::TempDir;
 

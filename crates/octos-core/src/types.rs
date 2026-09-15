@@ -607,7 +607,8 @@ pub fn is_reserved_channel_name(value: &str) -> bool {
 fn is_channel_name(value: &str) -> bool {
     matches!(
         value,
-        "api"
+        "acp"
+            | "api"
             | "cli"
             | "dingtalk"
             | "discord"
@@ -894,6 +895,15 @@ mod tests {
         assert_eq!(key.profile_id(), None);
         assert_eq!(key.channel(), "telegram");
         assert_eq!(key.chat_id(), "12345");
+    }
+
+    #[test]
+    fn acp_session_keys_keep_named_profile_and_fork_channel() {
+        let key = SessionKey::with_profile("dev", "acp", "editor-session");
+        assert_eq!(key.profile_id(), Some("dev"));
+        assert_eq!(key.channel(), "acp");
+        assert_eq!(key.fork_child("child").0, "dev:acp:child");
+        assert_eq!(SessionKey::new("acp", "legacy:session").profile_id(), None);
     }
 
     #[test]
