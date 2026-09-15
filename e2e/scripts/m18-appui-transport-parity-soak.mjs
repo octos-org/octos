@@ -1075,6 +1075,12 @@ function routeProbeParams(method) {
       return { session_id: sessionId, profile_id: profileId, job_id: 'm18-missing-job' };
     case 'onboarding/workspace_probe':
       return { path: workspace };
+    case 'onboarding/workspace_list':
+      return { path: workspace };
+    // WEB-WORKSPACE-BROWSER-CONTRACT-5000: an invalid name is refused before
+    // the server touches the filesystem, so the route probe creates nothing.
+    case 'onboarding/workspace_create':
+      return { parent: workspace, name: '..' };
     default:
       throw new Error(`missing route probe params for ${method}`);
   }

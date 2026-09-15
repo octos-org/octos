@@ -347,6 +347,15 @@ const APPUI_METHOD_SKILL_ACTION_JOB_READ: &str = "skill/action/job/read";
 /// cloud deployments reject with `profile_local_unsupported` so TUI clients
 /// see the same typed shape they get from `profile/local/create`.
 const APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE: &str = "onboarding/workspace_probe";
+/// WEB-WORKSPACE-BROWSER-CONTRACT-5000: server-side folder browsing for the
+/// web "Add workspace" form. The browser cannot read the server's filesystem
+/// and its own directory picker returns a handle with no path, so the server
+/// lists directories (`onboarding/workspace_list`) and creates one
+/// (`onboarding/workspace_create`). Siblings of `onboarding/workspace_probe`:
+/// local-solo only, same `profile_local_unsupported` refusal, same
+/// banned-system-root rule, same `~` expansion.
+const APPUI_METHOD_ONBOARDING_WORKSPACE_LIST: &str = "onboarding/workspace_list";
+const APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE: &str = "onboarding/workspace_create";
 const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
 
 /// The canonical model catalog — the single source of truth for provisionable
@@ -385,6 +394,11 @@ const MAX_ACTIVE_SKILL_ACTION_BATCHES: usize = 8;
 /// (a separate `octoscode` repo) only stages user intent — the canonical
 /// answer is the server's.
 const APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1: &str = "onboarding.workspace_probe.v1";
+/// WEB-WORKSPACE-BROWSER-CONTRACT-5000 gate. Advertised next to
+/// `onboarding.workspace_probe.v1` for local-solo deployments; a client that
+/// does not see it keeps the typed-path form and hides every browsing
+/// affordance (fail closed).
+const APPUI_FEATURE_ONBOARDING_WORKSPACE_BROWSE_V1: &str = "onboarding.workspace_browse.v1";
 const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_CLIENT_HELLO,
     APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
@@ -421,6 +435,8 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_SKILL_ACTION_JOB_LIST,
     APPUI_METHOD_SKILL_ACTION_JOB_READ,
     APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+    APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
+    APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
     octos_core::ui_protocol::methods::SESSION_BTW,
     APPUI_METHOD_SESSION_COMPACT,
     APPUI_METHOD_SESSION_COMPACT_MODE_SET,
@@ -2348,9 +2364,15 @@ impl ConnectionUiFeatures {
             // #1057: `onboarding/workspace_probe` is a local-solo onboarding
             // helper. Tenant/cloud deployments do not expose it because their
             // workspace lifecycle is owned by their control plane, not by
-            // per-session canonicalize/probe calls.
-            if *method == APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
-                && !supports_local_solo_profile_create(state)
+            // per-session canonicalize/probe calls. Contract
+            // WEB-WORKSPACE-BROWSER-CONTRACT-5000 adds the two folder-browsing
+            // siblings under exactly the same rule.
+            if matches!(
+                *method,
+                APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+                    | APPUI_METHOD_ONBOARDING_WORKSPACE_LIST
+                    | APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE
+            ) && !supports_local_solo_profile_create(state)
             {
                 continue;
             }
@@ -2497,6 +2519,14 @@ impl ConnectionUiFeatures {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1,
+            );
+            // WEB-WORKSPACE-BROWSER-CONTRACT-5000: the folder browser ships
+            // beside the probe so the web onboarding form only shows Browse /
+            // New folder when the backend can actually answer for the
+            // server's filesystem.
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_ONBOARDING_WORKSPACE_BROWSE_V1,
             );
         }
         if self.stdio_transport {
@@ -18399,6 +18429,29 @@ async fn handle_raw_appui_rpc(
             };
             onboarding_workspace_probe_result(state, &params.path)
         }
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST => {
+            // WEB-WORKSPACE-BROWSER-CONTRACT-5000 §1: params may be omitted
+            // entirely, which means the same as `{"path": null}` — list the
+            // server's own working directory.
+            let params: OnboardingWorkspaceListParams = match parse_optional_raw_params(request) {
+                Ok(params) => params,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
+            onboarding_workspace_list_result(state, params.path.as_deref())
+        }
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE => {
+            let params: OnboardingWorkspaceCreateParams = match parse_raw_params(request) {
+                Ok(params) => params,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
+            onboarding_workspace_create_result(state, &params.parent, &params.name)
+        }
         // Unreachable: the `raw_method_is_dispatched` guard at the top of this
         // function admits exactly the methods handled above. A method reaching
         // here means the guard and this match have drifted — a bug, and (for
@@ -18691,6 +18744,8 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_MCP_STATUS_LIST
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+            | APPUI_METHOD_ONBOARDING_WORKSPACE_LIST
+            | APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE
             | APPUI_METHOD_SESSION_COMPACT
             | APPUI_METHOD_SESSION_COMPACT_MODE_SET
             | APPUI_METHOD_VOICE_ADMIT
@@ -20775,6 +20830,479 @@ fn onboarding_workspace_probe_result(state: &AppState, path: &str) -> Result<Val
         "root_escape": root_escape,
         "banned_root": banned_root,
         "runtime_mode": runtime_mode_for_state(state),
+    }))
+}
+
+/// WEB-WORKSPACE-BROWSER-CONTRACT-5000 §1: `onboarding/workspace_list`
+/// returns at most this many directory entries; `truncated` reports that
+/// more existed. The cap also bounds the per-entry writability probes,
+/// which touch the filesystem once per returned entry.
+const ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES: usize = 500;
+
+/// WEB-WORKSPACE-BROWSER-CONTRACT-5000 §2: a new folder `name` is one path
+/// component of 1..=255 bytes.
+const ONBOARDING_WORKSPACE_CREATE_MAX_NAME_BYTES: usize = 255;
+
+/// Contract §1: parameters for `onboarding/workspace_list`.
+///
+/// `path` is absolute, or `~`-prefixed, or null/empty meaning "the
+/// server's own working directory". Params may be omitted entirely, which
+/// is the same as `{"path": null}`.
+#[derive(Debug, Default, Deserialize)]
+struct OnboardingWorkspaceListParams {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Contract §2: parameters for `onboarding/workspace_create`.
+#[derive(Debug, Deserialize)]
+struct OnboardingWorkspaceCreateParams {
+    parent: String,
+    name: String,
+}
+
+/// Per-method typed error kinds for the shared workspace-browse path
+/// resolver. The contract gives `workspace_list` and `workspace_create`
+/// disjoint `data.kind` vocabularies for the same underlying failures, so
+/// the resolver is parameterised over them rather than duplicated.
+struct OnboardingWorkspacePathErrorKinds {
+    invalid: &'static str,
+    not_found: &'static str,
+    permission_denied: &'static str,
+    root_escape: &'static str,
+}
+
+/// Typed `invalid_params` error in the probe's shape: a `data.kind`
+/// discriminant the client switches on, never a raw server string.
+fn workspace_browse_error(kind: &str, message: impl Into<String>) -> RpcError {
+    RpcError::invalid_params(message).with_data(json!({ "kind": kind }))
+}
+
+/// Typed `permission_denied` error for the `*_permission_denied` kinds.
+/// Same `data.kind` shape; only the JSON-RPC code differs, matching how
+/// `local_profile_permission_error` types the local-solo refusal.
+fn workspace_browse_permission_error(kind: &str, message: impl Into<String>) -> RpcError {
+    RpcError::permission_denied(message).with_data(json!({ "kind": kind }))
+}
+
+/// Typed root-escape error. `banned_root` names the banned system
+/// component (`"etc"`, …) when the escape is into a system path, and is
+/// null for a symlink escape out of the requested parent.
+fn workspace_browse_root_escape_error(
+    kind: &str,
+    message: impl Into<String>,
+    banned_root: Option<&str>,
+) -> RpcError {
+    RpcError::invalid_params(message).with_data(json!({
+        "kind": kind,
+        "banned_root": banned_root,
+    }))
+}
+
+/// Contract §1/§2: resolve a client-supplied directory path the way
+/// `onboarding/workspace_probe` does — trim, expand `~`, canonicalize —
+/// and apply the same banned-system-root rule
+/// (`workspace_root_escape_under_system_path`).
+///
+/// The root-escape check runs against BOTH the expanded literal and the
+/// canonical answer, and either one banning the path refuses it.
+///
+/// Checking the literal is what makes `/etc` refuse on macOS, where `/etc`
+/// is a symlink whose canonical form (`/private/etc`) no longer starts with
+/// a banned component — `onboarding/workspace_probe` evaluates the
+/// canonical form only, so it would answer `root_escape: false` there.
+/// Checking the canonical form afterwards catches the opposite case: a
+/// path that looks innocent but symlinks INTO a system root. Either check
+/// alone fails open.
+///
+/// The literal check does mean a hand-typed `/var/folders/...` (the macOS
+/// per-user temp root, which really is under the banned `/var`) is refused.
+/// That is the intended fail-closed answer, and it does not affect the
+/// browse flow: every path the client sends back came from a previous
+/// `canonical_path` or entry `path`, which never starts with a symlinked
+/// system root.
+fn onboarding_workspace_resolve_dir(
+    raw: &str,
+    kinds: &OnboardingWorkspacePathErrorKinds,
+) -> Result<PathBuf, RpcError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(workspace_browse_error(kinds.invalid, "path is required"));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(workspace_browse_error(
+            kinds.invalid,
+            "path must not contain control characters",
+        ));
+    }
+    let expanded = expand_home_path(trimmed);
+    if !expanded.is_absolute() {
+        return Err(workspace_browse_error(
+            kinds.invalid,
+            "path must be absolute or `~`-prefixed",
+        ));
+    }
+    if let Some(banned_root) = workspace_root_escape_under_system_path(&expanded) {
+        return Err(workspace_browse_root_escape_error(
+            kinds.root_escape,
+            format!(
+                "{} is rooted under the system path /{banned_root}",
+                expanded.display()
+            ),
+            Some(banned_root),
+        ));
+    }
+    let canonical = std::fs::canonicalize(&expanded).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => workspace_browse_error(
+            kinds.not_found,
+            format!("{} does not exist", expanded.display()),
+        ),
+        std::io::ErrorKind::PermissionDenied => workspace_browse_permission_error(
+            kinds.permission_denied,
+            format!("{} cannot be read", expanded.display()),
+        ),
+        _ => workspace_browse_error(
+            kinds.invalid,
+            format!("{} cannot be resolved: {error}", expanded.display()),
+        ),
+    })?;
+    if let Some(banned_root) = workspace_root_escape_under_system_path(&canonical) {
+        return Err(workspace_browse_root_escape_error(
+            kinds.root_escape,
+            format!(
+                "{} resolves under the system path /{banned_root}",
+                canonical.display()
+            ),
+            Some(banned_root),
+        ));
+    }
+    Ok(canonical)
+}
+
+const ONBOARDING_WORKSPACE_LIST_ERROR_KINDS: OnboardingWorkspacePathErrorKinds =
+    OnboardingWorkspacePathErrorKinds {
+        invalid: "workspace_list_invalid_path",
+        not_found: "workspace_list_not_found",
+        permission_denied: "workspace_list_permission_denied",
+        root_escape: "workspace_list_root_escape",
+    };
+
+const ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS: OnboardingWorkspacePathErrorKinds =
+    OnboardingWorkspacePathErrorKinds {
+        // The contract gives `workspace_create` no invalid-path kind: an
+        // unusable `parent` is reported as a parent that could not be found.
+        invalid: "workspace_create_parent_not_found",
+        not_found: "workspace_create_parent_not_found",
+        permission_denied: "workspace_create_permission_denied",
+        root_escape: "workspace_create_root_escape",
+    };
+
+/// WEB-WORKSPACE-BROWSER-CONTRACT-5000 §1 — server-side folder browsing
+/// for the web "Add workspace" form. The browser cannot read the server's
+/// filesystem and its own directory picker hands back a handle with no
+/// path, so the server answers the listing.
+///
+/// Result (exactly these fields — neither side invents any):
+/// - `canonical_path`: the resolved directory.
+/// - `parent_path`: the parent, or null at the filesystem root or when the
+///   parent would be a banned system path.
+/// - `writable`: whether a folder could be created inside `canonical_path`
+///   (gates the client's New folder affordance).
+/// - `entries`: DIRECTORIES ONLY, sorted case-insensitively by name, each
+///   `{name, path, writable}` with `path` canonical and absolute.
+/// - `truncated`: true when more than `ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES`
+///   directories existed.
+/// - `hidden_skipped`: how many dot-directories were omitted.
+///
+/// Local-solo only, refused exactly like `onboarding/workspace_probe`.
+fn onboarding_workspace_list_result(
+    state: &AppState,
+    path: Option<&str>,
+) -> Result<Value, RpcError> {
+    if !supports_local_solo_profile_create(state) {
+        return Err(local_profile_permission_error(
+            "profile_local_unsupported",
+            "onboarding/workspace_list is available only in local solo mode",
+            state,
+        ));
+    }
+    let canonical = match path {
+        // A path was supplied: it must be absolute (or `~`-prefixed).
+        Some(raw) => onboarding_workspace_resolve_dir(raw, &ONBOARDING_WORKSPACE_LIST_ERROR_KINDS)?,
+        // Null/omitted: the server's own working directory.
+        None => std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| {
+                workspace_browse_error(
+                    ONBOARDING_WORKSPACE_LIST_ERROR_KINDS.invalid,
+                    format!("the server working directory cannot be resolved: {error}"),
+                )
+            })?,
+    };
+
+    let metadata = std::fs::metadata(&canonical).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => workspace_browse_error(
+            ONBOARDING_WORKSPACE_LIST_ERROR_KINDS.not_found,
+            format!("{} does not exist", canonical.display()),
+        ),
+        _ => workspace_browse_permission_error(
+            ONBOARDING_WORKSPACE_LIST_ERROR_KINDS.permission_denied,
+            format!("{} cannot be inspected: {error}", canonical.display()),
+        ),
+    })?;
+    if !metadata.is_dir() {
+        return Err(workspace_browse_error(
+            "workspace_list_not_a_directory",
+            format!("{} is not a directory", canonical.display()),
+        ));
+    }
+
+    let read_dir = std::fs::read_dir(&canonical).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => workspace_browse_error(
+            ONBOARDING_WORKSPACE_LIST_ERROR_KINDS.not_found,
+            format!("{} does not exist", canonical.display()),
+        ),
+        _ => workspace_browse_permission_error(
+            ONBOARDING_WORKSPACE_LIST_ERROR_KINDS.permission_denied,
+            format!("{} cannot be listed: {error}", canonical.display()),
+        ),
+    })?;
+
+    let mut hidden_skipped: u64 = 0;
+    let mut directories: Vec<(String, PathBuf)> = Vec::new();
+    for entry in read_dir {
+        // A racing unlink between `read_dir` and the entry read is not a
+        // listing failure — the folder simply is not there any more.
+        let Ok(entry) = entry else { continue };
+        let entry_path = entry.path();
+        // Follow symlinks: a symlink to a directory is browsable, and the
+        // entry's `path` is reported canonically below.
+        let is_directory = std::fs::metadata(&entry_path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        if !is_directory {
+            // Files are never listed, and never counted as hidden.
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            hidden_skipped += 1;
+            continue;
+        }
+        directories.push((name, entry_path));
+    }
+
+    directories.sort_by(|left, right| {
+        left.0
+            .to_lowercase()
+            .cmp(&right.0.to_lowercase())
+            // Case-insensitive ties keep a deterministic order.
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let truncated = directories.len() > ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES;
+    directories.truncate(ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES);
+
+    // Writability is probed only for the entries actually returned, so a
+    // huge directory costs at most `MAX_ENTRIES` probes.
+    let entries: Vec<Value> = directories
+        .into_iter()
+        .map(|(name, entry_path)| {
+            let entry_canonical = std::fs::canonicalize(&entry_path).unwrap_or(entry_path);
+            json!({
+                "name": name,
+                "path": entry_canonical.to_string_lossy(),
+                "writable": directory_is_writable(&entry_canonical),
+            })
+        })
+        .collect();
+
+    // Null at the filesystem root, and null when stepping up would land the
+    // client in a banned system path it could never use anyway.
+    let parent_path = canonical
+        .parent()
+        .filter(|parent| workspace_root_escape_under_system_path(parent).is_none())
+        .map(|parent| parent.to_string_lossy().to_string());
+
+    Ok(json!({
+        "canonical_path": canonical.to_string_lossy(),
+        "parent_path": parent_path,
+        "writable": directory_is_writable(&canonical),
+        "entries": entries,
+        "truncated": truncated,
+        "hidden_skipped": hidden_skipped,
+    }))
+}
+
+/// Contract §2: `name` is exactly one path component — no `/`, no `\`, not
+/// `.`, not `..`, no NUL or control characters, 1..=255 bytes, and it must
+/// not start or end with whitespace. The client pre-validates the same
+/// rules; the server is the authority.
+fn validate_onboarding_workspace_folder_name(name: &str) -> Result<(), RpcError> {
+    let reject = |reason: &str| {
+        RpcError::invalid_params(format!("name is not a valid folder name: {reason}")).with_data(
+            json!({
+                "kind": "workspace_create_invalid_name",
+                "reason": reason,
+            }),
+        )
+    };
+    if name.is_empty() {
+        return Err(reject("empty"));
+    }
+    if name.len() > ONBOARDING_WORKSPACE_CREATE_MAX_NAME_BYTES {
+        return Err(reject("longer than 255 bytes"));
+    }
+    if name != name.trim() {
+        return Err(reject("leading or trailing whitespace"));
+    }
+    if name == "." || name == ".." {
+        return Err(reject("`.` and `..` are not folder names"));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(reject("must be a single path component"));
+    }
+    // `char::is_control` covers NUL along with every other control char.
+    if name.chars().any(char::is_control) {
+        return Err(reject("control characters are not allowed"));
+    }
+    // Belt and braces: whatever the host OS considers a separator, the name
+    // must still parse as exactly one normal component.
+    if !matches!(
+        Path::new(name).components().next(),
+        Some(std::path::Component::Normal(_))
+    ) || Path::new(name).components().count() != 1
+    {
+        return Err(reject("must be a single path component"));
+    }
+    Ok(())
+}
+
+/// WEB-WORKSPACE-BROWSER-CONTRACT-5000 §2 — create one folder under an
+/// existing parent, so the operator can make a workspace directory from
+/// the browser instead of shelling into the server.
+///
+/// Result (exactly these fields): `{ "canonical_path": …, "created": bool }`.
+/// `created` is false when a directory of that name already existed — an
+/// idempotent success, not an error.
+///
+/// Local-solo only, refused exactly like `onboarding/workspace_probe`.
+fn onboarding_workspace_create_result(
+    state: &AppState,
+    parent: &str,
+    name: &str,
+) -> Result<Value, RpcError> {
+    if !supports_local_solo_profile_create(state) {
+        return Err(local_profile_permission_error(
+            "profile_local_unsupported",
+            "onboarding/workspace_create is available only in local solo mode",
+            state,
+        ));
+    }
+    // Name first: a bad name is refused without touching the filesystem.
+    validate_onboarding_workspace_folder_name(name)?;
+
+    let parent_canonical =
+        onboarding_workspace_resolve_dir(parent, &ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS)?;
+    let parent_metadata =
+        std::fs::metadata(&parent_canonical).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => workspace_browse_error(
+                ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.not_found,
+                format!("{} does not exist", parent_canonical.display()),
+            ),
+            _ => workspace_browse_permission_error(
+                ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.permission_denied,
+                format!(
+                    "{} cannot be inspected: {error}",
+                    parent_canonical.display()
+                ),
+            ),
+        })?;
+    if !parent_metadata.is_dir() {
+        return Err(workspace_browse_error(
+            "workspace_create_parent_not_a_directory",
+            format!("{} is not a directory", parent_canonical.display()),
+        ));
+    }
+    if !directory_is_writable(&parent_canonical) {
+        return Err(workspace_browse_permission_error(
+            ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.permission_denied,
+            format!("{} is not writable", parent_canonical.display()),
+        ));
+    }
+
+    let target = parent_canonical.join(name);
+    let created = match std::fs::create_dir(&target) {
+        Ok(()) => true,
+        // Idempotent success (or a non-directory squatter — checked below).
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(workspace_browse_error(
+                ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.not_found,
+                format!(
+                    "{} disappeared before the folder could be created",
+                    parent_canonical.display()
+                ),
+            ));
+        }
+        Err(error) => {
+            return Err(workspace_browse_permission_error(
+                ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.permission_denied,
+                format!("{} could not be created: {error}", target.display()),
+            ));
+        }
+    };
+
+    if !created {
+        // Contract §2: a non-directory already at that path is an error,
+        // not a success.
+        let existing = std::fs::metadata(&target).map_err(|error| {
+            workspace_browse_permission_error(
+                ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.permission_denied,
+                format!("{} cannot be inspected: {error}", target.display()),
+            )
+        })?;
+        if !existing.is_dir() {
+            return Err(workspace_browse_error(
+                "workspace_create_exists_not_directory",
+                format!("{} already exists and is not a directory", target.display()),
+            ));
+        }
+    }
+
+    // Contract §2: the created path, canonicalized, must still live under
+    // `parent` — a pre-existing symlink must not hand the client a folder
+    // somewhere else on the box.
+    let canonical = std::fs::canonicalize(&target).map_err(|error| {
+        workspace_browse_permission_error(
+            ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.permission_denied,
+            format!("{} cannot be resolved: {error}", target.display()),
+        )
+    })?;
+    if !canonical.starts_with(&parent_canonical) {
+        return Err(workspace_browse_root_escape_error(
+            ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.root_escape,
+            format!(
+                "{} resolves outside {}",
+                canonical.display(),
+                parent_canonical.display()
+            ),
+            None,
+        ));
+    }
+    if let Some(banned_root) = workspace_root_escape_under_system_path(&canonical) {
+        return Err(workspace_browse_root_escape_error(
+            ONBOARDING_WORKSPACE_CREATE_ERROR_KINDS.root_escape,
+            format!(
+                "{} resolves under the system path /{banned_root}",
+                canonical.display()
+            ),
+            Some(banned_root),
+        ));
+    }
+
+    Ok(json!({
+        "canonical_path": canonical.to_string_lossy(),
+        "created": created,
     }))
 }
 
