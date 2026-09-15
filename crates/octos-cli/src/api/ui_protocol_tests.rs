@@ -29782,9 +29782,34 @@ impl octos_llm::LlmProvider for AppuiContinuationLlm {
     }
 }
 
+/// Mirrors `session_actor_tests::waiting_budget` (#2053): scale a test's
+/// WAITING budget on Windows, where loaded check-windows runners miss
+/// fixed-duration waits that pass everywhere else. Deadlines only, never
+/// stimuli.
+fn waiting_budget(base: Duration) -> Duration {
+    #[cfg(windows)]
+    {
+        base * 4
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
+
+/// Poll the mock provider until the drained continuation turn reaches it. A
+/// short fixed ceiling flakes on check-windows (main run 34931713823 failed
+/// two different callers of this helper, one per attempt, each with
+/// `call_count == 0` right after the window expired), so the deadline uses a
+/// generous base through `waiting_budget`; a passing run still exits on the
+/// first poll.
 async fn wait_for_appui_continuation(provider: &AppuiContinuationLlm) {
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + waiting_budget(Duration::from_secs(5));
+    loop {
         if provider.call_count.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
