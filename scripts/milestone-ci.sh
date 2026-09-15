@@ -108,7 +108,10 @@ run_oup_runtime() {
 }
 
 run_oup_minimal() {
-  cargo test --locked -p octos-cli --no-default-features --all-targets
+  # These server e2e bootstrap API-enabled binaries into separate target dirs.
+  # CI runs them in its dedicated API step; still compile every minimal target.
+  cargo test --locked -p octos-cli --no-default-features --all-targets -- \
+    --skip serve_broken_pipe --skip serve_sigterm
   cargo clippy --locked -p octos-cli --no-default-features --all-targets -- -D warnings
   cargo build --locked -p octos-cli --no-default-features
   OCTOS_BIN="${CARGO_TARGET_DIR:-target}/debug/octos" python3 scripts/tests/test-oup-runtime.py --minimal
