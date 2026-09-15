@@ -40,10 +40,10 @@
 //!   [`crate::ToolApprovalDecision::Deny`].
 //! - `approval_unavailable` — approval is required but no requester
 //!   was wired. **Fail closed** — never fall through to dispatch.
-//! - `env_forbidden` — the dispatch's task carries an env key that
-//!   fails either the dispatch policy's env allowlist (key not in
-//!   allowlist) or env denylist (key in denylist). Used by callers
-//!   that pass env through the task payload to the backend.
+//! - `env_forbidden` — the dispatch's task payload or the backend's
+//!   configured env carries a key that fails either the dispatch
+//!   policy's env allowlist (key not in allowlist) or env denylist
+//!   (key in denylist).
 //! - `sandbox_required` — the dispatch policy demands a sandboxed
 //!   backend but the wired backend does not self-report sandboxing.
 
@@ -59,16 +59,22 @@ use crate::{
 
 /// Backend facts needed by the dispatch policy gate.
 ///
-/// The gate only needs display labels for diagnostics and whether the
-/// caller can prove the dispatch will run under a sandbox. Keeping this
-/// metadata independent from [`McpAgentBackend`] lets direct CLI or
-/// native-specialist launchers reuse the same gate instead of open-coding
-/// parallel checks.
+/// The gate only needs display labels for diagnostics, whether the
+/// caller can prove the dispatch will run under a sandbox, and the env
+/// keys the backend will set on the spawned child (#1601). Keeping
+/// this metadata independent from [`McpAgentBackend`] lets direct CLI
+/// or native-specialist launchers reuse the same gate instead of
+/// open-coding parallel checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchBackendMetadata {
     backend_label: String,
     endpoint_label: String,
     sandboxed: bool,
+    /// Env keys the backend is configured to set on the spawned child
+    /// ([#1601](https://github.com/octos-org/octos/issues/1601)). The
+    /// env gate inspects them alongside any `env` object on the
+    /// dispatch payload.
+    env_keys: Vec<String>,
 }
 
 impl DispatchBackendMetadata {
@@ -81,6 +87,7 @@ impl DispatchBackendMetadata {
             backend_label: backend_label.into(),
             endpoint_label: endpoint_label.into(),
             sandboxed,
+            env_keys: Vec::new(),
         }
     }
 
@@ -97,6 +104,14 @@ impl DispatchBackendMetadata {
 
     pub fn from_mcp_backend(backend: &dyn McpAgentBackend) -> Self {
         Self::unsandboxed(backend.backend_label(), backend.endpoint_label())
+            .with_env_keys(backend.configured_env_keys())
+    }
+
+    /// Record the env keys the backend will set on the spawned child so
+    /// the env gates can inspect them.
+    pub fn with_env_keys(mut self, env_keys: Vec<String>) -> Self {
+        self.env_keys = env_keys;
+        self
     }
 
     pub fn backend_label(&self) -> &str {
@@ -109,6 +124,10 @@ impl DispatchBackendMetadata {
 
     pub fn is_sandboxed(&self) -> bool {
         self.sandboxed
+    }
+
+    pub fn env_keys(&self) -> &[String] {
+        &self.env_keys
     }
 }
 
@@ -130,21 +149,24 @@ pub struct DispatchPolicy {
     /// Approval bridge used when [`Self::require_approval`] is true.
     pub approval_requester: Option<Arc<dyn ToolApprovalRequester>>,
     /// Env keys the dispatch is allowed to forward to the backend.
-    /// Inspected against the dispatched task payload — if the task
-    /// carries an `env` object whose keys overlap any name **not** in
-    /// this allowlist, the dispatch is denied with `env_forbidden`.
-    /// `None` means allowlist checking is off. Names are matched
-    /// case-insensitively against the upper-cased form.
+    /// Inspected against the dispatched task payload's `env` object
+    /// and the backend's configured env keys — a key overlapping any
+    /// name **not** in this allowlist denies the dispatch with
+    /// `env_forbidden`. `None` means allowlist checking is off. Keys
+    /// are matched after upper-casing, so entries must be stored
+    /// upper-cased (as [`Self::from_agent_gates`] does).
     pub env_allowlist: Option<HashSet<String>>,
-    /// Env keys the dispatch must reject if the task payload tries to
-    /// forward them. Complements [`Self::env_allowlist`]: an entry here
-    /// is denied unconditionally (matches the agent's
-    /// `subprocess_env::BLOCKED_ENV_VARS` denylist semantics, e.g.
-    /// `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`). Both
-    /// fields can be wired together — the denylist runs first so a
-    /// permissive allowlist cannot accidentally let a known-bad key
-    /// through. Names are matched case-insensitively. `None` means the
-    /// denylist gate is off.
+    /// Env keys the dispatch must reject. Complements
+    /// [`Self::env_allowlist`]: an entry here is denied unconditionally
+    /// (matches the agent's `subprocess_env::BLOCKED_ENV_VARS` denylist
+    /// semantics, e.g. `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`,
+    /// `NODE_OPTIONS`). Inspected against both the task payload's `env`
+    /// object and the backend's configured env keys. Both fields can be
+    /// wired together — the denylist runs first so a permissive
+    /// allowlist cannot accidentally let a known-bad key through. Keys
+    /// are matched after upper-casing, so entries must be stored
+    /// upper-cased (as [`Self::from_agent_gates`] does). `None` means
+    /// the denylist gate is off.
     pub env_denylist: Option<HashSet<String>>,
     /// When `true`, the wired backend must self-report as sandboxed. No
     /// [`McpAgentBackend`] does today, so this field is provided for
@@ -216,8 +238,9 @@ impl DispatchPolicy {
     /// native side: an absent config means no policy is applied).
     /// `block_injection_env_vars: true` populates the env denylist
     /// with the workspace-wide [`crate::sandbox::BLOCKED_ENV_VARS`]
-    /// set so dispatches fail closed if the contract carries
-    /// `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, etc.
+    /// set so dispatches fail closed if the contract carries — or the
+    /// backend is configured to set (#1601) — `LD_PRELOAD`,
+    /// `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, etc.
     /// Use `false` only for tests that explicitly need to drive an
     /// injection-style env through the gate.
     pub fn from_agent_gates(
@@ -272,7 +295,10 @@ pub struct DispatchTarget<'a> {
     /// Tool name evaluated against [`DispatchPolicy::tool_policy`].
     pub tool_name: &'a str,
     /// Task payload inspected for forbidden env keys when an
-    /// allowlist / denylist is configured.
+    /// allowlist / denylist is configured. The gate also inspects the
+    /// backend's configured env keys ([`DispatchBackendMetadata::env_keys`])
+    /// so a policy cannot be bypassed by setting injection-class env in
+    /// the backend config instead of the payload (#1601).
     pub task: &'a serde_json::Value,
 }
 
@@ -284,10 +310,10 @@ pub struct DispatchTarget<'a> {
 ///
 /// 1. Sandbox requirement (cheapest, config-only).
 /// 2. Tool policy (synchronous evaluator, no I/O).
-/// 3. Env denylist (synchronous, inspects the task payload — runs
-///    before the allowlist so a permissive allowlist cannot let a
-///    known-bad key through).
-/// 4. Env allowlist (synchronous, inspects the task payload).
+/// 3. Env denylist (synchronous, inspects the payload `env` object and
+///    the backend's configured env keys — runs before the allowlist so
+///    a permissive allowlist cannot let a known-bad key through).
+/// 4. Env allowlist (synchronous, same inputs).
 /// 5. Approval (last; may block on user interaction).
 pub async fn enforce_dispatch_gates(
     policy: &DispatchPolicy,
@@ -338,33 +364,50 @@ pub async fn enforce_dispatch_gates_for_backend(
         }
     }
 
-    if let Some(ref denylist) = policy.env_denylist {
-        if let Some(forbidden) = first_denied_env_key(target.task, denylist) {
-            warn!(
-                dispatch_id = %target.dispatch_id,
-                forbidden_key = %forbidden,
-                "dispatch denied by env denylist"
-            );
-            return Err(GateDenial {
-                last_dispatch_outcome: "env_forbidden",
-                reason: format!(
-                    "env variable '{forbidden}' is denied by the dispatch denylist (injection-class env vars are blocked)"
-                ),
-            });
-        }
-    }
+    if policy.env_denylist.is_some() || policy.env_allowlist.is_some() {
+        // #1601: the effective env surface is the union of the keys the
+        // dispatch payload tries to forward (`task["env"]`, e.g. the
+        // supervised CLI specialist path) and the keys the backend
+        // itself is configured to set on the spawned process.
+        // Payload-only inspection had no live input — no MCP dispatch
+        // site sets `env` on the payload.
+        let env_keys: Vec<&str> = target
+            .task
+            .get("env")
+            .and_then(|env| env.as_object())
+            .into_iter()
+            .flat_map(|env| env.keys().map(String::as_str))
+            .chain(backend.env_keys().iter().map(String::as_str))
+            .collect();
 
-    if let Some(ref allowlist) = policy.env_allowlist {
-        if let Some(forbidden) = first_forbidden_env_key(target.task, allowlist) {
-            warn!(
-                dispatch_id = %target.dispatch_id,
-                forbidden_key = %forbidden,
-                "dispatch denied by env allowlist"
-            );
-            return Err(GateDenial {
-                last_dispatch_outcome: "env_forbidden",
-                reason: format!("env variable '{forbidden}' is not in the dispatch allowlist"),
-            });
+        if let Some(ref denylist) = policy.env_denylist {
+            if let Some(forbidden) = first_denied_env_key(&env_keys, denylist) {
+                warn!(
+                    dispatch_id = %target.dispatch_id,
+                    forbidden_key = %forbidden,
+                    "dispatch denied by env denylist"
+                );
+                return Err(GateDenial {
+                    last_dispatch_outcome: "env_forbidden",
+                    reason: format!(
+                        "env variable '{forbidden}' is denied by the dispatch denylist (injection-class env vars are blocked)"
+                    ),
+                });
+            }
+        }
+
+        if let Some(ref allowlist) = policy.env_allowlist {
+            if let Some(forbidden) = first_forbidden_env_key(&env_keys, allowlist) {
+                warn!(
+                    dispatch_id = %target.dispatch_id,
+                    forbidden_key = %forbidden,
+                    "dispatch denied by env allowlist"
+                );
+                return Err(GateDenial {
+                    last_dispatch_outcome: "env_forbidden",
+                    reason: format!("env variable '{forbidden}' is not in the dispatch allowlist"),
+                });
+            }
         }
     }
 
@@ -415,26 +458,21 @@ pub async fn enforce_dispatch_gates_for_backend(
     Ok(())
 }
 
-fn first_forbidden_env_key(
-    task: &serde_json::Value,
-    allowlist: &HashSet<String>,
-) -> Option<String> {
-    let env = task.get("env")?.as_object()?;
-    for key in env.keys() {
+fn first_forbidden_env_key(env_keys: &[&str], allowlist: &HashSet<String>) -> Option<String> {
+    for key in env_keys {
         let normalized = key.to_ascii_uppercase();
         if !allowlist.contains(&normalized) {
-            return Some(key.clone());
+            return Some((*key).to_string());
         }
     }
     None
 }
 
-fn first_denied_env_key(task: &serde_json::Value, denylist: &HashSet<String>) -> Option<String> {
-    let env = task.get("env")?.as_object()?;
-    for key in env.keys() {
+fn first_denied_env_key(env_keys: &[&str], denylist: &HashSet<String>) -> Option<String> {
+    for key in env_keys {
         let normalized = key.to_ascii_uppercase();
         if denylist.contains(&normalized) {
-            return Some(key.clone());
+            return Some((*key).to_string());
         }
     }
     None
@@ -446,7 +484,10 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
-    use crate::tools::mcp_agent::{DispatchOutcome, DispatchRequest, DispatchResponse};
+    use crate::tools::mcp_agent::{
+        CliAgentBackend, DispatchOutcome, DispatchRequest, DispatchResponse, McpAgentBackendConfig,
+        StdioMcpAgent,
+    };
 
     struct StubBackend;
 
@@ -538,6 +579,163 @@ mod tests {
             .expect_err("denied");
         assert_eq!(denial.last_dispatch_outcome, "env_forbidden");
         assert!(denial.reason.contains("LD_PRELOAD"));
+    }
+
+    /// #1601: no dispatch payload ever carries an `env` object — the
+    /// env that actually reaches a spawned sub-agent comes from the
+    /// backend's own configuration. The gate must inspect those
+    /// configured keys too, or the denylist has no live input.
+    #[tokio::test]
+    async fn env_denylist_blocks_backend_configured_env_keys() {
+        let policy = DispatchPolicy::from_agent_gates(None, true);
+        let backend = StdioMcpAgent::from_config(&McpAgentBackendConfig::Local {
+            cmd: "echo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::from([(
+                "LD_PRELOAD".to_string(),
+                "/tmp/evil.so".to_string(),
+            )]),
+            dispatch_timeout_secs: None,
+        })
+        .expect("valid backend config");
+        let task = json!({"task": "noop"});
+        let denial = enforce_dispatch_gates(&policy, &backend, target("c1", "any", &task))
+            .await
+            .expect_err("backend-configured LD_PRELOAD must fail closed");
+        assert_eq!(denial.last_dispatch_outcome, "env_forbidden");
+        assert!(denial.reason.contains("LD_PRELOAD"));
+    }
+
+    /// #1601: backend-configured keys are matched case-insensitively,
+    /// same as payload keys.
+    #[tokio::test]
+    async fn env_denylist_blocks_backend_env_keys_case_insensitively() {
+        let policy = DispatchPolicy::from_agent_gates(None, true);
+        let backend = StdioMcpAgent::from_config(&McpAgentBackendConfig::Local {
+            cmd: "echo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::from([(
+                "ld_preload".to_string(),
+                "/tmp/evil.so".to_string(),
+            )]),
+            dispatch_timeout_secs: None,
+        })
+        .expect("valid backend config");
+        let task = json!({"task": "noop"});
+        let denial = enforce_dispatch_gates(&policy, &backend, target("c1", "any", &task))
+            .await
+            .expect_err("lowercase ld_preload must fail closed");
+        assert_eq!(denial.last_dispatch_outcome, "env_forbidden");
+        assert!(denial.reason.contains("ld_preload"));
+    }
+
+    /// #1601: the allowlist gate inspects backend-configured keys too.
+    #[tokio::test]
+    async fn env_allowlist_blocks_backend_env_key_not_listed() {
+        let mut allowlist = HashSet::new();
+        allowlist.insert("PATH".to_string());
+
+        let policy = DispatchPolicy {
+            env_allowlist: Some(allowlist),
+            ..Default::default()
+        };
+        let backend = StdioMcpAgent::from_config(&McpAgentBackendConfig::Local {
+            cmd: "echo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::from([(
+                "ACME_TOKEN".to_string(),
+                "secret".to_string(),
+            )]),
+            dispatch_timeout_secs: None,
+        })
+        .expect("valid backend config");
+        let task = json!({"task": "noop"});
+        let denial = enforce_dispatch_gates(&policy, &backend, target("c1", "any", &task))
+            .await
+            .expect_err("backend env key outside the allowlist must be denied");
+        assert_eq!(denial.last_dispatch_outcome, "env_forbidden");
+        assert!(denial.reason.contains("ACME_TOKEN"));
+    }
+
+    /// #1601: harmless backend env keys must not trip the injection
+    /// denylist — the gate only fails closed on listed names.
+    #[tokio::test]
+    async fn env_denylist_permits_benign_backend_env_keys() {
+        let policy = DispatchPolicy::from_agent_gates(None, true);
+        let backend = StdioMcpAgent::from_config(&McpAgentBackendConfig::Local {
+            cmd: "echo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::from([(
+                "ACME_REGION".to_string(),
+                "us-test-1".to_string(),
+            )]),
+            dispatch_timeout_secs: None,
+        })
+        .expect("valid backend config");
+        let task = json!({"task": "noop"});
+        assert!(
+            enforce_dispatch_gates(&policy, &backend, target("c1", "any", &task))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// #1601: payload `env` and backend-configured env are inspected as
+    /// one union — a benign payload must not dilute a denied
+    /// backend-configured key, and vice versa.
+    #[tokio::test]
+    async fn env_denylist_unions_payload_and_backend_env_keys() {
+        let policy = DispatchPolicy::from_agent_gates(None, true);
+        let backend = StdioMcpAgent::from_config(&McpAgentBackendConfig::Local {
+            cmd: "echo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::from([(
+                "NODE_OPTIONS".to_string(),
+                "--require /tmp/evil.js".to_string(),
+            )]),
+            dispatch_timeout_secs: None,
+        })
+        .expect("valid backend config");
+        let task = json!({"env": {"ACME_REGION": "us-test-1"}});
+        let denial = enforce_dispatch_gates(&policy, &backend, target("c1", "any", &task))
+            .await
+            .expect_err(
+                "backend-configured NODE_OPTIONS must fail closed even with a benign payload env",
+            );
+        assert_eq!(denial.last_dispatch_outcome, "env_forbidden");
+        assert!(denial.reason.contains("NODE_OPTIONS"));
+    }
+
+    /// #1601: `from_mcp_backend` captures the CLI backend's configured
+    /// env keys so `enforce_dispatch_gates_for_backend` callers (the
+    /// supervised MCP specialist path) get the same live gate input.
+    #[tokio::test]
+    async fn cli_backend_env_keys_flow_into_backend_metadata() {
+        let policy = DispatchPolicy::from_agent_gates(None, true);
+        let backend = CliAgentBackend::from_config(&McpAgentBackendConfig::Cli {
+            cmd: "echo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::from([(
+                "DYLD_INSERT_LIBRARIES".to_string(),
+                "/tmp/evil.dylib".to_string(),
+            )]),
+            dispatch_timeout_secs: None,
+            prompt_via_stdin: false,
+        })
+        .expect("valid backend config");
+        let metadata = DispatchBackendMetadata::from_mcp_backend(&backend);
+        assert!(
+            metadata
+                .env_keys()
+                .iter()
+                .any(|key| key == "DYLD_INSERT_LIBRARIES")
+        );
+        let task = json!({"task": "noop"});
+        let denial =
+            enforce_dispatch_gates_for_backend(&policy, &metadata, target("c1", "any", &task))
+                .await
+                .expect_err("CLI backend configured with DYLD_INSERT_LIBRARIES must fail closed");
+        assert_eq!(denial.last_dispatch_outcome, "env_forbidden");
     }
 
     #[test]
