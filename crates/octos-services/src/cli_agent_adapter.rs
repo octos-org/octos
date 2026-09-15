@@ -168,6 +168,25 @@ impl CliAgentProcess {
             command.current_dir(cwd);
         }
         command.envs(&config.env);
+        // Injection-class vars must never reach the child — neither via
+        // config.env nor inherited from our own process. Strip the blocklist
+        // last so it always wins, mirroring the MCP dispatch backends.
+        // General inheritance stays: headless CLIs resolve provider
+        // credentials from the parent environment.
+        for key in config.env.keys() {
+            if octos_core::BLOCKED_ENV_VARS
+                .iter()
+                .any(|blocked| key.eq_ignore_ascii_case(blocked))
+            {
+                tracing::warn!(
+                    key = key.as_str(),
+                    "blocked dangerous CLI-agent environment variable"
+                );
+            }
+        }
+        for blocked in octos_core::BLOCKED_ENV_VARS {
+            command.env_remove(blocked);
+        }
 
         let mut child = spawn_cli_agent_command(&mut command)?;
         let stdout = child
@@ -559,6 +578,94 @@ printf '%s\n' "$1"
         assert!(
             !injected.exists(),
             "argv payload must not be shell-evaluated"
+        );
+    }
+
+    /// Injection-class vars must not reach the child even when the operator
+    /// config reintroduces them: the trailing blocklist strip always wins,
+    /// mirroring the MCP dispatch backends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_env_vars_do_not_reach_child_via_config_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            &dir,
+            "env-dump-agent",
+            r#"#!/bin/sh
+printf 'NODE_OPTIONS=%s\n' "${NODE_OPTIONS:-<unset>}"
+"#,
+        );
+
+        let result = run_cli_agent_command(
+            shell_fixture_config(&script).env("NODE_OPTIONS", "--require /tmp/evil"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.transcript.stdout, "NODE_OPTIONS=<unset>\n");
+    }
+
+    /// Re-exec harness for [`cli_agent_child_inherited_env_inner`]: runs that
+    /// test in a fresh test-binary process whose environment carries
+    /// injection-class vars, so the inherited-parent-env surface is exercised
+    /// without mutating this process's own (thread-shared) environment.
+    #[cfg(unix)]
+    #[test]
+    fn blocked_parent_env_vars_are_scrubbed_but_inheritance_survives() {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .arg("cli_agent_child_inherited_env_inner")
+            .arg("--nocapture")
+            .env("NODE_OPTIONS", "--require /tmp/evil")
+            .env("PYTHONSTARTUP", "/tmp/evil.py")
+            .env("OCTOS_CLI_AGENT_ENV_TEST_MARKER", "present")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "inner test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Inner half of the inherited-env test. Only does anything when the
+    /// re-exec harness above set its marker; a plain `cargo test` run skips.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_agent_child_inherited_env_inner() {
+        if std::env::var_os("OCTOS_CLI_AGENT_ENV_TEST_MARKER").is_none() {
+            return;
+        }
+        // Sanity: the harness really did hand us the injection-class vars,
+        // otherwise the assertions below would pass vacuously.
+        assert_eq!(
+            std::env::var("NODE_OPTIONS").unwrap(),
+            "--require /tmp/evil"
+        );
+        assert_eq!(std::env::var("PYTHONSTARTUP").unwrap(), "/tmp/evil.py");
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            &dir,
+            "env-dump-agent",
+            r#"#!/bin/sh
+printf 'NODE_OPTIONS=%s\n' "${NODE_OPTIONS:-<unset>}"
+printf 'PYTHONSTARTUP=%s\n' "${PYTHONSTARTUP:-<unset>}"
+printf 'MARKER=%s\n' "${OCTOS_CLI_AGENT_ENV_TEST_MARKER:-<unset>}"
+"#,
+        );
+
+        let result = run_cli_agent_command(shell_fixture_config(&script))
+            .await
+            .unwrap();
+
+        // Blocked names are scrubbed; ordinary vars still inherit (headless
+        // CLIs resolve provider credentials from the parent environment).
+        assert_eq!(
+            result.transcript.stdout,
+            "NODE_OPTIONS=<unset>\nPYTHONSTARTUP=<unset>\nMARKER=present\n"
         );
     }
 

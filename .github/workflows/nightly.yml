@@ -170,9 +170,114 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # #1923 — cadence-independent canary for the required e2e-tool-regression
+  # lane. In ci.yml that job only fires when a diff trips the path filter, so
+  # a serve-boot or endpoint-gating regression on main stays invisible until
+  # some unrelated PR happens to touch a matching path (the exact condition
+  # that let the original breakage sit unnoticed). This job runs the same
+  # spec (tests/tool-use-regression.spec.ts) on the same platform (macos-14 —
+  # the PATH assertion is Homebrew-specific) with the same feature set,
+  # blocking: a failure feeds the regression-issue reconciler below. As in
+  # the required lane, the two chat-turn tests pass vacuously with no
+  # provider configured — the canary's teeth are the serve boot, the
+  # admin-shell endpoint, and the ffmpeg/PATH assertions. The m9
+  # model-independent specs already have nightly coverage via
+  # protocol-e2e's glob, so they are not duplicated here.
+  tool-regression-e2e:
+    name: Tool-use regression E2E (required-lane canary)
+    runs-on: macos-14
+    # 90 rather than the protocol-e2e 60: save-if: false means every run is a
+    # cold release build on a 3-vCPU runner (the required lane's warm-cache
+    # build alone takes 12-25 min), and a runner-cancelled job feeds the
+    # reconciler's `cancelled` branch as a false regression alarm.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-tool-regression
+          save-if: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      # MUST precede the cargo build: the admin SPA is embedded into the
+      # binary at compile time (see the same comment on the required lane in
+      # ci.yml). Without it /admin/login answers 503 and the setup-wizard
+      # readiness probe times out.
+      - name: Build dashboard and server (required-lane feature set)
+        run: |
+          ./scripts/build-dashboard.sh
+          cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram" --locked
+      - name: Install Homebrew ffmpeg (macOS)
+        run: brew install ffmpeg
+      # /api/admin/shell is registered only when allow_admin_shell is true
+      # (see the #2031 comment on the required lane). Enabled on an ephemeral
+      # runner, bound to loopback, behind an admin token — nowhere else.
+      - name: Start octos serve
+        run: |
+          set -euo pipefail
+          echo '{"allow_admin_shell": true}' > /tmp/octos-nightly-tool-regression.json
+          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
+            --config /tmp/octos-nightly-tool-regression.json > server.log 2>&1 &
+          echo $! > server.pid
+          for attempt in $(seq 1 45); do
+            curl -sf http://localhost:3000/health >/dev/null && exit 0
+            echo "attempt $attempt/45: waiting for octos serve"
+            sleep 1
+          done
+          echo "::error::octos serve did not become healthy"
+          cat server.log
+          exit 1
+      # Fail loudly at the precondition rather than inside four assertions
+      # that each report it as `undefined` (same probe as the required lane).
+      - name: Verify the admin shell endpoint is live
+        run: |
+          set -euo pipefail
+          body=$(curl -s -w '\n%{http_code}' -X POST http://localhost:3000/api/admin/shell \
+            -H "Authorization: Bearer ci-test-token" \
+            -H 'Content-Type: application/json' \
+            -d '{"command":"command -v ffmpeg"}')
+          code=$(echo "$body" | tail -1)
+          echo "$body" | sed '$d'
+          if [ "$code" != "200" ]; then
+            echo "::error::/api/admin/shell answered HTTP $code — expected 200."
+            exit 1
+          fi
+      - name: Install browser test dependencies
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install chromium
+      - name: Run tool-use regression spec
+        working-directory: e2e
+        env:
+          OCTOS_TEST_URL: http://localhost:3000
+          OCTOS_AUTH_TOKEN: ci-test-token
+        run: npx playwright test --reporter=line tests/tool-use-regression.spec.ts
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill "$(cat server.pid)" 2>/dev/null || true; fi
+      - name: Upload tool-regression evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-tool-regression-evidence
+          path: |
+            server.log
+            e2e/test-results/
+            e2e/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
   regression-issue:
     name: Reconcile nightly regression issue
-    needs: [check-arm, check-windows, protocol-e2e]
+    needs: [check-arm, check-windows, protocol-e2e, tool-regression-e2e]
     if: always() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
