@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -7441,7 +7442,14 @@ async fn drain_connection_turns_for_shutdown(
 }
 
 pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
-    stdio_connection_with_io(state, tokio::io::stdin(), tokio::io::stdout()).await
+    stdio_connection_with_io(
+        state,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        #[cfg(test)]
+        new_stdio_dispatch_count_for_test(),
+    )
+    .await
 }
 
 /// Lifecycle owned by a local frontend, not a second execution policy.
@@ -7463,19 +7471,36 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    stdio_connection_with_io_policy(state, stdin_reader, stdout_writer, Some(control)).await
+    stdio_connection_with_io_policy(
+        state,
+        stdin_reader,
+        stdout_writer,
+        Some(control),
+        #[cfg(test)]
+        new_stdio_dispatch_count_for_test(),
+    )
+    .await
 }
 
 pub(crate) async fn stdio_connection_with_io<R, W>(
     state: Arc<AppState>,
     stdin_reader: R,
     stdout_writer: W,
+    #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    stdio_connection_with_io_policy(state, stdin_reader, stdout_writer, None).await
+    stdio_connection_with_io_policy(
+        state,
+        stdin_reader,
+        stdout_writer,
+        None,
+        #[cfg(test)]
+        dispatch_count,
+    )
+    .await
 }
 
 async fn stdio_connection_with_io_policy<R, W>(
@@ -7483,6 +7508,7 @@ async fn stdio_connection_with_io_policy<R, W>(
     stdin_reader: R,
     stdout_writer: W,
     embedded: Option<EmbeddedStdioControl>,
+    #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -7613,7 +7639,7 @@ where
                 serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
             );
             #[cfg(test)]
-            record_stdio_dispatch_for_test();
+            record_stdio_dispatch_for_test(&dispatch_count);
             let id = request.id.clone();
             // stdio transport is never a session-ingress socket.
             if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features, false) {
@@ -8220,23 +8246,20 @@ where
     dispatch_result
 }
 
+// Per-connection dispatch count: every stdio connection counts its own
+// requests, so tests running in parallel cannot observe each other's
+// traffic through a process-global counter (#2336).
 #[cfg(test)]
-static STDIO_DISPATCH_COUNT_FOR_TEST: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+type StdioDispatchCountForTest = Arc<std::sync::atomic::AtomicUsize>;
 
 #[cfg(test)]
-fn reset_stdio_dispatch_count_for_test() {
-    STDIO_DISPATCH_COUNT_FOR_TEST.store(0, Ordering::SeqCst);
+fn new_stdio_dispatch_count_for_test() -> StdioDispatchCountForTest {
+    Arc::new(std::sync::atomic::AtomicUsize::new(0))
 }
 
 #[cfg(test)]
-fn stdio_dispatch_count_for_test() -> usize {
-    STDIO_DISPATCH_COUNT_FOR_TEST.load(Ordering::SeqCst)
-}
-
-#[cfg(test)]
-fn record_stdio_dispatch_for_test() {
-    STDIO_DISPATCH_COUNT_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+fn record_stdio_dispatch_for_test(count: &StdioDispatchCountForTest) {
+    count.fetch_add(1, Ordering::SeqCst);
 }
 
 enum StdioFrameRead {
@@ -8650,6 +8673,39 @@ struct RawLlmRoute {
     api_type: Option<String>,
 }
 
+/// Wire form of `selection.context_window` (#2187): accepts ANY JSON integer
+/// (signed or unsigned 64-bit) so out-of-`u32` values reach the typed
+/// `llm_param_out_of_range` check instead of serde's generic deserialize
+/// error. Non-integers (floats, strings) still fail deserialization as
+/// before — those are type errors, not range errors.
+#[derive(Debug, Clone, Copy)]
+struct WireContextWindow(i128);
+
+impl<'de> Deserialize<'de> for WireContextWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct IntVisitor;
+        impl serde::de::Visitor<'_> for IntVisitor {
+            type Value = WireContextWindow;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an integer context window budget")
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(WireContextWindow(i128::from(value)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(WireContextWindow(i128::from(value)))
+            }
+        }
+        deserializer.deserialize_i128(IntVisitor)
+    }
+}
+
 /// The typed main-model selection + inference-parameter schema shared by
 /// `profile/llm/upsert`, `profile/llm/test`, and `profile/llm/fetch_models`
 /// (#2166). Test and Save parse the identical shape, so a payload that
@@ -8686,9 +8742,12 @@ struct RawLlmSelection {
     model_hints: Option<octos_llm::openai::ModelHints>,
     /// Local runtime context budget override (#2142). Reaches the runtime
     /// `ContextWindowOverride` via the durable selection; NOT an upstream
-    /// request field.
+    /// request field. Carried as a raw integer on the wire so negative /
+    /// over-u32 values reach the typed range check (#2187) instead of a
+    /// generic serde error; validated into the `u32` store type by
+    /// [`validate_llm_inference_fields`].
     #[serde(default)]
-    context_window: Option<u32>,
+    context_window: Option<WireContextWindow>,
     /// Per-model default sampling temperature (finite, 0.0..=2.0).
     #[serde(default)]
     temperature: Option<f64>,
@@ -8791,9 +8850,12 @@ fn reject_unknown_llm_upsert_fields(params: &Value) -> Result<(), RpcError> {
         .keys()
         .filter(|key| !LLM_UPSERT_KNOWN_TOP.contains(&key.as_str()))
         .filter(|key| {
+            // Only TOP-LEVEL foreign paths exclude a top-level key: a literal
+            // dotted key at the top level (legal in JSON) is an unknown key,
+            // not the nested foreign field (#2187).
             !LLM_FOREIGN_FIELDS
                 .iter()
-                .any(|(path, _)| *path == key.as_str())
+                .any(|(path, _)| !path.contains('.') && *path == key.as_str())
         })
         .map(String::clone)
         .collect();
@@ -8844,16 +8906,28 @@ fn reject_unknown_llm_upsert_fields(params: &Value) -> Result<(), RpcError> {
                 json!({ "field": path, "owner": owner })
             })
             .collect();
-        return Err(RpcError::invalid_params(format!(
+        let mut message = format!(
             "field(s) {} belong to a different configuration contract and are not \
              accepted by profile/llm/upsert",
             foreign.join(", ")
-        ))
-        .with_data(json!({
+        );
+        let mut data = json!({
             "kind": "llm_param_owned_elsewhere",
             "rejected_fields": foreign,
             "owners": owners,
-        })));
+        });
+        // #2187: unknown fields in the SAME request are rejected too — name
+        // them in this error instead of dropping them behind the foreign arm.
+        if !unknown.is_empty() {
+            unknown.sort();
+            message.push_str(&format!(
+                "; unknown field(s): {} — profile/llm/upsert accepts a typed schema and \
+                 never silently discards fields",
+                unknown.join(", ")
+            ));
+            data["unknown_fields"] = json!(unknown);
+        }
+        return Err(RpcError::invalid_params(message).with_data(data));
     }
 
     if !unknown.is_empty() {
@@ -8909,16 +8983,22 @@ fn validate_llm_inference_fields(selection: &RawLlmSelection) -> Result<(), RpcE
     }
     check_f64_range(selection.temperature, "temperature", "0.0..=2.0", 0.0, 2.0)?;
     check_f64_range(selection.top_p, "top_p", "0.0..=1.0", 0.0, 1.0)?;
-    if selection.context_window == Some(0) {
-        return Err(
-            RpcError::invalid_params("selection.context_window must be >= 1 token").with_data(
-                json!({
-                    "kind": "llm_param_out_of_range",
-                    "field": "selection.context_window",
-                    "range": ">=1",
-                }),
-            ),
-        );
+    // #2187: the wire type accepts any JSON integer precisely so out-of-u32
+    // values land here (typed range kind) rather than in serde's generic
+    // deserialize error.
+    if let Some(context_window) = selection.context_window {
+        let range = format!("1..={}", u32::MAX);
+        if !(1..=i128::from(u32::MAX)).contains(&context_window.0) {
+            return Err(RpcError::invalid_params(format!(
+                "selection.context_window must be in {range}, got {}",
+                context_window.0
+            ))
+            .with_data(json!({
+                "kind": "llm_param_out_of_range",
+                "field": "selection.context_window",
+                "range": range,
+            })));
+        }
     }
     Ok(())
 }
@@ -13029,7 +13109,9 @@ async fn raw_profile_llm_upsert(
         model_id: Some(model_id),
         route: Some(route),
         model_hints: params.selection.model_hints,
-        context_window: params.selection.context_window,
+        // Validated to 1..=u32::MAX by `validate_llm_inference_fields`
+        // (parse_llm_selection_params runs it before this point).
+        context_window: params.selection.context_window.map(|value| value.0 as u32),
         temperature: params.selection.temperature.map(|value| value as f32),
         top_p: params.selection.top_p.map(|value| value as f32),
         reasoning_effort: params.selection.reasoning_effort,

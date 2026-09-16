@@ -1333,6 +1333,109 @@ async fn llm_upsert_rejects_max_output_tokens_as_owned_elsewhere() {
     );
 }
 
+/// A request carrying BOTH foreign-owned and unknown fields must name both
+/// groups in the single rejection (#2187) — the unknown entries must not be
+/// silently dropped from the error just because a foreign field is present.
+/// Covers nested foreign + nested unknown (selection + route levels),
+/// top-level foreign, and a literal dotted top-level key (legal JSON) which
+/// is unknown, NOT the nested foreign field.
+#[tokio::test]
+async fn llm_upsert_rejects_foreign_and_unknown_fields_in_one_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let upsert = |id: &str, params: Value| {
+        RpcRequest::new(
+            id.to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            params,
+        )
+    };
+    let assert_names = |error: RpcError, foreign: &str, unknown: &[&str]| {
+        let data = error.data.as_ref().expect("typed error data");
+        assert_eq!(data["kind"], json!("llm_param_owned_elsewhere"));
+        assert!(
+            data["rejected_fields"]
+                .as_array()
+                .expect("foreign field list")
+                .iter()
+                .any(|value| *value == json!(foreign)),
+            "rejected_fields must name {foreign}: {data}"
+        );
+        let unknown_fields = data["unknown_fields"]
+            .as_array()
+            .expect("unknown field list");
+        for expected in unknown {
+            assert!(
+                unknown_fields.iter().any(|value| *value == json!(expected)),
+                "unknown_fields must name {expected}: {data}"
+            );
+        }
+    };
+    // Nested foreign + nested unknowns (selection and route levels).
+    let error = raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "u-mixed",
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": {
+                        "route_id": "fixture",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "bogus_route_key": true
+                    },
+                    "max_output_tokens": 4096,
+                    "temperature2": 0.5
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("foreign and unknown fields must both be rejected");
+    assert_names(
+        error,
+        "selection.max_output_tokens",
+        &["selection.temperature2", "selection.route.bogus_route_key"],
+    );
+    // Top-level foreign + a literal dotted top-level key: the dotted key is
+    // unknown (it is not the nested foreign field) and must still be named.
+    let error = raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "u-mixed-top",
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" }
+                },
+                "max_output_tokens": 4096,
+                "selection.max_output_tokens": 4096,
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("top-level foreign and unknown fields must both be rejected");
+    assert_names(error, "max_output_tokens", &["selection.max_output_tokens"]);
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .is_none(),
+        "a mixed rejection must not create or mutate the profile"
+    );
+}
+
 /// Out-of-range and non-finite typed values return a typed
 /// `llm_param_out_of_range` / `llm_param_non_finite` without mutating the
 /// prior configuration.
@@ -1340,12 +1443,23 @@ async fn llm_upsert_rejects_max_output_tokens_as_owned_elsewhere() {
 async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
-    for (field, value, kind) in [
-        ("temperature", json!(3.5), "llm_param_out_of_range"),
-        ("temperature", json!(-0.1), "llm_param_out_of_range"),
-        ("top_p", json!(1.5), "llm_param_out_of_range"),
-        ("context_window", json!(0), "llm_param_out_of_range"),
+    for (field, value, range) in [
+        ("temperature", json!(3.5), "0.0..=2.0"),
+        ("temperature", json!(-0.1), "0.0..=2.0"),
+        ("top_p", json!(1.5), "0.0..=1.0"),
+        ("context_window", json!(0), "1..=4294967295"),
+        // #2187: negative / over-u32 context_window must get the same typed
+        // range kind, not a generic serde deserialize error — at every
+        // integer width JSON can carry.
+        ("context_window", json!(-5), "1..=4294967295"),
+        ("context_window", json!(4_294_967_296u64), "1..=4294967295"),
+        (
+            "context_window",
+            json!(9_223_372_036_854_775_808u64),
+            "1..=4294967295",
+        ),
     ] {
+        let kind = "llm_param_out_of_range";
         let error = raw_profile_llm_upsert(
             &state,
             &RpcRequest::new(
@@ -1369,6 +1483,7 @@ async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
         let data = error.data.as_ref().expect("typed error data");
         assert_eq!(data["kind"], json!(kind), "{field}={value}");
         assert_eq!(data["field"], json!(format!("selection.{field}")));
+        assert_eq!(data["range"], json!(range), "{field}={value}");
     }
     // Non-finite guard: exercised directly (JSON cannot carry NaN/Inf).
     let error = validate_llm_inference_fields(&RawLlmSelection {
@@ -1379,6 +1494,58 @@ async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
     assert_eq!(
         error.data.as_ref().unwrap()["kind"],
         json!("llm_param_non_finite")
+    );
+    // Boundary: u32::MAX itself is a valid context_window override.
+    validate_llm_inference_fields(&RawLlmSelection {
+        context_window: Some(WireContextWindow(i128::from(u32::MAX))),
+        ..Default::default()
+    })
+    .expect("u32::MAX context_window must be accepted");
+}
+
+/// Boundary end-to-end (#2187): `context_window: 4294967295` (u32::MAX) is
+/// accepted by the typed range check and lands in the durable store as
+/// `Some(u32::MAX)` — pinning the validated i128 → u32 conversion.
+#[tokio::test]
+async fn llm_upsert_accepts_u32_max_context_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-cw-max".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" },
+                    "context_window": 4_294_967_295u64
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("u32::MAX context_window must upsert");
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .expect("profile created");
+    assert_eq!(
+        profile
+            .config
+            .llm
+            .as_ref()
+            .and_then(|llm| llm.primary.as_ref())
+            .and_then(|primary| primary.context_window),
+        Some(u32::MAX),
+        "the validated boundary value must persist as u32::MAX"
     );
 }
 
@@ -3406,7 +3573,7 @@ async fn stdio_ndjson_reader_rejects_oversized_frame_before_newline() {
 
 #[tokio::test]
 async fn stdio_connection_stops_dispatch_after_writer_failure() {
-    reset_stdio_dispatch_count_for_test();
+    let dispatch_count = new_stdio_dispatch_count_for_test();
     let write_failed = Arc::new(tokio::sync::Notify::new());
     let (mut input_tx, input_rx) = tokio::io::duplex(4096);
     let first = format!(
@@ -3445,6 +3612,7 @@ async fn stdio_connection_stops_dispatch_after_writer_failure() {
             Arc::new(AppState::empty_for_tests()),
             input_rx,
             FailingWriter::new(write_failed),
+            dispatch_count.clone(),
         ),
     )
     .await
@@ -3457,11 +3625,66 @@ async fn stdio_connection_stops_dispatch_after_writer_failure() {
         "unexpected error: {error:?}"
     );
     assert_eq!(
-        stdio_dispatch_count_for_test(),
+        dispatch_count.load(Ordering::SeqCst),
         1,
         "no request after the writer failure may be dispatched"
     );
-    reset_stdio_dispatch_count_for_test();
+}
+
+/// Each stdio connection counts only its own dispatched requests, so
+/// parallel tests can never observe each other through the counter (#2336).
+#[tokio::test]
+async fn stdio_dispatch_count_is_isolated_per_connection() {
+    async fn run_one_connection(dispatch_count: StdioDispatchCountForTest) {
+        let (mut input_tx, input_rx) = tokio::io::duplex(4096);
+        // Duplex writer like the OUP embedded tests; the error response
+        // fits in the buffer, so the read half can simply be held.
+        let (_response_rx, response_tx) = tokio::io::duplex(4096);
+        // Any parseable request is counted before routing; an unknown method
+        // keeps the connection on the shallow error path.
+        let request = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req",
+                "method": "nonexistent/method",
+                "params": {}
+            })
+        );
+        input_tx
+            .write_all(request.as_bytes())
+            .await
+            .expect("queue request");
+        drop(input_tx);
+        stdio_connection_with_io(
+            Arc::new(AppState::empty_for_tests()),
+            input_rx,
+            response_tx,
+            dispatch_count,
+        )
+        .await
+        .expect("connection exits on EOF");
+    }
+
+    let first_count = new_stdio_dispatch_count_for_test();
+    let second_count = new_stdio_dispatch_count_for_test();
+    // Drive each connection as a spawned task, like the OUP embedded
+    // tests: polling the policy future through this test's own await
+    // chain overflowed the test-thread stack.
+    let first = tokio::spawn(run_one_connection(first_count.clone()));
+    let second = tokio::spawn(run_one_connection(second_count.clone()));
+    first.await.expect("first connection task joins");
+    second.await.expect("second connection task joins");
+    assert_eq!(
+        first_count.load(Ordering::SeqCst),
+        1,
+        "first connection must count only its own request"
+    );
+    assert_eq!(
+        second_count.load(Ordering::SeqCst),
+        1,
+        "second connection must count only its own request"
+    );
 }
 
 /// Shutdown must WAIT for this connection's in-flight turns to finalize
@@ -29782,9 +30005,34 @@ impl octos_llm::LlmProvider for AppuiContinuationLlm {
     }
 }
 
+/// Mirrors `session_actor_tests::waiting_budget` (#2053): scale a test's
+/// WAITING budget on Windows, where loaded check-windows runners miss
+/// fixed-duration waits that pass everywhere else. Deadlines only, never
+/// stimuli.
+fn waiting_budget(base: Duration) -> Duration {
+    #[cfg(windows)]
+    {
+        base * 4
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
+
+/// Poll the mock provider until the drained continuation turn reaches it. A
+/// short fixed ceiling flakes on check-windows (main run 34931713823 failed
+/// two different callers of this helper, one per attempt, each with
+/// `call_count == 0` right after the window expired), so the deadline uses a
+/// generous base through `waiting_budget`; a passing run still exits on the
+/// first poll.
 async fn wait_for_appui_continuation(provider: &AppuiContinuationLlm) {
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + waiting_budget(Duration::from_secs(5));
+    loop {
         if provider.call_count.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

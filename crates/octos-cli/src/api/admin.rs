@@ -3031,16 +3031,21 @@ pub async fn platform_service_logs(
         .unwrap_or(50)
         .min(200);
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    // Try both common log file names
-    let log_path = {
-        let p1 = format!("{home}/.ominix/api.log");
-        let p2 = format!("{home}/.ominix/ominix-api.log");
-        if std::path::Path::new(&p1).exists() {
-            p1
-        } else {
-            p2
-        }
+    // Match the runtime's home resolution (api/ominix_runtime.rs): a custom
+    // OCTOS_OMINIX_HOME relocates the whole OMiniX home, logs included.
+    let home = std::env::var_os("OCTOS_OMINIX_HOME")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    let (log_path, err_log_path) = platform_service_log_paths(&home);
+
+    // The launchd plist routes stderr (startup failures, panics) to a
+    // separate api.err.log; surface it alongside the main log or bind
+    // failures and early crashes never reach the dashboard.
+    let (err_total_lines, err_lines) = match tokio::fs::read_to_string(&err_log_path).await {
+        Ok(c) => (c.lines().count(), last_lines(&c, lines)),
+        Err(_) => (0, Vec::new()),
     };
 
     let content = match tokio::fs::read_to_string(&log_path).await {
@@ -3050,18 +3055,46 @@ pub async fn platform_service_logs(
                 "log_path": log_path,
                 "error": format!("Cannot read log file: {e}"),
                 "lines": [],
+                "err_log_path": err_log_path,
+                "err_total_lines": err_total_lines,
+                "err_lines": err_lines,
             })));
         }
     };
 
-    let log_lines: Vec<&str> = content.lines().rev().take(lines).collect();
-    let log_lines: Vec<&str> = log_lines.into_iter().rev().collect();
-
     Ok(Json(serde_json::json!({
         "log_path": log_path,
         "total_lines": content.lines().count(),
-        "lines": log_lines,
+        "lines": last_lines(&content, lines),
+        "err_log_path": err_log_path,
+        "err_total_lines": err_total_lines,
+        "err_lines": err_lines,
     })))
+}
+
+/// Main and stderr log paths under the OMiniX home. Prefers `api.log`,
+/// falling back to the legacy `ominix-api.log` name.
+fn platform_service_log_paths(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = home.join(".ominix");
+    let primary = dir.join("api.log");
+    let main = if primary.exists() {
+        primary
+    } else {
+        dir.join("ominix-api.log")
+    };
+    (main, dir.join("api.err.log"))
+}
+
+fn last_lines(content: &str, n: usize) -> Vec<String> {
+    content
+        .lines()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_string)
+        .collect()
 }
 
 // ── Model Management (proxy to ominix-api) ─────────────────────────
@@ -6580,6 +6613,115 @@ mod tests {
         assert_eq!(input.lifecycle_state, "unknown");
         assert!(input.output_files.is_empty());
         assert!(input.runtime_state.is_none());
+    }
+
+    #[test]
+    fn platform_service_log_paths_prefer_api_log_and_point_at_err_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let ominix = dir.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+
+        // No api.log yet ⇒ legacy name.
+        let (main, err) = platform_service_log_paths(dir.path());
+        assert_eq!(main, ominix.join("ominix-api.log"));
+        assert_eq!(err, ominix.join("api.err.log"));
+
+        std::fs::write(ominix.join("api.log"), "out\n").unwrap();
+        let (main, err) = platform_service_log_paths(dir.path());
+        assert_eq!(main, ominix.join("api.log"));
+        assert_eq!(err, ominix.join("api.err.log"));
+    }
+
+    #[test]
+    fn last_lines_returns_the_tail_in_order_capped() {
+        let content = "one\ntwo\nthree\n";
+        assert_eq!(last_lines(content, 2), vec!["two", "three"]);
+        assert_eq!(last_lines(content, 50), vec!["one", "two", "three"]);
+        assert!(last_lines("", 5).is_empty());
+    }
+
+    /// With a custom `OCTOS_OMINIX_HOME`, the logs endpoint must read the
+    /// main log from the relocated home and surface the plist's stderr
+    /// log (`api.err.log`) alongside it.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    // The env must stay pivoted for the duration of the handler call, so the
+    // serializing lock is intentionally held across the await (test-only).
+    #[allow(clippy::await_holding_lock)]
+    async fn platform_service_logs_reads_custom_home_and_surfaces_err_log() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let custom = tempfile::tempdir().unwrap();
+        let default_home = tempfile::tempdir().unwrap();
+        let ominix = custom.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+        std::fs::write(ominix.join("api.log"), "boot ok\nserving\n").unwrap();
+        std::fs::write(ominix.join("api.err.log"), "panic: bind failed\n").unwrap();
+
+        let keys = ["OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("OCTOS_OMINIX_HOME", custom.path());
+            std::env::set_var("HOME", default_home.path());
+        }
+        let result =
+            platform_service_logs(axum::extract::Query(std::collections::HashMap::new())).await;
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        let Json(body) = result.expect("logs handler responds");
+        assert_eq!(body["lines"], serde_json::json!(["boot ok", "serving"]));
+        assert_eq!(body["total_lines"], 2);
+        assert_eq!(body["err_lines"], serde_json::json!(["panic: bind failed"]));
+        assert_eq!(body["err_total_lines"], 1);
+        assert!(body.get("error").is_none());
+    }
+
+    /// The exact startup-failure scenario: the daemon never wrote its main
+    /// log, but the plist captured stderr. The endpoint must still surface
+    /// `api.err.log` from the error arm.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    #[allow(clippy::await_holding_lock)] // see the happy-path test above
+    async fn platform_service_logs_surfaces_err_log_when_main_log_missing() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let custom = tempfile::tempdir().unwrap();
+        let default_home = tempfile::tempdir().unwrap();
+        let ominix = custom.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+        std::fs::write(ominix.join("api.err.log"), "panic: bind failed\n").unwrap();
+
+        let keys = ["OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("OCTOS_OMINIX_HOME", custom.path());
+            std::env::set_var("HOME", default_home.path());
+        }
+        let result =
+            platform_service_logs(axum::extract::Query(std::collections::HashMap::new())).await;
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        let Json(body) = result.expect("logs handler responds");
+        assert_eq!(body["lines"], serde_json::json!([]));
+        assert!(body.get("error").is_some());
+        assert_eq!(body["err_lines"], serde_json::json!(["panic: bind failed"]));
+        assert_eq!(body["err_total_lines"], 1);
     }
 }
 
