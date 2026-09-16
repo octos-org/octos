@@ -370,6 +370,16 @@ pub struct ServeCommand {
     #[arg(long)]
     pub auth_token: Option<String>,
 
+    /// Origin of the web client to build the one-time pairing link from
+    /// (WEB-PAIRING-CONTRACT-5100), e.g. `https://app.example.com`. When set
+    /// and valid, startup prints ONE ready link:
+    /// `Open the web client: <client-origin>/?octos=<server-origin>&pair=<code>`.
+    /// Without the flag — or with a value that is not an http(s) URL — the
+    /// server still starts and prints the origin and the code as two
+    /// labelled lines instead of a broken link.
+    #[arg(long, value_name = "URL")]
+    pub web_url: Option<String>,
+
     /// Enable the no-password "solo" login (`POST /api/auth/solo*`) for a
     /// local single-user install. OFF by default. Only honoured for direct
     /// loopback requests on a Local-mode host with profile/user stores, and
@@ -1313,6 +1323,18 @@ impl ServeCommand {
         let (http_listener, effective_serve_port) =
             bind_http_listener(self.stdio, &self.host, self.port).await?;
 
+        // WEB-PAIRING-CONTRACT-5100 — mint ONE pairing code per process
+        // start, against the REAL bound port (so `--port 0` pairs too). Only
+        // for an HTTP serve: `--stdio` binds no listener, so it exposes no
+        // `/pair/*` surface and the state stays `None`. The code lives in
+        // memory for this process only and is NEVER handed to `tracing`.
+        let pairing = (!self.stdio).then(|| {
+            Arc::new(crate::api::pairing::PairingState::mint(
+                format!("http://127.0.0.1:{effective_serve_port}"),
+                auth_token.clone(),
+            ))
+        });
+
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
@@ -1589,6 +1611,7 @@ impl ServeCommand {
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
             host_memory: config.memory.clone(),
+            pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
@@ -1962,6 +1985,29 @@ impl ServeCommand {
                 "Gateways".green(),
                 enabled_count
             ));
+        }
+        // WEB-PAIRING-CONTRACT-5100 — the pairing code reaches stdout HERE
+        // and nowhere else: no tracing call, at any level, ever sees it, so
+        // it cannot land in a log file the server writes. Printed verbatim
+        // (no ANSI) so the whole link is copy-pasteable.
+        if let Some(ref pairing) = pairing {
+            // An unusable `--web-url` is never fatal: warn once on stderr and
+            // fall through to the two labelled lines below.
+            if let Some(raw) = self.web_url.as_deref() {
+                if crate::api::pairing::validate_web_url(raw).is_none() {
+                    let _ = serve_console::print_stderr(&format!(
+                        "{}: --web-url must be an http(s) URL; printing the origin and code instead",
+                        "warning".yellow()
+                    ));
+                }
+            }
+            for line in crate::api::pairing::pairing_startup_lines(
+                self.web_url.as_deref(),
+                pairing.server_origin(),
+                &pairing.printed_code(),
+            ) {
+                let _ = serve_console::print_stdout(&line);
+            }
         }
         let _ = serve_console::print_stdout("");
 
