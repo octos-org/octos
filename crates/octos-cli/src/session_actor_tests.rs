@@ -7931,6 +7931,7 @@ fn make_supervisor_task(
         runtime_policy_stamp: None,
         projection_metadata: None,
         workspace_root: None,
+        relaunched_from: None,
     }
 }
 

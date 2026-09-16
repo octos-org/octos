@@ -22,6 +22,7 @@ use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
 use super::metrics;
+use super::pairing;
 use super::private_asr;
 use super::purge;
 use super::session_ingress;
@@ -897,6 +898,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/version", get(handlers::version))
         .route("/health", get(handlers::health));
 
+    // One-time pairing (WEB-PAIRING-CONTRACT-5100) — unauthenticated and
+    // LOOPBACK ONLY. These sit beside `/health` in the public group on
+    // purpose: they are how a local web client OBTAINS the bearer token, not
+    // a second way to bypass it — every authenticated route above keeps its
+    // middleware untouched. Both handlers answer 404 (never 403) to a
+    // non-loopback or proxied peer, and 404 when this deployment minted no
+    // code, which a client reads as "pairing not supported".
+    let pairing_routes = Router::new()
+        .route("/pair/info", get(pairing::pair_info))
+        .route("/pair/claim", post(pairing::pair_claim));
+
     // Internal endpoint for frps server plugin (no auth — called by frps on localhost)
     let internal_routes =
         Router::new().route("/api/internal/frps-auth", post(frps_plugin::frps_auth));
@@ -942,6 +954,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .merge(webhook_routes)
         .merge(version_routes)
+        .merge(pairing_routes)
         .merge(internal_routes);
 
     // Layer 1 defence for issue #995 — the strip middleware runs OUTSIDE

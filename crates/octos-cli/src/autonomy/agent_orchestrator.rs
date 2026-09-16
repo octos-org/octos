@@ -25595,6 +25595,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let (_, agent) = upsert_background_task_agent(&task, None)
@@ -25669,6 +25670,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let (mirrored_session, agent) = upsert_background_task_agent(&task, None)
@@ -26531,6 +26533,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         // Orchestrator A: the task mirrors (ChildCompleted + scatter persist)
@@ -28251,6 +28254,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         }
     }
 
@@ -29065,6 +29069,7 @@ mod tests {
                 runtime_policy_stamp: None,
                 projection_metadata: None,
                 workspace_root: None,
+                relaunched_from: None,
             };
             octos_agent::TerminalEvent {
                 task: task.clone(),
@@ -31928,6 +31933,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -32027,6 +32033,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -32142,6 +32149,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         // Reconcile under the profile the turn actually runs under ("coding"),

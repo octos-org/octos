@@ -28,18 +28,26 @@ export default function WeChatTab({ config, onChange, profileId }: Props) {
   const token = config.env_vars?.WECHAT_BOT_TOKEN || ""
   const isConnected = Boolean(channel && token)
 
+  // Own profile uses the user-scoped route; when an admin edits another
+  // profile the QR flow must target that profile, or the WeChat token and
+  // login state attach to the wrong account.
+  const qrBase = profileId
+    ? `/api/admin/profiles/${encodeURIComponent(profileId)}/wechat`
+    : "/api/my/profile/wechat"
+
   useEffect(() => {
+    // Also fires when profileId changes: the admin navigated to another
+    // profile, so a poll started for the previous one must not keep running.
     return () => {
       if (pollRef.current) clearInterval(pollRef.current)
     }
-  }, [])
+  }, [profileId])
 
   const startLogin = async () => {
     setError("")
     setStatus("loading")
     try {
-      const id = profileId || "admin"
-      const res = await fetch(`/api/my/profile/wechat/qr-start`, { headers: getAuthHeaders() })
+      const res = await fetch(`${qrBase}/qr-start`, { headers: getAuthHeaders() })
       if (!res.ok) throw new Error(await res.text())
       const data = await res.json()
       setQrUrl(data.qrcode_url)
@@ -56,8 +64,7 @@ export default function WeChatTab({ config, onChange, profileId }: Props) {
     if (pollRef.current) clearInterval(pollRef.current)
     pollRef.current = setInterval(async () => {
       try {
-        const id = profileId || "admin"
-        const res = await fetch(`/api/my/profile/wechat/qr-poll`, {
+        const res = await fetch(`${qrBase}/qr-poll`, {
           method: "POST",
           headers: getAuthHeaders(),
           body: JSON.stringify({ session_key: key }),
@@ -70,6 +77,22 @@ export default function WeChatTab({ config, onChange, profileId }: Props) {
           setStatus("connected")
           setQrUrl(null)
           if (pollRef.current) clearInterval(pollRef.current)
+          // The server pushed the WeChat channel onto the profile; mirror it
+          // into local state so a later Save doesn't clobber it with the
+          // stale channels array. The token itself never leaves the server.
+          if (!config.channels.some((c) => c.type === "wechat")) {
+            onChange({
+              ...config,
+              channels: [
+                ...config.channels,
+                {
+                  type: "wechat",
+                  token_env: "WECHAT_BOT_TOKEN",
+                  base_url: "https://ilinkai.weixin.qq.com",
+                },
+              ],
+            })
+          }
         } else if (data.status === "expired") {
           setStatus("expired")
           setQrUrl(null)

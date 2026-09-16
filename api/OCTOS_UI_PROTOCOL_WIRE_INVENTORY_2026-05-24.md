@@ -97,6 +97,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `skill/action/job/list` | shipped AppUI extra, UPCR-2026-027 |
 | `skill/action/job/read` | shipped AppUI extra, UPCR-2026-027 |
 | `onboarding/workspace_probe` | shipped local-solo AppUI extra |
+| `onboarding/workspace_list` | shipped local-solo AppUI extra, gate `onboarding.workspace_browse.v1` (WEB-WORKSPACE-BROWSER-CONTRACT-5000) |
+| `onboarding/workspace_create` | shipped local-solo AppUI extra, gate `onboarding.workspace_browse.v1` (WEB-WORKSPACE-BROWSER-CONTRACT-5000) |
 | `session/btw` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `user_question/respond` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/rollback` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
@@ -199,6 +201,12 @@ spec and UPCR documents. The authoritative source remains code:
   internal implementation details.
 - `onboarding/workspace_probe` is added to the executable route inventory
   because `APPUI_EXTRA_METHODS` advertises it for local-solo deployments.
+- `onboarding/workspace_list` and `onboarding/workspace_create` join it for
+  the same reason: `APPUI_EXTRA_METHODS` advertises both for local-solo
+  deployments, behind the `onboarding.workspace_browse.v1` feature advertised
+  next to `onboarding.workspace_probe.v1`. Tenant/cloud deployments advertise
+  neither the methods nor the feature, and refuse a direct call with
+  `profile_local_unsupported`.
 - `auth/logout` and all `content/*` methods are recorded as auth-bound
   unavailable over unauthenticated stdio, matching
   `APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS`.
