@@ -28,18 +28,21 @@ pub fn register(
         .get("webhook_port")
         .and_then(|v| v.as_u64())
         .unwrap_or(9322) as u16;
-    channel_mgr.register(Arc::new(
-        octos_bus::WeComChannel::new(
-            &corp_id,
-            &agent_id,
-            &agent_secret,
-            &verification_token,
-            &encoding_aes_key,
-            entry.allowed_senders.clone(),
-            shutdown.clone(),
-            media_dir.to_path_buf(),
-        )
-        .with_webhook_port(webhook_port),
-    ));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(
+            octos_bus::WeComChannel::new(
+                &corp_id,
+                &agent_id,
+                &agent_secret,
+                &verification_token,
+                &encoding_aes_key,
+                entry.allowed_senders.clone(),
+                shutdown.clone(),
+                media_dir.to_path_buf(),
+            )
+            .with_webhook_port(webhook_port),
+        ),
+    );
     Ok(())
 }

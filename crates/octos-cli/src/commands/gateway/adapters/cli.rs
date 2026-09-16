@@ -8,13 +8,16 @@ use crate::config::ChannelEntry;
 
 pub fn register(
     channel_mgr: &mut ChannelManager,
-    _entry: &ChannelEntry,
+    entry: &ChannelEntry,
     shutdown: &Arc<AtomicBool>,
     shutdown_notify: &Arc<Notify>,
 ) -> eyre::Result<()> {
-    channel_mgr.register(Arc::new(CliChannel::with_shutdown_notify(
-        shutdown.clone(),
-        shutdown_notify.clone(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(CliChannel::with_shutdown_notify(
+            shutdown.clone(),
+            shutdown_notify.clone(),
+        )),
+    );
     Ok(())
 }

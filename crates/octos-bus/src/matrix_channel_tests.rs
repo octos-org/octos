@@ -24,6 +24,7 @@ fn make_test_state(inbound_tx: mpsc::Sender<InboundMessage>) -> AppserviceState 
     registered.insert("@octos_bot:localhost".to_string());
     AppserviceState {
         inbound_tx,
+        routing_key: CHANNEL_NAME.to_string(),
         homeserver: "http://localhost:6167".to_string(),
         as_token: "test_as_token".to_string(),
         hs_token: "test_token".to_string(),

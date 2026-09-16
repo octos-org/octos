@@ -20,11 +20,14 @@ pub fn register(
     if app_id.is_empty() {
         eyre::bail!("qq-bot channel requires settings.app_id");
     }
-    channel_mgr.register(Arc::new(octos_bus::QQBotChannel::new(
-        &app_id,
-        &client_secret,
-        entry.allowed_senders.clone(),
-        shutdown.clone(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::QQBotChannel::new(
+            &app_id,
+            &client_secret,
+            entry.allowed_senders.clone(),
+            shutdown.clone(),
+        )),
+    );
     Ok(())
 }

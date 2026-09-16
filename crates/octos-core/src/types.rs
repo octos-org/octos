@@ -605,6 +605,16 @@ pub fn is_reserved_channel_name(value: &str) -> bool {
 }
 
 fn is_channel_name(value: &str) -> bool {
+    // Instance-qualified channel routes use `type@id`. `@` cannot appear in
+    // profile IDs (which are lowercase slug strings), so the profiled session
+    // key shape remains unambiguous. Keep bare type routes for legacy configs.
+    if let Some((channel_type, instance_id)) = value.split_once('@') {
+        return is_bare_channel_name(channel_type) && is_channel_instance_id(instance_id);
+    }
+    is_bare_channel_name(value)
+}
+
+fn is_bare_channel_name(value: &str) -> bool {
     matches!(
         value,
         "acp"
@@ -628,6 +638,16 @@ fn is_channel_name(value: &str) -> bool {
             | "wecom-bot"
             | "whatsapp"
     )
+}
+
+fn is_channel_instance_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 impl std::fmt::Display for SessionKey {
@@ -870,6 +890,29 @@ mod tests {
         assert_eq!(key.topic(), Some("ops"));
         assert_eq!(key.channel(), "matrix");
         assert_eq!(key.chat_id(), "!room:localhost");
+    }
+
+    #[test]
+    fn test_session_key_with_profile_supports_matrix_instance_route() {
+        let key = SessionKey::with_profile("weather", "matrix@operations", "!room:matrix.example");
+        assert_eq!(key.profile_id(), Some("weather"));
+        assert_eq!(key.channel(), "matrix@operations");
+        assert_eq!(key.chat_id(), "!room:matrix.example");
+        assert_eq!(key.fork_child("child").0, "weather:matrix@operations:child");
+
+        let bare = SessionKey::new("matrix@operations", "!room:matrix.example");
+        assert_eq!(bare.profile_id(), None);
+        assert_eq!(bare.channel(), "matrix@operations");
+        assert_eq!(bare.chat_id(), "!room:matrix.example");
+    }
+
+    #[test]
+    fn test_session_key_supports_generic_channel_instance_routes() {
+        let key = SessionKey::with_profile("weather", "telegram@support", "123:456");
+        assert_eq!(key.profile_id(), Some("weather"));
+        assert_eq!(key.channel(), "telegram@support");
+        assert_eq!(key.chat_id(), "123:456");
+        assert_eq!(key.fork_child("child").0, "weather:telegram@support:child");
     }
 
     #[test]

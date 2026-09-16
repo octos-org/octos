@@ -4330,6 +4330,7 @@ pub async fn my_wechat_qr_poll(
                         .config
                         .channels
                         .push(crate::profiles::ChannelCredentials::WeChat {
+                            id: None,
                             token_env: "WECHAT_BOT_TOKEN".into(),
                             base_url: "https://ilinkai.weixin.qq.com".into(),
                         });
@@ -5168,6 +5169,7 @@ mod tests {
     fn matrix_accept_adds_room_to_allowlist_once() {
         let mut profile = make_user_profile("matrix-user", "Matrix User");
         profile.config.channels.push(ChannelCredentials::Matrix {
+            id: None,
             homeserver: "https://matrix.example.org".into(),
             as_token: String::new(),
             hs_token: String::new(),
@@ -5201,6 +5203,7 @@ mod tests {
     fn matrix_test_config_overlays_draft_values() {
         let mut profile = make_user_profile("matrix-user", "Matrix User");
         profile.config.channels.push(ChannelCredentials::Matrix {
+            id: None,
             homeserver: "https://old.example.org".into(),
             as_token: String::new(),
             hs_token: String::new(),
@@ -5245,6 +5248,7 @@ mod tests {
     fn matrix_test_config_ignores_masked_draft_secrets() {
         let mut profile = make_user_profile("matrix-user", "Matrix User");
         profile.config.channels.push(ChannelCredentials::Matrix {
+            id: None,
             homeserver: "https://matrix.example.org".into(),
             as_token: String::new(),
             hs_token: String::new(),
@@ -5291,6 +5295,7 @@ mod tests {
     fn matrix_test_config_empty_access_token_clears_saved_token() {
         let mut profile = make_user_profile("matrix-user", "Matrix User");
         profile.config.channels.push(ChannelCredentials::Matrix {
+            id: None,
             homeserver: "https://matrix.example.org".into(),
             as_token: String::new(),
             hs_token: String::new(),

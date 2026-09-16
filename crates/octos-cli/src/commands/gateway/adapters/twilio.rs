@@ -26,14 +26,17 @@ pub fn register(
         .get("webhook_port")
         .and_then(|v| v.as_u64())
         .unwrap_or(8090) as u16;
-    channel_mgr.register(Arc::new(octos_bus::TwilioChannel::new(
-        &account_sid,
-        &auth_token,
-        &from_number,
-        entry.allowed_senders.clone(),
-        shutdown.clone(),
-        media_dir.to_path_buf(),
-        webhook_port,
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::TwilioChannel::new(
+            &account_sid,
+            &auth_token,
+            &from_number,
+            entry.allowed_senders.clone(),
+            shutdown.clone(),
+            media_dir.to_path_buf(),
+            webhook_port,
+        )),
+    );
     Ok(())
 }

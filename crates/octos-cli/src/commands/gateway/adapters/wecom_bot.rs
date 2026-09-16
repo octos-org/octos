@@ -19,11 +19,14 @@ pub fn register(
     if bot_id.is_empty() {
         eyre::bail!("wecom-bot channel requires settings.bot_id");
     }
-    channel_mgr.register(Arc::new(octos_bus::WeComBotChannel::new(
-        &bot_id,
-        &secret,
-        entry.allowed_senders.clone(),
-        shutdown.clone(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::WeComBotChannel::new(
+            &bot_id,
+            &secret,
+            entry.allowed_senders.clone(),
+            shutdown.clone(),
+        )),
+    );
     Ok(())
 }

@@ -1614,6 +1614,7 @@ impl Default for GatewayConfig {
         Self {
             channels: vec![ChannelEntry {
                 channel_type: "cli".into(),
+                id: None,
                 allowed_senders: vec![],
                 settings: serde_json::json!({}),
             }],
@@ -1650,6 +1651,11 @@ pub struct ChannelEntry {
     #[serde(rename = "type")]
     pub channel_type: String,
 
+    /// Stable instance identifier for channel types that support multiple
+    /// connections.  Omitted legacy entries retain their bare type route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
     /// Allowed sender IDs (empty = allow all).
     #[serde(default)]
     pub allowed_senders: Vec<String>,
@@ -1657,6 +1663,16 @@ pub struct ChannelEntry {
     /// Channel-specific settings.
     #[serde(default)]
     pub settings: serde_json::Value,
+}
+
+impl ChannelEntry {
+    /// Runtime routing key. Legacy entries remain byte-for-byte compatible.
+    pub fn routing_key(&self) -> String {
+        match self.id.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => format!("{}@{id}", self.channel_type),
+            None => self.channel_type.clone(),
+        }
+    }
 }
 
 fn default_max_history() -> usize {
@@ -2394,6 +2410,36 @@ mod tests {
     }
 
     #[test]
+    fn channel_instance_id_is_backward_compatible() {
+        let legacy: ChannelEntry = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "settings": {"mode": "user", "access_token": "syt_legacy"}
+        }))
+        .unwrap();
+        assert_eq!(legacy.id, None);
+        assert_eq!(legacy.routing_key(), "matrix");
+        assert!(
+            serde_json::to_value(&legacy).unwrap().get("id").is_none(),
+            "serializing a legacy entry must not introduce an id"
+        );
+
+        let named: ChannelEntry = serde_json::from_value(serde_json::json!({
+            "type": "matrix",
+            "id": "work",
+            "settings": {"mode": "user", "access_token": "syt_work"}
+        }))
+        .unwrap();
+        assert_eq!(named.routing_key(), "matrix@work");
+
+        let telegram: ChannelEntry = serde_json::from_value(serde_json::json!({
+            "type": "telegram",
+            "id": "support"
+        }))
+        .unwrap();
+        assert_eq!(telegram.routing_key(), "telegram@support");
+    }
+
+    #[test]
     fn test_gateway_reasoning_effort_parses() {
         let json = r#"{
             "channels": [{"type": "cli"}],
@@ -2610,6 +2656,7 @@ mod tests {
             gateway: Some(GatewayConfig {
                 channels: vec![ChannelEntry {
                     channel_type: "irc".to_string(),
+                    id: None,
                     allowed_senders: vec![],
                     settings: serde_json::json!({}),
                 }],

@@ -11,6 +11,8 @@ use std::sync::atomic::AtomicBool;
 use octos_bus::{ChannelManager, SessionManager};
 use tokio::sync::{Mutex, Notify};
 
+#[cfg(feature = "matrix")]
+use super::matrix_integration::matrix_is_user_mode;
 use crate::config::ChannelEntry;
 
 #[cfg(feature = "api")]
@@ -100,7 +102,7 @@ pub struct ChannelRegistrationCtx<'a> {
     /// Callback to stop the session actor when a session is deleted via API.
     pub on_session_deleted: Option<SessionDeletedCallback>,
     #[cfg(feature = "matrix")]
-    pub matrix_channel: &'a mut Option<Arc<octos_bus::MatrixChannel>>,
+    pub matrix_channels: &'a mut std::collections::HashMap<String, Arc<octos_bus::MatrixChannel>>,
 }
 
 /// Register all configured channels with the channel manager.
@@ -109,8 +111,7 @@ pub fn register_all(
     entries: &[ChannelEntry],
     ctx: &mut ChannelRegistrationCtx<'_>,
 ) -> eyre::Result<()> {
-    #[cfg(feature = "matrix")]
-    ensure_single_matrix_channel(entries)?;
+    validate_channel_instances(entries)?;
 
     for (channel_index, entry) in entries.iter().enumerate() {
         // `channel_index` is only consumed by the matrix arm below.
@@ -157,7 +158,7 @@ pub fn register_all(
             #[cfg(feature = "matrix")]
             "matrix" => matrix::register(
                 channel_mgr,
-                ctx.matrix_channel,
+                ctx.matrix_channels,
                 entry,
                 channel_index,
                 ctx.shutdown,
@@ -175,19 +176,47 @@ pub fn register_all(
     Ok(())
 }
 
-#[cfg(feature = "matrix")]
-fn ensure_single_matrix_channel(entries: &[ChannelEntry]) -> eyre::Result<()> {
-    let mut first_index: Option<usize> = None;
+fn validate_channel_instances(entries: &[ChannelEntry]) -> eyre::Result<()> {
+    let mut routes = std::collections::HashMap::<String, usize>::new();
+    #[cfg(feature = "matrix")]
+    let mut appservice_ports = std::collections::HashMap::<u64, usize>::new();
     for (idx, entry) in entries.iter().enumerate() {
-        if entry.channel_type != "matrix" {
-            continue;
+        if let Some(id) = entry.id.as_deref() {
+            let valid = !id.is_empty()
+                && id.len() <= 64
+                && !id.starts_with('-')
+                && !id.ends_with('-')
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+            if !valid {
+                eyre::bail!(
+                    "channel index {idx} ({}) has invalid id `{id}`; use 1-64 lowercase letters, digits, or hyphens",
+                    entry.channel_type
+                );
+            }
         }
-        if let Some(first) = first_index {
+
+        let route = entry.routing_key();
+        if let Some(first) = routes.insert(route.clone(), idx) {
             eyre::bail!(
-                "multiple Matrix channels are not supported yet; channel indexes {first} and {idx} share the same routing key"
+                "channel indexes {first} and {idx} share routing key `{route}`; give each additional channel of the same type a unique `id`"
             );
         }
-        first_index = Some(idx);
+
+        #[cfg(feature = "matrix")]
+        if entry.channel_type == "matrix" && !matrix_is_user_mode(entry) {
+            let port = entry
+                .settings
+                .get("port")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(super::matrix_integration::MATRIX_DEFAULT_PORT as u64);
+            if let Some(first) = appservice_ports.insert(port, idx) {
+                eyre::bail!(
+                    "Matrix appservice channel indexes {first} and {idx} both listen on port {port}; configure a unique port for each appservice"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -199,25 +228,79 @@ mod tests {
     fn entry(channel_type: &str) -> ChannelEntry {
         ChannelEntry {
             channel_type: channel_type.to_string(),
+            id: None,
             allowed_senders: Vec::new(),
             settings: serde_json::json!({}),
         }
     }
 
     #[test]
-    fn rejects_multiple_matrix_channels_before_registration() {
+    fn rejects_multiple_legacy_matrix_routes() {
         let entries = vec![entry("cli"), entry("matrix"), entry("matrix")];
 
-        let err = ensure_single_matrix_channel(&entries).unwrap_err();
+        let err = validate_channel_instances(&entries).unwrap_err();
 
-        assert!(err.to_string().contains("multiple Matrix channels"));
-        assert!(err.to_string().contains("1 and 2"));
+        assert!(err.to_string().contains("share routing key `matrix`"));
+        assert!(err.to_string().contains("indexes 1 and 2"));
     }
 
     #[test]
-    fn allows_single_matrix_channel() {
+    fn allows_legacy_and_named_matrix_channels() {
+        let mut named = entry("matrix");
+        named.id = Some("work".into());
+        named.settings = serde_json::json!({"mode": "user"});
         let entries = vec![entry("cli"), entry("matrix")];
 
-        ensure_single_matrix_channel(&entries).unwrap();
+        validate_channel_instances(&entries).unwrap();
+
+        let entries = vec![entry("matrix"), named];
+        validate_channel_instances(&entries).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_matrix_instance_ids() {
+        let mut first = entry("matrix");
+        first.id = Some("work".into());
+        let mut second = entry("matrix");
+        second.id = Some("work".into());
+
+        let err = validate_channel_instances(&[first, second]).unwrap_err();
+        assert!(err.to_string().contains("matrix@work"));
+    }
+
+    #[test]
+    fn rejects_invalid_matrix_instance_id() {
+        let mut invalid = entry("matrix");
+        invalid.id = Some("Work account".into());
+
+        let err = validate_channel_instances(&[invalid]).unwrap_err();
+        assert!(err.to_string().contains("invalid id"));
+    }
+
+    #[test]
+    fn rejects_duplicate_matrix_appservice_ports() {
+        let mut first = entry("matrix");
+        first.id = Some("primary".into());
+        let mut second = entry("matrix");
+        second.id = Some("secondary".into());
+
+        let err = validate_channel_instances(&[first, second]).unwrap_err();
+        assert!(err.to_string().contains("both listen on port 8009"));
+    }
+
+    #[test]
+    fn allows_multiple_named_non_matrix_channels() {
+        let mut support = entry("telegram");
+        support.id = Some("support".into());
+        let mut operations = entry("telegram");
+        operations.id = Some("operations".into());
+
+        validate_channel_instances(&[entry("telegram"), support, operations]).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_legacy_non_matrix_routes() {
+        let err = validate_channel_instances(&[entry("discord"), entry("discord")]).unwrap_err();
+        assert!(err.to_string().contains("routing key `discord`"));
     }
 }

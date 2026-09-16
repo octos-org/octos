@@ -34,14 +34,17 @@ pub fn register(
         .and_then(|v| v.as_u64())
         .unwrap_or(8650) as u16;
 
-    channel_mgr.register(Arc::new(
-        octos_bus::DingTalkChannel::new(
-            webhook_url,
-            secret,
-            entry.allowed_senders.clone(),
-            shutdown.clone(),
-        )
-        .with_webhook_port(webhook_port),
-    ));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(
+            octos_bus::DingTalkChannel::new(
+                webhook_url,
+                secret,
+                entry.allowed_senders.clone(),
+                shutdown.clone(),
+            )
+            .with_webhook_port(webhook_port),
+        ),
+    );
     Ok(())
 }

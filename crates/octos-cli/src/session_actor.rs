@@ -7745,7 +7745,7 @@ impl SessionActor {
         let channel_is_matrix = self
             .status_indicator
             .as_ref()
-            .map(|si| si.channel().name() == "matrix")
+            .map(|si| si.channel().channel_type() == "matrix")
             .unwrap_or(false);
         let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
 
@@ -8911,7 +8911,7 @@ impl SessionActor {
             );
             let channel_is_matrix = status_indicator
                 .as_ref()
-                .map(|si| si.channel().name() == "matrix")
+                .map(|si| si.channel().channel_type() == "matrix")
                 .unwrap_or(false);
             let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
 
@@ -9573,7 +9573,7 @@ impl SessionActor {
         let channel_is_matrix = self
             .status_indicator
             .as_ref()
-            .map(|si| si.channel().name() == "matrix")
+            .map(|si| si.channel().channel_type() == "matrix")
             .unwrap_or(false);
         let persist_visible_status = !channel_is_matrix || app_reply_tools.is_empty();
 

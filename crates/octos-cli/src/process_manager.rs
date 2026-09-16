@@ -1058,7 +1058,7 @@ impl ProcessManager {
         }
         profile.config.channels.iter().any(|ch| {
             matches!(ch,
-                ChannelCredentials::WhatsApp { bridge_url }
+                ChannelCredentials::WhatsApp { bridge_url, .. }
                 if bridge_url.is_empty() || bridge_url == "auto"
             )
         })
@@ -1699,6 +1699,7 @@ mod tests {
         let profile = test_profile(
             "wa-auto",
             vec![ChannelCredentials::WhatsApp {
+                id: None,
                 bridge_url: String::new(),
             }],
         );
@@ -1715,6 +1716,7 @@ mod tests {
         let profile = test_profile(
             "wa-auto2",
             vec![ChannelCredentials::WhatsApp {
+                id: None,
                 bridge_url: "auto".to_string(),
             }],
         );
@@ -1731,6 +1733,7 @@ mod tests {
         let profile = test_profile(
             "wa-explicit",
             vec![ChannelCredentials::WhatsApp {
+                id: None,
                 bridge_url: "ws://remote:3101".to_string(),
             }],
         );
@@ -1743,6 +1746,7 @@ mod tests {
         let profile = test_profile(
             "wa-no-js",
             vec![ChannelCredentials::WhatsApp {
+                id: None,
                 bridge_url: String::new(),
             }],
         );
@@ -1759,6 +1763,7 @@ mod tests {
         let profile = test_profile(
             "tg",
             vec![ChannelCredentials::Telegram {
+                id: None,
                 token_env: "BOT_TOKEN".to_string(),
                 allowed_senders: String::new(),
             }],
@@ -1774,6 +1779,7 @@ mod tests {
         let profile = test_profile(
             "wc",
             vec![ChannelCredentials::WeChat {
+                id: None,
                 token_env: "TOKEN".to_string(),
                 base_url: "http://localhost".to_string(),
             }],
@@ -1787,6 +1793,7 @@ mod tests {
         let profile = test_profile(
             "tg",
             vec![ChannelCredentials::Telegram {
+                id: None,
                 token_env: "BOT_TOKEN".to_string(),
                 allowed_senders: String::new(),
             }],

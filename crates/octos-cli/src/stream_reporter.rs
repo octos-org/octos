@@ -395,7 +395,7 @@ pub async fn run_stream_forwarder(
     // succeeds, drop the LLM's follow-up text so the user doesn't see a
     // duplicate chat-style summary under the card.
     let suppress_matrix_transient_status =
-        channel.name() == "matrix" && !matrix_app_reply_tools.is_empty();
+        channel.channel_type() == "matrix" && !matrix_app_reply_tools.is_empty();
     let mut suppress_follow_up_text_after_app_reply = false;
     // When true, the channel doesn't support send_with_id (returned None),
     // so we stop streaming edits and let the final reply go through out_tx.

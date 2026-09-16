@@ -349,6 +349,7 @@ mod tests {
     fn matrix_entry(settings: serde_json::Value) -> crate::config::ChannelEntry {
         crate::config::ChannelEntry {
             channel_type: MATRIX_CHANNEL_TYPE.to_string(),
+            id: None,
             allowed_senders: Vec::new(),
             settings,
         }
@@ -379,6 +380,7 @@ mod tests {
     fn matrix_channel_settings_copy_allowed_senders() {
         let entry = crate::config::ChannelEntry {
             channel_type: MATRIX_CHANNEL_TYPE.to_string(),
+            id: None,
             allowed_senders: vec!["@alice:localhost".into(), "@bob:localhost".into()],
             settings: serde_json::json!({
                 MATRIX_SETTING_AS_TOKEN: "as-token",
@@ -442,24 +444,60 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let data_dir = tempfile::TempDir::new().unwrap();
         let mut channel_mgr = ChannelManager::new();
-        let mut matrix_channel = None;
+        let mut matrix_channels = std::collections::HashMap::new();
 
         let channel = register_matrix_channel(
             &mut channel_mgr,
-            &mut matrix_channel,
+            &mut matrix_channels,
             &settings,
             &shutdown,
             data_dir.path(),
         );
 
         assert!(channel_mgr.get_channel(MATRIX_CHANNEL_TYPE).is_some());
-        assert!(matrix_channel.is_some());
+        assert_eq!(matrix_channels.len(), 1);
         assert!(Arc::ptr_eq(
             &channel,
-            matrix_channel
-                .as_ref()
-                .expect("matrix channel should be cached")
+            matrix_channels
+                .get(MATRIX_CHANNEL_TYPE)
+                .expect("matrix channel should be registered")
         ));
+    }
+
+    #[test]
+    fn gateway_registers_multiple_named_matrix_appservices() {
+        let mut first = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_AS_TOKEN: "as-first",
+            MATRIX_SETTING_HS_TOKEN: "hs-first",
+            "port": 8010,
+        }));
+        first.id = Some("primary".into());
+        let mut second = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_AS_TOKEN: "as-second",
+            MATRIX_SETTING_HS_TOKEN: "hs-second",
+            "port": 8011,
+        }));
+        second.id = Some("secondary".into());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut channel_mgr = ChannelManager::new();
+        let mut matrix_channels = std::collections::HashMap::new();
+
+        for entry in [&first, &second] {
+            let settings = MatrixChannelSettings::from_entry(entry).unwrap();
+            register_matrix_channel(
+                &mut channel_mgr,
+                &mut matrix_channels,
+                &settings,
+                &shutdown,
+                data_dir.path(),
+            );
+        }
+
+        assert_eq!(matrix_channels.len(), 2);
+        assert!(channel_mgr.get_channel("matrix@primary").is_some());
+        assert!(channel_mgr.get_channel("matrix@secondary").is_some());
     }
 
     #[test]
@@ -501,6 +539,7 @@ mod tests {
     fn matrix_user_settings_copy_allowed_senders() {
         let entry = crate::config::ChannelEntry {
             channel_type: MATRIX_CHANNEL_TYPE.to_string(),
+            id: None,
             allowed_senders: vec!["@alice:matrix.org".into(), "@bob:matrix.org".into()],
             settings: serde_json::json!({
                 MATRIX_SETTING_MODE: MATRIX_MODE_USER,
@@ -705,6 +744,33 @@ mod tests {
     }
 
     #[test]
+    fn gateway_registers_multiple_named_matrix_user_channels() {
+        let mut first = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_first",
+        }));
+        first.id = Some("personal".into());
+        let mut second = matrix_entry(serde_json::json!({
+            MATRIX_SETTING_MODE: MATRIX_MODE_USER,
+            MATRIX_SETTING_ACCESS_TOKEN: "syt_second",
+        }));
+        second.id = Some("work".into());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut channel_mgr = ChannelManager::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first_settings = MatrixUserChannelSettings::from_entry(&first).unwrap();
+        let second_settings = MatrixUserChannelSettings::from_entry(&second).unwrap();
+
+        register_matrix_user_channel(&mut channel_mgr, &first_settings, &shutdown, tmp.path(), 0);
+        register_matrix_user_channel(&mut channel_mgr, &second_settings, &shutdown, tmp.path(), 1);
+
+        assert!(channel_mgr.get_channel("matrix@personal").is_some());
+        assert!(channel_mgr.get_channel("matrix@work").is_some());
+        assert!(channel_mgr.get_channel("matrix").is_none());
+    }
+
+    #[test]
     fn test_dispatch_unknown_profile_falls_back() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = crate::profiles::ProfileStore::open_unified(dir.path()).unwrap();
@@ -766,6 +832,7 @@ mod tests {
             .config
             .channels
             .push(crate::profiles::ChannelCredentials::Matrix {
+                id: None,
                 homeserver: "http://localhost:6167".to_string(),
                 as_token: "as-token".to_string(),
                 hs_token: "hs-token".to_string(),
@@ -863,6 +930,7 @@ mod tests {
             .config
             .channels
             .push(crate::profiles::ChannelCredentials::Matrix {
+                id: None,
                 homeserver: "http://localhost:6167".to_string(),
                 as_token: "as-token".to_string(),
                 hs_token: "hs-token".to_string(),
@@ -947,6 +1015,7 @@ mod tests {
             .config
             .channels
             .push(crate::profiles::ChannelCredentials::Matrix {
+                id: None,
                 homeserver: "http://localhost:6167".to_string(),
                 as_token: "as-token".to_string(),
                 hs_token: "hs-token".to_string(),

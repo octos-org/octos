@@ -14,11 +14,14 @@ pub fn register(
     media_dir: &Path,
 ) -> eyre::Result<()> {
     let url = settings_str(&entry.settings, "bridge_url", "ws://localhost:3001");
-    channel_mgr.register(Arc::new(octos_bus::WhatsAppChannel::new(
-        &url,
-        entry.allowed_senders.clone(),
-        shutdown.clone(),
-        media_dir.to_path_buf(),
-    )));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(octos_bus::WhatsAppChannel::new(
+            &url,
+            entry.allowed_senders.clone(),
+            shutdown.clone(),
+            media_dir.to_path_buf(),
+        )),
+    );
     Ok(())
 }

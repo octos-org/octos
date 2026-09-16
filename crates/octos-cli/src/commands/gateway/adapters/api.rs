@@ -61,6 +61,6 @@ pub fn register(
     if let Some(cb) = on_session_deleted {
         channel = channel.with_on_session_deleted(move |id| cb(id));
     }
-    channel_mgr.register(Arc::new(channel));
+    channel_mgr.register_as(entry.routing_key(), Arc::new(channel));
     Ok(())
 }

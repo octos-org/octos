@@ -37,19 +37,22 @@ pub fn register(
         .get("verification_token")
         .and_then(|v| v.as_str())
         .map(String::from);
-    channel_mgr.register(Arc::new(
-        octos_bus::FeishuChannel::new(
-            &app_id,
-            &app_secret,
-            entry.allowed_senders.clone(),
-            shutdown.clone(),
-            &region,
-            media_dir.to_path_buf(),
-        )
-        .with_mode(&mode)
-        .with_webhook_port(webhook_port)
-        .with_encrypt_key(encrypt_key)
-        .with_verification_token(verification_token),
-    ));
+    channel_mgr.register_as(
+        entry.routing_key(),
+        Arc::new(
+            octos_bus::FeishuChannel::new(
+                &app_id,
+                &app_secret,
+                entry.allowed_senders.clone(),
+                shutdown.clone(),
+                &region,
+                media_dir.to_path_buf(),
+            )
+            .with_mode(&mode)
+            .with_webhook_port(webhook_port)
+            .with_encrypt_key(encrypt_key)
+            .with_verification_token(verification_token),
+        ),
+    );
     Ok(())
 }

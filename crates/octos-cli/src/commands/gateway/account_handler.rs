@@ -238,6 +238,7 @@ fn handle_account_update(
                     .config
                     .channels
                     .push(crate::profiles::ChannelCredentials::Telegram {
+                        id: None,
                         token_env: env_name.clone(),
                         allowed_senders: String::new(),
                     });
@@ -271,6 +272,7 @@ fn handle_account_update(
                         .config
                         .channels
                         .push(crate::profiles::ChannelCredentials::WhatsApp {
+                            id: None,
                             bridge_url: String::new(),
                         });
                     changed.push("whatsapp enabled");
@@ -309,6 +311,7 @@ fn handle_account_update(
                         .config
                         .channels
                         .push(crate::profiles::ChannelCredentials::Feishu {
+                            id: None,
                             app_id_env: id_env,
                             app_secret_env: secret_env,
                             mode: "webhook".to_string(),

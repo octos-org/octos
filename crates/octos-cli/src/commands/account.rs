@@ -158,6 +158,7 @@ impl Executable for AccountCommand {
                         name.to_uppercase().replace(' ', "_")
                     );
                     channels.push(ChannelCredentials::Telegram {
+                        id: None,
                         token_env: env_name.clone(),
                         allowed_senders: String::new(),
                     });
@@ -166,6 +167,7 @@ impl Executable for AccountCommand {
 
                 if whatsapp {
                     channels.push(ChannelCredentials::WhatsApp {
+                        id: None,
                         bridge_url: String::new(), // auto-managed
                     });
                 }
@@ -244,6 +246,7 @@ impl Executable for AccountCommand {
                         .retain(|ch| !matches!(ch, ChannelCredentials::Telegram { .. }));
                     let senders = telegram_senders.clone().unwrap_or_default();
                     profile.config.channels.push(ChannelCredentials::Telegram {
+                        id: None,
                         token_env: env_name.clone(),
                         allowed_senders: senders,
                     });
@@ -278,6 +281,7 @@ impl Executable for AccountCommand {
                         .retain(|ch| !matches!(ch, ChannelCredentials::WhatsApp { .. }));
                     if enable_wa {
                         profile.config.channels.push(ChannelCredentials::WhatsApp {
+                            id: None,
                             bridge_url: String::new(),
                         });
                         changed.push("whatsapp enabled");
@@ -306,6 +310,7 @@ impl Executable for AccountCommand {
                         .channels
                         .retain(|ch| !matches!(ch, ChannelCredentials::Feishu { .. }));
                     profile.config.channels.push(ChannelCredentials::Feishu {
+                        id: None,
                         app_id_env: id_env.clone(),
                         app_secret_env: secret_env.clone(),
                         mode: "webhook".to_string(),

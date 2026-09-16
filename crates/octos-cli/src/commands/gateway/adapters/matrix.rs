@@ -9,14 +9,14 @@ use crate::config::ChannelEntry;
 
 pub fn register(
     channel_mgr: &mut ChannelManager,
-    matrix_channel: &mut Option<Arc<octos_bus::MatrixChannel>>,
+    matrix_channels: &mut std::collections::HashMap<String, Arc<octos_bus::MatrixChannel>>,
     entry: &ChannelEntry,
     channel_index: usize,
     shutdown: &Arc<AtomicBool>,
     data_dir: &Path,
 ) -> eyre::Result<()> {
     // User-account (client) mode: log in with a Matrix account and long-poll
-    // `/sync`. Leaves `matrix_channel` (the appservice handle) unset — there is
+    // `/sync`. Leaves `matrix_channels` (the appservice handles) unchanged — there is
     // no virtual-user/bot management in this mode.
     if matrix_is_user_mode(entry) {
         let settings = MatrixUserChannelSettings::from_entry(entry)?;
@@ -26,6 +26,6 @@ pub fn register(
     }
 
     let settings = MatrixChannelSettings::from_entry(entry)?;
-    let _ = register_matrix_channel(channel_mgr, matrix_channel, &settings, shutdown, data_dir);
+    let _ = register_matrix_channel(channel_mgr, matrix_channels, &settings, shutdown, data_dir);
     Ok(())
 }
