@@ -4108,27 +4108,36 @@ impl TaskSupervisor {
     ///
     /// Idempotent: only the first call spawns the loop; later calls are
     /// no-ops (the flag is shared across `Clone`s). The loop holds only
-    /// a weak liveness story — it keeps running as long as the process
-    /// does; dropping the supervisor's last clone does not stop the
-    /// spawned task until the runtime shuts down (acceptable: the
-    /// production supervisor lives for the process lifetime).
+    /// a `Weak` self-reference and upgrades per tick (#1930): when the
+    /// owning session actor drops the last external `Arc` (session
+    /// deleted or idled out), the next tick's upgrade fails and the loop
+    /// exits instead of pinning the supervisor until process shutdown.
+    /// The upgrade is never held across the sleep, so an in-flight tick
+    /// does not defer the drop either.
     pub fn start_reaper(self: &Arc<Self>) {
         if self.reaper_started.swap(true, Ordering::SeqCst) {
             return;
         }
-        let supervisor = Arc::clone(self);
+        let supervisor = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
-                let interval = *supervisor
+                let Some(strong) = supervisor.upgrade() else {
+                    break;
+                };
+                let interval = *strong
                     .reap_interval
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                drop(strong);
                 tokio::time::sleep(interval).await;
-                let timeout = *supervisor
+                let Some(strong) = supervisor.upgrade() else {
+                    break;
+                };
+                let timeout = *strong
                     .stuck_timeout
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                supervisor.reap_stuck_tasks(Utc::now(), timeout);
+                strong.reap_stuck_tasks(Utc::now(), timeout);
             }
         });
     }

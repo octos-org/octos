@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -8672,6 +8673,39 @@ struct RawLlmRoute {
     api_type: Option<String>,
 }
 
+/// Wire form of `selection.context_window` (#2187): accepts ANY JSON integer
+/// (signed or unsigned 64-bit) so out-of-`u32` values reach the typed
+/// `llm_param_out_of_range` check instead of serde's generic deserialize
+/// error. Non-integers (floats, strings) still fail deserialization as
+/// before — those are type errors, not range errors.
+#[derive(Debug, Clone, Copy)]
+struct WireContextWindow(i128);
+
+impl<'de> Deserialize<'de> for WireContextWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct IntVisitor;
+        impl serde::de::Visitor<'_> for IntVisitor {
+            type Value = WireContextWindow;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an integer context window budget")
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(WireContextWindow(i128::from(value)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(WireContextWindow(i128::from(value)))
+            }
+        }
+        deserializer.deserialize_i128(IntVisitor)
+    }
+}
+
 /// The typed main-model selection + inference-parameter schema shared by
 /// `profile/llm/upsert`, `profile/llm/test`, and `profile/llm/fetch_models`
 /// (#2166). Test and Save parse the identical shape, so a payload that
@@ -8708,9 +8742,12 @@ struct RawLlmSelection {
     model_hints: Option<octos_llm::openai::ModelHints>,
     /// Local runtime context budget override (#2142). Reaches the runtime
     /// `ContextWindowOverride` via the durable selection; NOT an upstream
-    /// request field.
+    /// request field. Carried as a raw integer on the wire so negative /
+    /// over-u32 values reach the typed range check (#2187) instead of a
+    /// generic serde error; validated into the `u32` store type by
+    /// [`validate_llm_inference_fields`].
     #[serde(default)]
-    context_window: Option<u32>,
+    context_window: Option<WireContextWindow>,
     /// Per-model default sampling temperature (finite, 0.0..=2.0).
     #[serde(default)]
     temperature: Option<f64>,
@@ -8813,9 +8850,12 @@ fn reject_unknown_llm_upsert_fields(params: &Value) -> Result<(), RpcError> {
         .keys()
         .filter(|key| !LLM_UPSERT_KNOWN_TOP.contains(&key.as_str()))
         .filter(|key| {
+            // Only TOP-LEVEL foreign paths exclude a top-level key: a literal
+            // dotted key at the top level (legal in JSON) is an unknown key,
+            // not the nested foreign field (#2187).
             !LLM_FOREIGN_FIELDS
                 .iter()
-                .any(|(path, _)| *path == key.as_str())
+                .any(|(path, _)| !path.contains('.') && *path == key.as_str())
         })
         .map(String::clone)
         .collect();
@@ -8866,16 +8906,28 @@ fn reject_unknown_llm_upsert_fields(params: &Value) -> Result<(), RpcError> {
                 json!({ "field": path, "owner": owner })
             })
             .collect();
-        return Err(RpcError::invalid_params(format!(
+        let mut message = format!(
             "field(s) {} belong to a different configuration contract and are not \
              accepted by profile/llm/upsert",
             foreign.join(", ")
-        ))
-        .with_data(json!({
+        );
+        let mut data = json!({
             "kind": "llm_param_owned_elsewhere",
             "rejected_fields": foreign,
             "owners": owners,
-        })));
+        });
+        // #2187: unknown fields in the SAME request are rejected too — name
+        // them in this error instead of dropping them behind the foreign arm.
+        if !unknown.is_empty() {
+            unknown.sort();
+            message.push_str(&format!(
+                "; unknown field(s): {} — profile/llm/upsert accepts a typed schema and \
+                 never silently discards fields",
+                unknown.join(", ")
+            ));
+            data["unknown_fields"] = json!(unknown);
+        }
+        return Err(RpcError::invalid_params(message).with_data(data));
     }
 
     if !unknown.is_empty() {
@@ -8931,16 +8983,22 @@ fn validate_llm_inference_fields(selection: &RawLlmSelection) -> Result<(), RpcE
     }
     check_f64_range(selection.temperature, "temperature", "0.0..=2.0", 0.0, 2.0)?;
     check_f64_range(selection.top_p, "top_p", "0.0..=1.0", 0.0, 1.0)?;
-    if selection.context_window == Some(0) {
-        return Err(
-            RpcError::invalid_params("selection.context_window must be >= 1 token").with_data(
-                json!({
-                    "kind": "llm_param_out_of_range",
-                    "field": "selection.context_window",
-                    "range": ">=1",
-                }),
-            ),
-        );
+    // #2187: the wire type accepts any JSON integer precisely so out-of-u32
+    // values land here (typed range kind) rather than in serde's generic
+    // deserialize error.
+    if let Some(context_window) = selection.context_window {
+        let range = format!("1..={}", u32::MAX);
+        if !(1..=i128::from(u32::MAX)).contains(&context_window.0) {
+            return Err(RpcError::invalid_params(format!(
+                "selection.context_window must be in {range}, got {}",
+                context_window.0
+            ))
+            .with_data(json!({
+                "kind": "llm_param_out_of_range",
+                "field": "selection.context_window",
+                "range": range,
+            })));
+        }
     }
     Ok(())
 }
@@ -13055,7 +13113,9 @@ async fn raw_profile_llm_upsert(
         model_id: Some(model_id),
         route: Some(route),
         model_hints: params.selection.model_hints,
-        context_window: params.selection.context_window,
+        // Validated to 1..=u32::MAX by `validate_llm_inference_fields`
+        // (parse_llm_selection_params runs it before this point).
+        context_window: params.selection.context_window.map(|value| value.0 as u32),
         temperature: params.selection.temperature.map(|value| value as f32),
         top_p: params.selection.top_p.map(|value| value as f32),
         reasoning_effort: params.selection.reasoning_effort,
@@ -21010,25 +21070,98 @@ pub(crate) async fn ensure_session_profile_runtime(
     )))
 }
 
+/// Replace the cached runtime under `key` only while the entry is still the
+/// one `base` was read from — the skill-mutation counterpart of
+/// `insert_profile_runtime_if_current` (#2186). A cold bootstrap fills an empty
+/// slot (`or_insert`), but the rebuild's whole point is refreshing the plugin
+/// layer IN PLACE, so this replaces the existing entry. Two checks, both under
+/// the same write lock:
+///
+/// - the generation must still be `generation` — a post-commit invalidation
+///   bumps it before dropping the cache;
+/// - if an entry is cached it must BE `base` (pointer identity). The commit's
+///   bump and remove are separate lock acquisitions, so a rebuild can capture
+///   the POST-bump generation yet still read the PRE-commit entry — the
+///   generation check alone cannot catch that window, and without this the
+///   replacement (which carries base's provider chain) would overwrite the
+///   committed runtime.
+///
+/// An absent entry is only acceptable when `base` came from the startup-pinned
+/// map (`base_is_startup_pinned`) — a dynamic-map base is always re-inserted
+/// by its own bootstrap, and the only remover bumps the generation first.
+/// Returns `false` — leaving the cache untouched — when either check fails.
+fn replace_profile_runtime_if_current(
+    key: &str,
+    generation: u64,
+    base: &Arc<crate::runtime::ProfileRuntime>,
+    base_is_startup_pinned: bool,
+    runtime: Arc<crate::runtime::ProfileRuntime>,
+) -> bool {
+    let mut runtimes = dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current_profile_runtime_generation(key) != generation {
+        return false;
+    }
+    match runtimes.get(key) {
+        Some(cached) if !Arc::ptr_eq(cached, base) => return false,
+        Some(_) => {}
+        None if !base_is_startup_pinned => return false,
+        None => {}
+    }
+    runtimes.insert(key.to_owned(), runtime);
+    true
+}
+
 async fn rebuild_profile_runtime_after_skill_mutation(
     state: &Arc<AppState>,
     profile_id: &str,
 ) -> Result<(), RpcError> {
+    // #2186: capture the key and generation BEFORE fetching the runtime. The
+    // replacement derives from the CURRENT cached runtime, so it carries that
+    // runtime's provider chain — if a profile/llm commit lands anywhere after
+    // this point (generation bump + cache drop + fresh bootstrap), the guarded
+    // replace below refuses to overwrite the committed runtime with one
+    // rebuilt from the pre-commit chain. The per-profile skill mutation lock
+    // held by the callers serializes rebuilds against each other, but NOT
+    // against profile/llm commits, which is the race this guards.
+    let key = dynamic_profile_runtime_key(state, profile_id);
+    let generation = key.as_deref().map(current_profile_runtime_generation);
     let Some(current) = ensure_session_profile_runtime(state, Some(profile_id)).await? else {
         return Ok(());
     };
+    let key = key.ok_or_else(|| {
+        runtime_unavailable_error("profile runtime catalog is unavailable for skill mutation")
+    })?;
+    let generation = generation.expect("generation is captured together with the key");
+    let base_is_startup_pinned = state
+        .profiles
+        .get(profile_id)
+        .is_some_and(|pinned| Arc::ptr_eq(pinned, &current));
     let replacement = current.rebuild_plugin_layer().await.map_err(|error| {
         runtime_unavailable_error(format!(
             "failed to rebuild profile runtime after skill mutation: {error}"
         ))
     })?;
-    let key = dynamic_profile_runtime_key(state, profile_id).ok_or_else(|| {
-        runtime_unavailable_error("profile runtime catalog is unavailable for skill mutation")
-    })?;
-    dynamic_profile_runtimes()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key, replacement);
+    if !replace_profile_runtime_if_current(
+        &key,
+        generation,
+        &current,
+        base_is_startup_pinned,
+        replacement,
+    ) {
+        // The racing commit already invalidated the session cache and dropped
+        // the stale entry; for a dynamic profile it also re-bootstrapped from
+        // the committed file (which includes this skill mutation), and for a
+        // startup-pinned one it already reported restart_required. Dropping
+        // the stale replacement is the conservative outcome either way.
+        tracing::debug!(
+            profile_id = %profile_id,
+            "skill-mutation runtime rebuild raced a profile/llm commit; \
+             keeping the committed runtime"
+        );
+        return Ok(());
+    }
     state.session_cache.invalidate_profile(profile_id).await;
     Ok(())
 }

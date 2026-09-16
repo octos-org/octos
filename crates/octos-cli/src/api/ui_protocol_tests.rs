@@ -1333,6 +1333,109 @@ async fn llm_upsert_rejects_max_output_tokens_as_owned_elsewhere() {
     );
 }
 
+/// A request carrying BOTH foreign-owned and unknown fields must name both
+/// groups in the single rejection (#2187) — the unknown entries must not be
+/// silently dropped from the error just because a foreign field is present.
+/// Covers nested foreign + nested unknown (selection + route levels),
+/// top-level foreign, and a literal dotted top-level key (legal JSON) which
+/// is unknown, NOT the nested foreign field.
+#[tokio::test]
+async fn llm_upsert_rejects_foreign_and_unknown_fields_in_one_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let upsert = |id: &str, params: Value| {
+        RpcRequest::new(
+            id.to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            params,
+        )
+    };
+    let assert_names = |error: RpcError, foreign: &str, unknown: &[&str]| {
+        let data = error.data.as_ref().expect("typed error data");
+        assert_eq!(data["kind"], json!("llm_param_owned_elsewhere"));
+        assert!(
+            data["rejected_fields"]
+                .as_array()
+                .expect("foreign field list")
+                .iter()
+                .any(|value| *value == json!(foreign)),
+            "rejected_fields must name {foreign}: {data}"
+        );
+        let unknown_fields = data["unknown_fields"]
+            .as_array()
+            .expect("unknown field list");
+        for expected in unknown {
+            assert!(
+                unknown_fields.iter().any(|value| *value == json!(expected)),
+                "unknown_fields must name {expected}: {data}"
+            );
+        }
+    };
+    // Nested foreign + nested unknowns (selection and route levels).
+    let error = raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "u-mixed",
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": {
+                        "route_id": "fixture",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "bogus_route_key": true
+                    },
+                    "max_output_tokens": 4096,
+                    "temperature2": 0.5
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("foreign and unknown fields must both be rejected");
+    assert_names(
+        error,
+        "selection.max_output_tokens",
+        &["selection.temperature2", "selection.route.bogus_route_key"],
+    );
+    // Top-level foreign + a literal dotted top-level key: the dotted key is
+    // unknown (it is not the nested foreign field) and must still be named.
+    let error = raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "u-mixed-top",
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" }
+                },
+                "max_output_tokens": 4096,
+                "selection.max_output_tokens": 4096,
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("top-level foreign and unknown fields must both be rejected");
+    assert_names(error, "max_output_tokens", &["selection.max_output_tokens"]);
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .is_none(),
+        "a mixed rejection must not create or mutate the profile"
+    );
+}
+
 /// Out-of-range and non-finite typed values return a typed
 /// `llm_param_out_of_range` / `llm_param_non_finite` without mutating the
 /// prior configuration.
@@ -1340,12 +1443,23 @@ async fn llm_upsert_rejects_max_output_tokens_as_owned_elsewhere() {
 async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
-    for (field, value, kind) in [
-        ("temperature", json!(3.5), "llm_param_out_of_range"),
-        ("temperature", json!(-0.1), "llm_param_out_of_range"),
-        ("top_p", json!(1.5), "llm_param_out_of_range"),
-        ("context_window", json!(0), "llm_param_out_of_range"),
+    for (field, value, range) in [
+        ("temperature", json!(3.5), "0.0..=2.0"),
+        ("temperature", json!(-0.1), "0.0..=2.0"),
+        ("top_p", json!(1.5), "0.0..=1.0"),
+        ("context_window", json!(0), "1..=4294967295"),
+        // #2187: negative / over-u32 context_window must get the same typed
+        // range kind, not a generic serde deserialize error — at every
+        // integer width JSON can carry.
+        ("context_window", json!(-5), "1..=4294967295"),
+        ("context_window", json!(4_294_967_296u64), "1..=4294967295"),
+        (
+            "context_window",
+            json!(9_223_372_036_854_775_808u64),
+            "1..=4294967295",
+        ),
     ] {
+        let kind = "llm_param_out_of_range";
         let error = raw_profile_llm_upsert(
             &state,
             &RpcRequest::new(
@@ -1369,6 +1483,7 @@ async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
         let data = error.data.as_ref().expect("typed error data");
         assert_eq!(data["kind"], json!(kind), "{field}={value}");
         assert_eq!(data["field"], json!(format!("selection.{field}")));
+        assert_eq!(data["range"], json!(range), "{field}={value}");
     }
     // Non-finite guard: exercised directly (JSON cannot carry NaN/Inf).
     let error = validate_llm_inference_fields(&RawLlmSelection {
@@ -1379,6 +1494,58 @@ async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
     assert_eq!(
         error.data.as_ref().unwrap()["kind"],
         json!("llm_param_non_finite")
+    );
+    // Boundary: u32::MAX itself is a valid context_window override.
+    validate_llm_inference_fields(&RawLlmSelection {
+        context_window: Some(WireContextWindow(i128::from(u32::MAX))),
+        ..Default::default()
+    })
+    .expect("u32::MAX context_window must be accepted");
+}
+
+/// Boundary end-to-end (#2187): `context_window: 4294967295` (u32::MAX) is
+/// accepted by the typed range check and lands in the durable store as
+/// `Some(u32::MAX)` — pinning the validated i128 → u32 conversion.
+#[tokio::test]
+async fn llm_upsert_accepts_u32_max_context_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-cw-max".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" },
+                    "context_window": 4_294_967_295u64
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("u32::MAX context_window must upsert");
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .expect("profile created");
+    assert_eq!(
+        profile
+            .config
+            .llm
+            .as_ref()
+            .and_then(|llm| llm.primary.as_ref())
+            .and_then(|primary| primary.context_window),
+        Some(u32::MAX),
+        "the validated boundary value must persist as u32::MAX"
     );
 }
 
@@ -2349,6 +2516,280 @@ async fn should_refuse_stale_profile_runtime_insert_after_generation_bump() {
         "a current-generation bootstrap inserts"
     );
     assert!(dynamic_cached_profile_runtime(&state, "dev").is_some());
+}
+
+/// #2186 acceptance — the skill-mutation rebuild is the sibling writer the
+/// #2164 guard did not cover: its replace carries the generation captured when
+/// the rebuild started, so a profile/llm commit landing mid-rebuild (bump +
+/// drop + fresh bootstrap) is NOT overwritten by a runtime rebuilt from the
+/// pre-commit one.
+#[tokio::test]
+async fn should_refuse_stale_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-rebuild",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let runtime = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+    // A rebuilt plugin layer is a distinct Arc standing in for the in-flight
+    // rebuild's PRE-commit replacement (a second live bootstrap would take the
+    // episode-store lock the first runtime holds).
+    let stale_replacement = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    // The commit lands while the rebuild is in flight: generation bumped,
+    // cache dropped, and a fresh runtime bootstrapped from the committed file
+    // (a distinct Arc stands in for it here).
+    bump_profile_runtime_generation(&key);
+    let committed = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("committed runtime");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    // The in-flight rebuild finishes: the guarded replace must refuse it…
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &runtime,
+            false,
+            stale_replacement,
+        ),
+        "a stale skill-mutation rebuild must not overwrite the committed runtime"
+    );
+    // …leaving the committed runtime serving.
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the generation check alone has a hole: the commit's bump and remove
+/// are separate lock acquisitions, so a rebuild can capture the POST-bump
+/// generation yet still read the PRE-commit entry. The pointer-identity check
+/// on the cached entry closes that window — a same-generation replace against
+/// an entry that is not the rebuild's base must be refused.
+#[tokio::test]
+async fn should_refuse_skill_rebuild_replace_against_a_foreign_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-foreign",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let base = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The committed bootstrap lands between the rebuild's cache read and its
+    // replace — SAME generation (captured after the bump, before the remove).
+    let committed = base.rebuild_plugin_layer().await.expect("committed");
+    let stale_replacement = base
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    assert!(
+        !replace_profile_runtime_if_current(&key, generation, &base, false, stale_replacement),
+        "a replace whose base is no longer the cached entry must be refused"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the unraced skill-mutation rebuild must REPLACE the cached entry
+/// (its whole point is refreshing the plugin layer in place), which the
+/// bootstrap guard's `or_insert` cannot express.
+#[tokio::test]
+async fn should_replace_cached_profile_runtime_when_generation_is_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-replace",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let original = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The rebuilt plugin layer is exactly what the production rebuild inserts.
+    let replacement = original
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+    assert!(
+        !Arc::ptr_eq(&original, &replacement),
+        "the stand-in replacement must be a distinct Arc"
+    );
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &original,
+            false,
+            Arc::clone(&replacement),
+        ),
+        "a current-generation rebuild replaces the cached entry"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &replacement),
+        "the replacement must overwrite the old entry, not be dropped by or_insert"
+    );
+}
+
+/// #2186 — a startup-pinned profile has no dynamic entry for the rebuild to
+/// match against: the guarded replace must still install the refresh (this is
+/// how skill mutations take effect on pinned profiles without a restart).
+#[tokio::test]
+async fn should_install_skill_rebuild_for_a_startup_pinned_profile_without_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-skill-pinned", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // Simulate the startup-pinned shape: the base comes from state.profiles,
+    // not the dynamic cache, so no entry exists for the key.
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    let replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &pinned,
+            true,
+            Arc::clone(&replacement),
+        ),
+        "a pinned profile's refresh installs into the empty dynamic slot"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(Arc::ptr_eq(&cached, &replacement));
+}
+
+/// #2186 — the startup-pinned escape hatch (no cached entry to match against)
+/// is exactly where the generation check is load-bearing: a profile/llm commit
+/// racing the rebuild bumps the generation even though there is no entry to
+/// remove, and the stale refresh must NOT install afterwards.
+#[tokio::test]
+async fn should_refuse_pinned_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-pinned-bump", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+
+    // Startup-pinned shape: no dynamic entry. The racing commit then bumps the
+    // generation (for a pinned profile it reports restart_required instead of
+    // re-bootstrapping, so the slot stays empty).
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    bump_profile_runtime_generation(&key);
+    let stale_replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &pinned,
+            true,
+            stale_replacement,
+        ),
+        "a pinned rebuild that raced a commit must not install the stale refresh"
+    );
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the refused install must leave the dynamic slot empty"
+    );
 }
 
 /// #2164 acceptance — persisted-but-rebuild-failed is EXPLICIT in the
