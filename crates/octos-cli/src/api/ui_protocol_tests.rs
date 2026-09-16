@@ -40481,13 +40481,31 @@ fn should_report_cache_read_tokens_in_session_usage_status() {
 }
 
 #[test]
+fn should_report_cache_write_tokens_in_session_usage_status() {
+    // The 1.25x-premium side of the cache dimension: the ledger accumulates
+    // it per run, and without it in the status payload a client cannot tell
+    // cache-write spend apart from plain input spend.
+    let totals = UsageTotals {
+        run_count: 2,
+        input_tokens: 105,
+        output_tokens: 20,
+        cache_read_tokens: 95,
+        cache_write_tokens: 40,
+        estimated_cost_usd: 0.25,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["cached_input_tokens"], 95);
+    assert_eq!(usage["cache_write_input_tokens"], 40);
+}
+
+#[test]
 fn should_report_empty_usage_when_session_has_no_recorded_runs() {
     let usage = usage_status_json(&UsageTotals::default());
     assert_eq!(usage, serde_json::json!({}));
 }
 
 #[test]
-fn should_omit_cost_when_no_run_was_priced() {
+fn should_omit_cost_in_session_usage_status_when_no_run_was_priced() {
     // Tokens accrue but the model had no catalog pricing: report the tokens,
     // stay silent on spend rather than claiming a confident $0.0000.
     let totals = UsageTotals {
@@ -40504,11 +40522,12 @@ fn should_omit_cost_when_no_run_was_priced() {
     assert!(usage.get("estimated_cost_micros_usd").is_none());
 }
 
-/// A cold first turn reports zero cache reads. That is the correct reading,
-/// not a broken one — and it must be reported as an explicit `0` rather than
-/// omitted, because "absent" is what an unimplemented field looks like.
+/// A cold first turn reports zero cache reads/writes. That is the correct
+/// reading, not a broken one — and it must be reported as an explicit `0`
+/// rather than omitted, because "absent" is what an unimplemented field looks
+/// like.
 #[test]
-fn should_report_zero_cache_reads_explicitly_on_a_cold_session() {
+fn should_report_zero_cache_sides_explicitly_in_cold_session_usage_status() {
     let totals = UsageTotals {
         run_count: 1,
         input_tokens: 13_302,
@@ -40520,6 +40539,8 @@ fn should_report_zero_cache_reads_explicitly_on_a_cold_session() {
     let usage = usage_status_json(&totals);
     assert_eq!(usage["cached_input_tokens"], 0);
     assert!(usage.get("cached_input_tokens").is_some());
+    assert_eq!(usage["cache_write_input_tokens"], 0);
+    assert!(usage.get("cache_write_input_tokens").is_some());
 }
 
 // ---------------------------------------------------------------------------
