@@ -131,6 +131,9 @@ ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep
 # WAV decoding is always-on via `hound`; MP3 pulls in `symphonia` which is
 # heavier so we keep it opt-in for non-audio workspaces.
 audio_mp3 = ["dep:symphonia"]
+# Test-only helpers exposed to downstream crates' test builds (e.g. the
+# octos-cli #2353 observer-cycle regression test). Off in production builds.
+test-utils = []
 
 [lints]
 workspace = true
