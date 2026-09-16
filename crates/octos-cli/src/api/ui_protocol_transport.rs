@@ -30151,13 +30151,15 @@ async fn run_m9_fixture_turn(
                                 "persisted deterministic task snapshot".to_owned(),
                             ),
                             // #1123 / M13-B — synthetic fixture path has no
-                            // BackgroundTask projection; leave all five fields
+                            // BackgroundTask projection; leave all seven fields
                             // unset so the wire shape stays bare.
                             source: None,
                             role: None,
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            started_at: None,
+                            relaunched_from: None,
                             // C1 step 4: stamp the originating turn.
                             turn_id: Some(turn_id.clone()),
                         }),
@@ -30189,6 +30191,8 @@ async fn run_m9_fixture_turn(
                             summary: None,
                             artifact_count: None,
                             runtime_policy_stamp: None,
+                            started_at: None,
+                            relaunched_from: None,
                             // C1 step 4: stamp the originating turn.
                             turn_id: Some(turn_id.clone()),
                         }),
@@ -31284,6 +31288,10 @@ async fn run_native_code_review_turn(
             summary: Some("Launching native code review specialists".to_owned()),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+            // Not BackgroundTask-backed: no server start clock or
+            // relaunch lineage to mirror onto the wire.
+            started_at: None,
+            relaunched_from: None,
             // C1 step 4: stamp the originating turn.
             turn_id: Some(turn_id.clone()),
         }),
@@ -31442,6 +31450,8 @@ async fn run_native_code_review_turn(
                         summary: Some("Code review interrupted".to_owned()),
                         artifact_count: Some(0),
                         runtime_policy_stamp: review_runtime_policy_stamp.clone(),
+                        started_at: None,
+                        relaunched_from: None,
                         // C1 step 4: stamp the originating turn.
                         turn_id: Some(turn_id.clone()),
                     }),
@@ -31565,6 +31575,8 @@ async fn run_native_code_review_turn(
             )),
             artifact_count: Some(0),
             runtime_policy_stamp: review_runtime_policy_stamp,
+            started_at: None,
+            relaunched_from: None,
             // C1 step 4: stamp the originating turn.
             turn_id: Some(turn_id.clone()),
         }),
@@ -32097,6 +32109,10 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // Synthetic swarm path: not BackgroundTask-backed, so no
+            // server start clock or relaunch lineage to mirror.
+            started_at: None,
+            relaunched_from: None,
             // C1 step 4: stamp the originating turn.
             turn_id: Some(turn_id.clone()),
         }),
@@ -32247,6 +32263,8 @@ async fn run_m15_live_subagent_fixture_turn(
                         summary: None,
                         artifact_count: None,
                         runtime_policy_stamp: None,
+                        started_at: None,
+                        relaunched_from: None,
                         // C1 step 4: stamp the originating turn.
                         turn_id: Some(turn_id.clone()),
                     }),
@@ -32346,6 +32364,10 @@ async fn run_m15_live_subagent_fixture_turn(
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            // Synthetic swarm path: not BackgroundTask-backed, so no
+            // server start clock or relaunch lineage to mirror.
+            started_at: None,
+            relaunched_from: None,
             // C1 step 4: stamp the originating turn.
             turn_id: Some(turn_id.clone()),
         }),
