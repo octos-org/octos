@@ -1741,17 +1741,29 @@ pub(crate) fn install_peer_restore_observers_composed(
 /// already-adopted (Completed) row is skipped rather than re-marked terminal.
 /// Ungated: the gateway session actor (which owns the supervisor peer tasks
 /// register against) wires it WITHOUT the `api` feature.
+///
+/// #2353 — takes the supervisor behind its `Arc` so the composed consumer can
+/// capture a `Weak` and upgrade at fire time: a strong structural clone
+/// stored back into the supervisor's own `on_restore` slot would cycle
+/// (slot → closure → clone → the same slot) and pin the session's entire
+/// inner supervisor state until process shutdown. When the upgrade fails the
+/// session is gone, and there is nothing left to adopt or reconcile for, so
+/// the callback simply no-ops. The same applies to child supervisors that
+/// INHERIT the composed callback ([`octos_agent::TaskSupervisor::
+/// inherit_registration_observers`], e.g. the `snapshot_excluding` path): a
+/// child restoring after the parent's last owner dropped skips the adoption
+/// half, while the goal-reconcile half still runs over the child's own
+/// restored rows.
 pub(crate) fn install_peer_restore_observers_resolving_at_callback(
-    supervisor: &octos_agent::TaskSupervisor,
+    supervisor: &Arc<octos_agent::TaskSupervisor>,
     session_id: &SessionKey,
     profile_id: &str,
     profile_data_dir: &Path,
 ) {
-    let adoption_supervisor = supervisor.clone();
+    let restore_supervisor = Arc::downgrade(supervisor);
     let adoption_data_dir = profile_data_dir.to_path_buf();
     let adoption_profile = profile_id.to_owned();
     let adoption_master_session = session_id.to_string();
-    let reconcile_supervisor = supervisor.clone();
     install_goal_task_row_observers_resolving_at_callback_composed(
         supervisor,
         session_id,
@@ -1771,12 +1783,17 @@ pub(crate) fn install_peer_restore_observers_resolving_at_callback(
         // API needed), where the adopted rows are terminal with bindings
         // intact.
         Some(Box::new(move |_restored| {
+            let Some(supervisor) = restore_supervisor.upgrade() else {
+                // #2353 — the session's supervisor is gone; the parked rows it
+                // would have adopted went with it.
+                return;
+            };
             crate::peers::adopt_parked_peer_tasks_with_results(
-                &adoption_supervisor,
+                &supervisor,
                 &adoption_profile,
                 &adoption_master_session,
                 &adoption_data_dir,
-                &adoption_supervisor.get_all_tasks(),
+                &supervisor.get_all_tasks(),
             );
             if let Some(goal_id) = default_agent_orchestrator().bound_goal_id(
                 &SessionKey(adoption_master_session.clone()),
@@ -1786,7 +1803,7 @@ pub(crate) fn install_peer_restore_observers_resolving_at_callback(
                     &adoption_data_dir,
                     &adoption_profile,
                     &goal_id,
-                    &reconcile_supervisor.get_all_tasks(),
+                    &supervisor.get_all_tasks(),
                 );
             }
         })),
@@ -30839,7 +30856,7 @@ mod tests {
         // append is the durable part. Wired with the REAL production gateway
         // installer so its restore is delivered NOW (adoption finds no
         // Parked row yet, no-op) — no stale undelivered flag for boot 3.
-        let sweep_boot = octos_agent::TaskSupervisor::new();
+        let sweep_boot = Arc::new(octos_agent::TaskSupervisor::new());
         install_peer_restore_observers_resolving_at_callback(
             &sweep_boot,
             &wire,
@@ -30853,7 +30870,7 @@ mod tests {
         drop(sweep_boot);
 
         // ── boot 3 (gateway restore shape, post-park) ─────────────────────
-        let supervisor = octos_agent::TaskSupervisor::new();
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
         install_peer_restore_observers_resolving_at_callback(
             &supervisor,
             &wire,
@@ -30906,6 +30923,65 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(task_id);
+    }
+
+    /// #2353 — the composed restore observer must NOT pin the supervisor's
+    /// shared inner state: the adoption consumer needs the supervisor only at
+    /// fire time, so once every external owner drops, the `on_restore` slot
+    /// (and with it the task map, cancel tokens, channel senders) must be
+    /// reclaimed rather than kept alive by a captured strong clone cycling
+    /// back into the slot.
+    #[test]
+    fn restore_observer_installation_does_not_pin_supervisor_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = SessionKey::with_profile("tenant-restore-cycle", "api", "restore-cycle");
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let alive = supervisor.on_restore_slot_alive_probe_for_test();
+        install_peer_restore_observers_resolving_at_callback(
+            &supervisor,
+            &wire,
+            "tenant-restore-cycle",
+            dir.path(),
+        );
+        drop(supervisor);
+        assert!(
+            !alive(),
+            "the restore observer must not keep the supervisor's inner state \
+             alive after its last external owner dropped",
+        );
+    }
+
+    /// #2353 — a child supervisor that INHERITED the composed restore observer
+    /// (`inherit_registration_observers`, the `snapshot_excluding` path) and
+    /// restores after the parent's last owner dropped must cleanly no-op the
+    /// adoption half (its `Weak` upgrade fails) instead of running it against
+    /// a pinned parent — and the inherited copy itself must not re-pin the
+    /// parent's state either.
+    #[test]
+    fn inherited_restore_observer_no_ops_after_parent_supervisor_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = SessionKey::with_profile("tenant-restore-cycle", "api", "restore-cycle-child");
+        let parent = Arc::new(octos_agent::TaskSupervisor::new());
+        let parent_alive = parent.on_restore_slot_alive_probe_for_test();
+        install_peer_restore_observers_resolving_at_callback(
+            &parent,
+            &wire,
+            "tenant-restore-cycle",
+            dir.path(),
+        );
+        let child = octos_agent::TaskSupervisor::new();
+        child.inherit_registration_observers(&parent);
+        drop(parent);
+        assert!(
+            !parent_alive(),
+            "the inherited observer copy must not pin the parent's inner state",
+        );
+        // The inherited callback fires on the child's restore; the Weak
+        // upgrade fails and the adoption half no-ops. This must complete
+        // cleanly (no panic, no error).
+        child
+            .enable_persistence(dir.path().join("tasks.jsonl"))
+            .expect("child restore completes after the parent is gone");
     }
 
     /// #2056 case 1 — a terminal supervisor row whose ledger write never

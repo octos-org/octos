@@ -12106,7 +12106,7 @@ async fn invoke_skill_action_tool_binding(
 /// (`snapshot_excluding` — e.g. the native-review specialist swarm) inherit
 /// the pair onto their fresh supervisors.
 fn wire_goal_task_row_observers_for_cached_supervisor(
-    supervisor: &octos_agent::TaskSupervisor,
+    supervisor: &Arc<octos_agent::TaskSupervisor>,
     session_id: &SessionKey,
     profile_id: &str,
     profile_data_dir: &std::path::Path,
@@ -34011,24 +34011,32 @@ async fn run_standalone_turn(
             .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
         let peer_adopt_profile = session_runtime.profile.profile_id.clone();
         let peer_adopt_data_dir = session_runtime.profile.data_dir.clone();
-        let peer_adopt_supervisor = task_supervisor.clone();
+        // #2353 — capture a `Weak`, not strong clones: the composed callback
+        // is stored back into THIS supervisor's own `on_restore` slot, so a
+        // strong `Arc` clone would cycle (slot → closure → clone → the same
+        // allocation) and pin the whole per-turn supervisor until process
+        // shutdown. The upgrade can only fail once the turn's registry is
+        // gone, when there is nothing left to adopt or reconcile for.
+        let restore_supervisor = Arc::downgrade(&task_supervisor);
         let peer_adopt_master = session_id.to_string();
-        let reconcile_supervisor = task_supervisor.clone();
         crate::autonomy::agent_orchestrator::install_peer_restore_observers_composed(
             &task_supervisor,
             &session_runtime.profile.data_dir,
             move || register_goal_binding.clone(),
             move |_restored| {
+                let Some(supervisor) = restore_supervisor.upgrade() else {
+                    return;
+                };
                 // B — adopt FIRST (its `mark_completed` re-stashes the
                 // task→goal binding from the staged dir's `goal` file), then
                 // reconcile the POST-adoption table so the adopted row's
                 // terminal verdict reaches the goal ledger.
                 crate::peers::adopt_parked_peer_tasks_with_results(
-                    &peer_adopt_supervisor,
+                    &supervisor,
                     &peer_adopt_profile,
                     &peer_adopt_master,
                     &peer_adopt_data_dir,
-                    &peer_adopt_supervisor.get_all_tasks(),
+                    &supervisor.get_all_tasks(),
                 );
                 let orchestrator = default_agent_orchestrator();
                 let binding = if let Some((goal_key, profile)) = restore_goal_key.as_ref() {
@@ -34048,7 +34056,7 @@ async fn run_standalone_turn(
                         &peer_adopt_data_dir,
                         &profile,
                         &goal_id,
-                        &reconcile_supervisor.get_all_tasks(),
+                        &supervisor.get_all_tasks(),
                     );
                 }
             },

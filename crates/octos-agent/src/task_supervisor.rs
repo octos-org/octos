@@ -1791,6 +1791,21 @@ impl TaskSupervisor {
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
     }
 
+    /// #2353 — liveness probe for the SHARED `on_restore` slot, so a test can
+    /// assert the supervisor's inner state is actually reclaimed once every
+    /// external owner drops (i.e. no observer callback is pinning it through
+    /// a captured strong clone). Detects leaks that pin the slot's `Arc`
+    /// itself — the structural-clone cycle shape; a capture of an individual
+    /// inner `Arc` would need its own probe. Returns a closure because the
+    /// slot type is private.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn on_restore_slot_alive_probe_for_test(
+        &self,
+    ) -> impl Fn() -> bool + Send + Sync + 'static {
+        let weak = std::sync::Arc::downgrade(&self.on_restore);
+        move || weak.upgrade().is_some()
+    }
+
     /// #2056 round 3 — THE install path for the restore observer, shared by
     /// [`Self::set_on_restore`] and observer inheritance so neither can bypass
     /// the missed-restore handshake. Installing and taking the pending mark
