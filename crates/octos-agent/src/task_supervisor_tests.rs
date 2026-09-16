@@ -4585,6 +4585,33 @@ async fn start_reaper_loop_reaps_stuck_task_on_interval() {
     assert!(supervisor.cancel_token(&id).is_cancelled());
 }
 
+/// #1930: the reaper loop must not pin the supervisor on its own. A
+/// gateway session actor starts one reaper per session supervisor; when
+/// the session is deleted or idles out, every external owner drops, and
+/// the loop must exit on its next tick instead of pinning the supervisor
+/// until process shutdown.
+#[tokio::test]
+async fn reaper_exits_when_last_supervisor_clone_drops() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.set_reap_interval(Duration::from_millis(10));
+    supervisor.start_reaper();
+
+    let weak = Arc::downgrade(&supervisor);
+    drop(supervisor);
+
+    // The loop may be mid-tick — holding a short-lived upgrade while it
+    // reads the interval or runs a sweep — so allow a few intervals for
+    // it to reach the upgrade-failed exit. It must NEVER pin the
+    // supervisor indefinitely.
+    for _ in 0..50 {
+        if weak.upgrade().is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("reaper kept the supervisor alive after its last external clone dropped");
+}
+
 // ---------------------------------------------------------------------------
 // #2055 — registration observer (`set_on_register`).
 //
