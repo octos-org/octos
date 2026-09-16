@@ -2023,6 +2023,13 @@ Capability feature:
 
 Carries task lifecycle and summary updates that are useful to clients even before the full unified ledger exists.
 
+Optional fields (#1595):
+
+- `started_at`
+  Server clock timestamp of task registration (ISO-8601 / RFC 3339, same wire form as the `task/list` projection field of the same name). Clients ranking rows that share one `tool_call_id` (pipeline families, relaunch chains) order by this server timestamp, not by client receipt time. Absent on synthetic / legacy emitters.
+- `relaunched_from`
+  First-class relaunch lineage: the predecessor task id when this task was created by `TaskSupervisor::relaunch`. Unlike the JSON stamped into `runtime_detail` on the spawn transition (dropped by the next runtime-state overwrite), this field rides every frame, so clients can resolve the chain explicitly. Absent when the task is not a relaunch successor. Carried on `task/updated` only — the `task/list` projection is unchanged, so clients that need lineage outside the live stream still parse the spawn-transition `runtime_detail` JSON there.
+
 ### `task/output/delta`
 
 Carries live chunks of task output for a task/output viewer.

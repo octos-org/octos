@@ -19013,6 +19013,8 @@ fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            started_at: None,
+            relaunched_from: None,
             turn_id: None,
         }),
     );
@@ -19031,6 +19033,8 @@ fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            started_at: None,
+            relaunched_from: None,
             turn_id: None,
         }),
     );
@@ -23725,6 +23729,7 @@ fn make_background_task(
         runtime_policy_stamp: None,
         projection_metadata: None,
         workspace_root: None,
+        relaunched_from: None,
     }
 }
 
@@ -24007,6 +24012,7 @@ async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentr
         runtime_policy_stamp: None,
         projection_metadata: None,
         workspace_root: None,
+        relaunched_from: None,
     };
 
     // The production `set_on_change` callback, threading the resolved
@@ -24121,6 +24127,7 @@ fn unified_terminal_test_task(
         runtime_policy_stamp: None,
         projection_metadata: None,
         workspace_root: None,
+        relaunched_from: None,
     }
 }
 

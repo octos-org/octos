@@ -1371,6 +1371,8 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     })
     .into_rpc_notification()
@@ -3858,6 +3860,8 @@ fn task_updated_event_round_trips_with_cancelled_state() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     });
     let rpc = event
@@ -3939,6 +3943,14 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
         summary: Some("found 1 issue".into()),
         artifact_count: Some(2),
         runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+        // #1595: server clock and relaunch lineage round-trip alongside
+        // the projection fields.
+        started_at: Some(
+            DateTime::parse_from_rfc3339("2026-09-15T07:46:43Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ),
+        relaunched_from: Some("01900000-0000-7000-8000-0000000000aa".into()),
         // C1 step 4: turn_id round-trips alongside the projection fields.
         turn_id: Some(TurnId(Uuid::from_u128(0xCAFE))),
     };
@@ -3950,6 +3962,16 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
     assert_eq!(
         value.get("runtime_policy_stamp"),
         Some(&json!({ "approval_policy": "on-request" })),
+    );
+    assert_eq!(
+        value.get("started_at"),
+        Some(&json!("2026-09-15T07:46:43Z")),
+        "started_at must appear on the wire in RFC 3339 form",
+    );
+    assert_eq!(
+        value.get("relaunched_from"),
+        Some(&json!("01900000-0000-7000-8000-0000000000aa")),
+        "relaunched_from must appear on the wire when set",
     );
     assert_eq!(
         value.get("turn_id"),
@@ -3975,6 +3997,8 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     };
     let bare_value = serde_json::to_value(&bare).expect("serialize bare task/updated");
@@ -3988,6 +4012,14 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
     assert!(
         bare_value.get("runtime_policy_stamp").is_none(),
         "absent runtime_policy_stamp omits",
+    );
+    assert!(
+        bare_value.get("started_at").is_none(),
+        "absent started_at omits (#1595)",
+    );
+    assert!(
+        bare_value.get("relaunched_from").is_none(),
+        "absent relaunched_from omits (#1595)",
     );
     assert!(
         bare_value.get("turn_id").is_none(),
@@ -4006,6 +4038,8 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
     assert_eq!(parsed_legacy.summary, None);
     assert_eq!(parsed_legacy.artifact_count, None);
     assert_eq!(parsed_legacy.runtime_policy_stamp, None);
+    assert_eq!(parsed_legacy.started_at, None);
+    assert_eq!(parsed_legacy.relaunched_from, None);
     assert_eq!(parsed_legacy.turn_id, None);
 }
 
@@ -4418,6 +4452,8 @@ fn task_updated_and_spawn_complete_events_round_trip_tool_call_id() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     };
     let task_value = serde_json::to_value(&task_event).expect("serialize task_updated");
@@ -4445,6 +4481,8 @@ fn task_updated_and_spawn_complete_events_round_trip_tool_call_id() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     };
     let legacy_value = serde_json::to_value(&task_legacy).expect("serialize legacy");

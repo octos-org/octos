@@ -6723,6 +6723,48 @@ mod tests {
         assert_eq!(body["err_lines"], serde_json::json!(["panic: bind failed"]));
         assert_eq!(body["err_total_lines"], 1);
     }
+
+    // #1440: a WeChat QR flow started against a profile that does not exist
+    // must fail fast instead of reporting "confirmed" with the token dropped.
+    #[tokio::test]
+    async fn wechat_qr_start_rejects_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+
+        let status = match wechat_qr_start(State(state), Path("ghost".into())).await {
+            Err((status, _)) => status,
+            Ok(_) => panic!("unknown profile must be rejected"),
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn wechat_qr_poll_rejects_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+
+        let status = match wechat_qr_poll(
+            State(state),
+            Path("ghost".into()),
+            Json(WeChatQrPollRequest {
+                session_key: "sk-1".into(),
+            }),
+        )
+        .await
+        {
+            Err((status, _)) => status,
+            Ok(_) => panic!("unknown profile must be rejected"),
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6737,9 +6779,13 @@ pub struct WeChatQrStartResponse {
 
 /// GET /api/admin/profiles/{id}/wechat/qr-start
 pub async fn wechat_qr_start(
-    State(_state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
 ) -> Result<Json<WeChatQrStartResponse>, (StatusCode, String)> {
+    // Fail fast before the user scans a QR bound for a profile that does not
+    // exist — the poll below would have nowhere to land the token.
+    require_admin_profile(&state, &id)?;
+
     let client = reqwest::Client::new();
     let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
     let resp = client
@@ -6780,12 +6826,31 @@ pub struct WeChatQrPollResponse {
     pub bot_id: Option<String>,
 }
 
+/// Load the named profile or fail the request: a QR flow for a profile that
+/// does not exist would report "confirmed" while the token lands nowhere.
+fn require_admin_profile(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<Arc<crate::profiles::ProfileStore>, (StatusCode, String)> {
+    let store = state.profile_store.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    store
+        .get(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    Ok(store)
+}
+
 /// POST /api/admin/profiles/{id}/wechat/qr-poll
 pub async fn wechat_qr_poll(
     State(state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<WeChatQrPollRequest>,
 ) -> Result<Json<WeChatQrPollResponse>, (StatusCode, String)> {
+    let store = require_admin_profile(&state, &id)?;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(40))
         .build()
@@ -6832,27 +6897,8 @@ pub async fn wechat_qr_poll(
             .unwrap_or_default()
             .to_string();
 
-        // Save token to profile
-        if !bot_token.is_empty() {
-            if let Some(_pm) = state.process_manager.as_ref() {
-                // Write token with restrictive permissions from the start (no TOCTOU race)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let _ = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open("/tmp/octos-wechat-token")
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
-                }
-            }
-        }
+        // Save token to the profile being edited
+        super::auth_handlers::persist_wechat_bot_token(&store, &id, &bot_token);
 
         // Don't expose bot_token to the client — it's already saved server-side
         return Ok(Json(WeChatQrPollResponse {
