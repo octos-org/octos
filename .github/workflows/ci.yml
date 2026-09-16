@@ -479,6 +479,14 @@ jobs:
       - name: Session-open context compaction (octos-cli)
         run: cargo test -p octos-cli --features api session_open_snapshot -- --nocapture
 
+      # The session usage-status mapping lives in the `api`-gated ui_protocol
+      # module, so the unfeatured runs above never compile it — same reason as
+      # the §6 guard. Its tests matched NONE of the filters on this list
+      # (#2029), so the `cached_input_tokens`/`cache_write_input_tokens`
+      # mapping had never executed in CI.
+      - name: Session usage status mapping (octos-cli)
+        run: cargo test -p octos-cli --features api usage
+
       # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
       # unfeatured runs above never compile it — same reason as the §6 guard.
       # These cover slug reservation, worktree fencing, and the rollback
