@@ -21066,25 +21066,98 @@ pub(crate) async fn ensure_session_profile_runtime(
     )))
 }
 
+/// Replace the cached runtime under `key` only while the entry is still the
+/// one `base` was read from — the skill-mutation counterpart of
+/// `insert_profile_runtime_if_current` (#2186). A cold bootstrap fills an empty
+/// slot (`or_insert`), but the rebuild's whole point is refreshing the plugin
+/// layer IN PLACE, so this replaces the existing entry. Two checks, both under
+/// the same write lock:
+///
+/// - the generation must still be `generation` — a post-commit invalidation
+///   bumps it before dropping the cache;
+/// - if an entry is cached it must BE `base` (pointer identity). The commit's
+///   bump and remove are separate lock acquisitions, so a rebuild can capture
+///   the POST-bump generation yet still read the PRE-commit entry — the
+///   generation check alone cannot catch that window, and without this the
+///   replacement (which carries base's provider chain) would overwrite the
+///   committed runtime.
+///
+/// An absent entry is only acceptable when `base` came from the startup-pinned
+/// map (`base_is_startup_pinned`) — a dynamic-map base is always re-inserted
+/// by its own bootstrap, and the only remover bumps the generation first.
+/// Returns `false` — leaving the cache untouched — when either check fails.
+fn replace_profile_runtime_if_current(
+    key: &str,
+    generation: u64,
+    base: &Arc<crate::runtime::ProfileRuntime>,
+    base_is_startup_pinned: bool,
+    runtime: Arc<crate::runtime::ProfileRuntime>,
+) -> bool {
+    let mut runtimes = dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current_profile_runtime_generation(key) != generation {
+        return false;
+    }
+    match runtimes.get(key) {
+        Some(cached) if !Arc::ptr_eq(cached, base) => return false,
+        Some(_) => {}
+        None if !base_is_startup_pinned => return false,
+        None => {}
+    }
+    runtimes.insert(key.to_owned(), runtime);
+    true
+}
+
 async fn rebuild_profile_runtime_after_skill_mutation(
     state: &Arc<AppState>,
     profile_id: &str,
 ) -> Result<(), RpcError> {
+    // #2186: capture the key and generation BEFORE fetching the runtime. The
+    // replacement derives from the CURRENT cached runtime, so it carries that
+    // runtime's provider chain — if a profile/llm commit lands anywhere after
+    // this point (generation bump + cache drop + fresh bootstrap), the guarded
+    // replace below refuses to overwrite the committed runtime with one
+    // rebuilt from the pre-commit chain. The per-profile skill mutation lock
+    // held by the callers serializes rebuilds against each other, but NOT
+    // against profile/llm commits, which is the race this guards.
+    let key = dynamic_profile_runtime_key(state, profile_id);
+    let generation = key.as_deref().map(current_profile_runtime_generation);
     let Some(current) = ensure_session_profile_runtime(state, Some(profile_id)).await? else {
         return Ok(());
     };
+    let key = key.ok_or_else(|| {
+        runtime_unavailable_error("profile runtime catalog is unavailable for skill mutation")
+    })?;
+    let generation = generation.expect("generation is captured together with the key");
+    let base_is_startup_pinned = state
+        .profiles
+        .get(profile_id)
+        .is_some_and(|pinned| Arc::ptr_eq(pinned, &current));
     let replacement = current.rebuild_plugin_layer().await.map_err(|error| {
         runtime_unavailable_error(format!(
             "failed to rebuild profile runtime after skill mutation: {error}"
         ))
     })?;
-    let key = dynamic_profile_runtime_key(state, profile_id).ok_or_else(|| {
-        runtime_unavailable_error("profile runtime catalog is unavailable for skill mutation")
-    })?;
-    dynamic_profile_runtimes()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key, replacement);
+    if !replace_profile_runtime_if_current(
+        &key,
+        generation,
+        &current,
+        base_is_startup_pinned,
+        replacement,
+    ) {
+        // The racing commit already invalidated the session cache and dropped
+        // the stale entry; for a dynamic profile it also re-bootstrapped from
+        // the committed file (which includes this skill mutation), and for a
+        // startup-pinned one it already reported restart_required. Dropping
+        // the stale replacement is the conservative outcome either way.
+        tracing::debug!(
+            profile_id = %profile_id,
+            "skill-mutation runtime rebuild raced a profile/llm commit; \
+             keeping the committed runtime"
+        );
+        return Ok(());
+    }
     state.session_cache.invalidate_profile(profile_id).await;
     Ok(())
 }

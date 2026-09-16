@@ -2518,6 +2518,280 @@ async fn should_refuse_stale_profile_runtime_insert_after_generation_bump() {
     assert!(dynamic_cached_profile_runtime(&state, "dev").is_some());
 }
 
+/// #2186 acceptance — the skill-mutation rebuild is the sibling writer the
+/// #2164 guard did not cover: its replace carries the generation captured when
+/// the rebuild started, so a profile/llm commit landing mid-rebuild (bump +
+/// drop + fresh bootstrap) is NOT overwritten by a runtime rebuilt from the
+/// pre-commit one.
+#[tokio::test]
+async fn should_refuse_stale_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-rebuild",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let runtime = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+    // A rebuilt plugin layer is a distinct Arc standing in for the in-flight
+    // rebuild's PRE-commit replacement (a second live bootstrap would take the
+    // episode-store lock the first runtime holds).
+    let stale_replacement = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    // The commit lands while the rebuild is in flight: generation bumped,
+    // cache dropped, and a fresh runtime bootstrapped from the committed file
+    // (a distinct Arc stands in for it here).
+    bump_profile_runtime_generation(&key);
+    let committed = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("committed runtime");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    // The in-flight rebuild finishes: the guarded replace must refuse it…
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &runtime,
+            false,
+            stale_replacement,
+        ),
+        "a stale skill-mutation rebuild must not overwrite the committed runtime"
+    );
+    // …leaving the committed runtime serving.
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the generation check alone has a hole: the commit's bump and remove
+/// are separate lock acquisitions, so a rebuild can capture the POST-bump
+/// generation yet still read the PRE-commit entry. The pointer-identity check
+/// on the cached entry closes that window — a same-generation replace against
+/// an entry that is not the rebuild's base must be refused.
+#[tokio::test]
+async fn should_refuse_skill_rebuild_replace_against_a_foreign_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-foreign",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let base = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The committed bootstrap lands between the rebuild's cache read and its
+    // replace — SAME generation (captured after the bump, before the remove).
+    let committed = base.rebuild_plugin_layer().await.expect("committed");
+    let stale_replacement = base
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    assert!(
+        !replace_profile_runtime_if_current(&key, generation, &base, false, stale_replacement),
+        "a replace whose base is no longer the cached entry must be refused"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the unraced skill-mutation rebuild must REPLACE the cached entry
+/// (its whole point is refreshing the plugin layer in place), which the
+/// bootstrap guard's `or_insert` cannot express.
+#[tokio::test]
+async fn should_replace_cached_profile_runtime_when_generation_is_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-replace",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let original = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The rebuilt plugin layer is exactly what the production rebuild inserts.
+    let replacement = original
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+    assert!(
+        !Arc::ptr_eq(&original, &replacement),
+        "the stand-in replacement must be a distinct Arc"
+    );
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &original,
+            false,
+            Arc::clone(&replacement),
+        ),
+        "a current-generation rebuild replaces the cached entry"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &replacement),
+        "the replacement must overwrite the old entry, not be dropped by or_insert"
+    );
+}
+
+/// #2186 — a startup-pinned profile has no dynamic entry for the rebuild to
+/// match against: the guarded replace must still install the refresh (this is
+/// how skill mutations take effect on pinned profiles without a restart).
+#[tokio::test]
+async fn should_install_skill_rebuild_for_a_startup_pinned_profile_without_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-skill-pinned", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // Simulate the startup-pinned shape: the base comes from state.profiles,
+    // not the dynamic cache, so no entry exists for the key.
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    let replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &pinned,
+            true,
+            Arc::clone(&replacement),
+        ),
+        "a pinned profile's refresh installs into the empty dynamic slot"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(Arc::ptr_eq(&cached, &replacement));
+}
+
+/// #2186 — the startup-pinned escape hatch (no cached entry to match against)
+/// is exactly where the generation check is load-bearing: a profile/llm commit
+/// racing the rebuild bumps the generation even though there is no entry to
+/// remove, and the stale refresh must NOT install afterwards.
+#[tokio::test]
+async fn should_refuse_pinned_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-pinned-bump", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+
+    // Startup-pinned shape: no dynamic entry. The racing commit then bumps the
+    // generation (for a pinned profile it reports restart_required instead of
+    // re-bootstrapping, so the slot stays empty).
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    bump_profile_runtime_generation(&key);
+    let stale_replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &pinned,
+            true,
+            stale_replacement,
+        ),
+        "a pinned rebuild that raced a commit must not install the stale refresh"
+    );
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the refused install must leave the dynamic slot empty"
+    );
+}
+
 /// #2164 acceptance — persisted-but-rebuild-failed is EXPLICIT in the
 /// response (`persisted_but_not_live` + `runtime_error`), not collapsed into
 /// a warn-only server log, and recoverable once the bootstrap blocker is
