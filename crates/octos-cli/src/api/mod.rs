@@ -22,6 +22,7 @@ mod handlers;
 mod memory_panel;
 pub mod metrics;
 pub(crate) mod ominix_runtime;
+pub(crate) mod pairing;
 pub mod preview;
 pub mod preview_tokens;
 mod private_asr;
@@ -354,6 +355,13 @@ pub struct AppState {
     pub frps_port: Option<u16>,
     /// Deployment mode (local, tenant, or cloud).
     pub deployment_mode: crate::config::DeploymentMode,
+    /// One-time pairing state (WEB-PAIRING-CONTRACT-5100): the single
+    /// per-process pairing code, the API token it can be exchanged for, and
+    /// the loopback origin to hand back. `Some` only for an HTTP `octos
+    /// serve`; `None` in tests, stdio serves and embedded transports, where
+    /// `/pair/info` and `/pair/claim` answer 404 ("pairing not supported")
+    /// and the client falls back to the manual origin+token form.
+    pub pairing: Option<Arc<pairing::PairingState>>,
     /// Opt-in for the no-password "solo" REST login (`/api/auth/solo*`).
     /// OFF by default; set by `octos serve --solo` / `OCTOS_SOLO_LOGIN=1`.
     ///
@@ -519,6 +527,7 @@ impl AppState {
             frps_server: None,
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
+            pairing: None,
             solo_login_enabled: false,
             dangerous_default_permissions: false,
             default_network_denied: false,
