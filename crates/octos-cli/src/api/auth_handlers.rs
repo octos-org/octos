@@ -4206,6 +4206,57 @@ fn build_portal_state(
 // WeChat QR Login (user-scoped)
 // ---------------------------------------------------------------------------
 
+/// Persist a confirmed WeChat bot token onto `profile_id`: ensure the WeChat
+/// channel exists, set WECHAT_BOT_TOKEN, and save. Shared by the user-scoped
+/// and admin QR poll handlers so a QR confirmed through either route lands on
+/// the profile the client was actually editing.
+pub(crate) fn persist_wechat_bot_token(
+    ps: &crate::profiles::ProfileStore,
+    profile_id: &str,
+    bot_token: &str,
+) {
+    if bot_token.is_empty() {
+        return;
+    }
+    match ps.get(profile_id) {
+        Ok(Some(mut profile)) => {
+            let has_wechat = profile
+                .config
+                .channels
+                .iter()
+                .any(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }));
+            if !has_wechat {
+                profile
+                    .config
+                    .channels
+                    .push(crate::profiles::ChannelCredentials::WeChat {
+                        token_env: "WECHAT_BOT_TOKEN".into(),
+                        base_url: "https://ilinkai.weixin.qq.com".into(),
+                    });
+            }
+            profile
+                .config
+                .env_vars
+                .insert("WECHAT_BOT_TOKEN".into(), bot_token.to_string());
+            if let Err(e) = ps.save(&profile) {
+                tracing::error!(profile_id, "failed to persist WeChat bot token: {e}");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                profile_id,
+                "WeChat QR confirmed for unknown profile; token dropped"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                profile_id,
+                "failed to load profile for WeChat bot token: {e}"
+            );
+        }
+    }
+}
+
 /// GET /api/my/profile/wechat/qr-start
 pub async fn my_wechat_qr_start(
     State(state): State<Arc<AppState>>,
@@ -4319,43 +4370,7 @@ pub async fn my_wechat_qr_poll(
             .to_string();
 
         if !bot_token.is_empty() {
-            if let Ok(Some(mut profile)) = ps.get(&profile_id) {
-                let has_wechat = profile
-                    .config
-                    .channels
-                    .iter()
-                    .any(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }));
-                if !has_wechat {
-                    profile
-                        .config
-                        .channels
-                        .push(crate::profiles::ChannelCredentials::WeChat {
-                            token_env: "WECHAT_BOT_TOKEN".into(),
-                            base_url: "https://ilinkai.weixin.qq.com".into(),
-                        });
-                }
-                profile
-                    .config
-                    .env_vars
-                    .insert("WECHAT_BOT_TOKEN".into(), bot_token.clone());
-                let _ = ps.save(&profile);
-                // Set env var so the running wechat channel picks it up on next reconnect
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let _ = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open("/tmp/octos-wechat-token")
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
-                }
-            }
+            persist_wechat_bot_token(ps, &profile_id, &bot_token);
         }
 
         // Don't expose bot_token to client — already saved server-side
@@ -7052,5 +7067,90 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_bearer_token(&req), Some(String::new()));
+    }
+
+    fn wechat_test_profile(id: &str) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: id.into(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn wechat_channel_count(profile: &UserProfile) -> usize {
+        profile
+            .config
+            .channels
+            .iter()
+            .filter(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }))
+            .count()
+    }
+
+    #[test]
+    fn persist_wechat_bot_token_targets_the_named_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
+        ps.save(&wechat_test_profile("prof-a")).unwrap();
+        ps.save(&wechat_test_profile("prof-b")).unwrap();
+
+        persist_wechat_bot_token(&ps, "prof-a", "token-1");
+
+        // The named profile gains the channel and the token…
+        let saved = ps.get("prof-a").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&saved), 1);
+        assert_eq!(
+            saved
+                .config
+                .env_vars
+                .get("WECHAT_BOT_TOKEN")
+                .map(String::as_str),
+            Some("token-1")
+        );
+        // …and no other profile is touched.
+        let other = ps.get("prof-b").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&other), 0);
+        assert!(!other.config.env_vars.contains_key("WECHAT_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn persist_wechat_bot_token_repeat_confirm_does_not_stack_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
+        ps.save(&wechat_test_profile("prof-a")).unwrap();
+
+        persist_wechat_bot_token(&ps, "prof-a", "token-1");
+        persist_wechat_bot_token(&ps, "prof-a", "token-2");
+
+        let saved = ps.get("prof-a").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&saved), 1);
+        assert_eq!(
+            saved
+                .config
+                .env_vars
+                .get("WECHAT_BOT_TOKEN")
+                .map(String::as_str),
+            Some("token-2")
+        );
+    }
+
+    #[test]
+    fn persist_wechat_bot_token_noops_on_empty_token_and_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
+        ps.save(&wechat_test_profile("prof-a")).unwrap();
+
+        persist_wechat_bot_token(&ps, "prof-a", "");
+        let saved = ps.get("prof-a").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&saved), 0);
+        assert!(!saved.config.env_vars.contains_key("WECHAT_BOT_TOKEN"));
+
+        persist_wechat_bot_token(&ps, "no-such-profile", "token-1");
+        assert!(ps.get("no-such-profile").unwrap().is_none());
     }
 }

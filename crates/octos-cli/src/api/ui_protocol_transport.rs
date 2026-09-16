@@ -11136,6 +11136,10 @@ fn usage_status_json(totals: &UsageTotals) -> Value {
         "input_tokens": totals.input_tokens,
         "output_tokens": totals.output_tokens,
         "cached_input_tokens": totals.cache_read_tokens,
+        // The cache-WRITE (1.25x-premium) side of the same ledger dimension,
+        // emitted explicitly like the read side so a cold session's `0` is
+        // distinguishable from an unimplemented field.
+        "cache_write_input_tokens": totals.cache_write_tokens,
     });
     // Only emit a cost when the ledger actually priced something. A session
     // whose model has no catalog pricing accumulates tokens but no spend, and

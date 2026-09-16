@@ -469,8 +469,40 @@ async fn serve_goal_operator_connection(
 }
 
 enum ServeLiveness {
-    Offline,
+    /// No serve holds `<data_dir>/.octos-serve.lock` — and we now do. The
+    /// guard must stay alive across the offline append (#2181): probing
+    /// try_lock→unlock and appending afterwards left an ms-scale window in
+    /// which a serve could finish starting, restore pre-append state, and
+    /// overwrite the operator's transition from its stale live cache. With
+    /// the guard held, a serve starting inside that window cannot take its
+    /// startup lock — serve try_locks exactly once and fails closed with
+    /// `DATA_DIR_LOCKED_MARKER` before opening any store — so it never
+    /// restores a pre-append snapshot: a one-shot startup refusal instead
+    /// of a silent overwrite.
+    Offline(std::fs::File),
     Live,
+}
+
+// Test-only observation point at the start of the offline append arm of
+// `route_transition`: installed probes run while the transition is about to
+// append, so a test can assert what a concurrently starting serve would
+// observe on the data-dir lock at that exact moment.
+#[cfg(test)]
+type OfflineAppendProbe = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static OFFLINE_APPEND_PROBE_FOR_TEST: std::cell::RefCell<Option<OfflineAppendProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn notify_offline_append_probe_for_test(data_dir: &Path) {
+    OFFLINE_APPEND_PROBE_FOR_TEST.with(|probe| {
+        if let Some(probe) = &*probe.borrow() {
+            probe(data_dir);
+        }
+    });
 }
 
 fn serve_liveness(data_dir: &Path) -> Result<ServeLiveness> {
@@ -481,10 +513,7 @@ fn serve_liveness(data_dir: &Path) -> Result<ServeLiveness> {
         .truncate(false)
         .open(&lock_path)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => {
-            fs2::FileExt::unlock(&file)?;
-            Ok(ServeLiveness::Offline)
-        }
+        Ok(()) => Ok(ServeLiveness::Offline(file)),
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Ok(ServeLiveness::Live)
         }
@@ -792,7 +821,13 @@ fn route_transition(
     let located = locate_goal(goals_by_id, profile, goal_id)?;
     match serve_liveness(data_dir)? {
         ServeLiveness::Live => online_transition(data_dir, &located, profile, goal_id, action),
-        ServeLiveness::Offline => cmd_transition_located(store, located, goal_id, action),
+        // The guard binding keeps the lock held until the append returns
+        // (success or failure), closing the probe→append window.
+        ServeLiveness::Offline(_serve_lock) => {
+            #[cfg(test)]
+            notify_offline_append_probe_for_test(data_dir);
+            cmd_transition_located(store, located, goal_id, action)
+        }
     }
 }
 
@@ -1335,6 +1370,69 @@ mod tests_2116_readonly {
         let groups = store.load_goal_groups_by_id().expect("goal view");
         route_transition(temp.path(), &store, &groups, "octos", "goal_01", "archive")
             .expect("offline archive");
+        let folded = store.load_goal_groups_by_id().expect("folded state");
+        let goal = folded.values().next().expect("goal remains");
+        assert_eq!(metadata_str(goal, "status"), Some("archived"));
+    }
+
+    /// #2181 — the offline fallback must hold `.octos-serve.lock` across the
+    /// append. `serve_liveness` used to probe try_lock→unlock and the append
+    /// then ran unlocked: a serve finishing startup in that ms-scale window
+    /// restored pre-append state and its live cache could overwrite the
+    /// operator's transition. With the lock held, a starting serve instead
+    /// fails closed on its one-shot try_lock (`DATA_DIR_LOCKED_MARKER`)
+    /// before opening any store, so it can never restore the stale
+    /// snapshot. The probe fires at the append point and must observe the
+    /// same contention a starting serve would.
+    #[test]
+    fn goal_operator_offline_append_holds_serve_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = SupervisorStore::new(temp.path().join("supervisor"));
+        store
+            .record_group_registered(supervisor_goal_group(
+                "api:s1", "octos", "goal_01", "active",
+            ))
+            .expect("seed supervisor goal");
+
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let observed_in_probe = std::rc::Rc::clone(&observed);
+        OFFLINE_APPEND_PROBE_FOR_TEST.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |data_dir: &Path| {
+                let lock_path = data_dir.join(".octos-serve.lock");
+                let handle = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_path)
+                    .expect("probe handle");
+                let error = fs2::FileExt::try_lock_exclusive(&handle)
+                    .expect_err("serve lock must stay held across the offline append");
+                assert_eq!(
+                    error.raw_os_error(),
+                    fs2::lock_contended_error().raw_os_error(),
+                    "the probe failure must be lock contention, not another I/O error"
+                );
+                *observed_in_probe.borrow_mut() = true;
+            }));
+        });
+
+        let groups = store.load_goal_groups_by_id().expect("goal view");
+        route_transition(temp.path(), &store, &groups, "octos", "goal_01", "archive")
+            .expect("offline archive");
+        OFFLINE_APPEND_PROBE_FOR_TEST.with(|probe| probe.borrow_mut().take());
+        assert!(*observed.borrow(), "probe must fire on the offline arm");
+
+        // Once the transition returns the guard is dropped: a new starter
+        // acquires the lock and, restoring now, sees the appended row.
+        let lock_path = temp.path().join(".octos-serve.lock");
+        let handle = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("post-transition handle");
+        fs2::FileExt::try_lock_exclusive(&handle)
+            .expect("lock must be free again once the append has landed");
         let folded = store.load_goal_groups_by_id().expect("folded state");
         let goal = folded.values().next().expect("goal remains");
         assert_eq!(metadata_str(goal, "status"), Some("archived"));
