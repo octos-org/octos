@@ -30975,7 +30975,7 @@ mod tests {
         // upgrade fails and the adoption half no-ops. This must complete
         // cleanly (no panic, no error).
         child
-            .enable_persistence(&dir.path().join("tasks.jsonl"))
+            .enable_persistence(dir.path().join("tasks.jsonl"))
             .expect("child restore completes after the parent is gone");
     }
 
