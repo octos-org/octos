@@ -5609,11 +5609,22 @@ fn should_set_truncated_when_directory_exceeds_the_five_hundred_entry_cap() {
 fn should_report_null_parent_path_when_listing_the_filesystem_root() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state(dir.path());
+    // The root is `/` on Unix and `<drive>:\` on Windows; derive it from
+    // the canonical working directory so the contract runs on both.
+    let root = std::fs::canonicalize(std::env::current_dir().unwrap())
+        .unwrap()
+        .ancestors()
+        .last()
+        .unwrap()
+        .to_path_buf();
 
-    let result =
-        onboarding_workspace_list_result(&state, Some("/")).expect("list the filesystem root");
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list the filesystem root");
 
-    assert_eq!(result["canonical_path"], json!("/"));
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        root.to_string_lossy()
+    );
     assert_eq!(
         result["parent_path"],
         Value::Null,
@@ -5675,6 +5686,29 @@ fn should_return_typed_not_a_directory_when_listing_a_file() {
     );
 }
 
+/// Windows counterpart of the unix banned-root test: a unix-style path
+/// is not absolute on Windows (no drive prefix), so the resolver refuses
+/// it as an invalid path long before the unix-only banned-root rule runs.
+#[cfg(windows)]
+#[test]
+fn should_return_typed_invalid_path_when_listing_a_unix_style_path_on_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let error = onboarding_workspace_list_result(&state, Some("/etc"))
+        .expect_err("a unix-style path is not absolute on Windows");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_invalid_path")
+    );
+}
+
+// The banned-system-root list is Unix-only (`/etc`, `/usr`, `/proc`, …):
+// on Windows `/etc` is not absolute and is refused as an invalid path
+// before the banned-root rule runs, and no Windows roots are banned.
+#[cfg(unix)]
 #[test]
 fn should_return_typed_root_escape_when_listing_a_banned_system_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -5897,6 +5931,16 @@ fn should_return_typed_parent_errors_when_creating_workspace_folder() {
         workspace_browse_error_kind(&not_a_directory).as_deref(),
         Some("workspace_create_parent_not_a_directory")
     );
+}
+
+/// Contract §2 — a `parent` rooted under a banned system path is a typed
+/// root escape naming the banned component. Unix-only for the same reason
+/// as the list-side banned-root test above.
+#[cfg(unix)]
+#[test]
+fn should_return_typed_root_escape_when_creating_under_a_banned_system_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
 
     let root_escape = onboarding_workspace_create_result(&state, "/etc", "child")
         .expect_err("a banned system parent must be rejected");
@@ -5910,6 +5954,25 @@ fn should_return_typed_parent_errors_when_creating_workspace_folder() {
             .as_ref()
             .and_then(|data| data.get("banned_root")),
         Some(&json!("etc"))
+    );
+}
+
+/// Windows counterpart: the contract maps an unusable `parent` to
+/// `workspace_create_parent_not_found`, and a unix-style parent is
+/// unusable on Windows because it is not absolute.
+#[cfg(windows)]
+#[test]
+fn should_report_unix_style_parent_as_not_found_when_creating_on_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let error = onboarding_workspace_create_result(&state, "/etc", "child")
+        .expect_err("a unix-style parent is not absolute on Windows");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_create_parent_not_found")
     );
 }
 
