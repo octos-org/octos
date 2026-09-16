@@ -1,6 +1,13 @@
-# ADR: Personal memory — three tiers by trust, one index
+# Personal memory — three tiers by trust, one index
 
-Status: proposed · Date: 2026-09-16 · Scope: `octos-memory`, `octos-agent` tools, `octos-cli` runtime/profile, plugin skills; app-side ingestion in Octoscript-AppCard (Mail, Calendar) and the OctoSense phone shell.
+- Date: 2026-09-16 (proposal)
+- Status: **Proposed**. Phase 1 (plugin skill, no kernel change) starts in
+  Octoscript-AppCard alongside this ADR; phases 2–3 land in `octos-memory` /
+  `octos-agent` behind follow-up PRs that cite this record.
+- Scope: `octos-memory`, `octos-agent` tools, `octos-cli` runtime/profile,
+  plugin skills; app-side ingestion in Octoscript-AppCard (Mail, Calendar) and
+  the OctoSense phone shell.
+- Branch: `design/personal-memory-tiers` → `main`.
 
 ## Context
 
