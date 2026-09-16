@@ -2518,6 +2518,280 @@ async fn should_refuse_stale_profile_runtime_insert_after_generation_bump() {
     assert!(dynamic_cached_profile_runtime(&state, "dev").is_some());
 }
 
+/// #2186 acceptance — the skill-mutation rebuild is the sibling writer the
+/// #2164 guard did not cover: its replace carries the generation captured when
+/// the rebuild started, so a profile/llm commit landing mid-rebuild (bump +
+/// drop + fresh bootstrap) is NOT overwritten by a runtime rebuilt from the
+/// pre-commit one.
+#[tokio::test]
+async fn should_refuse_stale_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-rebuild",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let runtime = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+    // A rebuilt plugin layer is a distinct Arc standing in for the in-flight
+    // rebuild's PRE-commit replacement (a second live bootstrap would take the
+    // episode-store lock the first runtime holds).
+    let stale_replacement = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    // The commit lands while the rebuild is in flight: generation bumped,
+    // cache dropped, and a fresh runtime bootstrapped from the committed file
+    // (a distinct Arc stands in for it here).
+    bump_profile_runtime_generation(&key);
+    let committed = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("committed runtime");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    // The in-flight rebuild finishes: the guarded replace must refuse it…
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &runtime,
+            false,
+            stale_replacement,
+        ),
+        "a stale skill-mutation rebuild must not overwrite the committed runtime"
+    );
+    // …leaving the committed runtime serving.
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the generation check alone has a hole: the commit's bump and remove
+/// are separate lock acquisitions, so a rebuild can capture the POST-bump
+/// generation yet still read the PRE-commit entry. The pointer-identity check
+/// on the cached entry closes that window — a same-generation replace against
+/// an entry that is not the rebuild's base must be refused.
+#[tokio::test]
+async fn should_refuse_skill_rebuild_replace_against_a_foreign_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-foreign",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let base = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The committed bootstrap lands between the rebuild's cache read and its
+    // replace — SAME generation (captured after the bump, before the remove).
+    let committed = base.rebuild_plugin_layer().await.expect("committed");
+    let stale_replacement = base
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    assert!(
+        !replace_profile_runtime_if_current(&key, generation, &base, false, stale_replacement),
+        "a replace whose base is no longer the cached entry must be refused"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the unraced skill-mutation rebuild must REPLACE the cached entry
+/// (its whole point is refreshing the plugin layer in place), which the
+/// bootstrap guard's `or_insert` cannot express.
+#[tokio::test]
+async fn should_replace_cached_profile_runtime_when_generation_is_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-replace",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let original = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The rebuilt plugin layer is exactly what the production rebuild inserts.
+    let replacement = original
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+    assert!(
+        !Arc::ptr_eq(&original, &replacement),
+        "the stand-in replacement must be a distinct Arc"
+    );
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &original,
+            false,
+            Arc::clone(&replacement),
+        ),
+        "a current-generation rebuild replaces the cached entry"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &replacement),
+        "the replacement must overwrite the old entry, not be dropped by or_insert"
+    );
+}
+
+/// #2186 — a startup-pinned profile has no dynamic entry for the rebuild to
+/// match against: the guarded replace must still install the refresh (this is
+/// how skill mutations take effect on pinned profiles without a restart).
+#[tokio::test]
+async fn should_install_skill_rebuild_for_a_startup_pinned_profile_without_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-skill-pinned", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // Simulate the startup-pinned shape: the base comes from state.profiles,
+    // not the dynamic cache, so no entry exists for the key.
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    let replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &pinned,
+            true,
+            Arc::clone(&replacement),
+        ),
+        "a pinned profile's refresh installs into the empty dynamic slot"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(Arc::ptr_eq(&cached, &replacement));
+}
+
+/// #2186 — the startup-pinned escape hatch (no cached entry to match against)
+/// is exactly where the generation check is load-bearing: a profile/llm commit
+/// racing the rebuild bumps the generation even though there is no entry to
+/// remove, and the stale refresh must NOT install afterwards.
+#[tokio::test]
+async fn should_refuse_pinned_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-pinned-bump", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+
+    // Startup-pinned shape: no dynamic entry. The racing commit then bumps the
+    // generation (for a pinned profile it reports restart_required instead of
+    // re-bootstrapping, so the slot stays empty).
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    bump_profile_runtime_generation(&key);
+    let stale_replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &pinned,
+            true,
+            stale_replacement,
+        ),
+        "a pinned rebuild that raced a commit must not install the stale refresh"
+    );
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the refused install must leave the dynamic slot empty"
+    );
+}
+
 /// #2164 acceptance — persisted-but-rebuild-failed is EXPLICIT in the
 /// response (`persisted_but_not_live` + `runtime_error`), not collapsed into
 /// a warn-only server log, and recoverable once the bootstrap blocker is
@@ -3206,6 +3480,11 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             })
         }
         APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE => json!({ "path": "." }),
+        // WEB-WORKSPACE-BROWSER-CONTRACT-5000: relative path / invalid name so
+        // the dispatch probe exercises the route without touching the
+        // filesystem of whoever runs the suite.
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST => json!({ "path": "." }),
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE => json!({ "parent": ".", "name": ".." }),
         methods::SESSION_GOAL_OPERATOR_TRANSITION => json!({
             "session_id": session_id,
             "profile_id": "dispatch-parity",
@@ -5196,6 +5475,541 @@ fn workspace_probe_capability_is_local_solo_only() {
     assert!(
         !tenant_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1),
         "tenant deployment must NOT advertise the workspace probe feature",
+    );
+}
+
+// ===================================================================
+// WEB-WORKSPACE-BROWSER-CONTRACT-5000 — `onboarding/workspace_list` and
+// `onboarding/workspace_create`, the local-solo folder browser that lets
+// the web onboarding form pick a workspace instead of typing a blind
+// absolute path. Gated on `onboarding.workspace_browse.v1`; both methods
+// refuse tenant/cloud exactly like `onboarding/workspace_probe` (#1057).
+// ===================================================================
+
+/// Helper: pull the typed `data.kind` discriminant off an `RpcError`.
+fn workspace_browse_error_kind(error: &RpcError) -> Option<String> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("kind"))
+        .and_then(|kind| kind.as_str())
+        .map(ToOwned::to_owned)
+}
+
+/// Contract §1 — a listing returns DIRECTORIES ONLY, never files, sorted
+/// case-insensitively by name, each with its canonical absolute path.
+#[test]
+fn should_list_only_sorted_directories_with_canonical_paths_when_listing_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    // Feed the canonical base, the way a real client does: every path it
+    // sends back came from a previous `canonical_path` / entry `path`.
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["Zebra", "alpha", "Beta"] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+    }
+    std::fs::write(root.join("notes.txt"), "not a directory").unwrap();
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list an existing directory");
+
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        canonical_root.to_string_lossy()
+    );
+    let entries = result["entries"].as_array().unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "Beta", "Zebra"],
+        "entries must be directories only, sorted case-insensitively"
+    );
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap();
+        assert_eq!(
+            entry["path"].as_str().unwrap(),
+            std::fs::canonicalize(canonical_root.join(name))
+                .unwrap()
+                .to_string_lossy(),
+            "each entry path must be the canonical absolute path"
+        );
+        assert_eq!(entry["writable"], json!(true));
+    }
+    assert_eq!(result["writable"], json!(true));
+    assert_eq!(result["truncated"], json!(false));
+    assert_eq!(result["hidden_skipped"], json!(0));
+    assert_eq!(
+        result["parent_path"].as_str().unwrap(),
+        canonical_root.parent().unwrap().to_string_lossy()
+    );
+}
+
+/// Contract §1 — dot-directories are omitted from `entries` and counted
+/// in `hidden_skipped` (files, hidden or not, are never counted: they are
+/// not listable entries in the first place).
+#[test]
+fn should_skip_and_count_hidden_directories_when_listing_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("projects");
+    std::fs::create_dir_all(root.join("visible")).unwrap();
+    for hidden in [".git", ".cache", ".config"] {
+        std::fs::create_dir_all(root.join(hidden)).unwrap();
+    }
+    std::fs::write(root.join(".dotfile"), "hidden file, not a dir").unwrap();
+
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list a directory holding dot-directories");
+
+    let names: Vec<&str> = result["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["visible"]);
+    assert_eq!(
+        result["hidden_skipped"],
+        json!(3),
+        "the three dot-directories must be counted, the dot-FILE must not"
+    );
+}
+
+/// Contract §1 — at most 500 entries; `truncated` is true when more
+/// existed. The kept 500 are the first 500 of the sorted order.
+#[test]
+fn should_set_truncated_when_directory_exceeds_the_five_hundred_entry_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("many");
+    std::fs::create_dir_all(&root).unwrap();
+    for index in 0..ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES + 1 {
+        std::fs::create_dir_all(root.join(format!("dir-{index:04}"))).unwrap();
+    }
+
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list an over-cap directory");
+
+    let entries = result["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES);
+    assert_eq!(result["truncated"], json!(true));
+    assert_eq!(entries[0]["name"], json!("dir-0000"));
+}
+
+/// Contract §1 — `parent_path` is null at the filesystem root.
+#[test]
+fn should_report_null_parent_path_when_listing_the_filesystem_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let result =
+        onboarding_workspace_list_result(&state, Some("/")).expect("list the filesystem root");
+
+    assert_eq!(result["canonical_path"], json!("/"));
+    assert_eq!(
+        result["parent_path"],
+        Value::Null,
+        "the filesystem root has no parent"
+    );
+}
+
+/// Contract §1 — a null/empty `path` means "the server's own working
+/// directory".
+#[test]
+fn should_list_the_server_working_directory_when_path_is_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+
+    let result =
+        onboarding_workspace_list_result(&state, None).expect("list the server working directory");
+
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        cwd.to_string_lossy()
+    );
+}
+
+/// Contract §1 — a missing path, a file path and a banned system root
+/// each get their own typed `data.kind`.
+#[test]
+fn should_return_typed_not_found_when_listing_a_missing_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let missing = base.join("never-created");
+
+    let error = onboarding_workspace_list_result(&state, Some(missing.to_str().unwrap()))
+        .expect_err("a missing path must be rejected");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_not_found")
+    );
+}
+
+#[test]
+fn should_return_typed_not_a_directory_when_listing_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let file = base.join("README.md");
+    std::fs::write(&file, "a regular file").unwrap();
+
+    let error = onboarding_workspace_list_result(&state, Some(file.to_str().unwrap()))
+        .expect_err("a file path must be rejected");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_not_a_directory")
+    );
+}
+
+#[test]
+fn should_return_typed_root_escape_when_listing_a_banned_system_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let error = onboarding_workspace_list_result(&state, Some("/etc"))
+        .expect_err("a banned system root must be rejected");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_root_escape")
+    );
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("banned_root")),
+        Some(&json!("etc")),
+        "the root-escape error must name the banned system component"
+    );
+}
+
+#[test]
+fn should_return_typed_invalid_path_when_listing_an_empty_or_relative_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    // An explicitly blank string is not "null means cwd": it is unusable.
+    let error = onboarding_workspace_list_result(&state, Some("   "))
+        .expect_err("a blank path must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_invalid_path")
+    );
+
+    let relative = onboarding_workspace_list_result(&state, Some("relative/path"))
+        .expect_err("a relative path must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&relative).as_deref(),
+        Some("workspace_list_invalid_path")
+    );
+}
+
+/// Contract §1 — `~` is expanded exactly the way `onboarding/workspace_probe`
+/// expands it.
+#[test]
+fn should_expand_home_prefix_when_listing_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let Ok(canonical_home) = std::fs::canonicalize(&home) else {
+        return;
+    };
+
+    let result = onboarding_workspace_list_result(&state, Some("~")).expect("list the home dir");
+
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        canonical_home.to_string_lossy()
+    );
+}
+
+/// Contract §1 — tenant / cloud deployments are refused exactly like the
+/// probe refuses them.
+#[test]
+fn should_refuse_workspace_list_when_local_solo_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_profile_state(dir.path());
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        profile_store: local.profile_store.clone(),
+        user_store: local.user_store.clone(),
+        ..AppState::empty_for_tests()
+    };
+
+    let error = onboarding_workspace_list_result(&tenant, Some(dir.path().to_str().unwrap()))
+        .expect_err("tenant rejection");
+
+    assert_eq!(error.code, rpc_error_codes::PERMISSION_DENIED);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("profile_local_unsupported")
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("runtime_mode")),
+        Some(&json!("multi_tenant"))
+    );
+}
+
+/// Contract §2 — `name` is exactly one path component: no `/`, no `\`,
+/// not `.`, not `..`, no control characters, 1..=255 bytes, and it must
+/// not start or end with whitespace.
+#[test]
+fn should_reject_invalid_names_when_creating_workspace_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent_dir = dir.path().join("parent");
+    std::fs::create_dir_all(&parent_dir).unwrap();
+    let parent = parent_dir.to_str().unwrap();
+    let over_long = "a".repeat(ONBOARDING_WORKSPACE_CREATE_MAX_NAME_BYTES + 1);
+
+    for name in [
+        "..",
+        ".",
+        "a/b",
+        "a\\b",
+        "",
+        " leading",
+        "trailing ",
+        "ctrl\u{0007}char",
+        "nul\0byte",
+        over_long.as_str(),
+    ] {
+        let error = onboarding_workspace_create_result(&state, parent, name)
+            .expect_err(&format!("{name:?} must be rejected"));
+        assert_eq!(
+            error.code,
+            rpc_error_codes::INVALID_PARAMS,
+            "{name:?} must be an invalid-params rejection"
+        );
+        assert_eq!(
+            workspace_browse_error_kind(&error).as_deref(),
+            Some("workspace_create_invalid_name"),
+            "{name:?} must be rejected as an invalid name"
+        );
+    }
+
+    let leftovers = std::fs::read_dir(&parent_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(leftovers, 0, "a rejected name must never create anything");
+}
+
+#[test]
+fn should_create_directory_and_report_created_when_creating_workspace_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+
+    let result = onboarding_workspace_create_result(&state, parent.to_str().unwrap(), "new-app")
+        .expect("create a folder");
+
+    assert_eq!(result["created"], json!(true));
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        std::fs::canonicalize(parent.join("new-app"))
+            .unwrap()
+            .to_string_lossy()
+    );
+    assert!(parent.join("new-app").is_dir());
+    assert_eq!(
+        result.as_object().unwrap().len(),
+        2,
+        "the create result carries exactly canonical_path + created"
+    );
+}
+
+/// Contract §2 — `created` is false when a directory of that name already
+/// existed: idempotent success, not an error.
+#[test]
+fn should_report_created_false_when_workspace_folder_already_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(parent.join("existing")).unwrap();
+
+    let result = onboarding_workspace_create_result(&state, parent.to_str().unwrap(), "existing")
+        .expect("an existing directory is an idempotent success");
+
+    assert_eq!(result["created"], json!(false));
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        std::fs::canonicalize(parent.join("existing"))
+            .unwrap()
+            .to_string_lossy()
+    );
+}
+
+/// Contract §2 — a NON-directory already at that path is an error.
+#[test]
+fn should_return_typed_exists_not_directory_when_a_file_occupies_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(parent.join("occupied"), "a file, not a folder").unwrap();
+
+    let error = onboarding_workspace_create_result(&state, parent.to_str().unwrap(), "occupied")
+        .expect_err("a file of that name must be an error");
+
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_create_exists_not_directory")
+    );
+}
+
+#[test]
+fn should_return_typed_parent_errors_when_creating_workspace_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let missing = base.join("no-such-parent");
+    let file_parent = base.join("parent.txt");
+    std::fs::write(&file_parent, "a file used as a parent").unwrap();
+
+    let not_found = onboarding_workspace_create_result(&state, missing.to_str().unwrap(), "child")
+        .expect_err("a missing parent must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&not_found).as_deref(),
+        Some("workspace_create_parent_not_found")
+    );
+
+    let not_a_directory =
+        onboarding_workspace_create_result(&state, file_parent.to_str().unwrap(), "child")
+            .expect_err("a file parent must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&not_a_directory).as_deref(),
+        Some("workspace_create_parent_not_a_directory")
+    );
+
+    let root_escape = onboarding_workspace_create_result(&state, "/etc", "child")
+        .expect_err("a banned system parent must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&root_escape).as_deref(),
+        Some("workspace_create_root_escape")
+    );
+    assert_eq!(
+        root_escape
+            .data
+            .as_ref()
+            .and_then(|data| data.get("banned_root")),
+        Some(&json!("etc"))
+    );
+}
+
+/// Contract §2 — the created path, canonicalized, must still live under
+/// `parent`: a pre-existing symlink that points outside is a root escape,
+/// never a silent success on someone else's directory.
+#[cfg(unix)]
+#[test]
+fn should_return_typed_root_escape_when_the_name_symlinks_outside_the_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    let outside = parent.join("outside");
+    let inside = parent.join("inside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(&inside).unwrap();
+    std::os::unix::fs::symlink(&outside, inside.join("escape")).unwrap();
+
+    let error = onboarding_workspace_create_result(&state, inside.to_str().unwrap(), "escape")
+        .expect_err("a symlink escape must be rejected");
+
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_create_root_escape")
+    );
+}
+
+#[test]
+fn should_refuse_workspace_create_when_local_solo_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_profile_state(dir.path());
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        profile_store: local.profile_store.clone(),
+        user_store: local.user_store.clone(),
+        ..AppState::empty_for_tests()
+    };
+
+    let error =
+        onboarding_workspace_create_result(&tenant, dir.path().to_str().unwrap(), "new-app")
+            .expect_err("tenant rejection");
+
+    assert_eq!(error.code, rpc_error_codes::PERMISSION_DENIED);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("profile_local_unsupported")
+    );
+    assert!(
+        !dir.path().join("new-app").exists(),
+        "a refused create must not touch the filesystem"
+    );
+}
+
+/// Contract gate — both methods and `onboarding.workspace_browse.v1` are
+/// advertised for local-solo deployments and withheld from tenant ones, so
+/// a client that cannot see the feature fails closed to the typed-path form.
+#[test]
+fn should_advertise_workspace_browse_only_for_local_solo_deployments() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_profile_state(dir.path());
+    let local_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&local);
+    for method in [
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
+    ] {
+        assert!(
+            local_capabilities
+                .supported_methods
+                .iter()
+                .any(|advertised| advertised == method),
+            "local solo deployment must advertise {method}",
+        );
+    }
+    assert!(
+        local_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_BROWSE_V1),
+        "local solo deployment must advertise the workspace browse feature",
+    );
+
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        profile_store: local.profile_store.clone(),
+        user_store: local.user_store.clone(),
+        ..AppState::empty_for_tests()
+    };
+    let tenant_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&tenant);
+    for method in [
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
+    ] {
+        assert!(
+            !tenant_capabilities
+                .supported_methods
+                .iter()
+                .any(|advertised| advertised == method),
+            "tenant deployment must NOT advertise {method}",
+        );
+    }
+    assert!(
+        !tenant_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_BROWSE_V1),
+        "tenant deployment must NOT advertise the workspace browse feature",
     );
 }
 
@@ -19432,6 +20246,8 @@ fn raw_method_is_dispatched_covers_full_raw_surface() {
         APPUI_METHOD_MCP_STATUS_LIST,
         APPUI_METHOD_TOOL_STATUS_LIST,
         APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
         // Autonomy (session/goal/*, loop/*, agent/*, task/artifact/*):
         octos_core::ui_protocol::methods::SESSION_GOAL_GET,
         octos_core::ui_protocol::methods::SESSION_GOAL_SET,

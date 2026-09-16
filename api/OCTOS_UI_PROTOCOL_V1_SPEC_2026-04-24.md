@@ -522,6 +522,28 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
+- `onboarding/workspace_list`, `onboarding/workspace_create` (gate
+  `onboarding.workspace_browse.v1`, local-solo only;
+  WEB-WORKSPACE-BROWSER-CONTRACT-5000. Server-side folder browsing for the
+  workspace-creation form: `workspace_list` answers
+  `{canonical_path, parent_path, writable, entries[{name, path, writable}],
+  truncated, hidden_skipped}` for a resolved directory — directories only,
+  sorted case-insensitively, dot-directories counted in `hidden_skipped`,
+  at most 500 entries with `truncated` set when more existed, `parent_path`
+  null at the filesystem root or when the parent would be a banned system
+  path; `workspace_create` takes `{parent, name}` and answers
+  `{canonical_path, created}`, with `created: false` for an existing
+  directory of that name — an idempotent success, not an error. Typed
+  `data.kind` errors, same shape as the probe:
+  `workspace_list_invalid_path`, `workspace_list_not_found`,
+  `workspace_list_not_a_directory`, `workspace_list_permission_denied`,
+  `workspace_list_root_escape` (with `banned_root`),
+  `workspace_create_invalid_name`, `workspace_create_parent_not_found`,
+  `workspace_create_parent_not_a_directory`,
+  `workspace_create_permission_denied`, `workspace_create_root_escape`,
+  `workspace_create_exists_not_directory`, and `profile_local_unsupported`
+  on tenant/cloud. A client that does not see the feature keeps the
+  typed-path form and hides every browsing affordance — fail closed.)
 
 Notifications:
 
