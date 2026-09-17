@@ -29100,11 +29100,13 @@ async fn handle_memory_load(
     let recall = runtime.recall.clone();
     let lookup_id = record_id.clone();
     let fetched = tokio::task::spawn_blocking(move || {
-        let record = recall.get(&lookup_id)?;
-        if record.is_some() {
-            // A load is a visit: bump the heat so hot records keep
-            // their vector and get nominated for promotion.
-            if let Err(error) = recall.touch(&lookup_id) {
+        // A load is a visit: bump the heat first so hot records keep
+        // their vector and get nominated for promotion, and so the
+        // returned snapshot already carries this visit.
+        match recall.touch(&lookup_id) {
+            Ok(true) => {}
+            Ok(false) => return Ok::<_, eyre::Report>(None),
+            Err(error) => {
                 tracing::debug!(
                     target: "octos::ui_protocol::ws::aux",
                     id = %lookup_id,
@@ -29113,7 +29115,7 @@ async fn handle_memory_load(
                 );
             }
         }
-        Ok::<_, eyre::Report>(record)
+        recall.get(&lookup_id)
     })
     .await;
     let record = match fetched {
