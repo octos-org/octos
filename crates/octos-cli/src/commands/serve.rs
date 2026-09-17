@@ -366,7 +366,8 @@ pub struct ServeCommand {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Auth token for API access (overrides config).
+    /// Auth token for API access (overrides config). Visible in the process
+    /// list (`ps`) — prefer the OCTOS_AUTH_TOKEN env var or the config file.
     #[arg(long)]
     pub auth_token: Option<String>,
 
@@ -463,6 +464,37 @@ pub struct ServeCommand {
 /// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
 fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
     stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+}
+
+/// Where the effective dashboard bearer token came from. #2371: the argv
+/// source leaks the token to every local process via `ps`, so it earns a
+/// one-time warning at the call site; the env/config sources do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthTokenSource {
+    Argv,
+    Env,
+    Config,
+}
+
+/// Resolve the operator-supplied auth token with the documented precedence
+/// `--auth-token` > `OCTOS_AUTH_TOKEN` > config `auth_token` (an empty
+/// config token counts as absent). `None` means no operator source produced
+/// a token — the caller then auto-generates one for non-loopback binds.
+fn resolve_auth_token(
+    argv: Option<String>,
+    env: Option<String>,
+    config: Option<&str>,
+) -> Option<(String, AuthTokenSource)> {
+    if let Some(token) = argv {
+        return Some((token, AuthTokenSource::Argv));
+    }
+    if let Some(token) = env {
+        return Some((token, AuthTokenSource::Env));
+    }
+    match config {
+        Some(token) if !token.is_empty() => Some((token.to_string(), AuthTokenSource::Config)),
+        _ => None,
+    }
 }
 
 /// How long the serve keeps draining in-flight connections after the stop
@@ -938,17 +970,21 @@ impl ServeCommand {
         let metrics_handle = Some(init_metrics());
 
         // Security: warn if binding to non-localhost without auth token
-        // Check CLI arg, then OCTOS_AUTH_TOKEN env var
-        let auth_token = if self.auth_token.is_some() {
-            self.auth_token
-        } else if let Ok(env_token) = std::env::var("OCTOS_AUTH_TOKEN") {
-            Some(env_token)
-        } else if let Some(ref cfg_token) = config.auth_token {
-            if !cfg_token.is_empty() {
-                Some(cfg_token.clone())
-            } else {
-                None
+        // Precedence: CLI arg, then OCTOS_AUTH_TOKEN env var, then config
+        let auth_token = if let Some((token, source)) = resolve_auth_token(
+            self.auth_token.clone(),
+            std::env::var("OCTOS_AUTH_TOKEN").ok(),
+            config.auth_token.as_deref(),
+        ) {
+            if source == AuthTokenSource::Argv {
+                // #2371: argv is readable by any local process via `ps`;
+                // steer operators to the env var or the config file.
+                tracing::warn!(
+                    "--auth-token exposes the bearer token in the process list (ps); \
+                     prefer the OCTOS_AUTH_TOKEN env var or the config file"
+                );
             }
+            Some(token)
         } else if self.host != "127.0.0.1" && self.host != "localhost" && self.host != "::1" {
             tracing::warn!(
                 "Binding to {} without --auth-token is dangerous! \
@@ -2235,6 +2271,65 @@ impl ServeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_prefer_argv_auth_token_and_report_its_source() {
+        // #2371: precedence is argv > env > config, and the source must be
+        // reported so the serve can warn when the token arrives via the
+        // process list.
+        let resolved = resolve_auth_token(
+            Some("argv-token".to_string()),
+            Some("env-token".to_string()),
+            Some("config-token"),
+        );
+        assert_eq!(
+            resolved,
+            Some(("argv-token".to_string(), AuthTokenSource::Argv))
+        );
+    }
+
+    #[test]
+    fn should_fall_back_to_env_then_config_auth_token() {
+        assert_eq!(
+            resolve_auth_token(None, Some("env-token".to_string()), Some("config-token")),
+            Some(("env-token".to_string(), AuthTokenSource::Env))
+        );
+        assert_eq!(
+            resolve_auth_token(None, None, Some("config-token")),
+            Some(("config-token".to_string(), AuthTokenSource::Config))
+        );
+        // An empty config token counts as absent — the caller falls through
+        // to the auto-generated-token path for non-loopback binds.
+        assert_eq!(resolve_auth_token(None, None, Some("")), None);
+        assert_eq!(resolve_auth_token(None, None, None), None);
+    }
+
+    /// #2371 tripwire: the repo's own service generators must never place
+    /// the dashboard bearer token in argv — it is readable by any local
+    /// process via ps / systemctl cat. The OCTOS_AUTH_TOKEN env var carries
+    /// it instead. (deploy.ps1's NSSM path is the known remaining exception;
+    /// NSSM needs AppEnvironmentExtra for env injection, tracked separately.)
+    #[test]
+    fn service_templates_never_pass_auth_token_via_argv() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        for name in ["install.sh", "install.ps1", "local-tenant-deploy.sh"] {
+            let body = std::fs::read_to_string(scripts.join(name))
+                .unwrap_or_else(|e| panic!("read {name}: {e}"));
+            assert!(
+                body.contains("OCTOS_AUTH_TOKEN"),
+                "{name} must still deliver the token via OCTOS_AUTH_TOKEN"
+            );
+            for line in body.lines() {
+                let service_argv_line = line.contains("ExecStart=")
+                    || line.contains("\"$octosBin\" serve")
+                    || line.trim() == "<string>--auth-token</string>";
+                assert!(
+                    !(service_argv_line && line.contains("--auth-token")),
+                    "{name} puts --auth-token in the service argv: {line}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn stdio_serve_wires_task_query_store_for_in_process_cancel() {
